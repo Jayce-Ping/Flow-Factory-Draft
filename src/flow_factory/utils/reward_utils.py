@@ -3,7 +3,6 @@ from itertools import permutations
 import re
 import numpy as np
 from PIL import Image
-import openai
 
 # -------------------------------------Grid Utils-------------------------------------
 def divide_prompt(prompt: str) -> List[str]:
@@ -54,69 +53,6 @@ def extract_grid_info(prompt : str) -> tuple[int, int]:
         return (1, 1)
 
     return (int(match[0][0]), int(match[0][1]))
-
-
-# -------------------------------------OpenAI Utils------------------------------------
-def get_yes_cond_prob_from_completion(completion : openai.ChatCompletion, canonicalize=False) -> float:
-    """
-        Extract the conditional probability of "yes" from an OpenAI ChatCompletion response.
-        Args:
-            completion (openai.ChatCompletion): The completion response from OpenAI API.
-            canonicalize (bool): If True, aggregate probabilities for all case variations of "yes" and "no".
-        Returns:
-            float: The conditional probability of "yes". Returns 0.0 if "yes" or "no" cannot be determined.
-    """
-    if completion is None:
-        return 0.0
-
-    logprobs = completion.choices[0].logprobs
-    if logprobs:
-        # Use logprobs to compute, score = P('yes') / (P('yes') + P('no'))
-        # score = 1 / (1 + exp(logprob('no') -  logprob('yes')))
-        # Same formular for logits as well. Since the sum term will cancel out.
-        # Use uppercase only here.
-        if not canonicalize:
-            token_logprobs = {t.token: t.logprob for t in logprobs.content[0].top_logprobs}
-            yes_logprob = token_logprobs.get('Yes', float('-inf'))
-            no_logprob = token_logprobs.get('No', float('-inf'))
-            if yes_logprob == float('-inf') and no_logprob == float('-inf'):
-                # When inf - inf encountered, give 0.0 score.
-                yes_cond_prob = 0.0 # 0.0
-            else:
-                diff = torch.tensor(yes_logprob - no_logprob, dtype=torch.float64)
-                yes_cond_prob = torch.sigmoid(diff).item()
-        else:
-            # Sum all possible cases together
-            # 'yes', 'Yes', 'YES', 'yes ',....
-            # 'no', 'No', 'NO',....
-            token_probs = {t.token: np.exp(t.logprob, dtype=np.float64) for t in logprobs.content[0].top_logprobs}
-            
-            # Vectorized computation
-            tokens = np.array(list(token_probs.keys()))
-            probs = np.array(list(token_probs.values()))
-            
-            # Strip and lower the tokens for matching
-            tokens_stripped = np.array([token.strip().lower() for token in tokens])
-            
-            yes_mask = tokens_stripped == "yes"
-            no_mask = tokens_stripped == "no"
-            
-            yes_prob_sum = probs[yes_mask].sum()
-            no_prob_sum = probs[no_mask].sum()
-            
-            total = yes_prob_sum + no_prob_sum
-
-            if total == 0.0:
-                yes_cond_prob = 0.0
-            else:
-                yes_cond_prob = yes_prob_sum / total
-    else:
-        # log_prob cannot be derived here. Return 0.0.
-        # TODO
-        yes_cond_prob = 0.0
-
-    return yes_cond_prob
-
 
 # -------------------------------------Reward Computation Utils---------------------------------------
 def is_symmetric_matrix(matrix: np.ndarray) -> bool:
