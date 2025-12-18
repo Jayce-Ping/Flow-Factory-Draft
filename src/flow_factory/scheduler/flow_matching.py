@@ -126,6 +126,16 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler):
             return self.noise_level
 
         return 0.0
+
+    def get_noise_level_for_sigma(self, sigma) -> float:
+        """
+            Return the noise level for a specific sigma.
+        """
+        sigma_index = (self.sigmas - sigma).abs().argmin().item()
+        if sigma_index in self.noise_steps:
+            return self.noise_level
+
+        return 0.0
     
     def set_seed(self, seed: int):
         """
@@ -158,12 +168,12 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler):
             )
             step_index = int(timestep)
             timestep = self.timesteps[step_index]
-            sigma = timestep / 1000
-            sigma_prev = self.timesteps[step_index + 1] / 1000
+            sigma = self.sigmas[step_index]
+            sigma_prev = self.sigmas[step_index + 1]
         elif isinstance(timestep, torch.Tensor):
             step_index = self.index_for_timestep(timestep)
-            sigma = timestep / 1000
-            sigma_prev = self.timesteps[step_index + 1] / 1000
+            sigma = self.sigmas[step_index]
+            sigma_prev = self.sigmas[step_index + 1]
 
         # 1. Numerical Preparation
         model_output = model_output.float()

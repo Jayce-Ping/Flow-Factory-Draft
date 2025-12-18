@@ -10,7 +10,6 @@ import torch.distributed as dist
 from PIL import Image
 import torch
 import numpy as np
-import openai
 from accelerate import Accelerator
 
 # ------------------------------------Random Utils---------------------------------------

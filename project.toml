@@ -44,7 +44,7 @@ dependencies = [
     "einops>=0.8.0",
     
     # --- Critical Fixes for Flux/T5 ---
-    "protobuf>=3.20.3",       # REQUIRED for T5 serialization
+    "protobuf>=6.33.2",       # REQUIRED for T5 serialization
     "sentencepiece>=0.2.0",   # REQUIRED for T5 tokenizer
 
     # --- Data Processing ---
@@ -82,8 +82,8 @@ nvidia = [
 ]
 
 [project.scripts]
+flow-factory-train = "flow_factory.cli:train_cli"
 ff-train = "flow_factory.cli:train_cli"
-ff-eval = "flow_factory.cli:eval_cli"
 
 [tool.setuptools.packages.find]
 where = ["src"]
