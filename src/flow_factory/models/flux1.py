@@ -20,18 +20,18 @@ class Flux1Adapter(BaseAdapter):
     
     def __init__(self, model_args: ModelArguments, training_args: TrainingArguments):
         super().__init__(model_args, training_args)
+
+        # Load pipeline
+        self.pipeline = FluxPipeline.from_pretrained(
+            self.model_args.model_name_or_path,
+            torch_dtype=torch.bfloat16 if self.training_args.mixed_precision == "bf16" else torch.float16,
+        )
         
         # Initialize Scheduler
         self.pipeline.scheduler = FlowMatchEulerDiscreteSDEScheduler(
             noise_level=training_args.noise_level,
             noise_steps=training_args.noise_steps,
             num_noise_steps=training_args.num_noise_steps,
-        )
-
-        # Load pipeline
-        self.pipeline = FluxPipeline.from_pretrained(
-            self.model_args.model_name_or_path,
-            torch_dtype=torch.bfloat16 if self.training_args.mixed_precision == "bf16" else torch.float16,
         )
         
         # Freeze non-trainable components
@@ -80,11 +80,13 @@ class Flux1Adapter(BaseAdapter):
     
     def encode_prompts(self, prompt: Union[str, List[str]], **kwargs) -> Dict[str, Any]:
         """Encode text prompts using the pipeline's text encoder."""
+
+        execution_device = self.pipeline.text_encoder.device
         
         prompt_embeds, pooled_prompt_embeds, text_ids = self.pipeline.encode_prompt(
             prompt=prompt,
-            prompt_2=None,
-            device=self.device,
+            prompt_2=prompt,
+            device=execution_device,
         )
         
         prompt_ids = self.pipeline.tokenizer_2(
@@ -93,13 +95,12 @@ class Flux1Adapter(BaseAdapter):
             max_length=512,
             truncation=True,
             return_tensors="pt",
-        ).input_ids.to(self.device)
+        ).input_ids.to(execution_device)
                 
         return {
             'prompt_ids': prompt_ids,
             'prompt_embeds': prompt_embeds,
             'pooled_prompt_embeds': pooled_prompt_embeds,
-            'text_ids': text_ids,
         }
     
     def encode_images(self, images: Union[torch.Tensor, List[torch.Tensor]], **kwargs) -> torch.Tensor:
@@ -344,4 +345,4 @@ class Flux1Adapter(BaseAdapter):
     @property
     def device(self) -> torch.device:
         """Get model device."""
-        return next(self.pipeline.transformer.parameters()).device
+        return self.pipeline.transformer.device

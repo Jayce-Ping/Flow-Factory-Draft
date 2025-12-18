@@ -1,3 +1,8 @@
+# Environment Configuration
+launcher: "accelerate"  # Options: accelerate, torchrun
+config_path: config/accelerate_configs/deepspeed_zero2.yaml  # Path to distributed config file (optional)
+num_processes: 1
+
 # Data Configuration
 data:
   dataset_dir: "dataset/t2is"  # Path to dataset folder

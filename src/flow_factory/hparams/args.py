@@ -5,7 +5,7 @@ Supports loading from YAML files with nested structure.
 """
 from __future__ import annotations
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Literal
 import yaml
 
 from .data_args import DataArguments
@@ -17,7 +17,14 @@ from .reward_args import RewardArguments
 @dataclass
 class Arguments:
     """Main arguments class encapsulating all configurations."""
-    
+    launcher : Literal['accelerate', 'torchrun'] = field(
+        default='accelerate',
+        metadata={"help": "Distributed launcher to use."},
+    )
+    config_path: str | None = field(
+        default=None,
+        metadata={"help": "Path to distributed configuration file (e.g., deepspeed config)."},
+    )
     data_args: DataArguments = field(
         default_factory=DataArguments,
         metadata={"help": "Arguments for data configuration."},
