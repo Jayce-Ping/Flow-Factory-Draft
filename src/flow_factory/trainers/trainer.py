@@ -37,6 +37,10 @@ class BaseTrainer(ABC):
         self._initialization()
 
     @property
+    def transformer(self) -> nn.Module:
+        return self.adapter.transformer
+
+    @property
     def unwrapped_adapter(self) -> BaseAdapter:
         return self.accelerator.unwrap_model(self.adapter)
     
@@ -84,14 +88,14 @@ class BaseTrainer(ABC):
         # Prepare everything with accelerator
         # Here, `self.dataloader` is not prepared since it has been handled with DistributedKRepeatSampler
         if self.test_dataloader is not None:
-            self.adapter, self.optimizer, self.test_dataloader = self.accelerator.prepare(
-                self.adapter,
+            self.adapter.transformer, self.optimizer, self.test_dataloader = self.accelerator.prepare(
+                self.adapter.transformer,
                 self.optimizer,
                 self.test_dataloader,
             )
         else:
-            self.adapter, self.optimizer = self.accelerator.prepare(
-                self.adapter,
+            self.adapter.transformer, self.optimizer = self.accelerator.prepare(
+                self.adapter.transformer,
                 self.optimizer,
             )
 
@@ -115,6 +119,7 @@ class BaseTrainer(ABC):
 
     def save_checkpoint(self, path: str):
         """Save trainer state to a specific path."""
+        os.makedirs(path, exist_ok=True)
         self.adapter.save_checkpoint(path)
 
     def load_checkpoint(self, path: str):

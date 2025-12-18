@@ -127,8 +127,8 @@ class Flux1Adapter(BaseAdapter):
     def inference(
         self,
         prompt: Optional[Union[str, List[str]]] = None,
-        prompt_embeds: Optional[torch.FloatTensor] = None,
-        pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+        prompt_embeds: Optional[torch.Tensor] = None,
+        pooled_prompt_embeds: Optional[torch.Tensor] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: Optional[int] = None,
@@ -155,6 +155,8 @@ class Flux1Adapter(BaseAdapter):
             prompt_ids = encoded['prompt_ids']
             text_ids = encoded['text_ids']
         else:
+            prompt_embeds = prompt_embeds.to(device)
+            pooled_prompt_embeds = pooled_prompt_embeds.to(device)
             text_ids = torch.zeros(batch_size, prompt_embeds.shape[1], 3).to(
                 device=device, dtype=prompt_embeds.dtype
             )
