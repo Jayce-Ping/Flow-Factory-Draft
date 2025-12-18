@@ -59,7 +59,7 @@ def train_cli():
         subprocess.run([
             "accelerate", "launch",
             "--num_processes", str(gpu_count),
-            "--main_process_port", config.main_process_port
+            "--main_process_port", str(config.main_process_port),
             sys.argv[0],  # Call this same script
             *sys.argv[1:] # Pass the same config and args
         ])
