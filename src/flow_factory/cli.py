@@ -44,7 +44,6 @@ def run_distributed_supervisor(config, args: List[str]):
     logger.info(f"🚀 [Flow-Factory Supervisor] Launching distributed training with mode: {config.launcher.upper()}")
     
     cmd = []
-    print(config)
 
     # --- 1. Infrastructure Layer ---
     if config.launcher == "accelerate":
