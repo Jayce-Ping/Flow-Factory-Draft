@@ -5,9 +5,10 @@ from datasets import load_dataset
 from PIL import Image
 from collections import defaultdict
 from typing import Optional, Dict, Any, Callable, List, Protocol, Union
-from logging import getLogger
+import logging
 
-logger = getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')
+logger = logging.getLogger(__name__)
 
 class TextEncodeCallable(Protocol):
     def __call__(self, texts: Union[str, List[str]], **kwargs: Any) -> Dict[str, Any]:

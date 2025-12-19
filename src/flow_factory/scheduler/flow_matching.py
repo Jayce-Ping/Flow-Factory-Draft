@@ -1,19 +1,19 @@
 from typing import Any, Dict, List, Optional, Union, Callable, Tuple, Literal
 from argparse import Namespace
+import logging
+from dataclasses import dataclass
 import math
+
 import torch
 import numpy as np
-from dataclasses import dataclass
-
 from diffusers.utils.outputs import BaseOutput
 from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import retrieve_timesteps
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from ..utils.base import to_broadcast_tensor
 
-import logging
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')
 logger = logging.getLogger(__name__)
 
 def calculate_shift(

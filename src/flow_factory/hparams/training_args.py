@@ -8,7 +8,7 @@ import logging
 import torch.distributed as dist
 from datetime import datetime
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')
 logger = logging.getLogger(__name__)
 
 
@@ -231,10 +231,6 @@ class TrainingArguments:
 
         if self.eval_args.seed is None:
             self.eval_args.seed = self.seed
-
-        # If run_name is not provided, set it to a timestamp
-        if self.run_name is None:
-            self.run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         # Expand path to user's path
         self.save_dir = os.path.expanduser(self.save_dir)

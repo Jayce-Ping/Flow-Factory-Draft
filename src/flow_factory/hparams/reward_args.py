@@ -3,12 +3,13 @@ import os
 import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, Optional, Type
-from logging import getLogger
+import logging
 import torch
 
 from ..rewards.registry import get_reward_model_class
 
-logger = getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')
+logger = logging.getLogger(__name__)
 
 def get_world_size() -> int:
     # Standard PyTorch/Accelerate/DDP variable
