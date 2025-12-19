@@ -30,26 +30,26 @@ dependencies = [
     "torchaudio>=2.4.0",
     
     # --- Hugging Face Ecosystem ---
-    "transformers>=4.44.0",
-    "diffusers>=0.30.0",
-    "accelerate>=0.33.0",
-    "peft>=0.12.0",
-    "datasets>=2.20.0",
-    "tokenizers>=0.19.0",
-    "huggingface-hub>=0.24.0",
+    "transformers>=4.57.1",
+    "diffusers>=0.35.2",
+    "accelerate>=1.11.0",
+    "peft>=0.17.0",
+    "datasets>=3.3.2",
+    "tokenizers>=0.22.1",
+    "huggingface-hub>=0.35.3",
 
     # --- Optimization & Training ---
-    "deepspeed>=0.14.0",      # For ZeRO stage optimization
-    "bitsandbytes>=0.43.0",   # For 8-bit/4-bit quantization
+    "deepspeed==0.17.4",      # For ZeRO stage optimization
+    "bitsandbytes>=0.45.3",   # For 8-bit/4-bit quantization
     "einops>=0.8.0",
     
     # --- Critical Fixes for Flux/T5 ---
     "protobuf>=6.33.2",       # REQUIRED for T5 serialization
-    "sentencepiece>=0.2.0",   # REQUIRED for T5 tokenizer
+    "sentencepiece>=0.2.1",   # REQUIRED for T5 tokenizer
 
     # --- Data Processing ---
-    "numpy>=1.26.0",
-    "pandas>=2.2.0",
+    "numpy>=1.26.4",
+    "pandas>=2.0.0",
     "pillow>=10.4.0",
     "scipy>=1.13.0",
     "scikit-learn>=1.5.0",

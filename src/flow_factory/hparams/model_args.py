@@ -4,6 +4,7 @@ import math
 import yaml
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, Optional, Union, List
+from .abc import HParams
 import logging
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')

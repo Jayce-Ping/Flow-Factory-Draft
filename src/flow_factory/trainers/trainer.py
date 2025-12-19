@@ -60,7 +60,7 @@ class BaseTrainer(ABC):
     def _init_reward_model(self) -> BaseRewardModel:
         """Initialize reward model from configuration."""
         reward_model_cls = self.reward_args.reward_model_cls
-        self.reward_model = reward_model_cls(self.reward_args)
+        self.reward_model = reward_model_cls(config=self.config, accelerator=self.accelerator)
         return self.reward_model
 
     def _init_dataloader(self) -> Tuple[DataLoader, Union[None, DataLoader]]:
@@ -132,12 +132,12 @@ class BaseTrainer(ABC):
 
     @abstractmethod
     def compute_loss(self):
-        """Main training loop."""
+        """Compute loss for a training step."""
         pass
 
     @abstractmethod
     def evaluate(self):
-        """Evaluation loop."""
+        """Evaluation for one epoch."""
         pass
 
     def save_checkpoint(self, path: str):

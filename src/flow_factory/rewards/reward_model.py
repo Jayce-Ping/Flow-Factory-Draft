@@ -11,9 +11,10 @@ import numpy as np
 from dataclasses import dataclass
 from PIL import Image
 
+from accelerate import Accelerator
 from diffusers.utils.outputs import BaseOutput
-from ..hparams.reward_args import RewardArguments
-
+from ..hparams import *
+from deepspeed.runtime.zero.partition_parameters import GatheredParameters
 
 @dataclass
 class RewardModelOutput(BaseOutput):
@@ -35,17 +36,20 @@ class BaseRewardModel(ABC):
     All reward models should inherit from this class and implement
     the __call__ method to compute rewards.
     """
-    
-    def __init__(self, reward_args: RewardArguments):
+    model : nn.Module = None
+    def __init__(self, config: Arguments, accelerator : Accelerator):
         """
         Initialize reward model.
         
         Args:
             reward_args: Reward model configuration
         """
+        self.accelerator = accelerator
+        reward_args = config.reward_args
         self.reward_args = reward_args
-        self.device = reward_args.torch_device
-        self.dtype = reward_args.torch_dtype
+        self.device = reward_args.device
+        self.dtype = reward_args.dtype
+        print("The deepspeed stage is:", self.accelerator.state.deepspeed_plugin.zero_stage if self.accelerator.state.deepspeed_plugin else "No Deepspeed")
 
     @abstractmethod
     def __call__(self, **inputs) -> Union[RewardModelOutput, torch.Tensor, np.ndarray, List[float]]:

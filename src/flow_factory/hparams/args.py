@@ -4,10 +4,11 @@ Main arguments class that encapsulates all configurations.
 Supports loading from YAML files with nested structure.
 """
 from __future__ import annotations
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Literal
 import yaml
 
+from .abc import HParams
 from .data_args import DataArguments
 from .model_args import ModelArguments
 from .training_args import TrainingArguments
@@ -15,7 +16,7 @@ from .reward_args import RewardArguments
 
 
 @dataclass
-class Arguments:
+class Arguments(HParams):
     """Main arguments class encapsulating all configurations."""
     launcher : Literal['accelerate'] = field(
         default='accelerate',
@@ -50,9 +51,21 @@ class Arguments:
         metadata={"help": "Arguments for reward model configuration."},
     )
     
+
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return asdict(self)
+        result = {}
+        
+        for f in fields(self):
+            value = getattr(self, f.name)
+            if isinstance(value, HParams):
+                # Remove '_args' suffix for nested configs
+                key = f.name.replace('_args', '')
+                result[key] = value.to_dict()
+            else:
+                result[f.name] = value
+        
+        return result
 
     @classmethod
     def from_dict(cls, args_dict: dict[str, Any]) -> Arguments:

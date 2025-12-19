@@ -1,15 +1,16 @@
+from accelerate import Accelerator
 from transformers import CLIPProcessor, CLIPModel
 from PIL import Image
 import torch
 
 from .reward_model import BaseRewardModel, RewardModelOutput
-from ..hparams.reward_args import RewardArguments
+from ..hparams import *
 from .registry import register_reward_model
 
 @register_reward_model('PickScore')
 class PickScoreRewardModel(BaseRewardModel):
-    def __init__(self, reward_args : RewardArguments):
-        super().__init__(reward_args)
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
         processor_path = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
         model_path = "yuvalkirstain/PickScore_v1"
         self.processor = CLIPProcessor.from_pretrained(processor_path)

@@ -15,7 +15,7 @@ tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from .trainer import BaseTrainer
 from ..models.adapter import BaseSample
-from ..rewards.reward_model import BaseRewardModel
+
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')
 logger = logging.getLogger("flow_factory.train")
