@@ -5,7 +5,7 @@ import logging
 from .hparams.args import Arguments
 from .trainers.loader import load_trainer
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')
 logger = logging.getLogger("flow_factory.train")
 
 

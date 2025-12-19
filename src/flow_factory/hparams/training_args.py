@@ -188,8 +188,8 @@ class TrainingArguments:
         metadata={"help": "Directory to save logs and checkpoints. None for no saving."},
     )
 
-    run_name : str = field(
-        default_factory=lambda: datetime.now().strftime("%Y%m%d_%H%M%S"),
+    run_name : Optional[str] = field(
+        default=None,
         metadata={"help": "Name of the training run. Defaults to a timestamp."},
     )
 
@@ -231,6 +231,9 @@ class TrainingArguments:
 
         if self.eval_args.seed is None:
             self.eval_args.seed = self.seed
+
+        if self.run_name is None:
+            self.run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         # Expand path to user's path
         self.save_dir = os.path.expanduser(self.save_dir)
