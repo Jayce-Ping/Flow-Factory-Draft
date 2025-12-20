@@ -72,6 +72,7 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler):
         noise_steps : Optional[Union[int, list, torch.Tensor]] = None,
         num_noise_steps : Optional[int] = None,
         seed : int = 42,
+        sde_type : Literal["Flow-SDE", 'Dance-SDE', 'CPS'] = "Flow-SDE",
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -86,6 +87,20 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler):
         self.noise_steps = torch.tensor(noise_steps, dtype=torch.int64)
         self.num_noise_steps = num_noise_steps if num_noise_steps is not None else len(noise_steps) # Default to all noise steps
         self.seed = seed
+        self.sde_type = sde_type
+        self._is_eval = False
+
+    @property
+    def is_eval(self):
+        return self._is_eval
+
+    def eval(self):
+        """Apply ODE Sampling with noise_level = 0"""
+        self._is_eval = True
+
+    def train(self, *args, **kwargs):
+        """Apply SDE Sampling"""
+        self._is_eval = False
 
     @property
     def current_noise_steps(self) -> torch.Tensor:
@@ -139,7 +154,7 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler):
     
     def set_seed(self, seed: int):
         """
-            Set the random seed for noise generation.
+            Set the random seed for noise steps.
         """
         self.seed = seed
 
@@ -150,9 +165,10 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler):
         sample: torch.FloatTensor,
         prev_sample: Optional[torch.FloatTensor] = None,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        noise_level : Optional[Union[int, float, torch.Tensor]] = None,
         return_log_prob: bool = False,
         return_dict: bool = True,
-        sde_type: Literal["Flow-SDE", 'Dance-SDE', 'CPS'] = 'Flow-SDE',
+        sde_type : Optional[Literal['Flow-SDE', 'Dance-SDE', 'CPS']] = None,
         sigma_max: Optional[float] = 0.98,
     ):
         if (
@@ -182,13 +198,15 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler):
             prev_sample = prev_sample.float()
 
         # 2. Prepare variables
-        noise_level = self.get_noise_level_for_timestep(timestep)
+        noise_level = noise_level or (
+            0.0 if self.is_eval else self.get_noise_level_for_timestep(timestep)
+        )
         noise_level = to_broadcast_tensor(noise_level, sample)
         sigma = to_broadcast_tensor(sigma, sample)
         sigma_prev = to_broadcast_tensor(sigma_prev, sample)
         dt = sigma_prev - sigma # dt is negative, (batch_size, 1, 1)
 
-
+        sde_type = sde_type or self.sde_type
         # 3. Compute next sample
         if sde_type == "Flow-SDE":
             # FlowGRPO sde

@@ -20,7 +20,7 @@ model:
   model_name_or_path: "black-forest-labs/FLUX.1-dev"  # HuggingFace model ID or local path
   model_type: "flux1"  # Options: flux1, flux1-kontext, flux2, qwenimage, qwenimage-edit
   resume_path: null # Path to load previous checkpoint/lora adapter
-  master_weight_dtype: 'float32' # Master weight dtype for full-paramter fine-tuning, options are ["float16", "bfloat16", "float32"]
+  master_weight_dtype: 'float32' # Weight dtype for trainable parameters when full-paramter fine-tuning, options are ["float16", "bfloat16", "float32"]
 
 # Training Configuration
 train:
@@ -35,9 +35,9 @@ train:
   
   # Batch and sampling
   per_device_batch_size: 1  # Batch size per device
-  group_size: 4  # Group size for GRPO sampling
+  group_size: 16  # Group size for GRPO sampling
   global_std: true  # Use global std for advantage normalization
-  unique_sample_num_per_epoch: 4  # Unique samples per group
+  unique_sample_num_per_epoch: 40  # Unique samples per group
   gradient_step_per_epoch: 2  # Gradient steps per epoch
   
   # Clipping
@@ -67,7 +67,7 @@ train:
     seed: null  # Eval seed (defaults to training seed)
     guidance_scale: 3.5  # Guidance scale for sampling
     num_timesteps: 20  # Number of eval timesteps
-    eval_freq: 0  # Eval frequency in epochs (0 to disable)
+    eval_freq: 10  # Eval frequency in epochs (0 to disable)
 
 # Reward Model Configuration
 reward:

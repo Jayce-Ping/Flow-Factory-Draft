@@ -29,17 +29,10 @@ class Flux1Adapter(BaseAdapter):
         super().__init__(config)
 
         # Load pipeline
-        self.pipeline = FluxPipeline.from_pretrained(
-            self.model_args.model_name_or_path,
-            low_cpu_mem_usage=False
-        )
+        self.pipeline = self.load_pipeline()
         
         # Initialize Scheduler
-        self.pipeline.scheduler = FlowMatchEulerDiscreteSDEScheduler(
-            noise_level=self.training_args.noise_level,
-            noise_steps=self.training_args.noise_steps,
-            num_noise_steps=self.training_args.num_noise_steps,
-        )
+        self.pipeline.scheduler = self.load_scheduler()
 
         # Freeze non-trainable components
         self._freeze_components()
@@ -55,8 +48,13 @@ class Flux1Adapter(BaseAdapter):
         if self.training_args.enable_gradient_checkpointing:
             self.enable_gradient_checkpointing()
 
-        self.log_trainable_parameters()
     
+    def load_pipeline(self) -> FluxPipeline:
+        return FluxPipeline.from_pretrained(
+            self.model_args.model_name_or_path,
+            low_cpu_mem_usage=False
+        )
+
     @property
     def default_target_modules(self) -> List[str]:
         return [
@@ -198,7 +196,7 @@ class Flux1Adapter(BaseAdapter):
                 timestep=timestep,
                 sample=latents,
                 return_log_prob=compute_log_probs,
-                sde_type=self.training_args.sde_type
+                sde_type=self.training_args.sde_type,
             )
             
             latents = output.prev_sample.to(prompt_embeds.dtype)
@@ -286,51 +284,3 @@ class Flux1Adapter(BaseAdapter):
         )
         
         return output
-
-    # ======================== Utilities ========================
-
-    def train(self, mode: bool = True) -> "Flux1Adapter":
-        super().train(mode)
-        self.pipeline.transformer.train(mode)
-        return self
-
-    def eval(self):
-        """Set model to evaluation mode."""
-        super().eval()
-        self.pipeline.transformer.eval()
-
-    @property
-    def device(self) -> torch.device:
-        """Get model device."""
-        return self.pipeline.transformer.device
-
-    def log_trainable_parameters(self):
-        """Log trainable parameter statistics for transformer."""
-        total_params = 0
-        trainable_params = 0
-        total_size_bytes = 0
-        trainable_size_bytes = 0
-        
-        for param in self.transformer.parameters():
-            param_count = param.numel()
-            param_size = param.element_size() * param_count  # bytes
-            
-            total_params += param_count
-            total_size_bytes += param_size
-            
-            if param.requires_grad:
-                trainable_params += param_count
-                trainable_size_bytes += param_size
-        
-        # Convert to GB
-        total_size_gb = total_size_bytes / (1024 ** 3)
-        trainable_size_gb = trainable_size_bytes / (1024 ** 3)
-        
-        trainable_percentage = 100 * trainable_params / total_params if total_params > 0 else 0
-        
-        logger.info("=" * 70)
-        logger.info("Transformer Trainable Parameters:")
-        logger.info(f"  Total parameters:      {total_params:>15,d} ({total_size_gb:>6.2f} GB)")
-        logger.info(f"  Trainable parameters:  {trainable_params:>15,d} ({trainable_size_gb:>6.2f} GB)")
-        logger.info(f"  Trainable percentage:  {trainable_percentage:>14.2f}%")
-        logger.info("=" * 70)

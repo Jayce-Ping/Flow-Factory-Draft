@@ -57,14 +57,48 @@ class BaseAdapter(nn.Module, ABC):
     
     pipeline: DiffusionPipeline
 
-    def __init__(
-            self,
-            config: Arguments,
-        ):
+    def __init__(self, config: Arguments):
         super().__init__()
         self.config = config
         self.model_args = config.model_args
         self.training_args = config.training_args
+
+        # Load pipeline and scheduler (delegated to subclasses)
+        self.pipeline = self.load_pipeline()
+        self.pipeline.scheduler = self.load_scheduler()
+
+        # Freeze non-trainable components
+        self._freeze_components()
+
+        # Load checkpoint or apply LoRA
+        if self.model_args.resume_path:
+            self.load_checkpoint(self.model_args.resume_path)
+        elif self.model_args.finetune_type == 'lora':
+            self.apply_lora()
+
+        # Set precision
+        self._mix_precision()
+        self._set_trainable_params_dtype()
+
+        # Enable gradient checkpointing if needed
+        if self.training_args.enable_gradient_checkpointing:
+            self.enable_gradient_checkpointing()
+        
+
+    @abstractmethod
+    def load_pipeline(self) -> DiffusionPipeline:
+        """Load and return the diffusion pipeline. Must be implemented by subclasses."""
+        pass
+
+    def load_scheduler(self) -> FlowMatchEulerDiscreteSDEScheduler:
+        """Load and return the scheduler."""
+        return FlowMatchEulerDiscreteSDEScheduler(
+            noise_level=self.training_args.noise_level,
+            noise_steps=self.training_args.noise_steps,
+            num_noise_steps=self.training_args.num_noise_steps,
+            seed=self.training_args.seed,
+            sde_type=self.training_args.sde_type,
+        )
 
     @property
     def text_encoders(self) -> List[torch.nn.Module]:
@@ -100,14 +134,37 @@ class BaseAdapter(nn.Module, ABC):
     @property
     def scheduler(self) -> FlowMatchEulerDiscreteSDEScheduler:
         return self.pipeline.scheduler
+
+    @property
+    def device(self) -> torch.device:
+        return self.transformer.device
     
     def eval(self):
         """Set model to evaluation mode."""
         super().eval()
+        
+        # Set all components to eval mode
+        for encoder in self.text_encoders:
+            encoder.eval()
+        self.vae.eval()
+
+        self.transformer.eval()
+
+        if hasattr(self.scheduler, 'eval'):
+            self.scheduler.eval()
 
     def train(self, mode: bool = True):
         """Set model to training mode."""
         super().train(mode)
+        
+        # Set all components to training mode
+        for encoder in self.text_encoders:
+            encoder.train(mode)
+        self.vae.train(mode)
+        self.transformer.train(mode)
+
+        if hasattr(self.scheduler, 'train'):
+            self.scheduler.train(mode=mode)
 
     @property
     def default_target_modules(self) -> List[str]:
@@ -213,11 +270,6 @@ class BaseAdapter(nn.Module, ABC):
             model_to_save.to(dtype).save_pretrained(path, max_shard_size=max_shard_size)
 
         logger.info(f"Model shards saved successfully to {path}")
-    
-    @abstractmethod
-    def _freeze_components(self):
-        """Encapsulate freezing logic for cleanliness."""
-        pass
 
     def _freeze_text_encoders(self):
         """Freeze all text encoders."""
@@ -405,3 +457,34 @@ class BaseAdapter(nn.Module, ABC):
             return list(filter(lambda p: p.requires_grad, module.parameters()))
         else:
             raise ValueError(f"Pipeline does not have module named {target_module}")
+
+    def log_trainable_parameters(self):
+        """Log trainable parameter statistics for transformer."""
+        total_params = 0
+        trainable_params = 0
+        total_size_bytes = 0
+        trainable_size_bytes = 0
+        
+        for param in self.transformer.parameters():
+            param_count = param.numel()
+            param_size = param.element_size() * param_count  # bytes
+            
+            total_params += param_count
+            total_size_bytes += param_size
+            
+            if param.requires_grad:
+                trainable_params += param_count
+                trainable_size_bytes += param_size
+        
+        # Convert to GB
+        total_size_gb = total_size_bytes / (1024 ** 3)
+        trainable_size_gb = trainable_size_bytes / (1024 ** 3)
+        
+        trainable_percentage = 100 * trainable_params / total_params if total_params > 0 else 0
+        
+        logger.info("=" * 70)
+        logger.info("Transformer Trainable Parameters:")
+        logger.info(f"  Total parameters:      {total_params:>15,d} ({total_size_gb:>6.2f} GB)")
+        logger.info(f"  Trainable parameters:  {trainable_params:>15,d} ({trainable_size_gb:>6.2f} GB)")
+        logger.info(f"  Trainable percentage:  {trainable_percentage:>14.2f}%")
+        logger.info("=" * 70)

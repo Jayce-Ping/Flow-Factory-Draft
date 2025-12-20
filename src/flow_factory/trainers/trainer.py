@@ -38,17 +38,17 @@ class BaseTrainer(ABC):
         self.adapter = adapter
         self.epoch = 0
 
-        self.memory_profiler = MemoryProfiler(self.accelerator, enable_tensor_accumulation=True, log_file='./memory_log.log')
-        self.memory_profiler.register_model(self.adapter.transformer, 'adapter_transformer')
-        self.memory_profiler.register_model(self.adapter.pipeline.text_encoder_2, 'adapter_text_encoder_2')
-        self._initialization()
-        self.memory_profiler.snapshot("after_init")
-
         self.autocast = partial(
             torch.autocast,
             device_type=accelerator.device.type,
             dtype=torch.float16 if accelerator.mixed_precision == "fp16" else torch.bfloat16
         )
+
+        self._initialization()
+
+        if self.accelerator.is_local_main_process:
+            self.adapter.log_trainable_parameters()
+
 
     @property
     def transformer(self) -> nn.Module:
@@ -95,15 +95,9 @@ class BaseTrainer(ABC):
 
     def _initialization(self):
         # Init dataloader and optimizer
-        self.memory_profiler.snapshot("before_init")
         self.adapter.on_load(self.accelerator.device)
-        self.memory_profiler.snapshot("before_dataloader_init")
         self.dataloader, self.test_dataloader = self._init_dataloader()
-        self.memory_profiler.snapshot("before_optimizer_init")
         self.optimizer = self._init_optimizer()
-        self.memory_profiler.track_optimizer(self.optimizer)
-        self.memory_profiler.snapshot("after_optimizer_init")
-        self.memory_profiler.snapshot("before_accelerator_prepare")
         # Prepare everything with accelerator
         # Here, `self.dataloader` is not prepared since it has been handled with DistributedKRepeatSampler
         to_prepare = [self.adapter.transformer, self.optimizer, self.test_dataloader]
@@ -113,14 +107,11 @@ class BaseTrainer(ABC):
         if len(prepared) > 2:
             self.test_dataloader = prepared[2]
 
-        self.memory_profiler.snapshot("after_accelerator_prepare")
         # Load Vae for image decoding
         self.adapter.on_load_vae(self.accelerator.device)
-        self.memory_profiler.snapshot("after_vae_load")
         
         # Initialize reward model
         self._init_reward_model()
-        self.memory_profiler.snapshot("after_reward_model_init")
 
     @abstractmethod
     def run(self):
