@@ -5,6 +5,7 @@ import numpy as np
 from PIL import Image
 from typing import Any, Dict, List, Union, Optional
 from dataclasses import dataclass, is_dataclass, asdict
+from ..models.adapter import BaseSample
 
 @dataclass
 class LogImage:
@@ -47,7 +48,35 @@ class LogFormatter:
         return clean_data
 
     @classmethod
+    def _process_base_sample(cls, samples: List[BaseSample]) -> List[Union[LogImage, LogVideo]]:
+        results = []
+        for sample in samples:
+            caption_parts = []
+            if 'reward' in sample.extra_kwargs:
+                caption_parts.append(f"{sample.extra_kwargs['reward']:.2f}")
+            if sample.prompt:
+                caption_parts.append(sample.prompt[:50] + "..." if len(sample.prompt) > 50 else sample.prompt)
+            
+            final_caption = " | ".join(caption_parts)
+
+            if hasattr(sample, 'image') and sample.image is not None:
+                results.append(LogImage(sample.image, caption=final_caption))
+            
+            # For future extension to videos
+            # if hasattr(sample, 'video') and sample.video is not None:
+            #     results.append(LogVideo(sample.video, caption=final_caption))
+
+        return results
+        
+    @classmethod
     def _process_value(cls, value: Any) -> Any:
+        """Processes a single value according to the formatting rules."""
+        # Rule 0: BaseSample or List of BaseSample
+        if isinstance(value, BaseSample):
+            value = [value]
+        if cls._is_base_sample_collection(value):
+            return cls._process_base_sample(value)
+
         # Rule 1: PIL Image
         if isinstance(value, Image.Image):
             return LogImage(value)
@@ -56,10 +85,11 @@ class LogFormatter:
         if isinstance(value, str):
             if os.path.exists(value):
                 ext = os.path.splitext(value)[1].lower()
+                file_name = os.path.basename(value)
                 if ext in cls.IMG_EXTENSIONS:
-                    return LogImage(value)
+                    return LogImage(value, caption=file_name)
                 if ext in cls.VID_EXTENSIONS:
-                    return LogVideo(value)
+                    return LogVideo(value, caption=file_name)
             # If string is not a path or file doesn't exist, log as string text
             return value
 
@@ -73,6 +103,15 @@ class LogFormatter:
                  return cls._compute_mean(value)
 
         return value
+
+    @classmethod
+    def _is_base_sample_collection(cls, value: Any) -> bool:
+        """Checks if value is a list/tuple of BaseSample."""
+        if isinstance(value, (list, tuple)):
+            if len(value) == 0: return False
+            first = value[0]
+            return isinstance(first, BaseSample)
+        return False
 
     @classmethod
     def _is_numerical_collection(cls, value: Any) -> bool:

@@ -123,6 +123,13 @@ class GRPOTrainer(BaseTrainer):
         # Gather across processes
         gathered_prompt_ids = self.accelerator.gather(prompt_ids).cpu().numpy()
         gathered_rewards = self.accelerator.gather(rewards).cpu().numpy()
+        self.logger.log_data(
+            {
+                'train/reward_mean': np.mean(gathered_rewards),
+                'train/reward_std': np.std(gathered_rewards),
+            },
+            step=self.epoch,
+        )
 
         # Compute advantages
         _, group_indices = np.unique(gathered_prompt_ids, axis=0, return_inverse=True)
@@ -232,7 +239,7 @@ class GRPOTrainer(BaseTrainer):
         self.adapter.eval()
 
         with self.adapter.use_ema_parameters():
-            all_samples = []
+            all_samples : List[BaseSample] = []
             
             for batch in tqdm(
                 self.test_dataloader,
@@ -250,6 +257,14 @@ class GRPOTrainer(BaseTrainer):
             
             # Log statistics
             if self.accelerator.is_main_process:
-                avg_reward = np.mean(gathered_rewards)
-                std_reward = np.std(gathered_rewards)
-                print(f"Evaluation - Avg Reward: {avg_reward:.4f}, Std Reward: {std_reward:.4f}")
+                for sample, reward in zip(all_samples, gathered_rewards):
+                    sample.extra_kwargs['reward'] = reward
+                self.logger.log_data(
+                    {
+                        'eval/reward': np.mean(gathered_rewards),
+                        'eval/reward_std': np.std(gathered_rewards),
+                        'eval/samples' : all_samples,
+                    },
+                    step=self.epoch,
+                )
+            self.accelerator.wait_for_everyone()

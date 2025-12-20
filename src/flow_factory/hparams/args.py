@@ -43,6 +43,10 @@ class Arguments(ArgABC):
         default='Flow-Factory',
         metadata={"help": "Project name for logging platforms."},
     )
+    logging_backend : Literal['wandb', 'swanlab', 'none'] = field(
+        default='none',
+        metadata={"help": "Logging backend to use."},
+    )
     data_args: DataArguments = field(
         default_factory=DataArguments,
         metadata={"help": "Arguments for data configuration."},

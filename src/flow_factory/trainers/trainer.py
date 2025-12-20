@@ -42,6 +42,7 @@ class BaseTrainer(ABC):
         )
 
         self._initialization()
+        self._init_logging_backend()
 
         if self.accelerator.is_local_main_process:
             self.adapter.log_trainable_parameters()
@@ -55,6 +56,17 @@ class BaseTrainer(ABC):
     def unwrapped_transformer(self) -> BaseAdapter:
         return self.accelerator.unwrap_model(self.adapter.transformer)
     
+    def _init_logging_backend(self):
+        """Initialize logging backend if specified."""
+        if self.config.logging_backend == 'wandb':
+            from ..logger import WandbLogger
+            self.logger = WandbLogger(config=self.config)
+        elif self.config.logging_backend == 'swanlab':
+            from ..logger import SwanlabLogger
+            self.logger = SwanlabLogger(config=self.config)
+        else:
+            self.logger = None
+
     def _init_reward_model(self) -> BaseRewardModel:
         """Initialize reward model from configuration."""
         reward_model_cls = self.reward_args.reward_model_cls
