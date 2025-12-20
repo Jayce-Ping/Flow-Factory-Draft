@@ -63,6 +63,9 @@ class BaseTrainer(ABC):
         return self.accelerator.unwrap_model(self.adapter.transformer)
     
     def _init_logging_backend(self):
+        if not self.accelerator.is_main_process:
+            self.logger = None
+            return
         """Initialize logging backend if specified."""
         if self.config.logging_backend == 'wandb':
             from ..logger import WandbLogger
