@@ -171,49 +171,49 @@ class GRPOTrainer(BaseTrainer):
             position=0,
             disable=not self.accelerator.is_local_main_process,
         )):
-            num_timesteps = self.adapter.scheduler.current_noise_steps
-            for timestep_idx, timestep_index in enumerate(tqdm(
-                self.adapter.scheduler.current_noise_steps,
-                desc=f'Epoch {self.epoch} Timestep',
-                position=1,
-                leave=False,
-                disable=not self.accelerator.is_local_main_process,
-            )):
-                with self.accelerator.accumulate(self.adapter.transformer):
-                    # Get old log probs
-                    old_log_probs = torch.stack(
-                        [sample.log_probs[timestep_index] for sample in batch_samples],
-                        dim=0
-                    )
-
-                    with self.autocast():
-                        # Forward pass
-                        output = self.adapter.forward(
-                            batch_samples, 
-                            timestep_index=timestep_index, 
-                            return_log_prob=True
+            with self.accelerator.accumulate(self.adapter.transformer):
+                num_timesteps = len(self.adapter.scheduler.current_noise_steps)
+                for timestep_idx, timestep_index in enumerate(tqdm(
+                    self.adapter.scheduler.current_noise_steps,
+                    desc=f'Epoch {self.epoch} Timestep',
+                    position=1,
+                    leave=False,
+                    disable=not self.accelerator.is_local_main_process,
+                )):
+                        # Get old log probs
+                        old_log_probs = torch.stack(
+                            [sample.log_probs[timestep_index] for sample in batch_samples],
+                            dim=0
                         )
 
-                    # Clip advantages
-                    adv_clip_range = self.training_args.adv_clip_range         
-                    batch_advantages = torch.clamp(batch_advantages, adv_clip_range[0], adv_clip_range[1])
+                        with self.autocast():
+                            # Forward pass
+                            output = self.adapter.forward(
+                                batch_samples, 
+                                timestep_index=timestep_index, 
+                                return_log_prob=True
+                            )
 
-                    # PPO-style clipped loss
-                    ratio = torch.exp(output.log_prob - old_log_probs)
-                    ratio_clip_range = self.training_args.clip_range
+                        # Clip advantages
+                        adv_clip_range = self.training_args.adv_clip_range         
+                        batch_advantages = torch.clamp(batch_advantages, adv_clip_range[0], adv_clip_range[1])
 
-                    unclipped_loss = -batch_advantages * ratio
-                    clipped_loss = -batch_advantages * torch.clamp(ratio, ratio_clip_range[0], ratio_clip_range[1])
-                    policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+                        # PPO-style clipped loss
+                        ratio = torch.exp(output.log_prob - old_log_probs)
+                        ratio_clip_range = self.training_args.clip_range
 
-                    loss = policy_loss / num_timesteps # Normalize by timesteps.
-                    # Other normalization strategies:
-                    # 1. Temp-FlowGRPO
-                    # 2. GRPO-Guard
+                        unclipped_loss = -batch_advantages * ratio
+                        clipped_loss = -batch_advantages * torch.clamp(ratio, ratio_clip_range[0], ratio_clip_range[1])
+                        policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
 
-                    # Backward
-                    self.accelerator.backward(loss)
-                
+                        loss = policy_loss / num_timesteps # Normalize by timesteps.
+                        # Other normalization strategies:
+                        # 1. Temp-FlowGRPO
+                        # 2. GRPO-Guard
+
+                        # Backward
+                        self.accelerator.backward(loss)
+                    
                 if self.accelerator.sync_gradients:
                     self.accelerator.clip_grad_norm_(
                         self.adapter.get_trainable_parameters(),
