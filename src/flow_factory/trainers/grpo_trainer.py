@@ -226,7 +226,7 @@ class GRPOTrainer(BaseTrainer):
                         loss = policy_loss
                         loss_info['policy_loss'].append(policy_loss.detach().cpu().item())
                         loss_info['ratio'].append(ratio.detach().cpu().mean().item())
-                        loss_info['adv_mean'].append(batch_advantages.cpu().mean().item())
+                        loss_info['adv_mean'].append(batch_advantages.abs().cpu().mean().item())
                         # Other normalization strategies:
                         # 1. Temp-FlowGRPO
                         # 2. GRPO-Guard
