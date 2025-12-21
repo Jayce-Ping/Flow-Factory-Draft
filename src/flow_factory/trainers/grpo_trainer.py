@@ -80,7 +80,7 @@ class GRPOTrainer(BaseTrainer):
                     sample_batch = self.adapter.inference(**sample_kwargs)
             
             samples.extend(sample_batch)
-            
+
         self.adapter.transformer.train()
         return samples
 
@@ -134,6 +134,20 @@ class GRPOTrainer(BaseTrainer):
         gathered_prompt_ids = self.accelerator.gather(prompt_ids).cpu().numpy()
         gathered_rewards = self.accelerator.gather(rewards).cpu().numpy()
 
+
+        # 在 compute_advantages 中，gather 之前添加
+        local_size = len(samples)
+        local_indices = torch.arange(local_size, device=self.accelerator.device)
+        global_offset = self.accelerator.process_index * local_size
+        global_indices = local_indices + global_offset
+
+        # gather 之后添加
+        gathered_indices = self.accelerator.gather(global_indices).cpu().numpy()
+        expected_order = np.arange(len(gathered_indices))
+        print(f"Expected: {expected_order[:10]}")
+        print(f"Got:      {gathered_indices[:10]}")
+        print(f"Match: {np.array_equal(gathered_indices, expected_order)}")
+
         # Compute advantages
         unique_prompt_ids, group_indices = np.unique(gathered_prompt_ids, axis=0, return_inverse=True)
 
@@ -173,6 +187,28 @@ class GRPOTrainer(BaseTrainer):
     def compute_loss(self, samples: List[BaseSample]) -> None:
         """Main training loop: compute loss and update policy."""
         self.adapter.train()
+
+        # 在 compute_loss 开头添加
+        if self.accelerator.is_main_process and self.epoch == 0:
+            prompt_groups = defaultdict(list)
+            for i, sample in enumerate(samples):
+                prompt_groups[sample.prompt[:50]].append({
+                    'idx': i,
+                    'reward': sample.extra_kwargs.get('reward', 0),
+                    'advantage': advantages[i].item()
+                })
+            
+            for prompt, items in list(prompt_groups.items())[:2]:
+                print(f"\nPrompt: '{prompt}...'")
+                sorted_by_reward = sorted(items, key=lambda x: x['reward'])
+                for it in sorted_by_reward:
+                    print(f"  idx={it['idx']}: reward={it['reward']:.4f}, adv={it['advantage']:.4f}")
+                
+                # 检查单调性：reward 升序时 advantage 也应该升序
+                advs = [it['advantage'] for it in sorted_by_reward]
+                is_monotonic = all(advs[i] <= advs[i+1] for i in range(len(advs)-1))
+                print(f"  Advantages monotonic: {'✓' if is_monotonic else '✗ MISMATCH!'}")
+
         advantages = self.compute_advantages(samples)
 
         batched_samples = [

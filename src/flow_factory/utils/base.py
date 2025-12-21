@@ -42,6 +42,36 @@ def filter_kwargs(func: Callable, **kwargs: Any) -> dict[str, Any]:
     valid_keys = set(sig.parameters.keys())
     return {k: v for k, v in kwargs.items() if k in valid_keys}
 
+def split_kwargs(funcs: list[Callable], **kwargs: Any) -> list[dict[str, Any]]:
+    """
+    Split kwargs among multiple functions by their signatures.
+    Earlier functions have priority for overlapping params.
+    
+    Returns:
+        List of filtered kwargs dicts, one per function
+    """
+    results = []
+    remaining = kwargs.copy()
+    
+    for func in funcs:
+        sig = inspect.signature(func)
+        has_var_keyword = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD 
+            for p in sig.parameters.values()
+        )
+        
+        if has_var_keyword:
+            results.append(remaining.copy())
+        else:
+            valid_keys = set(sig.parameters.keys()) - {'self', 'args', 'kwargs'}
+            matched = {k: v for k, v in remaining.items() if k in valid_keys}
+            results.append(matched)
+            # Remove matched keys so they don't go to later functions
+            for k in matched:
+                remaining.pop(k, None)
+    
+    return results
+
 # ------------------------------------Random Utils---------------------------------------
 def create_generator(prompts : List[str], base_seed : int) -> List[torch.Generator]:
     generators = []
