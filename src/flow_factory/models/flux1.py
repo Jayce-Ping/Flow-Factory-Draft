@@ -173,8 +173,6 @@ class Flux1Adapter(BaseAdapter):
         # Denoising loop
         all_latents = [latents]
         all_log_probs = [] if compute_log_probs else None
-
-        print("Inference timesteps:", timesteps, 'num steps:', len(timesteps), "Scheduler noise steps", self.scheduler.current_noise_steps)
         
         for i, t in enumerate(timesteps):
             timestep = t.expand(batch_size).to(latents.dtype)
@@ -254,7 +252,6 @@ class Flux1Adapter(BaseAdapter):
         latents = torch.stack([s.all_latents[timestep_index] for s in samples], dim=0).to(device)
         next_latents = torch.stack([s.all_latents[timestep_index + 1] for s in samples], dim=0).to(device)
         timestep = torch.stack([s.timesteps[timestep_index] for s in samples], dim=0).to(device)
-        print("Forward timestep:", timestep, "index:", timestep_index)
         
         prompt_embeds = torch.stack([s.prompt_embeds for s in samples], dim=0).to(device)
         pooled_prompt_embeds = torch.stack([s.pooled_prompt_embeds for s in samples], dim=0).to(device)

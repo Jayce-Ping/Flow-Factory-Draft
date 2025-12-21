@@ -6,11 +6,11 @@ main_process_port: 29500
 
 run_name: null  # Run name (auto: {model_type}_{finetune_type}_{timestamp})
 project: "Flow-Factory"  # Project name for logging
-logging_backend: "swanlab"  # Options: wandb, swanlab, none
+logging_backend: "wandb"  # Options: wandb, swanlab, none
 
 # Data Configuration
 data:
-  dataset_dir: "dataset/t2is"  # Path to dataset folder
+  dataset_dir: "dataset/pickscore"  # Path to dataset folder
   preprocessing_batch_size: 8  # Batch size for preprocessing
   dataloader_num_workers: 16  # Number of workers for DataLoader
   enable_preprocess: true  # Enable dataset preprocessing
@@ -64,11 +64,11 @@ train:
 
   # EMA
   ema_decay: 0.995  # EMA decay rate (0 to disable)
-  ema_update_interval: 10  # EMA update interval (in epochs)
+  ema_update_interval: 4  # EMA update interval (in epochs)
   
   # Evaluation settings
   eval_args:
-    resolution: 1024  # Evaluation resolution
+    resolution: 512  # Evaluation resolution
     per_device_batch_size: 1  # Eval batch size
     seed: null  # Eval seed (defaults to training seed)
     guidance_scale: 3.5  # Guidance scale for sampling

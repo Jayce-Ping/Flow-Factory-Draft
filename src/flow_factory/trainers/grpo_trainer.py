@@ -120,6 +120,8 @@ class GRPOTrainer(BaseTrainer):
         rewards = self.compute_rewards(samples)
         prompt_ids = torch.stack([sample.prompt_ids for sample in samples], dim=0)
         prompt_ids = torch.as_tensor(prompt_ids, device=self.accelerator.device)
+        for sample, reward in zip(samples, rewards):
+            sample.extra_kwargs['reward'] = reward
 
         # Gather across processes
         gathered_prompt_ids = self.accelerator.gather(prompt_ids).cpu().numpy()
@@ -128,6 +130,7 @@ class GRPOTrainer(BaseTrainer):
             {
                 'train/reward_mean': np.mean(gathered_rewards),
                 'train/reward_std': np.std(gathered_rewards),
+                'train_samples': samples[:30],
             },
             step=self.step,
         )
@@ -216,7 +219,8 @@ class GRPOTrainer(BaseTrainer):
 
                         loss = policy_loss
                         loss_info['policy_loss'].append(policy_loss.detach().cpu().item())
-                        loss_info['raio'].append(ratio.detach().cpu().mean().item())
+                        loss_info['ratio'].append(ratio.detach().cpu().mean().item())
+                        loss_info['adv_mean'].append(batch_advantages.cpu().mean().item())
                         # Other normalization strategies:
                         # 1. Temp-FlowGRPO
                         # 2. GRPO-Guard
@@ -274,7 +278,7 @@ class GRPOTrainer(BaseTrainer):
                     {
                         'eval/reward': np.mean(gathered_rewards),
                         'eval/reward_std': np.std(gathered_rewards),
-                        'eval/samples' : all_samples,
+                        'eval_samples' : all_samples,
                     },
                     step=self.step,
                 )
