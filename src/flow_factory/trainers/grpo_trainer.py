@@ -47,10 +47,8 @@ class GRPOTrainer(BaseTrainer):
 
             # Evaluation
             if (self.training_args.eval_args.eval_freq > 0 and self.epoch % self.training_args.eval_args.eval_freq == 0):
-                self.adapter.eval()
                 self.evaluate()
 
-            self.adapter.train()
             samples = self.sample()
             self.compute_loss(samples)
 
@@ -60,6 +58,8 @@ class GRPOTrainer(BaseTrainer):
 
     def sample(self, **kwargs) -> List[BaseSample]:
         """Generate rollouts for GRPO."""
+        self.adapter.train()
+        self.adapter.transformer.eval()
         samples = []
         data_iter = iter(self.dataloader)
         
@@ -80,7 +80,8 @@ class GRPOTrainer(BaseTrainer):
                     sample_batch = self.adapter.inference(**sample_kwargs)
             
             samples.extend(sample_batch)
-
+            
+        self.adapter.transformer.train()
         return samples
 
     def compute_rewards(self, samples: List[BaseSample]) -> torch.Tensor:
@@ -171,6 +172,7 @@ class GRPOTrainer(BaseTrainer):
 
     def compute_loss(self, samples: List[BaseSample]) -> None:
         """Main training loop: compute loss and update policy."""
+        self.adapter.train()
         advantages = self.compute_advantages(samples)
 
         batched_samples = [
@@ -255,6 +257,7 @@ class GRPOTrainer(BaseTrainer):
         if self.test_dataloader is None:
             return
         
+        self.adapter.eval()
         with self.adapter.use_ema_parameters():
             all_samples : List[BaseSample] = []
             
