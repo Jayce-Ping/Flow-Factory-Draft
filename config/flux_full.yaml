@@ -10,7 +10,7 @@ logging_backend: "wandb"  # Options: wandb, swanlab, none
 
 # Data Configuration
 data:
-  dataset_dir: "dataset/pickscore"  # Path to dataset folder
+  dataset_dir: "dataset/t2is"  # Path to dataset folder
   preprocessing_batch_size: 8  # Batch size for preprocessing
   dataloader_num_workers: 16  # Number of workers for DataLoader
   enable_preprocess: true  # Enable dataset preprocessing
@@ -18,9 +18,7 @@ data:
 
 # Model Configuration
 model:
-  finetune_type: 'lora' # Options: full, lora
-  lora_rank : 64
-  lora_alpha : 128
+  finetune_type: 'full' # Options: full, lora
   target_modules: "default" # Options: all, default, or list of module names like ["to_k", "to_q", "to_v", "to_out.0"]
   model_name_or_path: "black-forest-labs/FLUX.1-dev"  # HuggingFace model ID or local path
   model_type: "flux1"  # Options: flux1, flux1-kontext, flux2, qwenimage, qwenimage-edit
@@ -60,7 +58,7 @@ train:
   
   # Optimization
   seed: 42  # Random seed
-  learning_rate: 3.0e-4  # Initial learning rate
+  learning_rate: 1.0e-5  # Initial learning rate
   adam_weight_decay: 1.0e-4  # AdamW weight decay
   adam_betas: [0.9, 0.999]  # AdamW betas
   adam_epsilon: 1.0e-8  # AdamW epsilon
