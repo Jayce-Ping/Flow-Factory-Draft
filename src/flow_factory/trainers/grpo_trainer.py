@@ -226,7 +226,6 @@ class GRPOTrainer(BaseTrainer):
                                 batch,
                                 timestep_index=timestep_index,
                                 return_log_prob=True,
-                                noise_level=self.training_args.noise_level,
                             )
 
                         # Clip advantages

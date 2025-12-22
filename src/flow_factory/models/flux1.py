@@ -201,7 +201,6 @@ class Flux1Adapter(BaseAdapter):
                 timestep=t,
                 sample=latents,
                 compute_log_prob=compute_log_probs and current_noise_level > 0,
-                sde_type=self.training_args.sde_type,
             )
             
             latents = output.prev_sample.to(prompt_embeds.dtype)
@@ -256,7 +255,6 @@ class Flux1Adapter(BaseAdapter):
         latents = torch.stack([s.all_latents[timestep_index] for s in samples], dim=0).to(device)
         next_latents = torch.stack([s.all_latents[timestep_index + 1] for s in samples], dim=0).to(device)
         timestep = torch.stack([s.timesteps[timestep_index] for s in samples], dim=0).to(device)
-        t = timestep[0].item()
         
         prompt_embeds = torch.stack([s.prompt_embeds for s in samples], dim=0).to(device)
         pooled_prompt_embeds = torch.stack([s.pooled_prompt_embeds for s in samples], dim=0).to(device)
@@ -287,11 +285,11 @@ class Flux1Adapter(BaseAdapter):
         step_kwargs = filter_kwargs(self.scheduler.step, **kwargs)
         output = self.scheduler.step(
             model_output=noise_pred,
-            timestep=t,
+            timestep=timestep,
             sample=latents,
             prev_sample=next_latents,
             compute_log_prob=compute_log_prob,
-            **step_kwargs
+            **step_kwargs,
         )
         
         return output
