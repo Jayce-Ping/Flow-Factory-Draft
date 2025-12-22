@@ -85,7 +85,7 @@ class GeneralDataset(Dataset):
             
             os.makedirs(cache_dir, exist_ok=True)
             fingerprint = (
-                f"{os.path.basename(self.data_root)}_{split}_"
+                f"cache_{os.path.basename(self.data_root)}_{split}_"
                 f"cutoff{max_dataset_size if max_dataset_size else 'full'}"
             )
             

@@ -51,6 +51,18 @@ class BaseSample(BaseOutput):
         result.update(extra)
         return result
 
+    def short_rep(self) -> Dict[str, Any]:
+        """Short representation for logging."""
+        def long_tensor_to_shape(t : torch.Tensor):
+            if isinstance(t, torch.Tensor) and t.numel() > 16:
+                return t.shape
+            else:
+                return t
+
+        d = self.to_dict()
+        d = {k: long_tensor_to_shape(v) for k,v in d.items()}
+        return d
+
 
 class BaseAdapter(nn.Module, ABC):
     """

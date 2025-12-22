@@ -150,7 +150,7 @@ class GRPOTrainer(BaseTrainer):
             assert len(group_rewards) == self.training_args.group_size, \
                 f"Group size mismatch: expected {self.training_args.group_size}, got {len(group_rewards)}"
 
-            mean = np.mean(group_rewards, keepdims=True)
+            mean = np.mean(group_rewards, axis=0, keepdims=True)
             if not self.training_args.global_std:
                 std = max(np.std(group_rewards, axis=0, keepdims=True), 1e-6)
             
@@ -179,6 +179,13 @@ class GRPOTrainer(BaseTrainer):
         self.adapter.train()
         self.adapter.scheduler.train()
         advantages = self.compute_advantages(samples)
+
+        # s = f"Rank {self.accelerator.process_index}: "
+        # for sample, adv in zip(samples, advantages):
+        #     sample.extra_kwargs['advantage'] = adv
+        #     s += f"[{sample.short_rep()}]"
+        
+        # # print(s)
 
         batched_samples = [
             samples[i:i + self.training_args.per_device_batch_size]
@@ -216,11 +223,12 @@ class GRPOTrainer(BaseTrainer):
                             output = self.adapter.forward(
                                 batch_samples,
                                 timestep_index=timestep_index,
-                                return_log_prob=True
+                                return_log_prob=True,
+                                noise_level=self.training_args.noise_level,
                             )
 
                         # Clip advantages
-                        adv_clip_range = self.training_args.adv_clip_range         
+                        adv_clip_range = self.training_args.adv_clip_range
                         batch_advantages = torch.clamp(batch_advantages, adv_clip_range[0], adv_clip_range[1])
                         # PPO-style clipped loss
                         ratio = torch.exp(output.log_prob - old_log_probs)
@@ -231,12 +239,12 @@ class GRPOTrainer(BaseTrainer):
                         policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
 
                         loss = policy_loss
-                        loss_info['ratio'].append(ratio.detach().cpu().mean().item())
-                        loss_info['unclipped_loss'].append(unclipped_loss.detach().cpu().mean().item())
-                        loss_info['clipped_loss'].append(clipped_loss.detach().cpu().mean().item())
-                        loss_info['policy_loss'].append(policy_loss.detach().cpu().item())
-                        loss_info["clip_frac_high"].append(torch.mean((ratio > 1.0 + ratio_clip_range[1]).float()).item())
-                        loss_info["clip_frac_low"].append(torch.mean((ratio < 1.0 + ratio_clip_range[0]).float()).item())
+                        loss_info['ratio'].append(ratio.detach())
+                        loss_info['unclipped_loss'].append(unclipped_loss.detach())
+                        loss_info['clipped_loss'].append(clipped_loss.detach())
+                        loss_info['policy_loss'].append(policy_loss.detach())
+                        loss_info["clip_frac_high"].append(torch.mean((ratio > 1.0 + ratio_clip_range[1]).float()))
+                        loss_info["clip_frac_low"].append(torch.mean((ratio < 1.0 + ratio_clip_range[0]).float()))
 
                         # Other normalization strategies:
                         # 1. Temp-FlowGRPO
@@ -250,8 +258,10 @@ class GRPOTrainer(BaseTrainer):
                         self.adapter.get_trainable_parameters(),
                         self.training_args.max_grad_norm,
                     )
+                    loss_info = {k: torch.as_tensor(v, device=self.accelerator.device) for k, v in loss_info.items()}
+                    loss_info = self.accelerator.reduce(loss_info, reduction="mean")
                     self.log_data(
-                        {f'train/{k}': np.mean(v) for k, v in loss_info.items()},
+                        {f'train/{k}': v for k, v in loss_info.items()},
                         step=self.step,
                     )
                     self.step += 1

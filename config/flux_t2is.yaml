@@ -1,7 +1,7 @@
 # Environment Configuration
 launcher: "accelerate"  # Options: accelerate
 config_file: config/accelerate_configs/multi_gpu.yaml  # Path to distributed config file (optional)
-num_processes: 8  # Number of processes to launch (overrides config file)
+num_processes: 2  # Number of processes to launch (overrides config file)
 main_process_port: 29500
 
 run_name: null  # Run name (auto: {model_type}_{finetune_type}_{timestamp})
@@ -14,7 +14,7 @@ data:
   preprocessing_batch_size: 8  # Batch size for preprocessing
   dataloader_num_workers: 16  # Number of workers for DataLoader
   enable_preprocess: true  # Enable dataset preprocessing
-  max_dataset_size: 1000  # Limit the maximum number of samples in the dataset
+  max_dataset_size: 100  # Limit the maximum number of samples in the dataset
 
 # Model Configuration
 model:
@@ -40,9 +40,9 @@ train:
   
   # Batch and sampling
   per_device_batch_size: 1  # Batch size per device
-  group_size: 24  # Group size for GRPO sampling
+  group_size: 8  # Group size for GRPO sampling
   global_std: false  # Use global std for advantage normalization
-  unique_sample_num_per_epoch: 32  # Unique samples per group
+  unique_sample_num_per_epoch: 4  # Unique samples per group
   gradient_step_per_epoch: 2  # Gradient steps per epoch
   
   # Clipping
@@ -76,7 +76,7 @@ train:
     seed: null  # Eval seed (defaults to training seed)
     guidance_scale: 3.5  # Guidance scale for sampling
     num_inference_steps: 28  # Number of eval timesteps
-    eval_freq: 10  # Eval frequency in epochs (0 to disable)
+    eval_freq: 0  # Eval frequency in epochs (0 to disable)
 
 # Reward Model Configuration
 reward:

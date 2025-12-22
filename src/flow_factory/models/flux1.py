@@ -12,6 +12,7 @@ import logging
 from ..hparams import *
 from .adapter import BaseAdapter, BaseSample
 from ..scheduler.flow_matching import FlowMatchEulerDiscreteSDEScheduler, FlowMatchEulerDiscreteSDESchedulerOutput, set_scheduler_timesteps
+from ..utils.base import filter_kwargs
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')
 logger = logging.getLogger(__name__)
@@ -283,12 +284,14 @@ class Flux1Adapter(BaseAdapter):
         )[0]
         
         # Compute log prob with ground truth next_latents
+        step_kwargs = filter_kwargs(self.scheduler.step, **kwargs)
         output = self.scheduler.step(
             model_output=noise_pred,
             timestep=t,
             sample=latents,
             prev_sample=next_latents,
             compute_log_prob=compute_log_prob,
+            **step_kwargs
         )
         
         return output

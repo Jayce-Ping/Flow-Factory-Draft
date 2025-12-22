@@ -78,16 +78,19 @@ class BaseTrainer(ABC):
 
     def _init_dataloader(self) -> Tuple[DataLoader, Union[None, DataLoader]]:
         # Move text-encoder & vae to GPU for dataloader encoding
-        self.adapter.on_load_text_encoder(self.accelerator.device)
-        dataloader, test_dataloader = get_dataloader(
-            config=self.config,
-            accelerator=self.accelerator,
-            text_encode_func=self.adapter.encode_prompt,
-            image_encode_func=self.adapter.encode_image,
-            video_encode_func=self.adapter.encode_video,
-        )
-        # Offload text-encoder after dataloader encoding
-        self.adapter.off_load_text_encoder()
+        with self.accelerator.main_process_first():
+            if self.accelerator.is_local_main_process:
+                self.adapter.on_load_text_encoder(self.accelerator.device)
+            dataloader, test_dataloader = get_dataloader(
+                config=self.config,
+                accelerator=self.accelerator,
+                text_encode_func=self.adapter.encode_prompt,
+                image_encode_func=self.adapter.encode_image,
+                video_encode_func=self.adapter.encode_video,
+            )
+            if self.accelerator.is_local_main_process:
+                # Offload text-encoder after dataloader encoding
+                self.adapter.off_load_text_encoder()
 
         self.accelerator.wait_for_everyone()
 
