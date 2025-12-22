@@ -28,27 +28,6 @@ class Flux1Adapter(BaseAdapter):
     
     def __init__(self, config: Arguments):
         super().__init__(config)
-
-        # Load pipeline
-        self.pipeline = self.load_pipeline()
-        
-        # Initialize Scheduler
-        self.pipeline.scheduler = self.load_scheduler()
-
-        # Freeze non-trainable components
-        self._freeze_components()
-
-        if self.config.model_args.resume_path:
-            self.load_checkpoint(self.config.model_args.resume_path)
-        elif self.config.model_args.finetune_type == 'lora':
-            self.apply_lora()
-
-        self._mix_precision()
-        self._set_trainable_params_dtype()
-
-        if self.training_args.enable_gradient_checkpointing:
-            self.enable_gradient_checkpointing()
-
     
     def load_pipeline(self) -> FluxPipeline:
         return FluxPipeline.from_pretrained(
