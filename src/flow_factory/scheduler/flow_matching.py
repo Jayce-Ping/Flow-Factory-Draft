@@ -35,7 +35,7 @@ def set_scheduler_timesteps(
     sigmas: Optional[Union[List[float], np.ndarray]] = None,
     device: Optional[Union[str, torch.device]] = None,
 ):
-    sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else np.array(sigmas)
+    sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
     if hasattr(scheduler.config, "use_flow_sigmas") and scheduler.config.use_flow_sigmas:
         sigmas = None
     # 5. Prepare scheduler, shift timesteps/sigmas according to image size (image_seq_len)

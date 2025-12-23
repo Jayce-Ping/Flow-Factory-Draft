@@ -9,6 +9,7 @@ from .dataset import GeneralDataset
 from .sampler import DistributedKRepeatSampler
 from ..hparams import *
 from ..data_utils.dataset import TextEncodeCallable, ImageEncodeCallable, VideoEncodeCallable
+from ..utils.base import filter_kwargs
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
@@ -28,14 +29,13 @@ def get_dataloader(
 
     # 1. Initialize Dataset (Now handles tokenization internally)
     dataset_init_kwargs = {
-        "dataset_dir": data_args.dataset,
-        "enable_preprocess": data_args.enable_preprocess,
-        "preprocessing_batch_size": data_args.preprocessing_batch_size,
-        'max_dataset_size': data_args.max_dataset_size,
         "text_encode_func": text_encode_func,
         "image_encode_func": image_encode_func,
         "video_encode_func": video_encode_func,
     }
+    dataset_init_kwargs.update(filter_kwargs(GeneralDataset.__init__, **data_args.to_dict()))
+    # Only the main process handles preprocessing and caching
+    dataset_init_kwargs['force_reprocess'] = data_args.force_reprocess and accelerator.is_main_process
     dataset = GeneralDataset(
         split="train",
         **dataset_init_kwargs

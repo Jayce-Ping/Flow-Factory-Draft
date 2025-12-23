@@ -115,9 +115,8 @@ class Flux1Adapter(BaseAdapter):
         width = width or (self.training_args.resolution[1] if self.training else self.training_args.eval_args.resolution[1])
         num_inference_steps = num_inference_steps or (self.training_args.num_inference_steps if self.training else self.training_args.eval_args.num_inference_steps)
         guidance_scale = guidance_scale or (self.training_args.guidance_scale if self.training else self.training_args.eval_args.guidance_scale)
-        batch_size = prompt_embeds.shape[0] if prompt_embeds is not None else 1
         device = self.device
-        dtype = prompt_embeds.dtype if prompt_embeds is not None else torch.float32
+        dtype = self.transformer.dtype
         # Encode prompts if not provided
         if prompt_embeds is None:
             encoded = self.encode_prompt(prompt)
@@ -127,6 +126,8 @@ class Flux1Adapter(BaseAdapter):
         else:
             prompt_embeds = prompt_embeds.to(device)
             pooled_prompt_embeds = pooled_prompt_embeds.to(device)
+
+        batch_size = len(prompt_embeds)
 
         text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(
             device=device, dtype=dtype
@@ -243,7 +244,10 @@ class Flux1Adapter(BaseAdapter):
         
         # Set scheduler timesteps
         _ = set_scheduler_timesteps(
-            self.scheduler, self.training_args.num_inference_steps, latents.shape[1], device
+            scheduler=self.scheduler,
+            num_inference_steps=self.training_args.num_inference_steps,
+            seq_len=latents.shape[1],
+            device=device
         )
         
         guidance = torch.as_tensor(guidance_scale, device=device, dtype=torch.float32)

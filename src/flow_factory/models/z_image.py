@@ -37,9 +37,8 @@ class ZImageAdapter(BaseAdapter):
     @property
     def default_target_modules(self) -> List[str]:
         return [
-            "attention.to_k", "attention.to_q", "attention.to_v",
-            "attention.to_out.0",
-            "feed_forward",
+            "attention.to_k", "attention.to_q", "attention.to_v", "attention.to_out.0",
+            "feed_forward.w1", "feed_forward.w2", "feed_forward.w3",
         ]
     
     def _encode_prompt(
@@ -47,7 +46,7 @@ class ZImageAdapter(BaseAdapter):
         prompt: Union[str, List[str]],
         device: Optional[torch.device] = None,
         max_sequence_length: int = 512,
-    ) -> Tuple[List[torch.FloatTensor], List[torch.Tensor]]:
+    ) -> Tuple[List[torch.FloatTensor], torch.Tensor]:
         device = device or self.device
 
         if isinstance(prompt, str):
@@ -87,7 +86,7 @@ class ZImageAdapter(BaseAdapter):
         for i in range(len(prompt_embeds)):
             embeddings_list.append(prompt_embeds[i][prompt_masks[i]])
 
-        return embeddings_list, text_input_ids.unbind(dim=0)
+        return embeddings_list, text_input_ids
 
     def encode_prompt(
         self,
@@ -96,7 +95,7 @@ class ZImageAdapter(BaseAdapter):
         do_classifier_free_guidance: bool = True,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         max_sequence_length: int = 512,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Union[List[torch.FloatTensor], torch.LongTensor]]:
         device = device or self.device
         prompt = [prompt] if isinstance(prompt, str) else prompt
         prompt_embeds, prompt_ids = self._encode_prompt(
@@ -118,12 +117,13 @@ class ZImageAdapter(BaseAdapter):
             )
         else:
             negative_prompt_embeds = []
+            negative_prompt_ids = []
 
         return {
             "prompt_embeds": prompt_embeds,
             "negative_prompt_embeds": negative_prompt_embeds,
             "prompt_ids": prompt_ids,
-            "negative_prompt_ids": negative_prompt_ids if do_classifier_free_guidance else None,
+            "negative_prompt_ids": negative_prompt_ids,
         }
     
     def encode_image(
@@ -180,11 +180,9 @@ class ZImageAdapter(BaseAdapter):
         width = width or (self.training_args.resolution[1] if self.training else self.training_args.eval_args.resolution[1])
         num_inference_steps = num_inference_steps or (self.training_args.num_inference_steps if self.training else self.training_args.eval_args.num_inference_steps)
         guidance_scale = guidance_scale or (self.training_args.guidance_scale if self.training else self.training_args.eval_args.guidance_scale)
-        batch_size = prompt_embeds.shape[0] if prompt_embeds is not None else 1
         device = self.device
         dtype = self.transformer.dtype
         do_classifier_free_guidance = guidance_scale > 1.0
-
 
         # Encode prompts if not provided
         if prompt_embeds is None:
@@ -195,13 +193,15 @@ class ZImageAdapter(BaseAdapter):
                 do_classifier_free_guidance=do_classifier_free_guidance,
                 device=device
             )
+            prompt_ids = encoded['prompt_ids']
             prompt_embeds = encoded['prompt_embeds']
+            negative_prompt_ids = encoded['negative_prompt_ids']
             negative_prompt_embeds = encoded['negative_prompt_embeds']
         else:
-            prompt_embeds = prompt_embeds.to(device)
-            negative_prompt_embeds = negative_prompt_embeds.to(device)
+            prompt_embeds = [pe.to(device) for pe in prompt_embeds]
+            negative_prompt_embeds = [npe.to(device) for npe in negative_prompt_embeds]
 
-        
+        batch_size = len(prompt_embeds)
         num_channels_latents = self.transformer.in_channels
 
         latents = self.pipeline.prepare_latents(
@@ -232,22 +232,23 @@ class ZImageAdapter(BaseAdapter):
             timestep = (1000 - timestep) / 1000 # Z-Image uses reversed timesteps?
             # Normalized time for time-aware config (0 at start, 1 at end)
             t_norm = timestep[0].item()
-            current_guidance_scale = guidance_scale
 
             if (
                 do_classifier_free_guidance
                 and cfg_truncation is not None
                 and float(cfg_truncation) <= 1
+                and t_norm > cfg_truncation
             ):
-                if t_norm > cfg_truncation:
-                    current_guidance_scale = 0.0
+                current_guidance_scale = 0.0
+            else:
+                current_guidance_scale = guidance_scale
 
             apply_cfg = do_classifier_free_guidance and current_guidance_scale > 0
 
             if apply_cfg:
                 latents_typed = latents.to(self.transformer.dtype)
                 latent_model_input = latents_typed.repeat(2, 1, 1, 1)
-                prompt_embeds_model_input = prompt_embeds + negative_prompt_embeds
+                prompt_embeds_model_input = prompt_embeds + negative_prompt_embeds # List concatenation
                 timestep_model_input = timestep.repeat(2)
             else:
                 latent_model_input = latents.to(self.transformer.dtype)
@@ -299,7 +300,7 @@ class ZImageAdapter(BaseAdapter):
                 timestep=t,
                 sample=latents,
                 compute_log_prob=compute_log_probs and current_noise_level > 0,
-            )[0]
+            )
 
             latents = output.prev_sample.to(dtype)
             all_latents.append(latents)
@@ -335,54 +336,53 @@ class ZImageAdapter(BaseAdapter):
         
         return samples
     
+    # ======================== Forward (Training) ========================
     def forward(
         self,
-        samples: List[ZImageSample],
+        samples : List[ZImageSample],
         timestep_index : int,
-        compute_log_prob: bool = True,
-        **kwargs,
+        compute_log_prob : bool = True,
+        **kwargs
     ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
         batch_size = len(samples)
         device = self.device
-        guidance_scale = [
-            s.extra_kwargs.get('guidance_scale', self.training_args.guidance_scale)
-            for s in samples
-        ]
+        guidance_scale = [s.extra_kwargs.get('guidance_scale', self.training_args.guidance_scale) for s in samples]
         do_classifier_free_guidance = guidance_scale[0] > 1.0
         cfg_truncation = samples[0].extra_kwargs.get('cfg_truncation', 1.0)
         cfg_normalization = samples[0].extra_kwargs.get('cfg_normalization', False)
 
-        # Extract data from samples
         latents = torch.stack([s.all_latents[timestep_index] for s in samples], dim=0).to(device)
         next_latents = torch.stack([s.all_latents[timestep_index + 1] for s in samples], dim=0).to(device)
         timestep = torch.stack([s.timesteps[timestep_index] for s in samples], dim=0).to(device)
-        t = (1000 - timestep) / 1000  # Z-Image uses reversed timesteps
+        t = (1000 - timestep) / 1000 # Z-Image uses reversed timesteps
         t_norm = t[0].item()
 
-        prompt_embeds = torch.stack([s.prompt_embeds for s in samples], dim=0).to(device)
-        negative_prompt_embeds = torch.stack([s.negative_prompt_embeds for s in samples], dim=0).to(device) if guidance_scale[0] > 1.0 else None
+        prompt_embeds = [s.prompt_embeds.to(device) for s in samples]
+        negative_prompt_embeds = [s.negative_prompt_embeds.to(device) for s in samples] if do_classifier_free_guidance else []
         
-        # Set scheduler timesteps
         _ = set_scheduler_timesteps(
-            self.scheduler, self.training_args.num_inference_steps, latents.shape[1], device
+            scheduler=self.scheduler,
+            num_inference_steps=self.training_args.num_inference_steps,
+            seq_len=latents.shape[1],
+            device=device
         )
-
-        guidance = torch.as_tensor(guidance_scale, device=device, dtype=torch.float32)
 
         if (
             do_classifier_free_guidance
-            and cfg_truncation is not None
+            and cfg_truncation
             and float(cfg_truncation) <= 1
+            and t_norm > cfg_truncation
         ):
-            if t_norm > cfg_truncation:
-                current_guidance_scale = 0.0
+            current_guidance_scale = 0.0
+        else:
+            current_guidance_scale = guidance_scale[0]    
 
         apply_cfg = do_classifier_free_guidance and current_guidance_scale > 0
 
         if apply_cfg:
             latents_typed = latents.to(self.transformer.dtype)
             latent_model_input = latents_typed.repeat(2, 1, 1, 1)
-            prompt_embeds_model_input = prompt_embeds + negative_prompt_embeds
+            prompt_embeds_model_input = prompt_embeds + negative_prompt_embeds # List concatenation
             timestep_model_input = t.repeat(2)
         else:
             latent_model_input = latents.to(self.transformer.dtype)
@@ -400,31 +400,27 @@ class ZImageAdapter(BaseAdapter):
         )[0]
 
         if apply_cfg:
-            # Perform CFG
             pos_out = model_out_list[:batch_size]
             neg_out = model_out_list[batch_size:]
-
             noise_pred = []
+            
             for j in range(batch_size):
                 pos = pos_out[j].float()
                 neg = neg_out[j].float()
-
-                pred = pos + guidance[j] * (pos - neg)
-
-                # Renormalization
+                pred = pos + current_guidance_scale * (pos - neg)
+                
                 if cfg_normalization and float(cfg_normalization) > 0.0:
                     ori_pos_norm = torch.linalg.vector_norm(pos)
                     new_pos_norm = torch.linalg.vector_norm(pred)
                     max_new_norm = ori_pos_norm * float(cfg_normalization)
                     if new_pos_norm > max_new_norm:
                         pred = pred * (max_new_norm / new_pos_norm)
-
+                
                 noise_pred.append(pred)
-
+            
             noise_pred = torch.stack(noise_pred, dim=0)
         else:
             noise_pred = torch.stack([t.float() for t in model_out_list], dim=0)
-
 
         noise_pred = noise_pred.squeeze(2)
         noise_pred = -noise_pred

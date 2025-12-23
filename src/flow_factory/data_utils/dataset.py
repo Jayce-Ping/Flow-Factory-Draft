@@ -45,6 +45,7 @@ class GeneralDataset(Dataset):
         split: str = "train",
         cache_dir="~/.cache/flow_factory/datasets",
         enable_preprocess=True,
+        force_reprocess=False,
         preprocessing_batch_size=16,
         max_dataset_size: Optional[int] = None,
         text_encode_func: Optional[TextEncodeCallable] = None,
@@ -100,7 +101,7 @@ class GeneralDataset(Dataset):
                 remove_columns=raw_dataset.column_names,
                 new_fingerprint=fingerprint,
                 desc="Pre-processing dataset",
-                load_from_cache_file=True,
+                load_from_cache_file=not force_reprocess,
             )
             
             try:

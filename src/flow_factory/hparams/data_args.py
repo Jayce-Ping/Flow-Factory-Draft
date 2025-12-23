@@ -24,6 +24,10 @@ class DataArguments(ArgABC):
         default=True,
         metadata={"help": "Whether to enable preprocessing of the dataset."},
     )
+    force_reprocess: bool = field(
+        default=False,
+        metadata={"help": "Whether to force reprocessing of the dataset even if cached data exists."},
+    )
 
     max_dataset_size: Optional[int] = field(
         default=None,
