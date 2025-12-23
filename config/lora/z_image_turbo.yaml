@@ -23,8 +23,8 @@ model:
   lora_rank : 64
   lora_alpha : 128
   target_modules: "default" # Options: all, default, or list of module names like ["to_k", "to_q", "to_v", "to_out.0"]
-  model_name_or_path: "black-forest-labs/FLUX.1-dev"  # HuggingFace model ID or local path
-  model_type: "flux1"  # Options: flux1, flux1-kontext, flux2, qwenimage, qwenimage-edit
+  model_name_or_path: "Tongyi-MAI/Z-Image-Turbo"  # HuggingFace model ID or local path
+  model_type: "z-image"  # Options: flux1, flux1-kontext, flux2, qwenimage, qwenimage-edit, z-image
   resume_path: null # Path to load previous checkpoint/lora adapter
   master_weight_dtype: 'float32' # Weight dtype for trainable parameters when full-paramter fine-tuning, options are ["float16", "bfloat16", "float32"]
 
@@ -52,11 +52,11 @@ train:
   
   # Denoising process
   sde_type: "Flow-SDE"  # Options: Flow-SDE, Dance-SDE, CPS
-  num_inference_steps: 10  # Number of SDE timesteps
+  num_inference_steps: 9  # Number of SDE timesteps
   noise_level: 0.7  # Noise level for sampling
   num_noise_steps: 1  # Number of noise steps
   noise_steps: [1, 2, 3]  # Custom noise window
-  guidance_scale: 3.5  # Guidance scale for sampling
+  guidance_scale: 0  # Guidance scale for sampling
   
   # Optimization
   seed: 42  # Random seed
@@ -74,8 +74,8 @@ train:
     resolution: 512  # Evaluation resolution
     per_device_batch_size: 1  # Eval batch size
     seed: 42  # Eval seed (defaults to training seed)
-    guidance_scale: 3.5  # Guidance scale for sampling
-    num_inference_steps: 28  # Number of eval timesteps
+    guidance_scale: 0  # Guidance scale for sampling
+    num_inference_steps: 9  # Number of eval timesteps
     eval_freq: 10  # Eval frequency in epochs (0 to disable)
 
 # Reward Model Configuration

@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Flux1Sample(BaseSample):
     """Output class for Flux Adapter models."""
-    pass
+    pooled_prompt_embeds : Optional[torch.FloatTensor] = None
 
 
 class Flux1Adapter(BaseAdapter):
@@ -71,9 +71,9 @@ class Flux1Adapter(BaseAdapter):
             'pooled_prompt_embeds': pooled_prompt_embeds,
         }
     
-    def encode_image(self, image: Union[torch.Tensor, List[torch.Tensor]], **kwargs) -> torch.Tensor:
+    def encode_image(self, image: Union[Image.Image, torch.Tensor, List[torch.Tensor]], **kwargs) -> torch.Tensor:
         """Not needed for FLUX text-to-image models."""
-        pass
+        return self.pipeline.encode_image(image, device=self.device, **kwargs)
 
     def encode_video(self, video: Union[torch.Tensor, List[torch.Tensor]], **kwargs) -> torch.Tensor:
         """Not needed for FLUX text-to-image models."""
@@ -128,7 +128,7 @@ class Flux1Adapter(BaseAdapter):
             pooled_prompt_embeds = pooled_prompt_embeds.to(device)
 
         text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(
-            device=device, dtype=prompt_embeds.dtype
+            device=device, dtype=dtype
         )
         
         # Prepare latents
@@ -182,7 +182,7 @@ class Flux1Adapter(BaseAdapter):
                 compute_log_prob=compute_log_probs and current_noise_level > 0,
             )
             
-            latents = output.prev_sample.to(prompt_embeds.dtype)
+            latents = output.prev_sample.to(dtype)
             all_latents.append(latents)
             
             if compute_log_probs:
@@ -268,6 +268,7 @@ class Flux1Adapter(BaseAdapter):
             sample=latents,
             prev_sample=next_latents,
             compute_log_prob=compute_log_prob,
+            return_dict=True,
             **step_kwargs,
         )
         

@@ -3,7 +3,6 @@ import logging
 from typing import Tuple
 from accelerate import Accelerator
 from .adapter import BaseAdapter
-from .flux1 import Flux1Adapter
 from ..hparams import *
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')
@@ -27,6 +26,10 @@ def load_model(config : Arguments) -> BaseAdapter:
     logger.info(f"Loading model architecture: {model_type}...")
     
     if model_type == "flux1":
+        from .flux1 import Flux1Adapter
         return Flux1Adapter(config=config)
+    elif model_type == 'z-image':
+        from .z_image import ZImageAdapter
+        return ZImageAdapter(config=config)
     else:
-        raise ValueError(f"Unknown model type: {model_type}. Supported: ['flux', 'sd3', 'sd']")
+        raise NotImplementedError(f"Model type '{model_type}' is not supported yet.")

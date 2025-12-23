@@ -49,7 +49,7 @@ class ModelArguments(ArgABC):
         metadata={"help": "Resume from checkpoint directory."}
     )
 
-    model_type: Literal["sd3", "flux1", "flux1-kontext", 'flux2', 'qwenimage', 'qwenimage-edit'] = field(
+    model_type: Literal["sd3", "flux1", "flux1-kontext", 'flux2', 'qwenimage', 'qwenimage-edit', 'z-image'] = field(
         default="flux1",
         metadata={"help": "Type of model to use."},
     )
