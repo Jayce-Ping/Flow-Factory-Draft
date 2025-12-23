@@ -23,7 +23,7 @@ class Flux1Sample(BaseSample):
     pooled_prompt_embeds : Optional[torch.FloatTensor] = None
 
 
-class Flux1INITAdapter(BaseAdapter):
+class Flux1InitAdapter(BaseAdapter):
     """Concrete implementation for Flow Matching models (FLUX.1)."""
     
     def __init__(self, config: Arguments):
