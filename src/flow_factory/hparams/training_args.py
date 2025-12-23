@@ -138,7 +138,7 @@ class TrainingArguments:
     gradient_accumulation_steps : int = field(init=False)
 
     # PPO/GRPO Clip arguments
-    trainer_type: Literal["grpo"] = field(
+    trainer_type: Literal["grpo", 'grpo_guard'] = field(
         default="grpo",
         metadata={"help": "Type of trainer to use."},
     )
