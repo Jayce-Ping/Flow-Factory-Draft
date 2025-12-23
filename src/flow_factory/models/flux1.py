@@ -114,7 +114,6 @@ class Flux1Adapter(BaseAdapter):
         width = width or (self.training_args.resolution[1] if self.training else self.training_args.eval_args.resolution[1])
         num_inference_steps = num_inference_steps or (self.training_args.num_inference_steps if self.training else self.training_args.eval_args.num_inference_steps)
         guidance_scale = guidance_scale or (self.training_args.guidance_scale if self.training else self.training_args.eval_args.guidance_scale)
-        batch_size = prompt_embeds.shape[0] if prompt_embeds is not None else 1
         device = self.device
         dtype = prompt_embeds.dtype if prompt_embeds is not None else torch.float32
         # Encode prompts if not provided
@@ -126,6 +125,8 @@ class Flux1Adapter(BaseAdapter):
         else:
             prompt_embeds = prompt_embeds.to(device)
             pooled_prompt_embeds = pooled_prompt_embeds.to(device)
+
+        batch_size = len(prompt_embeds)
 
         text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(
             device=device, dtype=dtype

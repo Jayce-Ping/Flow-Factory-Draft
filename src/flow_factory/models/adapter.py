@@ -32,13 +32,14 @@ class BaseSample(BaseOutput):
     """
     all_latents : torch.FloatTensor
     timesteps : torch.FloatTensor
-    prompt_ids : torch.FloatTensor
+    prompt_ids : torch.LongTensor
     negative_prompt_ids : Optional[torch.FloatTensor] = None
     height : Optional[int] = None
     width : Optional[int] = None
+    image: Optional[Image.Image] = None
     prompt : Optional[str] = None
     negative_prompt : Optional[str] = None
-    image: Optional[Image.Image] = None
+    negative_prompt_ids : Optional[torch.LongTensor] = None
     prompt_embeds : Optional[torch.FloatTensor] = None
     negative_prompt_embeds : Optional[torch.FloatTensor] = None
     log_probs : Optional[torch.FloatTensor] = None
