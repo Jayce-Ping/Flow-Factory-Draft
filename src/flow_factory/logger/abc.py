@@ -11,6 +11,8 @@ class Logger(ABC):
 
     def __init__(self, config: Arguments):
         self.config = config
+        self.clean_up_freq = 5
+        self._clean_cnt = 0
         self._init_platform()
 
     @abstractmethod
@@ -39,12 +41,27 @@ class Logger(ABC):
         # 4. Actual Logging
         if final_dict:
             self._log_impl(final_dict, step)
+            
+        # 5. Cleanup temporary files periodically
+        self._clean_cnt = (self._clean_cnt + 1) % self.clean_up_freq
+        if self._clean_cnt == 0:
+            self._cleanup_temp_files(formatted_dict)
 
     def _recursive_convert(self, value: Any) -> Any:
         """Helper to handle lists recursively."""
         if isinstance(value, (list, tuple)):
             return [self._recursive_convert(v) for v in value]
         return self._convert_to_platform(value)
+    
+    def _cleanup_temp_files(self, data: Dict):
+        """Recursively cleanup temporary files in logged data."""
+        for value in data.values():
+            if isinstance(value, LogImage):
+                value.cleanup()
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    if isinstance(item, LogImage):
+                        item.cleanup()
 
     @abstractmethod
     def _convert_to_platform(self, value: Any) -> Any:

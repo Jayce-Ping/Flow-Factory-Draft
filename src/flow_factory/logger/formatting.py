@@ -1,23 +1,120 @@
 # src/flow_factory/logger/formatting.py
 import os
+import tempfile
 import torch
 import numpy as np
 from PIL import Image
 from typing import Any, Dict, List, Union, Optional
-from dataclasses import dataclass, is_dataclass, asdict
+from dataclasses import dataclass, is_dataclass, asdict, field
 from ..models.adapter import BaseSample
+from ..utils.base import numpy_to_pil_image, tensor_to_pil_image
 
 @dataclass
 class LogImage:
-    """Intermediate representation for an Image."""
-    value: Union[str, Image.Image, np.ndarray, torch.Tensor]
+    """Intermediate representation for an Image with compression support."""
+    _value: Union[str, Image.Image, np.ndarray, torch.Tensor] = field(repr=False)
+    _img: Optional[Image.Image] = field(default=None, init=False, repr=False)
     caption: Optional[str] = None
+    compress: bool = True
+    quality: int = 85
+    _temp_path: Optional[str] = field(default=None, init=False, repr=False)
+    
+    @classmethod
+    def to_pil(cls, value: Union[str, Image.Image, np.ndarray, torch.Tensor]) -> Image.Image:
+        """Convert various input types to PIL Image."""
+        if isinstance(value, Image.Image):
+            return value
+        elif isinstance(value, torch.Tensor):
+            return tensor_to_pil_image(value)[0]
+        elif isinstance(value, np.ndarray):
+            return numpy_to_pil_image(value)[0]
+        elif isinstance(value, str) and os.path.exists(value):
+            return Image.open(value).convert('RGB')
+        else:
+            raise ValueError(f"Unsupported image type: {type(value)}")
+
+    @property
+    def value(self) -> Union[str, Image.Image]:
+        """Get compressed .jpg file path or original value."""
+        if self._temp_path:
+            return self._temp_path
+            
+        # If already a path, return as-is
+        if isinstance(self._value, str):
+            return self._value
+        
+        # Convert to PIL Image
+        if self._img is None:
+            self._img = LogImage.to_pil(self._value)
+
+        # Save to temporary file if compression enabled
+        if self.compress:
+            # Using mkstemp ensures the file exists and gives us control over closing it
+            fd, path = tempfile.mkstemp(suffix='.jpg')
+            try:
+                with os.fdopen(fd, 'wb') as f:
+                    self._img.convert('RGB').save(f, format='JPEG', quality=self.quality)
+                self._temp_path = path
+            except Exception as e:
+                if os.path.exists(path):
+                    os.unlink(path)
+                raise e
+            return self._temp_path
+
+        return self._img
+    
+    @value.setter
+    def value(self, val: Union[str, Image.Image, np.ndarray, torch.Tensor]):
+        """Set the value and reset all cached state."""
+        self.cleanup()  # Clean up existing temp files before replacing
+        self._value = val
+        self._img = None
+        self._temp_path = None
+    
+    def cleanup(self):
+        """Remove temporary file if created."""
+        if self._temp_path and os.path.exists(self._temp_path):
+            try:
+                os.unlink(self._temp_path)
+            finally:
+                self._temp_path = None
+
+    def __del__(self):
+        """Destructor to prevent storage leaks if cleanup is forgotten."""
+        self.cleanup()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        """Context manager exit to ensure cleanup."""
+        self.cleanup()
+
+    def __enter__(self):
+        """Context manager enter."""
+        return self
+
 
 @dataclass
 class LogVideo:
     """Intermediate representation for a Video."""
-    value: Union[str, np.ndarray, torch.Tensor]
+    _value: Union[str, np.ndarray, torch.Tensor] = field(repr=False)
     caption: Optional[str] = None
+    
+    def __init__(
+        self,
+        value: Union[str, np.ndarray, torch.Tensor],
+        caption: Optional[str] = None
+    ):
+        self._value = value
+        self.caption = caption
+    
+    @property
+    def value(self) -> Union[str, np.ndarray, torch.Tensor]:
+        """Get the original value."""
+        return self._value
+    
+    @value.setter
+    def value(self, val: Union[str, np.ndarray, torch.Tensor]):
+        """Set the value."""
+        self._value = val
 
 class LogFormatter:
     """
