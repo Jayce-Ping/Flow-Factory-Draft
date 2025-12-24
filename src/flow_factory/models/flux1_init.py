@@ -253,7 +253,9 @@ class Flux1InitAdapter(BaseAdapter):
         # Extract data from samples
         next_latents = torch.stack([s.all_latents[timestep_index + 1] for s in samples], dim=0).to(device)
         latents = torch.stack([s.extra_kwargs['init_latents_ref'] for s in samples], dim=0).to(device) # Use ref initial latents as base
-        init_latents_rand = torch.stack([s.extra_kwargs['init_latents_rand'] for s in samples], dim=0).to(device)
+        init_latents_rand = torch.randn_like(latents).to(device)
+        mix_ratio = self.training_args.mix_ratio
+        latents = (1 - mix_ratio) * latents + mix_ratio * init_latents_rand
         timestep = torch.stack([s.timesteps[timestep_index] for s in samples], dim=0).to(device)
     
         prompt_embeds = torch.stack([s.prompt_embeds for s in samples], dim=0).to(device)
