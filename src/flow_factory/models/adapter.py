@@ -20,6 +20,7 @@ from peft import get_peft_model, LoraConfig, PeftModel
 from ..ema import EMAModuleWrapper
 from ..scheduler import FlowMatchEulerDiscreteSDEScheduler, FlowMatchEulerDiscreteSDESchedulerOutput
 from ..hparams import *
+from ..utils.base import filter_kwargs
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')
 logger = logging.getLogger(__name__)
@@ -485,38 +486,100 @@ class BaseAdapter(nn.Module, ABC):
         self.on_load_vae(device)
         self.on_load_transformer(device)
 
+
+    def preprocess_func(
+        self,
+        prompt : Optional[List[str]] = None,
+        images : Optional[Union[List[Image.Image], List[List[Image.Image]]]] = None,
+        videos : Optional[Union[List[Any], List[List[Any]]]] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """
+        Preprocess input prompt, image, and video into model-compatible embeddings/tensors.
+        Always process a batch of inputs.
+        Args:
+            prompt: List of text prompts. A batch of text inputs.
+            images: 
+                - None: no image input.
+                - List[Image.Image]: list of images (a batch of single images)
+                - List[List[Image.Image]]: list of list of images (a batch of a list images, each image list can be empty)
+            videos: 
+                - None: no video input.
+                - List[Video]: list of videos (a batch of single videos)
+                - List[List[Video]]: list of list of videos (a batch of a list videos, each video list can be empty)
+            **kwargs: Additional keyword arguments for encoder methods.
+
+        """
+        results = {}
+        
+        for input, encoder_method in [
+            (prompt, self.encode_prompt),
+            (images, self.encode_image),
+            (videos, self.encode_video),
+        ]:
+            if input is not None:
+                results.update(
+                    encoder_method(
+                        input,
+                        **(filter_kwargs(encoder_method, **kwargs))
+                    )
+                ) 
+        return results
+
     @abstractmethod
     def encode_prompt(
         self,
-        prompts: Union[str, List[str]],
+        prompt: Union[str, List[str]],
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
         """
         Tokenizes input text prompts into model-compatible embeddings/tensors.
+        Args:
+            prompt: Single or a batch of text prompts.
+            **kwargs: Additional keyword arguments for tokenization/encoding.
         """
         pass
 
     @abstractmethod
     def encode_image(
         self,
-        images: Union[Image.Image, List[Image.Image]],
+        images : Union[Image.Image, List[Image.Image], List[List[Image.Image]]],
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
         """
         Encodes input images into latent representations if applicable.
-        For Flow Matching models, this might be identity.
+        Args:
+            images:
+                - Single Image.Image
+                - List[Image.Image]: list of images (a batch of single images)
+                - List[List[Image.Image]]: list of list of images (a batch of multiple images)
+
+        NOTE:
+            The determination of input `images` type is based on:
+                - if isinstance(images, Image.Image): single image
+                - elif isinstance(images, list) and all(isinstance(img, Image.Image) for img in images): list of single images
+                - elif isinstance(images, list) and all(isinstance(imgs, list) for imgs in images): list of list of images
         """
         pass
 
     @abstractmethod
     def encode_video(
         self,
-        videos: Union[Any, List[Any]],
+        videos: Union[Any, List[Any], List[List[Any]]],
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
         """
         Encodes input videos into latent representations if applicable.
-        For Flow Matching models, this might be identity.
+        Args:
+            videos:
+                - Single video input
+                - List[Any]: list of videos (A batch of single videos)
+                - List[List[Any]]: list of list of videos (A batch of multiple videos)
+        NOTE:
+            The determination of input `videos` type should be based on:
+                - if not isinstance(videos, list): single video
+                - elif isinstance(videos, list) and all(not isinstance(v, list) for v in videos): list of single videos
+                - elif isinstance(videos, list) and all(isinstance(v, list) for v in videos): list of list of videos
         """
         pass
 

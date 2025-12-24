@@ -129,7 +129,7 @@ def pil_image_to_tensor(image: Union[Image.Image, List[Image.Image]]) -> torch.T
         Args:
             image (Union[Image.Image, List[Image.Image]]): PIL Image object or list of PIL Image objects
         Returns:
-            torch.Tensor: Image tensor of shape (C, H, W) or (N, C, H, W)
+            torch.Tensor: Image tensor of shape (N, C, H, W), where N is the number of images. N=1 if input is a single image.
     """
     if isinstance(image, Image.Image):
         image = [image]
@@ -144,7 +144,7 @@ def pil_image_to_tensor(image: Union[Image.Image, List[Image.Image]]) -> torch.T
         img_tensor = torch.from_numpy(img_array).permute(2, 0, 1)  # HWC to CHW
         tensors.append(img_tensor)
     
-    return torch.stack(tensors, dim=0) if len(tensors) > 1 else tensors[0]
+    return torch.stack(tensors, dim=0) # Stack to (N, C, H, W)
 
 
 def tensor_to_pil_image(tensor: torch.Tensor) -> List[Image.Image]:

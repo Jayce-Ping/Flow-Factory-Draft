@@ -1,4 +1,4 @@
-# src/flow_factory/models/flux.py
+# src/flow_factory/models/flux1.py
 from __future__ import annotations
 
 import os
@@ -71,11 +71,17 @@ class Flux1Adapter(BaseAdapter):
             'pooled_prompt_embeds': pooled_prompt_embeds,
         }
     
-    def encode_image(self, image: Union[Image.Image, torch.Tensor, List[torch.Tensor]], **kwargs) -> torch.Tensor:
-        """Not needed for FLUX text-to-image models."""
-        return self.pipeline.encode_image(image, device=self.device, **kwargs)
+    def encode_image(self, images: Union[Image.Image, List[Optional[Image.Image]]], **kwargs) -> None:
+        """
+        Encode input images into latent representations using the VAE encoder.
+         Args:
+            images:
+                - Single Image.Image
+                - List[Image.Image]: list of images
+        """
+        pass
 
-    def encode_video(self, video: Union[torch.Tensor, List[torch.Tensor]], **kwargs) -> torch.Tensor:
+    def encode_video(self, videos: Union[torch.Tensor, List[torch.Tensor]], **kwargs) -> None:
         """Not needed for FLUX text-to-image models."""
         pass
 

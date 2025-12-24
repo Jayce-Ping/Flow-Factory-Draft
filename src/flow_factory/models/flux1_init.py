@@ -1,7 +1,8 @@
-# src/flow_factory/models/flux.py
+# src/flow_factory/models/flux1.py
 from __future__ import annotations
 
 import os
+import math
 from typing import Union, List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 import torch
@@ -153,10 +154,15 @@ class Flux1InitAdapter(BaseAdapter):
             device=device,
             generator=generator2,
         )
-        # Linear interpolation between two init latents, use `noise_level` to control the mix ratio
+        # 1. Linear interpolation between two init latents, use `noise_level` to control the mix ratio
         mix_ratio = self.training_args.mix_ratio
-        latents = mix_ratio * init_latents_rand + (1 - mix_ratio) * init_latents_ref
+        norm_factor = (mix_ratio**2 + (1 - mix_ratio)**2) ** 0.5
+        latents = (mix_ratio * init_latents_rand + (1 - mix_ratio) * init_latents_ref) / norm_factor
         
+        # 2. Cosine/Sine Interpolation
+        # theta = mix_ratio * (torch.pi / 2)
+        # latents = torch.cos(theta) * init_latents_rand + torch.sin(theta) * init_latents_ref
+
         # Set timesteps with scheduler
         timesteps = set_scheduler_timesteps(
             scheduler=self.pipeline.scheduler,
