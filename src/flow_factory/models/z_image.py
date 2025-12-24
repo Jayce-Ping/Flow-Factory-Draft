@@ -44,7 +44,7 @@ class ZImageAdapter(BaseAdapter):
         prompt: Union[str, List[str]],
         device: Optional[torch.device] = None,
         max_sequence_length: int = 512,
-    ) -> Tuple[List[torch.FloatTensor], torch.Tensor]:
+    ) -> Tuple[List[torch.FloatTensor], torch.LongTensor]:
         device = device or self.device
 
         if isinstance(prompt, str):
@@ -332,6 +332,8 @@ class ZImageAdapter(BaseAdapter):
             for b in range(batch_size)
         ]
         
+        self.pipeline.maybe_free_model_hooks()
+
         return samples
     
     # ======================== Forward (Training) ========================

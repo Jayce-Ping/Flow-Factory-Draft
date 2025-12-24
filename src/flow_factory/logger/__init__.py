@@ -8,7 +8,6 @@ loading system for easy extensibility.
 Supported backends:
 - WandB (Weights & Biases)
 - SwanLab
-- Custom backends via registry
 """
 
 from .abc import Logger, LogImage, LogVideo

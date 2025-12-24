@@ -149,6 +149,28 @@ class BaseAdapter(nn.Module, ABC):
         setattr(self.pipeline, first_encoder_name, module)
 
     @property
+    def tokenizers(self) -> List[Any]:
+        """Collect all tokenizers from pipeline."""
+        tokenizers = []
+        for attr_name, attr_value in vars(self.pipeline).items():
+            if (
+                'tokenizer' in attr_name 
+                and not attr_name.startswith('_')  # Filter private attr
+            ):
+                tokenizers.append((attr_name, attr_value))
+        
+        tokenizers.sort(key=lambda x: x[0])
+        return [tok for _, tok in tokenizers]
+    
+    @property
+    def tokenizer(self) -> Any:
+        """Get the first tokenizer."""
+        tokenizers = self.tokenizers
+        if len(tokenizers) == 0:
+            raise ValueError("No tokenizer found in the pipeline.")
+        return tokenizers[0]
+
+    @property
     def vae(self) -> torch.nn.Module:
         return self.pipeline.vae
     

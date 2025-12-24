@@ -210,6 +210,8 @@ class Flux1Adapter(BaseAdapter):
             )
             for b in range(batch_size)
         ]
+
+        self.pipeline.maybe_free_model_hooks()
         
         return samples
 
