@@ -1,4 +1,4 @@
-# src/flow_factory/data/loader.py
+# src/flow_factory/data_utils/loader.py
 import os
 from typing import Union, Tuple, Optional
 import torch

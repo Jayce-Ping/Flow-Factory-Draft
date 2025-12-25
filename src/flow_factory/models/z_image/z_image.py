@@ -9,10 +9,10 @@ from diffusers.pipelines.z_image.pipeline_z_image import ZImagePipeline
 from PIL import Image
 import logging
 
-from .adapter import BaseAdapter, BaseSample
-from ..hparams import *
-from ..scheduler import FlowMatchEulerDiscreteSDEScheduler, FlowMatchEulerDiscreteSDESchedulerOutput, set_scheduler_timesteps
-from ..utils.base import filter_kwargs
+from ..adapter import BaseAdapter, BaseSample
+from ...hparams import *
+from ...scheduler import FlowMatchEulerDiscreteSDEScheduler, FlowMatchEulerDiscreteSDESchedulerOutput, set_scheduler_timesteps
+from ...utils.base import filter_kwargs
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')
 logger = logging.getLogger(__name__)
@@ -344,6 +344,7 @@ class ZImageAdapter(BaseAdapter):
         compute_log_prob : bool = True,
         **kwargs
     ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
+        # 1. Extract data from samples
         batch_size = len(samples)
         device = self.device
         guidance_scale = [s.extra_kwargs.get('guidance_scale', self.training_args.guidance_scale) for s in samples]
@@ -359,7 +360,8 @@ class ZImageAdapter(BaseAdapter):
 
         prompt_embeds = [s.prompt_embeds.to(device) for s in samples]
         negative_prompt_embeds = [s.negative_prompt_embeds.to(device) for s in samples] if do_classifier_free_guidance else []
-        
+
+        # 2. Set scheduler timesteps        
         _ = set_scheduler_timesteps(
             scheduler=self.scheduler,
             num_inference_steps=self.training_args.num_inference_steps,
@@ -367,6 +369,7 @@ class ZImageAdapter(BaseAdapter):
             device=device
         )
 
+        # 3. Forward pass
         if (
             do_classifier_free_guidance
             and cfg_truncation
@@ -425,7 +428,7 @@ class ZImageAdapter(BaseAdapter):
         noise_pred = noise_pred.squeeze(2)
         noise_pred = -noise_pred
 
-        # Perform scheduler step
+        # 4. Compute log prob with given next_latents
         step_kwargs = filter_kwargs(self.scheduler.step, **kwargs)
         output = self.scheduler.step(
             model_output=noise_pred,

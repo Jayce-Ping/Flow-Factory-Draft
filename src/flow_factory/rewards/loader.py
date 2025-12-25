@@ -6,7 +6,7 @@ Factory function using registry pattern for extensibility.
 from typing import Optional
 from accelerate import Accelerator
 
-from .reward_model import BaseRewardModel
+from .abc import BaseRewardModel
 from .registry import get_reward_model_class, list_registered_reward_models
 from ..hparams import Arguments
 

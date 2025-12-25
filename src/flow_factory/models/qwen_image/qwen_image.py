@@ -1,4 +1,4 @@
-# src/flow_factory/models/qwen_image.py
+# src/flow_factory/models/qwen_image/qwen_image.py
 from __future__ import annotations
 
 import os
@@ -9,10 +9,10 @@ from diffusers.pipelines.qwenimage.pipeline_qwenimage import QwenImagePipeline
 from PIL import Image
 import logging
 
-from .adapter import BaseAdapter, BaseSample
-from ..hparams import *
-from ..scheduler import FlowMatchEulerDiscreteSDEScheduler, FlowMatchEulerDiscreteSDESchedulerOutput, set_scheduler_timesteps
-from ..utils.base import filter_kwargs
+from ..adapter import BaseAdapter, BaseSample
+from ...hparams import *
+from ...scheduler import FlowMatchEulerDiscreteSDEScheduler, FlowMatchEulerDiscreteSDESchedulerOutput, set_scheduler_timesteps
+from ...utils.base import filter_kwargs
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')
 logger = logging.getLogger(__name__)
@@ -343,6 +343,7 @@ class QwenImageAdapter(BaseAdapter):
         **kwargs,
     ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
         
+        # 1. Extract data from samples
         batch_size = len(samples)
         device = self.device
         dtype = self.transformer.dtype
@@ -379,6 +380,15 @@ class QwenImageAdapter(BaseAdapter):
 
         guidance = None # Always None for Qwen-Image
 
+        # 2. Set scheduler timesteps
+        _ = set_scheduler_timesteps(
+            scheduler=self.scheduler,
+            num_inference_steps=self.training_args.num_inference_steps,
+            seq_len=latents.shape[1],
+            device=device
+        )
+
+        # 3. Predict noise
         with self.transformer.cache_context("cond"):
             noise_pred = self.transformer(
                 hidden_states=latents,
@@ -411,6 +421,7 @@ class QwenImageAdapter(BaseAdapter):
             noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
             noise_pred = comb_pred * (cond_norm / noise_norm)
 
+        # 4. Compute log prob with given next_latents
         step_kwargs = filter_kwargs(self.scheduler.step, **kwargs)
         output = self.scheduler.step(
             model_output=noise_pred,

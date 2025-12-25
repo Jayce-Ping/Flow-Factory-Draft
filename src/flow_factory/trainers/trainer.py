@@ -33,6 +33,7 @@ class BaseTrainer(ABC):
         self.data_args = config.data_args
         self.training_args = config.training_args
         self.reward_args = config.reward_args
+        self.eval_args = config.eval_args
         self.adapter = adapter
         self.epoch = 0
         self.step = 0

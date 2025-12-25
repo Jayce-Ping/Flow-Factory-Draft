@@ -48,8 +48,8 @@ class GRPOTrainer(BaseTrainer):
 
             # Evaluation
             if (
-                self.training_args.eval_args.eval_freq > 0 and
-                self.epoch % self.training_args.eval_args.eval_freq == 0
+                self.eval_args.eval_freq > 0 and
+                self.epoch % self.eval_args.eval_freq == 0
             ):
                 self.evaluate()
 
@@ -294,7 +294,7 @@ class GRPOTrainer(BaseTrainer):
                 inference_kwargs = {
                     'compute_log_prob': False,
                     'generator': generator,
-                    **self.training_args.eval_args.to_dict(),
+                    **self.eval_args.to_dict(),
                 }
                 inference_kwargs.update(**batch)
                 inference_kwargs = filter_kwargs(self.adapter.inference, **inference_kwargs)

@@ -59,9 +59,9 @@ class ModelArguments(ArgABC):
         metadata={"help": "Rank for LoRA adapters."},
     )
 
-    lora_alpha : int = field(
-        default=16,
-        metadata={"help": "Alpha scaling factor for LoRA adapters."},
+    lora_alpha : Optional[int] = field(
+        default=None,
+        metadata={"help": "Alpha scaling factor for LoRA adapters. Default to `2 * lora_rank` if None."},
     )
 
     def __post_init__(self):        
@@ -71,6 +71,9 @@ class ModelArguments(ArgABC):
         if isinstance(self.target_modules, str):
             if self.target_modules not in ['all', 'default']:
                 self.target_modules = [self.target_modules]
+
+        if self.lora_alpha is None:
+            self.lora_alpha = 2 * self.lora_rank
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)

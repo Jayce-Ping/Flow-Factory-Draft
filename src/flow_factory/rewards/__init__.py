@@ -2,7 +2,7 @@
 """
 Reward models module for evaluating generated content.
 """
-from .reward_model import BaseRewardModel, RewardModelOutput
+from .abc import BaseRewardModel, RewardModelOutput
 from .registry import get_reward_model_class, list_registered_reward_models
 from .loader import load_reward_model
 

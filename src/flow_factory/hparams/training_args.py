@@ -99,7 +99,7 @@ class EvaluationArguments(ArgABC):
 
 
 @dataclass
-class TrainingArguments:
+class TrainingArguments(ArgABC):
     r"""Arguments pertaining to training configuration."""
     resolution: Union[int, tuple[int, int], list[int]] = field(
         default=(512, 512),
@@ -118,26 +118,18 @@ class TrainingArguments:
         default=1,
         metadata={"help": "Batch size per device for sampling and training."},
     )
-    group_size: int = field(
-        default=16,
-        metadata={"help": "Group size for GRPO sampling."},
-    )
-    global_std: bool = field(
-        default=True,
-        metadata={"help": "Whether to use global std for GRPO Advantage normalization."},
-    )
-    unique_sample_num_per_epoch: int = field(
-        default=8,
-        metadata={"help": "Number of unique samples per group for GRPO sampling."},
-    )
     gradient_step_per_epoch: int = field(
         default=2,
         metadata={"help": "Number of gradient steps per epoch."},
     )
+    max_grad_norm: float = field(
+        default=1.0,
+        metadata={"help": "Maximum gradient norm for clipping."},
+    )
     num_batches_per_epoch : int = field(init=False)
     gradient_accumulation_steps : int = field(init=False)
 
-    # PPO/GRPO Clip arguments
+    # GRPO arguments
     trainer_type: Literal["grpo", 'grpo_guard'] = field(
         default="grpo",
         metadata={"help": "Type of trainer to use."},
@@ -150,12 +142,20 @@ class TrainingArguments:
         default=(-5.0, 5.0),
         metadata={"help": "Clipping range for advantages in PPO/GRPO."},
     )
-    max_grad_norm: float = field(
-        default=1.0,
-        metadata={"help": "Maximum gradient norm for clipping."},
+    group_size: int = field(
+        default=16,
+        metadata={"help": "Group size for GRPO sampling."},
+    )
+    unique_sample_num_per_epoch: int = field(
+        default=8,
+        metadata={"help": "Number of unique samples per group for GRPO sampling."},
+    )
+    global_std: bool = field(
+        default=True,
+        metadata={"help": "Whether to use global std for GRPO Advantage normalization."},
     )
 
-    # Denoising process arguments
+    # Sampling arguments
     dynamics_type: Literal["Flow-SDE", 'Dance-SDE', 'CPS', 'ODE'] = field(
         default="Flow-SDE",
         metadata={"help": "Type of SDE to use."},
@@ -198,9 +198,9 @@ class TrainingArguments:
     )
 
     # Optimization arguments
-    learning_rate: float = field(
-        default=3e-4,
-        metadata={"help": "Initial learning rate."},
+    learning_rate: Optional[float] = field(
+        default=None,
+        metadata={"help": "Initial learning rate. Default to 2e-4 for LoRA and 1e-5 for full fine-tuning."},
     )
 
     adam_weight_decay: float = field(
@@ -240,12 +240,6 @@ class TrainingArguments:
     save_dir: str = field(
         default='save',
         metadata={"help": "Directory to save logs and checkpoints. None for no saving."},
-    )
-
-    # Nested evaluation arguments
-    eval_args: EvaluationArguments = field(
-        default_factory=EvaluationArguments,
-        metadata={"help": "Evaluation arguments."},
     )
 
     def __post_init__(self):
@@ -308,11 +302,12 @@ class TrainingArguments:
 
         assert self.adv_clip_range[0] < self.adv_clip_range[1], "`adv_clip_range` lower bound must be less than upper bound."
 
-        if isinstance(self.eval_args, dict):
-            self.eval_args = EvaluationArguments(**self.eval_args)
-
-        if self.eval_args.seed is None:
-            self.eval_args.seed = self.seed
+        if self.learning_rate is None:
+            if 'lora' in self.trainer_type.lower():
+                self.learning_rate = 2e-4
+            else:
+                self.learning_rate = 1e-5
+            logger.info(f"`learning_rate` is not set, using default {self.learning_rate} for `{self.trainer_type}` training.")
 
         # Expand path to user's path
         self.save_dir = os.path.expanduser(self.save_dir)
@@ -321,7 +316,6 @@ class TrainingArguments:
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
-        d['eval_args'] = self.eval_args.to_dict()
         return d
 
     def __str__(self) -> str:

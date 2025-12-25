@@ -12,7 +12,7 @@ from datetime import datetime
 from .abc import ArgABC
 from .data_args import DataArguments
 from .model_args import ModelArguments
-from .training_args import TrainingArguments
+from .training_args import TrainingArguments, EvaluationArguments
 from .reward_args import RewardArguments
 
 
@@ -67,6 +67,10 @@ class Arguments(ArgABC):
         default_factory=RewardArguments,
         metadata={"help": "Arguments for reward model configuration."},
     )
+    eval_args: EvaluationArguments = field(
+        default_factory=EvaluationArguments,
+        metadata={"help": "Arguments for evaluation configuration."},
+    )
 
     def __post_init__(self):
         if self.run_name is None:
@@ -98,6 +102,7 @@ class Arguments(ArgABC):
             'data_args': DataArguments(**args_dict.get('data', {})),
             'model_args': ModelArguments(**args_dict.get('model', {})),
             'training_args': TrainingArguments(**args_dict.get('train', {})),
+            'eval_args': EvaluationArguments(**args_dict.get('eval', {})),
             'reward_args': RewardArguments(**args_dict.get('reward', {})),
         }
         

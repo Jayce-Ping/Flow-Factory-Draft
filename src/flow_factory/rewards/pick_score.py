@@ -1,10 +1,11 @@
+# src/flow_factory/rewards/pick_score.py
 from accelerate import Accelerator
 from transformers import CLIPProcessor, CLIPModel
 from PIL import Image
 from contextlib import nullcontext
 import torch
 
-from .reward_model import BaseRewardModel, RewardModelOutput
+from .abc import BaseRewardModel, RewardModelOutput
 from ..hparams import *
 
 
