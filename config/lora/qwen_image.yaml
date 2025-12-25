@@ -7,7 +7,7 @@ mixed_precision: "bf16"  # Options: no, fp16, bf16
 
 run_name: null  # Run name (auto: {model_type}_{finetune_type}_{timestamp})
 project: "Flow-Factory"  # Project name for logging
-logging_backend: "wandb"  # Options: wandb, swanlab, none
+logging_backend: "none"  # Options: wandb, swanlab, none
 
 # Data Configuration
 data:
@@ -40,10 +40,10 @@ train:
   resolution: 512  # Can be int or [height, width]
   
   # Batch and sampling
-  per_device_batch_size: 1  # Batch size per device
-  group_size: 16  # Group size for GRPO sampling
+  per_device_batch_size: 2  # Batch size per device
+  group_size: 1  # Group size for GRPO sampling
   global_std: false  # Use global std for advantage normalization
-  unique_sample_num_per_epoch: 48  # Unique samples per group
+  unique_sample_num_per_epoch: 4  # Unique samples per group
   gradient_step_per_epoch: 2  # Gradient steps per epoch
   
   # Clipping
@@ -73,11 +73,11 @@ train:
 # Evaluation settings
 eval:
   resolution: 512  # Evaluation resolution
-  per_device_batch_size: 1  # Eval batch size
+  per_device_batch_size: 4  # Eval batch size
   seed: 42  # Eval seed
   guidance_scale: 4  # Guidance scale for sampling
   num_inference_steps: 50  # Number of eval timesteps
-  eval_freq: 0  # Eval frequency in epochs (0 to disable)
+  eval_freq: 10  # Eval frequency in epochs (0 to disable)
 
 # Reward Model Configuration
 reward:
