@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 # Trainer Registry Storage
 _TRAINER_REGISTRY: Dict[str, str] = {
     'grpo': 'flow_factory.trainers.grpo.GRPOTrainer',
-    'grpo_guard': 'flow_factory.trainers.grpo.GRPOGuardTrainer',
+    'grpo-guard': 'flow_factory.trainers.grpo.GRPOGuardTrainer',
 }
 
 
