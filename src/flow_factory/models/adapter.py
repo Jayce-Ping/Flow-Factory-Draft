@@ -18,8 +18,9 @@ from peft import get_peft_model, LoraConfig, PeftModel
 
 
 from ..ema import EMAModuleWrapper
-from ..scheduler.flow_matching import FlowMatchEulerDiscreteSDEScheduler, FlowMatchEulerDiscreteSDESchedulerOutput
+from ..scheduler import FlowMatchEulerDiscreteSDEScheduler, FlowMatchEulerDiscreteSDESchedulerOutput
 from ..hparams import *
+from ..utils.base import filter_kwargs
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')
 logger = logging.getLogger(__name__)
@@ -33,7 +34,6 @@ class BaseSample(BaseOutput):
     all_latents : torch.FloatTensor
     timesteps : torch.FloatTensor
     prompt_ids : torch.LongTensor
-    negative_prompt_ids : Optional[torch.FloatTensor] = None
     height : Optional[int] = None
     width : Optional[int] = None
     image: Optional[Image.Image] = None
@@ -111,10 +111,10 @@ class BaseAdapter(nn.Module, ABC):
         """Load and return the scheduler."""
         return FlowMatchEulerDiscreteSDEScheduler(
             noise_level=self.training_args.noise_level,
-            noise_steps=self.training_args.noise_steps,
-            num_noise_steps=self.training_args.num_noise_steps,
+            train_steps=self.training_args.train_steps,
+            num_train_steps=self.training_args.num_train_steps,
             seed=self.training_args.seed,
-            sde_type=self.training_args.sde_type,
+            dynamics_type=self.training_args.dynamics_type,
             **self.pipeline.scheduler.config.__dict__,
         )
 
@@ -150,6 +150,28 @@ class BaseAdapter(nn.Module, ABC):
         setattr(self.pipeline, first_encoder_name, module)
 
     @property
+    def tokenizers(self) -> List[Any]:
+        """Collect all tokenizers from pipeline."""
+        tokenizers = []
+        for attr_name, attr_value in vars(self.pipeline).items():
+            if (
+                'tokenizer' in attr_name 
+                and not attr_name.startswith('_')  # Filter private attr
+            ):
+                tokenizers.append((attr_name, attr_value))
+        
+        tokenizers.sort(key=lambda x: x[0])
+        return [tok for _, tok in tokenizers]
+    
+    @property
+    def tokenizer(self) -> Any:
+        """Get the first tokenizer."""
+        tokenizers = self.tokenizers
+        if len(tokenizers) == 0:
+            raise ValueError("No tokenizer found in the pipeline.")
+        return tokenizers[0]
+
+    @property
     def vae(self) -> torch.nn.Module:
         return self.pipeline.vae
     
@@ -160,6 +182,21 @@ class BaseAdapter(nn.Module, ABC):
     @property
     def transformer(self) -> torch.nn.Module:
         return self.pipeline.transformer
+    
+    @property
+    def transfomers(self) -> List[torch.nn.Module]:
+        """Collect all transformers from pipeline."""
+        transformers = []
+        for attr_name, attr_value in vars(self.pipeline).items():
+            if (
+                'transformer' in attr_name 
+                and not attr_name.startswith('_')  # Filter private attr
+                and isinstance(attr_value, torch.nn.Module)
+            ):
+                transformers.append((attr_name, attr_value))
+        
+        transformers.sort(key=lambda x: x[0])
+        return [trans for _, trans in transformers]
     
     @transformer.setter
     def transformer(self, module: torch.nn.Module):
@@ -187,14 +224,17 @@ class BaseAdapter(nn.Module, ABC):
                 encoder.eval()
             self.vae.eval()
 
-        self.transformer.eval()
+        for transformer in self.transformers:
+            transformer.eval()
 
         if hasattr(self.scheduler, 'eval'):
             self.scheduler.eval()
 
     def rollout(self, *args, **kwargs):
         """Set the model to rollout mode if applicable. Base implementation sets `transformer` to eval mode and try to set scheduler to rollout mode."""
-        self.transformer.eval()
+        for transformer in self.transformers:
+            transformer.eval()
+        
         if hasattr(self.scheduler, 'rollout'):
             self.scheduler.rollout(*args, **kwargs)
 
@@ -208,7 +248,8 @@ class BaseAdapter(nn.Module, ABC):
                 encoder.train(mode)
             self.vae.train(mode)
 
-        self.transformer.train(mode)
+        for transformer in self.transformers:
+            transformer.train(mode)
 
         if hasattr(self.scheduler, 'train'):
             self.scheduler.train(mode=mode)
@@ -464,38 +505,100 @@ class BaseAdapter(nn.Module, ABC):
         self.on_load_vae(device)
         self.on_load_transformer(device)
 
+
+    def preprocess_func(
+        self,
+        prompt : Optional[List[str]] = None,
+        images : Optional[Union[List[Image.Image], List[List[Image.Image]]]] = None,
+        videos : Optional[Union[List[Any], List[List[Any]]]] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """
+        Preprocess input prompt, image, and video into model-compatible embeddings/tensors.
+        Always process a batch of inputs.
+        Args:
+            prompt: List of text prompts. A batch of text inputs.
+            images: 
+                - None: no image input.
+                - List[Image.Image]: list of images (a batch of single images)
+                - List[List[Image.Image]]: list of list of images (a batch of a list images, each image list can be empty)
+            videos: 
+                - None: no video input.
+                - List[Video]: list of videos (a batch of single videos)
+                - List[List[Video]]: list of list of videos (a batch of a list videos, each video list can be empty)
+            **kwargs: Additional keyword arguments for encoder methods.
+
+        """
+        results = {}
+        
+        for input, encoder_method in [
+            (prompt, self.encode_prompt),
+            (images, self.encode_image),
+            (videos, self.encode_video),
+        ]:
+            if input is not None:
+                results.update(
+                    encoder_method(
+                        input,
+                        **(filter_kwargs(encoder_method, **kwargs))
+                    )
+                ) 
+        return results
+
     @abstractmethod
     def encode_prompt(
         self,
-        prompts: Union[str, List[str]],
+        prompt: Union[str, List[str]],
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
         """
         Tokenizes input text prompts into model-compatible embeddings/tensors.
+        Args:
+            prompt: Single or a batch of text prompts.
+            **kwargs: Additional keyword arguments for tokenization/encoding.
         """
         pass
 
     @abstractmethod
     def encode_image(
         self,
-        images: Union[Image.Image, List[Image.Image]],
+        images : Union[Image.Image, List[Image.Image], List[List[Image.Image]]],
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
         """
         Encodes input images into latent representations if applicable.
-        For Flow Matching models, this might be identity.
+        Args:
+            images:
+                - Single Image.Image
+                - List[Image.Image]: list of images (a batch of single images)
+                - List[List[Image.Image]]: list of list of images (a batch of multiple images)
+
+        NOTE:
+            The determination of input `images` type is based on:
+                - if isinstance(images, Image.Image): single image
+                - elif isinstance(images, list) and all(isinstance(img, Image.Image) for img in images): list of single images
+                - elif isinstance(images, list) and all(isinstance(imgs, list) for imgs in images): list of list of images
         """
         pass
 
     @abstractmethod
     def encode_video(
         self,
-        videos: Union[Any, List[Any]],
+        videos: Union[Any, List[Any], List[List[Any]]],
         **kwargs,
     ) -> Dict[str, torch.Tensor]:
         """
         Encodes input videos into latent representations if applicable.
-        For Flow Matching models, this might be identity.
+        Args:
+            videos:
+                - Single video input
+                - List[Any]: list of videos (A batch of single videos)
+                - List[List[Any]]: list of list of videos (A batch of multiple videos)
+        NOTE:
+            The determination of input `videos` type should be based on:
+                - if not isinstance(videos, list): single video
+                - elif isinstance(videos, list) and all(not isinstance(v, list) for v in videos): list of single videos
+                - elif isinstance(videos, list) and all(isinstance(v, list) for v in videos): list of list of videos
         """
         pass
 
@@ -516,6 +619,7 @@ class BaseAdapter(nn.Module, ABC):
         self,
         samples : List[BaseSample],
         timestep_index : Union[int, torch.IntTensor, torch.LongTensor],
+        compute_log_prob: bool = True,
         **kwargs,
     ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
         """

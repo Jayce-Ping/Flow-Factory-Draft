@@ -1,7 +1,8 @@
-# src/flow_factory/models/flux.py
+# src/flow_factory/models/flux/flux1.py
 from __future__ import annotations
 
 import os
+import math
 from typing import Union, List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 import torch
@@ -9,10 +10,10 @@ from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
 from PIL import Image
 import logging
 
-from ..hparams import *
-from .adapter import BaseAdapter, BaseSample
-from ..scheduler.flow_matching import FlowMatchEulerDiscreteSDEScheduler, FlowMatchEulerDiscreteSDESchedulerOutput, set_scheduler_timesteps
-from ..utils.base import filter_kwargs
+from ..adapter import BaseAdapter, BaseSample
+from ...hparams import *
+from ...scheduler import FlowMatchEulerDiscreteSDEScheduler, FlowMatchEulerDiscreteSDESchedulerOutput, set_scheduler_timesteps
+from ...utils.base import filter_kwargs
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')
 logger = logging.getLogger(__name__)
@@ -23,7 +24,7 @@ class Flux1Sample(BaseSample):
     pooled_prompt_embeds : Optional[torch.FloatTensor] = None
 
 
-class Flux1Adapter(BaseAdapter):
+class Flux1InitAdapter(BaseAdapter):
     """Concrete implementation for Flow Matching models (FLUX.1)."""
     
     def __init__(self, config: Arguments):
@@ -104,8 +105,9 @@ class Flux1Adapter(BaseAdapter):
         width: Optional[int] = None,
         num_inference_steps: Optional[int] = None,
         guidance_scale: Optional[float] = None,
-        generator: Optional[torch.Generator] = None,
-        compute_log_probs: bool = True,
+        generator1: Optional[torch.Generator] = None,
+        generator2: Optional[torch.Generator] = None,
+        compute_log_prob: bool = True,
     ) -> List[Flux1Sample]:
         """Execute generation and return FluxSample objects."""
         
@@ -134,16 +136,33 @@ class Flux1Adapter(BaseAdapter):
         
         # Prepare latents
         num_channels_latents = self.pipeline.transformer.config.in_channels // 4
-        latents, latent_image_ids = self.pipeline.prepare_latents(
+        init_latents_ref, latent_image_ids = self.pipeline.prepare_latents(
             batch_size=batch_size,
             num_channels_latents=num_channels_latents,
             height=height,
             width=width,
             dtype=dtype,
             device=device,
-            generator=generator,
+            generator=generator1,
         )
+        init_latents_rand, _ = self.pipeline.prepare_latents(
+            batch_size=batch_size,
+            num_channels_latents=num_channels_latents,
+            height=height,
+            width=width,
+            dtype=dtype,
+            device=device,
+            generator=generator2,
+        )
+        # 1. Linear interpolation between two init latents, use `noise_level` to control the mix ratio
+        mix_ratio = self.training_args.mix_ratio
+        # norm_factor = (mix_ratio**2 + (1 - mix_ratio)**2) ** 0.5
+        # latents = (mix_ratio * init_latents_rand + (1 - mix_ratio) * init_latents_ref) / norm_factor
         
+        # 2. Cosine/Sine Interpolation
+        theta = mix_ratio * (math.pi / 2)
+        latents = math.sin(theta) * init_latents_rand + math.cos(theta) * init_latents_ref
+
         # Set timesteps with scheduler
         timesteps = set_scheduler_timesteps(
             scheduler=self.pipeline.scheduler,
@@ -156,7 +175,7 @@ class Flux1Adapter(BaseAdapter):
         
         # Denoising loop
         all_latents = [latents]
-        all_log_probs = [] if compute_log_probs else None
+        all_log_probs = [] if compute_log_prob else None
         
         for i, t in enumerate(timesteps):
             timestep = t.expand(batch_size).to(latents.dtype)
@@ -180,13 +199,13 @@ class Flux1Adapter(BaseAdapter):
                 model_output=noise_pred,
                 timestep=t,
                 sample=latents,
-                compute_log_prob=compute_log_probs and current_noise_level > 0,
+                compute_log_prob=compute_log_prob and i == 0,  # Compute log_prob only for the first step
             )
             
             latents = output.prev_sample.to(dtype)
             all_latents.append(latents)
             
-            if compute_log_probs:
+            if compute_log_prob:
                 all_log_probs.append(output.log_prob)
         
         # Decode images
@@ -205,8 +224,12 @@ class Flux1Adapter(BaseAdapter):
                 prompt_embeds=prompt_embeds[b],
                 pooled_prompt_embeds=pooled_prompt_embeds[b],
                 image_ids=latent_image_ids,
-                log_probs=torch.stack([lp[b] for lp in all_log_probs], dim=0) if compute_log_probs else None,
-                extra_kwargs={'guidance_scale': guidance_scale},
+                log_probs=torch.stack([lp[b] for lp in all_log_probs], dim=0) if compute_log_prob else None,
+                extra_kwargs={
+                    'guidance_scale': guidance_scale,
+                    'init_latents_ref': init_latents_ref[b],
+                    'init_latents_rand': init_latents_rand[b],
+                },
             )
             for b in range(batch_size)
         ]
@@ -230,12 +253,18 @@ class Flux1Adapter(BaseAdapter):
             s.extra_kwargs.get('guidance_scale', self.training_args.guidance_scale)
             for s in samples
         ]
+
+        assert timestep_index == 0
         
         # Extract data from samples
-        latents = torch.stack([s.all_latents[timestep_index] for s in samples], dim=0).to(device)
         next_latents = torch.stack([s.all_latents[timestep_index + 1] for s in samples], dim=0).to(device)
-        timestep = torch.stack([s.timesteps[timestep_index] for s in samples], dim=0).to(device)
-        
+        latents = torch.stack([s.extra_kwargs['init_latents_ref'] for s in samples], dim=0).to(device) # Use ref initial latents as base
+        init_latents_rand = torch.randn_like(latents).to(device)
+        mix_ratio = self.training_args.mix_ratio
+        theta = mix_ratio * (math.pi / 2)
+        latents = math.sin(theta) * init_latents_rand + math.cos(theta) * latents
+
+        timestep = torch.stack([s.timesteps[timestep_index] for s in samples], dim=0).to(device)    
         prompt_embeds = torch.stack([s.prompt_embeds for s in samples], dim=0).to(device)
         pooled_prompt_embeds = torch.stack([s.pooled_prompt_embeds for s in samples], dim=0).to(device)
         text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=device)
@@ -269,7 +298,7 @@ class Flux1Adapter(BaseAdapter):
         output = self.scheduler.step(
             model_output=noise_pred,
             timestep=timestep,
-            sample=latents,
+            sample=latents, # Use init_latents_ref as the base sample
             prev_sample=next_latents,
             compute_log_prob=compute_log_prob,
             return_dict=True,

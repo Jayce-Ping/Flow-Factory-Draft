@@ -4,6 +4,7 @@ import swanlab
 from .abc import Logger
 from .formatting import LogImage, LogVideo
 
+
 class SwanlabLogger(Logger):
     def _init_platform(self):
         swanlab.init(

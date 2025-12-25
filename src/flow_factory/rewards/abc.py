@@ -1,6 +1,6 @@
-# src/flow_factory/rewards/reward_model.py
+# src/flow_factory/rewards/abc.py
 """
-Base class for reward models.
+Abstract Base Class for Reward Models
 Provides common interface for all reward models.
 """
 from abc import ABC, abstractmethod

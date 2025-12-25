@@ -22,6 +22,7 @@ from ..utils.base import filter_kwargs, create_generator
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')
 logger = logging.getLogger("flow_factory.train")
 
+
 class GRPOTrainer(BaseTrainer):
     """
     GRPO Trainer for Flow Matching models.
@@ -47,8 +48,8 @@ class GRPOTrainer(BaseTrainer):
 
             # Evaluation
             if (
-                self.training_args.eval_args.eval_freq > 0 and
-                self.epoch % self.training_args.eval_args.eval_freq == 0
+                self.eval_args.eval_freq > 0 and
+                self.epoch % self.eval_args.eval_freq == 0
             ):
                 self.evaluate()
 
@@ -74,7 +75,7 @@ class GRPOTrainer(BaseTrainer):
             
             with torch.no_grad(), self.autocast():
                     sample_kwargs = {
-                        'compute_log_probs': True,
+                        'compute_log_prob': True,
                         **self.training_args.to_dict(),
                     }
                     sample_kwargs.update(**batch)
@@ -210,8 +211,8 @@ class GRPOTrainer(BaseTrainer):
                     leave=False,
                     disable=not self.accelerator.is_local_main_process,
                 )):
-                        # Get old log probs
-                        old_log_probs = torch.stack(
+                        # Get old log prob
+                        old_log_prob = torch.stack(
                             [sample.log_probs[timestep_index] for sample in batch],
                             dim=0
                         )
@@ -225,14 +226,14 @@ class GRPOTrainer(BaseTrainer):
                             output = self.adapter.forward(
                                 batch,
                                 timestep_index=timestep_index,
-                                return_log_prob=True,
+                                compute_log_prob=True,
                             )
 
                         # Clip advantages
                         adv_clip_range = self.training_args.adv_clip_range
                         adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
                         # PPO-style clipped loss
-                        ratio = torch.exp(output.log_prob - old_log_probs)
+                        ratio = torch.exp(output.log_prob - old_log_prob)
                         ratio_clip_range = self.training_args.clip_range
 
                         unclipped_loss = -adv * ratio
@@ -291,9 +292,9 @@ class GRPOTrainer(BaseTrainer):
             ):
                 generator = create_generator(batch['prompt'], self.training_args.seed)
                 inference_kwargs = {
-                    'compute_log_probs': False,
+                    'compute_log_prob': False,
                     'generator': generator,
-                    **self.training_args.eval_args.to_dict(),
+                    **self.eval_args.to_dict(),
                 }
                 inference_kwargs.update(**batch)
                 inference_kwargs = filter_kwargs(self.adapter.inference, **inference_kwargs)
@@ -318,3 +319,113 @@ class GRPOTrainer(BaseTrainer):
                     step=self.step,
                 )
             self.accelerator.wait_for_everyone()
+
+
+
+class GRPOGuardTrainer(GRPOTrainer):
+    """
+    GRPOGuard Trainer with reweighted loss.
+    References:
+    [1] https://arxiv.org/abs/2510.22319
+    [2] https://arxiv.org/abs/2508.04324
+    """
+    
+    def optimize(self, samples: List[BaseSample]) -> None:
+        """Main training loop: compute loss and update policy."""
+        self.adapter.train()
+        # Compute rewards and advantages for samples
+        rewards = self.compute_rewards(samples)
+        advantages = self.compute_advantages(samples)
+        
+        sample_batches : List[List[BaseSample]] = [
+            samples[i:i + self.training_args.per_device_batch_size]
+            for i in range(0, len(samples), self.training_args.per_device_batch_size)
+        ]
+
+        loss_info = defaultdict(list)
+
+        for batch_idx, batch in enumerate(tqdm(
+            sample_batches,
+            total=len(sample_batches),
+            desc=f'Epoch {self.epoch} Training',
+            position=0,
+            disable=not self.accelerator.is_local_main_process,
+        )):
+            with self.accelerator.accumulate(self.adapter.transformer):
+                for idx, timestep_index in enumerate(tqdm(
+                    self.adapter.scheduler.train_timesteps,
+                    desc=f'Epoch {self.epoch} Timestep',
+                    position=1,
+                    leave=False,
+                    disable=not self.accelerator.is_local_main_process,
+                )):
+                        # Get old log probs
+                        old_log_prob = torch.stack(
+                            [sample.log_probs[timestep_index] for sample in batch],
+                            dim=0
+                        )
+                        adv = torch.stack(
+                            [sample.extra_kwargs['advantage'] for sample in batch],
+                            dim=0
+                        )
+
+                        with self.autocast():
+                            # Forward pass
+                            output = self.adapter.forward(
+                                batch,
+                                timestep_index=timestep_index,
+                                compute_log_prob=True,
+                            )
+
+                        # Clip advantages
+                        adv_clip_range = self.training_args.adv_clip_range
+                        adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
+
+                        # Reweighted ratio
+                        scale_factor = torch.sqrt(-output.dt) * output.std_dev_t
+                        old_prev_sample_mean = torch.stack([sample.prev_sample_mean[timestep_index] for sample in batch], dim=0)
+                        mse = (output.prev_sample_mean - old_prev_sample_mean).flatten(1).pow(2).mean(dim=1)
+                        ratio = torch.exp((output.log_prob - old_log_prob) * scale_factor + mse / (2 * scale_factor))
+
+                        # PPO-style clipped loss
+                        ratio_clip_range = self.training_args.clip_range
+
+                        unclipped_loss = -adv * ratio
+                        clipped_loss = -adv * torch.clamp(ratio, 1.0 + ratio_clip_range[0], 1.0 + ratio_clip_range[1])
+                        policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+
+                        loss = policy_loss
+                        loss_info['ratio'].append(ratio.detach())
+                        loss_info['unclipped_loss'].append(unclipped_loss.detach())
+                        loss_info['clipped_loss'].append(clipped_loss.detach())
+                        loss_info['policy_loss'].append(policy_loss.detach())
+                        loss_info["clip_frac_high"].append(torch.mean((ratio > 1.0 + ratio_clip_range[1]).float()))
+                        loss_info["clip_frac_low"].append(torch.mean((ratio < 1.0 + ratio_clip_range[0]).float()))
+
+                        # Other normalization strategies:
+                        # 1. Temp-FlowGRPO
+                        # 2. GRPO-Guard
+
+                        # Backward
+                        self.accelerator.backward(loss)
+                    
+                if self.accelerator.sync_gradients:
+                    self.accelerator.clip_grad_norm_(
+                        self.adapter.get_trainable_parameters(),
+                        self.training_args.max_grad_norm,
+                    )
+                    # Communicate and log losses
+                    loss_info = {
+                        k: torch.stack(v).mean() 
+                        for k, v in loss_info.items()
+                    }
+                    loss_info = self.accelerator.reduce(loss_info, reduction="mean")
+                    self.log_data(
+                        {f'train/{k}': v for k, v in loss_info.items()},
+                        step=self.step,
+                    )
+                    self.step += 1
+                    loss_info = defaultdict(list)
+                
+                self.optimizer.step()
+                self.optimizer.zero_grad()

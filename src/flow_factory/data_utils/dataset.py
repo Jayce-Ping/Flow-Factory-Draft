@@ -1,5 +1,8 @@
 # src/flow_factory/data_utils/dataset.py
 import os
+import inspect
+import hashlib
+
 import torch
 from torch.utils.data import Dataset
 from datasets import load_dataset, Dataset as HFDataset
@@ -31,6 +34,16 @@ class VideoEncodeCallable(Protocol):
         """
         ...
 
+class PreprocessCallable(Protocol):
+    def __call__(
+        self,
+        prompt: Optional[Union[str, List[str]]],
+        image: Optional[Union[Image.Image, List[Image.Image]]],
+        video: Optional[Union[str, List[str]]],
+        **kwargs: Any
+    ) -> Dict[str, Any]:
+        ...
+
 class GeneralDataset(Dataset):
     @staticmethod
     def check_exists(dataset_dir: str, split: str) -> bool:
@@ -48,9 +61,7 @@ class GeneralDataset(Dataset):
         force_reprocess=False,
         preprocessing_batch_size=16,
         max_dataset_size: Optional[int] = None,
-        text_encode_func: Optional[TextEncodeCallable] = None,
-        image_encode_func: Optional[ImageEncodeCallable] = None,
-        video_encode_func: Optional[VideoEncodeCallable] = None,
+        preprocess_func: Optional[PreprocessCallable] = None,
         **kwargs
     ):
         super().__init__()
@@ -80,14 +91,14 @@ class GeneralDataset(Dataset):
             logger.info(f"Dataset size limited to {max_dataset_size} samples.")
     
         if enable_preprocess:
-            self._text_encode_func = text_encode_func
-            self._image_encode_func = image_encode_func
-            self._video_encode_func = video_encode_func
+            self._preprocess_func = preprocess_func
             
             os.makedirs(cache_dir, exist_ok=True)
+            funcs_hash = _compute_encode_funcs_hash(preprocess_func)
             fingerprint = (
                 f"cache_{os.path.basename(self.data_root)}_{split}_"
-                f"cutoff{max_dataset_size if max_dataset_size else 'full'}"
+                f"cutoff{max_dataset_size if max_dataset_size else 'full'}_"
+                f"{funcs_hash}"
             )
             
             self.processed_dataset = raw_dataset.map(
@@ -121,51 +132,89 @@ class GeneralDataset(Dataset):
         image_dir: Optional[str],
         video_dir: Optional[str],
     ) -> Dict[str, Any]:
+        assert self._preprocess_func is not None, "Preprocess function must be provided for preprocessing."
+    
         
+        # 1. Prepare prompt inputs
         prompt = batch["prompt"]
         negative_prompt = batch.get("negative_prompt", None)
-        
-        # 1. Process Text
-        assert self._text_encode_func is not None, "Text encode function must be provided to process prompt."
         prompt_args = {'prompt': prompt} if negative_prompt is None else {'prompt': prompt, 'negative_prompt': negative_prompt}
-        prompt_res = self._text_encode_func(**prompt_args)
         
-        # 2. Process Images (only when image_dir exists and batch has images)
-        collated_image_res = defaultdict(list)
+        # 2. Prepare image inputs (only when image_dir exists and batch has images)
+        if 'image' in batch:
+            # Rename 'image' key to 'images' for consistency
+            batch['images'] = batch.pop('image')
+
+        image_args : Dict[
+            str,
+            Optional[List[List[Image.Image]]]
+        ] = {'images': []}
         if image_dir is not None and "images" in batch:
             img_paths_list = batch["images"]
+            image_args['images'] = []
             for img_paths in img_paths_list:
-                image = []
-                for img_path in img_paths:
-                    with Image.open(os.path.join(image_dir, img_path)) as img:
-                        image.append(img.convert("RGB"))
-                if len(image) > 0:
-                    assert self._image_encode_func is not None, "Image encode function must be provided to process image."
-                    encoded_single_sample = self._image_encode_func(image)
-                    for k, v in encoded_single_sample.items():
-                        collated_image_res[k].append(v)
+                if not img_paths:
+                    # img_paths is [] or None
+                    image_args['images'].append([])
+                else:
+                    if isinstance(img_paths, str):
+                        img_paths = [img_paths]
+                    
+                    image_args['images'].append([
+                        Image.open(os.path.join(image_dir, img_path)).convert("RGB") 
+                        for img_path in img_paths
+                    ])
+        else:
+            image_args['images'] = None
 
-        # 3. Process Videos (only when video_dir exists and batch has videos)
-        collated_video_res = defaultdict(list)
+
+        # 3. Prepare video inputs (only when video_dir exists and batch has videos)
+        if 'video' in batch:
+            # Rename 'video' key to 'videos' for consistency
+            batch['videos'] = batch.pop('video')
+
+        video_args : Dict[
+            str,
+            Optional[List[List[str]]]
+        ] = {'videos': []}
         if video_dir is not None and "videos" in batch:
             video_paths_list = batch["videos"]
+            video_args['videos'] = []
             for video_paths in video_paths_list:
-                video = []
-                for video_path in video_paths:
-                    video.append(os.path.join(video_dir, video_path))
-                if len(video) > 0:
-                    assert self._video_encode_func is not None, "Video encode function must be provided to process video."
-                    encoded_single_sample = self._video_encode_func(video)
-                    for k, v in encoded_single_sample.items():
-                        collated_video_res[k].append(v)
+                if not video_paths:
+                    # video_paths is [] or None
+                    video_args['videos'].append([])
+                else:
+                    if isinstance(video_paths, str):
+                        video_paths = [video_paths]
+                    
+                    video_args['videos'].append([
+                        os.path.join(video_dir, video_path) 
+                        for video_path in video_paths
+                    ])
+        else:
+            video_args['videos'] = None
 
         # 4. Merge results
-        prompt_res = {
-            k: (list(torch.unbind(v)) if isinstance(v, torch.Tensor) else v) 
-            for k, v in prompt_res.items()
+        input_args = {**prompt_args, **image_args, **video_args}
+        preprocess_res = self._preprocess_func(**input_args)
+
+        # Warn if there are overlapping keys
+        # Latter keys override former keys if any overlap
+        key_intersection = set(batch.keys()).intersection(set(preprocess_res.keys()))
+        if key_intersection:
+            logger.warning(
+                f"Preprocess function returned keys that overlap with original batch: {key_intersection}. "
+                f"Latter keys will override former keys."
+            )
+
+        # Convert any batched tensor outputs to List[Tensor] for consistency
+        preprocess_res = {
+            k: (list(torch.unbind(v, dim=0)) if isinstance(v, torch.Tensor) else v) 
+            for k, v in preprocess_res.items()
         }
 
-        return {**batch, **prompt_res, **collated_image_res, **collated_video_res}
+        return {**batch, **preprocess_res}
 
     def __len__(self):
         return len(self.processed_dataset)
@@ -175,9 +224,6 @@ class GeneralDataset(Dataset):
     
     @staticmethod
     def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Custom collate function to handle batching of pre-processed samples.
-        """
         if not batch:
             return {}
 
@@ -186,12 +232,105 @@ class GeneralDataset(Dataset):
 
         for key in keys:
             values = [sample[key] for sample in batch]
+            
+            # Check if values are tensors
             if isinstance(values[0], torch.Tensor):
-                try:
-                    collated_batch[key] = torch.stack(values)
-                except:
+                # Check if all tensors have the same shape
+                shapes = [v.shape for v in values]
+                if all(s == shapes[0] for s in shapes):
+                    collated_batch[key] = torch.stack(values, dim=0)
+                else:
+                    # Shapes differ (e.g., different number of conditions), keep as List[Tensor]
                     collated_batch[key] = values
             else:
+                # For int, str, list and etc...
                 collated_batch[key] = values
 
         return collated_batch
+
+
+def _compute_function_hash(func: Optional[Callable], digits: int = 16) -> str:
+    """
+    Compute a stable hash value for a callable function to use in cache fingerprints.
+    
+    Strategy (fallback chain):
+    1. Use function source code (most accurate)
+    2. Fall back to module path + function name (for compatibility)
+    3. Final fallback to object ID (unstable but always works)
+    
+    Args:
+        func: The callable to compute hash for, can be None
+    
+    Returns:
+        A 16-character hexadecimal hash string
+    
+    Examples:
+        >>> def my_func(x): return x * 2
+        >>> hash1 = _compute_function_hash(my_func)
+        >>> hash2 = _compute_function_hash(None)
+        >>> hash1 != hash2
+        True
+    """
+    _MAX_DIGITS = 32
+    digits = min(digits, _MAX_DIGITS)
+    if func is None:
+        return "none" * 4  # "nonenonenoneone" - stable identifier for None
+    
+    try:
+        # Method 1: Get function source code (most reliable)
+        source = inspect.getsource(func)
+        # Remove whitespace differences to avoid spurious cache misses
+        source = "".join(source.split())
+        return hashlib.md5(source.encode()).hexdigest()[:digits]
+    except (TypeError, OSError):
+        # Method 2: Use module path + function name (fallback)
+        try:
+            module = inspect.getmodule(func)
+            module_name = module.__name__ if module else "unknown"
+            func_name = getattr(func, '__qualname__', getattr(func, '__name__', 'anonymous'))
+            signature = f"{module_name}.{func_name}"
+            return hashlib.md5(signature.encode()).hexdigest()[:digits]
+        except:
+            # Method 3: Final fallback - use object ID (not stable across runs but prevents crashes)
+            logger.warning(f"Could not compute stable hash for {func}, using id() fallback")
+            return hashlib.md5(str(id(func)).encode()).hexdigest()[:digits]
+
+
+def _compute_encode_funcs_hash(*funcs: Optional[Callable], digits: int = 16) -> str:
+    """
+    Compute a joint hash value for multiple encoding functions.
+    
+    This ensures that cache is invalidated when any preprocessing logic changes,
+    while allowing cache reuse when logic remains the same.
+    
+    Args:
+        *funcs: Variable number of callables (encoding functions)
+                Can include None values which will be handled gracefully
+    
+    Returns:
+        A 16-character hexadecimal hash string representing the joint hash
+    
+    Examples:
+        >>> hash1 = _compute_encode_funcs_hash(text_enc, image_enc, None)
+        >>> hash2 = _compute_encode_funcs_hash(text_enc, image_enc, video_enc)
+        >>> hash1 != hash2  # Different because third function changed
+        True
+        
+        >>> # Same functions produce same hash
+        >>> hash3 = _compute_encode_funcs_hash(text_enc, image_enc, None)
+        >>> hash1 == hash3
+        True
+    """
+    _MAX_DIGITS = 32
+    digits = min(digits, _MAX_DIGITS)
+    # Compute individual hashes for each function
+    individual_hashes = [_compute_function_hash(func) for func in funcs]
+    
+    # Combine hashes with labels for clarity in debugging
+    combined_parts = [f"func{i}:{hash_val}" for i, hash_val in enumerate(individual_hashes)]
+    combined = "|".join(combined_parts)
+    
+    # Generate final joint hash
+    joint_hash = hashlib.md5(combined.encode()).hexdigest()[:digits]
+    
+    return joint_hash

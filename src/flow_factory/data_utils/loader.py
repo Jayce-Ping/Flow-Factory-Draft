@@ -1,4 +1,4 @@
-# src/flow_factory/data/loader.py
+# src/flow_factory/data_utils/loader.py
 import os
 from typing import Union, Tuple, Optional
 import torch
@@ -8,7 +8,7 @@ from accelerate import Accelerator
 from .dataset import GeneralDataset
 from .sampler import DistributedKRepeatSampler
 from ..hparams import *
-from ..data_utils.dataset import TextEncodeCallable, ImageEncodeCallable, VideoEncodeCallable
+from ..data_utils.dataset import TextEncodeCallable, ImageEncodeCallable, VideoEncodeCallable, PreprocessCallable
 from ..utils.base import filter_kwargs
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -16,9 +16,7 @@ os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 def get_dataloader(
     config : Arguments,
     accelerator : Accelerator,
-    text_encode_func : Optional[TextEncodeCallable] = None,
-    image_encode_func : Optional[ImageEncodeCallable] = None,
-    video_encode_func : Optional[VideoEncodeCallable] = None,
+    preprocess_func : Optional[PreprocessCallable] = None,
     **kwargs,
 ) -> Tuple[DataLoader, Union[DataLoader, None]]:
     """
@@ -29,21 +27,19 @@ def get_dataloader(
 
     # 1. Initialize Dataset (Now handles tokenization internally)
     dataset_init_kwargs = {
-        "text_encode_func": text_encode_func,
-        "image_encode_func": image_encode_func,
-        "video_encode_func": video_encode_func,
+        "preprocess_func": preprocess_func,
     }
     dataset_init_kwargs.update(filter_kwargs(GeneralDataset.__init__, **data_args.to_dict()))
     # Only the main process handles preprocessing and caching
     dataset_init_kwargs['force_reprocess'] = data_args.force_reprocess and accelerator.is_main_process
     dataset = GeneralDataset(
         split="train",
-        **dataset_init_kwargs
+        **dataset_init_kwargs,
     )
     if GeneralDataset.check_exists(data_args.dataset, "test"):
         test_dataset = GeneralDataset(
             split="test",
-            **dataset_init_kwargs
+            **dataset_init_kwargs,
         )
 
     # 3. Initialize GRPO Sampler (Logic Unchanged)

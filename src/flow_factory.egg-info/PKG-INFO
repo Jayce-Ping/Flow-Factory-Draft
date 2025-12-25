@@ -16,7 +16,7 @@ Requires-Dist: torch>=2.6.0
 Requires-Dist: torchvision>=0.19.0
 Requires-Dist: torchaudio>=2.4.0
 Requires-Dist: transformers>=4.57.1
-Requires-Dist: diffusers>=0.35.2
+Requires-Dist: diffusers>=0.36.0
 Requires-Dist: accelerate>=1.11.0
 Requires-Dist: peft>=0.17.0
 Requires-Dist: datasets>=3.3.2
@@ -31,7 +31,7 @@ Requires-Dist: pydantic>=2.8.0
 Requires-Dist: pyyaml>=6.0
 Requires-Dist: tqdm
 Provides-Extra: deepspeed
-Requires-Dist: deepspeed<=0.17.4,==0.15.4; extra == "deepspeed"
+Requires-Dist: deepspeed<=0.17.4,>=0.15.4; extra == "deepspeed"
 Provides-Extra: quantization
 Requires-Dist: bitsandbytes>=0.45.3; extra == "quantization"
 Provides-Extra: wandb

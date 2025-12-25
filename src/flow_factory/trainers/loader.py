@@ -1,39 +1,47 @@
-# src/flow_factory/trainers/loader.py
+# src/flow_factory/trainers/loader.py (重构版)
 """
 Trainer loader factory for extensibility.
-Supports multiple RL algorithms and can be easily extended.
+Supports multiple RL algorithms via registry pattern.
 """
 import os
 from accelerate import Accelerator
 from accelerate.utils import set_seed, ProjectConfiguration
-from typing import Literal
 import logging
 
 from ..models.loader import load_model
 from .trainer import BaseTrainer
-from .grpo_trainer import GRPOTrainer
-from ..hparams import *
+from .registry import get_trainer_class, list_registered_trainers
+from ..hparams import Arguments
 
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')
 logger = logging.getLogger(__name__)
 
 
-def load_trainer(
-    config : Arguments,
-) -> BaseTrainer:
+def load_trainer(config: Arguments) -> BaseTrainer:
     """
-    Factory function to instantiate the correct trainer based on algorithm type.
+    Factory function to instantiate trainer based on algorithm type.
+    
+    Uses registry pattern for automatic trainer discovery and loading.
+    Supports both built-in trainers and custom algorithms via python paths.
     
     Args:
-        trainer_type: Algorithm type (grpo, ppo, dpo, reinforce, etc.)
-        data_args: Data configuration
-        training_args: Training configuration
-        reward_args: Reward model configuration
-        adapter: Model adapter instance
+        config: Configuration containing trainer_type and all hyperparameters
     
     Returns:
-        An instance of a subclass of BaseTrainer
+        An instance of a BaseTrainer subclass
+    
+    Raises:
+        ImportError: If the trainer is not registered or cannot be imported
+    
+    Examples:
+        # Using built-in trainer
+        config.training_args.trainer_type = "grpo"
+        trainer = load_trainer(config)
+        
+        # Using custom trainer
+        config.training_args.trainer_type = "my_package.trainers.PPOTrainer"
+        trainer = load_trainer(config)
     """
     # Initialize Accelerator
     accelerator_config = ProjectConfiguration(
@@ -47,22 +55,20 @@ def load_trainer(
     )
     set_seed(config.training_args.seed, device_specific=True)
 
-    # Initialize model adapter    
+    # Initialize model adapter
     adapter = load_model(config=config)
 
-    # Initialize trainer
-    trainer_type = config.training_args.trainer_type.lower()
-    trainer_mapping = {
-        "grpo": GRPOTrainer,
-    }
+    # Get trainer class from registry
+    trainer_type = config.training_args.trainer_type
     
-    if trainer_type not in trainer_mapping:
-        raise ValueError(
-            f"Unknown trainer type: {trainer_type}. "
-            f"Supported: {list(trainer_mapping.keys())}"
-        )
-    
-    trainer_cls = trainer_mapping[trainer_type]
+    try:
+        trainer_cls = get_trainer_class(trainer_type)
+    except ImportError as e:
+        registered_trainers = list(list_registered_trainers().keys())
+        raise ImportError(
+            f"Failed to load trainer '{trainer_type}'. "
+            f"Available trainers: {registered_trainers}"
+        ) from e
     
     return trainer_cls(
         config=config,

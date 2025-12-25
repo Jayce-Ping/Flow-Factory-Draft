@@ -1,6 +1,6 @@
 # Environment Configuration
 launcher: "accelerate"  # Options: accelerate
-config_file: config/accelerate_configs/deepspeed_zero2.yaml  # Path to distributed config file (optional)
+config_file: config/accelerate_configs/multi_gpu.yaml  # Path to distributed config file (optional)
 num_processes: 8  # Number of processes to launch (overrides config file)
 main_process_port: 29500
 mixed_precision: "bf16"  # Options: no, fp16, bf16
@@ -15,6 +15,7 @@ data:
   preprocessing_batch_size: 8  # Batch size for preprocessing
   dataloader_num_workers: 16  # Number of workers for DataLoader
   enable_preprocess: true  # Enable dataset preprocessing
+  force_reprocess: false  # Force reprocessing of the dataset
   max_dataset_size: 1000  # Limit the maximum number of samples in the dataset
 
 # Model Configuration
@@ -51,11 +52,11 @@ train:
   max_grad_norm: 1.0  # Max gradient norm for clipping
   
   # Denoising process
-  sde_type: "Flow-SDE"  # Options: Flow-SDE, Dance-SDE, CPS
+  dynamics_type: "Flow-SDE"  # Options: Flow-SDE, Dance-SDE, CPS, ODE
   num_inference_steps: 9  # Number of SDE timesteps
   noise_level: 0.7  # Noise level for sampling
-  num_noise_steps: 1  # Number of noise steps
-  noise_steps: [1, 2, 3]  # Custom noise window
+  num_train_steps: 1  # Number of noise steps
+  train_steps: [1, 2, 3]  # Custom noise window
   guidance_scale: 3.5  # Guidance scale for sampling
   
   # Optimization
@@ -69,14 +70,14 @@ train:
   ema_decay: 0.9  # EMA decay rate (0 to disable)
   ema_update_interval: 4  # EMA update interval (in epochs)
   
-  # Evaluation settings
-  eval_args:
-    resolution: 512  # Evaluation resolution
-    per_device_batch_size: 1  # Eval batch size
-    seed: 42  # Eval seed (defaults to training seed)
-    guidance_scale: 3.5  # Guidance scale for sampling
-    num_inference_steps: 9  # Number of eval timesteps
-    eval_freq: 10  # Eval frequency in epochs (0 to disable)
+# Evaluation settings
+eval:
+  resolution: 512  # Evaluation resolution
+  per_device_batch_size: 1  # Eval batch size
+  seed: 42  # Eval seed (defaults to training seed)
+  guidance_scale: 3.5  # Guidance scale for sampling
+  num_inference_steps: 9  # Number of eval timesteps
+  eval_freq: 0  # Eval frequency in epochs (0 to disable)
 
 # Reward Model Configuration
 reward:

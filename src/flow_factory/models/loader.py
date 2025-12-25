@@ -1,42 +1,42 @@
-# src/flow_factory/model/loader.py
+# src/flow_factory/models/loader.py
+"""
+Model Adapter Loader
+Factory function using registry pattern for extensibility.
+"""
 import logging
-import importlib
 from typing import Tuple
 from accelerate import Accelerator
 from .adapter import BaseAdapter
-from ..hparams import *
+from .registry import get_model_adapter_class, list_registered_models
+from ..hparams import Arguments
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')
 logger = logging.getLogger(__name__)
 
-# register map
-_MODEL_REGISTRY = {
-    "flux1": ("flux1", "Flux1Adapter"),
-    "z-image": ("z_image", "ZImageAdapter"),
-    "sd3_5": ("sd3_5", "SD3_5Adapter"),
-}
 
 def load_model(config : Arguments) -> BaseAdapter:
     """
     Factory function to instantiate the correct model adapter based on configuration.
     
+    Uses a registry pattern for automatic model discovery and loading.
+    Supports both built-in models and custom adapters via python paths.
+    
     Args:
-        model_args: DataClass containing 'model_type', 'model_name_or_path', etc.
-        training_args: DataClass containing bf16/fp16 settings.
+        config: Arguments object containing model_args with 'model_type'
     
     Returns:
         An instance of a subclass of BaseAdapter.
     """
     model_args = config.model_args
     model_type = model_args.model_type.lower()
-    # print(f"Model type from config: {model_type}")
+    
     logger.info(f"Loading model architecture: {model_type}...")
     
-    if model_type not in _MODEL_REGISTRY:
+    if model_type == "flux1":
+        from .flux1 import Flux1Adapter
+        return Flux1Adapter(config=config)
+    elif model_type == 'z-image':
+        from .z_image import ZImageAdapter
+        return ZImageAdapter(config=config)
+    else:
         raise NotImplementedError(f"Model type '{model_type}' is not supported yet.")
-
-    module_name, class_name = _MODEL_REGISTRY[model_type]
-    module = importlib.import_module(f'.{module_name}', package=__package__)
-    adapter_class = getattr(module, class_name)
-    # print(f"Using adapter class: {adapter_class}")
-    return adapter_class(config=config)

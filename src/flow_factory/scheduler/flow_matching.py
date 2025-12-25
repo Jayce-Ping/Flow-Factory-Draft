@@ -31,21 +31,24 @@ def calculate_shift(
 def set_scheduler_timesteps(
     scheduler,
     num_inference_steps: int,
-    seq_len: int,
+    seq_len: Optional[int] = None,
     sigmas: Optional[Union[List[float], np.ndarray]] = None,
     device: Optional[Union[str, torch.device]] = None,
+    mu : Optional[float] = None,
 ):
     sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
     if hasattr(scheduler.config, "use_flow_sigmas") and scheduler.config.use_flow_sigmas:
         sigmas = None
     # 5. Prepare scheduler, shift timesteps/sigmas according to image size (image_seq_len)
-    mu = calculate_shift(
-        seq_len,
-        scheduler.config.get("base_image_seq_len", 256),
-        scheduler.config.get("max_image_seq_len", 4096),
-        scheduler.config.get("base_shift", 0.5),
-        scheduler.config.get("max_shift", 1.15),
-    )
+    if mu is None:
+        assert seq_len is not None, "`seq_len` must be provided if `mu` is not given."
+        mu = calculate_shift(
+            seq_len,
+            scheduler.config.get("base_image_seq_len", 256),
+            scheduler.config.get("max_image_seq_len", 4096),
+            scheduler.config.get("base_shift", 0.5),
+            scheduler.config.get("max_shift", 1.15),
+        )
     timesteps, num_inference_steps = retrieve_timesteps(
         scheduler,
         num_inference_steps,
@@ -74,25 +77,25 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler):
     def __init__(
         self,
         noise_level : float = 0.7,
-        noise_steps : Optional[Union[int, list, torch.Tensor]] = None,
-        num_noise_steps : Optional[int] = None,
+        train_steps : Optional[Union[int, list, torch.Tensor]] = None,
+        num_train_steps : Optional[int] = None,
         seed : int = 42,
-        sde_type : Literal["Flow-SDE", 'Dance-SDE', 'CPS'] = "Flow-SDE",
+        dynamics_type : Literal["Flow-SDE", 'Dance-SDE', 'CPS', 'ODE'] = "Flow-SDE",
         **kwargs
     ):
         super().__init__(**kwargs)
-        if noise_steps is None:
+        if train_steps is None:
             # Default to all noise steps
-            noise_steps = list(range(len(self.timesteps)))
+            train_steps = list(range(len(self.timesteps)))
 
         self.noise_level = noise_level
 
         assert self.noise_level >= 0, "Noise level must be non-negative."
 
-        self.noise_steps = torch.tensor(noise_steps, dtype=torch.int64)
-        self.num_noise_steps = num_noise_steps if num_noise_steps is not None else len(noise_steps) # Default to all noise steps
+        self.train_steps = torch.tensor(train_steps, dtype=torch.int64)
+        self.num_train_steps = num_train_steps if num_train_steps is not None else len(train_steps) # Default to all noise steps
         self.seed = seed
-        self.sde_type = sde_type
+        self.dynamics_type = dynamics_type
         self._is_eval = False
 
     @property
@@ -112,40 +115,40 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler):
         self.train(*args, **kwargs)
 
     @property
-    def current_noise_steps(self) -> torch.Tensor:
+    def current_train_steps(self) -> torch.Tensor:
         """
-            Returns the current noise steps under the self.seed.
-            Randomly select self.num_noise_steps from self.noise_steps.
+            Returns the current train step indices under the self.seed.
+            Randomly select self.num_train_steps from self.train_steps.
         """
-        if self.num_noise_steps >= len(self.noise_steps):
-            return self.noise_steps
+        if self.num_train_steps >= len(self.train_steps):
+            return self.train_steps
         generator = torch.Generator().manual_seed(self.seed)
-        selected_indices = torch.randperm(len(self.noise_steps), generator=generator)[:self.num_noise_steps]
-        return self.noise_steps[selected_indices]
+        selected_indices = torch.randperm(len(self.train_steps), generator=generator)[:self.num_train_steps]
+        return self.train_steps[selected_indices]
 
     @property
     def train_timesteps(self) -> torch.Tensor:
         """
             Returns timesteps that to train on.
         """
-        return self.current_noise_steps
+        return self.current_train_steps
 
-    def get_noise_timesteps(self) -> torch.Tensor:
+    def get_train_timesteps(self) -> torch.Tensor:
         """
             Returns timesteps within the current window.
         """
-        return self.timesteps[self.noise_steps]
+        return self.timesteps[self.train_steps]
 
-    def get_noise_sigmas(self) -> torch.Tensor:
+    def get_train_sigmas(self) -> torch.Tensor:
         """
             Returns sigmas within the current window.
         """
-        return self.sigmas[self.noise_steps]
+        return self.sigmas[self.train_steps]
 
     def get_noise_levels(self) -> torch.Tensor:
         """ Returns noise levels on all timesteps, where noise level is non-zero only within the current window. """
         noise_levels = torch.zeros_like(self.timesteps, dtype=torch.float32)
-        noise_levels[self.current_noise_steps] = self.noise_level
+        noise_levels[self.current_train_steps] = self.noise_level
         return noise_levels
 
     def get_noise_level_for_timestep(self, time_step) -> float:
@@ -153,7 +156,7 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler):
             Return the noise level for a specific timestep.
         """
         time_step_index = self.index_for_timestep(time_step)
-        if time_step_index in self.noise_steps:
+        if time_step_index in self.train_steps:
             return self.noise_level
 
         return 0.0
@@ -163,7 +166,7 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler):
             Return the noise level for a specific sigma.
         """
         sigma_index = (self.sigmas - sigma).abs().argmin().item()
-        if sigma_index in self.noise_steps:
+        if sigma_index in self.train_steps:
             return self.noise_level
 
         return 0.0
@@ -182,9 +185,9 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler):
         prev_sample: Optional[torch.FloatTensor] = None,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         noise_level : Optional[Union[int, float, torch.Tensor]] = None,
-        compute_log_prob: bool = False,
+        compute_log_prob: bool = True,
         return_dict: bool = True,
-        sde_type : Optional[Literal['Flow-SDE', 'Dance-SDE', 'CPS']] = None,
+        dynamics_type : Optional[Literal['Flow-SDE', 'Dance-SDE', 'CPS', 'ODE']] = None,
         sigma_max: Optional[float] = None,
     ):
         if (
@@ -227,9 +230,21 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler):
         sigma_prev = to_broadcast_tensor(sigma_prev, sample)
         dt = sigma_prev - sigma # dt is negative, (batch_size, 1, 1)
 
-        sde_type = sde_type or self.sde_type
+        dynamics_type = dynamics_type or self.dynamics_type
         # 3. Compute next sample
-        if sde_type == "Flow-SDE":
+        if dynamics_type == 'ODE':
+            # ODE Sampling
+            prev_sample_mean = sample + model_output * dt
+            std_dev_t = torch.zeros_like(sigma)
+
+            if prev_sample is None:
+                prev_sample = prev_sample_mean
+
+            if compute_log_prob:
+                log_prob = -((prev_sample.detach() - prev_sample_mean) ** 2)
+                log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+
+        elif dynamics_type == "Flow-SDE":
             # FlowGRPO sde
             sigma_max = sigma_max or self.sigmas[1].item() # To avoid dividing by zero
             sigma_max = to_broadcast_tensor(sigma_max, sample)
@@ -257,7 +272,7 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler):
                 )
                 log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
 
-        elif sde_type == "Dance-SDE":
+        elif dynamics_type == "Dance-SDE":
             pred_original_sample = sample - sigma * model_output
             std_dev_t = noise_level * torch.sqrt(-1 * dt)
             log_term = 0.5 * noise_level**2 * (sample - pred_original_sample * (1 - sigma)) / sigma**2
@@ -281,7 +296,7 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler):
                 # mean along all but batch dimension
                 log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
 
-        elif sde_type == "CPS":
+        elif dynamics_type == "CPS":
             # FlowCPS
             std_dev_t = sigma_prev * torch.sin(noise_level * torch.pi / 2)
             x0 = sample - sigma * model_output
