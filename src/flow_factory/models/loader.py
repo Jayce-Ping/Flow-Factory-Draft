@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 _MODEL_REGISTRY = {
     "flux1": ("flux1", "Flux1Adapter"),
     "z-image": ("z_image", "ZImageAdapter"),
+    "sd3_5": ("sd3_5", "SD3_5Adapter"),
 }
 
 def load_model(config : Arguments) -> BaseAdapter:
@@ -28,7 +29,7 @@ def load_model(config : Arguments) -> BaseAdapter:
     """
     model_args = config.model_args
     model_type = model_args.model_type.lower()
-    
+    # print(f"Model type from config: {model_type}")
     logger.info(f"Loading model architecture: {model_type}...")
     
     if model_type not in _MODEL_REGISTRY:
@@ -37,7 +38,5 @@ def load_model(config : Arguments) -> BaseAdapter:
     module_name, class_name = _MODEL_REGISTRY[model_type]
     module = importlib.import_module(f'.{module_name}', package=__package__)
     adapter_class = getattr(module, class_name)
-
-
-    
+    # print(f"Using adapter class: {adapter_class}")
     return adapter_class(config=config)
