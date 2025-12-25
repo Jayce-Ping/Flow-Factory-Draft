@@ -4,6 +4,7 @@ import wandb
 from .abc import Logger
 from .formatting import LogImage, LogVideo
 
+
 class WandbLogger(Logger):
     def _init_platform(self):
         wandb.init(

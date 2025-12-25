@@ -1,6 +1,6 @@
 # Environment Configuration
 launcher: "accelerate"  # Options: accelerate
-config_file: config/accelerate_configs/deepspeed_zero2.yaml  # Path to distributed config file (optional)
+config_file: config/accelerate_configs/multi_gpu.yaml  # Path to distributed config file (optional)
 num_processes: 8  # Number of processes to launch (overrides config file)
 main_process_port: 29500
 mixed_precision: "bf16"  # Options: no, fp16, bf16
@@ -11,7 +11,7 @@ logging_backend: "wandb"  # Options: wandb, swanlab, none
 
 # Data Configuration
 data:
-  dataset_dir: "dataset/pickscore"  # Path to dataset folder
+  dataset_dir: "dataset/t2is"  # Path to dataset folder
   preprocessing_batch_size: 8  # Batch size for preprocessing
   dataloader_num_workers: 16  # Number of workers for DataLoader
   enable_preprocess: true  # Enable dataset preprocessing
@@ -24,14 +24,13 @@ model:
   lora_rank : 64
   lora_alpha : 128
   target_modules: "default" # Options: all, default, or list of module names like ["to_k", "to_q", "to_v", "to_out.0"]
-  model_name_or_path: "Tongyi-MAI/Z-Image-Turbo"  # HuggingFace model ID or local path
-  model_type: "z-image"  # Options: flux1, flux1-kontext, flux2, qwenimage, qwenimage-edit, z-image
+  model_name_or_path: "Qwen/Qwen-Image"  # HuggingFace model ID or local path
+  model_type: "qwenimage"  # Options: flux1, flux1-kontext, flux2, qwenimage, qwenimage-edit
   resume_path: null # Path to load previous checkpoint/lora adapter
   master_weight_dtype: 'float32' # Weight dtype for trainable parameters when full-paramter fine-tuning, options are ["float16", "bfloat16", "float32"]
 
 # Training Configuration
 train:
-  trainer_type: 'grpo_guard'
   # Training settings
   enable_gradient_checkpointing: false  # Enable gradient checkpointing to save memory with extra compute
   save_freq: 0  # Save frequency in epochs (0 to disable)
@@ -54,11 +53,11 @@ train:
   
   # Denoising process
   dynamics_type: "Flow-SDE"  # Options: Flow-SDE, Dance-SDE, CPS, ODE
-  num_inference_steps: 6  # Number of SDE timesteps
-  noise_level: 0.7  # Noise level for sampling
+  num_inference_steps: 10  # Number of SDE timesteps
+  noise_level: 1.0  # Noise level for sampling
   num_train_steps: 1  # Number of noise steps
   train_steps: [1, 2, 3]  # Custom noise window
-  guidance_scale: 0  # Guidance scale for sampling
+  guidance_scale: 4  # Guidance scale for sampling
   
   # Optimization
   seed: 42  # Random seed
@@ -76,9 +75,9 @@ eval:
   resolution: 512  # Evaluation resolution
   per_device_batch_size: 1  # Eval batch size
   seed: 42  # Eval seed
-  guidance_scale: 0  # Guidance scale for sampling
-  num_inference_steps: 10  # Number of eval timesteps
-  eval_freq: 10  # Eval frequency in epochs (0 to disable)
+  guidance_scale: 4  # Guidance scale for sampling
+  num_inference_steps: 50  # Number of eval timesteps
+  eval_freq: 0  # Eval frequency in epochs (0 to disable)
 
 # Reward Model Configuration
 reward:

@@ -15,7 +15,7 @@ from accelerate.utils import set_seed, ProjectConfiguration
 from ..hparams import *
 from ..models.adapter import BaseAdapter
 from ..data_utils.loader import get_dataloader
-from ..rewards.reward_model import BaseRewardModel
+from ..rewards import load_reward_model, BaseRewardModel
 from ..logger import load_logger
 
 class BaseTrainer(ABC):
@@ -33,6 +33,7 @@ class BaseTrainer(ABC):
         self.data_args = config.data_args
         self.training_args = config.training_args
         self.reward_args = config.reward_args
+        self.eval_args = config.eval_args
         self.adapter = adapter
         self.epoch = 0
         self.step = 0
@@ -72,8 +73,10 @@ class BaseTrainer(ABC):
 
     def _init_reward_model(self) -> BaseRewardModel:
         """Initialize reward model from configuration."""
-        reward_model_cls = self.reward_args.reward_model_cls
-        self.reward_model = reward_model_cls(config=self.config, accelerator=self.accelerator)
+        self.reward_model = load_reward_model(
+            config=self.config,
+            accelerator=self.accelerator,
+        )
         return self.reward_model
 
     def _init_dataloader(self) -> Tuple[DataLoader, Union[None, DataLoader]]:
@@ -84,9 +87,7 @@ class BaseTrainer(ABC):
             dataloader, test_dataloader = get_dataloader(
                 config=self.config,
                 accelerator=self.accelerator,
-                text_encode_func=self.adapter.encode_prompt,
-                image_encode_func=self.adapter.encode_image,
-                video_encode_func=self.adapter.encode_video,
+                preprocess_func=self.adapter.preprocess_func,
             )
             if self.accelerator.is_local_main_process:
                 # Offload text-encoder after dataloader encoding

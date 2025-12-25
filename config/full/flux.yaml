@@ -15,6 +15,7 @@ data:
   preprocessing_batch_size: 8  # Batch size for preprocessing
   dataloader_num_workers: 16  # Number of workers for DataLoader
   enable_preprocess: true  # Enable dataset preprocessing
+  force_reprocess: true  # Force reprocessing of the dataset
   max_dataset_size: 1000  # Limit the maximum number of samples in the dataset
 
 # Model Configuration
@@ -49,11 +50,11 @@ train:
   max_grad_norm: 1.0  # Max gradient norm for clipping
   
   # Denoising process
-  sde_type: "Flow-SDE"  # Options: Flow-SDE, Dance-SDE, CPS
+  dynamics_type: "Flow-SDE"  # Options: Flow-SDE, Dance-SDE, CPS, ODE
   num_inference_steps: 10  # Number of SDE timesteps
   noise_level: 0.7  # Noise level for sampling
-  num_noise_steps: 1  # Number of noise steps
-  noise_steps: [1]  # Custom noise window
+  num_train_steps: 1  # Number of noise steps
+  train_steps: [1]  # Custom noise window
   guidance_scale: 3.5  # Guidance scale for sampling
   
   # Optimization
@@ -66,15 +67,15 @@ train:
   # EMA
   ema_decay: 0.9  # EMA decay rate (0 to disable)
   ema_update_interval: 4  # EMA update interval (in epochs)
-  
-  # Evaluation settings
-  eval_args:
-    resolution: 512  # Evaluation resolution
-    per_device_batch_size: 1  # Eval batch size
-    seed: null  # Eval seed (defaults to training seed)
-    guidance_scale: 3.5  # Guidance scale for sampling
-    num_inference_steps: 28  # Number of eval timesteps
-    eval_freq: 10  # Eval frequency in epochs (0 to disable)
+
+# Evaluation settings
+eval:
+  resolution: 512  # Evaluation resolution
+  per_device_batch_size: 1  # Eval batch size
+  seed: 42  # Eval seed
+  guidance_scale: 3.5  # Guidance scale for sampling
+  num_inference_steps: 28  # Number of eval timesteps
+  eval_freq: 10  # Eval frequency in epochs (0 to disable)
 
 # Reward Model Configuration
 reward:

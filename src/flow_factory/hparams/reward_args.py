@@ -8,7 +8,6 @@ import logging
 import torch
 
 from .abc import ArgABC
-from ..rewards.registry import get_reward_model_class
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')
 logger = logging.getLogger(__name__)
@@ -44,18 +43,10 @@ class RewardArguments(ArgABC):
         repr=False,
     )
 
-    reward_model_kwargs: Optional[dict[str, Any]] = field(
-        default=None,
-        metadata={"help": "Additional keyword arguments for the reward model."},
-    )
-
     batch_size: int = field(
         default=16,
         metadata={"help": "Batch size for reward model inference."},
     )
-    
-
-    _reward_model_cls: Optional[Type] = field(init=False, repr=False, default=None)
 
     def __post_init__(self):
 
@@ -63,21 +54,11 @@ class RewardArguments(ArgABC):
             self.dtype = dtype_map[self.dtype]
 
         if isinstance(self.device, str):
-            self.device = torch.device(self.device)
-
-        # Parse reward model name/path
-        self._reward_model_cls = get_reward_model_class(self.reward_model)
-
-    @property
-    def reward_model_cls(self) -> Type:
-        """Access the loaded class safely."""
-        return self._reward_model_cls
-        
+            self.device = torch.device(self.device)        
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary."""
-        # Conver dtype and device to str
-        d = asdict(self)
+        # Use super().to_dict() here as well
+        d = super().to_dict()
         d['dtype'] = str(self.dtype).split('.')[-1]
         d['device'] = str(self.device)
         return d

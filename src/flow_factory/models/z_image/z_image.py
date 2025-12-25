@@ -9,10 +9,10 @@ from diffusers.pipelines.z_image.pipeline_z_image import ZImagePipeline
 from PIL import Image
 import logging
 
-from ..hparams import *
-from .adapter import BaseAdapter, BaseSample
-from ..scheduler.flow_matching import FlowMatchEulerDiscreteSDEScheduler, FlowMatchEulerDiscreteSDESchedulerOutput, set_scheduler_timesteps
-from ..utils.base import filter_kwargs
+from ..adapter import BaseAdapter, BaseSample
+from ...hparams import *
+from ...scheduler import FlowMatchEulerDiscreteSDEScheduler, FlowMatchEulerDiscreteSDESchedulerOutput, set_scheduler_timesteps
+from ...utils.base import filter_kwargs
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')
 logger = logging.getLogger(__name__)
@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ZImageSample(BaseSample):
     pass
-
 
 class ZImageAdapter(BaseAdapter):
     def __init__(self, config: Arguments):
@@ -45,7 +44,7 @@ class ZImageAdapter(BaseAdapter):
         prompt: Union[str, List[str]],
         device: Optional[torch.device] = None,
         max_sequence_length: int = 512,
-    ) -> Tuple[List[torch.FloatTensor], torch.Tensor]:
+    ) -> Tuple[List[torch.FloatTensor], torch.LongTensor]:
         device = device or self.device
 
         if isinstance(prompt, str):
@@ -173,7 +172,7 @@ class ZImageAdapter(BaseAdapter):
         cfg_truncation: Optional[float] = 1.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         max_sequence_length: int = 512,
-        compute_log_probs: bool = True,
+        compute_log_prob: bool = True,
     ):
         height = height or (self.training_args.resolution[0] if self.training else self.training_args.eval_args.resolution[0])
         width = width or (self.training_args.resolution[1] if self.training else self.training_args.eval_args.resolution[1])
@@ -223,7 +222,7 @@ class ZImageAdapter(BaseAdapter):
         )
 
         all_latents = [latents]
-        all_log_probs = [] if compute_log_probs else None
+        all_log_probs = [] if compute_log_prob else None
         
         for i, t in enumerate(timesteps):
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
@@ -298,13 +297,13 @@ class ZImageAdapter(BaseAdapter):
                 model_output=noise_pred,
                 timestep=t,
                 sample=latents,
-                compute_log_prob=compute_log_probs and current_noise_level > 0,
+                compute_log_prob=compute_log_prob and current_noise_level > 0,
             )
 
             latents = output.prev_sample.to(dtype)
             all_latents.append(latents)
             
-            if compute_log_probs:
+            if compute_log_prob:
                 all_log_probs.append(output.log_prob)
 
         images = self.decode_latents(latents)
@@ -323,7 +322,7 @@ class ZImageAdapter(BaseAdapter):
                 negative_prompt=negative_prompt[b] if negative_prompt is not None else None,
                 negative_prompt_ids=negative_prompt_ids[b] if negative_prompt_ids is not None else None,
                 negative_prompt_embeds=negative_prompt_embeds[b] if negative_prompt_embeds is not None else None,
-                log_probs=torch.stack([lp[b] for lp in all_log_probs], dim=0) if compute_log_probs else None,
+                log_probs=torch.stack([lp[b] for lp in all_log_probs], dim=0) if compute_log_prob else None,
                 extra_kwargs={
                     'guidance_scale': guidance_scale,
                     'cfg_truncation': cfg_truncation,
@@ -333,6 +332,8 @@ class ZImageAdapter(BaseAdapter):
             for b in range(batch_size)
         ]
         
+        self.pipeline.maybe_free_model_hooks()
+
         return samples
     
     # ======================== Forward (Training) ========================
@@ -343,6 +344,7 @@ class ZImageAdapter(BaseAdapter):
         compute_log_prob : bool = True,
         **kwargs
     ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
+        # 1. Extract data from samples
         batch_size = len(samples)
         device = self.device
         guidance_scale = [s.extra_kwargs.get('guidance_scale', self.training_args.guidance_scale) for s in samples]
@@ -358,7 +360,8 @@ class ZImageAdapter(BaseAdapter):
 
         prompt_embeds = [s.prompt_embeds.to(device) for s in samples]
         negative_prompt_embeds = [s.negative_prompt_embeds.to(device) for s in samples] if do_classifier_free_guidance else []
-        
+
+        # 2. Set scheduler timesteps        
         _ = set_scheduler_timesteps(
             scheduler=self.scheduler,
             num_inference_steps=self.training_args.num_inference_steps,
@@ -366,6 +369,7 @@ class ZImageAdapter(BaseAdapter):
             device=device
         )
 
+        # 3. Forward pass
         if (
             do_classifier_free_guidance
             and cfg_truncation
@@ -424,7 +428,7 @@ class ZImageAdapter(BaseAdapter):
         noise_pred = noise_pred.squeeze(2)
         noise_pred = -noise_pred
 
-        # Perform scheduler step
+        # 4. Compute log prob with given next_latents
         step_kwargs = filter_kwargs(self.scheduler.step, **kwargs)
         output = self.scheduler.step(
             model_output=noise_pred,
