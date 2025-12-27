@@ -18,7 +18,8 @@ class PickScoreRewardModel(BaseRewardModel):
         self.model = CLIPModel.from_pretrained(model_path).eval().to(self.device)
         self.model = self.model.to(dtype=self.dtype)
 
-    def forward(self, prompt : list[str], image : list[Image.Image]):
+    @torch.no_grad()
+    def __call__(self, prompt : list[str], image : list[Image.Image]):
         if not isinstance(prompt, list):
             prompt = [prompt]
 

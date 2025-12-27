@@ -8,6 +8,8 @@ import torch
 from diffusers.pipelines.wan.pipeline_wan_video2video import WanVideoToVideoPipeline
 from PIL import Image
 import logging
+from accelerate import Accelerator
+from peft import PeftModel
 
 from ..adapter import BaseAdapter, BaseSample
 from ...hparams import *
@@ -25,8 +27,8 @@ class WanSample(BaseSample):
 
 
 class Wan2_I2V_Adapter(BaseAdapter):
-    def __init__(self, config: Arguments):
-        super().__init__(config)
+    def __init__(self, config: Arguments, accelerator : Accelerator):
+        super().__init__(config, accelerator)
     
     def load_pipeline(self) -> WanVideoToVideoPipeline:
         return WanVideoToVideoPipeline.from_pretrained(

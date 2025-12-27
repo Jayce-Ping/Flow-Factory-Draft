@@ -4,6 +4,8 @@ Model Adapter Loader
 Factory function using registry pattern for extensibility.
 """
 import logging
+from accelerate import Accelerator
+
 from .adapter import BaseAdapter
 from .registry import get_model_adapter_class, list_registered_models
 from ..hparams import Arguments
@@ -11,7 +13,7 @@ from ..utils.logger_utils import setup_logger
 
 logger = setup_logger(__name__)
 
-def load_model(config: Arguments) -> BaseAdapter:
+def load_model(config: Arguments, accelerator : Accelerator) -> BaseAdapter:
     """
     Factory function to instantiate the correct model adapter based on configuration.
     
@@ -45,7 +47,7 @@ def load_model(config: Arguments) -> BaseAdapter:
         adapter_class = get_model_adapter_class(model_type)
         
         # Instantiate adapter
-        adapter = adapter_class(config=config)
+        adapter = adapter_class(config=config, accelerator=accelerator)
         
         logger.info(f"Successfully loaded {adapter_class.__name__}")
         return adapter

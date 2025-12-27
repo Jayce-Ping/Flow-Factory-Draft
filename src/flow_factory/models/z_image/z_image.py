@@ -8,6 +8,7 @@ import torch
 from diffusers.pipelines.z_image.pipeline_z_image import ZImagePipeline
 from PIL import Image
 import logging
+from accelerate import Accelerator
 
 from ..adapter import BaseAdapter, BaseSample
 from ...hparams import *
@@ -23,8 +24,8 @@ class ZImageSample(BaseSample):
     pass
 
 class ZImageAdapter(BaseAdapter):
-    def __init__(self, config: Arguments):
-        super().__init__(config)
+    def __init__(self, config: Arguments, accelerator : Accelerator):
+        super().__init__(config, accelerator)
 
     def load_pipeline(self) -> ZImagePipeline:
         return ZImagePipeline.from_pretrained(
@@ -182,7 +183,7 @@ class ZImageAdapter(BaseAdapter):
         num_inference_steps = num_inference_steps or (self.training_args.num_inference_steps if self.training else self.eval_args.num_inference_steps)
         guidance_scale = guidance_scale or (self.training_args.guidance_scale if self.training else self.eval_args.guidance_scale)
         device = self.device
-        dtype = self.transformer.dtype
+        dtype = self.pipeline.transformer.dtype
         do_classifier_free_guidance = guidance_scale > 1.0
 
         # 2. Encode prompts if not provided
@@ -203,7 +204,7 @@ class ZImageAdapter(BaseAdapter):
             negative_prompt_embeds = [npe.to(device) for npe in negative_prompt_embeds]
 
         batch_size = len(prompt_embeds)
-        num_channels_latents = self.transformer.in_channels
+        num_channels_latents = self.pipeline.transformer.in_channels
 
         latents = self.pipeline.prepare_latents(
             batch_size=batch_size,
@@ -247,12 +248,12 @@ class ZImageAdapter(BaseAdapter):
             apply_cfg = do_classifier_free_guidance and current_guidance_scale > 0
 
             if apply_cfg:
-                latents_typed = latents.to(self.transformer.dtype)
+                latents_typed = latents.to(self.pipeline.transformer.dtype)
                 latent_model_input = latents_typed.repeat(2, 1, 1, 1)
                 prompt_embeds_model_input = prompt_embeds + negative_prompt_embeds # List concatenation
                 timestep_model_input = timestep.repeat(2)
             else:
-                latent_model_input = latents.to(self.transformer.dtype)
+                latent_model_input = latents.to(self.pipeline.transformer.dtype)
                 prompt_embeds_model_input = prompt_embeds
                 timestep_model_input = timestep
 
@@ -387,12 +388,12 @@ class ZImageAdapter(BaseAdapter):
         apply_cfg = do_classifier_free_guidance and current_guidance_scale > 0
 
         if apply_cfg:
-            latents_typed = latents.to(self.transformer.dtype)
+            latents_typed = latents.to(self.pipeline.transformer.dtype)
             latent_model_input = latents_typed.repeat(2, 1, 1, 1)
             prompt_embeds_model_input = prompt_embeds + negative_prompt_embeds # List concatenation
             timestep_model_input = t.repeat(2)
         else:
-            latent_model_input = latents.to(self.transformer.dtype)
+            latent_model_input = latents.to(self.pipeline.transformer.dtype)
             prompt_embeds_model_input = prompt_embeds
             timestep_model_input = t
 

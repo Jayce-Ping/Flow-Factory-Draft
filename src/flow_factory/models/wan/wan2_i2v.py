@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import os
 from typing import Union, List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass
-from peft import PeftModel
-import torch
-from diffusers.pipelines.wan.pipeline_wan_i2v import WanImageToVideoPipeline
-from PIL import Image
 import logging
+from dataclasses import dataclass
+
+from PIL import Image
+import torch
+from accelerate import Accelerator
+from diffusers.pipelines.wan.pipeline_wan_i2v import WanImageToVideoPipeline
+from peft import PeftModel
 
 from ..adapter import BaseAdapter, BaseSample
 from ...hparams import *
@@ -25,8 +27,8 @@ class WanSample(BaseSample):
 
 
 class Wan2_I2V_Adapter(BaseAdapter):
-    def __init__(self, config: Arguments):
-        super().__init__(config)
+    def __init__(self, config: Arguments, accelerator : Accelerator):
+        super().__init__(config, accelerator)
     
     def load_pipeline(self) -> WanImageToVideoPipeline:
         return WanImageToVideoPipeline.from_pretrained(

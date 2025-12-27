@@ -56,7 +56,7 @@ def load_trainer(config: Arguments) -> BaseTrainer:
     set_seed(config.training_args.seed, device_specific=True)
 
     # Initialize model adapter
-    adapter = load_model(config=config)
+    adapter = load_model(config=config, accelerator=accelerator)
 
     # Get trainer class from registry
     trainer_type = config.training_args.trainer_type

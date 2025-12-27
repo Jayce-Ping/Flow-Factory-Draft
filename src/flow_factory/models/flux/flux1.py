@@ -27,8 +27,8 @@ class Flux1Sample(BaseSample):
 class Flux1Adapter(BaseAdapter):
     """Concrete implementation for Flow Matching models (FLUX.1)."""
     
-    def __init__(self, config: Arguments):
-        super().__init__(config)
+    def __init__(self, config: Arguments, accelerator : Accelerator):
+        super().__init__(config, accelerator)
     
     def load_pipeline(self) -> FluxPipeline:
         return FluxPipeline.from_pretrained(
@@ -133,7 +133,6 @@ class Flux1Adapter(BaseAdapter):
         num_inference_steps = num_inference_steps or (self.training_args.num_inference_steps if self.training else self.eval_args.num_inference_steps)
         guidance_scale = guidance_scale or (self.training_args.guidance_scale if self.training else self.eval_args.guidance_scale)
         device = self.device
-        dtype = self.transformer.dtype
         
         # 2. Encode prompts if not provided
         if prompt_embeds is None:
@@ -146,13 +145,14 @@ class Flux1Adapter(BaseAdapter):
             pooled_prompt_embeds = pooled_prompt_embeds.to(device)
 
         batch_size = len(prompt_embeds)
+        dtype = prompt_embeds.dtype
 
         text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(
             device=device, dtype=dtype
         )
         
         # 3. Prepare latents
-        num_channels_latents = self.transformer.config.in_channels // 4
+        num_channels_latents = self.pipeline.transformer.config.in_channels // 4
         latents, latent_image_ids = self.pipeline.prepare_latents(
             batch_size=batch_size,
             num_channels_latents=num_channels_latents,

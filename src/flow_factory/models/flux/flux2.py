@@ -32,8 +32,8 @@ class Flux2Sample(BaseSample):
 class Flux2Adapter(BaseAdapter):
     """Concrete implementation for Flow Matching models (FLUX.2)."""
     
-    def __init__(self, config: Arguments):
-        super().__init__(config)
+    def __init__(self, config: Arguments, accelerator : Accelerator):
+        super().__init__(config, accelerator)
         self._has_warned_inference_fallback = False
         self._has_warned_preprocess_fallback = False
     
@@ -327,7 +327,6 @@ class Flux2Adapter(BaseAdapter):
         num_inference_steps = num_inference_steps or (self.training_args.num_inference_steps if self.training else self.eval_args.num_inference_steps)
         guidance_scale = guidance_scale or (self.training_args.guidance_scale if self.training else self.eval_args.guidance_scale)
         device = self.device
-        dtype = self.transformer.dtype
 
         # 2. Preprocess inputs
         if (
@@ -359,15 +358,16 @@ class Flux2Adapter(BaseAdapter):
             image_latent_ids = image_latent_ids.to(device) if image_latent_ids is not None else None
 
         batch_size = prompt_embeds.shape[0]
+        dtype = prompt_embeds.dtype
 
         # 3. Prepare initial noise
-        num_channels_latents = self.transformer.config.in_channels // 4
+        num_channels_latents = self.pipeline.transformer.config.in_channels // 4
         latents, latent_ids = self.pipeline.prepare_latents(
             batch_size=batch_size,
             num_latents_channels=num_channels_latents,
             height=height,
             width=width,
-            dtype=prompt_embeds.dtype,
+            dtype=dtype,
             device=device,
             generator=generator,
         )
@@ -392,11 +392,11 @@ class Flux2Adapter(BaseAdapter):
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
                 current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
 
-                latent_model_input = latents.to(self.transformer.dtype)
+                latent_model_input = latents.to(torch.float32)
                 latent_image_ids = latent_ids
 
                 if image_latents is not None:
-                    latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
+                    latent_model_input = torch.cat([latents, image_latents], dim=1).to(torch.float32)
                     latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
 
                 noise_pred = self.transformer(
@@ -577,11 +577,11 @@ class Flux2Adapter(BaseAdapter):
         attention_kwargs = samples[0].extra_kwargs.get('attention_kwargs', None)
 
         # Catenate condition latents if given
-        latent_model_input = latents.to(self.transformer.dtype)
+        latent_model_input = latents.to(torch.float32)
         latent_image_ids = latent_ids
 
         if image_latents is not None:
-            latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
+            latent_model_input = torch.cat([latents, image_latents], dim=1).to(torch.float32)
             latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
                 
         # 2. Set scheduler timesteps

@@ -82,16 +82,15 @@ class BaseSample(BaseOutput):
         return self
 
 
+
 class BaseAdapter(ABC):
     """
     Abstract Base Class for Flow-Factory models.
     """
-    
-    pipeline: DiffusionPipeline
-
-    def __init__(self, config: Arguments):
+    def __init__(self, config: Arguments, accelerator : Accelerator):
         super().__init__()
         self.config = config
+        self.accelerator = accelerator
         self.model_args = config.model_args
         self.training_args = config.training_args
         self.eval_args = config.eval_args
@@ -99,7 +98,11 @@ class BaseAdapter(ABC):
         # Load pipeline and scheduler (delegated to subclasses)
         self.pipeline = self.load_pipeline()
         self.pipeline.scheduler = self.load_scheduler()
+        
+        # Initialize prepared components cache
+        self._prepared_components: Dict[str, torch.nn.Module] = {}
 
+        # Cache target module mapping
         self.target_module_map = self._init_target_module_map()
 
         # Freeze non-trainable components
@@ -142,8 +145,38 @@ class BaseAdapter(ABC):
             dynamics_type=self.training_args.dynamics_type,
             **self.pipeline.scheduler.config.__dict__,
         )
-    
+
     # ============================== Component Accessors ==============================
+    # ---------------------------------- Wrappers ----------------------------------
+    def _unwrap(self, model: torch.nn.Module) -> torch.nn.Module:
+        """Get the unwrapped model from accelerator."""
+        return self.accelerator.unwrap_model(model)
+
+    def set_prepared(self, name: str, module: torch.nn.Module):
+        """Mark a component as prepared (after accelerator.prepare)."""
+        self._prepared_components[name] = module
+    
+    def get_component(self, name: str) -> torch.nn.Module:
+        """Get a component, preferring the prepared version if available."""
+        return self._prepared_components.get(name) or getattr(self.pipeline, name)
+
+    def get_component_unwrapped(self, name: str) -> torch.nn.Module:
+        """Get the original unwrapped component."""
+        return getattr(self.pipeline, name)
+    
+    def get_component_config(self, name: str):
+        """Get the config of a component."""
+        return getattr(self.pipeline, name).config
+
+    def prepare_components(self, accelerator: Accelerator, component_names: List[str]):
+        """Prepare specified components with the accelerator."""
+        components = [getattr(self.pipeline, name) for name in component_names]
+        prepared = accelerator.prepare(*components)
+        for name, module in zip(component_names, prepared):
+            self.set_prepared(name, module)
+        return prepared
+
+    # ------------------------------ Text Encoders & Tokenizers ------------------------------
     @property
     def text_encoders(self) -> List[torch.nn.Module]:
         """Collect all text encoders from pipeline."""
@@ -197,6 +230,7 @@ class BaseAdapter(ABC):
             raise ValueError("No tokenizer found in the pipeline.")
         return tokenizers[0]
 
+    # -------------------------------------- VAE --------------------------------------
     @property
     def vae(self) -> torch.nn.Module:
         return self.pipeline.vae
@@ -204,30 +238,37 @@ class BaseAdapter(ABC):
     @vae.setter
     def vae(self, module: torch.nn.Module):
         self.pipeline.vae = module
+        
+    # ---------------------------------- Transformers ----------------------------------
+    @property
+    def transformer_names(self) -> List[str]:
+        """Get all transformer component names."""
+        names = [
+            name for name, value in vars(self.pipeline).items()
+            if 'transformer' in name 
+            and not name.startswith('_')
+            and isinstance(value, torch.nn.Module)
+        ]
+        return sorted(names)
+
+    @property
+    def transformers(self) -> List[torch.nn.Module]:
+        """Collect all transformers, preferring prepared versions."""
+        return [self.get_component(name) for name in self.transformer_names]
     
     @property
     def transformer(self) -> torch.nn.Module:
-        return self.pipeline.transformer
-    
-    @property
-    def transformers(self) -> List[torch.nn.Module]:
-        """Collect all transformers from pipeline."""
-        transformers = []
-        for attr_name, attr_value in vars(self.pipeline).items():
-            if (
-                'transformer' in attr_name 
-                and not attr_name.startswith('_')  # Filter private attr
-                and isinstance(attr_value, torch.nn.Module)
-            ):
-                transformers.append((attr_name, attr_value))
-        
-        transformers.sort(key=lambda x: x[0])
-        return [trans for _, trans in transformers]
-    
+        return self.get_component('transformer')
+
     @transformer.setter
     def transformer(self, module: torch.nn.Module):
-        self.pipeline.transformer = module
+        self.set_prepared('transformer', module)
 
+    @property
+    def transformer_config(self):
+        return self.get_component_config('transformer')
+
+    # ------------------------------------ Scheduler ------------------------------------
     @property
     def scheduler(self) -> FlowMatchEulerDiscreteSDEScheduler:
         return self.pipeline.scheduler
@@ -236,9 +277,10 @@ class BaseAdapter(ABC):
     def scheduler(self, scheduler: FlowMatchEulerDiscreteSDEScheduler):
         self.pipeline.scheduler = scheduler
 
+    # ---------------------------------- Device & Dtype ----------------------------------
     @property
     def device(self) -> torch.device:
-        return self.transformer.device
+        return self.accelerator.device
     
     @property
     def _inference_dtype(self) -> torch.dtype:
@@ -248,17 +290,10 @@ class BaseAdapter(ABC):
         elif self.config.mixed_precision == "bf16":
             return torch.bfloat16
         return torch.float32
-    
-    # ============================== Mode Management ==============================
-    def eval(self, transformer_only: bool = True):
-        """Set model to evaluation mode."""
-        
-        if not transformer_only:
-            # Set all components to eval mode
-            for encoder in self.text_encoders:
-                encoder.eval()
-            self.vae.eval()
 
+    # ============================== Mode Management ==============================
+    def eval(self):
+        """Set model to evaluation mode."""
         for transformer in self.transformers:
             transformer.eval()
 
@@ -273,14 +308,8 @@ class BaseAdapter(ABC):
         if hasattr(self.scheduler, 'rollout'):
             self.scheduler.rollout(*args, **kwargs)
 
-    def train(self, mode: bool = True, transformer_only: bool = True):
-        """Set model to training mode."""        
-        # Set all components to training mode
-        if not transformer_only:
-            for encoder in self.text_encoders:
-                encoder.train(mode)
-            self.vae.train(mode)
-
+    def train(self, mode: bool = True):
+        """Set model to training mode."""
         for transformer in self.transformers:
             transformer.train(mode)
 
@@ -492,6 +521,7 @@ class BaseAdapter(ABC):
             
             model_component = getattr(self, comp)
             model_component = get_peft_model(model_component, lora_config)
+            model_component.set_adapter("default")
             setattr(self, comp, model_component)
             results[comp] = model_component
             
@@ -542,7 +572,6 @@ class BaseAdapter(ABC):
     def save_checkpoint(
             self,
             path: str,
-            accelerator : Accelerator,
             max_shard_size: str = "5GB",
             dtype: Union[torch.dtype, str] = torch.bfloat16,
             save_ema: bool = True,
@@ -570,8 +599,8 @@ class BaseAdapter(ABC):
             os.makedirs(comp_path, exist_ok=True)
 
             # remove hooks/wrappers to get the underlying state dict
-            unwrapped_model = accelerator.unwrap_model(component)
-            state_dict = accelerator.get_state_dict(unwrapped_model)
+            unwrapped_model = self.accelerator.unwrap_model(component)
+            state_dict = self.accelerator.get_state_dict(unwrapped_model)
 
             if self.model_args.finetune_type == 'lora' and isinstance(unwrapped_model, PeftModel):
                 logger.info(f"Saving LoRA adapter for {comp_name} to {comp_path}")
@@ -584,7 +613,7 @@ class BaseAdapter(ABC):
                 logger.info(f"Saving full weights (torch) for {comp_name} to {weight_path}")
                 weight_path = os.path.join(comp_path, "pytorch_model.bin")
                 state_dict = {
-                    k: v.to(dtype) for k, v in accelerator.get_state_dict(unwrapped_model).items()
+                    k: v.to(dtype) for k, v in self.accelerator.get_state_dict(unwrapped_model).items()
                 }
                 torch.save(state_dict, weight_path)
 
@@ -595,10 +624,12 @@ class BaseAdapter(ABC):
         """Freeze all text encoders."""
         for i, encoder in enumerate(self.text_encoders):
             encoder.requires_grad_(False)
+            encoder.eval()
 
     def _freeze_vae(self):
         """Freeze VAE."""
         self.vae.requires_grad_(False)
+        self.vae.eval()
 
     def _freeze_transformer(self, trainable_modules: Optional[Union[str, List[str]]] = None):
         """
@@ -907,6 +938,7 @@ class BaseAdapter(ABC):
         """
         pass
 
+    # ======================================= Postprocessing =======================================
     @abstractmethod
     def decode_latents(
         self,
@@ -919,6 +951,7 @@ class BaseAdapter(ABC):
         """
         pass
 
+    # ======================================= Sampling & Training =======================================
     @abstractmethod
     def forward(
         self,

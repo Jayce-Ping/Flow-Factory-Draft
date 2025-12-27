@@ -29,8 +29,8 @@ class QwenImageSample(BaseSample):
 class QwenImageAdapter(BaseAdapter):
     """Adapter for Qwen-Image text-to-image models."""
     
-    def __init__(self, config: Arguments):
-        super().__init__(config)
+    def __init__(self, config: Arguments, accelerator : Accelerator):
+        super().__init__(config, accelerator)
         self._warned_cfg_no_neg_prompt = False
         self._warned_no_cfg = False
     
@@ -261,7 +261,7 @@ class QwenImageAdapter(BaseAdapter):
         # Qwen-Image uses `true_cfg_scale` since it is not a guidance-distilled model.
         true_cfg_scale = guidance_scale or (self.training_args.guidance_scale if self.training else self.eval_args.guidance_scale)
         device = self.device
-        dtype = self.transformer.dtype
+        dtype = self.pipeline.transformer.dtype
         has_neg_prompt = negative_prompt is not None or (
             negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
         )
@@ -316,7 +316,7 @@ class QwenImageAdapter(BaseAdapter):
         # 3. Prepare latents
         batch_size = prompt_embeds.shape[0]
         
-        num_channels_latents = self.transformer.config.in_channels // 4
+        num_channels_latents = self.pipeline.transformer.config.in_channels // 4
         latents = self.pipeline.prepare_latents(
             batch_size=batch_size,
             num_channels_latents=num_channels_latents,
@@ -347,7 +347,7 @@ class QwenImageAdapter(BaseAdapter):
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
 
             # Conditioned prediction
-            with self.transformer.cache_context("cond"):
+            with self.pipeline.transformer.cache_context("cond"):
                 noise_pred = self.transformer(
                     hidden_states=latents,
                     timestep=timestep / 1000,
@@ -362,7 +362,7 @@ class QwenImageAdapter(BaseAdapter):
 
             # Negative conditioned prediction
             if do_true_cfg:
-                with self.transformer.cache_context("uncond"):
+                with self.pipeline.transformer.cache_context("uncond"):
                     neg_noise_pred = self.transformer(
                         hidden_states=latents,
                         timestep=timestep / 1000,
@@ -445,7 +445,7 @@ class QwenImageAdapter(BaseAdapter):
         # 1. Extract data from samples
         batch_size = len(samples)
         device = self.device
-        dtype = self.transformer.dtype
+        dtype = self.pipeline.transformer.dtype
         # Assume all samples have the same guidance scale
         true_cfg_scale = [
             s.extra_kwargs.get('guidance_scale', self.training_args.guidance_scale)
@@ -504,7 +504,7 @@ class QwenImageAdapter(BaseAdapter):
         )
 
         # 3. Predict noise
-        with self.transformer.cache_context("cond"):
+        with self.pipeline.transformer.cache_context("cond"):
             noise_pred = self.transformer(
                 hidden_states=latents,
                 timestep=timestep / 1000,
@@ -518,7 +518,7 @@ class QwenImageAdapter(BaseAdapter):
             )[0]
 
         if do_true_cfg:
-            with self.transformer.cache_context("uncond"):
+            with self.pipeline.transformer.cache_context("uncond"):
                 neg_noise_pred = self.transformer(
                     hidden_states=latents,
                     timestep=timestep / 1000,

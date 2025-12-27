@@ -27,8 +27,8 @@ class Flux1Sample(BaseSample):
 class Flux1InitAdapter(BaseAdapter):
     """Concrete implementation for Flow Matching models (FLUX.1)."""
     
-    def __init__(self, config: Arguments):
-        super().__init__(config)
+    def __init__(self, config: Arguments, accelerator : Accelerator):
+        super().__init__(config, accelerator)
     
     def load_pipeline(self) -> FluxPipeline:
         return FluxPipeline.from_pretrained(
@@ -117,7 +117,7 @@ class Flux1InitAdapter(BaseAdapter):
         num_inference_steps = num_inference_steps or (self.training_args.num_inference_steps if self.training else self.eval_args.num_inference_steps)
         guidance_scale = guidance_scale or (self.training_args.guidance_scale if self.training else self.eval_args.guidance_scale)
         device = self.device
-        dtype = self.transformer.dtype
+        dtype = self.pipeline.transformer.dtype
         # Encode prompts if not provided
         if prompt_embeds is None:
             encoded = self.encode_prompt(prompt)
@@ -182,7 +182,7 @@ class Flux1InitAdapter(BaseAdapter):
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
             
             # Predict noise
-            noise_pred = self.pipeline.transformer(
+            noise_pred = self.transformer(
                 hidden_states=latents,
                 timestep=timestep / 1000,
                 guidance=guidance.expand(batch_size),
@@ -281,7 +281,7 @@ class Flux1InitAdapter(BaseAdapter):
         guidance = torch.as_tensor(guidance_scale, device=device, dtype=torch.float32)
         
         # Forward pass
-        noise_pred = self.pipeline.transformer(
+        noise_pred = self.transformer(
             hidden_states=latents,
             timestep=timestep / 1000,
             guidance=guidance.expand(batch_size),

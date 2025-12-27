@@ -21,7 +21,7 @@ data:
 
 # Model Configuration
 model:
-  finetune_type: 'full' # Options: full, lora
+  finetune_type: 'lora' # Options: full, lora
   lora_rank : 64
   lora_alpha : 128
   target_modules: "default" # Options: all, default, or list of module names like ["to_k", "to_q", "to_v", "to_out.0"]
@@ -43,9 +43,9 @@ train:
   
   # Batch and sampling
   per_device_batch_size: 2  # Batch size per device
-  group_size: 4  # Group size for GRPO sampling
+  group_size: 16  # Group size for GRPO sampling
   global_std: false  # Use global std for advantage normalization
-  unique_sample_num_per_epoch: 4  # Unique samples per group
+  unique_sample_num_per_epoch: 48  # Unique samples per group
   gradient_step_per_epoch: 2  # Gradient steps per epoch
   
   # Clipping

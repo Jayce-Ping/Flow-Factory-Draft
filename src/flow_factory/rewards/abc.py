@@ -31,14 +31,12 @@ class RewardModelOutput(BaseOutput):
 
 
 
-class BaseRewardModel(ABC, nn.Module):
+class BaseRewardModel(ABC):
     """
     Abstract base class for reward models.
     
     Subclasses must implement the `forward` method. 
-    This class handles DeepSpeed ZeRO-3 parameter gathering and no_grad contexts automatically.
     """
-    model : nn.Module
     def __init__(self, config: Arguments, accelerator : Accelerator):
         """
         Args:
@@ -51,24 +49,10 @@ class BaseRewardModel(ABC, nn.Module):
         self.reward_args = reward_args
         self.device = self.accelerator.device if reward_args.device == torch.device('cuda') else reward_args.device
         self.dtype = reward_args.dtype
+        self.model = None  # To be defined in subclasses
 
+    @abstractmethod
     def __call__(self, *args, **kwargs):
         """
-        Wraps `forward` to automatically handle `torch.no_grad` and other contexts.
+        Implement the forward pass of the reward model.
         """
-        with torch.no_grad():
-            return super().__call__(*args, **kwargs)
-
-    
-    @abstractmethod
-    def forward(self, **kwargs) -> Union[RewardModelOutput, torch.Tensor, np.ndarray, List[float]]:
-        """
-        Compute rewards for the given inputs.
-        
-        Args:
-            **inputs: Model-specific inputs (e.g., pixel_values, input_ids).
-            
-        Returns:
-            The computed rewards in the specified format.
-        """
-        pass

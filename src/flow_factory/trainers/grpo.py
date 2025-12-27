@@ -91,7 +91,7 @@ class GRPOTrainer(BaseTrainer):
         """Compute rewards using the reward model."""
         rewards = []
         
-        filtered_key_fields = filter_kwargs(self.reward_model.forward, **samples[0])
+        filtered_key_fields = filter_kwargs(self.reward_model.__call__, **samples[0])
         
         for i in tqdm(
             range(0, len(samples), self.reward_args.batch_size),
