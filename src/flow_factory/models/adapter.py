@@ -579,7 +579,7 @@ class BaseAdapter(ABC):
 
         original_timeout = os.environ.get('NCCL_TIMEOUT') # Default 10 minutes
         # Extend NCCL timeout for large models if needed
-        timeout_minutes = 10
+        timeout_minutes = 60
         os.environ['NCCL_TIMEOUT'] = str(timeout_minutes * 60)
         
         try:
