@@ -249,7 +249,7 @@ class GRPOTrainer(BaseTrainer):
 
                         with self.autocast():
                             # Forward pass
-                            return_kwargs = ['log_prob', 'next_latents_mean', 'std_dev_t', 'dt']
+                            return_kwargs = ['log_prob', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt']
                             output = self.adapter.forward(
                                 batch,
                                 timestep_index=timestep_index,

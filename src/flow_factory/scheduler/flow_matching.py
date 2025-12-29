@@ -63,9 +63,9 @@ class FlowMatchEulerDiscreteSDESchedulerOutput(BaseOutput):
     Output class for a single SDE step in Flow Matching.
     """
 
-    next_latents: torch.FloatTensor
-    next_latents_mean: torch.FloatTensor
-    std_dev_t: torch.FloatTensor
+    next_latents: Optional[torch.FloatTensor] = None
+    next_latents_mean: Optional[torch.FloatTensor] = None
+    std_dev_t: Optional[torch.FloatTensor] = None
     dt: Optional[torch.FloatTensor] = None
     log_prob: Optional[torch.FloatTensor] = None
     noise_pred: Optional[torch.FloatTensor] = None
