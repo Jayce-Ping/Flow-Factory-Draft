@@ -490,15 +490,16 @@ class BaseAdapter(ABC):
             for comp_name in self.target_module_map.keys():
                 if hasattr(self, comp_name):
                     component = getattr(self, comp_name)
-                    if isinstance(component, PeftModel):
-                        active_adapters[comp_name] = component.active_adapter
-                        component.disable_adapter()
+                    unwrapped = self._unwrap(component)
+                    if isinstance(unwrapped, PeftModel):
+                        active_adapters[unwrapped] = unwrapped.active_adapter
+                        unwrapped.disable_adapter()
             try:
                 yield
             finally:
                 # 2. Re-enable specific adapters for each component
-                for comp_name, adapter_name in active_adapters.items():
-                    getattr(self, comp_name).set_adapter(adapter_name)
+                for unwrapped, adapter_name in active_adapters.items():
+                    unwrapped.set_adapter(adapter_name)
 
         elif self._ref_ema is not None:
             trainable_params = self.get_trainable_parameters()
