@@ -52,7 +52,8 @@ class BaseRewardModel(ABC):
         self.model = None  # To be defined in subclasses
 
     @abstractmethod
-    def __call__(self, *args, **kwargs):
+    def __call__(self, *args, **kwargs) -> Union[torch.Tensor, RewardModelOutput]:
         """
         Implement the forward pass of the reward model.
         """
+        pass

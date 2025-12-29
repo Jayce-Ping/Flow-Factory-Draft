@@ -58,7 +58,10 @@ class PickScoreRewardModel(BaseRewardModel):
         scores = scores.diag()
         # norm to 0-1
         scores = scores/26
-        return scores
+        return RewardModelOutput(
+            rewards=scores,
+            extra_info={},
+        )
 
 def download_model():
     scorer = PickScoreRewardModel(RewardArguments(device='cpu'))
