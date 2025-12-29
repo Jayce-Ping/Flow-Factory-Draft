@@ -15,7 +15,7 @@ logger = setup_logger(__name__)
 _TRAINER_REGISTRY: Dict[str, str] = {
     'grpo': 'flow_factory.trainers.grpo.GRPOTrainer',
     'grpo-guard': 'flow_factory.trainers.grpo.GRPOGuardTrainer',
-    'nft': 'flow_factory.trainers.nft.NFTTrainer',
+    'nft': 'flow_factory.trainers.nft.DiffusionNFTTrainer',
 }
 
 

@@ -156,6 +156,12 @@ class TrainingArguments(ArgABC):
         metadata={"help": "Whether to use global std for GRPO Advantage normalization."},
     )
 
+    # NFT arguments
+    nft_beta: float = field(
+        default=1,
+        metadata={"help": "Beta parameter for NFT trainer."},
+    )
+
     # Sampling arguments
     dynamics_type: Literal["Flow-SDE", 'Dance-SDE', 'CPS', 'ODE'] = field(
         default="Flow-SDE",

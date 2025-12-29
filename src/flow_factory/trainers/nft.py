@@ -260,10 +260,16 @@ class DiffusionNFTTrainer(BaseTrainer):
                         xt = torch.stack([
                             sample.all_latents[timestep_index] for sample in batch
                         ], dim=0)
+                        old_v_pred = torch.stack([
+                            sample.noise_preds[timestep_index] for sample in batch
+                        ], dim=0)
+                        new_v_pred = output.noise_pred
 
                         # 2. Compute adv
                         adv_clip_range = self.training_args.adv_clip_range
                         adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
+                        normalized_advantages_clip = (advantages / adv_clip_range[1]) / 2.0 + 0.5
+                        r = torch.clamp(normalized_advantages_clip, 0, 1)
 
                         # 3. Compute loss
                         positive_prediction = nft_beta * new_v_pred + (1 - nft_beta) * old_v_pred.detach()
