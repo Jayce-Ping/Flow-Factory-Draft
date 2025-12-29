@@ -33,6 +33,12 @@ class GRPOTrainer(BaseTrainer):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
+    
+    @property
+    def enable_kl_penalty(self) -> bool:
+        """Check if KL penalty is enabled."""
+        return self.training_args.kl_beta > 0.0
+
     def start(self):
         """Main training loop."""
         while True:
@@ -249,7 +255,13 @@ class GRPOTrainer(BaseTrainer):
 
                         with self.autocast():
                             # Forward pass
-                            return_kwargs = ['log_prob', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt']
+                            if self.enable_kl_penalty:
+                                if self.training_args.kl_type == 'v-based':
+                                    return_kwargs = ['log_prob', 'noise_pred', 'std_dev_t', 'dt']
+                                elif self.training_args.kl_type == 'x-based':
+                                    return_kwargs = ['log_prob', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt']
+                            else:
+                                return_kwargs = ['log_prob', 'std_dev_t', 'dt']
                             output = self.adapter.forward(
                                 batch,
                                 timestep_index=timestep_index,
@@ -270,7 +282,38 @@ class GRPOTrainer(BaseTrainer):
 
                         loss = policy_loss
 
-                        # KL-loss requires a copy of the original model. Not implemented here.
+                        if self.enable_kl_penalty:
+                            with self.autocast(), torch.no_grad(), self.adapter.use_ref_parameters():
+                                if self.training_args.kl_type == 'v-based':
+                                    # KL in velocity space
+                                    ref_output = self.adapter.forward(
+                                        batch,
+                                        timestep_index=timestep_index,
+                                        compute_log_prob=False,
+                                        return_kwargs=['noise_pred'],
+                                    )
+                                    kl_div = torch.mean(
+                                        ((output.noise_pred - ref_output.noise_pred) ** 2),
+                                        dim=tuple(range(1, output.noise_pred.ndim)), keepdim=True
+                                    ) / (2 * output.std_dev_t ** 2 + 1e-7)
+                                elif self.training_args.kl_type == 'x-based':
+                                    # KL in latent space
+                                    ref_output = self.adapter.forward(
+                                        batch,
+                                        timestep_index=timestep_index,
+                                        compute_log_prob=False,
+                                        return_kwargs=['next_latents_mean'],
+                                    )
+                                    kl_div = torch.mean(
+                                        ((output.next_latents_mean - ref_output.next_latents_mean) ** 2),
+                                        dim=tuple(range(1, output.next_latents_mean.ndim)), keepdim=True
+                                    ) / (2 * output.std_dev_t ** 2 + 1e-7)
+                            
+                            kl_penalty = self.training_args.kl_beta * kl_div
+                            loss += kl_penalty
+                            loss_info['kl_div'].append(kl_div.detach())
+                            loss_info['kl_penalty'].append(kl_penalty.detach())
+
 
                         loss_info['ratio'].append(ratio.detach())
                         loss_info['unclipped_loss'].append(unclipped_loss.detach())
@@ -424,16 +467,45 @@ class GRPOGuardTrainer(GRPOTrainer):
                         policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
 
                         loss = policy_loss
+
+                        if self.enable_kl_penalty:
+                            with self.autocast(), torch.no_grad(), self.adapter.use_ref_parameters():
+                                if self.training_args.kl_type == 'v-based':
+                                    # KL in velocity space
+                                    ref_output = self.adapter.forward(
+                                        batch,
+                                        timestep_index=timestep_index,
+                                        compute_log_prob=False,
+                                        return_kwargs=['noise_pred'],
+                                    )
+                                    kl_div = torch.mean(
+                                        ((output.noise_pred - ref_output.noise_pred) ** 2),
+                                        dim=tuple(range(1, output.noise_pred.ndim)), keepdim=True
+                                    ) / (2 * output.std_dev_t ** 2 + 1e-7)
+                                elif self.training_args.kl_type == 'x-based':
+                                    # KL in latent space
+                                    ref_output = self.adapter.forward(
+                                        batch,
+                                        timestep_index=timestep_index,
+                                        compute_log_prob=False,
+                                        return_kwargs=['next_latents_mean'],
+                                    )
+                                    kl_div = torch.mean(
+                                        ((output.next_latents_mean - ref_output.next_latents_mean) ** 2),
+                                        dim=tuple(range(1, output.next_latents_mean.ndim)), keepdim=True
+                                    ) / (2 * output.std_dev_t ** 2 + 1e-7)
+                            
+                            kl_penalty = self.training_args.kl_beta * kl_div
+                            loss += kl_penalty
+                            loss_info['kl_div'].append(kl_div.detach())
+                            loss_info['kl_penalty'].append(kl_penalty.detach())
+
                         loss_info['ratio'].append(ratio.detach())
                         loss_info['unclipped_loss'].append(unclipped_loss.detach())
                         loss_info['clipped_loss'].append(clipped_loss.detach())
                         loss_info['policy_loss'].append(policy_loss.detach())
                         loss_info["clip_frac_high"].append(torch.mean((ratio > 1.0 + ratio_clip_range[1]).float()))
                         loss_info["clip_frac_low"].append(torch.mean((ratio < 1.0 + ratio_clip_range[0]).float()))
-
-                        # Other normalization strategies:
-                        # 1. Temp-FlowGRPO
-                        # 2. GRPO-Guard
 
                         # Backward
                         self.accelerator.backward(loss)

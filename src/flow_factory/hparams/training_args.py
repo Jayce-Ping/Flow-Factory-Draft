@@ -155,6 +155,12 @@ class TrainingArguments(ArgABC):
         default=(-5.0, 5.0),
         metadata={"help": "Clipping range for advantages in PPO/GRPO."},
     )
+    kl_type: Literal['v-based', 'x-based'] = field(
+        default='x-based',
+        metadata={"help": """Type of KL divergence to use.
+            'v-based': KL divergence in velocity space.
+            'x-based': KL divergence in latent space."""},
+    )
     kl_beta: float = field(
          default=0,
             metadata={"help": "KL penalty beta for PPO/GRPO."},
