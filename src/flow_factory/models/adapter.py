@@ -147,6 +147,7 @@ class BaseAdapter(ABC):
     def post_init(self):
         """Hook for additional initialization after main trainer's `accelerator.prepare`."""
         self._init_ema()
+        self._init_ref_parameters()
 
     # ============================== Loading Components ==============================
     @abstractmethod
@@ -457,6 +458,52 @@ class BaseAdapter(ABC):
         if hasattr(self, 'ema_wrapper') and self.ema_wrapper is not None:
             trainable_params = self.get_trainable_parameters()
             with self.ema_wrapper.use_ema_parameters(trainable_params):
+                yield
+        else:
+            yield
+
+    # ============================== Reference Parameters ==============================
+    def _init_ref_parameters(self):
+        """Initialize reference parameters for target components."""
+        if (
+            self.training_args.kl_beta > 0.0
+            and self.model_args.finetune_type in ['full']
+        ):
+            ref_param_device = self.accelerator.device if self.training_args.ref_param_device == 'same_as_model' else torch.device(self.training_args.ref_param_device)
+            self._ref_ema = EMAModuleWrapper(
+                parameters=self.get_trainable_parameters(),
+                decay=0.0,  # No decay,
+                update_step_interval=0,  # No updates, just store original weights
+                device=ref_param_device,
+            )
+        else:
+            self._ref_ema = None
+
+    @contextmanager
+    def use_ref_parameters(self):
+        """Context manager to use reference parameters."""
+        if self.model_args.finetune_type == 'lora':
+            # Store adapter names per component to handle multiple components safely
+            active_adapters = {}
+            
+            # 1. Disable adapters and cache their names
+            for comp_name in self.target_module_map.keys():
+                if hasattr(self, comp_name):
+                    component = getattr(self, comp_name)
+                    if isinstance(component, PeftModel):
+                        active_adapters[comp_name] = component.active_adapter
+                        component.disable_adapter()
+            try:
+                yield
+            finally:
+                # 2. Re-enable specific adapters for each component
+                for comp_name, adapter_name in active_adapters.items():
+                    getattr(self, comp_name).set_adapter(adapter_name)
+
+        elif self._ref_ema is not None:
+            trainable_params = self.get_trainable_parameters()
+            # If ref_ema is on CPU, this line will be very slow!
+            with self._ref_ema.use_ema_parameters(trainable_params):
                 yield
         else:
             yield

@@ -3,6 +3,9 @@ from typing import Optional
 from collections.abc import Iterable
 from contextlib import contextmanager
 import torch
+from ..utils.logger_utils import setup_logger
+
+logger = setup_logger(__name__)
 
 
 class EMAModuleWrapper:
@@ -44,7 +47,7 @@ class EMAModuleWrapper:
         
         # Validation
         assert 0.0 <= decay <= 1.0, f"Decay must be in [0, 1], got {decay}"
-        assert update_step_interval > 0, f"Update interval must be > 0"
+        assert update_step_interval >= 0, f"""Update interval must be >= 0. Got {update_step_interval}. (0 indicates no updates, to maintain initial params.)"""
 
     def get_current_decay(self, optimization_step: int) -> float:
         """Calculate current decay with optional warmup."""
@@ -64,7 +67,7 @@ class EMAModuleWrapper:
         optimization_step: int
     ) -> None:
         """Update EMA parameters."""
-        if (optimization_step + 1) % self.update_step_interval != 0:
+        if self.update_step_interval <= 0 or (optimization_step + 1) % self.update_step_interval != 0:
             return
             
         parameters = list(parameters)

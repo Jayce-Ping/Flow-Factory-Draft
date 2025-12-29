@@ -135,14 +135,6 @@ class TrainingArguments(ArgABC):
         default="grpo",
         metadata={"help": "Type of trainer to use."},
     )
-    clip_range: Union[float, tuple[float, float]] = field(
-        default=(-1e-4, 1e-4),
-        metadata={"help": "Clipping range for PPO/GRPO."},
-    )
-    adv_clip_range: Union[float, tuple[float, float]] = field(
-        default=(-5.0, 5.0),
-        metadata={"help": "Clipping range for advantages in PPO/GRPO."},
-    )
     group_size: int = field(
         default=16,
         metadata={"help": "Group size for GRPO sampling."},
@@ -154,6 +146,22 @@ class TrainingArguments(ArgABC):
     global_std: bool = field(
         default=True,
         metadata={"help": "Whether to use global std for GRPO Advantage normalization."},
+    )
+    clip_range: Union[float, tuple[float, float]] = field(
+        default=(-1e-4, 1e-4),
+        metadata={"help": "Clipping range for PPO/GRPO."},
+    )
+    adv_clip_range: Union[float, tuple[float, float]] = field(
+        default=(-5.0, 5.0),
+        metadata={"help": "Clipping range for advantages in PPO/GRPO."},
+    )
+    kl_beta: float = field(
+         default=0,
+            metadata={"help": "KL penalty beta for PPO/GRPO."},
+    )
+    ref_param_device : Literal["cpu", "same_as_model"] = field(
+        default="same_as_model",
+        metadata={"help": "Device to store reference model parameters."},
     )
 
     # NFT arguments
