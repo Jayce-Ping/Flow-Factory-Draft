@@ -721,9 +721,11 @@ class BaseAdapter(ABC):
             return True
         if self._is_fsdp2():
             return True
-        if self._is_fsdp():
-            if self._is_fsdp_param_sharded() or self._is_fsdp_collective_state_dict():
-                return True
+        if self._is_fsdp() and (
+            self._is_fsdp_param_sharded()
+            or self._is_fsdp_collective_state_dict()
+        ):
+            return True
         return False
 
     # ============================== Checkpoint Management ==============================
@@ -966,10 +968,8 @@ class BaseAdapter(ABC):
 
         # Dtype casting
         if dtype is not None:
-            state_dict = {
-                k: v.to(device='cpu', dtype=dtype) 
-                for k, v in state_dict.items()
-            }
+            for k in state_dict.keys():
+                state_dict[k] = state_dict[k].to(device='cpu', dtype=dtype)
 
         os.makedirs(save_directory, exist_ok=True)
 
@@ -1115,46 +1115,145 @@ class BaseAdapter(ABC):
             logger.info(f"Checkpoint saved successfully to {path}")
 
     # -------------------------------------------- Load -------------------------------------------
-    def load_checkpoint(self, path: str):
-        """
-        Loads safetensors checkpoints. Detects if the path contains LoRA adapters,
-        a sharded full model, or a single safetensor file.
-        """
-        logger.info(f"Attempting to load checkpoint from {path}")
+    @staticmethod
+    def load_sharded_checkpoint(checkpoint_dir: str, index_file: str) -> Dict[str, torch.Tensor]:
+        """Load sharded safetensors checkpoint."""
+        with open(index_file, 'r') as f:
+            index = json.load(f)
+        
+        state_dict = {}
+        loaded_files = set()
+        
+        for param_name, filename in index["weight_map"].items():
+            if filename not in loaded_files:
+                shard_path = os.path.join(checkpoint_dir, filename)
+                shard = load_file(shard_path)
+                state_dict.update(shard)
+                loaded_files.add(filename)
+        
+        return state_dict
 
-        if self.model_args.finetune_type == 'lora':
-            logger.info("Loading LoRA checkpoint...")
-            for comp_name in self.model_args.target_components:
-                if not hasattr(self, comp_name):
-                    logger.warning(f"Component {comp_name} not found, skipping")
-                    continue
-                
-                component = getattr(self, comp_name)
-                comp_path = os.path.join(path, comp_name) if len(self.model_args.target_components) > 1 else path
-                
-                if not isinstance(component, PeftModel):
-                    component = PeftModel.from_pretrained(component, comp_path, is_trainable=True)
-                    component.set_adapter("default")
-                    setattr(self, comp_name, component)
-                else:
-                    component.load_adapter(comp_path, component.active_adapter)
-                
-                logger.info(f"LoRA adapter loaded for {comp_name}")
+    def _load_lora(self, path: str) -> None:
+        """Load LoRA adapters for target components."""
+        for comp_name in self.model_args.target_components:
+            if not hasattr(self, comp_name):
+                logger.warning(f"Component {comp_name} not found, skipping")
+                continue
+            
+            component = getattr(self, comp_name)
+            comp_path = (
+                os.path.join(path, comp_name) 
+                if len(self.model_args.target_components) > 1 
+                else path
+            )
+            
+            unwrapped = self.accelerator.unwrap_model(component)
+            
+            if not isinstance(unwrapped, PeftModel):
+                # Load as PeftModel
+                unwrapped = PeftModel.from_pretrained(unwrapped, comp_path, is_trainable=True)
+                unwrapped.set_adapter("default")
+                setattr(self, comp_name, unwrapped)
+            else:
+                # Load to existing adapter
+                unwrapped.load_adapter(comp_path, unwrapped.active_adapter)
+            
+            if self.accelerator.is_main_process:
+                logger.info(f"LoRA adapter loaded for {comp_name} from {comp_path}")
+
+    def _load_full_model(self, path: str, strict: bool = True) -> None:
+        """Load full model weights for target components."""
+        for comp_name in self.model_args.target_components:
+            if not hasattr(self, comp_name):
+                logger.warning(f"Component {comp_name} not found, skipping")
+                continue
+            
+            component = getattr(self, comp_name)
+            comp_path = (
+                os.path.join(path, comp_name) 
+                if len(self.model_args.target_components) > 1 
+                else path
+            )
+            
+            unwrapped = self.accelerator.unwrap_model(component)
+        
+            # Try from_pretrained first
+            try:
+                new_component = component_class.from_pretrained(comp_path)
+                setattr(self, comp_name, new_component)
+                if self.accelerator.is_main_process:
+                    logger.info(f"Loaded {comp_name} via from_pretrained from {comp_path}")
+                continue
+            except Exception as e:
+                if self.accelerator.is_main_process:
+                    logger.debug(f"from_pretrained failed for {comp_name}: {e}, trying manual load...")
+
+            # Detect the checkpoint type
+            index_file = os.path.join(comp_path, SAFE_DIFFUSION_WEIGHTS_INDEX_NAME)
+            weights_file = os.path.join(comp_path, SAFE_DIFFUSION_WEIGHTS_NAME)
+
+            if os.path.exists(index_file):
+                state_dict = self.load_sharded_checkpoint(comp_path, index_file)
+            elif os.path.exists(weights_file):
+                state_dict = load_file(weights_file)
+            else:
+                logger.error(f"No valid checkpoint found for {comp_name} at {comp_path}")
+                continue
+            
+            # Load state_dict
+            missing, unexpected = unwrapped.load_state_dict(state_dict, strict=strict)
+            
+            if self.accelerator.is_main_process:
+                if missing:
+                    logger.warning(f"Missing keys for {comp_name}: {missing[:5]}...")
+                if unexpected:
+                    logger.warning(f"Unexpected keys for {comp_name}: {unexpected[:5]}...")
+                logger.info(f"Full model weights loaded for {comp_name} from {comp_path}")
+
+    def _load_training_state(self, path: str) -> None:
+        """Load full training state for resuming training."""
+        if self.accelerator.is_main_process:
+            logger.info(f"Loading training state from {path}...")
+        
+        self.accelerator.load_state(path)
+        
+        if self.accelerator.is_main_process:
+            logger.info("Training state loaded successfully.")
+
+    def load_checkpoint(
+        self,
+        path: str,
+        model_only: bool = True,
+        strict: bool = True,
+    ) -> None:
+        """
+        Load checkpoint for target components.
+        
+        Args:
+            path: Checkpoint directory path
+            model_only: If True, load only model weights. If False, load full training state
+                        (model, optimizer, scheduler, RNG states) for resuming training.
+            strict: Whether to strictly enforce state_dict key matching (only for full model).
+        """
+        path = os.path.expanduser(path)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Checkpoint path not found: {path}")
+        
+        if not model_only:
+            # Full training state
+            self._load_training_state(path)
+        elif self.model_args.finetune_type == 'lora':
+            # Load LoRA adapter
+            self._load_lora(path)
         else:
-            for comp_name in self.model_args.target_components:
-                if not hasattr(self, comp_name):
-                    logger.warning(f"Component {comp_name} not found, skipping")
-                    continue
-                
-                component = getattr(self, comp_name)
-                comp_path = os.path.join(path, comp_name) if len(self.model_args.target_components) > 1 else path
-                component_class = type(component)
-                component = component_class.from_pretrained(comp_path)
-                setattr(self, comp_name, component)
-                logger.info(f"Weights loaded for {comp_name}")
-
-        # Move model back to target device
+            # Loadd full model
+            self._load_full_model(path, strict=strict)
+        
         self.on_load()
+        self.accelerator.wait_for_everyone()
+        
+        if self.accelerator.is_main_process:
+            logger.info(f"Checkpoint loaded successfully from {path}")
 
     # ============================== Freezing Components ==============================
     def _freeze_text_encoders(self):

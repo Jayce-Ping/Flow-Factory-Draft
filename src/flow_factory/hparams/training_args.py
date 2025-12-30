@@ -262,6 +262,16 @@ class TrainingArguments(ArgABC):
         default='save',
         metadata={"help": "Directory to save logs and checkpoints. None for no saving."},
     )
+    
+    save_model_only : bool = field(
+        default=True,
+        metadata={"help": "Whether to save the model only, or the complete training state (model and optimizer)."}
+    )
+
+    load_model_only : bool = field(
+        default=True,
+        metadata={"help": "Whether to load the model only, or the complete training state (model and optimizer)."}
+    )
 
     def __post_init__(self):
         if not self.resolution:

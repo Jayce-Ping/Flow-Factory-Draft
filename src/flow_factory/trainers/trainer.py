@@ -141,12 +141,17 @@ class BaseTrainer(ABC):
 
     def save_checkpoint(self, path: str):
         """Save trainer state to a specific path."""
-        os.makedirs(path, exist_ok=True)
-        self.adapter.save_checkpoint(path)
+        self.adapter.save_checkpoint(
+            path=path,
+            model_only=self.training_args.save_model_only,
+        )
 
         self.accelerator.wait_for_everyone()
 
     def load_checkpoint(self, path: str):
         """Load trainer state from a specific path."""
-        self.adapter.load_checkpoint(path)
+        self.adapter.load_checkpoint(
+            path=path,
+            model_only=self.training_args.load_model_only,
+        )
         self.accelerator.wait_for_everyone()
