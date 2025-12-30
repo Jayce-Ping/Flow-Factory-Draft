@@ -646,10 +646,9 @@ class BaseAdapter(ABC):
         
         return results[components[0]] if len(results) == 1 else results
 
-    # ============================== Checkpoint Management ==============================
+    # ============================== Distributed Utils ==================================
 
-    # -------------------------------- Helpers --------------------------------
-
+    # ------------------------------ Dist Types -----------------------------------------
     @property
     def _distributed_type(self) -> DistributedType:
         """Get current distributed type."""
@@ -659,33 +658,78 @@ class BaseAdapter(ABC):
         """Check if DeepSpeed is enabled."""
         return self._distributed_type == DistributedType.DEEPSPEED
 
-    def _is_zero3(self) -> bool:
-        """Check if DeepSpeed ZeRO Stage 3 is enabled."""
-        if self.accelerator.distributed_type != DistributedType.DEEPSPEED:
-            return False
-        ds_plugin = self.accelerator.state.deepspeed_plugin
-        return ds_plugin is not None and ds_plugin.zero_stage == 3
-
     def _is_fsdp(self) -> bool:
-        """Check if FSDP is enabled."""
+        """Check if FSDP (v1) is enabled."""
         return self._distributed_type == DistributedType.FSDP
 
     def _is_fsdp2(self) -> bool:
         """Check if FSDP2 is enabled."""
         return getattr(self.accelerator, 'is_fsdp2', False)
 
-    def _is_fsdp_full_shard(self) -> bool:
-        """Check if FSDP Full Shard is enabled."""
-        if self.accelerator.distributed_type != DistributedType.FSDP:
+
+    # ------------------------------ Shard Strategies ---------------------------------
+    def _is_zero3(self) -> bool:
+        """Check if DeepSpeed ZeRO Stage 3 (parameter sharding) is enabled."""
+        if not self._is_deepspeed():
+            return False
+        ds_plugin = self.accelerator.state.deepspeed_plugin
+        return ds_plugin is not None and ds_plugin.zero_stage == 3
+
+    def _is_fsdp_param_sharded(self) -> bool:
+        """Check if FSDP shards parameters across ranks (FULL_SHARD or HYBRID)."""
+        if not self._is_fsdp():
             return False
         fsdp_plugin = self.accelerator.state.fsdp_plugin
         if fsdp_plugin is None:
             return False
-        # Check for full sharding strategy
         from torch.distributed.fsdp import ShardingStrategy
         return fsdp_plugin.sharding_strategy in (
             ShardingStrategy.FULL_SHARD,
+            ShardingStrategy.HYBRID_SHARD,
+            ShardingStrategy._HYBRID_SHARD_ZERO2,
         )
+
+    # ------------------------------ FSDP Views ----------------------------------------
+    def _fsdp_state_dict_type(self):
+        """Get FSDP state_dict_type, returns None if not FSDP."""
+        if not self._is_fsdp():
+            return None
+        fsdp_plugin = self.accelerator.state.fsdp_plugin
+        return fsdp_plugin.state_dict_type if fsdp_plugin else None
+
+    def _is_fsdp_collective_state_dict(self) -> bool:
+        """Check if FSDP state_dict_type requires collective operations."""
+        from torch.distributed.fsdp import StateDictType
+        state_dict_type = self._fsdp_state_dict_type()
+        if state_dict_type is None:
+            return False
+        # LOCAL_STATE_DICT does not requires communication while others do
+        return state_dict_type != StateDictType.LOCAL_STATE_DICT
+
+
+    def _requires_collective_state_dict(self) -> bool:
+        """
+        Check if state_dict gathering requires all ranks to participate.
+        
+        This is True when:
+        - DeepSpeed ZeRO-3 (parameters sharded)
+        - FSDP2 (always uses collective ops)
+        - FSDP with FULL/SHARDED_STATE_DICT (collective save)
+        - FSDP with FULL_SHARD (parameters sharded, must gather)
+        """
+        if self._is_zero3():
+            return True
+        if self._is_fsdp2():
+            return True
+        if self._is_fsdp():
+            if self._is_fsdp_param_sharded() or self._is_fsdp_collective_state_dict():
+                return True
+        return False
+
+    # ============================== Checkpoint Management ==============================
+
+
+    # ------------------------------ State Dict ------------------------------------------
 
     def get_state_dict(
         self,
@@ -828,10 +872,7 @@ class BaseAdapter(ABC):
             return
 
         # If not sharded save, use standard save_pretrained
-        if not (self._is_zero3() or self._is_fsdp_full_shard()):
-            if self.accelerator.is_main_process:
-                unwrapped.save_pretrained(save_directory)
-        else:
+        if self._requires_collective_state_dict():
             # Handle sharded save
             # Gather all params before saving
             state_dict = self.get_state_dict(
@@ -845,6 +886,9 @@ class BaseAdapter(ABC):
                     save_directory,
                     state_dict=state_dict,
                 )
+        else:
+            if self.accelerator.is_main_process:
+                unwrapped.save_pretrained(save_directory)
 
         self.accelerator.wait_for_everyone()
 
@@ -894,7 +938,7 @@ class BaseAdapter(ABC):
         
         # No shard, no casting, no offload, save directyly
         if (
-            not (self._is_zero3() or self._is_fsdp_full_shard())
+            not self._requires_collective_state_dict
             and not cast_needed
             and not is_offloaded
         ):
@@ -992,7 +1036,7 @@ class BaseAdapter(ABC):
                 f"index located at {save_index_file}."
             )
         else:
-            path_to_weights = os.path.join(save_directory, WEIGHTS_NAME)
+            path_to_weights = os.path.join(save_directory, weights_name)
             logger.info(f"Model weights saved in {path_to_weights}")
 
     def save_checkpoint(
