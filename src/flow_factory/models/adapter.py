@@ -3,7 +3,7 @@ import os
 import re
 import json
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, Tuple, List, Union, Literal
+from typing import Dict, Any, Optional, Tuple, List, Union, Literal, Iterable
 from dataclasses import dataclass, field, asdict, fields
 from contextlib import contextmanager, nullcontext, ExitStack
 import logging
@@ -747,7 +747,7 @@ class BaseAdapter(ABC):
         self,
         model,
         unwrap=True,
-        state_dict_keys: Optional[List[str]] = None,
+        state_dict_keys: Optional[Iterable[str]] = None,
         ignore_frozen_params : bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
@@ -778,7 +778,7 @@ class BaseAdapter(ABC):
                 or (not strict) and keys is None or any(k in name for k in keys) # Non-strict: `keys` is None returns True
             )
 
-        state_dict_keys = state_dict_keys if state_dict_keys is not None else None
+        state_dict_keys = set(state_dict_keys) if state_dict_keys is not None else None
 
         from accelerate.utils import compare_versions
 
@@ -818,7 +818,6 @@ class BaseAdapter(ABC):
                 # Freeze unwanted params
                 for name, param in model.named_parameters():
                     original_state[name] = param.requires_grad
-                    logger.info(F"Param {name} has grad {param.requires_grad} and match {is_param_match_key(name, state_dict_keys)}")
                     param.requires_grad = is_param_match_key(name, state_dict_keys)
                 
                 options = StateDictOptions(
