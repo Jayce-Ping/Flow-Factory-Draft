@@ -149,6 +149,7 @@ def get_dataloader(
     base_kwargs = {
         "preprocess_func": preprocess_func,
         "preprocess_kwargs": filter_kwargs(preprocess_func, **data_args.to_dict()) if preprocess_func else None,
+        'extra_hash_strs': [config.model_args.model_type, config.model_args.model_name_or_path], # Use model info to differentiate caches
     }
     base_kwargs.update(filter_kwargs(GeneralDataset.__init__, **data_args.to_dict()))
     base_kwargs['force_reprocess'] = data_args.force_reprocess

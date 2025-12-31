@@ -84,6 +84,7 @@ class GeneralDataset(Dataset):
         preprocess_kwargs: Optional[Dict[str, Any]] = None,
         num_shards: Optional[int] = None,
         shard_index: Optional[int] = None,
+        extra_hash_strs: Optional[List[str]] = None,
         **kwargs
     ):
         """
@@ -131,6 +132,7 @@ class GeneralDataset(Dataset):
                 preprocessing_batch_size=preprocessing_batch_size,
                 force_reprocess=force_reprocess,
                 max_dataset_size=max_dataset_size,
+                extra_hash_strs=extra_hash_strs,
             )
         else:
             self.processed_dataset = raw_dataset
@@ -165,6 +167,7 @@ class GeneralDataset(Dataset):
         preprocessing_batch_size: int,
         force_reprocess: bool,
         max_dataset_size: Optional[int],
+        extra_hash_strs: Optional[List[str]] = None,
     ) -> HFDataset:
         """
         Apply preprocessing to raw dataset with caching.
@@ -175,15 +178,15 @@ class GeneralDataset(Dataset):
         self._preprocess_func = preprocess_func
         self._preprocess_kwargs = preprocess_kwargs
         
-        # Compute cache path
-        funcs_hash = _compute_encode_funcs_hash(preprocess_func)
-        kwargs_hash = hashlib.md5(str(sorted(preprocess_kwargs.items())).encode()).hexdigest()[:8]
-        
-        self.merged_cache_path = os.path.join(
-            self.cache_dir,
-            f"{os.path.basename(self.data_root)}_{self.split}_"
-            f"cutoff{max_dataset_size if max_dataset_size else 'full'}_"
-            f"{funcs_hash}_{kwargs_hash}"
+        # Compute cache path        
+        self.merged_cache_path = self.compute_cache_path(
+            dataset_dir=self.data_root,
+            split=self.split,
+            cache_dir=self.cache_dir,
+            max_dataset_size=max_dataset_size,
+            preprocess_func=preprocess_func,
+            preprocess_kwargs=preprocess_kwargs,
+            extra_hash_strs=extra_hash_strs,
         )
         
         # Shard dataset if distributed
@@ -360,6 +363,7 @@ class GeneralDataset(Dataset):
         max_dataset_size: Optional[int],
         preprocess_func: Optional[Callable],
         preprocess_kwargs: Optional[Dict[str, Any]],
+        extra_hash_strs: Optional[List[str]] = None,
     ) -> str:
         """
         Compute merged cache path without creating dataset instance.
@@ -379,12 +383,17 @@ class GeneralDataset(Dataset):
         kwargs_hash = hashlib.md5(
             str(sorted((preprocess_kwargs or {}).items())).encode()
         ).hexdigest()[:8]
+
+        extra_hash = ""
+        if extra_hash_strs:
+            extra_combined = "|".join(extra_hash_strs)
+            extra_hash = "_" + hashlib.md5(extra_combined.encode()).hexdigest()[:8]
         
         return os.path.join(
             os.path.expanduser(cache_dir),
             f"{os.path.basename(dataset_dir)}_{split}_"
             f"cutoff{max_dataset_size if max_dataset_size else 'full'}_"
-            f"{funcs_hash}_{kwargs_hash}"
+            f"{funcs_hash}_{kwargs_hash}{extra_hash}"
         )
 
     def save_shard(self, shard_path: str):
