@@ -288,7 +288,8 @@ class TrainingArguments(ArgABC):
         logger.info("World Size:" + str(world_size))
 
         if self.train_steps is None:
-            self.train_steps = list(range(self.num_inference_steps // 2))
+            first_n_steps = min(self.num_inference_steps // 3, self.num_train_steps) # Default to first 1/3 of the timesteps
+            self.train_steps = list(range(first_n_steps))
 
         # Adjust unique_sample_num for even distribution
         sample_num_per_iteration = world_size * self.per_device_batch_size

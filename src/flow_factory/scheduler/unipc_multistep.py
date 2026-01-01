@@ -7,44 +7,6 @@ import torch
 import numpy as np
 from diffusers.utils.outputs import BaseOutput
 from diffusers.utils.torch_utils import randn_tensor
-
-
-from ..utils.base import to_broadcast_tensor
-from ..utils.logger_utils import setup_logger
-
-
-@dataclass
-class UniPCMultistepSDESchedulerOutput(BaseOutput):
-    """Output for SDE step with log probability support."""
-    prev_sample: torch.FloatTensor
-    prev_sample_mean: Optional[torch.FloatTensor] = None
-    std_dev_t: Optional[torch.FloatTensor] = None
-    log_prob: Optional[torch.FloatTensor] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "UniPCMultistepSDESchedulerOutput":
-        field_names = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in field_names})
-    
-"""
-UniPCMultistepSDEScheduler: SDE extension for UniPC scheduler.
-
-Architecture:
-- SDESchedulerMixin: Reusable infrastructure for noise level management, train steps, etc.
-- UniPCMultistepSDEScheduler: Inherits from UniPCMultistepScheduler, uses mixin for SDE logic.
-"""
-
-import math
-from dataclasses import dataclass, fields, asdict
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
-
-import torch
-import numpy as np
-from diffusers.utils.outputs import BaseOutput
-from diffusers.utils.torch_utils import randn_tensor
 from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
 
 from ..utils.base import to_broadcast_tensor
@@ -87,15 +49,110 @@ class UniPCMultistepSDEScheduler(UniPCMultistepScheduler):
 
     def __init__(
         self,
-        noise_level: float = 0.7,
-        train_steps: Optional[Union[int, List[int], torch.Tensor]] = None,
-        num_train_steps: Optional[int] = None,
-        seed: int = 42,
-        dynamics_type: Literal["SDE", "ODE"] = "SDE",
-        **kwargs
+        noise_level : float = 0.7,
+        train_steps : Optional[Union[int, list, torch.Tensor]] = None,
+        num_train_steps : Optional[int] = None,
+        seed : int = 42,
+        dynamics_type : Literal["Flow-SDE", 'Dance-SDE', 'CPS', 'ODE'] = "Flow-SDE",
+        **kwargs,
     ):
-        UniPCMultistepScheduler.__init__(self, **kwargs)
-        self._init_sde_mixin(noise_level, train_steps, num_train_steps, seed, dynamics_type)
+        super().__init__(**kwargs)
+        if train_steps is None:
+            # Default to all noise steps
+            train_steps = list(range(len(self.timesteps)))
+
+        self.noise_level = noise_level
+
+        assert self.noise_level >= 0, "Noise level must be non-negative."
+
+        self.train_steps = torch.tensor(train_steps, dtype=torch.int64)
+        self.num_train_steps = num_train_steps if num_train_steps is not None else len(train_steps) # Default to all noise steps
+        self.seed = seed
+        self.dynamics_type = dynamics_type
+        self._is_eval = False
+
+    @property
+    def is_eval(self):
+        return self._is_eval
+
+    def eval(self):
+        """Apply ODE Sampling with noise_level = 0"""
+        self._is_eval = True
+
+    def train(self, *args, **kwargs):
+        """Apply SDE Sampling"""
+        self._is_eval = False
+
+    def rollout(self, *args, **kwargs):
+        """Apply SDE rollout sampling"""
+        self.train(*args, **kwargs)
+
+    @property
+    def current_sde_steps(self) -> torch.Tensor:
+        """
+            Returns the current SDE step indices under the self.seed.
+            Randomly select self.num_train_steps from self.train_steps.
+        """
+        if self.num_train_steps >= len(self.train_steps):
+            return self.train_steps
+        generator = torch.Generator().manual_seed(self.seed)
+        selected_indices = torch.randperm(len(self.train_steps), generator=generator)[:self.num_train_steps]
+        return self.train_steps[selected_indices]
+
+    @property
+    def train_timesteps(self) -> torch.Tensor:
+        """
+            Returns timesteps that to train on.
+        """
+        return self.current_sde_steps
+
+    def get_train_timesteps(self) -> torch.Tensor:
+        """
+            Returns timesteps within the current window.
+        """
+        return self.timesteps[self.train_steps]
+
+    def get_train_sigmas(self) -> torch.Tensor:
+        """
+            Returns sigmas within the current window.
+        """
+        return self.sigmas[self.train_steps]
+
+    def get_noise_levels(self) -> torch.Tensor:
+        """ Returns noise levels on all timesteps, where noise level is non-zero only within the current window. """
+        noise_levels = torch.zeros_like(self.timesteps, dtype=torch.float32)
+        noise_levels[self.current_sde_steps] = self.noise_level
+        return noise_levels
+
+    def get_noise_level_for_timestep(self, timestep : Union[float, torch.Tensor]) -> Union[float, torch.Tensor]:
+        """
+            Return the noise level for a specific timestep.
+        """
+        if not isinstance(timestep, torch.Tensor) or timestep.ndim == 0:
+            t = timestep.item() if isinstance(timestep, torch.Tensor) else timestep
+            timestep_index = self.index_for_timestep(t)
+            return self.noise_level if timestep_index in self.train_steps else 0.0
+
+        indices = torch.tensor([self.index_for_timestep(t.item()) for t in timestep])
+        mask = torch.isin(indices, self.train_steps)
+        return torch.where(mask, self.noise_level, 0.0).to(timestep.dtype)
+
+
+    def get_noise_level_for_sigma(self, sigma) -> float:
+        """
+            Return the noise level for a specific sigma.
+        """
+        sigma_index = (self.sigmas - sigma).abs().argmin().item()
+        if sigma_index in self.train_steps:
+            return self.noise_level
+
+        return 0.0
+    
+    def set_seed(self, seed: int):
+        """
+            Set the random seed for noise steps.
+        """
+        self.seed = seed
 
     def step(
         self,
@@ -121,103 +178,5 @@ class UniPCMultistepSDEScheduler(UniPCMultistepScheduler):
             compute_log_prob: Whether to compute log probability.
             return_dict: Return output as dataclass or tuple.
         """
-        if self.num_inference_steps is None:
-            raise ValueError("Run 'set_timesteps' before calling step()")
-
-        if self.step_index is None:
-            self._init_step_index(timestep)
-
-        # --- Original UniPC logic: corrector + model output conversion ---
-        use_corrector = (
-            self.step_index > 0
-            and self.step_index - 1 not in self.disable_corrector
-            and self.last_sample is not None
-        )
-
-        model_output_convert = self.convert_model_output(model_output, sample=sample)
-        
-        if use_corrector:
-            sample = self.multistep_uni_c_bh_update(
-                this_model_output=model_output_convert,
-                last_sample=self.last_sample,
-                this_sample=sample,
-                order=self.this_order,
-            )
-
-        # Update history
-        for i in range(self.config.solver_order - 1):
-            self.model_outputs[i] = self.model_outputs[i + 1]
-            self.timestep_list[i] = self.timestep_list[i + 1]
-        self.model_outputs[-1] = model_output_convert
-        self.timestep_list[-1] = timestep
-
-        # Compute order
-        if self.config.lower_order_final:
-            this_order = min(self.config.solver_order, len(self.timesteps) - self.step_index)
-        else:
-            this_order = self.config.solver_order
-        self.this_order = min(this_order, self.lower_order_nums + 1)
-
-        self.last_sample = sample
-
-        # --- UniP predictor step (deterministic mean) ---
-        prev_sample_mean = self.multistep_uni_p_bh_update(
-            model_output=model_output,
-            sample=sample,
-            order=self.this_order,
-        )
-
-        # --- SDE noise injection ---
-        effective_noise_level = noise_level if noise_level is not None else (
-            0.0 if self.is_eval else self.get_noise_level_for_step_index(self.step_index)
-        )
-
-        sigma_t = self.sigmas[self.step_index]
-        sigma_prev = self.sigmas[self.step_index + 1]
-        
-        # Noise std proportional to step size and noise level
-        # Using DDPM-style variance: std = noise_level * sqrt(|sigma_t - sigma_prev|)
-        dt = (sigma_prev - sigma_t).abs()
-        std_dev_t = effective_noise_level * torch.sqrt(dt)
-        std_dev_t = to_broadcast_tensor(std_dev_t, prev_sample_mean)
-
-        if self.dynamics_type == "ODE" or effective_noise_level == 0.0:
-            # Deterministic
-            if prev_sample is None:
-                prev_sample = prev_sample_mean
-            log_prob = torch.zeros(sample.shape[0], device=sample.device) if compute_log_prob else None
-        else:
-            # SDE sampling #TODO: Add 3 diff type
-            if prev_sample is None:
-                noise = randn_tensor(
-                    prev_sample_mean.shape,
-                    generator=generator,
-                    device=prev_sample_mean.device,
-                    dtype=prev_sample_mean.dtype,
-                )
-                prev_sample = prev_sample_mean + std_dev_t * noise
-
-            if compute_log_prob:
-                log_prob = (
-                    -((prev_sample.detach() - prev_sample_mean) ** 2) / (2 * std_dev_t ** 2 + 1e-8)
-                    - torch.log(std_dev_t + 1e-8)
-                    - 0.5 * math.log(2 * math.pi)
-                )
-                log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
-            else:
-                log_prob = None
-
-        # Update state
-        if self.lower_order_nums < self.config.solver_order:
-            self.lower_order_nums += 1
-        self._step_index += 1
-
-        if not return_dict:
-            return (prev_sample, prev_sample_mean, std_dev_t, log_prob)
-
-        return UniPCMultistepSDESchedulerOutput(
-            prev_sample=prev_sample,
-            prev_sample_mean=prev_sample_mean,
-            std_dev_t=std_dev_t,
-            log_prob=log_prob,
-        )
+        # TODO
+        pass

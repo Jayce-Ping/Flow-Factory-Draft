@@ -90,7 +90,7 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler):
         num_train_steps : Optional[int] = None,
         seed : int = 42,
         dynamics_type : Literal["Flow-SDE", 'Dance-SDE', 'CPS', 'ODE'] = "Flow-SDE",
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs)
         if train_steps is None:
