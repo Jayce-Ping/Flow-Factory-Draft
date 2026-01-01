@@ -25,7 +25,7 @@ class DataArguments(ArgABC):
         metadata={"help": "Whether to enable preprocessing of the dataset."},
     )
     force_reprocess: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Whether to force reprocessing of the dataset even if cached data exists."},
     )
 
