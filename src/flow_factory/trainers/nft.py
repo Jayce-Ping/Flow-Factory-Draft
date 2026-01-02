@@ -270,7 +270,7 @@ class DiffusionNFTTrainer(BaseTrainer):
                             sample.all_latents[timestep_index] for sample in batch
                         ], dim=0)
                         old_v_pred = torch.stack([
-                            sample.noise_preds[timestep_index] for sample in batch
+                            sample.noise_pred[timestep_index] for sample in batch
                         ], dim=0)
                         new_v_pred = output.noise_pred
 
