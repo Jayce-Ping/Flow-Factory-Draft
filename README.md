@@ -16,6 +16,7 @@
   - [Text-to-Image & Text-to-Video](#text-to-image--text-to-video)
   - [Image-to-Image & Image-to-Video](#image-to-image--image-to-video)
   - [Video-to-Video](#video-to-video)
+- [Reward Model](#-reward-model)
 - [Acknowledgements](#acknowledgements)
 
 # 🤗 Supported Models
@@ -149,11 +150,11 @@ For models like [FLUX.2-dev]((https://huggingface.co/black-forest-labs/FLUX.2-de
 {"prompt": "An astronaut riding a horse on Mars.", "videos": ["path/to/video2.png", "path/to/video3.png"]}
 ```
 
-## Reward Models
+# 💯 Reward Model
 
 Flow-Factory provides a flexible reward model system that supports both built-in and custom reward models for reinforcement learning.
 
-### Built-in Reward Models
+## Built-in Reward Models
 
 The following reward models are pre-registered and ready to use:
 
@@ -161,7 +162,7 @@ The following reward models are pre-registered and ready to use:
 |------|-------------|-----------|
 | `PickScore` | CLIP-based aesthetic scoring model | [PickScore](https://huggingface.co/yuvalkirstain/PickScore_v1) |
 
-### Using Built-in Reward Models
+## Using Built-in Reward Models
 
 Simply specify the reward model name in your config file:
 ```yaml

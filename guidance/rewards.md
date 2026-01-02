@@ -1,4 +1,4 @@
-# Reward Models Guidance
+# Reward Model Guidance
 
 Flow-Factory provides a flexible reward model system that supports both built-in and custom reward models for reinforcement learning.
 
