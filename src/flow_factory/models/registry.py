@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 # Model Adapter Registry Storage
 _MODEL_ADAPTER_REGISTRY: Dict[str, str] = {
+    'sd3-5': 'flow_factory.models.stable_diffusion.sd3_5.SD3_5Adapter',
     'flux1': 'flow_factory.models.flux.flux1.Flux1Adapter',
     'flux1_init': 'flow_factory.models.flux.flux1_init.Flux1InitAdapter',
     'flux2': 'flow_factory.models.flux.flux2.Flux2Adapter',
