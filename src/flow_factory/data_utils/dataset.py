@@ -371,44 +371,29 @@ class GeneralDataset(Dataset):
         preprocess_func: Optional[Callable],
         preprocess_kwargs: Optional[Dict[str, Any]],
         extra_hash_strs: Optional[List[str]] = None,
+        digits: int = 32,
     ) -> str:
         """
-        Compute merged cache path without creating dataset instance.
-        Ensures fingerprint length <= 64 chars (HuggingFace limit).
-        """
-        # Collect all hash components
-        funcs_hash = _compute_encode_funcs_hash(preprocess_func, digits=8)
-        kwargs_hash = hashlib.md5(
-            str(sorted((preprocess_kwargs or {}).items())).encode()
-        ).hexdigest()[:8]
-        extra_hash = ""
-        if extra_hash_strs:
-            extra_hash = hashlib.md5("|".join(extra_hash_strs).encode()).hexdigest()[:8]
+        Compute merged cache path by hashing all components.
         
-        # Build components
+        Args:
+            digits: Length of hash fingerprint (default: 32, max: 32)
+        
+        Returns:
+            Cache path with fingerprint of specified length
+        """
+        # Collect all components
         dataset_name = os.path.basename(dataset_dir)
         cutoff_str = str(max_dataset_size) if max_dataset_size else "full"
-        hash_part = f"{funcs_hash}{kwargs_hash}{extra_hash}"
+        funcs_hash = _compute_encode_funcs_hash(preprocess_func, digits=16)
+        kwargs_hash = hashlib.md5(
+            str(sorted((preprocess_kwargs or {}).items())).encode()
+        ).hexdigest()[:16]
+        extra_hash = "|".join(extra_hash_strs) if extra_hash_strs else ""
         
-        # Target length (reserve space for shard suffix)
-        max_len = _MAX_FINGERPRINT_LEN - _SHARD_SUFFIX_RESERVE
-        
-        # Try full descriptive name first
-        fingerprint = f"{dataset_name}_{split}_{cutoff_str}_{hash_part}"
-        
-        if len(fingerprint) <= max_len:
-            return os.path.join(os.path.expanduser(cache_dir), fingerprint)
-        
-        # Truncate dataset_name to fit
-        prefix_budget = max_len - len(f"_{split}_{cutoff_str}_{hash_part}")
-        if prefix_budget >= 4:
-            fingerprint = f"{dataset_name[:prefix_budget]}_{split}_{cutoff_str}_{hash_part}"
-        else:
-            # Fallback: hash everything
-            full_hash = hashlib.md5(
-                f"{dataset_name}|{split}|{cutoff_str}|{hash_part}".encode()
-            ).hexdigest()
-            fingerprint = f"{dataset_name[:8]}_{split}_{full_hash}"[:max_len]
+        # Hash all components together
+        combined = f"{dataset_name}|{split}|{cutoff_str}|{funcs_hash}|{kwargs_hash}|{extra_hash}"
+        fingerprint = hashlib.md5(combined.encode()).hexdigest()[:min(digits, 32)]
         
         return os.path.join(os.path.expanduser(cache_dir), fingerprint)
 
