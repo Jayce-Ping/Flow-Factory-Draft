@@ -416,8 +416,8 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         negative_prompt: Optional[Union[str, List[str]]] = None,
         num_inference_steps: int = 50,
         guidance_scale: float = 4.0, # Corresponds to `true_cfg_scale` in Qwen-Image-Edit-Plus-Pipeline.
-        height: Optional[int] = None,
-        width: Optional[int] = None,
+        height: int = 1024,
+        width: int = 1024,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
 
         # Prompt encoding arguments
@@ -448,11 +448,16 @@ class QwenImageEditPlusAdapter(BaseAdapter):
 
         # Determine height and width
         image_size = images[-1].size if isinstance(images, list) else images.size
-        target_resolution = self.config.eval_args.resolution if self.mode == 'eval' else self.config.training_args.resolution
-        target_area = target_resolution[0] * target_resolution[1]
-        calculated_width, calculated_height = calculate_dimensions(target_area, image_size[0] / image_size[1])
-        height = height or calculated_height
-        width = width or calculated_width
+        calculated_width, calculated_height = calculate_dimensions(height * width, image_size[0] / image_size[1])
+        if calculated_height != height or calculated_width != width:
+            logger.warning(
+                f"Input image has aspect ratio {image_size[0] / image_size[1]:.2f}, "
+                f"which differs from target aspect ratio {width / height:.2f}. "
+                f"Adjusting output dimensions to ({calculated_width}, {calculated_height})."
+            )
+
+        height = calculated_height
+        width = calculated_width
         multiple_of = self.pipeline.vae_scale_factor * 2
         width = width // multiple_of * multiple_of
         height = height // multiple_of * multiple_of
@@ -699,8 +704,8 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         negative_prompt: Optional[Union[str, List[str]]] = None,
         num_inference_steps: int = 50,
         guidance_scale: float = 4.0, # Corresponds to `true_cfg_scale` in Qwen-Image-Edit-Plus-Pipeline.
-        height: Optional[int] = None,
-        width: Optional[int] = None,
+        height: int = 1024,
+        width: int = 1024,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
 
         # Prompt encoding arguments

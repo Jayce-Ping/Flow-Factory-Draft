@@ -326,10 +326,10 @@ class Flux2Adapter(BaseAdapter):
         # Ordinary arguments
         images: Optional[Union[List[Image.Image], Image.Image]] = None,
         prompt: Union[str, List[str]] = None,
-        height: Optional[int] = None,
-        width: Optional[int] = None,
+        height: int = 1024,
+        width: int = 1024,
         num_inference_steps: int = 50,
-        guidance_scale: Optional[float] = 4.0,
+        guidance_scale: float = 4.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
 
         # Prompt encoding arguments
@@ -357,10 +357,6 @@ class Flux2Adapter(BaseAdapter):
         """
 
         # 1. Setup
-        height = height or (self.eval_args.resolution[0] if self.mode == 'eval' else self.training_args.resolution[0])
-        width = width or (self.eval_args.resolution[1] if self.mode == 'eval' else self.training_args.resolution[1])
-        num_inference_steps = num_inference_steps or (self.eval_args.num_inference_steps if self.mode == 'eval' else self.training_args.num_inference_steps)
-        guidance_scale = guidance_scale or (self.eval_args.guidance_scale if self.mode == 'eval' else self.training_args.guidance_scale)
         device = self.device
 
         # 2. Preprocess inputs
@@ -528,10 +524,10 @@ class Flux2Adapter(BaseAdapter):
         self,
         images: Optional[Union[List[Image.Image], List[List[Image.Image]]]] = None,
         prompt: Optional[List[str]] = None,
-        height: Optional[int] = None,
-        width: Optional[int] = None,
+        height: int = 1024,
+        width: int = 1024,
         num_inference_steps: int = 50,
-        guidance_scale: Optional[float] = 4.0,
+        guidance_scale: float = 4.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         prompt_ids: Optional[torch.LongTensor] = None,
         prompt_embeds: Optional[torch.Tensor] = None,

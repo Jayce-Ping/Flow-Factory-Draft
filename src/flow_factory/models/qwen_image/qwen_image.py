@@ -247,8 +247,8 @@ class QwenImageAdapter(BaseAdapter):
         negative_prompt: Union[str, List[str]] = None,
         num_inference_steps: int = 50,
         guidance_scale: float = 4.0, # Corresponds to `true_cfg_scale` in Qwen-Image-Pipeline.
-        height: Optional[int] = None,
-        width: Optional[int] = None,
+        height: int = 1024,
+        width: int = 1024,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
 
         # Prompt encoding arguments
@@ -269,10 +269,6 @@ class QwenImageAdapter(BaseAdapter):
         **kwargs,
     ):
         # 1. Prepare inputs
-        height = height or (self.eval_args.resolution[0] if self.mode == 'eval' else self.training_args.resolution[0])
-        width = width or (self.eval_args.resolution[1] if self.mode == 'eval' else self.training_args.resolution[1])
-        num_inference_steps = num_inference_steps or (self.eval_args.num_inference_steps if self.mode == 'eval' else self.training_args.num_inference_steps)
-        guidance_scale = guidance_scale or (self.eval_args.guidance_scale if self.mode == 'eval' else self.training_args.guidance_scale)
         # Qwen-Image uses `true_cfg_scale` since it is not a guidance-distilled model.
         true_cfg_scale = guidance_scale or (self.eval_args.guidance_scale if self.mode == 'eval' else self.training_args.guidance_scale)
         device = self.device

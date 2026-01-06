@@ -121,9 +121,9 @@ class Flux1Adapter(BaseAdapter):
         prompt_ids : Optional[torch.Tensor] = None,
         prompt_embeds: Optional[torch.Tensor] = None,
         pooled_prompt_embeds: Optional[torch.Tensor] = None,
-        height: Optional[int] = None,
-        width: Optional[int] = None,
-        num_inference_steps: Optional[int] = None,
+        height: int = 512,
+        width: int = 512,
+        num_inference_steps: int = 28,
         guidance_scale: float = 3.5,
         generator: Optional[torch.Generator] = None,
         compute_log_prob: bool = True,
@@ -132,10 +132,6 @@ class Flux1Adapter(BaseAdapter):
         """Execute generation and return FluxSample objects."""
         
         # 1. Setup
-        height = height or (self.eval_args.resolution[0] if self.mode == 'eval' else self.training_args.resolution[0])
-        width = width or (self.eval_args.resolution[1] if self.mode == 'eval' else self.training_args.resolution[1])
-        num_inference_steps = num_inference_steps or (self.eval_args.num_inference_steps if self.mode == 'eval' else self.training_args.num_inference_steps)
-        guidance_scale = guidance_scale or (self.eval_args.guidance_scale if self.mode == 'eval' else self.training_args.guidance_scale)
         device = self.device
         
         # 2. Encode prompts if not provided

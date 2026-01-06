@@ -248,10 +248,6 @@ class Wan2_T2V_Adapter(BaseAdapter):
         **kwargs,
     ):
         # 1. Setup args
-        height = height or (self.eval_args.resolution[0] if self.mode == 'eval' else self.training_args.resolution[0])
-        width = width or (self.eval_args.resolution[1] if self.mode == 'eval' else self.training_args.resolution[1])
-        num_inference_steps = num_inference_steps or (self.eval_args.num_inference_steps if self.mode == 'eval' else self.training_args.num_inference_steps)
-        guidance_scale = guidance_scale or (self.eval_args.guidance_scale if self.mode == 'eval' else self.training_args.guidance_scale)
         device = self.pipeline._execution_device
         do_classifier_free_guidance = guidance_scale > 1.0
 
