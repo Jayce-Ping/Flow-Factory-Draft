@@ -12,7 +12,8 @@ from accelerate import Accelerator
 from diffusers.pipelines.wan.pipeline_wan_i2v import WanImageToVideoPipeline
 from peft import PeftModel
 
-from ..adapter import BaseAdapter, BaseSample
+from ..adapter import BaseAdapter
+from ..samples import ImageConditionSample
 from ...hparams import *
 from ...scheduler import SDESchedulerOutput, set_scheduler_timesteps
 from ...utils.base import filter_kwargs
@@ -22,7 +23,7 @@ logger = setup_logger(__name__)
 
 
 @dataclass
-class WanSample(BaseSample):
+class WanSample(ImageConditionSample):
     pass
 
 

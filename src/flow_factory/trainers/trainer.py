@@ -101,6 +101,7 @@ class BaseTrainer(ABC):
         # Move text-encoder & vae to GPU for dataloader encoding
 
         self.adapter.on_load_text_encoders(self.accelerator.device)
+        self.adapter.on_load_vae(self.accelerator.device)
         dataloader, test_dataloader = get_dataloader(
             config=self.config,
             accelerator=self.accelerator,
@@ -108,6 +109,7 @@ class BaseTrainer(ABC):
         )
         # Offload text-encoder after dataloader encoding
         self.adapter.off_load_text_encoders()
+        self.adapter.off_load_vae()
 
         self.accelerator.wait_for_everyone()
 

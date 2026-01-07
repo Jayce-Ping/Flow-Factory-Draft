@@ -119,17 +119,176 @@ def num_to_base_tuple(num, base, length):
         num //= base
     return tuple(result.tolist())
 
+# ----------------------------------- Hash Utils --------------------------------------
+
+def hash_pil_image(image: Image.Image, size: Optional[int] = None) -> str:
+    """
+    Generate a hash string for a PIL Image.
+    Args:
+        image: PIL Image object
+        size: Optional thumbnail size for faster hashing. None uses full image.
+    Returns:
+        str: MD5 hash hex string
+    """
+    if size is not None:
+        image = image.copy()
+        image.thumbnail((size, size))
+    return hashlib.md5(image.tobytes()).hexdigest()
+
+def hash_tensor(tensor: torch.Tensor, max_elements: int = 1024) -> str:
+    """
+    Generate a hash string for a torch Tensor.
+    Args:
+        tensor: Input tensor
+        max_elements: Max elements to hash (for efficiency)
+    Returns:
+        str: MD5 hash hex string
+    """
+    flat = tensor.detach().flatten()
+    if flat.numel() > max_elements:
+        # Sample evenly across tensor
+        indices = torch.linspace(0, flat.numel() - 1, max_elements).long()
+        flat = flat[indices]
+    return hashlib.md5(flat.cpu().numpy().tobytes()).hexdigest()
+
+def hash_pil_image_list(images: List[Image.Image], size: int = 32) -> str:
+    """
+    Generate a combined hash for a list of PIL Images.
+    Args:
+        images: List of PIL Image objects
+        size: Thumbnail size per image
+    Returns:
+        str: Combined MD5 hash hex string
+    """
+    hasher = hashlib.md5()
+    for img in images:
+        hasher.update(hash_pil_image(img, size=size).encode())
+    return hasher.hexdigest()
+
 # -------------------------------------Image Utils-------------------------------------
 
-def hash_pil_image(image: Image.Image) -> str:
+def is_valid_image(image: Union[Image.Image, torch.Tensor, np.ndarray]) -> bool:
     """
-        Generate a hash string for a PIL Image.
-        Args:
-            image (Image.Image): PIL Image object
-        Returns:
-            str: Hash string of the image
+    Check if the input is a valid image type (PIL Image, torch Tensor, or NumPy array).
+    Args:
+        image: Input image
+    Returns:
+        bool: True if valid image type:
+            - A valid PIL.Image
+            - A torch.Tensor with shape (C, H, W) or (B, C, H, W)
+            - A np.ndarray with shape (H, W, C) or (B, H, W, C)
     """
-    return hashlib.md5(image.tobytes()).hexdigest()
+    # PIL Image
+    if isinstance(image, Image.Image):
+        return image.size[0] > 0 and image.size[1] > 0
+    
+    # Torch Tensor: (C, H, W) or (B, C, H, W)
+    if isinstance(image, torch.Tensor):
+        if image.ndim == 3:
+            c, h, w = image.shape
+            return c in (1, 3, 4) and h > 0 and w > 0
+        elif image.ndim == 4:
+            b, c, h, w = image.shape
+            return b > 0 and c in (1, 3, 4) and h > 0 and w > 0
+        return False
+    
+    # NumPy array: (H, W, C) or (B, H, W, C)
+    if isinstance(image, np.ndarray):
+        if image.ndim == 3:
+            h, w, c = image.shape
+            return h > 0 and w > 0 and c in (1, 3, 4)
+        elif image.ndim == 4:
+            b, h, w, c = image.shape
+            return b > 0 and h > 0 and w > 0 and c in (1, 3, 4)
+        return False
+    
+    return False
+
+def is_valid_image_list(images: Union[List[Image.Image], List[torch.Tensor], List[np.ndarray]]) -> bool:
+    """
+    Check if the input is a valid list of images.
+    Args:
+        images: Input image list
+    Returns:
+        bool: True if valid image list:
+            - A non-empty list
+            - All elements are valid images (PIL, Tensor, or ndarray)
+            - All elements are of the same type
+    """
+    if not isinstance(images, list):
+        return False
+    
+    if len(images) == 0:
+        return False
+    
+    # Check type consistency
+    first_type = type(images[0])
+    if not all(isinstance(img, first_type) for img in images):
+        return False
+    
+    # Check each image is valid
+    return all(is_valid_image(img) for img in images)
+
+
+def is_valid_image_batch(
+    images: Union[List[Image.Image], List[torch.Tensor], List[np.ndarray], torch.Tensor, np.ndarray]
+) -> bool:
+    """
+    Check if the input is a valid batch of images.
+    Args:
+        images: Input image batch
+    Returns:
+        bool: True if valid image batch:
+            - A List[PIL.Image]
+            - A List[torch.Tensor] where each tensor is (C, H, W)
+            - A List[np.ndarray] where each array is (H, W, C)
+            - A torch.Tensor with shape (B, C, H, W)
+            - A np.ndarray with shape (B, H, W, C)
+    """
+    # Case 1: List of images
+    if isinstance(images, list):
+        return is_valid_image_list(images)
+    
+    # Case 2: Batched torch.Tensor (B, C, H, W)
+    if isinstance(images, torch.Tensor):
+        if images.ndim != 4:
+            return False
+        b, c, h, w = images.shape
+        return b > 0 and c in (1, 3, 4) and h > 0 and w > 0
+    
+    # Case 3: Batched np.ndarray (B, H, W, C)
+    if isinstance(images, np.ndarray):
+        if images.ndim != 4:
+            return False
+        b, h, w, c = images.shape
+        return b > 0 and h > 0 and w > 0 and c in (1, 3, 4)
+    
+    return False
+
+def is_valid_image_batch_list(image_batches: List[List[Union[Image.Image, torch.Tensor, np.ndarray]]]) -> bool:
+    """
+    Check if the input is a valid batch of image lists (List[List[Image]]).
+    Args:
+        image_batches: Batch of image lists, e.g., [[img1, img2], [img3], [img4, img5, img6]]
+    Returns:
+        bool: True if valid:
+            - Outer list is non-empty
+            - Each inner element is either a valid image list or an empty list
+    """
+    if not isinstance(image_batches, list):
+        return False
+    
+    if len(image_batches) == 0:
+        return False
+    
+    for batch in image_batches:
+        if not isinstance(batch, list):
+            return False
+        # Allow empty lists (some samples may have no images)
+        if len(batch) > 0 and not is_valid_image_list(batch):
+            return False
+    
+    return True
 
 def pil_image_to_base64(image : Image.Image, format="JPEG") -> str:
     """

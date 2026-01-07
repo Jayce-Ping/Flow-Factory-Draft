@@ -7,6 +7,7 @@ from typing import Dict, Any, Optional, Tuple, List, Union, Literal, Iterable
 from dataclasses import dataclass, field, asdict, fields
 from contextlib import contextmanager, nullcontext, ExitStack
 import logging
+import hashlib
 
 import torch
 import torch.nn as nn
@@ -36,6 +37,7 @@ from accelerate.utils import (
 )
 
 
+from .samples import BaseSample
 from ..ema import EMAModuleWrapper
 from ..scheduler import FlowMatchEulerDiscreteSDEScheduler, SDESchedulerOutput
 from ..hparams import *
@@ -54,81 +56,6 @@ SAFE_DIFFUSION_WEIGHTS_INDEX_NAME = f"{SAFE_DIFFUSION_WEIGHTS_NAME}.index.json"
 
 
 logger = setup_logger(__name__)
-@dataclass
-class BaseSample(BaseOutput):
-    """
-    Base output class for Adapter models.
-    The tensors are without batch dimension.
-    """
-    all_latents : torch.FloatTensor
-    timesteps : torch.FloatTensor
-    prompt_ids : torch.LongTensor
-    height : Optional[int] = None
-    width : Optional[int] = None
-    image: Optional[Image.Image] = None
-    prompt : Optional[str] = None
-    negative_prompt : Optional[str] = None
-    negative_prompt_ids : Optional[torch.LongTensor] = None
-    prompt_embeds : Optional[torch.FloatTensor] = None
-    negative_prompt_embeds : Optional[torch.FloatTensor] = None
-    log_probs : Optional[torch.FloatTensor] = None
-    image_ids : Optional[torch.Tensor] = None
-    extra_kwargs : Dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dict for memory tracking, excluding non-tensor fields."""
-        result = asdict(self)
-        extra = result.pop('extra_kwargs', {})
-        result.update(extra)
-        return result
-
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "BaseSample":
-        """Create instance from dict, putting unknown fields into extra_kwargs."""
-        field_names = {f.name for f in fields(cls)}
-        known = {k: v for k, v in d.items() if k in field_names and k != 'extra_kwargs'}
-        extra = {k: v for k, v in d.items() if k not in field_names}
-        assert not (set(extra) & field_names), f"Key collision: {set(extra) & field_names} when creating BaseSample from dict."
-        extra.update(d.get('extra_kwargs', {}))
-        return cls(**known, extra_kwargs=extra)
-    
-    def __getattr__(self, key: str) -> Any:
-        """Access attributes. Check extra_kwargs if not found."""
-        extra = object.__getattribute__(self, 'extra_kwargs')
-        if key in extra:
-            return extra[key]
-        raise AttributeError(f"'{type(self).__name__}' has no attribute '{key}'")
-
-    def short_rep(self) -> Dict[str, Any]:
-        """Short representation for logging."""
-        def long_tensor_to_shape(t : torch.Tensor):
-            if isinstance(t, torch.Tensor) and t.numel() > 16:
-                return t.shape
-            else:
-                return t
-
-        d = self.to_dict()
-        d = {k: long_tensor_to_shape(v) for k,v in d.items()}
-        return d
-
-    def to(self, device: Union[torch.device, str], depth : int = 1) -> "BaseSample":
-        """Move all tensor fields to specified device."""
-        assert 0 <= depth <= 1, "Only depth 0 and 1 are supported."
-        device = torch.device(device)
-        for field in fields(self):
-            value = getattr(self, field.name)
-            if isinstance(value, torch.Tensor):
-                setattr(self, field.name, value.to(device))
-            elif depth == 1 and is_tensor_list(value):
-                setattr(
-                    self,
-                    field.name,
-                    [t.to(device) if isinstance(t, torch.Tensor) else t for t in value]
-                )
-            
-        return self
-
-
 
 class BaseAdapter(ABC):
     """

@@ -14,7 +14,8 @@ import torch
 from diffusers.pipelines.flux.pipeline_flux_kontext import FluxKontextPipeline
 from diffusers.utils.torch_utils import randn_tensor
 
-from ..adapter import BaseAdapter, BaseSample
+from ..adapter import BaseAdapter
+from ..samples import ImageConditionSample
 from ...hparams import *
 from ...scheduler import FlowMatchEulerDiscreteSDEScheduler, SDESchedulerOutput, set_scheduler_timesteps
 from ...utils.base import (
@@ -63,10 +64,9 @@ FluxKontextImageInput = Union[
 ]
 
 @dataclass
-class Flux1KontextSample(BaseSample):
+class Flux1KontextSample(ImageConditionSample):
     """Output class for Flux Adapter models."""
     pooled_prompt_embeds : Optional[torch.FloatTensor] = None
-    condition_images : Optional[Union[Image.Image, torch.Tensor, np.ndarray]] = None
     image_latents : Optional[torch.FloatTensor] = None
     condition_image_size: Optional[Tuple[int, int]] = None
 

@@ -340,10 +340,9 @@ class GeneralDataset(Dataset):
         final_res = {}
         for k, v in preprocess_res.items():
             if isinstance(v, torch.Tensor):
-                # Case A: Dense Batch Tensor (e.g. Qwen prompt embeddings)
+                # Case A: Dense Batch Tensor
                 # Move entire batch to CPU first (faster than moving slices), then unbind
-                v_cpu = v.cpu()
-                final_res[k] = list(torch.unbind(v_cpu, dim=0))
+                final_res[k] = list(torch.unbind(v.cpu(), dim=0))
             elif isinstance(v, list):
                 # Case B: Ragged List (e.g. Flux image latents of varying sizes)
                 # Check contents and move tensors to CPU if found

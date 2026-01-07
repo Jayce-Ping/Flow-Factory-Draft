@@ -6,7 +6,8 @@ Provides model adapters for different diffusion/flow-matching architectures
 with a registry-based loading system for easy extensibility.
 """
 
-from .adapter import BaseAdapter, BaseSample
+from .adapter import BaseAdapter
+from .samples import BaseSample, ImageConditionSample, VideoConditionSample
 from .registry import (
     get_model_adapter_class,
     list_registered_models,
@@ -16,7 +17,11 @@ from .loader import load_model
 __all__ = [
     # Core classes
     "BaseAdapter",
+
+    # Sample classes
     "BaseSample",
+    "ImageConditionSample",
+    "VideoConditionSample",
     
     # Registry functions
     "get_model_adapter_class",

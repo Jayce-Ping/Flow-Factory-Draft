@@ -1,13 +1,13 @@
 # Environment Configuration
 launcher: "accelerate"  # Options: accelerate
-config_file: config/deepspeed/deepspeed_zero2.yaml  # Path to distributed config file (optional)
+config_file: config/deepspeed/deepspeed_zero2.yaml  # Use FSDP2 to shard the model as well. Switch to config/deepspeed/deepspeed_zero2.yaml if you have enough GPU memory.
 num_processes: 8  # Number of processes to launch (overrides config file)
 main_process_port: 29500
 mixed_precision: "bf16"  # Options: no, fp16, bf16
 
 run_name: null  # Run name (auto: {model_type}_{finetune_type}_{timestamp})
 project: "Flow-Factory"  # Project name for logging
-logging_backend: "wandb"  # Options: wandb, swanlab, none
+logging_backend: "none"  # Options: wandb, swanlab, none
 
 # Data Configuration
 data:
@@ -17,7 +17,7 @@ data:
   enable_preprocess: true  # Enable dataset preprocessing
   force_reprocess: true  # Force reprocessing of the dataset
   cache_dir: "~/jcy/.cache/flow_factory/datasets" # Cache directory for preprocessed datasets
-  max_dataset_size: 128  # Limit the maximum number of samples in the dataset
+  max_dataset_size: 1000  # Limit the maximum number of samples in the dataset
   condition_image_size: 512  # Condition image size for kontext model
 
 # Model Configuration
@@ -26,8 +26,8 @@ model:
   lora_rank : 64
   lora_alpha : 128
   target_modules: "default" # Options: all, default, or list of module names like ["to_k", "to_q", "to_v", "to_out.0"]
-  model_name_or_path: "black-forest-labs/FLUX.1-Kontext-dev"  # HuggingFace model ID or local path
-  model_type: "flux1-kontext"  # Options: flux1-kontext
+  model_name_or_path: "Qwen/Qwen-Image-Edit-2509"  # HuggingFace model ID or local path
+  model_type: "qwen-image-edit-plus"  # Options: flux1, flux1-kontext, flux2, qwenimage, qwenimage-edit
   resume_path: null # Path to load previous checkpoint/lora adapter
   resume_training_state: false # Whether to resume training state, only effective when resume_path is a directory with full checkpoint
   master_weight_dtype: 'float32' # Weight dtype for trainable parameters when full-paramter fine-tuning, options are ["float16", "bfloat16", "float32"]
@@ -44,7 +44,7 @@ train:
   enable_gradient_checkpointing: false  # Enable gradient checkpointing to save memory with extra compute
 
   # Image settings
-  resolution: 384  # Can be int or [height, width]
+  resolution: 512  # Can be int or [height, width]
   
   # Batch and sampling
   per_device_batch_size: 1  # Batch size per device
@@ -58,13 +58,18 @@ train:
   adv_clip_range: 5.0  # Advantage clipping range
   max_grad_norm: 1.0  # Max gradient norm for clipping
   
+  # KL div
+  kl_type: 'x-based' # Options: 'x-based', 'normal-based'
+  kl_beta: 0.04 # KL divergence beta
+  ref_param_device: 'same_as_model' # Options: cpu, same_as_model
+
   # Denoising process
   dynamics_type: "Flow-SDE"  # Options: Flow-SDE, Dance-SDE, CPS, ODE
-  num_inference_steps: 8  # Number of SDE timesteps
-  noise_level: 0.9  # Noise level for sampling
+  num_inference_steps: 10  # Number of SDE timesteps
+  noise_level: 1.0  # Noise level for sampling
   num_train_steps: 1  # Number of noise steps
   train_steps: [1, 2, 3]  # Custom noise window
-  guidance_scale: 2.5  # Guidance scale for sampling
+  guidance_scale: 4  # Guidance scale for sampling
   
   # Optimization
   seed: 42  # Random seed
@@ -79,11 +84,11 @@ train:
   
 # Evaluation settings
 eval:
-  resolution: 512  # Evaluation resolution
-  per_device_batch_size: 4  # Eval batch size
-  seed: 42  # Eval seed (defaults to training seed)
-  guidance_scale: 2.5  # Guidance scale for sampling
-  num_inference_steps: 20  # Number of eval timesteps
+  resolution: 1024  # Evaluation resolution
+  per_device_batch_size: 1  # Eval batch size
+  seed: 42  # Eval seed
+  guidance_scale: 4  # Guidance scale for sampling
+  num_inference_steps: 28  # Number of eval timesteps
   eval_freq: 20  # Eval frequency in epochs (0 to disable)
 
 # Reward Model Configuration
@@ -91,4 +96,5 @@ reward:
   reward_model: "PickScore"  # Model name or path:class_name
   dtype: "bfloat16"  # Options: float16, bfloat16, float32
   device: "cuda"  # Options: cpu, cuda
+  reward_model_kwargs: null  # Additional kwargs for reward model
   batch_size: 16  # Inference batch size

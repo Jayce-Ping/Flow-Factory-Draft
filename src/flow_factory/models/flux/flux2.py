@@ -13,7 +13,8 @@ from diffusers.pipelines.flux2.pipeline_flux2 import Flux2Pipeline, format_input
 from diffusers.pipelines.flux2.system_messages import SYSTEM_MESSAGE, SYSTEM_MESSAGE_UPSAMPLING_T2I, SYSTEM_MESSAGE_UPSAMPLING_I2I
 import logging
 
-from ..adapter import BaseAdapter, BaseSample
+from ..adapter import BaseAdapter
+from ..samples import ImageConditionSample
 from ...hparams import *
 from ...scheduler import FlowMatchEulerDiscreteSDEScheduler, SDESchedulerOutput, set_scheduler_timesteps
 from ...utils.base import filter_kwargs, pil_image_to_tensor
@@ -23,11 +24,10 @@ logger = setup_logger(__name__)
 
 
 @dataclass
-class Flux2Sample(BaseSample):
+class Flux2Sample(ImageConditionSample):
     """Output class for Flux2Adapter models."""
     latent_ids : Optional[torch.Tensor] = None
     text_ids : Optional[torch.Tensor] = None
-    condition_images : Optional[Union[List[Image.Image], Image.Image]] = None
     image_latents : Optional[torch.Tensor] = None
     image_latent_ids : Optional[torch.Tensor] = None
 
