@@ -189,13 +189,13 @@ class LogFormatter:
         return clean_data
     
     @classmethod
-    def _build_caption(cls, sample: BaseSample) -> str:
+    def _build_caption(cls, sample: BaseSample, max_length : Optional[int] = None) -> str:
         """Build caption from reward and prompt."""
         parts = []
         if 'reward' in sample.extra_kwargs:
             parts.append(f"{sample.extra_kwargs['reward']:.2f}")
         if sample.prompt:
-            parts.append(sample.prompt[:50] + "..." if len(sample.prompt) > 50 else sample.prompt)
+            parts.append(sample.prompt[:max_length] + "..." if (max_length is not None and len(sample.prompt) > max_length) else sample.prompt)
         return " | ".join(parts)
 
     @classmethod
