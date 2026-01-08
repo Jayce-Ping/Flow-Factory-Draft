@@ -354,6 +354,7 @@ class GeneralDataset(Dataset):
                 final_res[k] = v
 
         batch_dict = {**prompt_args, **image_args, **video_args, **final_res}
+        batch_dict = {k: v for k, v in batch_dict.items() if v is not None} # Remove None values
         assert 'metadata' not in batch_dict.keys(), "RuntimeError: `metadata` should be saved for original data item"
         # Add the rest info to `metadata` key
         batch_dict['metadata'] = {
