@@ -251,7 +251,6 @@ class GRPOTrainer(BaseTrainer):
                         adv_clip_range = self.training_args.adv_clip_range
                         adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
                         # PPO-style clipped loss
-                        logger.info(f"new_log_prob={output.log_prob}, old_log_prob={old_log_prob}")
                         ratio = torch.exp(output.log_prob - old_log_prob)
                         ratio_clip_range = self.training_args.clip_range
 
