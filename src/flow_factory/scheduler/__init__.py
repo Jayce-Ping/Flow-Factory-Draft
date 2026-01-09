@@ -1,5 +1,5 @@
 from .flow_match_euler_discrete import FlowMatchEulerDiscreteSDEScheduler, FlowMatchEulerDiscreteSDESchedulerOutput, set_scheduler_timesteps
-from .unipc_multistep import UniPCMultistepScheduler, UniPCMultistepSDESchedulerOutput
+from .unipc_multistep import UniPCMultistepSDEScheduler, UniPCMultistepSDESchedulerOutput
 from .abc import SDESchedulerOutput
 
 __all__ = [
@@ -9,6 +9,6 @@ __all__ = [
     'FlowMatchEulerDiscreteSDEScheduler',
     'FlowMatchEulerDiscreteSDESchedulerOutput',
 
-    'UniPCMultistepScheduler',
+    'UniPCMultistepSDEScheduler',
     'UniPCMultistepSDESchedulerOutput',
 ]

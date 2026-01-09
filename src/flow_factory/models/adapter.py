@@ -120,12 +120,16 @@ class BaseAdapter(ABC):
 
     def load_scheduler(self) -> FlowMatchEulerDiscreteSDEScheduler:
         """Load and return the scheduler."""
+        sde_config_keys = ['noise_level', 'train_steps', 'num_train_steps', 'seed', 'dynamics_type']
+        # Check keys:
+        for k in sde_config_keys:
+            if not hasattr(self.training_args, k):
+                logger.warning(f"Missing SDE config key '{k}' in training_args, using default value")
+
         sde_config = {
-            'noise_level': self.training_args.noise_level,
-            'train_steps': self.training_args.train_steps,
-            'num_train_steps': self.training_args.num_train_steps,
-            'seed': self.training_args.seed,
-            'dynamics_type': self.training_args.dynamics_type,
+            k: getattr(self.training_args, k)
+            for k in sde_config_keys
+            if hasattr(self.training_args, k)
         }
         scheduler_config = self.pipeline.scheduler.config.__dict__.copy()
         scheduler_config.update(sde_config)
@@ -317,7 +321,17 @@ class BaseAdapter(ABC):
     def default_target_modules(self) -> List[str]:
         """Default target modules for training."""
         return ['to_q', 'to_k', 'to_v', 'to_out.0']
+
+    @property
+    def preprocessing_modules(self) -> List[str]:
+        """Modules that are requires for preprocessing"""
+        return ['text_encoders', 'vae']
     
+    @property
+    def inference_modules(self) -> List[str]:
+        """Modules taht are requires for inference and forward"""
+        return ['transformer', 'vae']
+
     def _parse_target_modules(
         self,
         target_modules: Union[str, List[str]],
@@ -1389,6 +1403,32 @@ class BaseAdapter(ABC):
                 if component is not None and hasattr(component, 'to'):
                     component.to('cpu')
                     logger.info(f"Off-loaded {comp} to CPU")
+
+    def on_load_components(self, components: Optional[Union[str, List[str]]] = None, device: Union[torch.device, str] = None):
+        """Load specified components to device."""
+        device = device or self.device
+        
+        if components is None:
+            if hasattr(self.pipeline, 'model_cpu_offload_seq'):
+                components = self.pipeline.model_cpu_offload_seq.split('->')
+                components = components[::-1] # Reverse the order
+            else:
+                components = ['transformers', 'vae', 'text_encoders']
+        elif isinstance(components, str):
+            components = [components]
+        
+        for comp in components:
+            if comp == 'text_encoders':
+                self.on_load_text_encoders(device)
+            elif comp == 'vae':
+                self.on_load_vae(device)
+            elif comp == 'transformers':
+                self.on_load_transformers(device)
+            else:
+                component = getattr(self, comp, None)
+                if component is not None and hasattr(component, 'to'):
+                    component.to(device)
+                    logger.info(f"Loaded {comp} to {device}")
 
     def off_load_text_encoders(self):
         """Off-load all text encoders to CPU."""

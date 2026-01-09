@@ -99,17 +99,19 @@ class BaseTrainer(ABC):
 
     def _init_dataloader(self) -> Tuple[DataLoader, Union[None, DataLoader]]:
         # Move text-encoder & vae to GPU for dataloader encoding
-
-        self.adapter.on_load_text_encoders(self.accelerator.device)
-        self.adapter.on_load_vae(self.accelerator.device)
+        self.adapter.on_load_components(
+            components=self.adapter.preprocessing_modules,
+            device=self.accelerator.device
+        )
         dataloader, test_dataloader = get_dataloader(
             config=self.config,
             accelerator=self.accelerator,
             preprocess_func=self.adapter.preprocess_func,
         )
         # Offload text-encoder after dataloader encoding
-        self.adapter.off_load_text_encoders()
-        self.adapter.off_load_vae()
+        self.adapter.off_load_components(
+            components=self.adapter.preprocessing_modules,
+        )
 
         self.accelerator.wait_for_everyone()
 
@@ -131,24 +133,46 @@ class BaseTrainer(ABC):
         # Otherwise they may be uninitialized on Rank > 0.
         if self.adapter._is_fsdp_cpu_efficient_loading():
             logger.info("FSDP CPU Efficient Loading detected. Synchronizing frozen components...")
-            self.adapter.on_load(self.accelerator.device)
+            # self.adapter.on_load(self.accelerator.device)
             self._synchronize_frozen_components()
-            self.adapter.off_load()
 
         # Init dataloader and optimizer
         self.dataloader, self.test_dataloader = self._init_dataloader()
         self.optimizer = self._init_optimizer()
         # Prepare everything with accelerator
-        # Here, `self.dataloader` is not prepared since it has been handled with DistributedKRepeatSampler
-        to_prepare = [self.adapter.transformer, self.optimizer, self.test_dataloader]
-        to_prepare = [x for x in to_prepare if x is not None]
-        prepared = self.accelerator.prepare(*to_prepare)
-        self.adapter.transformer, self.optimizer = prepared[:2]
-        if len(prepared) > 2:
-            self.test_dataloader = prepared[2]
+        # Dynamically get all trainable modules from target_module_map
+        trainable_module_names = list(self.adapter.target_module_map.keys())
+        trainable_modules = [
+            getattr(self.adapter, name) 
+            for name in trainable_module_names 
+            if hasattr(self.adapter, name) and getattr(self.adapter, name) is not None
+        ]
+        # Prepare trainable modules + optimizer + test_dataloader
+        to_prepare = trainable_modules + [self.optimizer]
+        if self.test_dataloader is not None:
+            to_prepare.append(self.test_dataloader)
 
-        # Load Vae for image decoding
-        self.adapter.on_load_vae(self.accelerator.device)
+        prepared = self.accelerator.prepare(*to_prepare)
+        # Here, `self.dataloader` is not prepared since it has been handled with DistributedKRepeatSampler
+        for i, name in enumerate(trainable_module_names):
+            if hasattr(self.adapter, name) and getattr(self.adapter, name) is not None:
+                setattr(self.adapter, name, prepared[i])
+
+        self.optimizer = prepared[len(trainable_modules)]
+        if self.test_dataloader is not None:
+            self.test_dataloader = prepared[len(trainable_modules) + 1]
+
+        # Load inference modules, excluding already-prepared ones
+        prepared_names = set(trainable_module_names)
+        modules_to_load = [
+            m for m in self.adapter.inference_modules
+            if m not in prepared_names
+        ]
+
+        self.adapter.on_load_components(
+            components=modules_to_load,
+            device=self.accelerator.device
+        )
         
         # Initialize reward model
         self._init_reward_model()

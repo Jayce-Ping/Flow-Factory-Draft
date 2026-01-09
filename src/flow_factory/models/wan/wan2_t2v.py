@@ -16,7 +16,7 @@ from peft import PeftModel
 from ..adapter import BaseAdapter
 from ..samples import BaseSample
 from ...hparams import *
-from ...scheduler import UniPCMultistepSDESchedulerOutput, set_scheduler_timesteps, UniPCMultistepScheduler
+from ...scheduler import UniPCMultistepSDESchedulerOutput, set_scheduler_timesteps, UniPCMultistepSDEScheduler
 from ...utils.base import filter_kwargs
 from ...utils.logger_utils import setup_logger
 
@@ -38,35 +38,53 @@ class Wan2_T2V_Adapter(BaseAdapter):
             self.model_args.model_name_or_path,
         )
     
-    def load_scheduler(self) -> UniPCMultistepScheduler:
+    def load_scheduler(self) -> UniPCMultistepSDEScheduler:
         """Load and return the scheduler."""
+        sde_config_keys = ['noise_level', 'train_steps', 'num_train_steps', 'seed', 'dynamics_type']
+        # Check keys:
+        for k in sde_config_keys:
+            if not hasattr(self.training_args, k):
+                logger.warning(f"Missing SDE config key '{k}' in training_args, using default value")
+
         sde_config = {
-            'noise_level': self.training_args.noise_level,
-            'train_steps': self.training_args.train_steps,
-            'num_train_steos': self.training_args.num_train_steps,
-            'seed': self.training_args.seed,
-            'dynamics_type': self.training_args.dynamics_type,
+            k: getattr(self.training_args, k)
+            for k in sde_config_keys
+            if hasattr(self.training_args, k)
         }
         scheduler_config = self.pipeline.scheduler.config.__dict__.copy()
         scheduler_config.update(sde_config)
-        return UniPCMultistepScheduler(**scheduler_config)
+        return UniPCMultistepSDEScheduler(**scheduler_config)
     
     @property
     def default_target_modules(self) -> List[str]:
         """Default LoRA target modules for Wan transformer."""
         return [
             # --- Self Attention ---
-            "self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o",
+            "attn1.to_q", "attn1.to_k", "attn1.to_v", "attn1.to_out.0",
             
             # --- Cross Attention ---
-            "cross_attn.q", "cross_attn.k", "cross_attn.v", "cross_attn.o",
-            
+            "attn2.to_q", "attn2.to_k", "attn2.to_v", "attn2.to_out.0",
+
             # --- Feed Forward Network ---
-            "ffn.0", "ffn.2"
+            "ffn.net.0.proj", "ffn.net.2"
         ]
+
+    @property
+    def preprocessing_modules(self) -> List[str]:
+        """Modules that are requires for preprocessing"""
+        return ['text_encoders', 'vae']
     
-    def apply_lora(self, components=['transformer', 'transformer_2'], target_modules=None) -> Union[PeftModel, Dict[str, PeftModel]]:
-        return super().apply_lora(components, target_modules)
+    @property
+    def inference_modules(self) -> List[str]:
+        """Modules taht are requires for inference and forward"""
+        return ['transformer', 'transformer_2', 'vae']
+
+    def apply_lora(
+        self,
+        target_modules: Union[str, List[str]],
+        components: Union[str, List[str]] = ['transformer', 'transformer_2'],
+    ) -> Union[PeftModel, Dict[str, PeftModel]]:
+        return super().apply_lora(target_modules=target_modules, components=components)
     
     @property
     def transformer_2(self) -> torch.nn.Module:
@@ -216,6 +234,7 @@ class Wan2_T2V_Adapter(BaseAdapter):
         video = self.pipeline.vae.decode(latents, return_dict=False)[0]
 
         video = self.pipeline.video_processor.postprocess_video(video, output_type=output_type)
+        return video
 
     # ======================== Inference ========================
 
@@ -249,13 +268,13 @@ class Wan2_T2V_Adapter(BaseAdapter):
         **kwargs,
     ):
         # 1. Setup args
-        device = self.pipeline._execution_device
+        device = self.device
         do_classifier_free_guidance = guidance_scale > 1.0
 
         if self.pipeline.config.boundary_ratio is not None and guidance_scale_2 is None:
             guidance_scale_2 = guidance_scale
 
-        if num_frames % self.pipeline.vae_scale_factor_temporal != 1:
+        if (num_frames - 1) % self.pipeline.vae_scale_factor_temporal != 0:
             logger.warning(f"`num_frames - 1` has to be divisible by {self.pipeline.vae_scale_factor_temporal}. Rounding to the nearest number.")
             num_frames = num_frames // self.pipeline.vae_scale_factor_temporal * self.pipeline.vae_scale_factor_temporal + 1
         num_frames = max(num_frames, 1)
@@ -451,7 +470,7 @@ class Wan2_T2V_Adapter(BaseAdapter):
         timestep_index : int,
         compute_log_prob: bool = True,
         **kwargs,
-    ) -> SDESchedulerOutput:
+    ) -> UniPCMultistepSDESchedulerOutput:
         # 1. Extract data from samples
         batch_size = len(samples)
         device = self.device
