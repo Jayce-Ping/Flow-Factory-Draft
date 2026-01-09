@@ -792,10 +792,6 @@ class BaseAdapter(ABC):
                 get_model_state_dict as fsdp_get_model_state_dict
             )
 
-            # New API after torch 2.1+
-            # state_dict = fsdp_get_model_state_dict(model)
-
-            # Old API
             full_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
             with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_state_dict_config):
                 state_dict = model.state_dict()
