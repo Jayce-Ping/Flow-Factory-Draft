@@ -290,7 +290,7 @@ def _normalize_to_uint8(data: Union[torch.Tensor, np.ndarray]) -> Union[torch.Te
 
 # ----------------------------------- Tensor/NumPy -> PIL --------------------------------------
 
-def tensor_to_pil_image(tensor: torch.Tensor) -> Union[Image.Image, ImageList]:
+def tensor_to_pil_image(tensor: torch.Tensor) -> ImageList:
     """
     Convert a torch Tensor to PIL Image(s).
     
@@ -301,7 +301,7 @@ def tensor_to_pil_image(tensor: torch.Tensor) -> Union[Image.Image, ImageList]:
                 - [-1, 1]: Normalized tensor format (e.g., from diffusion models)
     
     Returns:
-        - If input is 3D (C, H, W): Single PIL Image
+        - If input is 3D (C, H, W): ImageList contains single Image.
         - If input is 4D (N, C, H, W): ImageList (List of N PIL Images)
     
     Raises:
@@ -331,10 +331,10 @@ def tensor_to_pil_image(tensor: torch.Tensor) -> Union[Image.Image, ImageList]:
         tensor = tensor.squeeze(-1)
     
     result = [Image.fromarray(img) for img in tensor]
-    return result[0]
+    return result
 
 
-def numpy_to_pil_image(array: np.ndarray) -> Union[Image.Image, ImageList]:
+def numpy_to_pil_image(array: np.ndarray) -> ImageList:
     """
     Convert a NumPy array to PIL Image(s).
     
@@ -383,7 +383,7 @@ def numpy_to_pil_image(array: np.ndarray) -> Union[Image.Image, ImageList]:
         array = array.squeeze(-1)
     
     result = [Image.fromarray(img) for img in array]
-    return result[0]
+    return result
 
 
 def tensor_list_to_pil_image(tensor_list: List[torch.Tensor]) -> ImageList:

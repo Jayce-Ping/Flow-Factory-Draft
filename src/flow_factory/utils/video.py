@@ -256,7 +256,7 @@ def _normalize_video_to_uint8(data: Union[torch.Tensor, np.ndarray]) -> Union[to
 
 # ----------------------------------- Tensor/NumPy -> Frames --------------------------------------
 
-def tensor_to_video_frames(tensor: torch.Tensor) -> Union[VideoFrames, VideoFramesBatch]:
+def tensor_to_video_frames(tensor: torch.Tensor) -> VideoFramesBatch:
     """
     Convert a torch Tensor to video frames (PIL Images).
     
@@ -267,7 +267,7 @@ def tensor_to_video_frames(tensor: torch.Tensor) -> Union[VideoFrames, VideoFram
                 - [-1, 1]: Normalized tensor format (e.g., from diffusion models)
     
     Returns:
-        - If input is 4D (T, C, H, W): VideoFrames (List of T PIL Images)
+        - If input is 4D (T, C, H, W): Single-ton list of VideoFrames (List of T PIL Images)
         - If input is 5D (B, T, C, H, W): VideoFramesBatch (List of B videos)
     
     Raises:
@@ -297,7 +297,7 @@ def tensor_to_video_frames(tensor: torch.Tensor) -> Union[VideoFrames, VideoFram
         tensor = tensor.squeeze(-1)
     
     result = [[Image.fromarray(frame) for frame in video] for video in tensor]
-    return result[0]
+    return result
 
 
 def numpy_to_video_frames(array: np.ndarray) -> Union[VideoFrames, VideoFramesBatch]:
@@ -312,7 +312,7 @@ def numpy_to_video_frames(array: np.ndarray) -> Union[VideoFrames, VideoFramesBa
                 - [-1, 1]: Normalized float format (e.g., from diffusion models)
     
     Returns:
-        - If input is 4D: VideoFrames (List of T PIL Images)
+        - If input is 4D: Single-ton list of VideoFrames (List of T PIL Images)
         - If input is 5D: VideoFramesBatch (List of B videos)
     
     Raises:
@@ -349,7 +349,7 @@ def numpy_to_video_frames(array: np.ndarray) -> Union[VideoFrames, VideoFramesBa
         array = array.squeeze(-1)
     
     result = [[Image.fromarray(frame) for frame in video] for video in array]
-    return result[0]
+    return result
 
 
 def tensor_list_to_video_frames(tensor_list: List[torch.Tensor]) -> VideoFramesBatch:

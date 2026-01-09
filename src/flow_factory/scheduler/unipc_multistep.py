@@ -99,13 +99,13 @@ class UniPCMultistepSDEScheduler(UniPCMultistepScheduler):
         """
             Returns timesteps within the current window.
         """
-        return self.timesteps[self.train_steps]
+        return self.timesteps[self.train_timesteps]
 
     def get_train_sigmas(self) -> torch.Tensor:
         """
             Returns sigmas within the current window.
         """
-        return self.sigmas[self.train_steps]
+        return self.sigmas[self.train_timesteps]
 
     def get_noise_levels(self) -> torch.Tensor:
         """ Returns noise levels on all timesteps, where noise level is non-zero only within the current window. """
@@ -120,10 +120,10 @@ class UniPCMultistepSDEScheduler(UniPCMultistepScheduler):
         if not isinstance(timestep, torch.Tensor) or timestep.ndim == 0:
             t = timestep.item() if isinstance(timestep, torch.Tensor) else timestep
             timestep_index = self.index_for_timestep(t)
-            return self.noise_level if timestep_index in self.train_steps else 0.0
+            return self.noise_level if timestep_index in self.current_sde_steps else 0.0
 
         indices = torch.tensor([self.index_for_timestep(t.item()) for t in timestep])
-        mask = torch.isin(indices, self.train_steps)
+        mask = torch.isin(indices, self.current_sde_steps)
         return torch.where(mask, self.noise_level, 0.0).to(timestep.dtype)
 
 
@@ -173,11 +173,6 @@ class UniPCMultistepSDEScheduler(UniPCMultistepScheduler):
             dynamics_type (str, optional): "Flow-SDE", "Dance-SDE", "CPS", or "ODE". If None, uses scheduler's dynamics type.
             sigma_max (float, optional): Maximum sigma value for Flow-SDE dynamics.
         """
-        noise_pred = noise_pred.float()
-        latents = latents.float()
-        if next_latents is not None:
-            next_latents = next_latents.float()
-
         if self.is_eval:
             # Calcuate ODE step using `super()`
             next_latents_mean = super().step(noise_pred, timestep, latents, return_dict=False)[0]

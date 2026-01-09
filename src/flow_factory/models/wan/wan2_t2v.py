@@ -312,6 +312,7 @@ class Wan2_T2V_Adapter(BaseAdapter):
         # 3. Set scheduler
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
+        logger.info(f"timesteps: {timesteps}, sigmas: {self.scheduler.sigmas}")
 
 
         # 5. Prepare latent variables
@@ -348,15 +349,19 @@ class Wan2_T2V_Adapter(BaseAdapter):
         for i, t in enumerate(timesteps):
             self.pipeline._current_timestep = t
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
+            logger.info(f"Step {i+1}/{len(timesteps)}: t={t}, noise_level={current_noise_level}")
+
+            if torch.isnan(latents).any():
+                    logger.warning(f"Step {i}: latents contains NaN")
 
             if boundary_timestep is None or t >= boundary_timestep:
                 # wan2.1 or high-noise stage in wan2.2
-                current_model_pipeline = self.pipeline.transformer
+                current_pipeline_model = self.pipeline.transformer
                 current_model = self.transformer
                 current_guidance_scale = guidance_scale
             else:
                 # low-noise stage in wan2.2
-                current_model_pipeline = self.pipeline.transformer_2
+                current_pipeline_model = self.pipeline.transformer_2
                 current_model = self.transformer_2
                 current_guidance_scale = guidance_scale_2
 
@@ -369,7 +374,7 @@ class Wan2_T2V_Adapter(BaseAdapter):
             else:
                 timestep = t.expand(latents.shape[0])
 
-            with current_model_pipeline.cache_context("cond"):
+            with current_pipeline_model.cache_context("cond"):
                 noise_pred = current_model(
                     hidden_states=latent_model_input,
                     timestep=timestep,
@@ -379,7 +384,7 @@ class Wan2_T2V_Adapter(BaseAdapter):
                 )[0]
 
             if do_classifier_free_guidance:
-                with current_model_pipeline.cache_context("uncond"):
+                with current_pipeline_model.cache_context("uncond"):
                     noise_uncond = current_model(
                         hidden_states=latent_model_input,
                         timestep=timestep,
@@ -511,12 +516,12 @@ class Wan2_T2V_Adapter(BaseAdapter):
         # 3. Determine which transformer to use
         if boundary_timestep is None or t >= boundary_timestep:
             # wan2.1 or high-noise stage in wan2.2
-            current_model_pipeline = self.pipeline.transformer
+            current_pipeline_model = self.pipeline.transformer
             current_model = self.transformer
             current_guidance_scale = guidance_scale
         else:
             # low-noise stage in wan2.2
-            current_model_pipeline = self.pipeline.transformer_2
+            current_pipeline_model = self.pipeline.transformer_2
             current_model = self.transformer_2
             current_guidance_scale = guidance_scale_2
 
@@ -531,7 +536,7 @@ class Wan2_T2V_Adapter(BaseAdapter):
         else:
             timestep = t.expand(latents.shape[0])
 
-        with current_model_pipeline.cache_context("cond"):
+        with current_pipeline_model.cache_context("cond"):
             noise_pred = current_model(
                 hidden_states=latent_model_input,
                 timestep=timestep,
@@ -541,7 +546,7 @@ class Wan2_T2V_Adapter(BaseAdapter):
             )[0]
 
         if do_classifier_free_guidance:
-            with current_model_pipeline.cache_context("uncond"):
+            with current_pipeline_model.cache_context("uncond"):
                 noise_uncond = current_model(
                     hidden_states=latent_model_input,
                     timestep=timestep,
