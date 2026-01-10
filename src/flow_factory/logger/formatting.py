@@ -9,10 +9,18 @@ from PIL import Image
 import imageio
 from typing import Any, Dict, List, Union, Optional, Tuple
 from dataclasses import dataclass, is_dataclass, asdict, field
-from ..models.samples import BaseSample, ImageConditionSample, VideoConditionSample
-from ..utils.base import numpy_to_pil_image, tensor_to_pil_image
+from ..models.samples import BaseSample, T2ISample, T2VSample, I2ISample, I2VSample, V2VSample
+from ..utils.base import (
+    numpy_to_pil_image,
+    tensor_to_pil_image,
+    video_frames_to_numpy,
+    video_frames_to_tensor,
+    tensor_to_video_frames,
+    numpy_to_video_frames,
+)
 
 
+# ------------------------------------------- Helper Functions -------------------------------------------
 def _compute_optimal_grid(n: int) -> Tuple[int, int]:
     """Compute optimal grid (rows, cols) for n images, preferring wider layouts."""
     if n <= 0:
@@ -53,6 +61,7 @@ def _to_pil_list(images: Union[Image.Image, List[Image.Image], torch.Tensor, np.
         return numpy_to_pil_image(images)
     return []
 
+# ------------------------------------------- LogImage & LogVideo Classes -------------------------------------------
 
 @dataclass
 class LogImage:
@@ -166,7 +175,6 @@ class LogVideo:
             arr = value.detach().cpu().numpy()
         else:
             arr = value
-        
         # (T, C, H, W) -> (T, H, W, C) if channels-first
         if arr.ndim == 4 and arr.shape[1] in (1, 3, 4) and arr.shape[1] < arr.shape[2]:
             arr = np.transpose(arr, (0, 2, 3, 1))
@@ -191,8 +199,8 @@ class LogVideo:
         try:
             os.close(fd)
             imageio.mimwrite(
-                path, 
-                arr, 
+                path,
+                arr,
                 fps=self.fps, 
                 format='FFMPEG',
                 codec='libx264', 
@@ -227,6 +235,7 @@ class LogVideo:
     def __exit__(self, *_):
         self.cleanup()
 
+# ----------------------------------- LogFormatter Class -----------------------------------
 class LogFormatter:
     """
     Standardizes input dictionaries for logging.
@@ -269,13 +278,16 @@ class LogFormatter:
     def _process_sample(cls, samples: List[BaseSample]) -> List[Union[LogImage, LogVideo]]:
         """Dispatch to appropriate handler based on sample type."""
         results = []
+        sample_cls_to_handler = {
+            T2ISample: cls._process_t2i_sample,
+            T2VSample: cls._process_t2v_sample,
+            I2ISample: cls._process_i2i_sample,
+            I2VSample: cls._process_i2v_sample,
+            V2VSample: cls._process_v2v_sample,
+        }
         for sample in samples:
-            if isinstance(sample, VideoConditionSample):
-                result = cls._process_video_condition_sample(sample)
-            elif isinstance(sample, ImageConditionSample):
-                result = cls._process_image_condition_sample(sample)
-            else:
-                result = cls._process_base_sample(sample)
+            handler = sample_cls_to_handler.get(type(sample), cls._process_base_sample)
+            result = handler(sample)
             if result:
                 results.append(result)
         return results
@@ -289,9 +301,23 @@ class LogFormatter:
             return LogVideo(sample.video, caption=cls._build_caption(sample))
 
         return None
-        
+    
     @classmethod
-    def _process_image_condition_sample(cls, sample: ImageConditionSample) -> Optional[LogImage]:
+    def _process_t2i_sample(cls, sample: T2ISample) -> Optional[LogImage]:
+        """Handle text-to-image sample with generated image."""
+        if sample.image is None:
+            return None
+        return LogImage(sample.image, caption=cls._build_caption(sample))
+    
+    @classmethod
+    def _process_t2v_sample(cls, sample: T2VSample) -> Optional[LogVideo]:
+        """Handle text-to-video sample with generated video."""
+        if sample.video is None:
+            return None
+        return LogVideo(sample.video, caption=cls._build_caption(sample))
+    
+    @classmethod
+    def _process_i2i_sample(cls, sample: I2ISample) -> Optional[LogImage]:
         """Handle sample with condition images + generated image, concatenated in grid."""
         cond_imgs = _to_pil_list(sample.condition_images)
         gen_imgs = _to_pil_list(sample.image)
@@ -304,11 +330,15 @@ class LogFormatter:
         return LogImage(grid, caption=cls._build_caption(sample))
     
     @classmethod
-    def _process_video_condition_sample(cls, sample: VideoConditionSample) -> Optional[LogVideo]:
-        """Handle video condition sample (placeholder for future extension)."""
-        # TODO: Implement video grid concatenation
-        return None
+    def _process_i2v_sample(cls, sample: I2VSample) -> Optional[LogVideo]:
+        # TODO: Implement better concatenation for I2V samples
+        pass
     
+    @classmethod
+    def _process_v2v_sample(cls, sample: V2VSample) -> Optional[LogVideo]:
+        # TODO: Implement better concatenation for V2V samples
+        pass
+
     @classmethod
     def _process_value(cls, value: Any) -> Any:
         """Processes a single value according to the formatting rules."""
