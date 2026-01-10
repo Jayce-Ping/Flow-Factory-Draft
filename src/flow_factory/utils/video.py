@@ -14,7 +14,7 @@ Value ranges:
     - [-1, 1]: Normalized float format (diffusion models)
 """
 
-from typing import List, Union, Any
+from typing import List, Union, Any, Literal, Dict, Optional
 from PIL import Image
 import torch
 import numpy as np
@@ -28,11 +28,31 @@ VideoFrames = List[Image.Image]
 VideoFramesBatch = List[List[Image.Image]]
 """Type alias for a batch of videos, each represented as a list of PIL Images."""
 
+Video = Union[
+    torch.Tensor,                      # (T, C, H, W)
+    np.ndarray,                        # (T, H, W, C)
+    VideoFrames,                       # List[PIL.Image]
+]
+"""Type alias for a single video in various formats."""
+
+VideoBatch = Union[
+    torch.Tensor,                      # (B, T, C, H, W)
+    np.ndarray,                        # (B, T, H, W, C)
+    List[torch.Tensor],                # List of (T, C, H, W)
+    List[np.ndarray],                  # List of (T, H, W, C)
+    VideoFramesBatch,                  # List[List[PIL.Image]]
+]
+"""Type alias for a batch of videos in various formats."""
+
+VideoBatchList = List[VideoBatch]
 
 __all__ = [
     # Type aliases
+    'Video',
     'VideoFrames',
     'VideoFramesBatch',
+    'VideoBatch',
+    'VideoBatchList',
     # Type checks
     'is_video_frame_list',
     'is_video_frame_batch_list',
@@ -40,6 +60,7 @@ __all__ = [
     'is_valid_video',
     'is_valid_video_list',
     'is_valid_video_batch',
+    'is_valid_video_batch_list',
     # Tensor/NumPy -> Frames
     'tensor_to_video_frames',
     'numpy_to_video_frames',
@@ -48,6 +69,9 @@ __all__ = [
     # Frames -> Tensor/NumPy
     'video_frames_to_tensor',
     'video_frames_to_numpy',
+    # Normalization
+    'normalize_video_to_uint8',
+    'standardize_video_batch',
 ]
 
 
@@ -107,8 +131,8 @@ def is_valid_video(video: Union[VideoFrames, torch.Tensor, np.ndarray]) -> bool:
     Returns:
         bool: True if valid video type:
             - VideoFrames (List[PIL.Image]): Non-empty list of PIL Images
-            - torch.Tensor: Shape (T, C, H, W) where C in {1, 3, 4}
-            - np.ndarray: Shape (T, H, W, C) where C in {1, 3, 4}
+            - torch.Tensor: Shape (T, C, H, W) or (1, T, C, H, W) where C in {1, 3, 4}
+            - np.ndarray: Shape (T, H, W, C) or (1, T, H, W, C) where C in {1, 3, 4}
     
     Example:
         >>> # Tensor video
@@ -130,12 +154,16 @@ def is_valid_video(video: Union[VideoFrames, torch.Tensor, np.ndarray]) -> bool:
         return is_video_frame_list(video)
     
     if isinstance(video, torch.Tensor):
+        if video.ndim == 5 and video.shape[0] == 1:
+            video = video.squeeze(0)
         if video.ndim != 4:
             return False
         t, c, h, w = video.shape
-        return t > 0 and c in (1, 3, 4) and h > 0 and w > 0
+        return t > 0 and h > 0 and w > 0 and c in (1, 3, 4)
     
     if isinstance(video, np.ndarray):
+        if video.ndim == 5 and video.shape[0] == 1:
+            video = video.squeeze(0)
         if video.ndim != 4:
             return False
         t, h, w, c = video.shape
@@ -213,10 +241,37 @@ def is_valid_video_batch(videos: Union[VideoFramesBatch, torch.Tensor, np.ndarra
     
     return False
 
+def is_valid_video_batch_list(video_batches: List[VideoBatch]) -> bool:
+    """
+    Check if the input is a valid list of video batches.
+    
+    Args:
+        video_batches: List of video batches.
+    
+    Returns:
+        bool: True if valid:
+            - Outer list is non-empty
+            - Each inner element is either a valid video batch or an empty list
+    
+    Example:
+        >>> batch = [[[Image.new('RGB', (64, 64)) for _ in range(16)]], []]
+        >>> is_valid_video_batch_list(batch)
+        True
+    """
+    if not isinstance(video_batches, list) or len(video_batches) == 0:
+        return False
+    
+    for batch in video_batches:
+        if not isinstance(batch, list):
+            return False
+        if len(batch) > 0 and not is_valid_video_batch(batch):
+            return False
+    
+    return True
 
 # ----------------------------------- Normalization --------------------------------------
 
-def _normalize_video_to_uint8(data: Union[torch.Tensor, np.ndarray]) -> Union[torch.Tensor, np.ndarray]:
+def normalize_video_to_uint8(data: Union[torch.Tensor, np.ndarray]) -> Union[torch.Tensor, np.ndarray]:
     """
     Detect value range and normalize video data to [0, 255] uint8.
     
@@ -290,7 +345,7 @@ def tensor_to_video_frames(tensor: torch.Tensor) -> VideoFramesBatch:
         tensor = tensor.unsqueeze(0)
     
     # (B, T, C, H, W) -> (B, T, H, W, C)
-    tensor = _normalize_video_to_uint8(tensor).cpu().numpy()
+    tensor = normalize_video_to_uint8(tensor).cpu().numpy()
     tensor = tensor.transpose(0, 1, 3, 4, 2)
     
     if tensor.shape[-1] == 1:
@@ -339,7 +394,7 @@ def numpy_to_video_frames(array: np.ndarray) -> Union[VideoFrames, VideoFramesBa
     if array.ndim == 4:
         array = array[np.newaxis, ...]
     
-    array = _normalize_video_to_uint8(array)
+    array = normalize_video_to_uint8(array)
     
     # BTCHW -> BTHWC if channel dim detected
     if array.shape[2] in (1, 3, 4) and array.shape[2] < array.shape[3]:
@@ -570,3 +625,79 @@ def video_frames_to_numpy(
     if all(arr.shape == converted[0].shape for arr in converted):
         return np.stack(converted, axis=0)
     return converted
+
+
+# ----------------------------------- Standardization --------------------------------------
+def standardize_video_batch(
+    videos: Union[VideoFrames, VideoBatch],
+    output_type: Literal['pil', 'np', 'pt'] = 'pil',
+) -> VideoBatch:
+    """
+    Standardize video input to desired output type.
+    
+    Preserves input structure: stacked input -> stacked output, list input -> list output.
+    
+    Args:
+        videos: Input videos in any supported format.
+        output_type: Target format - 'pil', 'np', or 'pt'.
+    
+    Returns:
+        - 'pil': List[List[PIL.Image]]
+        - 'np': np.ndarray (B,T,H,W,C) if input was stacked, else List[np.ndarray]
+        - 'pt': torch.Tensor (B,T,C,H,W) if input was stacked, else List[torch.Tensor]
+    """
+    # Single video (List[PIL]) -> batch
+    if is_video_frame_list(videos):
+        videos = [videos]
+
+    # Stacked Tensor (B, T, C, H, W)
+    if isinstance(videos, torch.Tensor):
+        if output_type == 'pil':
+            return tensor_to_video_frames(videos)
+        elif output_type == 'np':
+            # (B, T, C, H, W) -> (B, T, H, W, C)
+            return normalize_video_to_uint8(videos).cpu().numpy().transpose(0, 1, 3, 4, 2)
+        return videos  # pt
+
+    # Stacked NumPy (B, T, H, W, C)
+    elif isinstance(videos, np.ndarray):
+        if output_type == 'pil':
+            return numpy_to_video_frames(videos)
+        elif output_type == 'pt':
+            # (B, T, H, W, C) -> (B, T, C, H, W)
+            arr = videos.astype(np.float32) / 255.0 if videos.max() > 1.0 else videos.astype(np.float32)
+            return torch.from_numpy(arr.transpose(0, 1, 4, 2, 3))
+        return videos  # np
+
+    # List types -> output as list
+    elif isinstance(videos, list):
+        # List[torch.Tensor]
+        if isinstance(videos[0], torch.Tensor):
+            if output_type == 'pil':
+                return tensor_list_to_video_frames(videos)
+            elif output_type == 'np':
+                return [normalize_video_to_uint8(v).cpu().numpy().transpose(0, 2, 3, 1) for v in videos]
+            return videos  # pt
+
+        # List[np.ndarray]
+        elif isinstance(videos[0], np.ndarray):
+            if output_type == 'pil':
+                return numpy_list_to_video_frames(videos)
+            elif output_type == 'pt':
+                return [
+                    torch.from_numpy(
+                        (v.astype(np.float32) / 255.0 if v.max() > 1.0 else v.astype(np.float32))
+                    ).permute(0, 3, 1, 2)  # THWC -> TCHW
+                    for v in videos
+                ]
+            return videos  # np
+
+        # List[List[PIL.Image]] (VideoFramesBatch)
+        elif isinstance(videos[0], list):
+            if output_type == 'np':
+                return [video_frames_to_numpy(v) for v in videos]
+            elif output_type == 'pt':
+                return [video_frames_to_tensor(v) for v in videos]
+            return videos  # pil
+
+    raise ValueError(f'Unsupported video input type: {type(videos)}')

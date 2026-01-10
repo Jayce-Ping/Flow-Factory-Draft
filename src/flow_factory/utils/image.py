@@ -4,7 +4,8 @@ Image utility functions for converting between PIL Images, torch Tensors, and Nu
 
 Supported formats:
     - ImageList: List[PIL.Image] - List of images
-    - ImageBatch: List[List[PIL.Image]] - Batch of image lists
+    - ImageBatch: np.ndarray | torch.Tensor | List[Union[PIL.Image, np.ndarray, torch.Tensor]]  - Batch of images
+    - ImageBatchList: List[ImageBatch] - List of image batches
     - torch.Tensor: (C, H, W) for single image, (N, C, H, W) for batch
     - np.ndarray: (H, W, C) for single image, (N, H, W, C) for batch
 
@@ -16,7 +17,7 @@ Value ranges:
 
 import base64
 from io import BytesIO
-from typing import List, Union, Any
+from typing import List, Union, Any, Literal
 
 from PIL import Image
 import torch
@@ -25,17 +26,29 @@ import numpy as np
 
 # ----------------------------------- Type Aliases --------------------------------------
 
-ImageList = List[Image.Image]
+ImageSingle = Union[Image.Image, torch.Tensor, np.ndarray]
+"""Type alias for a single image in various formats."""
+
+ImageList = List[ImageSingle]
 """Type alias for a list of PIL Images."""
 
-ImageBatch = List[List[Image.Image]]
+ImageBatch = Union[
+    np.ndarray,
+    torch.Tensor,
+    List[Union[Image.Image, np.ndarray, torch.Tensor]],
+]
 """Type alias for a batch of image lists."""
+
+ImageBatchList = List[ImageBatch]
+"""Type alias for a list of image batches."""
 
 
 __all__ = [
     # Type aliases
+    'ImageSingle',
     'ImageList',
     'ImageBatch',
+    'ImageBatchList',
     # Type checks
     'is_pil_image_list',
     'is_pil_image_batch_list',
@@ -53,6 +66,9 @@ __all__ = [
     'pil_image_to_tensor',
     'pil_image_to_numpy',
     'pil_image_to_base64',
+    # Normalization
+    'normalize_to_uint8',
+    'standardize_image_batch',
 ]
 
 
@@ -78,7 +94,7 @@ def is_pil_image_list(image_list: List[Any]) -> bool:
     return isinstance(image_list, list) and len(image_list) > 0 and all(isinstance(img, Image.Image) for img in image_list)
 
 
-def is_pil_image_batch_list(image_batch_list: ImageBatch) -> bool:
+def is_pil_image_batch_list(image_batch_list: ImageBatchList) -> bool:
     """
     Check if the input is a list of lists of PIL Images (batch of image lists).
     
@@ -102,9 +118,9 @@ def is_pil_image_batch_list(image_batch_list: ImageBatch) -> bool:
 
 # ----------------------------------- Validation --------------------------------------
 
-def is_valid_image(image: Union[Image.Image, torch.Tensor, np.ndarray]) -> bool:
+def is_valid_image(image: ImageSingle) -> bool:
     """
-    Check if the input is a valid image type.
+    Check if the input is a valid single image.
     
     Args:
         image: Input image in one of the supported formats.
@@ -112,8 +128,8 @@ def is_valid_image(image: Union[Image.Image, torch.Tensor, np.ndarray]) -> bool:
     Returns:
         bool: True if valid image type:
             - PIL.Image: Valid PIL Image with positive dimensions
-            - torch.Tensor: Shape (C, H, W) or (N, C, H, W) where C in {1, 3, 4}
-            - np.ndarray: Shape (H, W, C) or (N, H, W, C) where C in {1, 3, 4}
+            - torch.Tensor: Shape (C, H, W) or (1, C, H, W) where C in {1, 3, 4}
+            - np.ndarray: Shape (H, W, C) or (1, H, W, C) where C in {1, 3, 4}
     
     Example:
         >>> is_valid_image(Image.new('RGB', (64, 64)))
@@ -132,7 +148,7 @@ def is_valid_image(image: Union[Image.Image, torch.Tensor, np.ndarray]) -> bool:
             return c in (1, 3, 4) and h > 0 and w > 0
         elif image.ndim == 4:
             b, c, h, w = image.shape
-            return b > 0 and c in (1, 3, 4) and h > 0 and w > 0
+            return b == 1 and c in (1, 3, 4) and h > 0 and w > 0
         return False
     
     if isinstance(image, np.ndarray):
@@ -141,13 +157,13 @@ def is_valid_image(image: Union[Image.Image, torch.Tensor, np.ndarray]) -> bool:
             return h > 0 and w > 0 and c in (1, 3, 4)
         elif image.ndim == 4:
             b, h, w, c = image.shape
-            return b > 0 and h > 0 and w > 0 and c in (1, 3, 4)
+            return b == 1 and h > 0 and w > 0 and c in (1, 3, 4)
         return False
     
     return False
 
 
-def is_valid_image_list(images: List[Union[Image.Image, torch.Tensor, np.ndarray]]) -> bool:
+def is_valid_image_list(images: List[ImageSingle]) -> bool:
     """
     Check if the input is a valid list of images.
     
@@ -175,9 +191,7 @@ def is_valid_image_list(images: List[Union[Image.Image, torch.Tensor, np.ndarray
     return all(is_valid_image(img) for img in images)
 
 
-def is_valid_image_batch(
-    images: Union[ImageList, List[torch.Tensor], List[np.ndarray], torch.Tensor, np.ndarray]
-) -> bool:
+def is_valid_image_batch(images: ImageBatch) -> bool:
     """
     Check if the input is a valid batch of images.
     
@@ -186,9 +200,9 @@ def is_valid_image_batch(
     
     Returns:
         bool: True if valid image batch:
-            - ImageList (List[PIL.Image])
-            - List[torch.Tensor] where each tensor is (C, H, W)
-            - List[np.ndarray] where each array is (H, W, C)
+            - ImageList (List[ImageSingle])
+            - List[torch.Tensor] where each tensor is (C, H, W) or (1, C, H, W)
+            - List[np.ndarray] where each array is (H, W, C) or (1, H, W, C)
             - torch.Tensor with shape (N, C, H, W)
             - np.ndarray with shape (N, H, W, C)
     
@@ -216,7 +230,7 @@ def is_valid_image_batch(
     return False
 
 
-def is_valid_image_batch_list(image_batches: ImageBatch) -> bool:
+def is_valid_image_batch_list(image_batches: ImageBatchList) -> bool:
     """
     Check if the input is a valid batch of image lists.
     
@@ -242,7 +256,7 @@ def is_valid_image_batch_list(image_batches: ImageBatch) -> bool:
     for batch in image_batches:
         if not isinstance(batch, list):
             return False
-        if len(batch) > 0 and not is_valid_image_list(batch):
+        if len(batch) > 0 and not is_valid_image_batch(batch):
             return False
     
     return True
@@ -250,7 +264,7 @@ def is_valid_image_batch_list(image_batches: ImageBatch) -> bool:
 
 # ----------------------------------- Normalization --------------------------------------
 
-def _normalize_to_uint8(data: Union[torch.Tensor, np.ndarray]) -> Union[torch.Tensor, np.ndarray]:
+def normalize_to_uint8(data: Union[torch.Tensor, np.ndarray]) -> Union[torch.Tensor, np.ndarray]:
     """
     Detect value range and normalize to [0, 255] uint8.
     
@@ -290,7 +304,7 @@ def _normalize_to_uint8(data: Union[torch.Tensor, np.ndarray]) -> Union[torch.Te
 
 # ----------------------------------- Tensor/NumPy -> PIL --------------------------------------
 
-def tensor_to_pil_image(tensor: torch.Tensor) -> ImageList:
+def tensor_to_pil_image(tensor: torch.Tensor) -> List[Image.Image]:
     """
     Convert a torch Tensor to PIL Image(s).
     
@@ -301,8 +315,8 @@ def tensor_to_pil_image(tensor: torch.Tensor) -> ImageList:
                 - [-1, 1]: Normalized tensor format (e.g., from diffusion models)
     
     Returns:
-        - If input is 3D (C, H, W): ImageList contains single Image.
-        - If input is 4D (N, C, H, W): ImageList (List of N PIL Images)
+        - If input is 3D (C, H, W): Single-ton list containing one PIL Image
+        - If input is 4D (N, C, H, W): List of N PIL Images
     
     Raises:
         ValueError: If tensor is not 3D or 4D.
@@ -324,7 +338,7 @@ def tensor_to_pil_image(tensor: torch.Tensor) -> ImageList:
         tensor = tensor.unsqueeze(0)
     
     # (N, C, H, W) -> (N, H, W, C)
-    tensor = _normalize_to_uint8(tensor).cpu().numpy()
+    tensor = normalize_to_uint8(tensor).cpu().numpy()
     tensor = tensor.transpose(0, 2, 3, 1)
     
     if tensor.shape[-1] == 1:
@@ -334,7 +348,7 @@ def tensor_to_pil_image(tensor: torch.Tensor) -> ImageList:
     return result
 
 
-def numpy_to_pil_image(array: np.ndarray) -> ImageList:
+def numpy_to_pil_image(array: np.ndarray) -> List[Image.Image]:
     """
     Convert a NumPy array to PIL Image(s).
     
@@ -346,8 +360,8 @@ def numpy_to_pil_image(array: np.ndarray) -> ImageList:
                 - [-1, 1]: Normalized float format (e.g., from diffusion models)
     
     Returns:
-        - If input is 3D: Single PIL Image
-        - If input is 4D: ImageList (List of N PIL Images)
+        - If input is 3D: Single-ton list containing one PIL Image
+        - If input is 4D: List of N PIL Images
     
     Raises:
         ValueError: If array is not 3D or 4D.
@@ -373,7 +387,7 @@ def numpy_to_pil_image(array: np.ndarray) -> ImageList:
     if array.ndim == 3:
         array = array[np.newaxis, ...]
     
-    array = _normalize_to_uint8(array)
+    array = normalize_to_uint8(array)
     
     # NCHW -> NHWC if channel dim detected
     if array.shape[1] in (1, 3, 4) and array.shape[1] < array.shape[2]:
@@ -386,7 +400,7 @@ def numpy_to_pil_image(array: np.ndarray) -> ImageList:
     return result
 
 
-def tensor_list_to_pil_image(tensor_list: List[torch.Tensor]) -> ImageList:
+def tensor_list_to_pil_image(tensor_list: List[torch.Tensor]) -> List[Image.Image]:
     """
     Convert a list of torch Tensors to PIL Images.
     
@@ -399,7 +413,7 @@ def tensor_list_to_pil_image(tensor_list: List[torch.Tensor]) -> ImageList:
             Supported value ranges: [0, 1] or [-1, 1].
     
     Returns:
-        ImageList: List of PIL Images, one per input tensor.
+        List[Image.Image]: List of PIL Images, one per input tensor.
     
     Note:
         - Tensors with shape (1, C, H, W) are automatically squeezed to (C, H, W).
@@ -434,7 +448,7 @@ def tensor_list_to_pil_image(tensor_list: List[torch.Tensor]) -> ImageList:
     return [tensor_to_pil_image(t) for t in squeezed]
 
 
-def numpy_list_to_pil_image(numpy_list: List[np.ndarray]) -> ImageList:
+def numpy_list_to_pil_image(numpy_list: List[np.ndarray]) -> List[Image.Image]:
     """
     Convert a list of NumPy arrays to PIL Images.
     
@@ -447,7 +461,7 @@ def numpy_list_to_pil_image(numpy_list: List[np.ndarray]) -> ImageList:
             Supported value ranges: [0, 255], [0, 1], or [-1, 1].
     
     Returns:
-        ImageList: List of PIL Images, one per input array.
+        List[Image.Image]: List of PIL Images, one per input array.
     
     Note:
         - Arrays with shape (1, H, W, C) are automatically squeezed.
@@ -485,19 +499,19 @@ def numpy_list_to_pil_image(numpy_list: List[np.ndarray]) -> ImageList:
 # ----------------------------------- PIL -> Tensor/NumPy/Base64 --------------------------------------
 
 def pil_image_to_tensor(
-    images: Union[Image.Image, ImageList]
+    images: Union[Image.Image, List[Image.Image]]
 ) -> torch.Tensor:
     """
     Convert PIL Image(s) to torch Tensor.
     
     Args:
-        images: Single PIL Image or ImageList.
+        images: Single PIL Image or List of PIL Images.
             All images should have the same dimensions for batch processing.
     
     Returns:
         torch.Tensor: Image tensor with values in [0, 1].
             - If single Image: Shape (1, C, H, W)
-            - If ImageList: Shape (N, C, H, W)
+            - If List of PIL Images: Shape (N, C, H, W)
     
     Raises:
         ValueError: If images is empty.
@@ -538,19 +552,19 @@ def pil_image_to_tensor(
 
 
 def pil_image_to_numpy(
-    images: Union[Image.Image, ImageList]
+    images: Union[Image.Image, List[Image.Image]]
 ) -> np.ndarray:
     """
     Convert PIL Image(s) to NumPy array.
     
     Args:
-        images: Single PIL Image or ImageList.
+        images: Single PIL Image or List of PIL Images.
             All images should have the same dimensions for batch processing.
     
     Returns:
         np.ndarray: Image array with uint8 dtype.
             - If single Image: Shape (1, H, W, C)
-            - If ImageList: Shape (N, H, W, C)
+            - If List of PIL Images: Shape (N, H, W, C)
     
     Raises:
         ValueError: If images is empty.
@@ -598,3 +612,62 @@ def pil_image_to_base64(image: Image.Image, format: str = "JPEG") -> str:
     image.save(buffered, format=format)
     encoded = base64.b64encode(buffered.getvalue()).decode("utf-8")
     return f"data:image/{format.lower()};base64,{encoded}"
+
+
+# ----------------------------------- Standardization --------------------------------------
+def standardize_image_batch(
+    images: Union[Image.Image, ImageBatch],
+    output_type: Literal['pil', 'np', 'pt'] = 'pil',
+) -> ImageBatch:
+    """Standardize image input to desired output type."""
+    # Single image -> list
+    if isinstance(images, Image.Image):
+        images = [images]
+    
+    # Tensor (N, C, H, W)
+    if isinstance(images, torch.Tensor):
+        if output_type == 'pil':
+            return tensor_to_pil_image(images)
+        elif output_type == 'np':
+            return normalize_to_uint8(images).cpu().numpy().transpose(0, 2, 3, 1)
+        return images  # pt
+    # NumPy array (N, H, W, C)
+    elif isinstance(images, np.ndarray):
+        if output_type == 'pil':
+            return numpy_to_pil_image(images)
+        elif output_type == 'pt':
+            # NHWC -> NCHW, [0,255] -> [0,1]
+            arr = images.astype(np.float32) / 255.0 if images.max() > 1.0 else images
+            return torch.from_numpy(arr.transpose(0, 3, 1, 2))
+        return images  # np
+
+    # List of images
+    elif isinstance(images, list):
+        # List[torch.Tensor]
+        if isinstance(images[0], torch.Tensor):
+            if output_type == 'pil':
+                return tensor_list_to_pil_image(images)
+            elif output_type == 'np':
+                return [normalize_to_uint8(t).cpu().numpy().transpose(1, 2, 0) for t in images]
+            return images  # pt
+        # List[np.ndarray]
+        elif isinstance(images[0], np.ndarray):
+            if output_type == 'pil':
+                return numpy_list_to_pil_image(images)
+            elif output_type == 'pt':
+                return [
+                    torch.from_numpy(
+                        arr.astype(np.float32) / 255.0 if arr.max() > 1.0 else arr.astype(np.float32)
+                    ).permute(2, 0, 1)
+                    for arr in images
+                ]
+            return images  # np
+        # List[PIL.Image]
+        elif isinstance(images[0], Image.Image):
+            if output_type == 'np':
+                return pil_image_to_numpy(images)
+            elif output_type == 'pt':
+                return pil_image_to_tensor(images)
+            return images  # pil
+
+    raise ValueError(f'Unsupported image input type: {type(images)}')
