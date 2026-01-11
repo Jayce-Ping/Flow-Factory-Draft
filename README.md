@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/logo.png" alt="logo" height="100">
+  <img src="./assets/logo.png" alt="logo" height="150">
 </p>
 <h1 align="center">Flow-Factory</h1>
 
@@ -13,7 +13,7 @@
   <b>Easy Reinforcement Learning for Diffusion and Flow-Matching Models</b>
 </p>
 
-# Table of Contents
+# 📕 Table of Contents
 
 - [Supported Models](#-supported-models)
 - [Supported Algorithms](#-supported-algorithms)
@@ -26,7 +26,7 @@
   - [Image-to-Image & Image-to-Video](#image-to-image--image-to-video)
   - [Video-to-Video](#video-to-video)
 - [Reward Model](#-reward-model)
-- [Acknowledgements](#acknowledgements)
+- [Acknowledgements](#-acknowledgements)
 
 # 🤗 Supported Models
 
@@ -36,10 +36,10 @@
   <tr><td><a href="https://huggingface.co/Tongyi-MAI/Z-Image-Turbo">Z-Image-Turbo</a></td><td>12B</td><td>z-image</td></tr>
   <tr><td><a href="https://huggingface.co/Qwen/Qwen-Image">Qwen-Image</a></td><td>20B</td><td>qwen-image</td></tr>
   <tr><td><a href="https://huggingface.co/Qwen/Qwen-Image-2512">Qwen-Image-2512</a></td><td>20B</td><td>qwen-image</td></tr>
-  <tr><td>Text-to-Image & Image(s)-to-Image</td><td><a href="https://huggingface.co/black-forest-labs/FLUX.2-dev">FLUX.2-dev</a></td><td>30B</td><td>flux2</td></tr>
   <tr><td>Image-to-Image</td><td><a href="https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev">FLUX.1-Kontext-dev</a></td><td>13B</td><td>flux1-kontext</td></tr>
   <tr><td rowspan="2">Image(s)-to-Image</td><td><a href="https://huggingface.co/Qwen/Qwen-Image-Edit-2509">Qwen-Image-Edit-2509</a></td><td>20B</td><td>qwen-image-edit-plus</td></tr>
   <tr><td><a href="https://huggingface.co/Qwen/Qwen-Image-Edit-2511">Qwen-Image-Edit-2511</a></td><td>20B</td><td>qwen-image-edit-plus</td></tr>
+  <tr><td>Text-to-Image & Image(s)-to-Image</td><td><a href="https://huggingface.co/black-forest-labs/FLUX.2-dev">FLUX.2-dev</a></td><td>30B</td><td>flux2</td></tr>
   <tr><td rowspan="3">Text-to-Video</td><td><a href="https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers">Wan2.1-T2V-1.3B</a></td><td>1.3B</td><td>wan2_t2v</td></tr>
   <tr><td><a href="https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers">Wan2.1-T2V-14B</a></td><td>14B</td><td>wan2_t2v</td></tr>
   <tr><td><a href="https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers">Wan2.2-T2V-A14B</a></td><td>A14B</td><td>wan2_t2v</td></tr>
@@ -202,7 +202,7 @@ reward:
 Refer to [Rewards Guidance](guidance/rewards.md) for more information about advanced usage, such as creating a custom reward model.
 
 
-# Acknowledgements
+# 🤗 Acknowledgements
 
 This repository is based on [diffusers](https://github.com/huggingface/diffusers/), [accelerate](https://github.com/huggingface/accelerate) and [peft](https://github.com/huggingface/peft).
-We thank them for their contributions to the community!!
+We thank them for their contributions to the community!!!
