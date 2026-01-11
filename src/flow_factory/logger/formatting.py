@@ -176,7 +176,7 @@ class LogVideo:
     _value: Union[str, np.ndarray, torch.Tensor, List[Image.Image]] = field(repr=False)
     caption: Optional[str] = None
     fps: int = 8
-    _temp_path: Optional[str] = field(default=None, init=False, repr=False)
+    _temp_paths: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
     @property
     def format(self) -> str:
@@ -209,46 +209,70 @@ class LogVideo:
         if arr.dtype != np.uint8:
             arr = ((arr * 255) if arr.max() <= 1.0 else arr).clip(0, 255).astype(np.uint8)
         return arr
-
-    @property
-    def value(self) -> str:
-        """Get video file path (converts tensor/array/frames to mp4)."""
-        if self._temp_path:
-            return self._temp_path
-        if isinstance(self._value, str):
-            return self._value
+    
+    def get_value(self, format: str = 'mp4') -> str:
+        """Get video file path in specified format (converts if needed)."""
+        format = format.lower().lstrip('.')
         
-        arr = self.to_numpy(self._value)
-        fd, path = tempfile.mkstemp(suffix='.mp4')
+        # Check cache
+        if format in self._temp_paths:
+            return self._temp_paths[format]
+        
+        # If source is a file with matching format, return directly
+        if isinstance(self._value, str):
+            if self.format == format:
+                return self._value
+            arr = imageio.mimread(self._value)
+            arr = np.stack(arr, axis=0)
+        else:
+            arr = self.to_numpy(self._value)
+        
+        # Write to temp file
+        fd, path = tempfile.mkstemp(suffix=f'.{format}')
         try:
             os.close(fd)
-            imageio.mimwrite(
-                path,
-                arr,
-                fps=self.fps, 
-                format='FFMPEG',
-                codec='libx264', 
-               pixelformat='yuv420p',
-            )
-            self._temp_path = path
+            if format == 'gif':
+                imageio.mimwrite(
+                    path,
+                    arr,
+                    fps=self.fps,
+                    format='GIF',
+                    loop=0
+                )
+            else:  # mp4
+                imageio.mimwrite(
+                    path,
+                    arr,
+                    fps=self.fps,
+                    format='FFMPEG',
+                    codec='libx264',
+                    pixelformat='yuv420p'
+                )
+            self._temp_paths[format] = path
         except Exception:
             if os.path.exists(path):
                 os.unlink(path)
             raise
-        return self._temp_path
+        return path
+
+    @property
+    def value(self) -> str:
+        """Default: get mp4 path."""
+        return self.get_value('mp4')
 
     @value.setter
     def value(self, val: Union[str, np.ndarray, torch.Tensor, List[Image.Image]]):
         self.cleanup()
         self._value = val
-        self._temp_path = None
 
     def cleanup(self):
-        if self._temp_path and os.path.exists(self._temp_path):
-            try:
-                os.unlink(self._temp_path)
-            finally:
-                self._temp_path = None
+        for path in self._temp_paths.values():
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except Exception:
+                    pass
+        self._temp_paths.clear()
 
     def __del__(self):
         self.cleanup()

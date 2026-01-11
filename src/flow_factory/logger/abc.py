@@ -34,10 +34,13 @@ class Logger(ABC):
             formatted_dict = {k: v for k, v in formatted_dict.items() if k in valid_keys}
 
         # 3. Convert IR to Platform Objects
-        final_dict = {
-            k: self._recursive_convert(v)
-            for k, v in formatted_dict.items()
-        }
+        final_dict = {}
+        for k, v in formatted_dict.items():
+            converted = self._recursive_convert(v)
+            if isinstance(converted, dict): # for LogTable conversion case returning dict, e.g., SwanlabLogger
+                final_dict.update(converted)
+            else:
+                final_dict[k] = converted
 
         # 4. Actual Logging
         if final_dict:
