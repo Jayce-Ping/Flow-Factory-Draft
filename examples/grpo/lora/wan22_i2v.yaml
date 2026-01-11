@@ -34,6 +34,7 @@ model:
   # Even if you only want to train one transformer at the time, a trick to save memory is that
   # with `fsdp_full_shard`, set `target_components` to `['transformer', 'transformer_2']` and target_modules to `transformer.default`
   # both `transformer` and `transformer_2` will be shared among GPUs to save memory.
+  # But pay attention to the `boundary_ratio` that used in Wan2.2, before/after which different transformer is used and therefore needed for backward.
   target_modules: "transformer.default"
   model_name_or_path: "Wan-AI/Wan2.2-I2V-A14B-Diffusers" # Wan-AI/Wan2.2-TI2V-5B-Diffusers / Wan-AI/Wan2.2-I2V-A14B-Diffusers
   model_type: "wan2_i2v"  # wan2_t2v, wan2_i2v, wan2_v2v
@@ -72,7 +73,7 @@ train:
   num_inference_steps: 8  # Number of SDE timesteps
   noise_level: 0.9  # Noise level for sampling
   num_train_steps: 1  # Number of noise steps
-  train_steps: [1, 2, 3]  # Custom noise window
+  train_steps: [1]  # Custom noise window
   guidance_scale: 3.5  # Guidance scale for sampling
   
   # Optimization
