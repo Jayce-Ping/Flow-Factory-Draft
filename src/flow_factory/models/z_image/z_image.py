@@ -194,7 +194,7 @@ class ZImageAdapter(BaseAdapter):
         # 1. Setup
         device = self.device
         dtype = self.pipeline.transformer.dtype
-        do_classifier_free_guidance = guidance_scale > 1.0
+        do_classifier_free_guidance = guidance_scale > 0.0
 
         # 2. Encode prompts if not provided
         if prompt_embeds is None:
@@ -394,7 +394,7 @@ class ZImageAdapter(BaseAdapter):
         batch_size = len(samples)
         device = self.device
         guidance_scale = [s.extra_kwargs.get('guidance_scale', self.training_args.guidance_scale) for s in samples]
-        do_classifier_free_guidance = guidance_scale[0] > 1.0
+        do_classifier_free_guidance = guidance_scale[0] > 0.0
         cfg_truncation = samples[0].extra_kwargs.get('cfg_truncation', 1.0)
         cfg_normalization = samples[0].extra_kwargs.get('cfg_normalization', False)
 
@@ -425,7 +425,7 @@ class ZImageAdapter(BaseAdapter):
         ):
             current_guidance_scale = 0.0
         else:
-            current_guidance_scale = guidance_scale[0]    
+            current_guidance_scale = guidance_scale[0]
 
         apply_cfg = do_classifier_free_guidance and current_guidance_scale > 0
 

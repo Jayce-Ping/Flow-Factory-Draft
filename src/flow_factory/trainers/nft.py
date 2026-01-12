@@ -253,12 +253,16 @@ class DiffusionNFTTrainer(BaseTrainer):
                         with self.autocast():
                             # Forward pass
                             return_kwargs = ['noise_pred', 'next_latents', 'latents', 'dt']
-                            output = self.adapter.forward(
-                                batch,
-                                timestep_index=timestep_index,
-                                compute_log_prob=False,
-                                return_kwargs=return_kwargs,
-                            )
+                            forward_kwargs = {
+                                'samples': batch,
+                                'timestep_index': timestep_index,
+                                'compute_log_prob': False,
+                                'return_kwargs': return_kwargs,
+                                **self.training_args,
+                            }
+                            forward_kwargs = filter_kwargs(self.adapter.forward, **forward_kwargs)
+                            output = self.adapter.forward(**forward_kwargs)
+
                         # 1. Prepare variables                        
                         nft_beta = self.training_args.nft_beta if hasattr(self.training_args, 'nft_beta') else 1 # 1 as default
                         timestep = samples[0].timesteps[timestep_index].to(self.accelerator.device)

@@ -624,13 +624,56 @@ def pil_image_to_base64(image: Image.Image, format: str = "JPEG") -> str:
 
 # ----------------------------------- Standardization --------------------------------------
 def standardize_image_batch(
-    images: Union[Image.Image, ImageBatch],
+    images: Union[ImageSingle, ImageBatch],
     output_type: Literal['pil', 'np', 'pt'] = 'pil',
 ) -> ImageBatch:
-    """Standardize image input to desired output type."""
+    """
+    Standardize input image(s) (single or batch) to the desired output format.
+    
+    Supports automatic promotion of single images to batch format and preserves
+    input structure: stacked input -> stacked output, list input -> list output.
+    
+    Args:
+        images: Input image(s) in any supported format:
+            - Single: PIL.Image, torch.Tensor (C,H,W), np.ndarray (H,W,C)
+            - Batch: List[PIL.Image], torch.Tensor (N,C,H,W), np.ndarray (N,H,W,C)
+            - List[torch.Tensor] or List[np.ndarray] (variable shapes allowed)
+        output_type: Target format.
+            - 'pil': List[PIL.Image]
+            - 'np': np.ndarray (N,H,W,C) uint8 if stacked, else List[np.ndarray]
+            - 'pt': torch.Tensor (N,C,H,W) float32 [0,1] if stacked, else List[torch.Tensor]
+    
+    Returns:
+        ImageBatch: Standardized batch in the requested format.
+    
+    Raises:
+        ValueError: If input type is unsupported.
+    
+    Example:
+        >>> # Single image -> batch
+        >>> img = Image.new('RGB', (64, 64))
+        >>> batch = standardize_image_batch(img, 'pt')
+        >>> batch.shape
+        torch.Size([1, 3, 64, 64])
+        
+        >>> # Tensor batch -> PIL
+        >>> tensor = torch.rand(4, 3, 256, 256)
+        >>> pil_images = standardize_image_batch(tensor, 'pil')
+        >>> len(pil_images)
+        4
+        
+        >>> # Variable-shape list preserved as list
+        >>> tensors = [torch.rand(3, 64, 64), torch.rand(3, 128, 128)]
+        >>> arrays = standardize_image_batch(tensors, 'np')
+        >>> isinstance(arrays, list)
+        True
+    """
     # Single image -> list
     if isinstance(images, Image.Image):
         images = [images]
+    # Single tensor/array -> batch
+    if isinstance(images, (torch.Tensor, np.ndarray)) and images.ndim == 3:
+        images = images.unsqueeze(0) if isinstance(images, torch.Tensor) else images[np.newaxis, ...]
     
     # Tensor (N, C, H, W)
     if isinstance(images, torch.Tensor):

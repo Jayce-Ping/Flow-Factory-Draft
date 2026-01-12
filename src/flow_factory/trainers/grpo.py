@@ -86,10 +86,10 @@ class GRPOTrainer(BaseTrainer):
             
             with torch.no_grad(), self.autocast():
                 sample_kwargs = {
-                    'compute_log_prob': True,
                     **self.training_args,
+                    'compute_log_prob': True,
+                    **batch,
                 }
-                sample_kwargs.update(**batch)
                 sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
                 sample_batch = self.adapter.inference(**sample_kwargs)
             
@@ -240,12 +240,16 @@ class GRPOTrainer(BaseTrainer):
                                     return_kwargs = ['log_prob', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt']
                             else:
                                 return_kwargs = ['log_prob', 'std_dev_t', 'dt']
-                            output = self.adapter.forward(
-                                batch,
-                                timestep_index=timestep_index,
-                                compute_log_prob=True,
-                                return_kwargs=return_kwargs,
-                            )
+                            
+                            forward_kwargs = {
+                                **self.training_args,
+                                'samples': batch,
+                                'timestep_index': timestep_index,
+                                'compute_log_prob': True,
+                                'return_kwargs': return_kwargs,
+                            }
+                            forward_kwargs = filter_kwargs(self.adapter.forward, **forward_kwargs)
+                            output = self.adapter.forward(**forward_kwargs)
 
                         # Clip advantages
                         adv_clip_range = self.training_args.adv_clip_range
@@ -423,12 +427,15 @@ class GRPOGuardTrainer(GRPOTrainer):
                         with self.autocast():
                             # Forward pass
                             return_kwargs = ['log_prob', 'next_latents_mean', 'std_dev_t', 'dt']
-                            output = self.adapter.forward(
-                                batch,
-                                timestep_index=timestep_index,
-                                compute_log_prob=True,
-                                return_kwargs=return_kwargs,
-                            )
+                            forward_kwargs = {
+                                **self.training_args,
+                                'samples': batch,
+                                'timestep_index': timestep_index,
+                                'compute_log_prob': True,
+                                'return_kwargs': return_kwargs,
+                            }
+                            forward_kwargs = filter_kwargs(self.adapter.forward, **forward_kwargs)
+                            output = self.adapter.forward(**forward_kwargs)
 
                         # Clip advantages
                         adv_clip_range = self.training_args.adv_clip_range

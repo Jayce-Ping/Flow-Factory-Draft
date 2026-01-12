@@ -42,8 +42,8 @@ class BaseSample(BaseOutput):
     height : Optional[int] = None
     width : Optional[int] = None
     # Generated media
-    image: Optional[Image.Image] = None
-    video: Optional[List[Image.Image]] = None
+    image: Optional[Union[Image.Image, torch.Tensor, np.ndarray]] = None
+    video: Optional[Union[List[Image.Image], torch.Tensor, np.ndarray]] = None
     # Prompt information
     prompt : Optional[str] = None
     prompt_ids : Optional[torch.LongTensor] = None

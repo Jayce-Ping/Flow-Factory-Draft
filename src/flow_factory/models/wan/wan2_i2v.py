@@ -45,7 +45,6 @@ WanPipelineImageInput = Union[
 
 @dataclass
 class WanI2VSample(I2VSample):
-    video : Optional[Union[np.ndarray, torch.Tensor, List[Image.Image]]] = None
     image_embeds : Optional[torch.FloatTensor] = None
     condition_latents : Optional[torch.FloatTensor] = None
     first_frame_mask : Optional[torch.FloatTensor] = None

@@ -19,6 +19,7 @@ from safetensors.torch import save_file, load_file
 from diffusers.utils.outputs import BaseOutput
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.models.modeling_utils import ModelMixin
+from diffusers.schedulers.scheduling_utils import SchedulerMixin
 from peft import get_peft_model, LoraConfig, PeftModel
 
 from huggingface_hub import split_torch_state_dict_into_shards
@@ -261,11 +262,11 @@ class BaseAdapter(ABC):
 
     # ------------------------------------ Scheduler ------------------------------------
     @property
-    def scheduler(self) -> FlowMatchEulerDiscreteSDEScheduler:
+    def scheduler(self) -> SchedulerMixin:
         return self.pipeline.scheduler
 
     @scheduler.setter
-    def scheduler(self, scheduler: FlowMatchEulerDiscreteSDEScheduler):
+    def scheduler(self, scheduler: SchedulerMixin):
         self.pipeline.scheduler = scheduler
 
     # ---------------------------------- Device & Dtype ----------------------------------

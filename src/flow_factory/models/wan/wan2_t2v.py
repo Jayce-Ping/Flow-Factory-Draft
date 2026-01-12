@@ -26,12 +26,13 @@ logger = setup_logger(__name__)
 
 @dataclass
 class WanT2VSample(T2VSample):
-    video : Optional[Union[np.ndarray, torch.Tensor, List[Image.Image]]] = None
-
+    pass
 
 class Wan2_T2V_Adapter(BaseAdapter):
     def __init__(self, config: Arguments, accelerator : Accelerator):
         super().__init__(config, accelerator)
+        self.pipeline: WanPipeline
+        self.scheduler: UniPCMultistepSDEScheduler
     
     def load_pipeline(self) -> WanPipeline:
         return WanPipeline.from_pretrained(
@@ -223,7 +224,7 @@ class Wan2_T2V_Adapter(BaseAdapter):
         """Not needed for Wan text-to-video models."""
         pass
 
-    def decode_latents(self, latents: torch.Tensor, output_type: Literal['pt', 'pil', 'np'] = 'pil', **kwargs) -> torch.Tensor:
+    def decode_latents(self, latents: torch.Tensor, output_type: Literal['pt', 'pil', 'np'] = 'pil') -> torch.Tensor:
         """Decode the latents using the VAE decoder."""
         latents = latents.float()
         latents_mean = (

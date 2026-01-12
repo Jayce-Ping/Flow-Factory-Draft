@@ -652,26 +652,56 @@ def video_frames_to_numpy(
 
 # ----------------------------------- Standardization --------------------------------------
 def standardize_video_batch(
-    videos: Union[VideoFrames, VideoBatch],
+    videos: Union[Video, VideoBatch],
     output_type: Literal['pil', 'np', 'pt'] = 'pil',
 ) -> VideoBatch:
     """
-    Standardize video input to desired output type.
+    Standardize input video(s) (single or batch) to the desired output format.
     
-    Preserves input structure: stacked input -> stacked output, list input -> list output.
+    Supports automatic promotion of single videos to batch format and preserves
+    input structure: stacked input -> stacked output, list input -> list output.
     
     Args:
-        videos: Input videos in any supported format.
-        output_type: Target format - 'pil', 'np', or 'pt'.
+        videos: Input video(s) in any supported format:
+            - Single: List[PIL.Image], torch.Tensor (T,C,H,W), np.ndarray (T,H,W,C)
+            - Batch: List[List[PIL.Image]], torch.Tensor (B,T,C,H,W), np.ndarray (B,T,H,W,C)
+            - List[torch.Tensor] or List[np.ndarray] (variable shapes allowed)
+        output_type: Target format.
+            - 'pil': List[List[PIL.Image]]
+            - 'np': np.ndarray (B,T,H,W,C) uint8 if stacked, else List[np.ndarray]
+            - 'pt': torch.Tensor (B,T,C,H,W) float32 [0,1] if stacked, else List[torch.Tensor]
     
     Returns:
-        - 'pil': List[List[PIL.Image]]
-        - 'np': np.ndarray (B,T,H,W,C) if input was stacked, else List[np.ndarray]
-        - 'pt': torch.Tensor (B,T,C,H,W) if input was stacked, else List[torch.Tensor]
+        VideoBatch: Standardized batch in the requested format.
+    
+    Raises:
+        ValueError: If input type is unsupported.
+    
+    Example:
+        >>> # Single video -> batch
+        >>> frames = [Image.new('RGB', (64, 64)) for _ in range(16)]
+        >>> batch = standardize_video_batch(frames, 'pt')
+        >>> batch.shape
+        torch.Size([1, 16, 3, 64, 64])
+        
+        >>> # Tensor batch -> PIL
+        >>> tensor = torch.rand(4, 16, 3, 256, 256)
+        >>> pil_videos = standardize_video_batch(tensor, 'pil')
+        >>> len(pil_videos), len(pil_videos[0])
+        (4, 16)
+        
+        >>> # Single 4D tensor -> batch
+        >>> video = torch.rand(16, 3, 128, 128)
+        >>> batch = standardize_video_batch(video, 'np')
+        >>> batch.shape
+        (1, 16, 128, 128, 3)
     """
     # Single video (List[PIL]) -> batch
     if is_video_frame_list(videos):
         videos = [videos]
+    # Single video tensor/array -> batch
+    if isinstance(videos, (torch.Tensor, np.ndarray)) and videos.ndim == 4:
+        videos = videos.unsqueeze(0) if isinstance(videos, torch.Tensor) else videos[np.newaxis, ...]
 
     # Stacked Tensor (B, T, C, H, W)
     if isinstance(videos, torch.Tensor):
