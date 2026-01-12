@@ -12,6 +12,7 @@ from datetime import datetime
 from .abc import ArgABC
 from .data_args import DataArguments
 from .model_args import ModelArguments
+from .scheduler_args import SchedulerArguments
 from .training_args import TrainingArguments, EvaluationArguments
 from .reward_args import RewardArguments
 from .log_args import LogArguments
@@ -59,6 +60,10 @@ class Arguments(ArgABC):
     model_args: ModelArguments = field(
         default_factory=ModelArguments,
         metadata={"help": "Arguments for model configuration."},
+    )
+    scheduler_args: SchedulerArguments = field(
+        default_factory=SchedulerArguments,
+        metadata={"help": "Arguments for scheduler configuration."},
     )
     training_args: TrainingArguments = field(
         default_factory=TrainingArguments,
@@ -113,6 +118,7 @@ class Arguments(ArgABC):
         nested_map = {
             'data': ('data_args', DataArguments),
             'model': ('model_args', ModelArguments),
+            'scheduler': ('scheduler_args', SchedulerArguments),
             'train': ('training_args', TrainingArguments),
             'eval': ('eval_args', EvaluationArguments),
             'reward': ('reward_args', RewardArguments),

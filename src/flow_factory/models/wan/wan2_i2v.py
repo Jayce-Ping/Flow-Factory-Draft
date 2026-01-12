@@ -16,7 +16,7 @@ from peft import PeftModel
 from ..adapter import BaseAdapter
 from ..samples import I2VSample
 from ...hparams import *
-from ...scheduler import UniPCMultistepSDESchedulerOutput, set_scheduler_timesteps, UniPCMultistepSDEScheduler
+from ...scheduler import UniPCMultistepSDESchedulerOutput, UniPCMultistepSDEScheduler
 from ...utils.base import (
     filter_kwargs,
     pil_image_to_tensor,
@@ -61,23 +61,6 @@ class Wan2_I2V_Adapter(BaseAdapter):
         return WanImageToVideoPipeline.from_pretrained(
             self.model_args.model_name_or_path,
         )
-    
-    def load_scheduler(self) -> UniPCMultistepSDEScheduler:
-        """Load and return the scheduler."""
-        sde_config_keys = ['noise_level', 'train_steps', 'num_train_steps', 'seed', 'dynamics_type']
-        # Check keys:
-        for k in sde_config_keys:
-            if not hasattr(self.training_args, k):
-                logger.warning(f"Missing SDE config key '{k}' in training_args, using default value")
-
-        sde_config = {
-            k: getattr(self.training_args, k)
-            for k in sde_config_keys
-            if hasattr(self.training_args, k)
-        }
-        scheduler_config = self.pipeline.scheduler.config.__dict__.copy()
-        scheduler_config.update(sde_config)
-        return UniPCMultistepSDEScheduler(**scheduler_config)
     
     @property
     def default_target_modules(self) -> List[str]:

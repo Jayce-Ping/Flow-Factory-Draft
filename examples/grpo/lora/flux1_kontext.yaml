@@ -58,11 +58,7 @@ train:
   max_grad_norm: 1.0  # Max gradient norm for clipping
   
   # Denoising process
-  dynamics_type: "Flow-SDE"  # Options: Flow-SDE, Dance-SDE, CPS, ODE
-  num_inference_steps: 8  # Number of SDE timesteps
-  noise_level: 0.9  # Noise level for sampling
-  num_train_steps: 1  # Number of noise steps
-  train_steps: [1, 2, 3]  # Custom noise window
+  num_inference_steps: 8  # Number of timesteps
   guidance_scale: 2.5  # Guidance scale for sampling
   
   # Optimization
@@ -75,7 +71,15 @@ train:
   # EMA
   ema_decay: 0.9  # EMA decay rate (0 to disable)
   ema_update_interval: 4  # EMA update interval (in epochs)
-  
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "Flow-SDE"  # Options: Flow-SDE, Dance-SDE, CPS, ODE
+  noise_level: 0.9  # Noise level for sampling
+  num_train_steps: 1  # Number of noise steps
+  train_steps: [1, 2, 3]  # Custom noise window, noise steps are randomly selected from this list during training
+  seed: 42  # Scheduler seed (for noise step selection)
+
 # Evaluation settings
 eval:
   resolution: 512  # Evaluation resolution

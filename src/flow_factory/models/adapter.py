@@ -42,11 +42,13 @@ from accelerate.utils import (
 
 from .samples import BaseSample
 from ..ema import EMAModuleWrapper
-from ..scheduler import FlowMatchEulerDiscreteSDEScheduler, SDESchedulerOutput
+from ..scheduler import (
+    load_scheduler as _load_scheduler,
+    SDESchedulerOutput
+)
 from ..hparams import *
 from ..utils.base import filter_kwargs, is_tensor_list
 from ..utils.logger_utils import setup_logger
-
 
 # Constants
 CONFIG_NAME = "config.json"
@@ -121,22 +123,13 @@ class BaseAdapter(ABC):
         """Load and return the diffusion pipeline. Must be implemented by subclasses."""
         pass
 
-    def load_scheduler(self) -> FlowMatchEulerDiscreteSDEScheduler:
+    def load_scheduler(self) -> SchedulerMixin:
         """Load and return the scheduler."""
-        sde_config_keys = ['noise_level', 'train_steps', 'num_train_steps', 'seed', 'dynamics_type']
-        # Check keys:
-        for k in sde_config_keys:
-            if not hasattr(self.training_args, k):
-                logger.warning(f"Missing SDE config key '{k}' in training_args, using default value")
-
-        sde_config = {
-            k: getattr(self.training_args, k)
-            for k in sde_config_keys
-            if hasattr(self.training_args, k)
-        }
-        scheduler_config = self.pipeline.scheduler.config.__dict__.copy()
-        scheduler_config.update(sde_config)
-        return FlowMatchEulerDiscreteSDEScheduler(**scheduler_config)
+        scheduler = _load_scheduler(
+            pipeline_scheduler=self.pipeline.scheduler,
+            scheduler_args=self.config.scheduler_args,
+        )
+        return scheduler
 
     # ============================== Component Accessors ==============================
     # ---------------------------------- Wrappers ----------------------------------

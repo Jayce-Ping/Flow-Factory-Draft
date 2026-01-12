@@ -177,40 +177,14 @@ class TrainingArguments(ArgABC):
     )
 
     # Sampling arguments
-    dynamics_type: Literal["Flow-SDE", 'Dance-SDE', 'CPS', 'ODE'] = field(
-        default="Flow-SDE",
-        metadata={"help": "Type of SDE to use."},
-    )
     num_inference_steps: int = field(
         default=10,
         metadata={"help": "Number of timesteps for SDE."},
-    )
-    noise_level: float = field(
-        default=0.7,
-        metadata={"help": "Noise level for SDE sampling."},
-    )
-    mix_ratio: float = field(
-        default=0.01,
-        metadata={"help": "Mix ratio between two initial latents for SDE sampling."},
-    )
-    num_train_steps : int = field(
-        default=1,
-        metadata={"help": "Number of train steps."},
-    )
-    train_steps: Optional[List[int]] = field(
-        default=None,
-        metadata={"help": (
-            "Training steps for optimization. "
-            "    `train_steps` will be randomly sampled from this list."
-            "    If None, will use the first 1/2 of the timesteps."
-        )
-        },
     )
     guidance_scale: float = field(
         default=3.5,
         metadata={"help": "Guidance scale for sampling."},
     )
-
 
     # Environment arguments
     seed: int = field(
@@ -286,10 +260,6 @@ class TrainingArguments(ArgABC):
 
         world_size = get_world_size()
         logger.info("World Size:" + str(world_size))
-
-        if self.train_steps is None:
-            first_n_steps = min(self.num_inference_steps // 3, self.num_train_steps) # Default to first 1/3 of the timesteps
-            self.train_steps = list(range(first_n_steps))
 
         # Adjust unique_sample_num for even distribution
         sample_num_per_iteration = world_size * self.per_device_batch_size
