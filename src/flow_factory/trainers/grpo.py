@@ -109,7 +109,7 @@ class GRPOTrainer(BaseTrainer):
             
             for i in tqdm(
                 range(0, len(samples), reward_model.config.batch_size),
-                desc=f'Epoch {self.epoch} Computing Rewards',
+                desc=f'Epoch {self.epoch} Computing Rewards: {reward_name}',
                 disable=not self.accelerator.is_local_main_process,
             ):
                 batch_samples = [
@@ -190,11 +190,11 @@ class GRPOTrainer(BaseTrainer):
 
         # 5. Log statistics
         _log_data = {
-            f'train/reward_mean_{key}': np.mean(value)
+            f'train/reward_{key}_mean': np.mean(value)
             for key, value in gathered_rewards.items()
         }
         _log_data.update({
-            f'train/reward_std_{key}': np.std(value)
+            f'train/reward_{key}_std': np.std(value)
             for key, value in gathered_rewards.items()
         })
         _log_data.update({
@@ -397,11 +397,11 @@ class GRPOTrainer(BaseTrainer):
             # Log statistics
             if self.accelerator.is_main_process:
                 _log_data = {
-                    f'eval/reward_mean_{key}': np.mean(value)
+                    f'eval/reward_{key}_mean': np.mean(value)
                     for key, value in gathered_rewards.items()
                 }
                 _log_data.update({
-                    f'eval/reward_std_{key}': np.std(value)
+                    f'eval/reward_{key}_std': np.std(value)
                     for key, value in gathered_rewards.items()
                 })
                 self.log_data(

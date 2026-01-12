@@ -11,13 +11,12 @@ from ..hparams import *
 
 
 class PickScoreRewardModel(BaseRewardModel):
-    def __init__(self, reward_args: RewardArguments, accelerator: Accelerator):
-        super().__init__(reward_args, accelerator)
+    def __init__(self, config: RewardArguments, accelerator: Accelerator):
+        super().__init__(config, accelerator)
         processor_path = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
         model_path = "yuvalkirstain/PickScore_v1"
         self.processor = CLIPProcessor.from_pretrained(processor_path)
         self.model = CLIPModel.from_pretrained(model_path).eval().to(self.device)
-        self.model = self.model.to(dtype=self.dtype)
 
     @torch.no_grad()
     def __call__(

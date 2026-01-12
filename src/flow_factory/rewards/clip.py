@@ -16,7 +16,7 @@ class CLIPRewardModel(BaseRewardModel):
     CLIP-based reward model that computes image-text similarity.
     """
     
-    DEFAULT_MODEL = "openai/clip-vit-large-patch32"
+    DEFAULT_MODEL = "openai/clip-vit-large-patch14"
     
     def __init__(self, config: RewardArguments, accelerator: Accelerator):
         super().__init__(config, accelerator)

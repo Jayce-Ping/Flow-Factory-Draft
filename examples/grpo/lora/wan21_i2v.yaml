@@ -107,7 +107,7 @@ rewards:
 # Optional Evaluation Reward Models
 # eval_rewards:
 #   - name: "text_alignment_2"
-#     reward_model: "CLIPRewardModel"
+#     reward_model: "CLIP"
 #     batch_size: 16
 #     device: "cuda"
 #     dtype: bfloat16

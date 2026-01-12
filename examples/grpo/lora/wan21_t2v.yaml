@@ -94,12 +94,14 @@ eval:
 # Reward Model Configuration
 rewards:
   - name: "text_alignment" # Alias for this reward model
-    reward_model: "CLIPRewardModel" # Reward model type or a path like 'my_package.rewards.CustomReward'
+    reward_model: "CLIP" # Reward model type or a path like 'my_package.rewards.CustomReward'
+    weight: 1.0  # Weight of this reward model
     batch_size: 16
     device: "cuda"
     dtype: bfloat16
   - name: "pick_score"
     reward_model: "PickScore"
+    weight: 0.5  # Weight of this reward model
     batch_size: 16
     device: "cuda"
     dtype: bfloat16
@@ -107,7 +109,7 @@ rewards:
 # Optional Evaluation Reward Models
 # eval_rewards:
 #   - name: "text_alignment_2"
-#     reward_model: "CLIPRewardModel"
+#     reward_model: "CLIP"
 #     batch_size: 16
 #     device: "cuda"
 #     dtype: bfloat16

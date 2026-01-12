@@ -14,10 +14,6 @@ class SchedulerArguments(ArgABC):
         default="Flow-SDE",
         metadata={"help": "Type of SDE dynamics to use."},
     )
-    num_inference_steps: int = field(
-        default=10,
-        metadata={"help": "Number of timesteps for SDE."},
-    )
     noise_level: float = field(
         default=0.7,
         metadata={"help": "Noise level for SDE sampling."},
@@ -31,7 +27,7 @@ class SchedulerArguments(ArgABC):
         metadata={"help": (
             "Training step indices for optimization. "
             "`num_train_steps` will be randomly sampled from this list. "
-            "If None, uses the first 1/3 of timesteps."
+            "If None, uses all the timesteps."
         )},
     )
     seed: int = field(
@@ -40,9 +36,7 @@ class SchedulerArguments(ArgABC):
     )
 
     def __post_init__(self):
-        if self.train_steps is None:
-            first_n_steps = max(1, self.num_inference_steps // 3)
-            self.train_steps = list(range(first_n_steps))
+        pass
 
     def to_dict(self) -> dict[str, Any]:
         return super().to_dict()
