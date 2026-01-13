@@ -13,8 +13,8 @@ from ..hparams import *
 
 
 class SudokuRewardModel(BaseRewardModel):
-    def __init__(self, reward_args: RewardArguments, accelerator: Accelerator):
-        super().__init__(reward_args, accelerator)
+    def __init__(self, config: RewardArguments, accelerator: Accelerator):
+        super().__init__(config, accelerator)
         self.model = AutoModelForImageTextToText.from_pretrained(
             "stepfun-ai/GOT-OCR-2.0-hf", device_map=self.device, torch_dtype=torch.bfloat16
         )
