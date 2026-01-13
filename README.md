@@ -202,11 +202,12 @@ The following reward models are pre-registered and ready to use:
 
 Simply specify the reward model name in your config file:
 ```yaml
-reward:
-  reward_model: "PickScore"
-  dtype: "bfloat16"
-  device: "cuda"
+rewards:
+  name: "aesthetic" # Alias for this reward model
+  reward_model: "PickScore" # Reward model type or a path like 'my_package.rewards.CustomReward'
   batch_size: 16
+  device: "cuda"
+  dtype: bfloat16
 ```
 
 Refer to [Rewards Guidance](guidance/rewards.md) for more information about advanced usage, such as creating a custom reward model.
