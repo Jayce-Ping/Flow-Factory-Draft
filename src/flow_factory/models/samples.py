@@ -1,9 +1,10 @@
 # src/flow_factory/models/samples.py
+from __future__ import annotations
 import os
 import re
 import json
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, Tuple, List, Union, Literal, Iterable
+from typing import Dict, Any, Optional, Tuple, List, Union, Literal, Iterable, ClassVar
 from dataclasses import dataclass, field, asdict, fields
 import hashlib
 import numpy as np
@@ -11,9 +12,18 @@ import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
-from diffusers.utils.outputs import BaseOutput
+from diffusers.utils.import_utils import is_torch_available, is_torch_version
 
-from ..utils.base import hash_pil_image, hash_tensor, hash_pil_image_list, is_tensor_list
+from ..utils.base import (
+    ImageSingle,
+    ImageBatch,
+    Video,
+    VideoBatch,
+    hash_pil_image,
+    hash_tensor,
+    hash_pil_image_list,
+    is_tensor_list
+)
 from ..utils.logger_utils import setup_logger
 
 
@@ -29,32 +39,63 @@ __all__ = [
 ]
 
 @dataclass
-class BaseSample(BaseOutput):
+class BaseSample:
     """
     Base output class for Adapter models.
     The tensors are without batch dimension.
     """
+    _id_fields : ClassVar[frozenset[str]] = frozenset({'prompt', 'prompt_ids'})  # Fields used for unique_id computation
+
     # Denoiseing trajectory
-    all_latents : torch.FloatTensor
-    timesteps : torch.FloatTensor
-    log_probs : Optional[torch.FloatTensor] = None
+    all_latents : torch.Tensor # (num_steps, Seq_len, C)
+    timesteps : torch.Tensor # (num_steps,)
+    log_probs : Optional[torch.Tensor] = None # (num_steps,)
     # Output dimensions
     height : Optional[int] = None
     width : Optional[int] = None
     # Generated media
-    image: Optional[Union[Image.Image, torch.Tensor, np.ndarray]] = None
-    video: Optional[Union[List[Image.Image], torch.Tensor, np.ndarray]] = None
+    image: Optional[ImageSingle] = None # PIL.Image | torch.Tensor | np.ndarray
+    video: Optional[Video] = None # List[Image.Image] | torch.Tensor | np.ndarray
     # Prompt information
     prompt : Optional[str] = None
-    prompt_ids : Optional[torch.LongTensor] = None
-    prompt_embeds : Optional[torch.FloatTensor] = None
+    prompt_ids : Optional[torch.Tensor] = None
+    prompt_embeds : Optional[torch.Tensor] = None
     # Negative prompt information
     negative_prompt : Optional[str] = None
-    negative_prompt_ids : Optional[torch.LongTensor] = None
-    negative_prompt_embeds : Optional[torch.FloatTensor] = None
+    negative_prompt_ids : Optional[torch.Tensor] = None
+    negative_prompt_embeds : Optional[torch.Tensor] = None
     extra_kwargs : Dict[str, Any] = field(default_factory=dict)
 
     _unique_id: Optional[int] = field(default=None, repr=False, compare=False)
+
+    def __init_subclass__(cls) -> None:
+        """Register subclasses as PyTorch pytree nodes for DDP/FSDP compatibility."""
+        super().__init_subclass__()
+        if is_torch_available():
+            import torch.utils._pytree as pytree
+            
+            def flatten(obj):
+                """Flatten dataclass to (values, context)."""
+                values = []
+                keys = []
+                for f in fields(obj):
+                    keys.append(f.name)
+                    values.append(getattr(obj, f.name))
+                return values, keys
+            
+            def unflatten(values, keys):
+                """Reconstruct dataclass from (values, context)."""
+                return cls(**dict(zip(keys, values)))
+            
+            if is_torch_available() and is_torch_version("<", "2.2"):
+                pytree._register_pytree_node(cls, flatten, unflatten)
+            else:
+                pytree.register_pytree_node(
+                    cls, 
+                    flatten, 
+                    unflatten,
+                    serialized_type_name=f"{cls.__module__}.{cls.__name__}"
+                )
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dict for memory tracking, excluding non-tensor fields."""
@@ -64,35 +105,54 @@ class BaseSample(BaseOutput):
         return result
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "BaseSample":
+    def from_dict(cls, d: Dict[str, Any]) -> BaseSample:
         """Create instance from dict, putting unknown fields into extra_kwargs."""
         field_names = {f.name for f in fields(cls)}
         known = {k: v for k, v in d.items() if k in field_names and k != 'extra_kwargs'}
+        
+        # Collect unknown fields
         extra = {k: v for k, v in d.items() if k not in field_names}
-        assert not (set(extra) & field_names), f"Key collision: {set(extra) & field_names} when creating BaseSample from dict."
-        extra.update(d.get('extra_kwargs', {}))
+        
+        # Merge with incoming extra_kwargs and check for conflicts
+        incoming_extra = d.get('extra_kwargs', {})
+        conflicting_keys = set(incoming_extra) & (field_names - {'extra_kwargs'})
+        if conflicting_keys:
+            raise ValueError(
+                f"extra_kwargs contains reserved field names: {conflicting_keys}"
+            )
+        extra.update(incoming_extra)
+        
         return cls(**known, extra_kwargs=extra)
     
     def __getattr__(self, key: str) -> Any:
         """Access attributes. Check extra_kwargs if not found."""
-        extra = object.__getattribute__(self, 'extra_kwargs')
+        try:
+            extra = object.__getattribute__(self, 'extra_kwargs')
+        except AttributeError:
+            # extra_kwargs not yet initialized (during __init__)
+            raise AttributeError(f"'{type(self).__name__}' has no attribute '{key}'")
+        
         if key in extra:
             return extra[key]
         raise AttributeError(f"'{type(self).__name__}' has no attribute '{key}'")
 
+    def __setattr__(self, key: str, value: Any) -> None:
+        """Set attributes."""
+        if key in type(self)._id_fields:
+            object.__setattr__(self, '_unique_id', None) # Reset unique_id cache
+
+        super().__setattr__(key, value)
+
     def short_rep(self) -> Dict[str, Any]:
-        """Short representation for logging."""
-        def long_tensor_to_shape(t : torch.Tensor):
-            if isinstance(t, torch.Tensor) and t.numel() > 16:
-                return t.shape
-            else:
-                return t
+        """Short representation for logging (replaces large tensors with shapes)."""
+        def tensor_to_repr(v):
+            if isinstance(v, torch.Tensor) and v.numel() > 16:
+                return f"Tensor{tuple(v.shape)}"
+            return v
 
-        d = self.to_dict()
-        d = {k: long_tensor_to_shape(v) for k,v in d.items()}
-        return d
+        return {k: tensor_to_repr(v) for k, v in self.to_dict().items()}
 
-    def to(self, device: Union[torch.device, str], depth : int = 1) -> "BaseSample":
+    def to(self, device: Union[torch.device, str], depth : int = 1) -> BaseSample:
         """Move all tensor fields to specified device."""
         assert 0 <= depth <= 1, "Only depth 0 and 1 are supported."
         device = torch.device(device)
@@ -143,7 +203,10 @@ class BaseSample(BaseOutput):
 
 @dataclass
 class ImageConditionSample(BaseSample):
-    condition_images : Optional[Union[Image.Image, List[Image.Image], torch.Tensor, np.ndarray]] = None
+    """Sample for tasks with image conditions."""
+    _id_fields : ClassVar[frozenset[str]] = BaseSample._id_fields | frozenset({'condition_images'})
+
+    condition_images : Optional[ImageBatch] = None # A list of (Image.Image | torch.Tensor | np.ndarray) or a batched tensor/array
 
     def compute_unique_id(self) -> int:
         """Hash prompt + condition_images."""
@@ -173,8 +236,10 @@ class ImageConditionSample(BaseSample):
 
 @dataclass
 class VideoConditionSample(BaseSample):
-    """Sample for video editing tasks."""
-    condition_videos: Optional[Union[List[Image.Image], List[List[Image.Image]], torch.Tensor, np.ndarray]] = None
+    """Sample for tasks with video conditions."""
+    _id_fields : ClassVar[frozenset[str]] = BaseSample._id_fields | frozenset({'condition_videos'})
+
+    condition_videos: Optional[VideoBatch] = None # A list of (List[Image.Image] | torch.Tensor | np.ndarray) or a batched tensor/array
 
     def compute_unique_id(self) -> int:
         """Hash prompt + condition_videos (sampling 4 evenly spaced frames)."""
