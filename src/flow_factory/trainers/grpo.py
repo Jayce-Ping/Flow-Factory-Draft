@@ -241,8 +241,13 @@ class GRPOTrainer(BaseTrainer):
             'train/adv_max': np.max(advantages),
             'train/adv_min': np.min(advantages),
             'train/adv_abs_mean': np.mean(np.abs(advantages)),
-            'train_samples': samples[:30], # Hard code to log first 30 samples
         })
+        # Add rewards to sample for logging
+        for sample, i in zip(samples, range(len(samples))):
+            sample.extra_kwargs['rewards'] = {
+                key: value for key, value in zip(gathered_rewards.keys(), [arr[i] for arr in gathered_rewards.values()])
+            }
+        _log_data['train_samples'] = samples[:30]
 
         self.log_data(_log_data, step=self.step)
 

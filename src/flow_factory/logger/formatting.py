@@ -138,8 +138,20 @@ def _to_video_list(
 def _build_sample_caption(sample : BaseSample, max_length: Optional[int] = None) -> str:
     """Build caption from reward and prompt."""
     parts = []
-    if 'reward' in sample.extra_kwargs:
-        parts.append(f"{sample.extra_kwargs['reward']:.2f}")
+    if 'rewards' in sample.extra_kwargs:
+        rewards = sample.extra_kwargs['rewards']
+        if isinstance(rewards, float):
+            parts.append(f"{rewards:.2f}")
+        elif isinstance(rewards, (list, tuple)) and rewards:
+            if len(rewards) == 1:
+                parts.append(f"{rewards[0]:.2f}")
+            else:
+                parts.append(", ".join(f"{r:.2f}" for r in rewards))
+        elif isinstance(rewards, dict):
+            if len(rewards) == 1:
+                parts.append(f"{next(iter(rewards.values())):.2f}")
+            else:
+                parts.append(", ".join(f"{k}: {v:.2f}" for k, v in rewards.items()))
     if sample.prompt:
         parts.append(sample.prompt[:max_length] + "..." if (max_length is not None and len(sample.prompt) > max_length) else sample.prompt)
     return " | ".join(parts)
