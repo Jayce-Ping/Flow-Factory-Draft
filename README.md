@@ -83,8 +83,6 @@ pip install -e .[deepspeed]
 
 To use [Weights & Biases](https://wandb.ai/site/) or [SwanLab](https://github.com/SwanHubX/SwanLab) to log experimental results, install extra dependencies via `pip install -e .[wandb]` or `pip install -e .[swanlab]`.
 
-> [SwanLab](https://github.com/SwanHubX/SwanLab) is recommended for users in mainland China.
-
 After installation, set corresponding arguments in the config file:
 
 ```yaml

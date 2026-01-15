@@ -16,17 +16,9 @@ class DataArguments(ArgABC):
         default=None,
         metadata={"help": "Path to the folder containing conditioning images. Defaults to 'images' subfolder in dataset_dir."},
     )
-    condition_image_size: Optional[Union[int, Tuple[int, int]]] = field(
-        default=None,
-        metadata={"help": "The size (height, width) to which conditioning images are resized"}
-    )
     video_dir: Optional[str] = field(
         default=None,
         metadata={"help": "Path to the folder containing conditioning videos. Defaults to 'videos' subfolder in dataset_dir."},
-    )
-    condition_video_size: Optional[Union[int, Tuple[int, int]]] = field(
-        default=None,
-        metadata={"help": "The size (height, width) to which conditioning video frames are resized"}
     )
     preprocessing_batch_size: int = field(
         default=8,
