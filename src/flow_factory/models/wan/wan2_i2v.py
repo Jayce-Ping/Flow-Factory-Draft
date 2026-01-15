@@ -78,7 +78,7 @@ class Wan2_I2V_Adapter(BaseAdapter):
     
     @property
     def inference_modules(self) -> List[str]:
-        """Modules taht are requires for inference and forward"""
+        """Modules that are required for inference and forward"""
         if self.pipeline.config.boundary_ratio is None or self.pipeline.config.boundary_ratio <= 0:
             return ['transformer', 'vae']
 
