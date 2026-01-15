@@ -1,7 +1,8 @@
 # Environment Configuration
 launcher: "accelerate"  # Options: accelerate
-config_file: config/deepspeed/deepspeed_zero2.yaml  # Use FSDP2 to shard the model as well. Switch to config/deepspeed/deepspeed_zero2.yaml if you have enough GPU memory.
-num_processes: 8  # Number of processes to launch (overrides config file)
+# Use `config/accelerate_configs/fsdp2.yaml` to shard the model for lower memory usage.
+config_file: config/deepspeed/deepspeed_zero2.yaml # Switch to config/deepspeed/deepspeed_zero2.yaml if you have enough GPU memory.
+num_processes: 6  # Number of processes to launch (overrides config file)
 main_process_port: 29500
 mixed_precision: "bf16"  # Options: no, fp16, bf16
 
@@ -11,13 +12,13 @@ logging_backend: "wandb"  # Options: wandb, swanlab, none
 
 # Data Configuration
 data:
-  dataset_dir: "dataset/sharegpt4o_image_mini"  # Path to dataset folder
+  dataset_dir: "dataset/multi_ref_image"  # `sharegpt4o_image_mini` contains single-ref image, while multi_ref_image contains multi-ref images (2~5 each item)
   preprocessing_batch_size: 8  # Batch size for preprocessing
   dataloader_num_workers: 16  # Number of workers for DataLoader
   enable_preprocess: true  # Enable dataset preprocessing
   force_reprocess: true  # Force reprocessing of the dataset
   cache_dir: "~/jcy/.cache/flow_factory/datasets" # Cache directory for preprocessed datasets
-  max_dataset_size: 1000  # Limit the maximum number of samples in the dataset
+  max_dataset_size: 128  # Limit the maximum number of samples in the dataset
 
 # Model Configuration
 model:
@@ -42,9 +43,9 @@ train:
   enable_gradient_checkpointing: false  # Enable gradient checkpointing to save memory with extra compute
 
   # Image settings
-  resolution: 512  # Can be int or [height, width]
+  resolution: 384  # Can be int or [height, width]
   auto_resize: true # Enable auto-resize to fit the condition images' aspect ratio during inference
-  condition_image_size: [512, 512]  # Max condition image resolution, int or [height, width]
+  condition_image_size: [384, 384]  # Max condition image resolution, int or [height, width]
   
   # Batch and sampling
   per_device_batch_size: 1  # Qwen-Image-Edit-Plus accepts varying length of multi-image as condition, so the batch_size will always fallback to 1.
@@ -60,7 +61,7 @@ train:
   
   # KL div
   kl_type: 'v-based' # Options: 'x-based', 'v-based'
-  kl_beta: 0.04 # KL divergence beta
+  kl_beta: 0 # KL divergence beta
   ref_param_device: 'same_as_model' # Options: cpu, same_as_model
 
   # Denoising process
@@ -99,11 +100,11 @@ eval:
 
 # Reward Model Configuration
 rewards:
-  - name: "pick_score"
-    reward_model: "PickScore"
-    batch_size: 16
-    device: "cuda"
-    dtype: bfloat16
+  name: "pick_score"
+  reward_model: "PickScore"
+  batch_size: 16
+  device: "cuda"
+  dtype: bfloat16
 
 # Optional Evaluation Reward Models
 # eval_rewards:

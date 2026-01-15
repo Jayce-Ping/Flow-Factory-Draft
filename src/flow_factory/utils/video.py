@@ -98,7 +98,15 @@ def is_video_frame_list(frames: List[Any]) -> bool:
         >>> is_video_frame_list([])
         False
     """
-    return isinstance(frames, list) and len(frames) > 0 and all(isinstance(f, Image.Image) for f in frames)
+    if not isinstance(frames, list):
+        return False
+    if len(frames) == 0:
+        return False
+    
+    if not isinstance(frames[0]. Image.Image):
+        return False
+
+    return all(f.size == frames[0].size for f in frames[1:])
 
 
 def is_video_frame_batch_list(frame_batches: VideoFramesBatch) -> bool:
@@ -345,7 +353,7 @@ def tensor_to_video_frames(tensor: torch.Tensor) -> VideoFramesBatch:
                 - [-1, 1]: Normalized tensor format (e.g., from diffusion models)
     
     Returns:
-        - If input is 4D (T, C, H, W): Single-ton list of VideoFrames (List of T PIL Images)
+        - If input is 4D (T, C, H, W): Single-ton list of VideoFrames [[frame1, frame2, frame3, ...]]
         - If input is 5D (B, T, C, H, W): VideoFramesBatch (List of B videos)
     
     Raises:
@@ -354,7 +362,7 @@ def tensor_to_video_frames(tensor: torch.Tensor) -> VideoFramesBatch:
     Example:
         >>> # Single video
         >>> video_tensor = torch.rand(16, 3, 256, 256)
-        >>> frames = tensor_to_video_frames(video_tensor)
+        >>> frames = tensor_to_video_frames(video_tensor)[0] # Take the first and the only element
         >>> len(frames)
         16
         
@@ -378,7 +386,7 @@ def tensor_to_video_frames(tensor: torch.Tensor) -> VideoFramesBatch:
     return result
 
 
-def numpy_to_video_frames(array: np.ndarray) -> Union[VideoFrames, VideoFramesBatch]:
+def numpy_to_video_frames(array: np.ndarray) -> VideoFramesBatch:
     """
     Convert a NumPy array to video frames (PIL Images).
     
@@ -390,7 +398,7 @@ def numpy_to_video_frames(array: np.ndarray) -> Union[VideoFrames, VideoFramesBa
                 - [-1, 1]: Normalized float format (e.g., from diffusion models)
     
     Returns:
-        - If input is 4D: Single-ton list of VideoFrames (List of T PIL Images)
+        - If input is 4D: Single-ton list of VideoFrames [[frame1, frame2, frame3, ...]]
         - If input is 5D: VideoFramesBatch (List of B videos)
     
     Raises:
@@ -404,7 +412,7 @@ def numpy_to_video_frames(array: np.ndarray) -> Union[VideoFrames, VideoFramesBa
     Example:
         >>> # Single video (THWC)
         >>> video_array = np.random.rand(16, 256, 256, 3).astype(np.float32)
-        >>> frames = numpy_to_video_frames(video_array)
+        >>> frames = numpy_to_video_frames(video_array)[0] # Take the first and the only element
         >>> len(frames)
         16
         
@@ -475,7 +483,7 @@ def tensor_list_to_video_frames(tensor_list: List[torch.Tensor]) -> VideoFramesB
         return tensor_to_video_frames(torch.stack(squeezed, dim=0))
     
     # Variable shape -> process individually (returns VideoFrames for each 4D tensor)
-    return [tensor_to_video_frames(t) for t in squeezed]
+    return [tensor_to_video_frames(t)[0] for t in squeezed]
 
 
 def numpy_list_to_video_frames(numpy_list: List[np.ndarray]) -> VideoFramesBatch:
@@ -523,7 +531,7 @@ def numpy_list_to_video_frames(numpy_list: List[np.ndarray]) -> VideoFramesBatch
         return numpy_to_video_frames(np.stack(squeezed, axis=0))
     
     # Variable shape -> process individually
-    return [numpy_to_video_frames(arr) for arr in squeezed]
+    return [numpy_to_video_frames(arr)[0] for arr in squeezed]
 
 
 # ----------------------------------- Frames -> Tensor/NumPy --------------------------------------
@@ -535,7 +543,7 @@ def video_frames_to_tensor(
     Convert PIL frames to torch Tensor(s).
     
     Args:
-        frames: Single video (VideoFrames) or batch (VideoFramesBatch).
+        frames: Single video (List[PIL.Image]) or batch (List[List[PIL.Image]]).
             All frames within a video should have the same dimensions.
     
     Returns:
@@ -572,7 +580,7 @@ def video_frames_to_tensor(
     if not frames:
         raise ValueError("Empty frame list")
     
-    # Single video: List[PIL]
+    # Single video: List[PIL] -> tensor(T, C, H, W)
     if isinstance(frames[0], Image.Image):
         arrays = [np.array(img.convert('RGB')).astype(np.float32) / 255.0 for img in frames]
         tensors = [torch.from_numpy(arr).permute(2, 0, 1) for arr in arrays]
@@ -597,7 +605,7 @@ def video_frames_to_numpy(
     Convert PIL frames to NumPy array(s).
     
     Args:
-        frames: Single video (VideoFrames) or batch (VideoFramesBatch).
+        frames: Single video (List[PIL.Image]) or batch (List[List[PIL.Image]]).
             All frames within a video should have the same dimensions.
     
     Returns:
@@ -710,6 +718,7 @@ def standardize_video_batch(
         elif output_type == 'np':
             # (B, T, C, H, W) -> (B, T, H, W, C)
             return normalize_video_to_uint8(videos).cpu().numpy().transpose(0, 1, 3, 4, 2)
+        # Maybe convert the tensor to [0,1] ?
         return videos  # pt
 
     # Stacked NumPy (B, T, H, W, C)

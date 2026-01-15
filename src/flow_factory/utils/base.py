@@ -146,6 +146,22 @@ def hash_pil_image_list(images: List[Image.Image], size: int = 32) -> str:
         hasher.update(hash_pil_image(img, size=size).encode())
     return hasher.hexdigest()
 
+def hash_tensor_list(tensors: List[torch.Tensor], max_elements_per_tensor: int = 1024) -> str:
+    """
+    Generate a combined hash for a list of torch Tensors.
+    Args:
+        tensors: List of input tensors
+        max_elements_per_tensor: Max elements to hash per tensor for efficiency
+    Returns:
+        str: Combined MD5 hash hex string
+    """
+    hasher = hashlib.md5()
+    for tensor in tensors:
+        # Compute individual hash using your existing hash_tensor function
+        t_hash = hash_tensor(tensor, max_elements=max_elements_per_tensor)
+        # Update the master hasher with this tensor's hash
+        hasher.update(t_hash.encode())
+    return hasher.hexdigest()
 
 # ------------------------------------ Grid Latents --------------------------------------------
 

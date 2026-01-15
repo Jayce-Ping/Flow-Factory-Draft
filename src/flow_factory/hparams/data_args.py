@@ -44,16 +44,6 @@ class DataArguments(ArgABC):
     def __post_init__(self):
         self.dataset = self.dataset_dir
 
-        if isinstance(self.condition_image_size, int):
-            self.condition_image_size = (self.condition_image_size, self.condition_image_size)
-        elif isinstance(self.condition_image_size, Iterable):
-            self.condition_image_size = tuple(self.condition_image_size)
-
-        if isinstance(self.condition_video_size, int):
-            self.condition_video_size = (self.condition_video_size, self.condition_video_size)
-        elif isinstance(self.condition_video_size, Iterable):
-            self.condition_video_size = tuple(self.condition_video_size)
-
     def to_dict(self) -> dict[str, Any]:
         return super().to_dict()
 

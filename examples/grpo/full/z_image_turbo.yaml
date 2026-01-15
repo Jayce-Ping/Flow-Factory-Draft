@@ -56,7 +56,7 @@ train:
   
   # KL div
   kl_type: 'x-based' # Options: 'x-based', 'normal-based'
-  kl_beta: 0.04 # KL divergence beta - 0 to disable and save memory
+  kl_beta: 0 # KL divergence beta - 0 to disable and save memory. Set 0 at first to see if Z-Image-Turbo can learn the reward.
   ref_param_device: 'same_as_model' # Options: cpu, same_as_model
 
   # Denoising process

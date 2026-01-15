@@ -302,7 +302,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
             condition_image_sizes.append((condition_width, condition_height))
             vae_image_sizes.append((vae_width, vae_height))
             condition_image = self.pipeline.image_processor.resize(img, condition_height, condition_width)
-            condition_image = self._standardize_image_input(condition_image, output_type='pt')[0] # Convert to tensor
+            condition_image = self._standardize_image_input(condition_image, output_type='pt')[0] # Convert to tensor (C, H, W)
             condition_images.append(condition_image)
             vae_images.append(self.pipeline.image_processor.preprocess(img, vae_height, vae_width).unsqueeze(2))
 
@@ -318,11 +318,11 @@ class QwenImageEditPlusAdapter(BaseAdapter):
             generator,
         )
         return {
-            "condition_images": condition_images,
-            "condition_image_sizes": condition_image_sizes,
-            "vae_images": vae_images,
-            "vae_image_sizes": vae_image_sizes,
-            'image_latents': image_latents,
+            "condition_images": condition_images, # List[tensor(C, H, W)]
+            "condition_image_sizes": condition_image_sizes, # List[Tuple[int, int]]
+            "vae_images": vae_images, # List[tensor(1, C, 1, H, W)]
+            "vae_image_sizes": vae_image_sizes, # List[Tuple[int, int]]
+            'image_latents': image_latents, # tensor(B, seq_len_total, C) C = 64 here
         }
 
     def prepare_image_latents(

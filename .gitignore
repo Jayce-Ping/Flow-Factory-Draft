@@ -19,6 +19,9 @@ __pycache__/
 *.ipynb
 .vscode
 
+# gitattributes in dataset
+dataset/**/.gitattributes
+
 # Image data
 dataset/**/image/
 dataset/**/image*

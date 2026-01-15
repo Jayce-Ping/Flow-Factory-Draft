@@ -332,7 +332,7 @@ def tensor_to_pil_image(tensor: torch.Tensor) -> List[Image.Image]:
     Example:
         >>> # Single image
         >>> img_tensor = torch.rand(3, 256, 256)
-        >>> pil_image = tensor_to_pil_image(img_tensor)
+        >>> pil_image = tensor_to_pil_image(img_tensor)[0] # Take the first and the only element
         >>> isinstance(pil_image, Image.Image)
         True
         
@@ -382,7 +382,7 @@ def numpy_to_pil_image(array: np.ndarray) -> List[Image.Image]:
     Example:
         >>> # Single image (HWC)
         >>> img_array = np.random.rand(256, 256, 3).astype(np.float32)
-        >>> pil_image = numpy_to_pil_image(img_array)
+        >>> pil_image = numpy_to_pil_image(img_array)[0] # Take the first and the only element
         >>> isinstance(pil_image, Image.Image)
         True
         
@@ -453,7 +453,7 @@ def tensor_list_to_pil_image(tensor_list: List[torch.Tensor]) -> List[Image.Imag
         return tensor_to_pil_image(torch.stack(squeezed, dim=0))
     
     # Variable shape -> process individually (returns single Image for each 3D tensor)
-    return [tensor_to_pil_image(t) for t in squeezed]
+    return [tensor_to_pil_image(t)[0] for t in squeezed]
 
 
 def numpy_list_to_pil_image(numpy_list: List[np.ndarray]) -> List[Image.Image]:
@@ -501,7 +501,7 @@ def numpy_list_to_pil_image(numpy_list: List[np.ndarray]) -> List[Image.Image]:
         return numpy_to_pil_image(np.stack(squeezed, axis=0))
     
     # Variable shape -> process individually
-    return [numpy_to_pil_image(arr) for arr in squeezed]
+    return [numpy_to_pil_image(arr)[0] for arr in squeezed]
 
 
 # ----------------------------------- PIL -> Tensor/NumPy/Base64 --------------------------------------

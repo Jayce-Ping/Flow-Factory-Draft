@@ -56,6 +56,11 @@ train:
   adv_clip_range: 5.0  # Advantage clipping range
   max_grad_norm: 1.0  # Max gradient norm for clipping
   
+  # KL div
+  kl_type: 'x-based' # Options: 'x-based', 'normal-based'
+  kl_beta: 0 # KL divergence beta - 0 to disable and save memory. Set 0 at first to see if Z-Image-Turbo can learn the reward.
+  ref_param_device: 'same_as_model' # Options: cpu, same_as_model
+
   # Denoising process
   num_inference_steps: 6  # Number of timesteps
   guidance_scale: 0  # Guidance scale for sampling
