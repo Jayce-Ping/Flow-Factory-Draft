@@ -213,12 +213,10 @@ def gather_samples(
     
     sample_cls = samples[0].__class__ # Assume all samples are of the same class
     device = torch.device(device)
+    field_names = sorted(field_names) # Sort to make sure async
     d = {field_name: [] for field_name in field_names}
 
     for field_name in field_names:
-        # Skip any None
-        if any(getattr(sample, field_name) is None for sample in samples):
-            continue
         # Collect field values from all samples
         field_values = [getattr(sample, field_name) for sample in samples]
         if is_tensor_list(field_values):

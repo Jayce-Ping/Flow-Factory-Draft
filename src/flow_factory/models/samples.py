@@ -69,8 +69,8 @@ class BaseSample:
     _id_fields : ClassVar[frozenset[str]] = frozenset({'prompt', 'prompt_ids'})  # Fields used for unique_id computation
 
     # Denoiseing trajectory
-    all_latents : torch.Tensor # (num_steps, Seq_len, C)
-    timesteps : torch.Tensor # (num_steps,)
+    all_latents : Optional[torch.Tensor] = None # (num_steps, Seq_len, C)
+    timesteps : Optional[torch.Tensor] = None # (num_steps,)
     log_probs : Optional[torch.Tensor] = None # (num_steps,)
     # Output dimensions
     height : Optional[int] = None

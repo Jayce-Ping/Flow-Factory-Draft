@@ -17,7 +17,7 @@
 Unified Reward Processor for handling multiple reward models.
 """
 from __future__ import annotations
-from typing import Dict, Any, Optional, List, Tuple, Set, Union
+from typing import Dict, Any, Optional, List, Tuple, Set, Union, Literal
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -101,6 +101,7 @@ class RewardProcessor:
         samples: List[BaseSample],
         store_to_samples: bool = True,
         epoch: int = 0,
+        split: Literal['pointwise', 'groupwise', 'all'] = 'all',
     ) -> Dict[str, torch.Tensor]:
         """
         Compute rewards using bound reward models.
@@ -109,18 +110,22 @@ class RewardProcessor:
             samples: Local samples on this rank
             store_to_samples: Whether to store rewards in sample.extra_kwargs
             epoch: Current epoch for progress bar display
-        
+            split: Which reward models to use
+                - 'pointwise': Only pointwise models (no cross-rank communication)
+                - 'groupwise': Only groupwise models (requires gather/scatter)
+                - 'all': Both pointwise and groupwise models
+
         Returns:
             Dict mapping reward_name -> rewards tensor aligned with local samples
         """
         results: Dict[str, torch.Tensor] = {}
-        
+
         # Pointwise: local computation
-        if self._pointwise_models:
+        if split in ('pointwise', 'all') and self._pointwise_models:
             results.update(self._compute_pointwise_rewards(samples, epoch))
         
         # Groupwise: gather -> compute -> scatter
-        if self._groupwise_models:
+        if split in ('groupwise', 'all') and self._groupwise_models:
             results.update(self._compute_groupwise_rewards(samples, epoch))
         
         # Store to samples
@@ -185,7 +190,7 @@ class RewardProcessor:
         device = self.accelerator.device
         
         # 1. Collect required fields from all groupwise models
-        required_fields: Set[str] = {'unique_id'}
+        required_fields: Set[str] = set()
         for model in self._groupwise_models.values():
             required_fields.update(model.required_fields)
         

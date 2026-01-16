@@ -374,6 +374,7 @@ class GRPOTrainer(BaseTrainer):
                 samples=all_samples,
                 store_to_samples=False,
                 epoch=self.epoch,
+                split='pointwise',  # Only `pointwise` reward can be compute when evaluation, since there is no `group` here.
             )
             # Gather and log rewards
             rewards = {key: torch.as_tensor(value).to(self.accelerator.device) for key, value in rewards.items()}

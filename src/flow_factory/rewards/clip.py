@@ -29,7 +29,7 @@ class CLIPRewardModel(PointwiseRewardModel):
     """
     CLIP-based reward model that computes image-text similarity.
     """
-    
+    required_fields = ("prompt", "image", "video")
     DEFAULT_MODEL = "openai/clip-vit-large-patch14"
     
     def __init__(self, config: RewardArguments, accelerator: Accelerator):

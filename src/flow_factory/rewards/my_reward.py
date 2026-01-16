@@ -72,7 +72,7 @@ class MyPointwiseRewardModel(PointwiseRewardModel):
         )
 
 
-class MyGroupwiseRewardModel(PointwiseRewardModel):
+class MyGroupwiseRewardModel(GroupwiseRewardModel):
     def __init__(self, config: RewardArguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
         # `super().__init__` gives you:
