@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/models/sd3.py
+# src/flow_factory/models/stable_diffusion/sd3_5.py
 from __future__ import annotations
 
 import os
