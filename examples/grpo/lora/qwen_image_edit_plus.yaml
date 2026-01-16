@@ -2,7 +2,7 @@
 launcher: "accelerate"  # Options: accelerate
 # Use `config/accelerate_configs/fsdp2.yaml` to shard the model for lower memory usage.
 config_file: config/deepspeed/deepspeed_zero2.yaml # Switch to config/deepspeed/deepspeed_zero2.yaml if you have enough GPU memory.
-num_processes: 6  # Number of processes to launch (overrides config file)
+num_processes: 8  # Number of processes to launch (overrides config file)
 main_process_port: 29500
 mixed_precision: "bf16"  # Options: no, fp16, bf16
 
@@ -12,7 +12,8 @@ logging_backend: "wandb"  # Options: wandb, swanlab, none
 
 # Data Configuration
 data:
-  dataset_dir: "dataset/multi_ref_image"  # `sharegpt4o_image_mini` contains single-ref image, while multi_ref_image contains multi-ref images (2~5 each item)
+  # `sharegpt4o_image_mini` contains single-ref image, while multi_ref_image contains multi-ref images (2~3 each item)
+  dataset_dir: "dataset/sharegpt4o_image_mini"
   preprocessing_batch_size: 8  # Batch size for preprocessing
   dataloader_num_workers: 16  # Number of workers for DataLoader
   enable_preprocess: true  # Enable dataset preprocessing
@@ -40,7 +41,7 @@ log:
 train:
   # Training settings
   trainer_type: 'grpo'
-  enable_gradient_checkpointing: false  # Enable gradient checkpointing to save memory with extra compute
+  enable_gradient_checkpointing: true  # Enable gradient checkpointing to save memory with extra compute
 
   # Image settings
   resolution: 384  # Can be int or [height, width]
