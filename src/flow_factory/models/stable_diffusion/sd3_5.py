@@ -28,7 +28,7 @@ import logging
 from accelerate import Accelerator
 
 from ...hparams import *
-from ..adapter import BaseAdapter, BaseSample
+from ..abc import BaseAdapter, BaseSample
 from ...scheduler import FlowMatchEulerDiscreteSDEScheduler, FlowMatchEulerDiscreteSDESchedulerOutput, set_scheduler_timesteps
 from ...utils.base import filter_kwargs
 
@@ -73,7 +73,7 @@ class SD3_5Adapter(BaseAdapter):
         prompt: Union[str, List[str]],
         negative_prompt: Optional[Union[str, List[str]]] = None,
         do_classifier_free_guidance: bool = False,
-        max_sequence_length: Optional[int] = 256,
+        max_sequence_length: Optional[int] = 512,
         device: Optional[torch.device] = None,
     ):
         device = device if device is not None else self.device
@@ -177,7 +177,7 @@ class SD3_5Adapter(BaseAdapter):
     ) -> List[SD3_5Sample]:
         # 1. Setup
         device = self.device
-        dtype = self.transformer.dtype
+        dtype = self.pipeline.transformer.dtype
 
         # 2. Encode prompt
         if prompt_embeds is None or pooled_prompt_embeds is None:
@@ -245,12 +245,13 @@ class SD3_5Adapter(BaseAdapter):
         extra_call_back_res = defaultdict(list)
 
         for i, t in enumerate(timesteps):
-            # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-            timestep = t.expand(latent_model_input.shape[0])
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
 
             # expand the latents if we are doing classifier free guidance
             latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+            # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+            timestep = t.expand(latent_model_input.shape[0])
+
             noise_pred = self.transformer(
                 hidden_states=latent_model_input,
                 timestep=timestep,
