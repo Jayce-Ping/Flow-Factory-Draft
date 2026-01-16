@@ -776,8 +776,10 @@ class BaseAdapter(ABC):
             modules = component_modules.get(comp)
             
             # Handle special cases
-            if modules == 'all':
+            if modules == 'default':
                 modules = self.default_target_modules
+            elif modules == 'all':
+                modules = 'all' # Keep as 'all' for PEFT
             elif not modules:
                 logger.warning(f"No target modules for {comp}, skipping LoRA")
                 continue
