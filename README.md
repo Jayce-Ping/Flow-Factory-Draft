@@ -188,13 +188,23 @@ For models like [FLUX.2-dev]((https://huggingface.co/black-forest-labs/FLUX.2-de
 
 Flow-Factory provides a flexible reward model system that supports both built-in and custom reward models for reinforcement learning.
 
+## Reward Model Types
+
+Flow-Factory supports two types of reward models:
+
+- **Pointwise Reward**: Computes independent scores for each sample (e.g., aesthetic quality, text-image alignment).
+- **Pairwise Reward**: Computes rewards based on the pairwise comparison within the group. This is a special case of the following **Groupwise Reward**.
+- **Groupwise Reward**: Computes rewards that requires the all samples in a group (e.g., ranking-based score or pairwise comparison).
+
 ## Built-in Reward Models
 
 The following reward models are pre-registered and ready to use:
 
-| Name | Description | Reference |
-|------|-------------|-----------|
-| `PickScore` | CLIP-based aesthetic scoring model | [PickScore](https://huggingface.co/yuvalkirstain/PickScore_v1) |
+| Name | Type | Description | Reference |
+|------|------|-------------|-----------|
+| `PickScore` | Pointwise | CLIP-based aesthetic scoring model | [PickScore](https://huggingface.co/yuvalkirstain/PickScore_v1) |
+| `PickScoreRank` | Groupwise | Ranking-based reward using PickScore | [PickScore](https://huggingface.co/yuvalkirstain/PickScore_v1) |
+| `CLIP` | Pointwise | Image-text cosine similarity | [CLIP](https://huggingface.co/openai/clip-vit-large-patch14) |
 
 ## Using Built-in Reward Models
 

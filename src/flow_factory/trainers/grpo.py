@@ -29,37 +29,17 @@ from torch.nn.utils.rnn import pad_sequence
 import tqdm as tqdm_
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
-from .trainer import BaseTrainer
+from .abc import BaseTrainer
 from ..rewards import BaseRewardModel
-from ..models.adapter import BaseSample
+from ..models.abc import BaseSample
 from ..utils.base import filter_kwargs, create_generator
 from ..utils.logger_utils import setup_logger
+from ..rewards import (
+    BaseRewardModel,
+    RewardProcessor,
+)
 
 logger = setup_logger(__name__)
-
-
-# ============================ Helper Functions ============================
-def compute_group_zero_std_ratio(rewards: np.ndarray, group_indices: np.ndarray, eps: float = 1e-6) -> float:
-    """
-    Compute the fraction of groups with near-zero standard deviation.
-    
-    Args:
-        rewards: Array of reward values
-        group_indices: Array mapping each sample to its group
-        eps: Threshold for considering std as zero
-        
-    Returns:
-        Fraction of groups with std < eps
-    """
-    unique_groups = np.unique(group_indices)
-    zero_std_count = 0
-    
-    for group_id in unique_groups:
-        group_rewards = rewards[group_indices == group_id]
-        if np.std(group_rewards) < eps:
-            zero_std_count += 1
-    
-    return zero_std_count / len(unique_groups)
 
 
 # ============================ GRPO Trainer ============================
@@ -71,7 +51,6 @@ class GRPOTrainer(BaseTrainer):
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-
     
     @property
     def enable_kl_penalty(self) -> bool:
@@ -110,7 +89,7 @@ class GRPOTrainer(BaseTrainer):
 
             self.epoch += 1
 
-    def sample(self, **kwargs) -> List[BaseSample]:
+    def sample(self) -> List[BaseSample]:
         """Generate rollouts for GRPO."""
         self.adapter.rollout()
         samples = []
@@ -135,65 +114,6 @@ class GRPOTrainer(BaseTrainer):
             samples.extend(sample_batch)
 
         return samples
-
-    def compute_rewards(self, samples: List[BaseSample], reward_models : Dict[str, BaseRewardModel], store_to_samples : bool = True) -> Dict[str, torch.Tensor]:
-        """Compute rewards using the reward model."""
-        name_to_rewards = {}
-
-        for reward_name, reward_model in reward_models.items():
-            rewards = []
-            
-            filtered_key_fields = filter_kwargs(reward_model.__call__, **samples[0])
-            stackable_keys = None
-            
-            for i in tqdm(
-                range(0, len(samples), reward_model.config.batch_size),
-                desc=f'Epoch {self.epoch} Computing Rewards: {reward_name}',
-                disable=not self.accelerator.is_local_main_process,
-            ):
-                batch_samples = [
-                    {key: getattr(sample, key) for key in filtered_key_fields}
-                    for sample in samples[i:i + reward_model.config.batch_size]
-                ]
-
-                # Detect stackable keys on first batch
-                if stackable_keys is None:
-                    stackable_keys = {
-                        key for key in filtered_key_fields
-                        if isinstance(batch_samples[0][key], torch.Tensor)
-                        and all(s[key].shape == batch_samples[0][key].shape for s in batch_samples)
-                    }
-                
-                batch_samples = {
-                    key: torch.stack([sample[key] for sample in batch_samples], dim=0) if key in stackable_keys
-                    else [sample[key] for sample in batch_samples]
-                    for key in filtered_key_fields
-                }
-                batch_samples = {
-                    k: v for k, v in batch_samples.items()
-                    if all(x is not None for x in v)
-                }
-                
-                reward_output = reward_model(**batch_samples)
-                reward_tensor = torch.as_tensor(
-                    reward_output.rewards if hasattr(reward_output, 'rewards') else reward_output,
-                    device='cpu',
-                    dtype=torch.float32
-                )
-                
-                rewards.append(reward_tensor)
-
-            rewards = torch.cat(rewards, dim=0)
-            name_to_rewards[reward_name] = rewards
-
-        # Store `rewards` as a `Dict[str, Tensor(cpu)]` in extra_kwargs
-        if store_to_samples:
-            for i, sample in enumerate(samples):
-                sample.extra_kwargs['rewards'] = {
-                    key: value[i] for key, value in name_to_rewards.items()
-                }
-
-        return name_to_rewards
 
     def compute_advantages(self, samples: List[BaseSample], rewards: Dict[str, torch.Tensor], store_to_samples: bool = True) -> torch.Tensor:
         """
@@ -257,7 +177,7 @@ class GRPOTrainer(BaseTrainer):
             for key, value in gathered_rewards.items()
         })
         # Log aggregated reward zero std ratio
-        zero_std_ratio = compute_group_zero_std_ratio(aggregated_rewards, group_indices)
+        zero_std_ratio = self.reward_processor.compute_group_zero_std_ratio(aggregated_rewards, group_indices)
         _log_data['train/reward_zero_std_ratio'] = zero_std_ratio
         # Log other stats
         _log_data.update({
@@ -287,7 +207,7 @@ class GRPOTrainer(BaseTrainer):
         """Main training loop: compute loss and update policy."""
         self.adapter.train()
         # Compute rewards and advantages for samples
-        rewards = self.compute_rewards(samples, self.reward_models, store_to_samples=True)
+        rewards = self.reward_processor.compute_rewards(samples, store_to_samples=True, epoch=self.epoch)
         advantages = self.compute_advantages(samples, rewards, store_to_samples=True)
         
         # Create batches for optimization
@@ -450,7 +370,12 @@ class GRPOTrainer(BaseTrainer):
                 all_samples.extend(samples)
             
             # Compute rewards with eval reward models
-            rewards = self.compute_rewards(all_samples, self.eval_reward_models)
+            rewards = self.eval_reward_processor.compute_rewards(
+                samples=all_samples,
+                store_to_samples=False,
+                epoch=self.epoch,
+                split='pointwise',  # Only `pointwise` reward can be compute when evaluation, since there is no `group` here.
+            )
             # Gather and log rewards
             rewards = {key: torch.as_tensor(value).to(self.accelerator.device) for key, value in rewards.items()}
             gathered_rewards = {
@@ -491,7 +416,7 @@ class GRPOGuardTrainer(GRPOTrainer):
         """Main training loop: compute loss and update policy."""
         self.adapter.train()
         # Compute rewards and advantages for samples
-        rewards = self.compute_rewards(samples, self.reward_models)
+        rewards = self.reward_processor.compute_rewards(samples, store_to_samples=True, epoch=self.epoch)
         advantages = self.compute_advantages(samples, rewards)
 
         # Add advantages to samples
@@ -685,7 +610,7 @@ class GDPOTrainer(GRPOTrainer):
         })
         # Log per-reward zero std ratio
         _log_data.update({
-            f'train/reward_{key}_zero_std_ratio': compute_group_zero_std_ratio(arr, group_indices)
+            f'train/reward_{key}_zero_std_ratio': self.reward_processor.compute_group_zero_std_ratio(arr, group_indices)
             for key, arr in gathered_rewards.items()
         })
         # Log combined stats

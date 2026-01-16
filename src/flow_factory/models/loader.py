@@ -17,10 +17,9 @@
 Model Adapter Loader
 Factory function using registry pattern for extensibility.
 """
-import logging
 from accelerate import Accelerator
 
-from .adapter import BaseAdapter
+from .abc import BaseAdapter
 from .registry import get_model_adapter_class, list_registered_models
 from ..hparams import Arguments
 from ..utils.logger_utils import setup_logger

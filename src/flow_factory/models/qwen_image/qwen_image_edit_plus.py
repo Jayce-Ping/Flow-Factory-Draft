@@ -30,7 +30,7 @@ from accelerate import Accelerator
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import QwenImageEditPlusPipeline
 from diffusers.utils.torch_utils import randn_tensor
 
-from ..adapter import BaseAdapter
+from ..abc import BaseAdapter
 from ..samples import I2ISample
 from ...hparams import *
 from ...scheduler import FlowMatchEulerDiscreteSDEScheduler, SDESchedulerOutput, set_scheduler_timesteps

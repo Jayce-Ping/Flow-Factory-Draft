@@ -27,7 +27,7 @@ from diffusers.pipelines.flux2.pipeline_flux2 import Flux2Pipeline, format_input
 from diffusers.pipelines.flux2.system_messages import SYSTEM_MESSAGE, SYSTEM_MESSAGE_UPSAMPLING_T2I, SYSTEM_MESSAGE_UPSAMPLING_I2I
 import logging
 
-from ..adapter import BaseAdapter
+from ..abc import BaseAdapter
 from ..samples import I2ISample
 from ...hparams import *
 from ...scheduler import FlowMatchEulerDiscreteSDEScheduler, SDESchedulerOutput, set_scheduler_timesteps

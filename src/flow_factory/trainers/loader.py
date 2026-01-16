@@ -23,7 +23,7 @@ from accelerate.utils import set_seed, ProjectConfiguration
 import logging
 
 from ..models.loader import load_model
-from .trainer import BaseTrainer
+from .abc import BaseTrainer
 from .registry import get_trainer_class, list_registered_trainers
 from ..hparams import Arguments
 from ..utils.logger_utils import setup_logger

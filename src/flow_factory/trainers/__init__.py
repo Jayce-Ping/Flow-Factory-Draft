@@ -16,7 +16,7 @@
 """
 Trainers module for various RL algorithms.
 """
-from .trainer import BaseTrainer
+from .abc import BaseTrainer
 from .registry import get_trainer_class, list_registered_trainers
 from .loader import load_trainer
 

@@ -28,7 +28,7 @@ from PIL import Image
 from accelerate import Accelerator
 from peft import PeftModel
 
-from ..adapter import BaseAdapter
+from ..abc import BaseAdapter
 from ..samples import V2VSample
 from ...hparams import *
 from ...scheduler import UniPCMultistepSDESchedulerOutput, UniPCMultistepSDEScheduler
@@ -96,7 +96,7 @@ class Wan2_V2V_Adapter(BaseAdapter):
     
     @property
     def inference_modules(self) -> List[str]:
-        """Modules taht are requires for inference and forward"""
+        """Modules that are required for inference and forward"""
         if self.pipeline.config.boundary_ratio is None or self.pipeline.config.boundary_ratio <= 0:
             return ['transformer', 'vae']
 

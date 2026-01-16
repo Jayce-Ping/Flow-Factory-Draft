@@ -27,8 +27,8 @@ logger = setup_logger(__name__)
 # Reward Model Registry Storage
 _REWARD_MODEL_REGISTRY: Dict[str, str] = {
     'pickscore': 'flow_factory.rewards.pick_score.PickScoreRewardModel',
+    'pickscore_rank': 'flow_factory.rewards.pick_score.PickScoreRankRewardModel',
     'clip': 'flow_factory.rewards.clip.CLIPRewardModel',
-    'consistent_editing': 'flow_factory.rewards.consistent_editing.ConsistentEditingRewardModel'
 }
 _REWARD_MODEL_REGISTRY = {k.lower(): v for k, v in _REWARD_MODEL_REGISTRY.items()}
 

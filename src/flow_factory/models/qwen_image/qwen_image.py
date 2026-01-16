@@ -27,7 +27,7 @@ from torch.nn.utils.rnn import pad_sequence
 from diffusers.pipelines.qwenimage.pipeline_qwenimage import QwenImagePipeline
 from accelerate import Accelerator
 
-from ..adapter import BaseAdapter
+from ..abc import BaseAdapter
 from ..samples import T2ISample
 from ...hparams import *
 from ...scheduler import SDESchedulerOutput, set_scheduler_timesteps, FlowMatchEulerDiscreteSDEScheduler

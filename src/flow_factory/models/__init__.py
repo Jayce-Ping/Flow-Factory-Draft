@@ -20,8 +20,17 @@ Provides model adapters for different diffusion/flow-matching architectures
 with a registry-based loading system for easy extensibility.
 """
 
-from .adapter import BaseAdapter
-from .samples import BaseSample, ImageConditionSample, VideoConditionSample
+from .abc import BaseAdapter
+from .samples import (
+    BaseSample,
+    ImageConditionSample,
+    VideoConditionSample,
+    T2ISample,
+    T2VSample,
+    I2ISample,
+    I2VSample,
+    V2VSample,
+)
 from .registry import (
     get_model_adapter_class,
     list_registered_models,
@@ -36,7 +45,12 @@ __all__ = [
     "BaseSample",
     "ImageConditionSample",
     "VideoConditionSample",
-    
+    "T2ISample",
+    "T2VSample",
+    "I2ISample",
+    "I2VSample",
+    "V2VSample",
+
     # Registry functions
     "get_model_adapter_class",
     "list_registered_models",

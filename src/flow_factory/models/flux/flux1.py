@@ -27,7 +27,7 @@ import torch
 from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
 
 from ..samples import T2ISample
-from ..adapter import BaseAdapter
+from ..abc import BaseAdapter
 from ...hparams import *
 from ...scheduler import FlowMatchEulerDiscreteSDEScheduler, SDESchedulerOutput, set_scheduler_timesteps
 from ...utils.base import filter_kwargs

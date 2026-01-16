@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/models/adapter.py
+# src/flow_factory/models/abc.py
 import os
 import re
 import json
@@ -347,7 +347,7 @@ class BaseAdapter(ABC):
     
     @property
     def inference_modules(self) -> List[str]:
-        """Modules taht are requires for inference and forward"""
+        """Modules that are required for inference and forward"""
         return ['transformer', 'vae']
 
     @property

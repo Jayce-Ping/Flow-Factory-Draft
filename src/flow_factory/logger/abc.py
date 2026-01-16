@@ -17,7 +17,6 @@ from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, List
 
 from ..hparams import *
-from ..models.adapter import BaseSample
 from .formatting import LogFormatter, LogImage, LogVideo, LogTable
 
 

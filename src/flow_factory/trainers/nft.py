@@ -29,8 +29,8 @@ from torch.nn.utils.rnn import pad_sequence
 import tqdm as tqdm_
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
-from .trainer import BaseTrainer
-from ..models.adapter import BaseSample
+from .abc import BaseTrainer
+from ..models.abc import BaseSample
 from ..rewards import BaseRewardModel
 from ..utils.base import filter_kwargs, create_generator
 from ..utils.logger_utils import setup_logger

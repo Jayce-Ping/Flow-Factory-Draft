@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/trainers/trainer.py
+# src/flow_factory/trainers/abc.py
 import os
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, Tuple, List, Union
@@ -28,9 +28,9 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed, ProjectConfiguration
 
 from ..hparams import *
-from ..models.adapter import BaseAdapter
+from ..models.abc import BaseAdapter
 from ..data_utils.loader import get_dataloader
-from ..rewards import load_reward_model, BaseRewardModel, MultiRewardLoader
+from ..rewards import load_reward_model, BaseRewardModel, MultiRewardLoader, RewardProcessor
 from ..logger import load_logger
 from ..utils.logger_utils import setup_logger
 
@@ -94,14 +94,28 @@ class BaseTrainer(ABC):
         # We need to disable ZeRO-3 init context when loading the model to avoid issues
         # NOTE: This bug persists even with this context manager. DONOT USE ZeRO-3.
         # A possible solution: use DeepSpeed GatherParamter manually in the reward_model's `forward`.
+
+        # Initialize all reward model instances
         self.reward_loader = MultiRewardLoader(
             reward_args=self.config.reward_args,
             accelerator=self.accelerator,
             eval_reward_args=self.config.eval_reward_args,
         ).load()
-
+        # Get training & eval reward models
         self.reward_models = self.reward_loader.get_training_reward_models()
         self.eval_reward_models = self.reward_loader.get_eval_reward_models()
+        # Initialize reward processor
+        self.reward_processor = RewardProcessor(
+            accelerator=self.accelerator,
+            reward_models=self.reward_models,
+            tokenizer=self.adapter.tokenizer, # For prompt encoding/decoding
+        )
+        self.eval_reward_processor = RewardProcessor(
+            accelerator=self.accelerator,
+            reward_models=self.eval_reward_models,
+            tokenizer=self.adapter.tokenizer, # For prompt encoding/decoding
+        )
+            
         return self.reward_models, self.eval_reward_models
 
     def _init_dataloader(self) -> Tuple[DataLoader, Union[None, DataLoader]]:
