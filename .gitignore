@@ -19,9 +19,6 @@ __pycache__/
 *.ipynb
 .vscode
 
-# Ignore diffusers sub repo, to add `dev` version features in advance
-diffusers/*
-
 # gitattributes in dataset
 dataset/**/.gitattributes
 

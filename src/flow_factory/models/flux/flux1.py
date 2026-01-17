@@ -16,7 +16,8 @@
 from __future__ import annotations
 
 import os
-from typing import Union, List, Dict, Any, Optional, Tuple
+from typing import Union, List, Dict, Any, Optional, Tuple, Literal
+import numpy as np
 from dataclasses import dataclass
 from PIL import Image
 import logging
@@ -118,7 +119,7 @@ class Flux1Adapter(BaseAdapter):
         """Not needed for FLUX text-to-image models."""
         pass
 
-    def decode_latents(self, latents: torch.Tensor, height: int, width: int, **kwargs) -> List[Image.Image]:
+    def decode_latents(self, latents: torch.Tensor, height: int, width: int, output_type: Literal['pil', 'pt', 'np'] = 'pil') -> Union[List[Image.Image], torch.Tensor, np.ndarray]:
         """Decode latents to images using VAE."""
         
         latents = self.pipeline._unpack_latents(latents, height, width, self.pipeline.vae_scale_factor)
@@ -126,7 +127,7 @@ class Flux1Adapter(BaseAdapter):
         latents = latents.to(dtype=self.pipeline.vae.dtype)
         
         images = self.pipeline.vae.decode(latents, return_dict=False)[0]
-        images = self.pipeline.image_processor.postprocess(images, output_type="pil")
+        images = self.pipeline.image_processor.postprocess(images, output_type=output_type)
         
         return images
 

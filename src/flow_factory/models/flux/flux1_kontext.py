@@ -328,7 +328,7 @@ class Flux1KontextAdapter(BaseAdapter):
         """Flux.2 does not support video encoding."""
         pass
 
-    def decode_latents(self, latents: torch.Tensor, height, width, output_type="pil") -> Image.Image | List[Image.Image]:
+    def decode_latents(self, latents: torch.Tensor, height, width, output_type="pil") -> List[Union[Image.Image, torch.Tensor, np.ndarray]]:
         latents = latents.to(dtype=self.pipeline.vae.dtype)
         latents = self.pipeline._unpack_latents(latents, height, width, self.pipeline.vae_scale_factor)
         latents = (latents / self.pipeline.vae.config.scaling_factor) + self.pipeline.vae.config.shift_factor
