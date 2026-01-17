@@ -268,7 +268,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         generator : Optional[torch.Generator] = None,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
-    ):
+    ) -> Dict[str, Union[torch.Tensor, List[torch.Tensor], List[Tuple[int, int]]]]: 
         """
         Preprocess condition images and prepare image latents.
         The input requires `multiple condition images` used to generate one image.
@@ -343,7 +343,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         generator : Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
-    ) -> Dict[str, Union[torch.Tensor, List[torch.Tensor], List[Tuple[int, int]]]]:
+    ) -> Dict[str, List[Union[torch.Tensor, List[torch.Tensor], List[Tuple[int, int]]]]]:
         """
         Encode input images into latent representations using the VAE encoder.
         Args:
@@ -387,13 +387,13 @@ class QwenImageEditPlusAdapter(BaseAdapter):
 
     def prepare_image_latents(
         self,
-        images,
-        batch_size,
-        num_channels_latents,
-        dtype,
-        device,
-        generator
-    ):
+        images : QwenImageEditPlusImageInput,
+        batch_size : int,
+        num_channels_latents : int,
+        dtype : torch.dtype,
+        device : torch.device,
+        generator : Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+    ) -> torch.Tensor:
         images = self._standardize_image_input(images, 'pt')
 
         all_image_latents = []
@@ -425,17 +425,17 @@ class QwenImageEditPlusAdapter(BaseAdapter):
 
     def prepare_latents(
         self,
-        batch_size,
-        num_channels_latents,
-        height,
-        width,
-        dtype,
-        device,
-        generator,
-        latents=None,
-        images=None,
-        image_latents=None,
-    ):
+        batch_size : int,
+        num_channels_latents : int,
+        height : int,
+        width : int,
+        dtype : torch.dtype,
+        device : torch.device,
+        generator : Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents : Optional[torch.Tensor] = None,
+        images : Optional[QwenImageEditPlusImageInput] = None,
+        image_latents : Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # VAE applies 8x compression on images but we must also account for packing which requires
         # latent height and width to be divisible by 2.
         height = 2 * (int(height) // (self.pipeline.vae_scale_factor * 2))
@@ -548,7 +548,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         padding_value : Union[int, float],
         device: Optional[torch.device] = None,
         max_len: Optional[int] = None,
-    ):
+    ) -> Optional[torch.Tensor]:
         if data is None: 
             return None
         
