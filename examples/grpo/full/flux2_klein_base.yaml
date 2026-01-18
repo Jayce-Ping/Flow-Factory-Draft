@@ -89,7 +89,7 @@ eval:
   per_device_batch_size: 1  # Eval batch size
   seed: 42  # Eval seed (defaults to training seed)
   guidance_scale: 4.0  # Guidance scale for sampling
-  num_inference_steps: 50  # Number of eval timesteps
+  num_inference_steps: 28  # Number of eval timesteps
   eval_freq: 20  # Eval frequency in epochs (0 to disable)
 
 # Reward Model Configuration
