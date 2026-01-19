@@ -171,6 +171,8 @@ class UniPCMultistepSDEScheduler(UniPCMultistepScheduler, SDESchedulerMixin):
         """
         # Find the index that corresponds to the given sigma, no tolerance
         indices = (self.sigmas == sigma).nonzero()
+        if len(indices) == 0:
+            raise ValueError(f"Sigma {sigma} not found in scheduler sigmas {self.sigmas}")
         pos = 1 if len(indices) > 1 else 0
         index = indices[pos].item()
         if index in self.current_sde_steps:
@@ -265,15 +267,16 @@ class UniPCMultistepSDEScheduler(UniPCMultistepScheduler, SDESchedulerMixin):
             next_latents = next_latents.float()
 
         # 2. Prepare variables
+        dynamics_type = dynamics_type or self.dynamics_type
         if noise_level is None:
-            noise_level = 0.0 if self.is_eval else self.get_noise_level_for_sigma(sigma)
+            # Auto-infer the noise_level
+            noise_level = 0.0 if (self.is_eval or dynamics_type == 'ODE') else self.get_noise_level_for_sigma(sigma)
 
         noise_level = to_broadcast_tensor(noise_level, latents) # To (B, 1, 1)
         sigma = to_broadcast_tensor(sigma, latents)
         sigma_prev = to_broadcast_tensor(sigma_prev, latents)
         dt = sigma_prev - sigma # dt is negative, (batch_size, 1, 1)
 
-        dynamics_type = dynamics_type or self.dynamics_type
         # 3. Compute next sample
         if dynamics_type == 'ODE':
             # ODE Sampling
@@ -284,8 +287,9 @@ class UniPCMultistepSDEScheduler(UniPCMultistepScheduler, SDESchedulerMixin):
                 next_latents = next_latents_mean
 
             if compute_log_prob:
-                log_prob = -((next_latents.detach() - next_latents_mean) ** 2)
-                log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+                # ODE doesn't support log_prob computation, provide zero
+                logger.warning(f"`log_prob` is meaningless when `dynamics_type` is set `ODE`, setting to zero.")
+                log_prob = torch.zeros((next_latents.shape[0]), dtype=next_latents.dtype, device=next_latents.device)
 
         elif dynamics_type == "Flow-SDE":
             # FlowGRPO sde

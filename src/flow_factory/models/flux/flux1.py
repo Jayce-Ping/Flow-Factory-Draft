@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import os
-from typing import Union, List, Dict, Any, Optional, Tuple, Literal
+from typing import Union, List, Dict, Any, Optional, Tuple, Literal, ClassVar
 import numpy as np
 from dataclasses import dataclass
 from PIL import Image
@@ -40,8 +40,11 @@ logger = setup_logger(__name__)
 @dataclass
 class Flux1Sample(T2ISample):
     """Output class for Flux Adapter models."""
+    # Class variables
+    _shared_fields: ClassVar[frozenset[str]] = frozenset({'img_ids'})
+    # Object variables
     pooled_prompt_embeds : Optional[torch.FloatTensor] = None
-    image_ids : Optional[torch.Tensor] = None
+    img_ids : Optional[torch.Tensor] = None
 
 
 class Flux1Adapter(BaseAdapter):
@@ -169,10 +172,6 @@ class Flux1Adapter(BaseAdapter):
 
         batch_size = len(prompt_embeds)
         dtype = prompt_embeds.dtype
-
-        text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(
-            device=device, dtype=dtype
-        )
         
         # 3. Prepare latents
         num_channels_latents = self.pipeline.transformer.config.in_channels // 4
@@ -194,7 +193,6 @@ class Flux1Adapter(BaseAdapter):
             device=device,
         )
 
-        guidance = torch.full([1], guidance_scale, device=device, dtype=torch.float32)
         
         # 5. Denoising loop
         all_latents = [latents]
@@ -213,8 +211,7 @@ class Flux1Adapter(BaseAdapter):
                 latents=latents,
                 prompt_embeds=prompt_embeds,
                 pooled_prompt_embeds=pooled_prompt_embeds,
-                guidance=guidance,
-                txt_ids=text_ids,
+                guidance_scale=guidance_scale,
                 img_ids=latent_image_ids,
                 compute_log_prob=compute_log_prob and current_noise_level > 0,
                 joint_attention_kwargs=joint_attention_kwargs,
@@ -229,7 +226,7 @@ class Flux1Adapter(BaseAdapter):
                 all_log_probs.append(output.log_prob)
 
             if extra_call_back_kwargs:
-                capturable = {'noise_levels': current_noise_level}
+                capturable = {'noise_level': current_noise_level}
                 for key in extra_call_back_kwargs:
                     if key in capturable and capturable[key] is not None:
                         # First check in capturable dict
@@ -258,22 +255,18 @@ class Flux1Adapter(BaseAdapter):
                 all_latents=torch.stack([lat[b] for lat in all_latents], dim=0),
                 timesteps=timesteps,
                 log_probs=torch.stack([lp[b] for lp in all_log_probs], dim=0) if compute_log_prob else None,
-
                 # Prompt
                 prompt=prompt[b] if isinstance(prompt, list) else prompt,
                 prompt_ids=prompt_ids[b] if prompt_ids is not None else None,
                 prompt_embeds=prompt_embeds[b],
                 pooled_prompt_embeds=pooled_prompt_embeds[b],
-
                 # Image & metadata
                 height=height,
                 width=width,
                 image=images[b],
-                image_ids=latent_image_ids,
-
+                img_ids=latent_image_ids,
                 # Extra kwargs
                 extra_kwargs={
-                    'guidance_scale': guidance_scale,
                     **{k: v[b] for k, v in extra_call_back_res.items()}
                 },
             )
@@ -293,33 +286,39 @@ class Flux1Adapter(BaseAdapter):
         latents: torch.Tensor,
         prompt_embeds: torch.Tensor,
         pooled_prompt_embeds: torch.Tensor,
-        guidance: torch.Tensor,
-        txt_ids: torch.Tensor,
         img_ids: torch.Tensor,
+        guidance_scale: Union[float, List[float]] = 3.5,
+        noise_level: Optional[float] = None,
         next_latents: Optional[torch.Tensor] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
         return_kwargs : List[str] = ['noise_pred', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
-        noise_level: float = 0.0,
-        **kwargs,
     ) -> SDESchedulerOutput:
         """Forward pass with given timestep, timestep+1 and latents."""
+        # 1. Prepare variables
+        device = latents.device
+        dtype = latents.dtype
         batch_size = latents.shape[0]
         sigma = t / 1000
         sigma_prev = t_next / 1000
-        
+
+        guidance = torch.as_tensor(guidance_scale, device=device, dtype=dtype)
+        guidance = guidance.expand(batch_size) # Assume List[float] has len `batch_size`
+
+        # 2. transformer forward
         noise_pred = self.transformer(
             hidden_states=latents,
             timestep=sigma.expand(batch_size),
-            guidance=guidance.expand(batch_size),
+            guidance=guidance,
             pooled_projections=pooled_prompt_embeds,
             encoder_hidden_states=prompt_embeds,
-            txt_ids=txt_ids,
+            txt_ids=torch.zeros(prompt_embeds.shape[1], 3).to(device=device, dtype=dtype),
             img_ids=img_ids,
             joint_attention_kwargs=joint_attention_kwargs,
             return_dict=False,
         )[0]
 
+        # 3. Scheduler step
         output = self.scheduler.step(
             noise_pred=noise_pred,
             sigma=sigma,
@@ -330,6 +329,5 @@ class Flux1Adapter(BaseAdapter):
             return_dict=True,
             return_kwargs=return_kwargs,
             noise_level=noise_level,
-            **filter_kwargs(self.scheduler.step, **kwargs),
         )
         return output

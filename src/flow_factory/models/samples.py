@@ -68,6 +68,11 @@ class BaseSample:
     """
     _id_fields : ClassVar[frozenset[str]] = frozenset({'prompt', 'prompt_ids'})  # Fields used for unique_id computation
 
+    # Fields that are shared across the batch
+    _shared_fields: ClassVar[frozenset[str]] = frozenset({
+        'height', 'width'
+    })
+
     # Denoiseing trajectory
     all_latents : Optional[torch.Tensor] = None # (num_steps, Seq_len, C)
     timesteps : Optional[torch.Tensor] = None # (num_steps,)
@@ -133,6 +138,15 @@ class BaseSample:
         if self.video is not None:
             # -> (1, T, C, H, W) -> (T, C, H, W)
             self.video = standardize_video_batch(self.video, 'pt')[0]
+    
+    @classmethod
+    def shared_fields(cls) -> frozenset[str]:
+        """Merge all _shared_fields from inheritance chain."""
+        fields = set()
+        for base in cls.__mro__[:-1]:  # Exclude object
+            if hasattr(base, '_shared_fields'):
+                fields.update(base._shared_fields)
+        return frozenset(fields)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dict for memory tracking, excluding non-tensor fields."""
@@ -251,29 +265,90 @@ class BaseSample:
         """Reset cached unique_id (call after modifying relevant fields)."""
         self._unique_id = None
 
-    @staticmethod
-    def stack(samples: List[BaseSample]) -> Dict[str, Union[torch.Tensor, List[Any]]]:
-        """Stack a list of BaseSample instances into batched tensors/lists."""
+    @classmethod
+    def _stack_values(cls, key: str, values: List[Any]) -> Union[torch.Tensor, Dict, List, Any]:
+        """
+        Recursively stack values based on field configuration.
+        
+        Processing order:
+            1. Shared fields → return first element only
+            2. Stackable fields → attempt stacking (tensors/dicts)
+            3. Other fields → return as list
+        
+        Args:
+            key: Field name to determine stacking behavior
+            values: List of values to stack
+        
+        Returns:
+            - Any: If shared, returns first element
+            - torch.Tensor: If stackable and all values are matching tensors
+            - Dict: If stackable and all values are dicts (recursively stacked)
+            - List: Otherwise
+        """
+        if not values:
+            return values
+        
+        first = values[0]
+        
+        # 1. Shared fields - take first element only
+        if key in cls.shared_fields():
+            return first
+
+        # 2. Tensor fields, try to stack
+        # Stack tensors with matching shapes
+        if isinstance(first, torch.Tensor):
+            # Assume all tensors
+            if all(v.shape == first.shape for v in values):
+                return torch.stack(values)
+            return values
+
+        # 3. Recursively stack dictionaries
+        if isinstance(first, dict):
+            if all(isinstance(v, dict) for v in values):
+                return {
+                    k: cls._stack_values(k, [v[k] for v in values])
+                    for k in first.keys()
+                }
+            return values
+        
+        # 3. Default - return as list
+        return values
+
+    @classmethod
+    def stack(cls, samples: List[BaseSample]) -> Dict[str, Union[torch.Tensor, Dict, List, Any]]:
+        """
+        Stack BaseSample instances into batched structures.
+        
+        Field behavior controlled by class methods:
+            - shared_fields(): Take first element only (shared across batch)
+            - stackable_fields(): Stack tensors/dicts with matching structure
+            - Other: Collect into lists
+        
+        Args:
+            samples: List of BaseSample instances
+        
+        Returns:
+            Dictionary with processed values per field
+        
+        Raises:
+            ValueError: If samples list is empty
+        """
         if not samples:
             raise ValueError("No samples to stack.")
         
-        stacked = {}
-        sample_dicts = [s.to_dict() for s in samples] # Convert to dicts to handle extra_kwargs
-
-        for key in sample_dicts[0].keys():
-            values = [d[key] for d in sample_dicts]
-            if all(isinstance(v, torch.Tensor) for v in values):
-                stacked[key] = torch.stack(values)
-            else:
-                stacked[key] = values
+        sample_dicts = [s.to_dict() for s in samples]
         
-        return stacked
+        return {
+            key: cls._stack_values(key, [d[key] for d in sample_dicts])
+            for key in sample_dicts[0].keys()
+        }
 
 
 @dataclass
 class ImageConditionSample(BaseSample):
     """Sample for tasks with image conditions."""
     _id_fields : ClassVar[frozenset[str]] = BaseSample._id_fields | frozenset({'condition_images'})
+    _stackable_fields: ClassVar[frozenset[str]] = frozenset({'condition_images'})
 
     condition_images : Optional[ImageBatch] = None # A list of (Image.Image | torch.Tensor | np.ndarray) or a batched tensor/array
     # `condition_images` will be convert to a list of tensors of shape (C, H, W) for canonicalization.
@@ -312,6 +387,7 @@ class ImageConditionSample(BaseSample):
 class VideoConditionSample(BaseSample):
     """Sample for tasks with video conditions."""
     _id_fields : ClassVar[frozenset[str]] = BaseSample._id_fields | frozenset({'condition_videos'})
+    _stackable_fields: ClassVar[frozenset[str]] = frozenset({'condition_videos'})
 
     condition_videos: Optional[VideoBatch] = None # A list of (List[Image.Image] | torch.Tensor | np.ndarray) or a batched tensor/array
     # `condition_videos` will be convert to a list of tensors of shape (T, C, H, W) for canonicalization.

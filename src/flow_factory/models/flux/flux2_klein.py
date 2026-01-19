@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import os
-from typing import Union, List, Dict, Any, Optional, Tuple, Literal
+from typing import Union, List, Dict, Any, Optional, Tuple, Literal, ClassVar
 from dataclasses import dataclass
 from PIL import Image
 from collections import defaultdict
@@ -50,6 +50,9 @@ logger = setup_logger(__name__)
 @dataclass
 class Flux2KleinSample(I2ISample):
     """Output class for Flux2Adapter models."""
+    # Class vars
+    _shared_fields: ClassVar[frozenset[str]] = frozenset({})
+    # Obj vars
     latent_ids : Optional[torch.Tensor] = None
     text_ids : Optional[torch.Tensor] = None
     negative_text_ids : Optional[torch.Tensor] = None
@@ -367,7 +370,7 @@ class Flux2KleinAdapter(BaseAdapter):
         image_latent_ids: Optional[torch.Tensor] = None,
         # Other arguments
         condition_image_size : Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
-        attention_kwargs: Optional[Dict[str, Any]] = None,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         max_sequence_length: int = 512,
         hidden_states_layers: Tuple[int, ...] = (9, 18, 27),
         compute_log_prob: bool = False,
@@ -474,7 +477,7 @@ class Flux2KleinAdapter(BaseAdapter):
                 negative_text_ids=negative_text_ids,
                 do_classifier_free_guidance=do_classifier_free_guidance,
                 guidance_scale=guidance_scale,
-                attention_kwargs=attention_kwargs,
+                joint_attention_kwargs=joint_attention_kwargs,
                 compute_log_prob=compute_log_prob and current_noise_level > 0,
                 return_kwargs=return_kwargs,
                 noise_level=current_noise_level,
@@ -488,7 +491,7 @@ class Flux2KleinAdapter(BaseAdapter):
                 all_log_probs.append(output.log_prob)
 
             if extra_call_back_kwargs:
-                capturable = {'noise_levels': current_noise_level}
+                capturable = {'noise_level': current_noise_level}
                 for key in extra_call_back_kwargs:
                     if key in capturable and capturable[key] is not None:
                         # First check in capturable dict
@@ -518,32 +521,27 @@ class Flux2KleinAdapter(BaseAdapter):
                 all_latents=torch.stack([lat[b] for lat in all_latents], dim=0),
                 timesteps=timesteps,
                 log_probs=torch.stack([lp[b] for lp in all_log_probs], dim=0) if compute_log_prob else None,
-
                 # Generated image & metadata
                 height=height,
                 width=width,
                 image=decoded_images[b],
                 latent_ids=latent_ids[b],
-
                 # Prompt & condition info
                 prompt=prompt[b] if isinstance(prompt, list) else prompt,
                 prompt_ids=prompt_ids[b],
                 prompt_embeds=prompt_embeds[b],
                 text_ids=text_ids[b],
-
                 # Negative prompt info
                 negative_prompt=negative_prompt[b] if negative_prompt is not None else None,
                 negative_prompt_ids=negative_prompt_ids[b] if negative_prompt_ids is not None else None,
                 negative_prompt_embeds=negative_prompt_embeds[b] if negative_prompt_embeds is not None else None,
                 negative_text_ids=negative_text_ids[b] if negative_text_ids is not None else None,
-
                 # Condition images & latents
                 condition_images=condition_images if condition_images is not None else None,
                 image_latents=image_latents[b] if image_latents is not None else None,
                 image_latent_ids=image_latent_ids[b] if image_latent_ids is not None else None,
+                # Extra kwargs
                 extra_kwargs={
-                    'do_classifier_free_guidance': do_classifier_free_guidance,
-                    'guidance_scale': guidance_scale,
                     **{k: v[b] for k, v in extra_call_back_res.items()}
                 },
             )
@@ -565,8 +563,9 @@ class Flux2KleinAdapter(BaseAdapter):
         width: int = 1024,
         num_inference_steps: int = 50,
         guidance_scale: float = 4.0,
+        do_classifier_free_guidance: bool = False,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        attention_kwargs: Optional[Dict[str, Any]] = None,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         max_sequence_length: int = 512,
         hidden_states_layers: Tuple[int, ...] = (9, 18, 27),
         # Encoded prompt
@@ -616,6 +615,7 @@ class Flux2KleinAdapter(BaseAdapter):
                 width=width,
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
+                do_classifier_free_guidance=do_classifier_free_guidance,
                 generator=generator,
                 # Prompt encoding args
                 prompt_ids=prompt_ids,
@@ -630,7 +630,7 @@ class Flux2KleinAdapter(BaseAdapter):
                 image_latents=image_latents,
                 image_latent_ids=image_latent_ids,
                 # Other args
-                attention_kwargs=attention_kwargs,
+                joint_attention_kwargs=joint_attention_kwargs,
                 max_sequence_length=max_sequence_length,
                 hidden_states_layers=hidden_states_layers,
                 compute_log_prob=compute_log_prob,
@@ -657,6 +657,7 @@ class Flux2KleinAdapter(BaseAdapter):
                 width=width,
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
+                do_classifier_free_guidance=do_classifier_free_guidance,
                 generator=generator[idx] if isinstance(generator, list) else generator,
                 # Prompt encoding args
                 prompt_ids=prompt_ids[idx:idx+1] if prompt_ids is not None else None,
@@ -671,7 +672,7 @@ class Flux2KleinAdapter(BaseAdapter):
                 image_latents=image_latents[idx] if is_ragged_image_latents else image_latents,
                 image_latent_ids=image_latent_ids[idx] if is_ragged_image_latents else image_latent_ids,
                 # Other args
-                attention_kwargs=attention_kwargs,
+                joint_attention_kwargs=joint_attention_kwargs,
                 max_sequence_length=max_sequence_length,
                 hidden_states_layers=hidden_states_layers,
                 compute_log_prob=compute_log_prob,
@@ -700,12 +701,11 @@ class Flux2KleinAdapter(BaseAdapter):
         guidance_scale: float = 4.0,
         # Other
         next_latents: Optional[torch.Tensor] = None,
-        attention_kwargs: Optional[Dict[str, Any]] = None,
+        noise_level: Optional[float] = None,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
         return_kwargs: List[str] = ['noise_pred', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
-        noise_level: float = 0.0,
         use_cache_context: bool = True,
-        **kwargs,
     ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
         """
         Core forward pass handling both T2I and I2I.
@@ -724,7 +724,7 @@ class Flux2KleinAdapter(BaseAdapter):
             do_classifier_free_guidance: Whether to apply CFG.
             guidance_scale: CFG scale factor.
             next_latents: Optional target latents for log-prob computation.
-            attention_kwargs: Optional kwargs for attention layers.
+            joint_attention_kwargs: Optional kwargs for attention layers.
             compute_log_prob: Whether to compute log probabilities.
             return_kwargs: List of outputs to return.
             noise_level: Current noise level for SDE sampling.
@@ -755,7 +755,7 @@ class Flux2KleinAdapter(BaseAdapter):
                     encoder_hidden_states=prompt_embeds,
                     txt_ids=text_ids,
                     img_ids=latent_image_ids,
-                    joint_attention_kwargs=attention_kwargs,
+                    joint_attention_kwargs=joint_attention_kwargs,
                     return_dict=False,
                 )[0]
         else:
@@ -766,7 +766,7 @@ class Flux2KleinAdapter(BaseAdapter):
                 encoder_hidden_states=prompt_embeds,
                 txt_ids=text_ids,
                 img_ids=latent_image_ids,
-                joint_attention_kwargs=attention_kwargs,
+                joint_attention_kwargs=joint_attention_kwargs,
                 return_dict=False,
             )[0]
 
@@ -784,7 +784,7 @@ class Flux2KleinAdapter(BaseAdapter):
                         encoder_hidden_states=negative_prompt_embeds,
                         txt_ids=negative_text_ids,
                         img_ids=latent_image_ids,
-                        joint_attention_kwargs=attention_kwargs,
+                        joint_attention_kwargs=joint_attention_kwargs,
                         return_dict=False,
                     )[0]
             else:
@@ -795,7 +795,7 @@ class Flux2KleinAdapter(BaseAdapter):
                     encoder_hidden_states=negative_prompt_embeds,
                     txt_ids=negative_text_ids,
                     img_ids=latent_image_ids,
-                    joint_attention_kwargs=attention_kwargs,
+                    joint_attention_kwargs=joint_attention_kwargs,
                     return_dict=False,
                 )[0]
 
@@ -813,7 +813,6 @@ class Flux2KleinAdapter(BaseAdapter):
             return_dict=True,
             return_kwargs=return_kwargs,
             noise_level=noise_level,
-            **filter_kwargs(self.scheduler.step, **kwargs),
         )
         return output
 
@@ -835,12 +834,11 @@ class Flux2KleinAdapter(BaseAdapter):
         guidance_scale: float = 4.0,
         # Other
         next_latents: Optional[torch.Tensor] = None,
-        attention_kwargs: Optional[Dict[str, Any]] = None,
+        noise_level: Optional[float] = None,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
         return_kwargs: List[str] = ['noise_pred', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
-        noise_level: float = 0.0,
         use_cache_context: bool = False,
-        **kwargs,
     ) -> SDESchedulerOutput:
         """
         General forward method handling both T2I and I2I, including ragged I2I batches.
@@ -864,12 +862,11 @@ class Flux2KleinAdapter(BaseAdapter):
                 do_classifier_free_guidance=do_classifier_free_guidance,
                 guidance_scale=guidance_scale,
                 next_latents=next_latents,
-                attention_kwargs=attention_kwargs,
+                joint_attention_kwargs=joint_attention_kwargs,
                 compute_log_prob=compute_log_prob,
                 return_kwargs=return_kwargs,
                 noise_level=noise_level,
                 use_cache_context=use_cache_context,
-                **kwargs,
             )
 
         # Ragged I2I: process one by one
@@ -912,12 +909,11 @@ class Flux2KleinAdapter(BaseAdapter):
                 do_classifier_free_guidance=do_classifier_free_guidance,
                 guidance_scale=guidance_scale,
                 next_latents=single_next_latents,
-                attention_kwargs=attention_kwargs,
+                joint_attention_kwargs=joint_attention_kwargs,
                 compute_log_prob=compute_log_prob,
                 return_kwargs=return_kwargs,
                 noise_level=noise_level,
                 use_cache_context=use_cache_context,
-                **kwargs,
             )
             outputs.append(out)
 
