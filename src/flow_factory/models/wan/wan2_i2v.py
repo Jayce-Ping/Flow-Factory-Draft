@@ -32,31 +32,20 @@ from ..abc import BaseAdapter
 from ..samples import I2VSample
 from ...hparams import *
 from ...scheduler import UniPCMultistepSDESchedulerOutput, UniPCMultistepSDEScheduler
-from ...utils.base import (
-    filter_kwargs,
-    pil_image_to_tensor,
-    tensor_to_pil_image,
-    tensor_list_to_pil_image,
-    numpy_to_pil_image,
-    numpy_list_to_pil_image,
-    is_valid_image,
-    is_valid_image_batch,
-    is_valid_image_list,
-    is_valid_image_batch_list,
+from ...utils.base import filter_kwargs
+from ...utils.image import (
+    ImageSingle,
+    ImageBatch,
+    MultiImageBatch,
+    is_image,
+    is_image_batch,
+    is_multi_image_batch,
     standardize_image_batch,
 )
+
 from ...utils.logger_utils import setup_logger
 
 logger = setup_logger(__name__)
-
-WanPipelineImageInput = Union[
-    Image.Image,
-    np.ndarray,
-    torch.Tensor,
-    List[Image.Image],
-    List[np.ndarray],
-    List[torch.Tensor],
-]
 
 @dataclass
 class WanI2VSample(I2VSample):
@@ -150,6 +139,7 @@ class Wan2_I2V_Adapter(BaseAdapter):
         self.set_prepared('transformer_2', module)
 
     # ======================== Encoding & Decoding ========================
+    # ------------------------ Prompt Encoding ------------------------
     def _get_t5_prompt_embeds(
         self,
         prompt: Union[str, List[str]],
@@ -267,37 +257,38 @@ class Wan2_I2V_Adapter(BaseAdapter):
 
         return results
     
+    # ------------------------ Image Encoding ------------------------
     def encode_image(
         self,
-        images: WanPipelineImageInput, # A batch of images or a single image
+        images: Union[ImageSingle, ImageBatch], # A batch of images or a single image
         device: Optional[torch.device] = None,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Union[None, Dict[str, torch.Tensor]]:
         images = self._standardize_image_input(
             images,
             output_type='pil',
         )
         
-        if not is_valid_image_batch(images):
-            raise ValueError(f"Invalid image input type: {type(images)}. Must be a PIL Image, numpy array, torch tensor, or a list of these types.")
+        if not is_image_batch(images):
+            raise ValueError(
+                f"Invalid image input type: {type(images)}. "
+                f"Must be a PIL Image, numpy array, torch tensor, or a list of these types."
+            )
 
-        res = {}
-        batch_size = len(images)
         # only Wan 2.1 I2V transformer accepts image_embeds, else None directly
         if self.pipeline.transformer is not None and self.pipeline.transformer.config.image_dim is not None:
+            batch_size = len(images)
             device = device or self.image_encoder.device
             images = self.pipeline.image_processor(images=images, return_tensors="pt").to(device)
             image_embeds = self.pipeline.image_encoder(**images, output_hidden_states=True)
-            res = {
+            return {
                 'image_embeds': image_embeds.hidden_states[-2],
             }
         else:
-            res = None
-
-        return res
+            return None
     
     def _standardize_image_input(
         self,
-        images: WanPipelineImageInput,
+        images: Union[ImageSingle, ImageBatch],
         output_type: Literal['pil', 'pt', 'np'] = 'pil',
     ):
         """
@@ -305,7 +296,7 @@ class Wan2_I2V_Adapter(BaseAdapter):
         """
         if isinstance(images, Image.Image):
             images = [images]
-        elif is_valid_image_batch_list(images):
+        elif is_multi_image_batch(images):
             # A list of list of images
             if any(len(batch) > 1 for batch in images) and not self._has_warned_multi_image:
                 self._has_warned_multi_image = True
@@ -321,9 +312,32 @@ class Wan2_I2V_Adapter(BaseAdapter):
         )
         return images
 
+    # ------------------------ Video Encoding ------------------------
+    def encode_video(self, videos: Union[np.ndarray, torch.Tensor, List[Image.Image]]):
+        pass
+
+    # ------------------------ Latent Decoding ------------------------
+    def decode_latents(self, latents: torch.Tensor, output_type: Literal['pt', 'pil', 'np'] = 'pil') -> torch.Tensor:
+        """Decode the latents using the VAE decoder."""
+        latents = latents.float()
+        latents_mean = (
+            torch.tensor(self.pipeline.vae.config.latents_mean)
+            .view(1, self.pipeline.vae.config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents_std = 1.0 / torch.tensor(self.pipeline.vae.config.latents_std).view(1, self.pipeline.vae.config.z_dim, 1, 1, 1).to(
+            latents.device, latents.dtype
+        )
+        latents = latents / latents_std + latents_mean
+        video = self.pipeline.vae.decode(latents, return_dict=False)[0]
+
+        video = self.pipeline.video_processor.postprocess_video(video, output_type=output_type)
+        return video
+    
+    # ======================== Latent Preparation ========================
     def prepare_latents(
         self,
-        image: WanPipelineImageInput,
+        image: torch.Tensor,
         batch_size: int,
         num_channels_latents: int = 16,
         height: int = 480,
@@ -336,7 +350,7 @@ class Wan2_I2V_Adapter(BaseAdapter):
         last_image: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-            Modified from `diffusers`  WanImageToVideoPipeline with batch_size bug fixed
+            Modified from `diffusers: WanImageToVideoPipeline` with batch_size bug fixed
         """
         num_latent_frames = (num_frames - 1) // self.pipeline.vae_scale_factor_temporal + 1
         latent_height = height // self.pipeline.vae_scale_factor_spatial
@@ -409,35 +423,11 @@ class Wan2_I2V_Adapter(BaseAdapter):
 
         return latents, torch.concat([mask_lat_size, latent_condition], dim=1)
 
-    def encode_video(
-        self,
-        video: Union[np.ndarray, torch.Tensor, List[Image.Image]],
-        **kwargs
-    ):
-        pass
-
-    def decode_latents(self, latents: torch.Tensor, output_type: Literal['pt', 'pil', 'np'] = 'pil', **kwargs) -> torch.Tensor:
-        """Decode the latents using the VAE decoder."""
-        latents = latents.float()
-        latents_mean = (
-            torch.tensor(self.pipeline.vae.config.latents_mean)
-            .view(1, self.pipeline.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents_std = 1.0 / torch.tensor(self.pipeline.vae.config.latents_std).view(1, self.pipeline.vae.config.z_dim, 1, 1, 1).to(
-            latents.device, latents.dtype
-        )
-        latents = latents / latents_std + latents_mean
-        video = self.pipeline.vae.decode(latents, return_dict=False)[0]
-
-        video = self.pipeline.video_processor.postprocess_video(video, output_type=output_type)
-        return video
-    
     # ======================== Inference ========================
     def inference(
         self,
         # Oridinary arguments
-        images: WanPipelineImageInput,
+        images: Union[ImageSingle, ImageBatch], # A batch of images or a single image
         prompt: Union[str, List[str]] = None,
         negative_prompt: Union[str, List[str]] = None,
         height: int = 480,
@@ -766,8 +756,8 @@ class Wan2_I2V_Adapter(BaseAdapter):
         output = self.scheduler.step(
             noise_pred=noise_pred,
             timestep=t,
-            timestep_next=t_next,
             latents=latents,
+            timestep_next=t_next,
             next_latents=next_latents,
             compute_log_prob=compute_log_prob,
             return_dict=True,

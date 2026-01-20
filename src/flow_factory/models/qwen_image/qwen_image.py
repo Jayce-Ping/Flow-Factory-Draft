@@ -169,11 +169,11 @@ class QwenImageAdapter(BaseAdapter):
 
         return results
     
-    def encode_image(self, image: Union[Image.Image, torch.Tensor, List[torch.Tensor]], **kwargs) -> torch.Tensor:
+    def encode_image(self, image: Union[Image.Image, torch.Tensor, List[torch.Tensor]]):
         """Not needed for Qwen-Image text-to-image models."""
         pass
 
-    def encode_video(self, video: Union[torch.Tensor, List[torch.Tensor]], **kwargs) -> torch.Tensor:
+    def encode_video(self, video: Union[torch.Tensor, List[torch.Tensor]]):
         """Not needed for Qwen-Image text-to-image models."""
         pass
 

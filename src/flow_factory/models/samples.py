@@ -36,7 +36,7 @@ from diffusers.utils.import_utils import is_torch_available, is_torch_version
 from ..utils.base import (
     ImageSingle,
     ImageBatch,
-    Video,
+    VideoSingle,
     VideoBatch,
     hash_pil_image,
     hash_tensor,
@@ -84,7 +84,7 @@ class BaseSample:
     width : Optional[int] = None
     # Generated media
     image: Optional[ImageSingle] = None # PIL.Image | torch.Tensor | np.ndarray. This field will be convert to a tensor of shape (C, H, W) for canonicalization.
-    video: Optional[Video] = None # List[Image.Image] | torch.Tensor | np.ndarray. This field will be convert to a tensor of shape (T, C, H, W) for canonicalization.
+    video: Optional[VideoSingle] = None # List[Image.Image] | torch.Tensor | np.ndarray. This field will be convert to a tensor of shape (T, C, H, W) for canonicalization.
     # Prompt information
     prompt : Optional[str] = None
     prompt_ids : Optional[torch.Tensor] = None

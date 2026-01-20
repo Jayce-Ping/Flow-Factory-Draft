@@ -32,19 +32,15 @@ from ..abc import BaseAdapter
 from ..samples import I2ISample
 from ...hparams import *
 from ...scheduler import FlowMatchEulerDiscreteSDEScheduler, SDESchedulerOutput, set_scheduler_timesteps
-from ...utils.base import (
-    filter_kwargs,
-    is_pil_image_batch_list,
-    is_pil_image_list,
-    tensor_to_pil_image,
-    tensor_list_to_pil_image,
-    numpy_list_to_pil_image,
-    numpy_to_pil_image,
-    pil_image_to_tensor,
-    is_valid_image,
-    is_valid_image_batch,
-    is_valid_image_list,
-    is_valid_image_batch_list,
+from ...utils.base import filter_kwargs
+from ...utils.image import (
+    ImageSingle,
+    ImageBatch,
+    MultiImageBatch,
+    is_image,
+    is_image_batch,
+    is_multi_image_batch,
+    standardize_image_batch,
 )
 from ...utils.logger_utils import setup_logger
 
@@ -71,15 +67,6 @@ PREFERRED_KONTEXT_RESOLUTIONS = [
 ]
 
 CONDITION_IMAGE_SIZE = (1024, 1024)
-
-FluxKontextImageInput = Union[
-    Image.Image,
-    np.ndarray,
-    torch.Tensor,
-    List[Image.Image],
-    List[np.ndarray],
-    List[torch.Tensor],
-]
 
 @dataclass
 class Flux1KontextSample(I2ISample):
@@ -191,7 +178,7 @@ class Flux1KontextAdapter(BaseAdapter):
 
     def _standardize_image_input(
         self,
-        images: Union[FluxKontextImageInput, List[FluxKontextImageInput]],
+        images: Union[ImageSingle, ImageBatch, MultiImageBatch],
         output_type: Literal['pil', 'np', 'pt'] = 'pil',
     ):
         """
@@ -199,67 +186,27 @@ class Flux1KontextAdapter(BaseAdapter):
         """
         if isinstance(images, Image.Image):
             images = [images]
-        elif is_valid_image_batch_list(images):
+        elif is_multi_image_batch(images):
+            images = [batch[0] for batch in images]
             # A list of list of images
-            if any(len(batch) > 1 for batch in images) and not self._has_warned_multi_image:
+            if not self._has_warned_multi_image and any(len(batch) > 1 for batch in images):
                 self._has_warned_multi_image = True
                 logger.warning(
                     "Multiple condition images are not supported for Flux1-Kontext-dev. Only the first image of each batch will be used."
                 )
-            
-            images = [batch[0] for batch in images]
         
+        images = standardize_image_batch(
+            images,
+            output_type=output_type,
+        )
         
-        if isinstance(images, torch.Tensor):
-            if output_type == 'pil':
-                images = tensor_to_pil_image(images)
-            elif output_type == 'np':
-                images = images.cpu().numpy()
-        elif isinstance(images, np.ndarray):
-            if output_type == 'pil':
-                images = numpy_to_pil_image(images)
-            elif output_type == 'pt':
-                images = torch.from_numpy(images)
-        elif isinstance(images, list):
-            if isinstance(images[0], torch.Tensor):
-                if output_type == 'pil':
-                    images = tensor_list_to_pil_image(images)
-                elif output_type == 'np':
-                    min_value = images[0].min()
-                    max_value = images[0].max()
-                    if -1.0 <= min_value and max_value <= 1.0:
-                        # From tensor's [-1, 1] to numpy's [0, 255]
-                        images = [ ((img.cpu().numpy() + 1.0) / 2.0 * 255).astype(np.uint8) for img in images ]
-                    elif 0.0 <= min_value and max_value <= 255.0:
-                        # From tensor's [0, 1] to numpy's [0, 255]
-                        images = [ (img.cpu().numpy() * 255).astype(np.uint8) for img in images ]
-                    else:
-                        images = [ img.cpu().numpy().astype(np.uint8) for img in images ]
-            elif isinstance(images[0], np.ndarray):
-                if output_type == 'pil':
-                    images = numpy_list_to_pil_image(images)
-                elif output_type == 'pt':
-                    # From numpy's [0, 255] to tensor's [0, 1]
-                    if images.max() > 1.0:
-                        images = images.astype(np.float32) / 255.0
-                    images = torch.from_numpy(images)
-            elif isinstance(images[0], Image.Image):
-                if output_type == 'np':
-                    images = [np.array(img) for img in images]
-                elif output_type == 'pt':
-                    images = pil_image_to_tensor(images)
-            else:
-                raise ValueError(f'Unsupported image type in list: {type(images[0])}.')
-        else:
-            raise ValueError(f'Unsupported image input type: {type(images)}.')
         return images
 
     def encode_image(
         self,
-        images: Union[List[FluxKontextImageInput], FluxKontextImageInput],
+        images: Union[ImageSingle, ImageBatch],
         condition_image_size : Optional[Union[int, Tuple[int, int]]] = None,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        **kwargs
     ) -> Dict[str, torch.Tensor]:
         """
         Encode input images into latent representations using the VAE encoder.
@@ -278,7 +225,7 @@ class Flux1KontextAdapter(BaseAdapter):
             output_type='pil',
         )
         
-        if not is_valid_image_batch(images):
+        if not is_image_batch(images):
             raise ValueError(f"Invalid image input type: {type(images)}. Must be a PIL Image, numpy array, torch tensor, or a list of these types.")
 
         batch_size = len(images)
@@ -327,7 +274,7 @@ class Flux1KontextAdapter(BaseAdapter):
             'image_ids': image_ids.unsqueeze(0).expand(batch_size, *[-1] * (image_ids.ndim)),  # Expand to batch size
         }
     
-    def encode_video(self, video: Any, **kwargs) -> None:
+    def encode_video(self, videos: Any) -> None:
         """Flux.2 does not support video encoding."""
         pass
 
@@ -378,7 +325,7 @@ class Flux1KontextAdapter(BaseAdapter):
     def inference(
         self,
         # Oridinary inputs
-        images: Optional[FluxKontextImageInput] = None,
+        images: Optional[ImageBatch] = None,
         prompt: Optional[Union[str, List[str]]] = None,
         condition_image_size : Optional[Union[int, Tuple[int, int]]] = None,
         num_inference_steps: int = 50,
@@ -394,7 +341,7 @@ class Flux1KontextAdapter(BaseAdapter):
         pooled_prompt_embeds: Optional[torch.Tensor] = None,
 
         # Encoded images
-        condition_images: Optional[FluxKontextImageInput] = None,
+        condition_images: Optional[ImageBatch] = None,
         image_latents: Optional[torch.Tensor] = None,
         image_ids: Optional[torch.Tensor] = None,
 
@@ -600,8 +547,6 @@ class Flux1KontextAdapter(BaseAdapter):
         device = latents.device
         dtype = latents.dtype
         batch_size = latents.shape[0]
-        sigma = t / 1000
-        sigma_prev = t_next / 1000
         guidance = torch.as_tensor(guidance_scale, device=device, dtype=dtype)
         guidance = guidance.expand(batch_size) # Assume List[float] has len `batch_size`
         # Concatenate latents with condition image latents
@@ -610,7 +555,7 @@ class Flux1KontextAdapter(BaseAdapter):
         # 2. Transformer foward pass
         noise_pred = self.transformer(
             hidden_states=latent_model_input,
-            timestep=sigma.expand(batch_size),
+            timestep=t.expand(batch_size) / 1000,  # Scale timestep to [0, 1]
             guidance=guidance,
             pooled_projections=pooled_prompt_embeds,
             encoder_hidden_states=prompt_embeds,
@@ -626,9 +571,9 @@ class Flux1KontextAdapter(BaseAdapter):
         # 3. Scheduler step
         output = self.scheduler.step(
             noise_pred=noise_pred,
-            sigma=sigma,
-            sigma_prev=sigma_prev,
+            timestep=t,
             latents=latents,
+            timestep_next=t_next,
             next_latents=next_latents,
             compute_log_prob=compute_log_prob,
             return_dict=True,

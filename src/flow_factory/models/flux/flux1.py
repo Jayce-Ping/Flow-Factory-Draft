@@ -108,7 +108,7 @@ class Flux1Adapter(BaseAdapter):
             'pooled_prompt_embeds': pooled_prompt_embeds,
         }
     
-    def encode_image(self, images: Union[Image.Image, List[Optional[Image.Image]]], **kwargs) -> None:
+    def encode_image(self, images: Union[Image.Image, List[Optional[Image.Image]]]) -> None:
         """
         Encode input images into latent representations using the VAE encoder.
          Args:
@@ -118,7 +118,7 @@ class Flux1Adapter(BaseAdapter):
         """
         pass
 
-    def encode_video(self, videos: Union[torch.Tensor, List[torch.Tensor]], **kwargs) -> None:
+    def encode_video(self, videos: Union[torch.Tensor, List[torch.Tensor]]) -> None:
         """Not needed for FLUX text-to-image models."""
         pass
 

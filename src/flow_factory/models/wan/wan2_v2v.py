@@ -34,13 +34,13 @@ from ...hparams import *
 from ...scheduler import UniPCMultistepSDESchedulerOutput, UniPCMultistepSDEScheduler
 from ...utils.base import filter_kwargs
 from ...utils.video import (
+    VideoSingle,
     VideoBatch,
-    VideoBatchList,
-    is_valid_video,
+    MultiVideoBatch,
+    is_video,
     is_video_frame_list,
-    is_valid_video_batch,
-    is_valid_video_batch_list,
-
+    is_video_batch,
+    is_multi_video_batch,
     standardize_video_batch,
 )
 from ...utils.logger_utils import setup_logger
@@ -118,6 +118,7 @@ class Wan2_V2V_Adapter(BaseAdapter):
         self.set_prepared('transformer_2', module)
 
     # ============================ Encoding & Decoding ============================
+    # --------------------------- Prompt Encoding --------------------------
     def _get_t5_prompt_embeds(
         self,
         prompt: Union[str, List[str]],
@@ -234,18 +235,25 @@ class Wan2_V2V_Adapter(BaseAdapter):
             })
 
         return results
-    
+    # --------------------------- Image Encoding --------------------------
+    def encode_image(self, images: Union[Image.Image, torch.Tensor, List[torch.Tensor]]) -> None:
+        """Skip this for Wan V2V as the pipeline handles encoding internally."""
+        pass
+    # --------------------------- Video Encoding --------------------------
+    def encode_video(self, videos: Union[torch.Tensor, List[torch.Tensor]]) -> None:
+        """Skip this for Wan V2V as the pipeline handles encoding internally."""
+        pass
 
     def _standardize_video_input(
         self,
-        videos: Union[List[WanPipelineVideoInput], WanPipelineVideoInput],
+        videos: Union[VideoSingle, VideoBatch, MultiVideoBatch],
         output_type: Literal['np', 'pt', 'pil'] = 'pt',
     ) -> VideoBatch:
         """Convert a batch/list of videos into the target format."""
         if is_video_frame_list(videos):
             # One video as list of PIL images
             videos = [videos]
-        if is_valid_video_batch_list(videos):
+        if is_multi_video_batch(videos):
             # A list of video batches
             if any(len(batch) > 1 for batch in videos) and not self._has_warned_multi_video_input:
                 self._has_warned_multi_video_input = True
@@ -260,10 +268,7 @@ class Wan2_V2V_Adapter(BaseAdapter):
         )
         return standardized_videos
 
-    def encode_video(self, videos: Union[torch.Tensor, List[torch.Tensor]], **kwargs) -> None:
-        """Skip this for Wan V2V as the pipeline handles encoding internally."""
-        pass
-
+    # --------------------------- Video Decoding --------------------------
     def decode_latents(self, latents: torch.Tensor, output_type: Literal['pt', 'pil', 'np'] = 'pil') -> torch.Tensor:
         """Decode the latents using the VAE decoder."""
         latents = latents.float()
@@ -286,7 +291,7 @@ class Wan2_V2V_Adapter(BaseAdapter):
     def inference(
         self,
         # Ordinary inputs
-        videos: WanPipelineVideoInput,
+        videos: Union[VideoSingle, VideoBatch],
         prompt: Union[str, List[str]] = None,
         negative_prompt: Union[str, List[str]] = None,
         height: int = 480,
@@ -315,8 +320,6 @@ class Wan2_V2V_Adapter(BaseAdapter):
         do_classifier_free_guidance = guidance_scale > 1.0
         height = height or self.pipeline.transformer.config.sample_height * self.pipeline.vae_scale_factor_spatial
         width = width or self.pipeline.transformer.config.sample_width * self.pipeline.vae_scale_factor_spatial
-
-        videos = self._standardize_video_input(videos, output_type='pt')
 
         # 2. Encode prompt
         if prompt_embeds is None or negative_prompt_embeds is None:

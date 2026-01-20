@@ -60,7 +60,9 @@ class ZImageAdapter(BaseAdapter):
             "attention.to_k", "attention.to_q", "attention.to_v", "attention.to_out.0",
             "feed_forward.w1", "feed_forward.w2", "feed_forward.w3",
         ]
-    
+
+    # ======================== Encoding / Decoding ======================== 
+    # ----------------------- Prompt Encoding -----------------------   
     def _encode_prompt(
         self,
         prompt: Union[str, List[str]],
@@ -146,10 +148,10 @@ class ZImageAdapter(BaseAdapter):
 
         return results
     
+    # ----------------------- Image / Video Encoding & Decoding -----------------------
     def encode_image(
         self,
         images: Union[Image.Image, torch.Tensor, List[torch.Tensor]],
-        **kwargs   
     ):
         """Not needed for Z-Image models."""
         pass
@@ -157,7 +159,6 @@ class ZImageAdapter(BaseAdapter):
     def encode_video(
         self,
         videos: Union[torch.Tensor, List[torch.Tensor]],
-        **kwargs
     ):
         """Not needed for Z-Image models."""
         pass

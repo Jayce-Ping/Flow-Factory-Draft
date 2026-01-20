@@ -80,7 +80,8 @@ class SD3_5Adapter(BaseAdapter):
         do_classifier_free_guidance: bool = False,
         max_sequence_length: Optional[int] = 512,
         device: Optional[torch.device] = None,
-    ):
+    ) -> Dict[str, torch.Tensor]:
+        """Encode the prompt(s) into embeddings using the pipeline's text encoder."""
         device = device if device is not None else self.device
         (
             prompt_embeds, 
@@ -131,11 +132,11 @@ class SD3_5Adapter(BaseAdapter):
 
         return result
 
-    def encode_image(self, image: Union[Image.Image, torch.Tensor, List[torch.Tensor]], **kwargs):
+    def encode_image(self, images: Union[Image.Image, torch.Tensor, List[torch.Tensor]]):
         """Not needed for SD3 text-to-image models."""
         pass
 
-    def encode_video(self, video: Union[torch.Tensor, List[torch.Tensor]], **kwargs) -> torch.Tensor:
+    def encode_video(self, videos: Union[torch.Tensor, List[torch.Tensor]]):
         """Not needed for SD3 text-to-image models."""
         pass
 
@@ -175,7 +176,6 @@ class SD3_5Adapter(BaseAdapter):
         negative_prompt_ids: Optional[torch.Tensor] = None,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         negative_pooled_prompt_embeds: Optional[torch.Tensor] = None,
-
         # Other args
         compute_log_prob: bool = True,
         extra_call_back_kwargs: List[str] = [],
