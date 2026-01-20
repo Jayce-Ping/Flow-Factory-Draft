@@ -272,6 +272,9 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler, SDESch
                 sigma_prev = self.sigmas[[i + 1 for i in step_index]]
             else:
                 raise TypeError(f"`timestep` must be float, or torch.Tensor, got {type(timestep).__name__}.")
+        else:
+            # Sigma provided, update timestep
+            timestep = sigma * 1000
 
         # 1. Numerical Preparation
         noise_pred = noise_pred.float()

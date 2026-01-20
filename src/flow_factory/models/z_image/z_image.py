@@ -370,9 +370,16 @@ class ZImageAdapter(BaseAdapter):
             FlowMatchEulerDiscreteSDESchedulerOutput containing requested outputs.
         """
         # 1. Prepare variables
+        device = latents.device
+        dtype = latents.dtype
         batch_size = latents.shape[0]
         sigma = t / 1000
         sigma_prev = t_next / 1000
+
+        # Convert prompt_embeds to `list of tensors`` on correct device
+        prompt_embeds = [pe.to(device) for pe in prompt_embeds]
+        if negative_prompt_embeds is not None:
+            negative_prompt_embeds = [npe.to(device) for npe in negative_prompt_embeds]
         
         # Z-Image uses reversed timesteps
         timestep = t.expand(batch_size).to(latents.dtype)

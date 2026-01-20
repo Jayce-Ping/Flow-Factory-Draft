@@ -217,11 +217,6 @@ class UniPCMultistepSDEScheduler(UniPCMultistepScheduler, SDESchedulerMixin):
             dynamics_type (str, optional): "Flow-SDE", "Dance-SDE", "CPS", or "ODE". If None, uses scheduler's dynamics type.
             sigma_max (float, optional): Maximum sigma value for Flow-SDE dynamics.
         """
-        if self.is_eval:
-            # Calcuate ODE step using `super()`
-            next_latents_mean = super().step(noise_pred, timestep, latents, return_dict=False)[0]
-            return UniPCMultistepSDESchedulerOutput(next_latents=next_latents_mean)
-
         _is_sigma_provided = sigma is not None and sigma_prev is not None
         if not _is_sigma_provided:
             if (
@@ -259,6 +254,16 @@ class UniPCMultistepSDEScheduler(UniPCMultistepScheduler, SDESchedulerMixin):
                 sigma_prev = self.sigmas[[i + 1 for i in step_index]]
             else:
                 raise TypeError(f"`timestep` must be float, or torch.Tensor, got {type(timestep).__name__}.")
+        else:
+            # Sigma provided, update timestep
+            timestep = sigma * 1000
+
+        # 0.  Use super().step() fro evaluation
+        if self.is_eval:
+            if self.step_index is None:
+                self._init_step_index(timestep)
+            next_latents_mean = super().step(noise_pred, timestep, latents, return_dict=False)[0]
+            return UniPCMultistepSDESchedulerOutput(next_latents=next_latents_mean)
 
         # 1. Numerical Preparation
         noise_pred = noise_pred.float()

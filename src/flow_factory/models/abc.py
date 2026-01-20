@@ -769,7 +769,7 @@ class BaseAdapter(ABC):
         
         # Parse with explicit target_modules
         component_modules = self._parse_target_modules(target_modules, components)
-        
+        logger.info(f"components:{components}")
         # Apply LoRA to each component
         results = {}
         for comp in components:

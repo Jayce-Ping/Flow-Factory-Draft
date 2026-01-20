@@ -324,8 +324,6 @@ class Wan2_T2V_Adapter(BaseAdapter):
             generator=generator,
         )
 
-        mask = torch.ones(latents.shape, dtype=torch.float32, device=device)
-
         # 6. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)

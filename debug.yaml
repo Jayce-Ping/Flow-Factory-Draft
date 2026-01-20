@@ -1,7 +1,7 @@
 # Environment Configuration
 launcher: "accelerate"  # Options: accelerate
 config_file: config/accelerate_configs/fsdp2.yaml  # Switch to config/accelerate_configs/fsdp2.yaml if you have limited GPU memory.
-num_processes: 8  # Number of processes to launch (overrides config file)
+num_processes: 6  # Number of processes to launch (overrides config file)
 main_process_port: 29500
 mixed_precision: "bf16"  # Options: no, fp16, bf16
 
@@ -11,7 +11,7 @@ logging_backend: "none"  # Options: wandb, swanlab, none
 
 # Data Configuration
 data:
-  dataset_dir: "dataset/t2is"  # Path to dataset folder
+  dataset_dir: "dataset/sharegpt4o_image_mini"  # Path to dataset folder
   preprocessing_batch_size: 8  # Batch size for preprocessing
   dataloader_num_workers: 16  # Number of workers for DataLoader
   enable_preprocess: true  # Enable dataset preprocessing
@@ -24,13 +24,16 @@ model:
   finetune_type: 'lora' # Options: full, lora
   lora_rank : 64
   lora_alpha : 128
+  target_components: 'transformer' # Options: transformer (Wan2.1 & Wan2.2), transformer_2 (Wan2.2)
   target_modules: "default" # Options: all, default, or list of module names like ["to_k", "to_q", "to_v", "to_out.0"]
   # model_name_or_path: "Qwen/Qwen-Image-Edit-2509"  # Options: black-forest-labs/FLUX.2-klein-base-4B, black-forest-labs/FLUX.2-klein-base-9B
   # model_type: "qwen-image-edit-plus"
   # model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"  # Options: black-forest-labs/FLUX.2-klein-base-4B, black-forest-labs/FLUX.2-klein-base-9B
   # model_type: "flux2-klein"
-  model_name_or_path: "black-forest-labs/FLUX.1-dev"  # Options: black-forest-labs/FLUX.2-klein-base-4B, black-forest-labs/FLUX.2-klein-base-9B
-  model_type: "flux1"
+  # model_name_or_path: "Tongyi-MAI/Z-Image-Turbo"  # HuggingFace                                                   qqqmodel ID or local path
+  # model_type: "z-image"
+  model_name_or_path: "Wan-AI/Wan2.2-T2V-A14B-Diffusers"  # Wan-AI/Wan2.1-T2V-14B-Diffusers / Wan-AI/Wan2.2-T2V-A14B-Diffusers
+  model_type: "wan2_t2v"  # wan2_t2v, wan2_i2v, wan2_v2v
   resume_path: null # Path to load previous checkpoint/lora adapter
   resume_training_state: false # Whether to resume training state, only effective when resume_path is a directory with full checkpoint
 
@@ -47,10 +50,11 @@ train:
 
   # Image settings
   resolution: 256  # Can be int or [height, width]
-  condition_image_size: 256
+  # condition_image_size: 256
+  num_frames: 5 # (F - 1) mod 4 == 0
   auto_resize: false
   # Batch and sampling
-  per_device_batch_size: 1  # Batch size per device. For image-to-image task, this will always fallback to 1.
+  per_device_batch_size: 2  # Batch size per device. For image-to-image task, this will always fallback to 1.
   group_size: 8  # Group size for GRPO sampling
   global_std: false  # Use global std for advantage normalization
   unique_sample_num_per_epoch: 8  # Unique samples per group
@@ -93,9 +97,9 @@ scheduler:
 # Evaluation settings
 eval:
   resolution: 256  # Evaluation resolution
-  condition_image_size: 256
-  auto_resize: false
-  per_device_batch_size: 1  # Eval batch size
+  # condition_image_size: 256
+  num_frames: 5 # (F - 1) mod 4 == 0
+  per_device_batch_size: 2  # Eval batch size
   seed: 42  # Eval seed (defaults to training seed)
   guidance_scale: 4.0  # Guidance scale for sampling
   num_inference_steps: 28  # Number of eval timesteps

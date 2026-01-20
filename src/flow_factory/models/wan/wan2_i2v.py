@@ -492,7 +492,7 @@ class Wan2_I2V_Adapter(BaseAdapter):
 
             # call extra callbacks
             if extra_call_back_kwargs:
-                capturable = {'noise_pred': noise_pred, 'noise_levels': current_noise_level}
+                capturable = {'noise_level': current_noise_level}
                 for key in extra_call_back_kwargs:
                     if key in capturable and capturable[key] is not None:
                         # First check in capturable dict
@@ -562,7 +562,7 @@ class Wan2_I2V_Adapter(BaseAdapter):
         self,
         t: torch.Tensor,
         t_next: torch.Tensor,
-        latents: torch.Tenspr,
+        latents: torch.Tensor,
         prompt_embeds: torch.Tensor,
         # Optional for CFG
         negative_prompt_embeds: Optional[torch.Tensor] = None,
