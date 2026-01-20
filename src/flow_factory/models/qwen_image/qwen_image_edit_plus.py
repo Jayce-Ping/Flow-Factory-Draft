@@ -899,10 +899,12 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         vae_image_sizes: Optional[List[List[Tuple[int, int]]]] = None, # A batch of VAE image size lists
         image_latents: Optional[List[torch.Tensor]] = None, # A batch of image latents
         # Other arguments
-        extra_call_back_kwargs: List[str] = [],
+        condition_image_size : Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
         attention_kwargs: Optional[Dict[str, Any]] = {},
         max_sequence_length: int = 1024,
         compute_log_prob: bool = False,
+        auto_resize : bool = True,
+        extra_call_back_kwargs: List[str] = [],
     ):
         """
         Batch inference, the input must be in the batch format
@@ -936,8 +938,6 @@ class QwenImageEditPlusAdapter(BaseAdapter):
                 height=height,
                 width=width,
                 generator=generator[b] if isinstance(generator, List) else generator,
-                attention_kwargs=attention_kwargs,
-                max_sequence_length=max_sequence_length,
                 # Encoded prompt
                 prompt_ids=prompt_ids[b:b+1] if prompt_ids is not None else None,
                 prompt_embeds=prompt_embeds[b:b+1] if prompt_embeds is not None else None,
@@ -953,8 +953,12 @@ class QwenImageEditPlusAdapter(BaseAdapter):
                 vae_image_sizes=vae_image_sizes[b] if vae_image_sizes is not None else None,
                 image_latents=image_latents[b] if image_latents is not None else None,
                 # Shared parameters
+                condition_image_size=condition_image_size,
+                attention_kwargs=attention_kwargs,
+                max_sequence_length=max_sequence_length,
                 compute_log_prob=compute_log_prob,
                 extra_call_back_kwargs=extra_call_back_kwargs,
+                auto_resize=auto_resize,
             )
             all_samples.extend(sample)
 
