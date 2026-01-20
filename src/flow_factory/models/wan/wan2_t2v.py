@@ -469,7 +469,7 @@ class Wan2_T2V_Adapter(BaseAdapter):
         # 1. Prepare variables
         t = t[0] if t.ndim == 1 else t # A scalar
         if t_next is not None:
-            t_next = t[0] if t_next.ndim == 1 else t_next
+            t_next = t_next[0] if t_next.ndim == 1 else t_next
 
         batch_size = latents.shape[0]
         device = latents.device

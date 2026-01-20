@@ -6,18 +6,18 @@ main_process_port: 29500
 mixed_precision: "bf16"  # Options: no, fp16, bf16
 
 run_name: null  # Run name (auto: {model_type}_{finetune_type}_{timestamp})
-project: "Flow-Factory-debug"  # Project name for logging
+project: "Flow-Factory-Debug"  # Project name for logging
 logging_backend: "wandb"  # Options: wandb, swanlab, none
 
 # Data Configuration
 data:
-  dataset_dir: "dataset/sharegpt4o_image_mini"  # Path to dataset folder
+  dataset_dir: "dataset/pickscore"  # Path to dataset folder
   preprocessing_batch_size: 8  # Batch size for preprocessing
   dataloader_num_workers: 16  # Number of workers for DataLoader
   enable_preprocess: true  # Enable dataset preprocessing
   force_reprocess: true  # Force reprocessing of the dataset
   cache_dir: "~/jcy/.cache/flow_factory/datasets" # Cache directory for preprocessed datasets
-  max_dataset_size: null  # Limit the maximum number of samples in the dataset
+  max_dataset_size: 120  # Limit the maximum number of samples in the dataset
 
 # Model Configuration
 model:
@@ -32,8 +32,8 @@ model:
   # model_type: "flux2-klein"
   # model_name_or_path: "Tongyi-MAI/Z-Image-Turbo"  # HuggingFace ID or local path
   # model_type: "z-image"
-  model_name_or_path: "Wan-AI/Wan2.2-I2V-A14B-Diffusers"  # Wan-AI/Wan2.1-T2V-14B-Diffusers / Wan-AI/Wan2.2-T2V-A14B-Diffusers
-  model_type: "wan2_i2v"  # wan2_t2v, wan2_i2v, wan2_v2v
+  model_name_or_path: "Wan-AI/Wan2.2-T2V-A14B-Diffusers"  # Wan-AI/Wan2.1-T2V-14B-Diffusers / Wan-AI/Wan2.2-T2V-A14B-Diffusers
+  model_type: "wan2_t2v"  # wan2_t2v, wan2_i2v, wan2_v2v
   resume_path: null # Path to load previous checkpoint/lora adapter
   resume_training_state: false # Whether to resume training state, only effective when resume_path is a directory with full checkpoint
 
