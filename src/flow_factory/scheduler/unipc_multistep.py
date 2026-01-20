@@ -188,11 +188,10 @@ class UniPCMultistepSDEScheduler(UniPCMultistepScheduler, SDESchedulerMixin):
     def step(
         self,
         noise_pred: torch.Tensor,
+        timestep: Union[int, float, torch.Tensor],
         latents: torch.Tensor,
         next_latents: Optional[torch.Tensor] = None,
-        timestep: Optional[Union[int, float, torch.Tensor]] = None,
-        sigma: Optional[torch.Tensor] = None,
-        sigma_prev: Optional[torch.Tensor] = None,
+        timestep_next : Optional[Union[float, torch.Tensor]] = None,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         noise_level : Optional[Union[int, float, torch.Tensor]] = None,
         compute_log_prob: bool = True,
@@ -217,8 +216,8 @@ class UniPCMultistepSDEScheduler(UniPCMultistepScheduler, SDESchedulerMixin):
             dynamics_type (str, optional): "Flow-SDE", "Dance-SDE", "CPS", or "ODE". If None, uses scheduler's dynamics type.
             sigma_max (float, optional): Maximum sigma value for Flow-SDE dynamics.
         """
-        _is_sigma_provided = sigma is not None and sigma_prev is not None
-        if not _is_sigma_provided:
+        if timestep_next is None:
+            # Get step index and the `timestep_next`
             if (
                 isinstance(timestep, int)
                 or isinstance(timestep, torch.IntTensor)
@@ -230,14 +229,12 @@ class UniPCMultistepSDEScheduler(UniPCMultistepScheduler, SDESchedulerMixin):
                         ", rather than one of the `scheduler.timesteps` as a timestep."
                     ),
                 )
-                step_index = int(timestep)
-                timestep = self.timesteps[step_index]
-                sigma = self.sigmas[step_index] # (1)
-                sigma_prev = self.sigmas[step_index + 1] # (1)
+                step_index = [int(timestep)] # (1,)
             elif isinstance(timestep, torch.Tensor):
+                # Find step_index
                 if timestep.ndim == 0:
                     # Scalar tensor
-                    step_index = [self.index_for_timestep(timestep)]
+                    step_index = [self.index_for_timestep(timestep)] # (1,)
                 elif timestep.ndim == 1:
                     # Batched 1D tensor (B,)
                     step_index = [self.index_for_timestep(t) for t in timestep]
@@ -246,22 +243,28 @@ class UniPCMultistepSDEScheduler(UniPCMultistepScheduler, SDESchedulerMixin):
                         f"`timestep` must be a scalar or 1D tensor, got shape {tuple(timestep.shape)}. "
                         f"If using expanded timesteps (e.g. for Wan models), pass the original scalar timestep `t` instead."
                     )
-                sigma = self.sigmas[step_index]
-                sigma_prev = self.sigmas[[i + 1 for i in step_index]]
             elif isinstance(timestep, float):
-                step_index = [self.index_for_timestep(timestep)]
-                sigma = self.sigmas[step_index]
-                sigma_prev = self.sigmas[[i + 1 for i in step_index]]
+                step_index = [self.index_for_timestep(timestep)] # (1, )
             else:
                 raise TypeError(f"`timestep` must be float, or torch.Tensor, got {type(timestep).__name__}.")
+            
+            # Update `timestep` and `timestep_next`
+            timestep = self.timesteps[step_index]
+            timestep_next = torch.as_tensor([
+                self.timesteps[i + 1] if i + 1 < len(self.timesteps)
+                else torch.tensor(0, device=timestep.device)
+                for i in step_index
+            ], device=timestep.device)
+            # Update sigma
+            sigma = self.sigmas[step_index]
+            sigma_prev = self.sigmas[[i + 1 for i in step_index]]
         else:
-            # Sigma provided, update timestep
-            timestep = sigma * 1000
+            # `timestep_next` provided
+            sigma = timestep / 1000
+            sigma_prev = timestep_next / 1000
 
         # 0.  Use super().step() fro evaluation
         if self.is_eval:
-            if self.step_index is None:
-                self._init_step_index(timestep)
             next_latents_mean = super().step(noise_pred, timestep, latents, return_dict=False)[0]
             return UniPCMultistepSDESchedulerOutput(next_latents=next_latents_mean)
 

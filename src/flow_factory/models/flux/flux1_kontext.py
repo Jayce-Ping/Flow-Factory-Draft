@@ -557,15 +557,19 @@ class Flux1KontextAdapter(BaseAdapter):
     def forward(
         self,
         t: torch.Tensor,
-        t_next: torch.Tensor,
         latents: torch.Tensor,
+        # Condtion image
         image_latents: torch.Tensor,
+        latent_ids: torch.Tensor,
+        # Prompt Info
         prompt_embeds: torch.Tensor,
         pooled_prompt_embeds: torch.Tensor,
-        latent_ids: torch.Tensor,
+        # Next timestep info
+        t_next: Optional[torch.Tensor] = None,
+        next_latents: Optional[torch.Tensor] = None,
+        # Other
         guidance_scale : float = 3.5,
         noise_level: Optional[float] = None,
-        next_latents: Optional[torch.Tensor] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
         return_kwargs: List[str] = ['noise_pred', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],

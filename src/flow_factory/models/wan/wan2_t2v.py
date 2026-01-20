@@ -326,19 +326,19 @@ class Wan2_T2V_Adapter(BaseAdapter):
 
         # 6. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-        self._num_timesteps = len(timesteps)
+        self.pipeline._num_timesteps = len(timesteps)
         if self.pipeline.config.boundary_ratio is not None:
             boundary_timestep = self.pipeline.config.boundary_ratio * self.scheduler.config.num_train_timesteps
         else:
-            boundary_timestep = None        
+            boundary_timestep = None
 
         all_latents = [latents]
         all_log_probs = [] if compute_log_prob else None
         extra_call_back_res = defaultdict(list)
 
         for i, t in enumerate(timesteps):
+            self.pipeline._current_timestep = t
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
-            t_next = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
             return_kwargs = list(set(['next_latents', 'log_prob', 'noise_pred'] + extra_call_back_kwargs))
 
             # Select variables based on boundary
@@ -349,7 +349,6 @@ class Wan2_T2V_Adapter(BaseAdapter):
 
             output = self.forward(
                 t=t,
-                t_next=t_next,
                 latents=latents,
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
@@ -429,16 +428,17 @@ class Wan2_T2V_Adapter(BaseAdapter):
     def forward(
         self,
         t: torch.Tensor,
-        t_next: torch.Tensor,
         latents: torch.Tensor,
         prompt_embeds: torch.Tensor,
+        # Optional next time step info
+        t_next: Optional[torch.Tensor] = None,
+        next_latents: Optional[torch.Tensor] = None,
         # Optional for CFG
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         do_classifier_free_guidance: bool = True,
         guidance_scale: float = 5.0,
         guidance_scale_2: Optional[float] = None,
         # Other
-        next_latents: Optional[torch.Tensor] = None,
         noise_level: Optional[float] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
@@ -466,9 +466,11 @@ class Wan2_T2V_Adapter(BaseAdapter):
             UniPCMultistepSDESchedulerOutput containing requested outputs.
         """
         # 1. Prepare variables
+        t = t[0] if t.ndim == 1 else t # A scalar
+        if t_next is not None:
+            t_next = t[0] if t_next.ndim == 1 else t_next
+
         batch_size = latents.shape[0]
-        sigma = t / 1000
-        sigma_prev = t_next / 1000
         device = latents.device
         dtype = self.pipeline.transformer.dtype if self.pipeline.transformer is not None else self.pipeline.transformer_2.dtype
 
@@ -523,9 +525,9 @@ class Wan2_T2V_Adapter(BaseAdapter):
         # 5. Scheduler step
         output = self.scheduler.step(
             noise_pred=noise_pred,
-            sigma=sigma,
-            sigma_prev=sigma_prev,
+            timestep=t,
             latents=latents,
+            timestep_next=t_next,
             next_latents=next_latents,
             compute_log_prob=compute_log_prob,
             return_dict=True,

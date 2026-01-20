@@ -117,7 +117,7 @@ def is_video_frame_list(frames: List[Any]) -> bool:
     if len(frames) == 0:
         return False
     
-    if not isinstance(frames[0]. Image.Image):
+    if not isinstance(frames[0], Image.Image):
         return False
 
     return all(f.size == frames[0].size for f in frames[1:])
