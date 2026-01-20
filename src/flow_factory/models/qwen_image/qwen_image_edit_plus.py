@@ -1173,8 +1173,8 @@ class QwenImageEditPlusAdapter(BaseAdapter):
             )
             self._has_warned_forward_fallback = True
 
-        batch_size = latents.shape[0]
-        if batch_size > 1 and isinstance(latents, list):
+        batch_size = len(latents)
+        if batch_size > 1 or isinstance(latents, list):
             first_latent_shape = latents[0].shape
             if not all(first_latent_shape == lat.shape for lat in latents[1:]):
                 raise ValueError(
