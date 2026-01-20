@@ -31,7 +31,12 @@ from diffusers.utils.torch_utils import randn_tensor
 from ..abc import BaseAdapter
 from ..samples import I2ISample
 from ...hparams import *
-from ...scheduler import FlowMatchEulerDiscreteSDEScheduler, SDESchedulerOutput, set_scheduler_timesteps
+from ...scheduler import (
+    FlowMatchEulerDiscreteSDEScheduler,
+    FlowMatchEulerDiscreteSDESchedulerOutput,
+    SDESchedulerOutput,
+    set_scheduler_timesteps
+)
 from ...utils.base import filter_kwargs
 from ...utils.image import (
     ImageSingle,
@@ -417,18 +422,16 @@ class Flux1KontextAdapter(BaseAdapter):
         for i, t in enumerate(timesteps):
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
             t_next = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
-
             return_kwargs = list(set(['next_latents', 'log_prob', 'noise_pred'] + extra_call_back_kwargs))
 
             output = self.forward(
                 t=t,
-                t_next=t_next,
                 latents=latents,
                 image_latents=image_latents,
+                latent_ids=latent_ids,
                 prompt_embeds=prompt_embeds,
                 pooled_prompt_embeds=pooled_prompt_embeds,
                 guidance_scale=guidance_scale,
-                latent_ids=latent_ids,
                 compute_log_prob=compute_log_prob and current_noise_level > 0,
                 joint_attention_kwargs=joint_attention_kwargs,
                 return_kwargs=return_kwargs,
@@ -520,7 +523,7 @@ class Flux1KontextAdapter(BaseAdapter):
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
         return_kwargs: List[str] = ['noise_pred', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
-    ) -> SDESchedulerOutput:
+    ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
         """
         Forward pass with given timestep, next timestep, and latents.
 

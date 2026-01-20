@@ -382,7 +382,6 @@ class Wan2_V2V_Adapter(BaseAdapter):
 
             output = self.forward(
                 t=t,
-                t_next=t_next,
                 latents=latents,
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
@@ -463,14 +462,15 @@ class Wan2_V2V_Adapter(BaseAdapter):
     def forward(
         self,
         t: torch.Tensor,
-        t_next: torch.Tensor,
         latents: torch.Tensor,
         prompt_embeds: torch.Tensor,
         # Optional for CFG
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         guidance_scale: float = 5.0,
-        # Other
+        # Next timestep info
+        t_next: Optional[torch.Tensor] = None,
         next_latents: Optional[torch.Tensor] = None,
+        # Other
         noise_level: Optional[float] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
@@ -497,8 +497,6 @@ class Wan2_V2V_Adapter(BaseAdapter):
         """
         # 1. Prepare variables
         batch_size = latents.shape[0]
-        sigma = t / 1000
-        sigma_prev = t_next / 1000
         device = latents.device
         dtype = self.pipeline.transformer.dtype
 
@@ -533,9 +531,9 @@ class Wan2_V2V_Adapter(BaseAdapter):
         # 5. Scheduler step
         output = self.scheduler.step(
             noise_pred=noise_pred,
-            sigma=sigma,
-            sigma_prev=sigma_prev,
+            timestep=t,
             latents=latents,
+            timestep_next=t_next,
             next_latents=next_latents,
             compute_log_prob=compute_log_prob,
             return_dict=True,

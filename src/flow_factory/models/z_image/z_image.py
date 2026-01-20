@@ -29,7 +29,12 @@ from diffusers.pipelines.z_image.pipeline_z_image import ZImagePipeline
 from ..abc import BaseAdapter
 from ..samples import T2ISample
 from ...hparams import *
-from ...scheduler import FlowMatchEulerDiscreteSDESchedulerOutput, set_scheduler_timesteps, FlowMatchEulerDiscreteSDEScheduler
+from ...scheduler import (
+    FlowMatchEulerDiscreteSDEScheduler,
+    FlowMatchEulerDiscreteSDESchedulerOutput,
+    SDESchedulerOutput,
+    set_scheduler_timesteps
+)
 from ...utils.base import filter_kwargs
 from ...utils.logger_utils import setup_logger
 
@@ -262,7 +267,6 @@ class ZImageAdapter(BaseAdapter):
 
             output = self.forward(
                 t=t,
-                t_next=t_next,
                 latents=latents,
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
@@ -336,7 +340,6 @@ class ZImageAdapter(BaseAdapter):
     def forward(
         self,
         t: torch.Tensor,
-        t_next: torch.Tensor,
         latents: torch.Tensor,
         prompt_embeds: List[torch.FloatTensor],
         # Optional for CFG
@@ -344,8 +347,10 @@ class ZImageAdapter(BaseAdapter):
         guidance_scale: float = 5.0,
         cfg_normalization: bool = False,
         cfg_truncation: Optional[float] = 1.0,
-        # Other
+        # Next timestep info
+        t_next: Optional[torch.Tensor] = None,
         next_latents: Optional[torch.Tensor] = None,
+        # Other
         noise_level: Optional[float] = None,
         compute_log_prob: bool = True,
         return_kwargs: List[str] = ['noise_pred', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
@@ -374,8 +379,6 @@ class ZImageAdapter(BaseAdapter):
         device = latents.device
         dtype = latents.dtype
         batch_size = latents.shape[0]
-        sigma = t / 1000
-        sigma_prev = t_next / 1000
 
         # Convert prompt_embeds to `list of tensors`` on correct device
         prompt_embeds = [pe.to(device) for pe in prompt_embeds]
@@ -459,9 +462,9 @@ class ZImageAdapter(BaseAdapter):
         # 6. Scheduler step
         output = self.scheduler.step(
             noise_pred=noise_pred,
-            sigma=sigma,
-            sigma_prev=sigma_prev,
+            timestep=t,
             latents=latents,
+            timestep_next=t_next,
             next_latents=next_latents,
             compute_log_prob=compute_log_prob,
             return_dict=True,

@@ -30,7 +30,12 @@ from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
 from ..samples import T2ISample
 from ..abc import BaseAdapter
 from ...hparams import *
-from ...scheduler import FlowMatchEulerDiscreteSDEScheduler, SDESchedulerOutput, set_scheduler_timesteps
+from ...scheduler import (
+    FlowMatchEulerDiscreteSDEScheduler,
+    FlowMatchEulerDiscreteSDESchedulerOutput,
+    SDESchedulerOutput,
+    set_scheduler_timesteps
+)
 from ...utils.base import filter_kwargs
 from ...utils.logger_utils import setup_logger
 
@@ -202,17 +207,15 @@ class Flux1Adapter(BaseAdapter):
         for i, t in enumerate(timesteps):
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
             t_next = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
-
             return_kwargs = list(set(['next_latents', 'log_prob', 'noise_pred'] + extra_call_back_kwargs))
 
             output = self.forward(
                 t=t,
-                t_next=t_next,
                 latents=latents,
                 prompt_embeds=prompt_embeds,
                 pooled_prompt_embeds=pooled_prompt_embeds,
-                guidance_scale=guidance_scale,
                 img_ids=latent_image_ids,
+                guidance_scale=guidance_scale,
                 compute_log_prob=compute_log_prob and current_noise_level > 0,
                 joint_attention_kwargs=joint_attention_kwargs,
                 return_kwargs=return_kwargs,
@@ -282,25 +285,27 @@ class Flux1Adapter(BaseAdapter):
     def forward(
         self,
         t: torch.Tensor,
-        t_next: torch.Tensor,
         latents: torch.Tensor,
+        # Prompt
         prompt_embeds: torch.Tensor,
         pooled_prompt_embeds: torch.Tensor,
+        # Image ids
         img_ids: torch.Tensor,
+        # Next timestep info
+        t_next: Optional[torch.Tensor] = None,
+        next_latents: Optional[torch.Tensor] = None,
+        # Other args
         guidance_scale: Union[float, List[float]] = 3.5,
         noise_level: Optional[float] = None,
-        next_latents: Optional[torch.Tensor] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
         return_kwargs : List[str] = ['noise_pred', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
-    ) -> SDESchedulerOutput:
+    ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
         """Forward pass with given timestep, timestep+1 and latents."""
         # 1. Prepare variables
         device = latents.device
         dtype = latents.dtype
         batch_size = latents.shape[0]
-        sigma = t / 1000
-        sigma_prev = t_next / 1000
 
         guidance = torch.as_tensor(guidance_scale, device=device, dtype=dtype)
         guidance = guidance.expand(batch_size) # Assume List[float] has len `batch_size`
@@ -308,7 +313,7 @@ class Flux1Adapter(BaseAdapter):
         # 2. transformer forward
         noise_pred = self.transformer(
             hidden_states=latents,
-            timestep=sigma.expand(batch_size),
+            timestep=t.expand(batch_size) / 1000,
             guidance=guidance,
             pooled_projections=pooled_prompt_embeds,
             encoder_hidden_states=prompt_embeds,
@@ -321,9 +326,9 @@ class Flux1Adapter(BaseAdapter):
         # 3. Scheduler step
         output = self.scheduler.step(
             noise_pred=noise_pred,
-            sigma=sigma,
-            sigma_prev=sigma_prev,
+            timestep=t,
             latents=latents,
+            timestep_next=t_next,
             next_latents=next_latents,
             compute_log_prob=compute_log_prob,
             return_dict=True,

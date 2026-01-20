@@ -30,7 +30,12 @@ import logging
 from ..abc import BaseAdapter
 from ..samples import I2ISample
 from ...hparams import *
-from ...scheduler import FlowMatchEulerDiscreteSDEScheduler, FlowMatchEulerDiscreteSDESchedulerOutput, SDESchedulerOutput, set_scheduler_timesteps
+from ...scheduler import (
+    FlowMatchEulerDiscreteSDEScheduler,
+    FlowMatchEulerDiscreteSDESchedulerOutput,
+    SDESchedulerOutput,
+    set_scheduler_timesteps
+)
 from ...utils.base import filter_kwargs
 from ...utils.image import (
     ImageSingle,
@@ -484,7 +489,6 @@ class Flux2KleinAdapter(BaseAdapter):
 
             output = self._forward(
                 t=t,
-                t_next=t_next,
                 latents=latents,
                 latent_ids=latent_ids,
                 prompt_embeds=prompt_embeds,
@@ -710,7 +714,6 @@ class Flux2KleinAdapter(BaseAdapter):
     def _forward(
         self,
         t: torch.Tensor,
-        t_next: torch.Tensor,
         latents: torch.Tensor,
         latent_ids: torch.Tensor,
         prompt_embeds: torch.Tensor,
@@ -723,8 +726,10 @@ class Flux2KleinAdapter(BaseAdapter):
         negative_text_ids: Optional[torch.Tensor] = None,
         do_classifier_free_guidance: bool = False,
         guidance_scale: float = 4.0,
-        # Other
+        # Next timestep info
+        t_next: Optional[torch.Tensor] = None,
         next_latents: Optional[torch.Tensor] = None,
+        # Other
         noise_level: Optional[float] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
@@ -757,7 +762,7 @@ class Flux2KleinAdapter(BaseAdapter):
         """
         batch_size = latents.shape[0]
 
-        # Prepare model input (concatenate condition latents for I2I)
+        # 1. Prepare model input (concatenate condition latents for I2I)
         latent_model_input = latents.to(torch.float32)
         latent_image_ids = latent_ids
 
@@ -765,7 +770,7 @@ class Flux2KleinAdapter(BaseAdapter):
             latent_model_input = torch.cat([latents, image_latents], dim=1).to(torch.float32)
             latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
 
-        # Conditional forward pass
+        # 2. Conditional forward pass
         with self.pipeline.transformer.cache_context("cond"):
             noise_pred = self.transformer(
                 hidden_states=latent_model_input,
@@ -781,7 +786,7 @@ class Flux2KleinAdapter(BaseAdapter):
         # Extract only target latent predictions (exclude condition image part)
         noise_pred = noise_pred[:, :latents.shape[1]]
 
-        # CFG: unconditional forward pass
+        # 3. CFG: unconditional forward pass
         if do_classifier_free_guidance and guidance_scale > 1.0:
             with self.pipeline.transformer.cache_context("uncond"):
                 neg_noise_pred = self.transformer(
@@ -798,7 +803,7 @@ class Flux2KleinAdapter(BaseAdapter):
             neg_noise_pred = neg_noise_pred[:, :latents.shape[1]]
             noise_pred = neg_noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
 
-        # Scheduler step
+        # 4. Scheduler step
         output = self.scheduler.step(
             noise_pred=noise_pred,
             timestep=t,
@@ -815,7 +820,6 @@ class Flux2KleinAdapter(BaseAdapter):
     def forward(
         self,
         t: torch.Tensor,
-        t_next: torch.Tensor,
         latents: torch.Tensor,
         latent_ids: Union[torch.Tensor, List[torch.Tensor]],
         prompt_embeds: torch.Tensor,
@@ -828,8 +832,10 @@ class Flux2KleinAdapter(BaseAdapter):
         negative_text_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
         do_classifier_free_guidance: bool = False,
         guidance_scale: float = 4.0,
-        # Other
+        # Next timestep info
+        t_next: Optional[torch.Tensor] = None,
         next_latents: Optional[torch.Tensor] = None,
+        # Other
         noise_level: Optional[float] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
@@ -849,7 +855,6 @@ class Flux2KleinAdapter(BaseAdapter):
             # T2I or uniform I2I, call _forward() directly
             return self._forward(
                 t=t,
-                t_next=t_next,
                 latents=latents,
                 latent_ids=latent_ids,
                 prompt_embeds=prompt_embeds,
@@ -860,6 +865,7 @@ class Flux2KleinAdapter(BaseAdapter):
                 negative_text_ids=negative_text_ids,
                 do_classifier_free_guidance=do_classifier_free_guidance,
                 guidance_scale=guidance_scale,
+                t_next=t_next,
                 next_latents=next_latents,
                 joint_attention_kwargs=joint_attention_kwargs,
                 compute_log_prob=compute_log_prob,
@@ -902,7 +908,6 @@ class Flux2KleinAdapter(BaseAdapter):
 
             out = self._forward(
                 t=single_t,
-                t_next=single_t_next,
                 latents=single_latents,
                 latent_ids=single_latent_ids,
                 prompt_embeds=single_prompt_embeds,
@@ -913,6 +918,7 @@ class Flux2KleinAdapter(BaseAdapter):
                 negative_text_ids=single_negative_text_ids,
                 do_classifier_free_guidance=do_classifier_free_guidance,
                 guidance_scale=guidance_scale,
+                t_next=single_t_next,
                 next_latents=single_next_latents,
                 joint_attention_kwargs=joint_attention_kwargs,
                 compute_log_prob=compute_log_prob,

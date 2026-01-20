@@ -30,7 +30,12 @@ import logging
 from ..abc import BaseAdapter
 from ..samples import I2ISample
 from ...hparams import *
-from ...scheduler import FlowMatchEulerDiscreteSDEScheduler, FlowMatchEulerDiscreteSDESchedulerOutput, SDESchedulerOutput, set_scheduler_timesteps
+from ...scheduler import (
+    FlowMatchEulerDiscreteSDEScheduler,
+    FlowMatchEulerDiscreteSDESchedulerOutput,
+    SDESchedulerOutput,
+    set_scheduler_timesteps
+)
 from ...utils.base import filter_kwargs
 from ...utils.image import (
     ImageSingle,
@@ -533,7 +538,6 @@ class Flux2Adapter(BaseAdapter):
 
             output = self._forward(
                 t=t,
-                t_next=t_next,
                 latents=latents,
                 latent_ids=latent_ids,
                 prompt_embeds=prompt_embeds,
@@ -731,7 +735,6 @@ class Flux2Adapter(BaseAdapter):
     def _forward(
         self,
         t: torch.Tensor,
-        t_next: torch.Tensor,
         latents: torch.Tensor,
         latent_ids: torch.Tensor,
         prompt_embeds: torch.Tensor,
@@ -739,9 +742,11 @@ class Flux2Adapter(BaseAdapter):
         # Optional for I2I
         image_latents: Optional[torch.Tensor] = None,
         image_latent_ids: Optional[torch.Tensor] = None,
+        # Next timestep info
+        t_next: Optional[torch.Tensor] = None,
+        next_latents: Optional[torch.Tensor] = None,
         # Other
         guidance_scale: float = 4.0,
-        next_latents: Optional[torch.Tensor] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
         return_kwargs: List[str] = ['noise_pred', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
@@ -771,8 +776,6 @@ class Flux2Adapter(BaseAdapter):
         """
         # 1. Prepare variables        
         batch_size = latents.shape[0]
-        sigma = t / 1000
-        sigma_prev = t_next / 1000
 
         guidance = torch.full([batch_size], guidance_scale, device=latents.device, dtype=torch.float32)
 
@@ -787,7 +790,7 @@ class Flux2Adapter(BaseAdapter):
         # Forward pass
         noise_pred = self.transformer(
             hidden_states=latent_model_input,
-            timestep=sigma.expand(batch_size),
+            timestep=t.expand(batch_size) / 1000,  # Scale timestep
             guidance=guidance,
             encoder_hidden_states=prompt_embeds,
             txt_ids=text_ids,
@@ -802,9 +805,9 @@ class Flux2Adapter(BaseAdapter):
         # Scheduler step
         output = self.scheduler.step(
             noise_pred=noise_pred,
-            sigma=sigma,
-            sigma_prev=sigma_prev,
+            timestep=t,
             latents=latents,
+            timestep_next=t_next,
             next_latents=next_latents,
             compute_log_prob=compute_log_prob,
             return_dict=True,
@@ -816,7 +819,6 @@ class Flux2Adapter(BaseAdapter):
     def forward(
         self,
         t: torch.Tensor,
-        t_next: torch.Tensor,
         latents: torch.Tensor,
         latent_ids: Union[torch.Tensor, List[torch.Tensor]],
         prompt_embeds: torch.Tensor,
@@ -824,9 +826,11 @@ class Flux2Adapter(BaseAdapter):
         # Optional for I2I (can be List for ragged batches)
         image_latents: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
         image_latent_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
+        # Next timestep info
+        t_next: Optional[torch.Tensor] = None,
+        next_latents: Optional[torch.Tensor] = None,
         # Other
         guidance_scale: float = 4.0,
-        next_latents: Optional[torch.Tensor] = None,
         noise_level: Optional[float] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
@@ -846,7 +850,6 @@ class Flux2Adapter(BaseAdapter):
             # T2I or uniform I2I, call _forward() directly
             return self._forward(
                 t=t,
-                t_next=t_next,
                 latents=latents,
                 latent_ids=latent_ids,
                 prompt_embeds=prompt_embeds,
@@ -854,6 +857,7 @@ class Flux2Adapter(BaseAdapter):
                 image_latents=image_latents,
                 image_latent_ids=image_latent_ids,
                 guidance_scale=guidance_scale,
+                t_next=t_next,
                 next_latents=next_latents,
                 joint_attention_kwargs=joint_attention_kwargs,
                 compute_log_prob=compute_log_prob,
@@ -890,7 +894,6 @@ class Flux2Adapter(BaseAdapter):
 
             out = self._forward(
                 t=single_t,
-                t_next=single_t_next,
                 latents=single_latents,
                 latent_ids=single_latent_ids,
                 prompt_embeds=single_prompt_embeds,
@@ -898,6 +901,7 @@ class Flux2Adapter(BaseAdapter):
                 image_latents=single_image_latents,
                 image_latent_ids=single_image_latent_ids,
                 guidance_scale=guidance_scale,
+                t_next=single_t_next,
                 next_latents=single_next_latents,
                 joint_attention_kwargs=joint_attention_kwargs,
                 compute_log_prob=compute_log_prob,

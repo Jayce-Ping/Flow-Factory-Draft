@@ -551,6 +551,7 @@ class Wan2_I2V_Adapter(BaseAdapter):
         for i, t in enumerate(timesteps):
             self.pipeline._current_timestep = t
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
+            t_next = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
             return_kwargs = list(set(['next_latents', 'log_prob', 'noise_pred'] + extra_call_back_kwargs))
 
             output = self.forward(
@@ -649,9 +650,6 @@ class Wan2_I2V_Adapter(BaseAdapter):
         t: torch.Tensor,
         latents: torch.Tensor,
         prompt_embeds: torch.Tensor,
-        # Next timestep info
-        t_next: Optional[torch.Tensor] = None,
-        next_latents: Optional[torch.Tensor] = None,
         # Optional for CFG
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         guidance_scale: float = 5.0,
@@ -661,6 +659,9 @@ class Wan2_I2V_Adapter(BaseAdapter):
         condition: Optional[torch.Tensor] = None,
         first_frame_mask: Optional[torch.Tensor] = None,
         boundary_timestep: Optional[float] = None,
+        # Next timestep info
+        t_next: Optional[torch.Tensor] = None,
+        next_latents: Optional[torch.Tensor] = None,
         # Other
         noise_level: Optional[float] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,

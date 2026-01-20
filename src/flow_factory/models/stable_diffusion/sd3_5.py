@@ -29,7 +29,12 @@ from accelerate import Accelerator
 
 from ...hparams import *
 from ..abc import BaseAdapter, BaseSample
-from ...scheduler import FlowMatchEulerDiscreteSDEScheduler, FlowMatchEulerDiscreteSDESchedulerOutput, set_scheduler_timesteps
+from ...scheduler import (
+    FlowMatchEulerDiscreteSDEScheduler,
+    FlowMatchEulerDiscreteSDESchedulerOutput,
+    SDESchedulerOutput,
+    set_scheduler_timesteps
+)
 from ...utils.base import filter_kwargs
 
 
@@ -256,7 +261,6 @@ class SD3_5Adapter(BaseAdapter):
 
             output = self.forward(
                 t=t,
-                t_next=t_next,
                 latents=latents,
                 prompt_embeds=prompt_embeds,
                 pooled_prompt_embeds=pooled_prompt_embeds,
@@ -325,7 +329,6 @@ class SD3_5Adapter(BaseAdapter):
     def forward(
         self,
         t: torch.Tensor,
-        t_next: torch.Tensor,
         latents: torch.Tensor,
         prompt_embeds: torch.Tensor,
         pooled_prompt_embeds: torch.Tensor,
@@ -333,8 +336,10 @@ class SD3_5Adapter(BaseAdapter):
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         negative_pooled_prompt_embeds: Optional[torch.Tensor] = None,
         guidance_scale: float = 7.5,
-        # Other
+        # Next timestep info
+        t_next: Optional[torch.Tensor] = None,
         next_latents: Optional[torch.Tensor] = None,
+        # Other
         noise_level: Optional[float] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
@@ -363,8 +368,6 @@ class SD3_5Adapter(BaseAdapter):
         """
         # 1. Prepare variables
         batch_size = latents.shape[0]
-        sigma = t / 1000
-        sigma_prev = t_next / 1000
         timestep = t.expand(batch_size).to(latents.dtype)
         
         # Auto-detect CFG
@@ -404,9 +407,9 @@ class SD3_5Adapter(BaseAdapter):
         # 5. Scheduler step
         output = self.scheduler.step(
             noise_pred=noise_pred,
-            sigma=sigma,
-            sigma_prev=sigma_prev,
+            timestep=t,
             latents=latents,
+            timestep_next=t_next,
             next_latents=next_latents,
             compute_log_prob=compute_log_prob,
             return_dict=True,

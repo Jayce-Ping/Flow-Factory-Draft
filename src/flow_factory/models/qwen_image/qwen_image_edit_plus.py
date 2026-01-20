@@ -33,7 +33,12 @@ from diffusers.utils.torch_utils import randn_tensor
 from ..abc import BaseAdapter
 from ..samples import I2ISample
 from ...hparams import *
-from ...scheduler import FlowMatchEulerDiscreteSDEScheduler, FlowMatchEulerDiscreteSDESchedulerOutput, set_scheduler_timesteps
+from ...scheduler import (
+    FlowMatchEulerDiscreteSDEScheduler,
+    FlowMatchEulerDiscreteSDESchedulerOutput,
+    SDESchedulerOutput,
+    set_scheduler_timesteps
+)
 from ...utils.logger_utils import setup_logger
 from ...utils.base import filter_kwargs
 from ...utils.image import (
@@ -549,7 +554,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         prompt_embeds: Optional[Union[List[torch.Tensor], torch.Tensor]] = None,
         prompt_ids: Optional[Union[List[torch.Tensor], torch.Tensor]] = None,
         device : Optional[torch.device] = None,
-    ) -> Tuple[List[int], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[List[int], torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         if isinstance(prompt_embeds_mask, list):
             device = device or prompt_embeds_mask[0].device
             txt_seq_lens = [mask.sum() for mask in prompt_embeds_mask]
@@ -586,12 +591,12 @@ class QwenImageEditPlusAdapter(BaseAdapter):
             max_len=max_pos_len,
         )
         # Make the output order the args order
-        results = [txt_seq_lens, padded_prompt_embeds_mask]
-        if padded_prompt_embeds is not None:
-            results.append(padded_prompt_embeds)
-        if padded_prompt_ids is not None:
-            results.append(padded_prompt_ids)
-        return tuple(results)
+        return (
+            txt_seq_lens,
+            padded_prompt_embeds_mask,
+            padded_prompt_embeds,
+            padded_prompt_ids,
+        )
     
     # ======================== Sampling / Inference ========================
     # Handle one sample
@@ -774,7 +779,6 @@ class QwenImageEditPlusAdapter(BaseAdapter):
 
             output = self._forward(
                 t=t,
-                t_next=t_next,
                 latents=latents,
                 prompt_embeds=prompt_embeds,
                 prompt_embeds_mask=prompt_embeds_mask,
@@ -945,7 +949,6 @@ class QwenImageEditPlusAdapter(BaseAdapter):
     def _forward(
         self,
         t: torch.Tensor,
-        t_next: torch.Tensor,
         latents: torch.Tensor,
         prompt_embeds: torch.Tensor,
         prompt_embeds_mask: torch.Tensor,
@@ -956,8 +959,10 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         negative_prompt_embeds: Optional[Union[List[torch.Tensor], torch.Tensor]] = None,
         negative_prompt_embeds_mask: Optional[Union[List[torch.Tensor], torch.Tensor]] = None,
         guidance_scale: float = 4.0,
-        # Other
+        # Next timestep info
+        t_next: Optional[torch.Tensor] = None,
         next_latents: Optional[torch.Tensor] = None,
+        # Other
         noise_level: Optional[float] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
@@ -1002,14 +1007,14 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         # Prepare txt_seq_lens and negative_txt_seq_lens, which will be deprecated in `diffuers==0.39.0`,
         # to update, just modify the following lines accordingly.
         # Truncate prompt embeddings and masks to max valid lengths in the batch
-        txt_seq_lens, prompt_embeds_mask, prompt_embeds = self._pad_batch_prompt(
+        txt_seq_lens, prompt_embeds_mask, prompt_embeds, _ = self._pad_batch_prompt(
             prompt_embeds_mask=prompt_embeds_mask,
             prompt_embeds=prompt_embeds,
             device=device
         )
 
         if do_true_cfg:
-            negative_txt_seq_lens, negative_prompt_embeds_mask, negative_prompt_embeds = self._pad_batch_prompt(
+            negative_txt_seq_lens, negative_prompt_embeds_mask, negative_prompt_embeds, _ = self._pad_batch_prompt(
                 prompt_embeds_mask=negative_prompt_embeds_mask,
                 prompt_embeds=negative_prompt_embeds,
                 device=device
@@ -1065,9 +1070,9 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         # 3. Scheduler step
         output = self.scheduler.step(
             noise_pred=noise_pred,
-            sigma=sigma,
-            sigma_prev=sigma_prev,
+            timestep=t,
             latents=latents,
+            timestep_next=t_next,
             next_latents=next_latents,
             compute_log_prob=compute_log_prob,
             return_dict=True,
@@ -1079,7 +1084,6 @@ class QwenImageEditPlusAdapter(BaseAdapter):
     def forward(
         self,
         t: torch.Tensor,
-        t_next: torch.Tensor,
         latents: torch.Tensor,
         prompt_embeds: torch.Tensor,
         prompt_embeds_mask: Union[torch.Tensor, List[torch.Tensor]],
@@ -1090,8 +1094,10 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         negative_prompt_embeds: Optional[Union[List[torch.Tensor], torch.Tensor]] = None,
         negative_prompt_embeds_mask: Optional[Union[List[torch.Tensor], torch.Tensor]] = None,
         guidance_scale: float = 4.0,
-        # Other
+        # Next timestep info
+        t_next: Optional[torch.Tensor] = None,
         next_latents: Optional[torch.Tensor] = None,
+        # Other
         noise_level: Optional[float] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
