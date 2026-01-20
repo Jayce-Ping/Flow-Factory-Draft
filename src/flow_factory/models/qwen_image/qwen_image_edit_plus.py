@@ -994,8 +994,6 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         # 1. Prepare inputs
         device = latents.device
         batch_size = latents.shape[0]
-        sigma = t / 1000
-        sigma_prev = t_next / 1000
         timestep = t.expand(batch_size).to(latents.dtype)
         has_negative_prompt = (
             negative_prompt_embeds is not None
