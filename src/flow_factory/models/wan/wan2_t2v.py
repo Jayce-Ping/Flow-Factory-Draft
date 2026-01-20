@@ -470,7 +470,7 @@ class Wan2_T2V_Adapter(BaseAdapter):
         t = t[0] if t.ndim == 1 else t # A scalar
         if t_next is not None:
             t_next = t_next[0] if t_next.ndim == 1 else t_next
-
+        logger.info(f"boundary_timestep={boundary_timestep}, t={t}, t_next={t_next}, noise_level={noise_level}")
         batch_size = latents.shape[0]
         device = latents.device
         dtype = self.pipeline.transformer.dtype if self.pipeline.transformer is not None else self.pipeline.transformer_2.dtype

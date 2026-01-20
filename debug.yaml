@@ -25,7 +25,7 @@ model:
   lora_rank : 64
   lora_alpha : 128
   target_components: ['transformer', 'transformer_2'] # Options: transformer (Wan2.1 & Wan2.2), transformer_2 (Wan2.2)
-  target_modules: "transformer_2.default" # Options: all, default, or list of module names like ["to_k", "to_q", "to_v", "to_out.0"]
+  target_modules: "default" # Options: all, default, or list of module names like ["to_k", "to_q", "to_v", "to_out.0"]
   # model_name_or_path: "Qwen/Qwen-Image-Edit-2509"  # Options: black-forest-labs/FLUX.2-klein-base-4B, black-forest-labs/FLUX.2-klein-base-9B
   # model_type: "qwen-image-edit-plus"
   # model_name_or_path: "black-forest-labs/FLUX.2-klein-base-4B"  # Options: black-forest-labs/FLUX.2-klein-base-4B, black-forest-labs/FLUX.2-klein-base-9B

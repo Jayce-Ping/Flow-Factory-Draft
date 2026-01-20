@@ -276,9 +276,11 @@ class UniPCMultistepSDEScheduler(UniPCMultistepScheduler, SDESchedulerMixin):
 
         # 2. Prepare variables
         dynamics_type = dynamics_type or self.dynamics_type
-        if noise_level is None:
+        if (self.is_eval or dynamics_type == 'ODE'):
+            noise_level = 0.0
+        elif noise_level is None:
             # Auto-infer the noise_level
-            noise_level = 0.0 if (self.is_eval or dynamics_type == 'ODE') else self.get_noise_level_for_sigma(sigma)
+            noise_level = self.get_noise_level_for_sigma(sigma)
 
         noise_level = to_broadcast_tensor(noise_level, latents) # To (B, 1, 1)
         sigma = to_broadcast_tensor(sigma, latents)
