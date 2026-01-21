@@ -78,7 +78,8 @@ DIFFUSION_WEIGHTS_INDEX_NAME = f"{DIFFUSION_WEIGHTS_NAME}.index.json"
 SAFE_DIFFUSION_WEIGHTS_NAME = "diffusion_pytorch_model.safetensors"
 SAFE_DIFFUSION_WEIGHTS_PATTERN_NAME = "diffusion_pytorch_model{suffix}.safetensors"
 SAFE_DIFFUSION_WEIGHTS_INDEX_NAME = f"{SAFE_DIFFUSION_WEIGHTS_NAME}.index.json"
-
+LORA_ADAPTER_CONFIG_NAME = "adapter_config.json"
+LORA_ADAPTER_WEIGHTS_NAME = "adapter_model.safetensors"
 
 logger = setup_logger(__name__)
 
@@ -1352,7 +1353,7 @@ class BaseAdapter(ABC):
             unwrapped = self.accelerator.unwrap_model(component)
             
             # Auto-detect checkpoint format
-            adapter_config_path = os.path.join(comp_path, "adapter_config.json")
+            adapter_config_path = os.path.join(comp_path, LORA_ADAPTER_CONFIG_NAME)
             has_config_file = os.path.exists(adapter_config_path)
             
             if has_config_file:
@@ -1365,15 +1366,8 @@ class BaseAdapter(ABC):
                     setattr(self, comp_name, unwrapped)
                 else:
                     unwrapped.load_adapter(comp_path, unwrapped.active_adapter)
-                
-                if self.accelerator.is_main_process:
-                    logger.info(f"LoRA adapter loaded (PeftModel format) for {comp_name} from {comp_path}")
             else:
                 # No config file found, manual `state_dict` loading with key mapping
-                if self.accelerator.is_main_process:
-                    logger.info(f"Detected `diffusers` LoRA format for {comp_name}, applying key mapping...")
-                
-                # Load `state_dict`
                 # Detect `safetensors` or `bin` format with `safetensors` preferred
                 safetensors_files = glob.glob(os.path.join(comp_path, "*.safetensors"))
                 if safetensors_files:
@@ -1390,8 +1384,8 @@ class BaseAdapter(ABC):
                 
                 if self.accelerator.is_main_process:
                     logger.info(
-                        f"Loaded LoRA state_dict from: {state_dict_path}. "
-                        f"If this is not wanted, please make sure the directory contains only single checkpoint file."
+                        f"Loaded LoRA `state_dict` from: {state_dict_path}. "
+                        f"If this is not wanted, please make sure the directory contains only single checkpoint file. "
                     )
 
                 state_dict = load_file(state_dict_path) if state_dict_path.endswith('.safetensors') else torch.load(state_dict_path)
@@ -1435,9 +1429,11 @@ class BaseAdapter(ABC):
                         logger.warning(f"Missing keys: {missing[:5]}...")
                     if unexpected:
                         logger.warning(f"Unexpected keys: {unexpected[:5]}...")
-                    logger.info(f"LoRA adapter loaded (legacy format) for {comp_name} from {comp_path}")
                 
                 setattr(self, comp_name, unwrapped)
+            
+            if self.accelerator.is_main_process:
+                logger.info(f"LoRA adapter loaded for {comp_name} from {comp_path}")
 
     def _load_full_model(self, path: str, strict: bool = True) -> None:
         """Load full model weights for target components."""

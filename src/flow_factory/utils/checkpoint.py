@@ -30,11 +30,13 @@ def mapping_lora_state_dict(
         adapter_name: str = "default"
     ) -> Dict[str, torch.Tensor]:
     """
-    Map  LoRA state_dict keys to PeftModel format.
-    Converts 'lora_A.weight' -> 'lora_A.default.weight'
+    Map LoRA state_dict keys to PeftModel format.
+    Converts 'xxx.lora_A.weight' -> 'base_model.model.xxx.lora_A.default.weight'
     """
     new_state_dict = {}
     for key, value in state_dict.items():
+        if not key.startswith('base_model.model'):
+            key = 'base_model.model.' + key
         if "lora_A.weight" in key or "lora_B.weight" in key:
             new_key = key.replace("lora_A.weight", f"lora_A.{adapter_name}.weight").replace("lora_B.weight", f"lora_B.{adapter_name}.weight")
             new_state_dict[new_key] = value
