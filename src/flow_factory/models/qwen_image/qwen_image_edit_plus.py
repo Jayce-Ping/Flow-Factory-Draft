@@ -113,7 +113,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
     
     @property
     def default_target_modules(self) -> List[str]:
-        """Default LoRA target modules for Qwen-Image transformer."""
+        """Default LoRA target modules for Qwen-Image-Edit-Plus transformer."""
         return [
             # Attention
             "to_q", "to_k", "to_v", "to_out.0",

@@ -61,6 +61,7 @@ class ZImageAdapter(BaseAdapter):
     
     @property
     def default_target_modules(self) -> List[str]:
+        """Default LoRA target modules for Z-Image transformer."""
         return [
             "attention.to_k", "attention.to_q", "attention.to_v", "attention.to_out.0",
             "feed_forward.w1", "feed_forward.w2", "feed_forward.w3",

@@ -132,6 +132,7 @@ class Flux1KontextAdapter(BaseAdapter):
 
     @property
     def default_target_modules(self) -> List[str]:
+        """Default Trainable target modules for FLUX.1-Kontext-dev model."""
         return [
             "attn.to_k", "attn.to_q", "attn.to_v", "attn.to_out.0",
             "attn.add_k_proj", "attn.add_q_proj", "attn.add_v_proj", "attn.to_add_out",
