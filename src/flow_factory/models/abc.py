@@ -54,7 +54,11 @@ from accelerate.utils import (
     clean_state_dict_for_safetensors,
 )
 
-
+from ..utils.checkpoint import (
+    mapping_lora_state_dict,
+    infer_lora_config,
+    infer_target_modules,
+)
 from .samples import BaseSample
 from ..ema import EMAModuleWrapper
 from ..scheduler import (
@@ -1349,9 +1353,9 @@ class BaseAdapter(ABC):
             
             # Auto-detect checkpoint format
             adapter_config_path = os.path.join(comp_path, "adapter_config.json")
-            is_peft_format = os.path.exists(adapter_config_path)
+            has_config_file = os.path.exists(adapter_config_path)
             
-            if is_peft_format:
+            if has_config_file:
                 # Standard PeftModel format
                 if not isinstance(unwrapped, PeftModel):
                     unwrapped = PeftModel.from_pretrained(
@@ -1365,11 +1369,11 @@ class BaseAdapter(ABC):
                 if self.accelerator.is_main_process:
                     logger.info(f"LoRA adapter loaded (PeftModel format) for {comp_name} from {comp_path}")
             else:
-                # `diffusers`/`Diffsynth-Studio` format - manual state_dict loading with key mapping
+                # No config file found, manual `state_dict` loading with key mapping
                 if self.accelerator.is_main_process:
                     logger.info(f"Detected `diffusers` LoRA format for {comp_name}, applying key mapping...")
                 
-                # Load state_dict
+                # Load `state_dict`
                 # Detect `safetensors` or `bin` format with `safetensors` preferred
                 safetensors_files = glob.glob(os.path.join(comp_path, "*.safetensors"))
                 if safetensors_files:
@@ -1385,17 +1389,22 @@ class BaseAdapter(ABC):
                         continue
                 
                 if self.accelerator.is_main_process:
-                    logger.info(f"Loaded LoRA state_dict from: {state_dict_path}")
+                    logger.info(
+                        f"Loaded LoRA state_dict from: {state_dict_path}. "
+                        f"If this is not wanted, please make sure the directory contains only single checkpoint file."
+                    )
 
                 state_dict = load_file(state_dict_path) if state_dict_path.endswith('.safetensors') else torch.load(state_dict_path)
                 
                 # Apply key mapping for legacy format
-                state_dict = self._mapping_lora_state_dict(state_dict)
+                state_dict = mapping_lora_state_dict(state_dict)
                 
                 # Infer LoRA configuration from state_dict
-                lora_rank, lora_alpha = self._infer_lora_config_from_state_dict(state_dict)
+                lora_rank, lora_alpha = infer_lora_config(state_dict)
                 lora_alpha = self.model_args.lora_alpha or lora_alpha # Use model arg if given
-                target_modules = self._infer_target_modules_from_state_dict(state_dict)
+                if self.model_args.target_modules in [None, 'default']:
+                    # If default, infer target modules
+                    target_modules = infer_target_modules(state_dict)
                 
                 if self.accelerator.is_main_process:
                     logger.info(
@@ -1417,6 +1426,9 @@ class BaseAdapter(ABC):
                 
                 # Load mapped state_dict
                 missing, unexpected = unwrapped.load_state_dict(state_dict, strict=False)
+
+                # Filter missing keys to LoRA only
+                missing = [k for k in missing if any(lk in k for lk in self.lora_keys)]
                 
                 if self.accelerator.is_main_process:
                     if missing:
@@ -1426,95 +1438,6 @@ class BaseAdapter(ABC):
                     logger.info(f"LoRA adapter loaded (legacy format) for {comp_name} from {comp_path}")
                 
                 setattr(self, comp_name, unwrapped)
-
-    @staticmethod
-    def _mapping_lora_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Map `diffusers` LoRA state_dict keys to PeftModel format.
-        Converts 'lora_A.weight' -> 'lora_A.default.weight'
-        """
-        new_state_dict = {}
-        for key, value in state_dict.items():
-            if "lora_A.weight" in key or "lora_B.weight" in key:
-                new_key = key.replace("lora_A.weight", "lora_A.default.weight").replace("lora_B.weight", "lora_B.default.weight")
-                new_state_dict[new_key] = value
-            elif "lora_A.default.weight" in key or "lora_B.default.weight" in key:
-                # Already in correct format
-                new_state_dict[key] = value
-            else:
-                # Keep other keys as-is
-                new_state_dict[key] = value
-        return new_state_dict
-
-    @staticmethod
-    def _infer_lora_config_from_state_dict(
-        state_dict: Dict[str, torch.Tensor]
-    ) -> Tuple[int, int]:
-        """
-        Infer lora_rank and lora_alpha from loaded state_dict.
-        
-        Args:
-            state_dict: LoRA state dictionary
-        
-        Returns:
-            Tuple of (lora_rank, lora_alpha)
-        
-        Note:
-            - lora_rank is inferred from lora_A weight shape
-            - lora_alpha defaults to lora_rank (common practice)
-        """
-        lora_rank = None
-        
-        # Find first lora_A weight to infer rank
-        for key, tensor in state_dict.items():
-            if "lora_A" in key and "weight" in key:
-                # lora_A shape: [rank, in_features]
-                lora_rank = tensor.shape[0]
-                break
-        
-        if lora_rank is None:
-            # Fallback: try lora_B
-            for key, tensor in state_dict.items():
-                if "lora_B" in key and "weight" in key:
-                    # lora_B shape: [out_features, rank]
-                    lora_rank = tensor.shape[1]
-                    break
-        
-        if lora_rank is None:
-            raise ValueError("Cannot infer lora_rank from state_dict - no lora_A or lora_B weights found")
-        
-        # Check if there's a scaling parameter (some implementations save this)
-        lora_alpha = None
-        for key in state_dict.keys():
-            if "lora_alpha" in key.lower() or "scaling" in key.lower():
-                # Some implementations save alpha as a parameter
-                lora_alpha = int(state_dict[key].item())
-                break
-        
-        # Default: lora_alpha = lora_rank (standard practice)
-        if lora_alpha is None:
-            lora_alpha = lora_rank
-        
-        return lora_rank, lora_alpha
-
-    @staticmethod
-    def _infer_target_modules_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> List[str]:
-        """
-        Infer target_modules from loaded state_dict keys.
-        Extracts module names from keys like 'module.to_q.lora_A.default.weight'
-        """
-        target_modules = set()
-        for key in state_dict.keys():
-            if "lora_A" in key or "lora_B" in key:
-                # Extract module name: 'layer.to_q.lora_A.default.weight' -> 'to_q'
-                parts = key.split(".")
-                for i, part in enumerate(parts):
-                    if part in ["lora_A", "lora_B"]:
-                        if i > 0:
-                            target_modules.add(parts[i-1])
-                        break
-        
-        return sorted(list(target_modules))
 
     def _load_full_model(self, path: str, strict: bool = True) -> None:
         """Load full model weights for target components."""
