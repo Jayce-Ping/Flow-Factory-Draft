@@ -37,22 +37,21 @@ log:
 # Training Configuration
 train:
   # Trainer settings
-  trainer_type: 'awm'
-  awm_weighting: Uniform
+  trainer_type: 'nft'
+  nft_beta: 1
   # Training Timestep distribution
   num_train_timesteps: 4 # Default to all steps
   time_type: Uniform
   time_shift: 3.0
+  # KL div
+  kl_type: 'v-based'
+  kl_beta: 0 # KL divergence beta, 0 to disable
+  ref_param_device: 'cuda' # Options: cpu, cuda
   # Clipping
   clip_range: 1.0e-4  # PPO/GRPO clipping range
   adv_clip_range: 5.0  # Advantage clipping range
   max_grad_norm: 1.0  # Max gradient norm for clipping
-  # KL div
-  ema_kl_beta: 0 # Used for KL-loss between current policy and EMA policy
-  kl_weight: 'Uniform'
-  kl_type: 'v-based'
-  kl_beta: 0 # KL divergence beta
-  ref_param_device: 'cuda' # Options: cpu, cuda
+
 
   # Sampling Settings
   resolution: 384  # Can be int or [height, width]
@@ -91,8 +90,8 @@ scheduler:
 
 # Evaluation settings
 eval:
-  resolution: 512  # Evaluation resolution
-  condition_image_size: 512
+  resolution: 1024  # Evaluation resolution
+  condition_image_size: 1024
   per_device_batch_size: 1  # Eval batch size
   guidance_scale: 4.0  # Guidance scale for sampling
   num_inference_steps: 20  # Number of eval timesteps
