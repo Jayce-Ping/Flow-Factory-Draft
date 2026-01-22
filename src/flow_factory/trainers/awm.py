@@ -21,7 +21,7 @@ from typing import List, Dict, Optional, Any, Union, Literal
 from functools import partial
 from collections import defaultdict
 import math
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
@@ -151,6 +151,15 @@ class AWMTrainer(GRPOTrainer):
     def enable_ema_kl_penalty(self) -> bool:
         """Check if EMA-based KL penalty is enabled."""
         return self.ema_kl_beta > 0.0
+    
+    @contextmanager
+    def sampling_context(self):
+        """Context manager for sampling with or without EMA parameters."""
+        if self.off_policy:
+            with self.adapter.use_ema_parameters():
+                yield
+        else:
+            yield
 
     def start(self):
         """Main training loop."""
@@ -178,12 +187,7 @@ class AWMTrainer(GRPOTrainer):
                 self.evaluate()
 
             # Sample with EMA model if off-policy
-            sampling_context = (
-                self.adapter.use_ema_parameters() 
-                if self.off_policy 
-                else nullcontext()
-            )
-            with sampling_context:
+            with self.sampling_context():
                 samples = self.sample()
             
             self.optimize(samples)
@@ -276,8 +280,9 @@ class AWMTrainer(GRPOTrainer):
             Tensor of shape (num_train_timesteps, batch_size) with t in (0, 1).
         """
         device = self.accelerator.device
+        time_type = self.time_type.lower()
         
-        if self.time_type == 'logit_normal':
+        if time_type == 'logit_normal':
             t = TimeSampler.logit_normal_shifted(
                 batch_size=batch_size,
                 num_timesteps=self.num_train_timesteps,
@@ -285,7 +290,7 @@ class AWMTrainer(GRPOTrainer):
                 device=device,
                 stratified=True,
             )
-        elif self.time_type == 'uniform':
+        elif time_type == 'uniform':
             t = TimeSampler.uniform(
                 batch_size=batch_size,
                 num_timesteps=self.num_train_timesteps,
@@ -293,7 +298,7 @@ class AWMTrainer(GRPOTrainer):
                 device=device,
             )
         else:
-            raise ValueError(f"Unknown time_type: {self.time_type}")
+            raise ValueError(f"Unknown time_type: {self.time_type}, available: ['logit_normal', 'uniform']")
         
         return t  # (num_train_timesteps, batch_size)
 
@@ -422,16 +427,10 @@ class AWMTrainer(GRPOTrainer):
                     noise = all_random_noise[t_idx]
                     noised_latents = (1 - t_broadcast) * clean_latents + t_broadcast * noise
                     
-                    with torch.no_grad():
-                        if self.off_policy:
-                            with self.adapter.use_ema_parameters():
-                                old_output = self._compute_awm_output(
-                                    batch, t_flat, noised_latents, clean_latents, noise
-                                )
-                        else:
-                            old_output = self._compute_awm_output(
-                                batch, t_flat, noised_latents, clean_latents, noise
-                            )
+                    with torch.no_grad(), self.autocast(), self.sampling_context():
+                        old_output = self._compute_awm_output(
+                            batch, t_flat, noised_latents, clean_latents, noise
+                        )
                     
                     old_log_probs_list.append(old_output['log_prob'].detach())  # (B,)
                 
