@@ -14,42 +14,98 @@
 
 # src/flow_factory/trainers/nft.py
 """
-DiffusionNFT Trainer.
+DiffusionNFT Trainer with off-policy and continuous timestep support.
 Reference: https://arxiv.org/abs/2509.16117
 """
 import os
-from typing import List, Dict, Optional, Any, Union
+from typing import List, Dict, Any, Union, Optional
 from functools import partial
 from collections import defaultdict
-import inspect
-import logging
+from contextlib import nullcontext, contextmanager
 import numpy as np
 import torch
-from torch.nn.utils.rnn import pad_sequence
+from diffusers.utils.torch_utils import randn_tensor
 import tqdm as tqdm_
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from .abc import BaseTrainer
 from ..models.abc import BaseSample
-from ..rewards import BaseRewardModel
-from ..utils.base import filter_kwargs, create_generator
+from ..utils.base import filter_kwargs, create_generator, to_broadcast_tensor
 from ..utils.logger_utils import setup_logger
+from ..utils.noise_schedule import TimeSampler
 
 logger = setup_logger(__name__)
 
+
+
 class DiffusionNFTTrainer(BaseTrainer):
     """
-    DiffusionNFT Trainer.
+    DiffusionNFT Trainer with off-policy and continuous timestep support.
     Reference: https://arxiv.org/abs/2509.16117
     """
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        
+        # NFT-specific config
+        self.nft_beta = getattr(self.training_args, 'nft_beta', 1.0)
+        self.off_policy = getattr(self.training_args, 'off_policy', False)
+        
+        # Timestep sampling config
+        self.time_type = getattr(self.training_args, 'time_type', 'logit_normal')
+        self.time_shift = getattr(self.training_args, 'time_shift', 3.0)
+        self.num_train_timesteps = getattr(self.training_args, 'num_train_timesteps', self.training_args.num_inference_steps)
+        
+        # Check args
+        self.kl_type = getattr(self.training_args, 'kl_type', 'v-based')
+        if self.kl_type != 'v-based':
+            logger.warning(f"DiffusionNFT-Trainer only supports 'v-based' KL loss, got {self.kl_type}, switching to 'v-based'.")
+            self.kl_type = 'v-based'
 
     @property
-    def enable_kl_penalty(self) -> bool:
+    def enable_kl_loss(self) -> bool:
         """Check if KL penalty is enabled."""
         return self.training_args.kl_beta > 0.0
+    
+    @contextmanager
+    def sampling_context(self):
+        """Context manager for sampling with or without EMA parameters."""
+        if self.off_policy:
+            with self.adapter.use_ema_parameters():
+                yield
+        else:
+            yield
+
+    def _sample_timesteps(self, batch_size: int, device: Optional[torch.device] = None) -> torch.Tensor:
+        """
+        Sample continuous timesteps.
+        
+        Returns:
+            Tensor of shape (num_train_timesteps, batch_size) with t in (0, 1).
+        """
+        device = device or self.accelerator.device
+        available_types = ['logit_normal', 'uniform']
+        
+        assert self.time_type.lower() in available_types, \
+            f"Unknown time_type: {self.time_type}, available: {available_types}"
+
+        if self.time_type == 'logit_normal':
+            timesteps = TimeSampler.logit_normal_shifted(
+                batch_size=batch_size,
+                num_timesteps=self.num_train_timesteps,
+                shift=self.time_shift,
+                device=device,
+                stratified=True,
+            )
+        elif self.time_type == 'uniform':
+            timesteps = TimeSampler.uniform(
+                batch_size=batch_size,
+                num_timesteps=self.num_train_timesteps,
+                shift=self.time_shift,
+                device=device,
+            )
+
+        return timesteps  # (num_train_timesteps, batch_size)
 
     def start(self):
         """Main training loop."""
@@ -76,14 +132,12 @@ class DiffusionNFTTrainer(BaseTrainer):
             ):
                 self.evaluate()
 
-            with self.adapter.use_ema_parameters():
-                # Sampling with the EMA model
+            # Sampling: use EMA if off_policy
+            with self.sampling_context():
                 samples = self.sample()
 
             self.optimize(samples)
-
             self.adapter.ema_step(step=self.epoch)
-
             self.epoch += 1
 
     def sample(self) -> List[BaseSample]:
@@ -102,8 +156,7 @@ class DiffusionNFTTrainer(BaseTrainer):
             with torch.no_grad(), self.autocast():
                 sample_kwargs = {
                     **self.training_args,
-                    'compute_log_prob': False, # No need to compute log probs during sampling
-                    'extra_call_back_kwargs': ['noise_pred'],
+                    'compute_log_prob': False,
                     **batch
                 }
                 sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
@@ -113,9 +166,10 @@ class DiffusionNFTTrainer(BaseTrainer):
 
         return samples
 
+    # Copied from src.flow_factory.trainers.grpo.GRPOTrainer.compute_advantages.
     def compute_advantages(self, samples: List[BaseSample], rewards: Dict[str, torch.Tensor], store_to_samples: bool = True) -> torch.Tensor:
         """
-        Compute advantages for GRPO.
+        Compute advantages for DiffusionNFT.
         Args:
             samples: List of BaseSample instances
             rewards: Dict of reward_name to reward tensors - these should be aligned with samples
@@ -126,7 +180,6 @@ class DiffusionNFTTrainer(BaseTrainer):
             - If you want to customize advantage computation (e.g., different normalization),
             you can override this method in a subclass, e.g., for GDPO.
         """
-
         # 1. Get rewards
         rewards = {key: torch.as_tensor(value).to(self.accelerator.device) for key, value in rewards.items()}
         gathered_rewards = {
@@ -201,17 +254,51 @@ class DiffusionNFTTrainer(BaseTrainer):
 
         return advantages
 
+    def _compute_nft_output(
+        self,
+        batch: Dict[str, Any],
+        timestep: torch.Tensor,
+        noised_latents: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute NFT forward pass for a single timestep.
+        
+        Args:
+            batch: Batch containing prompt embeddings and other inputs.
+            timestep: Timestep tensor of shape (B,) in [0, 1].
+            noised_latents: Interpolated latents x_t = (1-t)*x_1 + t*noise.
+        
+        Returns:
+            Dict with noise_pred and std_dev_t.
+        """
+        t_scaled = (timestep * 1000).view(-1)  # Scale to [0, 1000], ensure (B,)
+        
+        forward_kwargs = {
+            **self.training_args,
+            't': t_scaled,
+            't_next': torch.zeros_like(t_scaled),
+            'latents': noised_latents,
+            'compute_log_prob': False,
+            'return_kwargs': ['noise_pred'],
+            **{k: v for k, v in batch.items() if k not in ['all_latents', 'timesteps', 'advantage']},
+        }
+        forward_kwargs = filter_kwargs(self.adapter.forward, **forward_kwargs)
+        
+        with self.autocast():
+            output = self.adapter.forward(**forward_kwargs)
+        
+        return {
+            'noise_pred': output.noise_pred,
+        }
+
     def optimize(self, samples: List[BaseSample]) -> None:
-        """Main training loop: compute loss and update policy."""
+        """Main optimization loop with continuous timestep sampling."""
         self.adapter.train()
         # Compute rewards and advantages for samples
         rewards = self.reward_processor.compute_rewards(samples, store_to_samples=True, epoch=self.epoch)
         advantages = self.compute_advantages(samples, rewards, store_to_samples=True)
     
-        # Create batches for optimization
-        # `BaseSample.stack` will try to stack all tensor fields,
-        # stack non-tensor fields as a list, keep shared fields as single value
-        sample_batches : List[Dict[str, Union[torch.Tensor, Any, List[Any]]]] = [
+        sample_batches: List[Dict[str, Union[torch.Tensor, Any, List[Any]]]] = [
             BaseSample.stack(samples[i:i + self.training_args.per_device_batch_size])
             for i in range(0, len(samples), self.training_args.per_device_batch_size)
         ]
@@ -225,140 +312,97 @@ class DiffusionNFTTrainer(BaseTrainer):
             position=0,
             disable=not self.accelerator.is_local_main_process,
         )):
+            batch_size = batch['all_latents'].shape[0]
+            clean_latents = batch['all_latents'][:, -1]  # x0
+            
             with self.accelerator.accumulate(self.adapter.transformer):
-                for idx, timestep_index in enumerate(tqdm(
-                    self.adapter.scheduler.train_timesteps,
+                # Sample timesteps: (T, B)
+                all_timesteps = self._sample_timesteps(batch_size)
+                
+                for t_idx in tqdm(
+                    range(self.num_train_timesteps),
                     desc=f'Epoch {self.epoch} Timestep',
                     position=1,
                     leave=False,
                     disable=not self.accelerator.is_local_main_process,
-                )):
-                    # 1. Prepare forward inputs 
-                    timestep = samples[0].timesteps[timestep_index].to(self.accelerator.device)
-                    timestep_next = (
-                        samples[0].timesteps[timestep_index + 1].to(self.accelerator.device)
-                        if timestep_index + 1 < len(self.adapter.scheduler.train_timesteps)
-                        else torch.tensor(0.0, device=self.accelerator.device)
-                    )
-                    t = (timestep / 1000).view(-1, *([1] * (output.noise_pred.dim() - 1)))
-
-                    # 2. Forward pass
-                    return_kwargs = ['noise_pred', 'next_latents', 'latents', 'dt']
-                    forward_inputs = {
-                        **self.training_args,
-                        't': timestep,
-                        't_next': timestep_next,
-                        'compute_log_prob': False,
-                        'return_kwargs': return_kwargs,
-                        **batch,
-                    }
-                    forward_inputs = filter_kwargs(self.adapter.forward, **forward_inputs)
+                ):
+                    # 1. Prepare inputs
+                    t_flat = all_timesteps[t_idx]  # (B,)
+                    t_broadcast = to_broadcast_tensor(t_flat, clean_latents)
+                    noise = randn_tensor(clean_latents.shape, device=self.accelerator.device, dtype=clean_latents.dtype)
+                    noised_latents = (1 - t_broadcast) * clean_latents + t_broadcast * noise
                     
-                    with self.autocast():
-                        output = self.adapter.forward(**forward_inputs)
-
-                    # 3. Prepare variables                        
-                    nft_beta = self.training_args.nft_beta if hasattr(self.training_args, 'nft_beta') else 1 # 1 as default
-                    x0 = torch.stack([
-                        sample.all_latents[-1] for sample in batch
-                    ], dim=0)
-                    xt = torch.stack([
-                        sample.all_latents[timestep_index] for sample in batch
-                    ], dim=0)
-                    old_v_pred = torch.stack([
-                        sample.noise_pred[timestep_index] for sample in batch
-                    ], dim=0)
-                    new_v_pred = output.noise_pred
-
-                    # 4. Compute adv
-                    adv = torch.stack([
-                        sample.extra_kwargs['advantage'] for sample in batch
-                    ], dim=0)
+                    # 2. Forward pass
+                    output = self._compute_nft_output(batch, t_flat, noised_latents)
+                    new_v_pred = output['noise_pred']
+                    
+                    # Target velocity: v = noise - x0
+                    old_v_pred = noise - clean_latents
+                    
+                    # 3. Compute NFT loss
+                    # Get advantages and clip,
+                    adv = batch['advantage']
                     adv_clip_range = self.training_args.adv_clip_range
                     adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
-                    normalized_advantages_clip = (adv / adv_clip_range[1]) / 2.0 + 0.5
-                    r = torch.clamp(normalized_advantages_clip, 0, 1)
-
-                    # 5. Compute loss
-                    positive_prediction = nft_beta * new_v_pred + (1 - nft_beta) * old_v_pred.detach()
-                    implicit_negative_prediction = (1.0 + nft_beta) * old_v_pred.detach() - nft_beta * new_v_pred
-
-                    x0_prediction = xt - t * positive_prediction
-                    with torch.no_grad():
-                        weight_factor = (
-                            torch.abs(x0_prediction.double() - x0.double())
-                            .mean(dim=tuple(range(1, x0.ndim)), keepdim=True)
-                            .clip(min=0.00001)
-                        )
-                    positive_loss = ((x0_prediction - x0) ** 2 / weight_factor).mean(dim=tuple(range(1, x0.ndim)))
-
-
-                    negative_x0_prediction = xt - t * implicit_negative_prediction
-                    with torch.no_grad():
-                        negative_weight_factor = (
-                            torch.abs(negative_x0_prediction.double() - x0.double())
-                            .mean(dim=tuple(range(1, x0.ndim)), keepdim=True)
-                            .clip(min=0.00001)
-                        )
-                    negative_loss = ((negative_x0_prediction - x0) ** 2 / negative_weight_factor).mean(
-                        dim=tuple(range(1, x0.ndim))
-                    )
-
-                    ori_policy_loss = (r * positive_loss  + (1.0 - r) * negative_loss) / nft_beta
-                    policy_loss = (ori_policy_loss * adv_clip_range[1]).mean()
-
-                    loss = policy_loss
-
-                    # 6. KL penalty
-                    if self.enable_kl_penalty:
-                        with self.autocast(), torch.no_grad(), self.adapter.use_ref_parameters():
-                            ref_forward_inputs = forward_inputs.copy()
-                            ref_forward_inputs['compute_log_prob'] = False
-                            if self.training_args.kl_type == 'v-based':
-                                # KL in velocity space
-                                ref_forward_inputs['return_kwargs'] = ['noise_pred']
-                                ref_output = self.adapter.forward(**ref_forward_inputs)
-                                kl_div = torch.mean(
-                                    ((output.noise_pred - ref_output.noise_pred) ** 2),
-                                    dim=tuple(range(1, output.noise_pred.ndim)), keepdim=True
-                                ) / (2 * output.std_dev_t ** 2 + 1e-7)
-                            elif self.training_args.kl_type == 'x-based':
-                                # KL in latent space
-                                ref_forward_inputs['return_kwargs'] = ['next_latents_mean']
-                                ref_output = self.adapter.forward(**ref_forward_inputs)
-                                kl_div = torch.mean(
-                                    ((output.next_latents_mean - ref_output.next_latents_mean) ** 2),
-                                    dim=tuple(range(1, output.next_latents_mean.ndim)), keepdim=True
-                                ) / (2 * output.std_dev_t ** 2 + 1e-7)
-                        
-                        kl_div = torch.mean(kl_div)
-                        kl_penalty = self.training_args.kl_beta * kl_div
-                        loss += kl_penalty
-                        loss_info['kl_div'].append(kl_div.detach())
-                        loss_info['kl_penalty'].append(kl_penalty.detach())
-
-                    loss_info["policy_loss"].append(policy_loss.detach())
-                    loss_info["unweighted_policy_loss"].append(ori_policy_loss.mean().detach())
-                    loss_info["loss"].append(loss.detach())
-
-                    # Backward
-                    self.accelerator.backward(loss)
+                    # Normalize advantage to [0, 1]
+                    normalized_adv = (adv / adv_clip_range[1]) / 2.0 + 0.5
+                    r = torch.clamp(normalized_adv, 0, 1).view(-1, *([1] * (new_v_pred.dim() - 1)))
                     
+                    # Positive/negative predictions
+                    positive_pred = self.nft_beta * new_v_pred + (1 - self.nft_beta) * old_v_pred.detach()
+                    negative_pred = (1.0 + self.nft_beta) * old_v_pred.detach() - self.nft_beta * new_v_pred
+                    
+                    # Positive loss
+                    x0_pred = noised_latents - t_broadcast * positive_pred
+                    with torch.no_grad():
+                        weight = torch.abs(x0_pred.double() - clean_latents.double()).mean(
+                            dim=tuple(range(1, clean_latents.ndim)), keepdim=True
+                        ).clip(min=1e-5)
+                    positive_loss = ((x0_pred - clean_latents) ** 2 / weight).mean(dim=tuple(range(1, clean_latents.ndim)))
+                    
+                    # Negative loss
+                    neg_x0_pred = noised_latents - t_broadcast * negative_pred
+                    with torch.no_grad():
+                        neg_weight = torch.abs(neg_x0_pred.double() - clean_latents.double()).mean(
+                            dim=tuple(range(1, clean_latents.ndim)), keepdim=True
+                        ).clip(min=1e-5)
+                    negative_loss = ((neg_x0_pred - clean_latents) ** 2 / neg_weight).mean(dim=tuple(range(1, clean_latents.ndim)))
+                    
+                    # Combined loss
+                    ori_policy_loss = (r.squeeze() * positive_loss + (1.0 - r.squeeze()) * negative_loss) / self.nft_beta
+                    policy_loss = (ori_policy_loss * adv_clip_range[1]).mean()
+                    loss = policy_loss
+                    
+                    # 4. KL penalty
+                    if self.enable_kl_loss:
+                        with torch.no_grad(), self.adapter.use_ref_parameters():
+                            ref_output = self._compute_nft_output(batch, t_flat, noised_latents)
+                        # KL-loss in v-space
+                        kl_div = torch.mean(
+                            (new_v_pred - ref_output['noise_pred']) ** 2,
+                            dim=tuple(range(1, new_v_pred.ndim))
+                        )
+                        
+                        kl_div = kl_div.mean()
+                        kl_loss = self.training_args.kl_beta * kl_div
+                        loss = loss + kl_loss
+                        loss_info['kl_div'].append(kl_div.detach())
+                        loss_info['kl_loss'].append(kl_loss.detach())
+                    
+                    loss_info['policy_loss'].append(policy_loss.detach())
+                    loss_info['unweighted_policy_loss'].append(ori_policy_loss.mean().detach())
+                    loss_info['loss'].append(loss.detach())
+                    
+                    self.accelerator.backward(loss)
+                
                 if self.accelerator.sync_gradients:
                     self.accelerator.clip_grad_norm_(
                         self.adapter.get_trainable_parameters(),
                         self.training_args.max_grad_norm,
                     )
-                    # Communicate and log losses
-                    loss_info = {
-                        k: torch.stack(v).mean() 
-                        for k, v in loss_info.items()
-                    }
+                    loss_info = {k: torch.stack(v).mean() for k, v in loss_info.items()}
                     loss_info = self.accelerator.reduce(loss_info, reduction="mean")
-                    self.log_data(
-                        {f'train/{k}': v for k, v in loss_info.items()},
-                        step=self.step,
-                    )
+                    self.log_data({f'train/{k}': v for k, v in loss_info.items()}, step=self.step)
                     self.step += 1
                     loss_info = defaultdict(list)
                 
@@ -391,11 +435,20 @@ class DiffusionNFTTrainer(BaseTrainer):
                     samples = self.adapter.inference(**inference_kwargs)
                 all_samples.extend(samples)
             
-            # Multi-reward evaluation
-            rewards = self.compute_rewards(all_samples, self.eval_reward_models)
+            rewards = self.eval_reward_processor.compute_rewards(
+                samples=all_samples,
+                store_to_samples=False,
+                epoch=self.epoch,
+                split='pointwise',  # Only `pointwise` reward can be compute when evaluation, since there is no `group` here.
+            )
+            # Gather and log rewards
             rewards = {key: torch.as_tensor(value).to(self.accelerator.device) for key, value in rewards.items()}
-            gathered_rewards = {key: self.accelerator.gather(value).cpu().numpy() for key, value in rewards.items()}
-            
+            gathered_rewards = {
+                key: self.accelerator.gather(value).cpu().numpy()
+                for key, value in rewards.items()
+            }
+
+            # Log statistics
             if self.accelerator.is_main_process:
                 _log_data = {f'eval/reward_{key}_mean': np.mean(value) for key, value in gathered_rewards.items()}
                 _log_data.update({f'eval/reward_{key}_std': np.std(value) for key, value in gathered_rewards.items()})

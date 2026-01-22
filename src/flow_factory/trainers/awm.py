@@ -34,87 +34,10 @@ from ..models.abc import BaseSample
 from .grpo import GRPOTrainer
 from ..rewards import BaseRewardModel
 from ..utils.base import filter_kwargs, create_generator, to_broadcast_tensor
+from ..utils.noise_schedule import TimeSampler
 from ..utils.logger_utils import setup_logger
 
 logger = setup_logger(__name__)
-
-
-# ============================ Time Samplers ============================
-class TimeSampler:
-    """Continuous time sampler for flow matching training."""
-    
-    @staticmethod
-    def logit_normal_shifted(
-        batch_size: int,
-        num_timesteps: int,
-        m: float = 0.0,
-        s: float = 1.0,
-        shift: float = 3.0,
-        device: torch.device = torch.device('cpu'),
-        stratified: bool = True,
-    ) -> torch.Tensor:
-        """
-        Logit-normal shifted time sampling.
-        
-        Args:
-            batch_size: Number of samples per timestep.
-            num_timesteps: Number of timesteps to sample.
-            m: Mean of the normal distribution.
-            s: Standard deviation of the normal distribution.
-            shift: Shift parameter for the logit-normal distribution.
-            device: Device to create tensors on.
-            stratified: Whether to use stratified sampling for better coverage.
-        
-        Returns:
-            Tensor of shape (num_timesteps, batch_size) with t in (0, 1).
-        """
-        if stratified:
-            # Stratified sampling for better coverage
-            base = (torch.arange(num_timesteps, device=device) + torch.rand(num_timesteps, device=device)) / num_timesteps
-            normal_dist = torch.distributions.Normal(loc=0.0, scale=1.0)
-            u_standard = normal_dist.icdf(torch.clamp(base, 1e-7, 1 - 1e-7))
-            u_standard = u_standard[torch.randperm(num_timesteps, device=device)]
-        else:
-            u_standard = torch.randn(num_timesteps, device=device)
-        
-        u = u_standard * s + m
-        t = torch.sigmoid(u)
-        t = shift * t / (1 + (shift - 1) * t)
-        t = torch.clamp(t, min=0.01)
-        
-        # Expand to (num_timesteps, batch_size)
-        return t.unsqueeze(1).expand(num_timesteps, batch_size)
-    
-    @staticmethod
-    def uniform(
-        batch_size: int,
-        num_timesteps: int,
-        lower: float = 0.2,
-        upper: float = 1.0,
-        shift: float = 1.0,
-        device: torch.device = torch.device('cpu'),
-    ) -> torch.Tensor:
-        """
-        Uniform time sampling with optional shift.
-        
-        Args:
-            batch_size: Number of samples per timestep.
-            num_timesteps: Number of timesteps to sample.
-            lower: Lower bound of uniform distribution.
-            upper: Upper bound of uniform distribution.
-            shift: Time shift parameter.
-            device: Device to create tensors on.
-        
-        Returns:
-            Tensor of shape (num_timesteps, batch_size).
-        """
-        rand_u = torch.rand(num_timesteps, batch_size, device=device)
-        normalized = (torch.arange(num_timesteps, device=device).unsqueeze(1) + rand_u) / num_timesteps
-        matrix = lower + normalized * (upper - lower)
-        # Shuffle along timestep dimension
-        t = torch.gather(matrix, 0, torch.rand_like(matrix).argsort(dim=0))
-        t = shift * t / (1 + (shift - 1) * t)
-        return t
 
 
 # ============================ AWM Trainer ============================
@@ -140,15 +63,18 @@ class AWMTrainer(GRPOTrainer):
         # KL regularization
         self.kl_beta = getattr(self.training_args, 'kl_beta', 0.0)
         self.ema_kl_beta = getattr(self.training_args, 'ema_kl_beta', 0.0)
-        self.kl_weight = getattr(self.training_args, 'kl_weight', 'Uniform')
+        self.kl_type = getattr(self.training_args, 'kl_type', 'v-based')
+        if self.kl_type != 'v-based':
+            logger.warning(f"DiffusionNFT-Trainer only supports 'v-based' KL loss, got {self.kl_type}, switching to 'v-based'.")
+            self.kl_type = 'v-based'
     
     @property
-    def enable_kl_penalty(self) -> bool:
+    def enable_kl_loss(self) -> bool:
         """Check if KL penalty is enabled."""
         return self.kl_beta > 0.0
     
     @property
-    def enable_ema_kl_penalty(self) -> bool:
+    def enable_ema_kl_loss(self) -> bool:
         """Check if EMA-based KL penalty is enabled."""
         return self.ema_kl_beta > 0.0
     
@@ -315,7 +241,7 @@ class AWMTrainer(GRPOTrainer):
         
         Args:
             batch: Batch containing prompt embeddings and other inputs.
-            timestep: Timestep tensor of shape (B,).
+            timestep: Timestep tensor of shape (B,), with values in (0, 1).
             noised_latents: Interpolated latents x_t = (1-t)*x_1 + t*noise.
             clean_latents: Clean latents x_1 (final denoised).
             random_noise: Sampled noise.
@@ -326,17 +252,17 @@ class AWMTrainer(GRPOTrainer):
                 - noise_pred: same shape as latents
                 - std_dev_t: broadcastable shape (B, 1, ..., 1)
         """
-        t = timestep.view(-1)  # Ensure (B,)
+        t_scaled = (timestep * 1000).view(-1)  # Scale to [0, 1000], ensure (B,)
         
         # Prepare forward inputs
         forward_kwargs = {
             **self.training_args,
-            't': (t * 1000).long(),  # Scale to [0, 1000]
-            't_next': torch.zeros_like(t).long(),  # Use zeros as t_next
+            't': t_scaled,
+            't_next': torch.zeros_like(t_scaled),  # Use zeros as t_next
             'latents': noised_latents,
-            'compute_log_prob': False,  # We compute our own log_prob
+            'compute_log_prob': False,  # Compute log prob based on matching loss
             'return_kwargs': ['noise_pred'],
-            **{k: v for k, v in batch.items() if k not in ['all_latents', 'log_probs', 'timesteps', 'advantage']},
+            **{k: v for k, v in batch.items() if k not in ['all_latents', 'timesteps', 'advantage']},
         }
         
         forward_kwargs = filter_kwargs(self.adapter.forward, **forward_kwargs)
@@ -351,21 +277,14 @@ class AWMTrainer(GRPOTrainer):
         log_prob = self.compute_weighted_log_prob(
             model_output=output.noise_pred,
             target=target,
-            timestep=t,
+            timestep=timestep, # Input timestep (B,) in (0, 1)
             weighting=self.weighting,
             ghuber_power=self.ghuber_power,
         )
-        
-        # Compute std_dev_t for KL penalty - use to_broadcast_tensor for dynamic shape
-        # std_dev_t needs to be broadcastable with noise_pred
-        sigma = t.clamp(max=0.99)
-        std_dev_t_scalar = torch.sqrt(sigma / (1 - sigma)) * 0.7  # (B,)
-        std_dev_t = to_broadcast_tensor(std_dev_t_scalar, output.noise_pred)  # (B, 1, ..., 1)
-        
+                
         return {
             'log_prob': log_prob,             # (B,)
             'noise_pred': output.noise_pred,  # Same shape as latents
-            'std_dev_t': std_dev_t,           # (B, 1, ..., 1) broadcastable
         }
 
     def optimize(self, samples: List[BaseSample]) -> None:
@@ -373,13 +292,11 @@ class AWMTrainer(GRPOTrainer):
         Main optimization loop for AWM.
         
         Unlike GRPO which iterates over discrete timesteps from the trajectory,
-        AWM samples continuous timesteps and computes matching loss directly.
-        Each timestep is processed separately to avoid OOM, with gradient 
-        accumulation handled by accelerator.backward() per timestep.
+        AWM decouples sampling/training timesteps and performs multiple passes
+        over all sampled timesteps for each batch.
         """
         self.adapter.train()
-        
-        # Compute rewards and advantages
+        # Compute rewards and advantages for samples
         rewards = self.reward_processor.compute_rewards(samples, store_to_samples=True, epoch=self.epoch)
         advantages = self.compute_advantages(samples, rewards, store_to_samples=True)
         
@@ -475,42 +392,38 @@ class AWMTrainer(GRPOTrainer):
                     loss = policy_loss
                     
                     # 4. KL regularization with reference model
-                    if self.enable_kl_penalty:
+                    if self.enable_kl_loss:
                         with torch.no_grad(), self.adapter.use_ref_parameters():
                             ref_output = self._compute_awm_output(
                                 batch, t_flat, noised_latents, clean_latents, noise
                             )
-                        
+                        # KL-div in velocity space
                         noise_pred = current_output['noise_pred']
                         ref_noise_pred = ref_output['noise_pred']
-                        std_dev_t = current_output['std_dev_t']  # (B, 1, ..., 1)
-                                                
-                        if self.kl_weight == 'ELBO':
-                            kl = ((noise_pred - ref_noise_pred) ** 2).mean(dim=tuple(range(1, noise_pred.ndim))) / (
-                                2 * std_dev_t.view(-1) ** 2 + 1e-7
-                            )
-                        else:  # Uniform
-                            kl = ((noise_pred - ref_noise_pred) ** 2).mean(dim=tuple(range(1, noise_pred.ndim)))
+
+                        # Uniform across all dimensions except batch
+                        kl_div = ((noise_pred - ref_noise_pred) ** 2).mean(dim=tuple(range(1, noise_pred.ndim)))
                         
-                        kl_loss = kl.mean()
-                        kl_penalty = self.kl_beta * kl_loss
-                        loss = loss + kl_penalty
+                        kl_loss = kl_div.mean()
+                        kl_loss = self.kl_beta * kl_loss
+                        loss = loss + kl_loss
+                        loss_info['kl_div'].append(kl_div.detach())
                         loss_info['kl_loss'].append(kl_loss.detach())
                     
                     # 5. EMA-based KL regularization
-                    if self.enable_ema_kl_penalty:
+                    if self.enable_ema_kl_loss:
                         with torch.no_grad(), self.adapter.use_ema_parameters():
                             ema_output = self._compute_awm_output(
                                 batch, t_flat, noised_latents, clean_latents, noise
                             )
-                        
+                        # KL-div in velocity space
                         noise_pred = current_output['noise_pred']
                         ema_noise_pred = ema_output['noise_pred']
                         
                         ema_kl = ((noise_pred - ema_noise_pred) ** 2).mean(dim=tuple(range(1, noise_pred.ndim)))
                         ema_kl_loss = ema_kl.mean()
-                        ema_kl_penalty = self.ema_kl_beta * ema_kl_loss
-                        loss = loss + ema_kl_penalty
+                        ema_kl_loss = self.ema_kl_beta * ema_kl_loss
+                        loss = loss + ema_kl_loss
                         loss_info['ema_kl_loss'].append(ema_kl_loss.detach())
                     
                     # Record metrics per timestep

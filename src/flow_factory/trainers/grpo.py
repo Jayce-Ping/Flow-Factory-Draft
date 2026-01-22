@@ -53,7 +53,7 @@ class GRPOTrainer(BaseTrainer):
         super().__init__(**kwargs)
     
     @property
-    def enable_kl_penalty(self) -> bool:
+    def enable_kl_loss(self) -> bool:
         """Check if KL penalty is enabled."""
         return self.training_args.kl_beta > 0.0
 
@@ -238,7 +238,6 @@ class GRPOTrainer(BaseTrainer):
                     # 1. Prepare inputs
                     # Get old log prob
                     old_log_prob = batch['log_probs'][:, timestep_index]
-                    adv = batch['advantage']
                     # Get current timestep data
                     num_timesteps = batch['timesteps'].shape[1]
                     t = batch['timesteps'][:, timestep_index]
@@ -264,20 +263,20 @@ class GRPOTrainer(BaseTrainer):
                     forward_inputs = filter_kwargs(self.adapter.forward, **forward_inputs)
                     # 2. Forward pass
                     with self.autocast():
-                        # Forward pass
-                        if self.enable_kl_penalty:
+                        if self.enable_kl_loss:
                             if self.training_args.kl_type == 'v-based':
                                 return_kwargs = ['log_prob', 'noise_pred', 'std_dev_t', 'dt']
                             elif self.training_args.kl_type == 'x-based':
                                 return_kwargs = ['log_prob', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt']
                         else:
-                            return_kwargs = ['log_prob', 'std_dev_t', 'dt']
+                            return_kwargs = ['log_prob', 'dt']
                         
                         forward_inputs['return_kwargs'] = return_kwargs
                         output = self.adapter.forward(**forward_inputs)
 
                     # 3. Compute loss
                     # Clip advantages
+                    adv = batch['advantage']
                     adv_clip_range = self.training_args.adv_clip_range
                     adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
                     # PPO-style clipped loss
@@ -291,7 +290,7 @@ class GRPOTrainer(BaseTrainer):
                     loss = policy_loss
 
                     # 4. Compute KL-div
-                    if self.enable_kl_penalty:
+                    if self.enable_kl_loss:
                         with self.autocast(), torch.no_grad(), self.adapter.use_ref_parameters():
                             ref_forward_inputs = forward_inputs.copy()
                             ref_forward_inputs['compute_log_prob'] = False
@@ -313,10 +312,10 @@ class GRPOTrainer(BaseTrainer):
                                 ) / (2 * output.std_dev_t ** 2 + 1e-7)
                         
                         kl_div = torch.mean(kl_div)
-                        kl_penalty = self.training_args.kl_beta * kl_div
-                        loss += kl_penalty
+                        kl_loss = self.training_args.kl_beta * kl_div
+                        loss += kl_loss
                         loss_info['kl_div'].append(kl_div.detach())
-                        loss_info['kl_penalty'].append(kl_penalty.detach())
+                        loss_info['kl_loss'].append(kl_loss.detach())
 
 
                     loss_info['ratio'].append(ratio.detach())
@@ -393,21 +392,10 @@ class GRPOTrainer(BaseTrainer):
             
             # Log statistics
             if self.accelerator.is_main_process:
-                _log_data = {
-                    f'eval/reward_{key}_mean': np.mean(value)
-                    for key, value in gathered_rewards.items()
-                }
-                _log_data.update({
-                    f'eval/reward_{key}_std': np.std(value)
-                    for key, value in gathered_rewards.items()
-                })
-                self.log_data(
-                    {
-                        **_log_data,
-                        'eval_samples' : all_samples,
-                    },
-                    step=self.step,
-                )
+                _log_data = {f'eval/reward_{key}_mean': np.mean(value) for key, value in gathered_rewards.items()}
+                _log_data.update({f'eval/reward_{key}_std': np.std(value) for key, value in gathered_rewards.items()})
+                _log_data['eval_samples'] = all_samples
+                self.log_data(_log_data, step=self.step)
             self.accelerator.wait_for_everyone()
 
 
@@ -496,7 +484,7 @@ class GRPOGuardTrainer(GRPOTrainer):
 
                     loss = policy_loss
 
-                    if self.enable_kl_penalty:
+                    if self.enable_kl_loss:
                         with self.autocast(), torch.no_grad(), self.adapter.use_ref_parameters():
                             if self.training_args.kl_type == 'v-based':
                                 # KL in velocity space
@@ -509,7 +497,7 @@ class GRPOGuardTrainer(GRPOTrainer):
                                 kl_div = torch.mean(
                                     ((output.noise_pred - ref_output.noise_pred) ** 2),
                                     dim=tuple(range(1, output.noise_pred.ndim)), keepdim=True
-                                ) / (2 * output.std_dev_t ** 2 + 1e-7)
+                                )
                             elif self.training_args.kl_type == 'x-based':
                                 # KL in latent space
                                 ref_output = self.adapter.forward(
@@ -521,12 +509,12 @@ class GRPOGuardTrainer(GRPOTrainer):
                                 kl_div = torch.mean(
                                     ((output.next_latents_mean - ref_output.next_latents_mean) ** 2),
                                     dim=tuple(range(1, output.next_latents_mean.ndim)), keepdim=True
-                                ) / (2 * output.std_dev_t ** 2 + 1e-7)
+                                )
                         
-                        kl_penalty = self.training_args.kl_beta * kl_div
-                        loss += kl_penalty
+                        kl_loss = self.training_args.kl_beta * kl_div
+                        loss += kl_loss
                         loss_info['kl_div'].append(kl_div.detach())
-                        loss_info['kl_penalty'].append(kl_penalty.detach())
+                        loss_info['kl_loss'].append(kl_loss.detach())
 
                     loss_info['ratio'].append(ratio.detach())
                     loss_info['unclipped_loss'].append(unclipped_loss.detach())
