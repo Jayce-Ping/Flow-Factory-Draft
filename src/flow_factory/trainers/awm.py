@@ -321,7 +321,6 @@ class AWMTrainer(GRPOTrainer):
             
             with self.accelerator.accumulate(self.adapter.transformer):
                 # Get clean latents (final denoised x_1)
-                # Shape varies: (B, C, H, W) or (B, seq_len, dim) or (B, T, C, H, W)
                 clean_latents = batch['all_latents'][:, -1]
                 
                 # Sample timesteps: (T, B)
@@ -426,6 +425,7 @@ class AWMTrainer(GRPOTrainer):
                         ema_kl_loss = ema_kl.mean()
                         ema_kl_loss = self.ema_kl_beta * ema_kl_loss
                         loss = loss + ema_kl_loss
+                        loss_info['ema_kl_div'].append(ema_kl.detach())
                         loss_info['ema_kl_loss'].append(ema_kl_loss.detach())
                     
                     # Record metrics per timestep

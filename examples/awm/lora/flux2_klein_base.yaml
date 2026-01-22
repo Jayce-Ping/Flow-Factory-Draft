@@ -40,7 +40,7 @@ train:
   trainer_type: 'awm'
   awm_weighting: Uniform
   # Training Timestep distribution
-  num_train_timesteps: 4 # Default to all steps
+  num_train_timesteps: 6 # Default to all steps
   time_type: Uniform
   time_shift: 3.0
   # Clipping
@@ -48,11 +48,15 @@ train:
   adv_clip_range: 5.0  # Advantage clipping range
   max_grad_norm: 1.0  # Max gradient norm for clipping
   # KL div
-  ema_kl_beta: 0 # Used for KL-loss between current policy and EMA policy
   kl_weight: 'Uniform'
   kl_type: 'v-based'
-  kl_beta: 0 # KL divergence beta
+  kl_beta: 0.003 # KL divergence beta
   ref_param_device: 'cuda' # Options: cpu, cuda
+  # EMA
+  ema_kl_beta: 1 # Used for KL-loss between current policy and EMA policy
+  ema_decay: 0.99  # EMA decay rate (0 to disable)
+  ema_update_interval: 1  # EMA update interval (in epochs)
+  ema_device: "cuda"  # Device to store EMA model (options: cpu, cuda)
 
   # Sampling Settings
   resolution: 384  # Can be int or [height, width]
@@ -66,18 +70,13 @@ train:
   group_size: 16  # Group size for GRPO sampling
   global_std: false  # Use global std for advantage normalization
   unique_sample_num_per_epoch: 48  # Unique samples per group
-  gradient_step_per_epoch: 1  # Gradient steps per epoch
+  gradient_step_per_epoch: 2  # Gradient steps per epoch
   
   # Optimizer
   learning_rate: 3.0e-4  # Initial learning rate
   adam_weight_decay: 1.0e-4  # AdamW weight decay
   adam_betas: [0.9, 0.999]  # AdamW betas
   adam_epsilon: 1.0e-8  # AdamW epsilon
-  
-  # EMA
-  ema_decay: 0.9  # EMA decay rate (0 to disable)
-  ema_update_interval: 4  # EMA update interval (in epochs)
-  ema_device: "cuda"  # Device to store EMA model (options: cpu, cuda)
   
   # Gradient Checkpointing
   enable_gradient_checkpointing: false  # Enable gradient checkpointing to save memory with extra compute
