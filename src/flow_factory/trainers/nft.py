@@ -79,36 +79,38 @@ class DiffusionNFTTrainer(GRPOTrainer):
         else:
             yield
 
-    def _sample_timesteps(self, batch_size: int, device: Optional[torch.device] = None) -> torch.Tensor:
+    def _sample_timesteps(self, batch_size: int) -> torch.Tensor:
         """
-        Sample continuous timesteps.
+        Sample continuous timesteps based on configured time_type.
+        
+        Args:
+            batch_size: Number of samples in the batch.
         
         Returns:
             Tensor of shape (num_train_timesteps, batch_size) with t in (0, 1).
         """
-        device = device or self.accelerator.device
-        available_types = ['logit_normal', 'uniform']
+        device = self.accelerator.device
+        time_type = self.time_type.lower()
         
-        assert self.time_type.lower() in available_types, \
-            f"Unknown time_type: {self.time_type}, available: {available_types}"
-
-        if self.time_type == 'logit_normal':
-            timesteps = TimeSampler.logit_normal_shifted(
+        if time_type == 'logit_normal':
+            t = TimeSampler.logit_normal_shifted(
                 batch_size=batch_size,
                 num_timesteps=self.num_train_timesteps,
                 shift=self.time_shift,
                 device=device,
                 stratified=True,
             )
-        elif self.time_type == 'uniform':
-            timesteps = TimeSampler.uniform(
+        elif time_type == 'uniform':
+            t = TimeSampler.uniform(
                 batch_size=batch_size,
                 num_timesteps=self.num_train_timesteps,
                 shift=self.time_shift,
                 device=device,
             )
-
-        return timesteps  # (num_train_timesteps, batch_size)
+        else:
+            raise ValueError(f"Unknown time_type: {self.time_type}, available: ['logit_normal', 'uniform']")
+        
+        return t  # (num_train_timesteps, batch_size)
 
     def start(self):
         """Main training loop."""
