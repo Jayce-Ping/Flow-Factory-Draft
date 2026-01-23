@@ -125,16 +125,14 @@ class AWMTrainer(GRPOTrainer):
 
     def _sample_timesteps(self, batch_size: int) -> torch.Tensor:
         """
-        Sample continuous timesteps based on configured time_type.
-        
-        Args:
-            batch_size: Number of samples in the batch.
+        Sample continuous or discrete timesteps based on configured time_type.
         
         Returns:
             Tensor of shape (num_train_timesteps, batch_size) with t in (0, 1).
         """
         device = self.accelerator.device
         time_type = self.time_type.lower()
+        availibles = ['logit_normal', 'uniform', 'discrete', 'discrete_with_init', 'discrete_wo_init']
         
         if time_type == 'logit_normal':
             t = TimeSampler.logit_normal_shifted(
@@ -151,8 +149,18 @@ class AWMTrainer(GRPOTrainer):
                 shift=self.time_shift,
                 device=device,
             )
+        elif time_type in ('discrete', 'discrete_with_init', 'discrete_wo_init'):
+            timestep_fraction = getattr(self.training_args, 'timestep_fraction', 1.0)
+            sampler_fn = getattr(TimeSampler, time_type)
+            t = sampler_fn(
+                batch_size=batch_size,
+                num_train_timesteps=self.num_train_timesteps,
+                scheduler_timesteps=self.adapter.scheduler.timesteps,
+                timestep_fraction=timestep_fraction,
+                normalize=True,
+            )
         else:
-            raise ValueError(f"Unknown time_type: {self.time_type}, available: ['logit_normal', 'uniform']")
+            raise ValueError(f"Unknown time_type: {self.time_type}. Availibles are {availibles}")
         
         return t  # (num_train_timesteps, batch_size)
     
