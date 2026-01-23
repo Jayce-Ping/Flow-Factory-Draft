@@ -1,6 +1,6 @@
 # Environment Configuration
 launcher: "accelerate"  # Options: accelerate
-config_file: config/deepspeed/deepspeed_zero2.yaml  # Path to distributed config file (optional)
+config_file: config/accelerate_configs/multi_gpu.yaml  # Path to distributed config file (optional)
 num_processes: 8  # Number of processes to launch (overrides config file)
 main_process_port: 29500
 mixed_precision: "bf16"  # Options: no, fp16, bf16
@@ -28,7 +28,6 @@ model:
   model_type: "flux1"
   resume_path: null # Path to load previous checkpoint/lora adapter
   resume_training_state: false # Whether to resume training state, only effective when resume_path is a directory with full checkpoint
-  master_weight_dtype: 'float32' # Weight dtype for trainable parameters when full-paramter fine-tuning, options are ["float16", "bfloat16", "float32"]
 
 log:
   save_dir: "~/jcy/Flow-Factory"  # Directory to save model checkpoints and logs
@@ -41,9 +40,10 @@ train:
   trainer_type: 'nft'
   nft_beta: 1
   # Training Timestep distribution
-  num_train_timesteps: 4 # Default to all steps
-  time_type: uniform # Options: uniform, logit_normal
+  num_train_timesteps: 2 # Set null to all steps
+  time_type: discrete_wo_init # Options: uniform, logit_normal
   time_shift: 3.0
+  timestep_fraction: 0.5
   # KL div
   kl_type: 'v-based'
   kl_beta: 0 # KL divergence beta, 0 to disable

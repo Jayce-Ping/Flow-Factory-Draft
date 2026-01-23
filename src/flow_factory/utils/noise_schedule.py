@@ -84,19 +84,21 @@ class TimeSampler:
         scheduler_timesteps: torch.Tensor,
         timestep_fraction: float = 1.0,
         normalize: bool = True,
+        include_init: bool = True,
+        force_init: bool = False,
     ) -> torch.Tensor:
         """
         Discrete stratified time sampling from scheduler timesteps.
         
-        Divides the valid timestep range into `num_train_timesteps` strata and
-        samples one index uniformly from each stratum.
-        
         Args:
             batch_size: Number of samples per timestep.
             num_train_timesteps: Number of training timesteps to sample.
             scheduler_timesteps: Actual timesteps from scheduler, shape (num_inference_steps,).
             timestep_fraction: Fraction of trajectory to use (0, 1].
             normalize: If True, normalize timesteps to (0, 1) by dividing by 1000.
+            include_init: If True, index 0 is included in sampling range.
+            force_init: If True, first sampled timestep is always index 0.
+                        (implies include_init=False for remaining samples)
         
         Returns:
             Tensor of shape (num_train_timesteps, batch_size) with sampled timesteps.
@@ -104,111 +106,36 @@ class TimeSampler:
         device = scheduler_timesteps.device
         max_idx = int(len(scheduler_timesteps) * timestep_fraction)
         
-        boundaries = torch.linspace(0, max_idx, steps=num_train_timesteps + 1, device=device)
-        lower_bounds = boundaries[:-1].long()
-        upper_bounds = boundaries[1:].long()
-        
-        rand_u = torch.rand(num_train_timesteps, device=device)
-        t_indices = lower_bounds + (rand_u * (upper_bounds - lower_bounds)).long()
-        t_indices = t_indices.clamp(max=len(scheduler_timesteps) - 1)
-        
-        timesteps = scheduler_timesteps[t_indices]  # (num_train_timesteps,)
-        timesteps = timesteps.unsqueeze(1).expand(-1, batch_size)  # (T, B)
-        
-        if normalize:
-            timesteps = timesteps.float() / 1000.0
-        
-        return timesteps
-    
-    @staticmethod
-    def discrete_with_init(
-        batch_size: int,
-        num_train_timesteps: int,
-        scheduler_timesteps: torch.Tensor,
-        timestep_fraction: float = 1.0,
-        normalize: bool = True,
-    ) -> torch.Tensor:
-        """
-        Discrete time sampling that always includes t=0 (initial timestep).
-        
-        The first sampled timestep is always index 0, remaining timesteps are
-        stratified-sampled from indices [1, max_idx].
-        
-        Args:
-            batch_size: Number of samples per timestep.
-            num_train_timesteps: Total number of training timesteps (including init).
-            scheduler_timesteps: Actual timesteps from scheduler, shape (num_inference_steps,).
-            timestep_fraction: Fraction of trajectory to use (0, 1].
-            normalize: If True, normalize timesteps to (0, 1) by dividing by 1000.
-        
-        Returns:
-            Tensor of shape (num_train_timesteps, batch_size) with sampled timesteps.
-        """
-        device = scheduler_timesteps.device
-        max_idx = int(len(scheduler_timesteps) * timestep_fraction)
-        
-        init_index = torch.tensor([0], device=device, dtype=torch.long)
-        num_remaining = num_train_timesteps - 1
-        
-        if num_remaining > 0:
-            boundaries = torch.linspace(1, max_idx, steps=num_remaining + 1, device=device)
-            lower_bounds = boundaries[:-1].long()
-            upper_bounds = boundaries[1:].long()
-            
-            rand_u = torch.rand(num_remaining, device=device)
-            remaining_indices = lower_bounds + (rand_u * (upper_bounds - lower_bounds)).long()
-            remaining_indices = remaining_indices.clamp(max=len(scheduler_timesteps) - 1)
-            t_indices = torch.cat([init_index, remaining_indices])
+        if force_init:
+            # First is always 0, sample remaining from [1, max_idx]
+            if num_train_timesteps == 1:
+                t_indices = torch.zeros(1, device=device, dtype=torch.long)
+            else:
+                start_idx, num_samples = 1, num_train_timesteps - 1
+                t_indices = torch.cat([
+                    torch.zeros(1, device=device, dtype=torch.long),
+                    TimeSampler._stratified_sample(num_samples, start_idx, max_idx, device),
+                ])
         else:
-            t_indices = init_index
+            start_idx = 0 if include_init else 1
+            t_indices = TimeSampler._stratified_sample(
+                num_train_timesteps, start_idx, max_idx, device
+            )
         
-        timesteps = scheduler_timesteps[t_indices]  # (num_train_timesteps,)
-        timesteps = timesteps.unsqueeze(1).expand(-1, batch_size)  # (T, B)
+        t_indices = t_indices.clamp(max=len(scheduler_timesteps) - 1)
+        timesteps = scheduler_timesteps[t_indices].unsqueeze(1).expand(-1, batch_size)
         
-        if normalize:
-            timesteps = timesteps.float() / 1000.0
-        
-        return timesteps
-    
+        return timesteps.float() / 1000.0 if normalize else timesteps
+
     @staticmethod
-    def discrete_wo_init(
-        batch_size: int,
-        num_train_timesteps: int,
-        scheduler_timesteps: torch.Tensor,
-        timestep_fraction: float = 1.0,
-        normalize: bool = True,
+    def _stratified_sample(
+        num_samples: int,
+        start_idx: int,
+        end_idx: int,
+        device: torch.device,
     ) -> torch.Tensor:
-        """
-        Discrete time sampling excluding t=0 (initial timestep).
-        
-        Stratified sampling from indices [1, max_idx], useful when the initial
-        timestep (pure noise) provides little training signal.
-        
-        Args:
-            batch_size: Number of samples per timestep.
-            num_train_timesteps: Number of training timesteps to sample.
-            scheduler_timesteps: Actual timesteps from scheduler, shape (num_inference_steps,).
-            timestep_fraction: Fraction of trajectory to use (0, 1].
-            normalize: If True, normalize timesteps to (0, 1) by dividing by 1000.
-        
-        Returns:
-            Tensor of shape (num_train_timesteps, batch_size) with sampled timesteps.
-        """
-        device = scheduler_timesteps.device
-        max_idx = int(len(scheduler_timesteps) * timestep_fraction)
-        
-        boundaries = torch.linspace(1, max_idx, steps=num_train_timesteps + 1, device=device)
-        lower_bounds = boundaries[:-1].long()
-        upper_bounds = boundaries[1:].long()
-        
-        rand_u = torch.rand(num_train_timesteps, device=device)
-        t_indices = lower_bounds + (rand_u * (upper_bounds - lower_bounds)).long()
-        t_indices = t_indices.clamp(1, len(scheduler_timesteps) - 1)
-        
-        timesteps = scheduler_timesteps[t_indices]  # (num_train_timesteps,)
-        timesteps = timesteps.unsqueeze(1).expand(-1, batch_size)  # (T, B)
-        
-        if normalize:
-            timesteps = timesteps.float() / 1000.0
-        
-        return timesteps
+        """Stratified sampling of indices from [start_idx, end_idx]."""
+        boundaries = torch.linspace(start_idx, end_idx, num_samples + 1, device=device)
+        lower, upper = boundaries[:-1].long(), boundaries[1:].long()
+        rand_u = torch.rand(num_samples, device=device)
+        return lower + (rand_u * (upper - lower)).long()

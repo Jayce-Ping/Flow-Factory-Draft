@@ -16,7 +16,7 @@ data:
   dataloader_num_workers: 16  # Number of workers for DataLoader
   force_reprocess: false  # Force reprocessing of the dataset
   cache_dir: "~/jcy/.cache/flow_factory/datasets" # Cache directory for preprocessed datasets
-  max_dataset_size: 1000  # Limit the maximum number of samples in the dataset
+  max_dataset_size: 128  # Limit the maximum number of samples in the dataset
 
 # Model Configuration
 model:
@@ -28,7 +28,6 @@ model:
   model_type: "flux1"
   resume_path: null # Path to load previous checkpoint/lora adapter
   resume_training_state: false # Whether to resume training state, only effective when resume_path is a directory with full checkpoint
-  master_weight_dtype: 'float32' # Weight dtype for trainable parameters when full-paramter fine-tuning, options are ["float16", "bfloat16", "float32"]
 
 log:
   save_dir: "~/jcy/Flow-Factory"  # Directory to save model checkpoints and logs
@@ -41,9 +40,10 @@ train:
   trainer_type: 'awm'
   awm_weighting: Uniform
   # Training Timestep distribution
-  num_train_timesteps: 4 # Set null to all steps
-  time_type: uniform # Options: uniform, logit_normal
+  num_train_timesteps: 2 # Set null to all steps
+  time_type: discrete_wo_init # Options: uniform, logit_normal
   time_shift: 3.0
+  timestep_fraction: 0.9
   # Clipping
   clip_range: 1.0e-4  # PPO/GRPO clipping range
   adv_clip_range: 1.0  # Advantage clipping range

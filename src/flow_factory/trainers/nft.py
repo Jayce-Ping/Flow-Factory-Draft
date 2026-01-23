@@ -58,7 +58,8 @@ class DiffusionNFTTrainer(GRPOTrainer):
         self.time_type = getattr(self.training_args, 'time_type', 'logit_normal')
         self.time_shift = getattr(self.training_args, 'time_shift', 3.0)
         self.num_train_timesteps = getattr(self.training_args, 'num_train_timesteps', self.training_args.num_inference_steps)
-        
+        self.timestep_fraction = getattr(self.training_args, 'timestep_fraction', 0.9)
+    
         # Check args
         self.kl_type = getattr(self.training_args, 'kl_type', 'v-based')
         if self.kl_type != 'v-based':
@@ -88,10 +89,10 @@ class DiffusionNFTTrainer(GRPOTrainer):
         """
         device = self.accelerator.device
         time_type = self.time_type.lower()
-        availibles = ['logit_normal', 'uniform', 'discrete', 'discrete_with_init', 'discrete_wo_init']
+        available = ['logit_normal', 'uniform', 'discrete', 'discrete_with_init', 'discrete_wo_init']
         
         if time_type == 'logit_normal':
-            t = TimeSampler.logit_normal_shifted(
+            return TimeSampler.logit_normal_shifted(
                 batch_size=batch_size,
                 num_timesteps=self.num_train_timesteps,
                 shift=self.time_shift,
@@ -99,26 +100,34 @@ class DiffusionNFTTrainer(GRPOTrainer):
                 stratified=True,
             )
         elif time_type == 'uniform':
-            t = TimeSampler.uniform(
+            return TimeSampler.uniform(
                 batch_size=batch_size,
                 num_timesteps=self.num_train_timesteps,
                 shift=self.time_shift,
                 device=device,
             )
-        elif time_type in ('discrete', 'discrete_with_init', 'discrete_wo_init'):
-            timestep_fraction = getattr(self.training_args, 'timestep_fraction', 1.0)
-            sampler_fn = getattr(TimeSampler, time_type)
-            t = sampler_fn(
+        elif time_type.startswith('discrete'):
+            # Map time_type to (include_init, force_init)
+            discrete_config = {
+                'discrete':           (True,  False),
+                'discrete_with_init': (True,  True),
+                'discrete_wo_init':   (False, False),
+            }
+            if time_type not in discrete_config:
+                raise ValueError(f"Unknown time_type: {time_type}. Available: {available}")
+            
+            include_init, force_init = discrete_config[time_type]
+            return TimeSampler.discrete(
                 batch_size=batch_size,
                 num_train_timesteps=self.num_train_timesteps,
                 scheduler_timesteps=self.adapter.scheduler.timesteps,
-                timestep_fraction=timestep_fraction,
+                timestep_fraction=self.timestep_fraction,
                 normalize=True,
+                include_init=include_init,
+                force_init=force_init,
             )
         else:
-            raise ValueError(f"Unknown time_type: {self.time_type}. Availibles are {availibles}")
-        
-        return t  # (num_train_timesteps, batch_size)
+            raise ValueError(f"Unknown time_type: {time_type}. Available: {available}")
 
     def start(self):
         """Main training loop."""
@@ -272,7 +281,7 @@ class DiffusionNFTTrainer(GRPOTrainer):
                     adv_clip_range = self.training_args.adv_clip_range
                     adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
                     # Normalize advantage to [0, 1]
-                    normalized_adv = (adv / adv_clip_range[1]) / 2.0 + 0.5
+                    normalized_adv = (adv / max(adv_clip_range)) / 2.0 + 0.5
                     r = torch.clamp(normalized_adv, 0, 1).view(-1, *([1] * (new_v_pred.dim() - 1)))
                     
                     # Positive/negative predictions
