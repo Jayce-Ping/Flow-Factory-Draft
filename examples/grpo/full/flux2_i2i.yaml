@@ -43,7 +43,6 @@ train:
   # Clipping
   clip_range: 1.0e-4  # PPO/GRPO clipping range
   adv_clip_range: 5.0  # Advantage clipping range
-  max_grad_norm: 1.0  # Max gradient norm for clipping
   # KL div
   kl_type: 'v-based' # Options: 'x-based', 'v-based'
   kl_beta: 0 # KL divergence coefficient - 0 to disable and save memory. Set ~1e-2 for 'x-based' and ~1e-3 for 'v-based'.
@@ -62,11 +61,12 @@ train:
   unique_sample_num_per_epoch: 48  # Unique samples per group
   gradient_step_per_epoch: 2  # Gradient steps per epoch
   
-  # Optimizer
+  # Optimization
   learning_rate: 1.0e-5  # Initial learning rate
   adam_weight_decay: 1.0e-4  # AdamW weight decay
   adam_betas: [0.9, 0.999]  # AdamW betas
   adam_epsilon: 1.0e-8  # AdamW epsilon
+  max_grad_norm: 1.0  # Max gradient norm for clipping
 
   # EMA
   ema_decay: 0.9  # EMA decay rate (0 to disable)
