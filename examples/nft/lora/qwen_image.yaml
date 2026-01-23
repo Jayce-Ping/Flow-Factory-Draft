@@ -42,7 +42,7 @@ train:
   nft_beta: 1
   # Training Timestep distribution
   num_train_timesteps: 4 # Default to all steps
-  time_type: Uniform
+  time_type: uniform # Options: uniform, logit_normal
   time_shift: 3.0
   # KL div
   kl_type: 'v-based'
