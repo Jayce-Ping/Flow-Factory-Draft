@@ -298,7 +298,6 @@ class MyRewardServer(RewardServer):
         prompts: List[str],
         images: Optional[List[Image.Image]] = None,
         videos: Optional[List[List[Image.Image]]] = None,
-        **kwargs,
     ) -> List[float]:
         # Your reward logic here
         return [self.model.score(p, i) for p, i in zip(prompts, images)]
