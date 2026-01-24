@@ -80,8 +80,8 @@ pip install -e .
 |----------------|----------------|
 | GRPO           | grpo           |
 | GRPO-Guard     | grpo-guard     |
-| GDPO           | gdpo           |
 | DiffusionNFT   | nft            |
+| AWM            | awm            |
 
 See [`Algorithm Guidance`](guidance/algorithms.md) for more information.
 
