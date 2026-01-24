@@ -290,14 +290,18 @@ rewards:
 
 ### Server Dependencies
 
-Install via optional dependency:
-```bash
-pip install "flow-factory[reward-server]"
-```
+The reward server runs in an **isolated environment**, separate from Flow-Factory.
 
-Or install manually (for isolated environments without Flow-Factory):
 ```bash
+# Create isolated environment
+conda create -n your_reward_server python=3.10
+conda activate your_reward_server
+
+# Install server framework
 pip install fastapi uvicorn pillow
+
+# Install your reward model's dependencies
+pip install paddlepaddle paddleocr  # example
 ```
 
 ### When to Use

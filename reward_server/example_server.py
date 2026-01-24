@@ -20,10 +20,10 @@ A standalone server for computing rewards in an isolated environment.
 Copy this file and implement `compute_reward()` with your logic.
 
 Dependencies:
-    pip install fastapi uvicorn pillow
+    >>> pip install fastapi uvicorn pillow
 
 Usage:
-    python example_server.py --port 8000
+    >>> python example_server.py --port 8000
 
 Training Config:
     rewards:
