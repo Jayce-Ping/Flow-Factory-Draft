@@ -328,6 +328,7 @@ class AWMTrainer(GRPOTrainer):
         ]
 
         # ==================== Pre-compute: Timesteps, Noise, and Old Log Probs ====================
+        self.adapter.rollout()
         for batch in tqdm(
             sample_batches,
             total=len(sample_batches),
