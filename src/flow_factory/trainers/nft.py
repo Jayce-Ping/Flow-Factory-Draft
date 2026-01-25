@@ -231,7 +231,6 @@ class DiffusionNFTTrainer(GRPOTrainer):
         """
         Main optimization loop for DiffusionNFT.
         """
-        self.adapter.train()
         # Compute rewards and advantages for samples
         rewards = self.reward_processor.compute_rewards(samples, store_to_samples=True, epoch=self.epoch)
         advantages = self.compute_advantages(samples, rewards, store_to_samples=True)
@@ -280,6 +279,7 @@ class DiffusionNFTTrainer(GRPOTrainer):
             batch['_old_v_pred_list'] = old_v_pred_list
 
         # ==================== Training Loop ====================
+        self.adapter.train()
         loss_info = defaultdict(list)
 
         for batch in tqdm(

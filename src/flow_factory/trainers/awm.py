@@ -317,7 +317,6 @@ class AWMTrainer(GRPOTrainer):
         AWM decouples sampling/training timesteps and performs multiple passes
         over all sampled timesteps for each batch.
         """
-        self.adapter.train()
         # Compute rewards and advantages for samples
         rewards = self.reward_processor.compute_rewards(samples, store_to_samples=True, epoch=self.epoch)
         advantages = self.compute_advantages(samples, rewards, store_to_samples=True)
@@ -369,6 +368,7 @@ class AWMTrainer(GRPOTrainer):
             batch['_old_log_probs'] = old_log_probs_list
 
         # ==================== Training Loop ====================
+        self.adapter.train()
         loss_info = defaultdict(list)
         
         for batch in tqdm(

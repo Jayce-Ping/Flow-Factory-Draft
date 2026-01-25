@@ -171,7 +171,6 @@ class GRPOTrainer(BaseTrainer):
     # =========================== Optimization Loop ============================
     def optimize(self, samples: List[BaseSample]) -> None:
         """Main training loop: compute loss and update policy."""
-        self.adapter.train()
         # Compute rewards and advantages for samples
         rewards = self.reward_processor.compute_rewards(samples, store_to_samples=True, epoch=self.epoch)
         advantages = self.compute_advantages(samples, rewards, store_to_samples=True)
@@ -184,6 +183,7 @@ class GRPOTrainer(BaseTrainer):
             for i in range(0, len(samples), self.training_args.per_device_batch_size)
         ]
 
+        self.adapter.train()
         loss_info = defaultdict(list)
 
         for batch_idx, batch in enumerate(tqdm(
