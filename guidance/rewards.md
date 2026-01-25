@@ -227,6 +227,49 @@ rewards:
     batch_size: 32
 ```
 
+### Advantage Aggregation
+
+When using multiple rewards, Flow-Factory supports the following aggregation strategies via `advantage_aggregation`:
+
+| Strategy | Description |
+|----------|-------------|
+| `sum` | Advantage of the weighted sum of rewards |
+| `gdpo` | Weighted sum of advantages from each reward |
+
+> To use a customized aggregation algorithm, refer to and modify `src/flow_factory/trainer/grpo:GRPOTrainer.compute_advantages`.
+
+**Weighted Sum (`sum`):**
+
+Standard approach that *aggregates multiple rewards as a weighted sum* and computes the advantage from this weighted sum:
+
+$$r_{total} = \sum_{i} w_i \cdot r_i$$
+
+where $w_i$ is the `weight` specified for each reward model.
+
+**GDPO (`gdpo`):**
+
+Implements the advantage aggregation from [GDPO: Group Reward-Decoupled Normalization Policy Optimization](https://arxiv.org/abs/2601.05242), which computes *a weighted combination of individual advantages*:
+
+$$A_{total} = \sum_{i} w_i \cdot A_i$$
+
+It then applies *batch normalization*. To use this formula, set:
+```yaml
+train:
+  trainer_type: 'grpo'
+  advantage_aggregation: 'gdpo'  # Options: 'sum', 'gdpo'
+
+rewards:
+  - name: "aesthetic"
+    reward_model: "PickScore"
+    weight: 1.0
+    batch_size: 16
+    
+  - name: "text_align"
+    reward_model: "CLIP"
+    weight: 0.5
+    batch_size: 32
+```
+
 **Automatic deduplication:** Identical configurations share the same model instance to save GPU memory.
 
 ```yaml
@@ -237,7 +280,7 @@ rewards:
     
   - name: "aesthetic_2"
     reward_model: "PickScore"  # Same config → reuses model above
-    batch_size: 16
+    batch_size: 32
 ```
 
 ## Decoupling Training and Evaluation Reward Models
