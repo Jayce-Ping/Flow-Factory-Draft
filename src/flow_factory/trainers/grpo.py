@@ -18,7 +18,7 @@ Group Relative Policy Optimization (GRPO) Trainer.
 Implements GRPO algorithm for flow matching models.
 """
 import os
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any, Union, Literal, Callable
 from functools import partial
 from collections import defaultdict
 import inspect
@@ -47,13 +47,17 @@ class GRPOTrainer(BaseTrainer):
     """
     GRPO Trainer for Flow Matching models.
     Implements group-based advantage computation and PPO-style clipping.
+    References:
+    [1] Flow-GRPO: Training Flow Matching Models via Online RL
+        - https://arxiv.org/abs/2505.05470
     """
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-    
+        self.num_train_timesteps = len(self.adapter.scheduler.train_timesteps)
+
     @property
-    def enable_kl_penalty(self) -> bool:
+    def enable_kl_loss(self) -> bool:
         """Check if KL penalty is enabled."""
         return self.training_args.kl_beta > 0.0
 
@@ -89,260 +93,7 @@ class GRPOTrainer(BaseTrainer):
 
             self.epoch += 1
 
-    def sample(self) -> List[BaseSample]:
-        """Generate rollouts for GRPO."""
-        self.adapter.rollout()
-        samples = []
-        data_iter = iter(self.dataloader)
-        
-        for batch_index in tqdm(
-            range(self.training_args.num_batches_per_epoch),
-            desc=f'Epoch {self.epoch} Sampling',
-            disable=not self.accelerator.is_local_main_process,
-        ):
-            batch = next(data_iter)
-            
-            with torch.no_grad(), self.autocast():
-                sample_kwargs = {
-                    **self.training_args,
-                    'compute_log_prob': True,
-                    **batch,
-                }
-                sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
-                sample_batch = self.adapter.inference(**sample_kwargs)
-            
-            samples.extend(sample_batch)
-
-        return samples
-
-    def compute_advantages(self, samples: List[BaseSample], rewards: Dict[str, torch.Tensor], store_to_samples: bool = True) -> torch.Tensor:
-        """
-        Compute advantages for GRPO.
-        Args:
-            samples: List of BaseSample instances
-            rewards: Dict of reward_name to reward tensors - these should be aligned with samples
-        Returns:
-            advantages: Tensor of shape (num_samples, ) with computed advantages
-
-        Notes:
-            - If you want to customize advantage computation (e.g., different normalization),
-            you can override this method in a subclass, e.g., for GDPO.
-        """
-
-        # 1. Get rewards
-        rewards = {key: torch.as_tensor(value).to(self.accelerator.device) for key, value in rewards.items()}
-        gathered_rewards = {
-            key: self.accelerator.gather(value).cpu().numpy()
-            for key, value in rewards.items()
-        }
-
-        # 2. Aggregate rewards if multiple reward models
-        aggregated_rewards = np.zeros_like(next(iter(gathered_rewards.values())), dtype=np.float64)
-        for key, reward_array in gathered_rewards.items():
-            # Simple weighted sum
-            aggregated_rewards += reward_array * self.reward_models[key].config.weight
-
-        # 3. Group rewards by unique_ids - each sample has its `unique_id` hashed from its prompt, conditioning, etc.
-        unique_ids = torch.tensor([s.unique_id for s in samples], dtype=torch.int64, device=self.accelerator.device)
-        gathered_ids = self.accelerator.gather(unique_ids).cpu().numpy()
-        _unique_ids, group_indices = np.unique(gathered_ids, return_inverse=True)
-
-        # 4. Compute advantages within each group
-        advantages = np.zeros_like(aggregated_rewards, dtype=np.float64)
-
-        if self.training_args.global_std:
-            std = max(np.std(aggregated_rewards, axis=0, keepdims=True), 1e-6)
-
-        for group_id in np.unique(group_indices):
-            mask = (group_indices == group_id)
-            group_rewards = aggregated_rewards[mask]
-            assert len(group_rewards) == self.training_args.group_size, \
-                f"Group size mismatch: expected {self.training_args.group_size}, got {len(group_rewards)}"
-
-            mean = np.mean(group_rewards, axis=0, keepdims=True)
-            if not self.training_args.global_std:
-                std = max(np.std(group_rewards, axis=0, keepdims=True), 1e-6)
-            
-            advantages[mask] = (group_rewards - mean) / std
-
-        # 5. Log statistics
-        # Log per-reward mean
-        _log_data = {
-            f'train/reward_{key}_mean': np.mean(value)
-            for key, value in gathered_rewards.items()
-        }
-        # Log per-reward std
-        _log_data.update({
-            f'train/reward_{key}_std': np.std(value)
-            for key, value in gathered_rewards.items()
-        })
-        # Log aggregated reward zero std ratio
-        zero_std_ratio = self.reward_processor.compute_group_zero_std_ratio(aggregated_rewards, group_indices)
-        _log_data['train/reward_zero_std_ratio'] = zero_std_ratio
-        # Log other stats
-        _log_data.update({
-            'train/reward_mean': np.mean(aggregated_rewards),
-            'train/reward_std': np.std(aggregated_rewards),
-            'train/adv_max': np.max(advantages),
-            'train/adv_min': np.min(advantages),
-            'train/adv_abs_mean': np.mean(np.abs(advantages)),
-        })
-        _log_data['train_samples'] = samples[:30]
-
-        self.log_data(_log_data, step=self.step)
-
-        # 6. Scatter advantages back to align with samples
-        advantages = torch.as_tensor(advantages).reshape(
-            self.accelerator.num_processes, -1, *advantages.shape[1:]
-        )[self.accelerator.process_index].to(self.accelerator.device)
-
-        # Store advantages to samples' extra_kwargs
-        if store_to_samples:
-            for sample, adv in zip(samples, advantages):
-                sample.extra_kwargs['advantage'] = adv
-
-        return advantages
-
-    def optimize(self, samples: List[BaseSample]) -> None:
-        """Main training loop: compute loss and update policy."""
-        self.adapter.train()
-        # Compute rewards and advantages for samples
-        rewards = self.reward_processor.compute_rewards(samples, store_to_samples=True, epoch=self.epoch)
-        advantages = self.compute_advantages(samples, rewards, store_to_samples=True)
-        
-        # Create batches for optimization
-        sample_batches : List[List[BaseSample]] = [
-            samples[i:i + self.training_args.per_device_batch_size]
-            for i in range(0, len(samples), self.training_args.per_device_batch_size)
-        ]
-
-        loss_info = defaultdict(list)
-
-        for batch_idx, batch in enumerate(tqdm(
-            sample_batches,
-            total=len(sample_batches),
-            desc=f'Epoch {self.epoch} Training',
-            position=0,
-            disable=not self.accelerator.is_local_main_process,
-        )):
-            with self.accelerator.accumulate(self.adapter.transformer):
-                for idx, timestep_index in enumerate(tqdm(
-                    self.adapter.scheduler.train_timesteps,
-                    desc=f'Epoch {self.epoch} Timestep',
-                    position=1,
-                    leave=False,
-                    disable=not self.accelerator.is_local_main_process,
-                )):
-                        # Get old log prob
-                        old_log_prob = torch.stack(
-                            [sample.log_probs[timestep_index] for sample in batch],
-                            dim=0
-                        )
-                        adv = torch.stack(
-                            [sample.extra_kwargs['advantage'] for sample in batch],
-                            dim=0
-                        )
-
-                        with self.autocast():
-                            # Forward pass
-                            if self.enable_kl_penalty:
-                                if self.training_args.kl_type == 'v-based':
-                                    return_kwargs = ['log_prob', 'noise_pred', 'std_dev_t', 'dt']
-                                elif self.training_args.kl_type == 'x-based':
-                                    return_kwargs = ['log_prob', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt']
-                            else:
-                                return_kwargs = ['log_prob', 'std_dev_t', 'dt']
-                            
-                            forward_kwargs = {
-                                **self.training_args,
-                                'samples': batch,
-                                'timestep_index': timestep_index,
-                                'compute_log_prob': True,
-                                'return_kwargs': return_kwargs,
-                            }
-                            forward_kwargs = filter_kwargs(self.adapter.forward, **forward_kwargs)
-                            output = self.adapter.forward(**forward_kwargs)
-
-                        # Clip advantages
-                        adv_clip_range = self.training_args.adv_clip_range
-                        adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
-                        # PPO-style clipped loss
-                        ratio = torch.exp(output.log_prob - old_log_prob)
-                        ratio_clip_range = self.training_args.clip_range
-
-                        unclipped_loss = -adv * ratio
-                        clipped_loss = -adv * torch.clamp(ratio, 1.0 + ratio_clip_range[0], 1.0 + ratio_clip_range[1])
-                        policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
-
-                        loss = policy_loss
-
-                        # Compute KL-div
-                        if self.enable_kl_penalty:
-                            with self.autocast(), torch.no_grad(), self.adapter.use_ref_parameters():
-                                if self.training_args.kl_type == 'v-based':
-                                    # KL in velocity space
-                                    ref_output = self.adapter.forward(
-                                        batch,
-                                        timestep_index=timestep_index,
-                                        compute_log_prob=False,
-                                        return_kwargs=['noise_pred'],
-                                    )
-                                    kl_div = torch.mean(
-                                        ((output.noise_pred - ref_output.noise_pred) ** 2),
-                                        dim=tuple(range(1, output.noise_pred.ndim)), keepdim=True
-                                    ) / (2 * output.std_dev_t ** 2 + 1e-7)
-                                elif self.training_args.kl_type == 'x-based':
-                                    # KL in latent space
-                                    ref_output = self.adapter.forward(
-                                        batch,
-                                        timestep_index=timestep_index,
-                                        compute_log_prob=False,
-                                        return_kwargs=['next_latents_mean'],
-                                    )
-                                    kl_div = torch.mean(
-                                        ((output.next_latents_mean - ref_output.next_latents_mean) ** 2),
-                                        dim=tuple(range(1, output.next_latents_mean.ndim)), keepdim=True
-                                    ) / (2 * output.std_dev_t ** 2 + 1e-7)
-                            
-                            kl_div = torch.mean(kl_div)
-                            kl_penalty = self.training_args.kl_beta * kl_div
-                            loss += kl_penalty
-                            loss_info['kl_div'].append(kl_div.detach())
-                            loss_info['kl_penalty'].append(kl_penalty.detach())
-
-
-                        loss_info['ratio'].append(ratio.detach())
-                        loss_info['unclipped_loss'].append(unclipped_loss.detach())
-                        loss_info['clipped_loss'].append(clipped_loss.detach())
-                        loss_info['policy_loss'].append(policy_loss.detach())
-                        loss_info['loss'].append(loss.detach())
-                        loss_info["clip_frac_high"].append(torch.mean((ratio > 1.0 + ratio_clip_range[1]).float()))
-                        loss_info["clip_frac_low"].append(torch.mean((ratio < 1.0 + ratio_clip_range[0]).float()))
-
-                        # Backward
-                        self.accelerator.backward(loss)
-                    
-                if self.accelerator.sync_gradients:
-                    self.accelerator.clip_grad_norm_(
-                        self.adapter.get_trainable_parameters(),
-                        self.training_args.max_grad_norm,
-                    )
-                    # Communicate and log losses
-                    loss_info = {
-                        k: torch.stack(v).mean() 
-                        for k, v in loss_info.items()
-                    }
-                    loss_info = self.accelerator.reduce(loss_info, reduction="mean")
-                    self.log_data(
-                        {f'train/{k}': v for k, v in loss_info.items()},
-                        step=self.step,
-                    )
-                    self.step += 1
-                    loss_info = defaultdict(list)
-                
-                self.optimizer.step()
-                self.optimizer.zero_grad()
-
+    # =========================== Evaluation Loop ============================
     def evaluate(self) -> None:
         """Evaluation loop."""
         if self.test_dataloader is None:
@@ -385,101 +136,120 @@ class GRPOTrainer(BaseTrainer):
             
             # Log statistics
             if self.accelerator.is_main_process:
-                _log_data = {
-                    f'eval/reward_{key}_mean': np.mean(value)
-                    for key, value in gathered_rewards.items()
-                }
-                _log_data.update({
-                    f'eval/reward_{key}_std': np.std(value)
-                    for key, value in gathered_rewards.items()
-                })
-                self.log_data(
-                    {
-                        **_log_data,
-                        'eval_samples' : all_samples,
-                    },
-                    step=self.step,
-                )
+                _log_data = {f'eval/reward_{key}_mean': np.mean(value) for key, value in gathered_rewards.items()}
+                _log_data.update({f'eval/reward_{key}_std': np.std(value) for key, value in gathered_rewards.items()})
+                _log_data['eval_samples'] = all_samples
+                self.log_data(_log_data, step=self.step)
             self.accelerator.wait_for_everyone()
 
+    # =========================== Sampling Loop ============================
+    def sample(self) -> List[BaseSample]:
+        """Generate rollouts for GRPO."""
+        self.adapter.rollout()
+        samples = []
+        data_iter = iter(self.dataloader)
+        
+        for batch_index in tqdm(
+            range(self.training_args.num_batches_per_epoch),
+            desc=f'Epoch {self.epoch} Sampling',
+            disable=not self.accelerator.is_local_main_process,
+        ):
+            batch = next(data_iter)
+            
+            with torch.no_grad(), self.autocast():
+                sample_kwargs = {
+                    **self.training_args,
+                    'compute_log_prob': True,
+                    **batch,
+                }
+                sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
+                sample_batch = self.adapter.inference(**sample_kwargs)
+            
+            samples.extend(sample_batch)
 
-# ============================ GRPO-Guard Trainer ============================
-class GRPOGuardTrainer(GRPOTrainer):
-    """
-    GRPOGuard Trainer with reweighted loss.
-    References:
-    [1] GRPO-Guard: https://arxiv.org/abs/2510.22319
-    [2] Temp-FlowGRPO: https://arxiv.org/abs/2508.04324
-    """
+        return samples
     
+    # =========================== Optimization Loop ============================
     def optimize(self, samples: List[BaseSample]) -> None:
         """Main training loop: compute loss and update policy."""
-        self.adapter.train()
         # Compute rewards and advantages for samples
         rewards = self.reward_processor.compute_rewards(samples, store_to_samples=True, epoch=self.epoch)
-        advantages = self.compute_advantages(samples, rewards)
+        advantages = self.compute_advantages(samples, rewards, store_to_samples=True)
 
-        # Add advantages to samples
-        for sample, adv in zip(samples, advantages):
-            sample.extra_kwargs['advantage'] = adv
-        
-        # Create batches for optimization        
-        sample_batches : List[List[BaseSample]] = [
-            samples[i:i + self.training_args.per_device_batch_size]
+        # Create batches for optimization
+        # `BaseSample.stack` will try to stack all tensor fields,
+        # stack non-tensor fields as a list, keep shared fields as single value
+        sample_batches : List[Dict[str, Union[torch.Tensor, Any, List[Any]]]] = [
+            BaseSample.stack(samples[i:i + self.training_args.per_device_batch_size])
             for i in range(0, len(samples), self.training_args.per_device_batch_size)
         ]
 
+        self.adapter.train()
         loss_info = defaultdict(list)
 
-        for batch_idx, batch in enumerate(tqdm(
-            sample_batches,
-            total=len(sample_batches),
-            desc=f'Epoch {self.epoch} Training',
-            position=0,
-            disable=not self.accelerator.is_local_main_process,
-        )):
-            with self.accelerator.accumulate(self.adapter.transformer):
-                for idx, timestep_index in enumerate(tqdm(
-                    self.adapter.scheduler.train_timesteps,
-                    desc=f'Epoch {self.epoch} Timestep',
-                    position=1,
-                    leave=False,
-                    disable=not self.accelerator.is_local_main_process,
-                )):
-                        # Get old log probs
-                        old_log_prob = torch.stack(
-                            [sample.log_probs[timestep_index] for sample in batch],
-                            dim=0
+        with self.autocast():
+            for batch_idx, batch in enumerate(tqdm(
+                sample_batches,
+                total=len(sample_batches),
+                desc=f'Epoch {self.epoch} Training',
+                position=0,
+                disable=not self.accelerator.is_local_main_process,
+            )):
+                with self.accelerator.accumulate(self.adapter.transformer):
+                    total_loss = torch.tensor(0.0, device=self.accelerator.device)
+                    # Iterate through timesteps
+                    for idx, timestep_index in enumerate(tqdm(
+                        self.adapter.scheduler.train_timesteps,
+                        desc=f'Epoch {self.epoch} Timestep',
+                        position=1,
+                        leave=False,
+                        disable=not self.accelerator.is_local_main_process,
+                    )):
+                        # 1. Prepare inputs
+                        # Get old log prob
+                        old_log_prob = batch['log_probs'][:, timestep_index]
+                        # Get current timestep data
+                        num_timesteps = batch['timesteps'].shape[1]
+                        t = batch['timesteps'][:, timestep_index]
+                        t_next = (
+                            batch['timesteps'][:, timestep_index + 1]
+                            if timestep_index + 1 < num_timesteps
+                            else torch.tensor(0, device=self.accelerator.device)
                         )
-                        adv = torch.stack(
-                            [sample.extra_kwargs['advantage'] for sample in batch],
-                            dim=0
-                        )
+                        # Get latents
+                        latents = batch['all_latents'][:, timestep_index]
+                        next_latents = batch['all_latents'][:, timestep_index + 1]
+                        # Prepare forward input
+                        forward_inputs = {
+                            **self.training_args, # Pass kwargs like `guidance_scale` and `do_classifier_free_guidance`
+                            't': t,
+                            't_next': t_next,
+                            'latents': latents,
+                            'next_latents': next_latents,
+                            'compute_log_prob': True,
+                            'noise_level': self.adapter.scheduler.noise_level,
+                            **batch
+                        }
+                        forward_inputs = filter_kwargs(self.adapter.forward, **forward_inputs)
+                        # 2. Forward pass
+                        if self.enable_kl_loss:
+                            if self.training_args.kl_type == 'v-based':
+                                return_kwargs = ['log_prob', 'noise_pred', 'dt']
+                            elif self.training_args.kl_type == 'x-based':
+                                return_kwargs = ['log_prob', 'next_latents', 'next_latents_mean', 'dt']
+                        else:
+                            return_kwargs = ['log_prob', 'dt']
+                        
+                        forward_inputs['return_kwargs'] = return_kwargs
+                        output = self.adapter.forward(**forward_inputs)
 
-                        with self.autocast():
-                            # Forward pass
-                            return_kwargs = ['log_prob', 'next_latents_mean', 'std_dev_t', 'dt']
-                            forward_kwargs = {
-                                **self.training_args,
-                                'samples': batch,
-                                'timestep_index': timestep_index,
-                                'compute_log_prob': True,
-                                'return_kwargs': return_kwargs,
-                            }
-                            forward_kwargs = filter_kwargs(self.adapter.forward, **forward_kwargs)
-                            output = self.adapter.forward(**forward_kwargs)
-
+                        # 3. Compute loss
                         # Clip advantages
+                        adv = batch['advantage']
                         adv_clip_range = self.training_args.adv_clip_range
                         adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
-
-                        # Reweighted ratio
-                        scale_factor = torch.sqrt(-output.dt) * output.std_dev_t
-                        old_next_latents_mean = torch.stack([sample.next_latents_mean[timestep_index] for sample in batch], dim=0)
-                        mse = (output.next_latents_mean - old_next_latents_mean).flatten(1).pow(2).mean(dim=1)
-                        ratio = torch.exp((output.log_prob - old_log_prob) * scale_factor + mse / (2 * scale_factor))
-
                         # PPO-style clipped loss
+                        ratio = torch.exp(output.log_prob - old_log_prob)
                         ratio_clip_range = self.training_args.clip_range
 
                         unclipped_loss = -adv * ratio
@@ -488,38 +258,38 @@ class GRPOGuardTrainer(GRPOTrainer):
 
                         loss = policy_loss
 
-                        if self.enable_kl_penalty:
-                            with self.autocast(), torch.no_grad(), self.adapter.use_ref_parameters():
+                        # 4. Compute KL-div
+                        if self.enable_kl_loss:
+                            with torch.no_grad(), self.adapter.use_ref_parameters():
+                                ref_forward_inputs = forward_inputs.copy()
+                                ref_forward_inputs['compute_log_prob'] = False
                                 if self.training_args.kl_type == 'v-based':
                                     # KL in velocity space
-                                    ref_output = self.adapter.forward(
-                                        batch,
-                                        timestep_index=timestep_index,
-                                        compute_log_prob=False,
-                                        return_kwargs=['noise_pred'],
-                                    )
+                                    ref_forward_inputs['return_kwargs'] = ['noise_pred']
+                                    ref_output = self.adapter.forward(**ref_forward_inputs)
                                     kl_div = torch.mean(
                                         ((output.noise_pred - ref_output.noise_pred) ** 2),
                                         dim=tuple(range(1, output.noise_pred.ndim)), keepdim=True
-                                    ) / (2 * output.std_dev_t ** 2 + 1e-7)
+                                    )
                                 elif self.training_args.kl_type == 'x-based':
                                     # KL in latent space
-                                    ref_output = self.adapter.forward(
-                                        batch,
-                                        timestep_index=timestep_index,
-                                        compute_log_prob=False,
-                                        return_kwargs=['next_latents_mean'],
-                                    )
+                                    ref_forward_inputs['return_kwargs'] = ['next_latents_mean']
+                                    ref_output = self.adapter.forward(**ref_forward_inputs)
                                     kl_div = torch.mean(
                                         ((output.next_latents_mean - ref_output.next_latents_mean) ** 2),
                                         dim=tuple(range(1, output.next_latents_mean.ndim)), keepdim=True
-                                    ) / (2 * output.std_dev_t ** 2 + 1e-7)
+                                    )
                             
-                            kl_penalty = self.training_args.kl_beta * kl_div
-                            loss += kl_penalty
+                            kl_div = torch.mean(kl_div)
+                            kl_loss = self.training_args.kl_beta * kl_div
+                            loss += kl_loss
                             loss_info['kl_div'].append(kl_div.detach())
-                            loss_info['kl_penalty'].append(kl_penalty.detach())
+                            loss_info['kl_loss'].append(kl_loss.detach())
 
+                        # 5. Accumulate per-timestep loss
+                        total_loss += loss / self.num_train_timesteps
+
+                        # 6. Log per-timestep info
                         loss_info['ratio'].append(ratio.detach())
                         loss_info['unclipped_loss'].append(unclipped_loss.detach())
                         loss_info['clipped_loss'].append(clipped_loss.detach())
@@ -527,42 +297,171 @@ class GRPOGuardTrainer(GRPOTrainer):
                         loss_info["clip_frac_high"].append(torch.mean((ratio > 1.0 + ratio_clip_range[1]).float()))
                         loss_info["clip_frac_low"].append(torch.mean((ratio < 1.0 + ratio_clip_range[0]).float()))
 
-                        # Backward
-                        self.accelerator.backward(loss)
-                    
-                if self.accelerator.sync_gradients:
-                    self.accelerator.clip_grad_norm_(
-                        self.adapter.get_trainable_parameters(),
-                        self.training_args.max_grad_norm,
-                    )
-                    # Communicate and log losses
-                    loss_info = {
-                        k: torch.stack(v).mean() 
-                        for k, v in loss_info.items()
-                    }
-                    loss_info = self.accelerator.reduce(loss_info, reduction="mean")
-                    self.log_data(
-                        {f'train/{k}': v for k, v in loss_info.items()},
-                        step=self.step,
-                    )
-                    self.step += 1
-                    loss_info = defaultdict(list)
-                
-                self.optimizer.step()
-                self.optimizer.zero_grad()
+                    # Backward per batch
+                    self.accelerator.backward(total_loss)
+                    loss_info['loss'].append(total_loss.detach())
 
-# =========================== GDPO Trainer ============================
-class GDPOTrainer(GRPOTrainer):
-    """
-    GDPO Trainer - computes advantages per reward separately before combining.
-    References:
-    [1] GDPO: https://arxiv.org/abs/2601.05242
-    """
-    
-    def compute_advantages(self, samples: List[BaseSample], rewards: Dict[str, torch.Tensor], store_to_samples: bool = True) -> torch.Tensor:
+                    if self.accelerator.sync_gradients:
+                        self.accelerator.clip_grad_norm_(
+                            self.adapter.get_trainable_parameters(),
+                            self.training_args.max_grad_norm,
+                        )
+                        # Communicate and log losses
+                        loss_info = {
+                            k: torch.stack(v).mean() 
+                            for k, v in loss_info.items()
+                        }
+                        loss_info = self.accelerator.reduce(loss_info, reduction="mean")
+                        self.log_data(
+                            {f'train/{k}': v for k, v in loss_info.items()},
+                            step=self.step,
+                        )
+                        self.step += 1
+                        loss_info = defaultdict(list)
+                    
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+
+    # =========================== Advantage Computation ============================
+    def compute_advantages(
+        self,
+        samples: List[BaseSample],
+        rewards: Dict[str, torch.Tensor],
+        store_to_samples: bool = True,
+        aggregation_func: Optional[Union[Literal['sum', 'gdpo'], Callable]] = None,
+    ) -> torch.Tensor:
+        """
+        Compute advantages for GRPO.
+        Args:
+            samples: List of BaseSample instances
+            rewards: Dict of reward_name to reward tensors - these should be aligned with samples
+            store_to_samples: Whether to store computed advantages back to samples' extra_kwargs
+            aggregation_func: Method to aggregate advantages within each group.
+                Options: 'sum' (default GRPO), 'gdpo' (GDPO-style), or a custom callable.
+        Returns:
+            advantages: Tensor of shape (num_samples, ) with computed advantages
+        """
+        aggregation_func = aggregation_func or self.training_args.advantage_aggregation
+        if aggregation_func == 'sum':
+            return self.compute_advantage_weighted_sum(samples, rewards, store_to_samples)
+        elif aggregation_func == 'gdpo':
+            return self.compute_advantages_gdpo(samples, rewards, store_to_samples)
+        elif callable(aggregation_func):
+            return aggregation_func(self, samples, rewards, store_to_samples)
+        else:
+            raise ValueError(
+                f"Unsupported advantage aggregation method: {aggregation_func}. "
+                " Supported: ['sum', 'gdpo'] "
+                "or a callable function that takes (trainer, samples, rewards, store_to_samples) as inputs."
+            )
+        
+
+    def compute_advantage_weighted_sum(
+        self,
+        samples: List[BaseSample],
+        rewards: Dict[str, torch.Tensor],
+        store_to_samples: bool = True
+    ) -> torch.Tensor:
+        """
+        Compute advantages for GRPO using weighted sum aggregation.
+        Args:
+            samples: List of BaseSample instances
+            rewards: Dict of reward_name to reward tensors - these should be aligned with samples
+        Returns:
+            advantages: Tensor of shape (num_samples, ) with computed advantages
+
+        Notes:
+            - If you want to customize advantage computation (e.g., different normalization),
+            you can override this method in a subclass, e.g., for GDPO.
+        """
+
+        # 1. Get rewards
+        rewards = {key: torch.as_tensor(value).to(self.accelerator.device) for key, value in rewards.items()}
+        gathered_rewards = {
+            key: self.accelerator.gather(value).cpu().numpy()
+            for key, value in rewards.items()
+        }
+
+        # 2. Aggregate rewards if multiple reward models
+        aggregated_rewards = np.zeros_like(next(iter(gathered_rewards.values())), dtype=np.float64)
+        for key, reward_array in gathered_rewards.items():
+            # Simple weighted sum
+            aggregated_rewards += reward_array * self.reward_models[key].config.weight
+
+        # 3. Group rewards by unique_ids - each sample has its `unique_id` hashed from its prompt, conditioning, etc.
+        unique_ids = torch.tensor([s.unique_id for s in samples], dtype=torch.int64, device=self.accelerator.device)
+        gathered_ids = self.accelerator.gather(unique_ids).cpu().numpy()
+        _unique_ids, group_indices, _counts = np.unique(gathered_ids, return_inverse=True, return_counts=True)
+        
+        # 4. Compute advantages within each group
+        advantages = np.zeros_like(aggregated_rewards, dtype=np.float64)
+
+        if self.training_args.global_std:
+            std = max(np.std(aggregated_rewards, axis=0, keepdims=True), 1e-6)
+
+        for group_id in np.unique(group_indices):
+            mask = (group_indices == group_id)
+            group_rewards = aggregated_rewards[mask]
+            assert len(group_rewards) == self.training_args.group_size, \
+                f"Group size mismatch: expected {self.training_args.group_size}, got {len(group_rewards)}"
+
+            mean = np.mean(group_rewards, axis=0, keepdims=True)
+            if not self.training_args.global_std:
+                std = max(np.std(group_rewards, axis=0, keepdims=True), 1e-6)
+            
+            advantages[mask] = (group_rewards - mean) / std
+
+        # 5. Log statistics
+        # Log per-reward mean
+        _log_data = {
+            f'train/reward_{key}_mean': np.mean(value)
+            for key, value in gathered_rewards.items()
+        }
+        # Log per-reward std
+        _log_data.update({
+            f'train/reward_{key}_std': np.std(value)
+            for key, value in gathered_rewards.items()
+        })
+        # Log aggregated reward zero std ratio
+        zero_std_ratio = RewardProcessor.compute_group_zero_std_ratio(aggregated_rewards, group_indices)
+        _log_data['train/reward_zero_std_ratio'] = zero_std_ratio
+        # Log other stats
+        _log_data.update({
+            'train/reward_mean': np.mean(aggregated_rewards),
+            'train/reward_std': np.std(aggregated_rewards),
+            'train/adv_max': np.max(advantages),
+            'train/adv_min': np.min(advantages),
+            'train/adv_abs_mean': np.mean(np.abs(advantages)),
+        })
+        _log_data['train_samples'] = samples[:30]
+
+        self.log_data(_log_data, step=self.step)
+
+        # 6. Scatter advantages back to align with samples
+        advantages = torch.as_tensor(advantages).reshape(
+            self.accelerator.num_processes, -1, *advantages.shape[1:]
+        )[self.accelerator.process_index].to(self.accelerator.device)
+
+        # Store advantages to samples' extra_kwargs
+        if store_to_samples:
+            for sample, adv in zip(samples, advantages):
+                sample.extra_kwargs['advantage'] = adv
+
+        return advantages
+
+
+    def compute_advantages_gdpo(
+        self,
+        samples: List[BaseSample],
+        rewards: Dict[str, torch.Tensor],
+        store_to_samples: bool = True
+    ) -> torch.Tensor:
         """
         Compute advantages using GDPO: normalize each reward group-wise first,
         then combine with weights and apply batch normalization.
+        References:
+        [1] GDPO: Group reward-Decoupled Normalization Policy Optimization for Multi-reward RL Optimization
+            - https://arxiv.org/abs/2601.05242
         """
         # 1. Gather rewards across processes
         rewards = {key: torch.as_tensor(value).to(self.accelerator.device) for key, value in rewards.items()}
@@ -610,7 +509,7 @@ class GDPOTrainer(GRPOTrainer):
         })
         # Log per-reward zero std ratio
         _log_data.update({
-            f'train/reward_{key}_zero_std_ratio': self.reward_processor.compute_group_zero_std_ratio(arr, group_indices)
+            f'train/reward_{key}_zero_std_ratio': RewardProcessor.compute_group_zero_std_ratio(arr, group_indices)
             for key, arr in gathered_rewards.items()
         })
         # Log combined stats
@@ -635,3 +534,148 @@ class GDPOTrainer(GRPOTrainer):
                 sample.extra_kwargs['advantage'] = adv
 
         return advantages
+
+
+# ============================ GRPO-Guard Trainer ============================
+class GRPOGuardTrainer(GRPOTrainer):
+    """
+    GRPOGuard Trainer with reweighted loss.
+    References:
+    [1] GRPO-Guard: https://arxiv.org/abs/2510.22319
+    [2] Temp-FlowGRPO: https://arxiv.org/abs/2508.04324
+    """
+    
+    def optimize(self, samples: List[BaseSample]) -> None:
+        """Main training loop: compute loss and update policy."""
+        self.adapter.train()
+        # Compute rewards and advantages for samples
+        rewards = self.reward_processor.compute_rewards(samples, store_to_samples=True, epoch=self.epoch)
+        advantages = self.compute_advantages(samples, rewards, store_to_samples=True)
+        
+        # Create batches for optimization        
+        sample_batches : List[List[BaseSample]] = [
+            samples[i:i + self.training_args.per_device_batch_size]
+            for i in range(0, len(samples), self.training_args.per_device_batch_size)
+        ]
+
+        loss_info = defaultdict(list)
+
+        for batch_idx, batch in enumerate(tqdm(
+            sample_batches,
+            total=len(sample_batches),
+            desc=f'Epoch {self.epoch} Training',
+            position=0,
+            disable=not self.accelerator.is_local_main_process,
+        )):
+            with self.accelerator.accumulate(self.adapter.transformer):
+                for idx, timestep_index in enumerate(tqdm(
+                    self.adapter.scheduler.train_timesteps,
+                    desc=f'Epoch {self.epoch} Timestep',
+                    position=1,
+                    leave=False,
+                    disable=not self.accelerator.is_local_main_process,
+                )):
+                    # Get old log probs
+                    old_log_prob = torch.stack(
+                        [sample.log_probs[timestep_index] for sample in batch],
+                        dim=0
+                    )
+                    adv = torch.stack(
+                        [sample.extra_kwargs['advantage'] for sample in batch],
+                        dim=0
+                    )
+
+                    with self.autocast():
+                        # Forward pass
+                        return_kwargs = ['log_prob', 'next_latents_mean', 'std_dev_t', 'dt']
+                        forward_kwargs = {
+                            **self.training_args,
+                            'samples': batch,
+                            'timestep_index': timestep_index,
+                            'compute_log_prob': True,
+                            'return_kwargs': return_kwargs,
+                        }
+                        forward_kwargs = filter_kwargs(self.adapter.forward, **forward_kwargs)
+                        output = self.adapter.forward(**forward_kwargs)
+
+                    # Clip advantages
+                    adv_clip_range = self.training_args.adv_clip_range
+                    adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
+
+                    # Reweighted ratio
+                    scale_factor = torch.sqrt(-output.dt) * output.std_dev_t
+                    old_next_latents_mean = torch.stack([sample.next_latents_mean[timestep_index] for sample in batch], dim=0)
+                    mse = (output.next_latents_mean - old_next_latents_mean).flatten(1).pow(2).mean(dim=1)
+                    ratio = torch.exp((output.log_prob - old_log_prob) * scale_factor + mse / (2 * scale_factor))
+
+                    # PPO-style clipped loss
+                    ratio_clip_range = self.training_args.clip_range
+
+                    unclipped_loss = -adv * ratio
+                    clipped_loss = -adv * torch.clamp(ratio, 1.0 + ratio_clip_range[0], 1.0 + ratio_clip_range[1])
+                    policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+
+                    loss = policy_loss
+
+                    if self.enable_kl_loss:
+                        with self.autocast(), torch.no_grad(), self.adapter.use_ref_parameters():
+                            if self.training_args.kl_type == 'v-based':
+                                # KL in velocity space
+                                ref_output = self.adapter.forward(
+                                    batch,
+                                    timestep_index=timestep_index,
+                                    compute_log_prob=False,
+                                    return_kwargs=['noise_pred'],
+                                )
+                                kl_div = torch.mean(
+                                    ((output.noise_pred - ref_output.noise_pred) ** 2),
+                                    dim=tuple(range(1, output.noise_pred.ndim)), keepdim=True
+                                )
+                            elif self.training_args.kl_type == 'x-based':
+                                # KL in latent space
+                                ref_output = self.adapter.forward(
+                                    batch,
+                                    timestep_index=timestep_index,
+                                    compute_log_prob=False,
+                                    return_kwargs=['next_latents_mean'],
+                                )
+                                kl_div = torch.mean(
+                                    ((output.next_latents_mean - ref_output.next_latents_mean) ** 2),
+                                    dim=tuple(range(1, output.next_latents_mean.ndim)), keepdim=True
+                                )
+                        
+                        kl_loss = self.training_args.kl_beta * kl_div
+                        loss += kl_loss
+                        loss_info['kl_div'].append(kl_div.detach())
+                        loss_info['kl_loss'].append(kl_loss.detach())
+
+                    loss_info['ratio'].append(ratio.detach())
+                    loss_info['unclipped_loss'].append(unclipped_loss.detach())
+                    loss_info['clipped_loss'].append(clipped_loss.detach())
+                    loss_info['policy_loss'].append(policy_loss.detach())
+                    loss_info["clip_frac_high"].append(torch.mean((ratio > 1.0 + ratio_clip_range[1]).float()))
+                    loss_info["clip_frac_low"].append(torch.mean((ratio < 1.0 + ratio_clip_range[0]).float()))
+
+                    # Backward
+                    self.accelerator.backward(loss)
+                    
+                if self.accelerator.sync_gradients:
+                    self.accelerator.clip_grad_norm_(
+                        self.adapter.get_trainable_parameters(),
+                        self.training_args.max_grad_norm,
+                    )
+                    # Communicate and log losses
+                    loss_info = {
+                        k: torch.stack(v).mean() 
+                        for k, v in loss_info.items()
+                    }
+                    loss_info = self.accelerator.reduce(loss_info, reduction="mean")
+                    self.log_data(
+                        {f'train/{k}': v for k, v in loss_info.items()},
+                        step=self.step,
+                    )
+                    self.step += 1
+                    loss_info = defaultdict(list)
+                
+                self.optimizer.step()
+                self.optimizer.zero_grad()

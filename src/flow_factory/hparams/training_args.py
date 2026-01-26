@@ -149,6 +149,10 @@ class TrainingArguments(ArgABC):
         default="grpo",
         metadata={"help": "Type of trainer to use."},
     )
+    advantage_aggregation: Literal['sum', 'gdpo'] = field(
+        default='gdpo',
+        metadata={"help": "Method to aggregate advantages within each group for GRPO. Options: ['sum', 'gdpo']."},
+    )
     group_size: int = field(
         default=16,
         metadata={"help": "Group size for GRPO sampling."},

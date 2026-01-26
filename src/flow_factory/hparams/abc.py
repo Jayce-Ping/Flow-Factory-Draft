@@ -52,6 +52,15 @@ class ArgABC(ABC):
             init_data["extra_kwargs"] = extras
         
         return cls(**init_data)
+    
+    def __getattr__(self, name: str) -> Any:
+        """Fallback to extra_kwargs for unknown attributes."""
+        if "extra_kwargs" in self.__dict__:
+            extras = self.__dict__["extra_kwargs"]
+            if name in extras:
+                return extras[name]
+        
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict, flattening extra_kwargs into the root."""
@@ -60,6 +69,13 @@ class ArgABC(ABC):
         # Merge extras back into the main dict for a clean export
         d.update(extras) 
         return d
+
+    def __getattr__(self, name: str) -> Any:
+        """Fallback to extra_kwargs for unknown attributes."""
+        extras = self.__dict__.get("extra_kwargs")
+        if extras and name in extras:
+            return extras[name]
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
     # --- Magic methods for ** unpacking ---
     def keys(self):
