@@ -163,9 +163,8 @@ class GRPOTrainer(BaseTrainer):
                     **batch,
                 }
                 sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
-                sample_batch = self.adapter.inference(**sample_kwargs)
-            
-            samples.extend(sample_batch)
+                sample_batch = self.adapter.inference(**sample_kwargs)        
+                samples.extend(sample_batch)
 
         return samples
     
