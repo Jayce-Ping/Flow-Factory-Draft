@@ -357,9 +357,14 @@ class BaseAdapter(ABC):
         return ['transformer', 'vae']
 
     @property
-    def trainable_components(self) -> List[str]:
-        """Components with trainable parameters."""
+    def trainable_component_names(self) -> List[str]:
+        """Names of components with trainable parameters."""
         return [comp for comp, mods in self.target_module_map.items() if mods]
+
+    @property
+    def trainable_components(self) -> List[torch.nn.Module]:
+        """Prepared model objects with trainable parameters."""
+        return [self.get_component(name) for name in self.trainable_component_names]
 
     def _merge_module_pattern(
         self,
