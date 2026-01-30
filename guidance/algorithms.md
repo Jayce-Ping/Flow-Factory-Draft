@@ -13,6 +13,8 @@
 
 - [DiffusionNFT](#diffusionnft)
 
+- [AWM: Advantage Weighted Matching](#awm-advantage-weighted-matching)
+
 - [References](#references)
 
 ## GRPO
@@ -129,6 +131,7 @@ train:
 ## DiffusionNFT
 
 This algorithm is introduced in [[7]](#ref7), to use this algorithm, set:
+
 ```yaml
 train:
     trainer_type: 'nft'
@@ -138,13 +141,26 @@ train:
 
 ```yaml
 train:
-    dynamics_type: 'ODE' # Other options are also available.
+  num_train_timesteps: 2 # Number of timesteps to train on. Set `null` to all timesteps.
+  time_sampling_strategy: discrete_with_init # Options: uniform, logit_normal, discrete, discrete_with_init, discrete_wo_init
+  time_shift: 3.0
+  timestep_fraction: 0.3 # Train using only the first 30% of timesteps.
 
-    num_train_steps: 3
-    train_steps: [1, 2, 3] # Train on the timesteps with index 1, 2, 3
+scheduler:
+    dynamics_type: 'ODE' # Other options are also available.
 ```
 
 > **Note**: Since Reinforcement Learning typically requires exploration, it is often beneficial to experiment with SDE-based `dynamics_type` settings as well. Using `CPS`[[8]](#ref8) for NFT sampling is also a good choice.
+
+## AWM: Advantage Weighted Matching
+
+This algorithm is introduced in [[9]](#ref9), to use this algorithm, set:
+```yaml
+train:
+    trainer_type: 'awm'
+```
+
+**Advantage Weighted Matching** also decouples the **actual sampling dynamics** from the **training timesteps** and the relevant parameters are the same as **DiffusionNFT**.
 
 
 ### References
@@ -157,3 +173,5 @@ train:
 * <a name="ref6"></a>[6] [**PaCo-RL**: Advancing Reinforcement Learning for Consistent Image Generation with Pairwise Reward Modeling](https://arxiv.org/abs/2512.04784)
 * <a name="ref7"></a>[7] [**DiffusionNFT**: Online Diffusion Reinforcement with Forward Process](https://arxiv.org/abs/2509.16117)
 * <a name="ref8"></a>[8] [**<u>C</u>oefficients-<u>P</u>reserving <u>S</u>ampling** for Reinforcement Learning with Flow Matching](https://arxiv.org/abs/2509.05952)
+* <a name="ref8"></a>[9] [**<u>A</u>dvantage <u>W</u>eighted <u>M</u>atching**: Aligning RL with Pretraining in Diffusion Models
+](https://arxiv.org/abs/2509.25050)
