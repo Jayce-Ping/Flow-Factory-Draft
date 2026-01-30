@@ -471,8 +471,13 @@ class Wan2_I2V_Adapter(BaseAdapter):
             num_frames = num_frames // self.pipeline.vae_scale_factor_temporal * self.pipeline.vae_scale_factor_temporal + 1
         num_frames = max(num_frames, 1)
         # Check `height` and `width`
-        h_multiple_of = self.pipeline.vae_scale_factor_spatial * self.pipeline.transformer.config.patch_size[1]
-        w_multiple_of = self.pipeline.vae_scale_factor_spatial * self.pipeline.transformer.config.patch_size[2]
+        patch_size = (
+            self.pipeline.transformer.config.patch_size
+            if self.pipeline.transformer is not None
+            else self.pipeline.transformer_2.config.patch_size
+        )
+        h_multiple_of = self.pipeline.vae_scale_factor_spatial * patch_size[1]
+        w_multiple_of = self.pipeline.vae_scale_factor_spatial * patch_size[2]
         calc_height = height // h_multiple_of * h_multiple_of
         calc_width = width // w_multiple_of * w_multiple_of
         if height != calc_height or width != calc_width:
