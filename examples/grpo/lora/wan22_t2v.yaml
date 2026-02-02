@@ -58,10 +58,11 @@ train:
   ref_param_device: 'cuda' # Options: cpu, cuda
 
   # Video settings
-  resolution: 256  # Can be int or [height, width]
-  num_frames: 41 # (F - 1) mod 4 == 0
+  resolution: 480  # Can be int or [height, width]
+  num_frames: 5 # (F - 1) mod 4 == 0
   num_inference_steps: 10  # Number of timesteps
-  guidance_scale: 5.0  # Guidance scale for sampling
+  guidance_scale: 4.0  # Guidance scale for sampling
+  guidance_scale_2: 3.0  # Guidance scale for sampling
 
   # Batch and sampling
   per_device_batch_size: 1  # Batch size per device
@@ -99,32 +100,27 @@ scheduler:
 
 # Evaluation settings
 eval:
-  resolution: 480  # Evaluation resolution
-  num_frames: 13 # Evaluation frames
+  resolution: 720  # Evaluation resolution
+  num_frames: 21 # Evaluation frames
   per_device_batch_size: 1  # Eval batch size
-  guidance_scale: 5.0  # Guidance scale for sampling
+  guidance_scale: 4.0  # Guidance scale for sampling
+  guidance_scale_2: 3.0  # Guidance scale for sampling
   num_inference_steps: 28  # Number of eval timesteps
   eval_freq: 20  # Eval frequency in epochs (0 to disable)
   seed: 42  # Eval seed (defaults to training seed)
 
 # Reward Model Configuration
 rewards:
-  - name: "text_alignment" # Alias for this reward model
-    reward_model: "CLIP" # Reward model type or a path like 'my_package.rewards.CustomReward'
-    weight: 1.0  # Weight of this reward model
-    batch_size: 16
-    device: "cuda"
-    dtype: bfloat16
   - name: "pick_score"
     reward_model: "PickScore"
-    weight: 0.5  # Weight of this reward model
+    weight: 1  # Weight of this reward model
     batch_size: 16
     device: "cuda"
     dtype: bfloat16
 
 # Optional Evaluation Reward Models
 # eval_rewards:
-#   - name: "text_alignment_2"
+#   - name: "text_alignment"
 #     reward_model: "CLIP"
 #     batch_size: 16
 #     device: "cuda"
