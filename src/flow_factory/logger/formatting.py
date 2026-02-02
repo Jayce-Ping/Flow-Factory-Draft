@@ -747,7 +747,7 @@ class LogFormatter:
             return value
 
         # Rule 3: Lists / Arrays / Tensors (Aggregations)
-        if cls._is_numerical_collection(value):
+        if cls.is_numerical_collection(value):
             return cls._compute_mean(value)
 
         # Handle single Tensors/Numpy arrays that aren't images
@@ -767,13 +767,40 @@ class LogFormatter:
         return False
 
     @classmethod
-    def _is_numerical_collection(cls, value: Any) -> bool:
+    def is_numerical(cls, value: Any) -> bool:
+        """Check if value is a single numerical scalar (int, float, or 0-dim tensor/array)."""
+        if isinstance(value, (int, float, complex, np.number)):
+            return True
+        if isinstance(value, torch.Tensor) and value.ndim == 0:
+            return True
+        if isinstance(value, np.ndarray) and value.ndim == 0:
+            return True
+        return False
+    
+    @classmethod
+    def is_numerical_collection(cls, value: Any) -> bool:
         """Checks if value is a list/tuple of numbers, arrays, or tensors."""
-        if isinstance(value, (list, tuple)):
-            if len(value) == 0: return False
+        # Tensor/Array with ndim > 0
+        if isinstance(value, (torch.Tensor, np.ndarray)) and value.ndim > 0:
+            return True
+        # List/Tuple of numerical values
+        if isinstance(value, (list, tuple)) and len(value) > 0:
             first = value[0]
             return isinstance(first, (int, float, complex, np.number, torch.Tensor, np.ndarray))
         return False
+
+    @classmethod
+    def to_scalar(cls, value: Any) -> Optional[Union[int, float]]:
+        """Convert numerical value/collection to scalar. Returns None if not numerical."""
+        if cls.is_numerical(value):
+            if isinstance(value, int):  # Keep int as int
+                return value
+            if isinstance(value, torch.Tensor):
+                return value.detach().float().item()
+            return float(value)
+        if cls.is_numerical_collection(value):
+            return cls._compute_mean(value)
+        return None
 
     @classmethod
     def _compute_mean(cls, value: Union[List, torch.Tensor, np.ndarray]) -> float:
