@@ -39,6 +39,7 @@ train:
   # Trainer settings
   trainer_type: 'awm'
   advantage_aggregation: 'sum' # Options: 'sum', 'gdpo'
+  off_policy: false
   awm_weighting: 'ghuber'
   ghuber_power: 0.25
   awm_weighting: Uniform

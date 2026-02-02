@@ -58,8 +58,8 @@ train:
   ref_param_device: 'cuda' # Options: cpu, cuda
 
   # Sampling settings
-  resolution: 256  # Can be int or [height, width]
-  num_frames: 21 # (F - 1) mod 4 == 0
+  resolution: 480  # Can be int or [height, width]
+  num_frames: 5 # (F - 1) mod 4 == 0
   num_inference_steps: 8  # Number of timesteps
   guidance_scale: 3.5  # Guidance scale for sampling
 
@@ -98,8 +98,8 @@ scheduler:
 
 # Evaluation settings
 eval:
-  resolution: 480  # Evaluation resolution
-  num_frames: 13 # Evaluation frames
+  resolution: 720  # Evaluation resolution
+  num_frames: 21 # Evaluation frames
   per_device_batch_size: 1  # Eval batch size
   guidance_scale: 3.5  # Guidance scale for sampling
   num_inference_steps: 28  # Number of eval timesteps
