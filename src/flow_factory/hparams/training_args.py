@@ -275,6 +275,10 @@ class TrainingArguments(ArgABC):
         default="cuda",
         metadata={"help": "Device to store EMA model."},
     )
+    ema_decay_schedule: Literal["constant", "power", "linear", "piecewise_linear", "cosine", "warmup_cosine"] = field(
+        default="power",
+        metadata={"help": "Decay schedule for EMA. Options: ['constant', 'power', 'linear', 'piecewise_linear', 'cosine', 'warmup_cosine']."},
+    )
 
     def __post_init__(self):
         if not self.resolution:

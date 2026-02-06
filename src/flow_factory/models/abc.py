@@ -476,6 +476,9 @@ class BaseAdapter(ABC):
                 decay=self.training_args.ema_decay,
                 update_step_interval=self.training_args.ema_update_interval,
                 device=ema_device,
+                decay_schedule=self.training_args.ema_decay_schedule,
+                # Pass decay schedule params from training_args
+                **self.training_args
             )
         else:
             self.ema_wrapper = None
