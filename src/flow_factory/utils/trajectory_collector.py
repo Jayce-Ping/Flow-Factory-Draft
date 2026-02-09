@@ -81,11 +81,18 @@ class TrajectoryCollector:
         self._target_indices: Optional[Set[int]] = self._normalize_indices()
     
     def _normalize_indices(self) -> Optional[Set[int]]:
-        """Convert user indices to normalized positive indices."""
+        """
+        Convert user indices to normalized positive indices.
+        
+        Returns:
+            - set(): Empty set when indices=None (disabled, collect nothing)
+            - None: When indices='all' (collect all steps)
+            - Set[int]: Specific normalized indices to collect
+        """
         if self.indices is None:
-            return None
+            return set()  # Empty set signals "collect nothing"
         if self.indices == 'all':
-            return None  # Signal to collect all
+            return None   # None signals "collect everything"
 
         # Total positions = total_steps + 1 (initial + each step result)
         total_positions = self.total_steps + 1
@@ -104,12 +111,12 @@ class TrajectoryCollector:
     @property
     def is_disabled(self) -> bool:
         """Check if collection is disabled."""
-        return self.indices is None
+        return self._target_indices is not None and len(self._target_indices) == 0 # Empty set means "collect nothing"
     
     @property
     def collect_all(self) -> bool:
         """Check if collecting all steps."""
-        return self.indices == 'all'
+        return self._target_indices is None  # `None` means collect all
     
     def should_collect(self, step_idx: int) -> bool:
         """Check if value should be collected at this step."""
