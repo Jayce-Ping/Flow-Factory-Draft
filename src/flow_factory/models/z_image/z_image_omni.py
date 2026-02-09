@@ -45,9 +45,11 @@ from ...utils.image import (
     standardize_image_batch,
 )
 from ...utils.trajectory_collector import (
-    TrajectoryCollector, 
+    TrajectoryCollector,
+    CallbackCollector,
     TrajectoryIndicesType, 
     create_trajectory_collector,
+    create_callback_collector,
 )
 from ...utils.base import filter_kwargs
 from ...utils.logger_utils import setup_logger
@@ -671,17 +673,17 @@ class ZImageOmniAdapter(BaseAdapter):
         # 7. Initialize collectors
         latent_collector = create_trajectory_collector(trajectory_indices, num_inference_steps)
         latent_collector.collect(latents, step_idx=0)
-        log_prob_collector = None
         if compute_log_prob:
             log_prob_collector = create_trajectory_collector(trajectory_indices, num_inference_steps)
-        extra_call_back_res = defaultdict(list)
+        callback_collector = create_callback_collector(trajectory_indices, num_inference_steps)
 
         # 8. Denoising loop
         for i, t in enumerate(timesteps):
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
             t_next = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
             return_kwargs = list(set(['next_latents', 'log_prob', 'noise_pred'] + extra_call_back_kwargs))
-
+            current_compute_log_prob = compute_log_prob and current_noise_level > 0
+            
             output = self.forward(
                 t=t,
                 latents=latents,
@@ -695,53 +697,41 @@ class ZImageOmniAdapter(BaseAdapter):
                 cfg_normalization=cfg_normalization,
                 cfg_truncation=cfg_truncation,
                 t_next=t_next,
-                compute_log_prob=compute_log_prob and current_noise_level > 0,
+                compute_log_prob=current_compute_log_prob,
                 return_kwargs=return_kwargs,
                 noise_level=current_noise_level,
             )
 
             latents = output.next_latents.to(dtype)
             latent_collector.collect(latents, i + 1)
-            if compute_log_prob and log_prob_collector is not None:
+            if current_compute_log_prob:
                 log_prob_collector.collect(output.log_prob, i)
 
-            # Capture extra callback outputs
-            if extra_call_back_kwargs:
-                capturable = {'noise_level': current_noise_level}
-                for key in extra_call_back_kwargs:
-                    if key in capturable and capturable[key] is not None:
-                        extra_call_back_res[key].append(capturable[key])
-                    elif hasattr(output, key):
-                        val = getattr(output, key)
-                        if val is not None:
-                            extra_call_back_res[key].append(val)
+            callback_collector.collect_step(
+                step_idx=i,
+                output=output,
+                keys=extra_call_back_kwargs,
+                capturable={'noise_level': current_noise_level},
+            )
 
         # 9. Decode latents to images
         images_out = self.decode_latents(latents, output_type='pt')
 
-        # 10. Transpose extra_call_back_res: (T, B, ...) -> (B, T, ...)
-        extra_call_back_res = {
-            k: torch.stack(v, dim=1) if isinstance(v[0], torch.Tensor) else v
-            for k, v in extra_call_back_res.items()
-        }
-
-        # 11. Gather trajectory results
-        all_latents = latent_collector.get_result()
-        all_log_probs = log_prob_collector.get_result() if log_prob_collector else None
-
-        # 12. Create output samples
+        # 10. Create output samples
+        extra_call_back_res = callback_collector.get_result()          # (B, len(trajectory_indices), ...)
+        callback_index_map = callback_collector.get_index_map()        # (T,) LongTensor
+        all_latents = latent_collector.get_result()                    # List[torch.Tensor(B, ...)]
+        latent_index_map = latent_collector.get_index_map()            # (T+1,) LongTensor
+        all_log_probs = log_prob_collector.get_result() if compute_log_prob else None
+        log_prob_index_map = log_prob_collector.get_index_map() if compute_log_prob else None
         samples = [
             ZImageOmniSample(
                 # Denoising trajectory
                 timesteps=timesteps,
-                all_latents=(
-                    torch.stack([lat[b] for lat in all_latents], dim=0)
-                    if all_latents is not None else None
-                ),
-                log_probs=(
-                    torch.stack([lp[b] for lp in all_log_probs], dim=0)
-                    if all_log_probs is not None else None
-                ),
+                all_latents=torch.stack([lat[b] for lat in all_latents], dim=0) if all_latents is not None else None,
+                log_probs=torch.stack([lp[b] for lp in all_log_probs], dim=0) if all_log_probs is not None else None,
+                latent_index_map=latent_index_map,
+                log_prob_index_map=log_prob_index_map,
                 # Generated image & metadata
                 height=height,
                 width=width,
@@ -777,7 +767,10 @@ class ZImageOmniAdapter(BaseAdapter):
                     negative_condition_siglip_embeds[b] if negative_condition_siglip_embeds and negative_condition_siglip_embeds[b] else None
                 ),
                 # Extra kwargs
-                extra_kwargs={k: v[b] for k, v in extra_call_back_res.items()},
+                extra_kwargs={
+                    **{k: v[b] for k, v in extra_call_back_res.items()},
+                    'callback_index_map': callback_index_map,
+                },
             )
             for b in range(batch_size)
         ]
