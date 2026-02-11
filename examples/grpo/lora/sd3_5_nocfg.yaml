@@ -1,5 +1,5 @@
-# This config file corresponds to `flow_grpo:pickscore_sd3_fast`
-# https://github.com/yifan123/flow_grpo/blob/9745241cf1101407e9b518dd4f10498092150522/config/grpo.py#L281
+# This config file corresponds to `flow_grpo.pickscore_sd3_fast_nocfg`:
+# https://github.com/yifan123/flow_grpo/blob/9745241cf1101407e9b518dd4f10498092150522/config/grpo.py#L323
 
 # Environment Configuration
 launcher: "accelerate"  # Options: accelerate
@@ -58,9 +58,9 @@ train:
   
   # Batch and sampling
   per_device_batch_size: 8  # Batch size per device
-  group_size: 24  # Group size for GRPO sampling
+  group_size: 18  # Group size for GRPO sampling
   global_std: true  # Use global std for advantage normalization
-  unique_sample_num_per_epoch: 48  # Unique samples per group
+  unique_sample_num_per_epoch: 64  # Unique samples per group
   gradient_step_per_epoch: 2  # Gradient steps per epoch
   
   # Optimization
@@ -83,10 +83,10 @@ train:
 
 # Scheduler Configuration
 scheduler:
-  dynamics_type: "Flow-SDE"  # Options: Flow-SDE, Dance-SDE, CPS, ODE
+  dynamics_type: "CPS"  # Options: Flow-SDE, Dance-SDE, CPS, ODE
   noise_level: 0.8  # Noise level for sampling
-  num_sde_steps: 2  # Number of noise steps
-  sde_steps: [1, 2, 3, 4, 5]  # Custom noise window, noise steps are randomly selected from this list during training
+  num_sde_steps: 3  # Number of noise steps
+  sde_steps: [0, 1, 2, 3, 4]  # Custom noise window, noise steps are randomly selected from this list during training
   seed: 42  # Scheduler seed (for noise step selection)
 
 # Evaluation settings
