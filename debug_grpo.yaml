@@ -28,7 +28,7 @@ model:
   model_type: "sd3-5"
   resume_path: null # Path to load previous checkpoint/lora adapter
   resume_type: null # Options: lora, full, state. Null to auto-detect based on `finetune_type`
-  # attn_backend: '_flash_3_hub' # Attention backend for training.
+  attn_backend: '_flash_3_hub' # Attention backend for training.
 
 log:
   save_dir: "~/jcy/Flow-Factory"  # Directory to save model checkpoints and logs
@@ -50,13 +50,13 @@ train:
 
   # Sampling settings
   resolution: 512  # Can be int or [height, width]
-  num_inference_steps: 10  # Number of timesteps
-  guidance_scale: 4.5  # Guidance scale for sampling
+  num_inference_steps: 14  # Number of timesteps
+  guidance_scale: 1.0  # Guidance scale for sampling
   
   # Batch and sampling
-  per_device_batch_size: 8  # Batch size per device
-  group_size: 24  # Group size for GRPO sampling
-  global_std: true  # Use global std for advantage normalization
+  per_device_batch_size: 2  # Batch size per device
+  group_size: 16  # Group size for GRPO sampling
+  global_std: false  # Use global std for advantage normalization
   unique_sample_num_per_epoch: 48  # Unique samples per group
   gradient_step_per_epoch: 2  # Gradient steps per epoch
   
@@ -68,7 +68,7 @@ train:
   max_grad_norm: 1.0  # Max gradient norm for clipping
 
   # EMA
-  ema_decay: 0.99  # EMA decay rate (0 to disable)
+  ema_decay: 0.9  # EMA decay rate (0 to disable)
   ema_update_interval: 4  # EMA update interval (in epochs)
   ema_device: "cuda"  # Device to store EMA model (options: cpu, cuda)
 
@@ -81,16 +81,16 @@ train:
 # Scheduler Configuration
 scheduler:
   dynamics_type: "Flow-SDE"  # Options: Flow-SDE, Dance-SDE, CPS, ODE
-  noise_level: 0.8  # Noise level for sampling
-  num_sde_steps: 2  # Number of noise steps
-  sde_steps: [1, 2, 3, 4, 5]  # Custom noise window, noise steps are randomly selected from this list during training
+  noise_level: 0.7  # Noise level for sampling
+  num_sde_steps: 1  # Number of noise steps
+  sde_steps: [1, 2, 3]  # Custom noise window, noise steps are randomly selected from this list during training
   seed: 42  # Scheduler seed (for noise step selection)
 
 # Evaluation settings
 eval:
   resolution: 512  # Evaluation resolution
   per_device_batch_size: 8  # Eval batch size
-  guidance_scale: 4.5  # Guidance scale for sampling
+  guidance_scale: 1.0  # Guidance scale for sampling
   num_inference_steps: 40  # Number of eval timesteps
   eval_freq: 20  # Eval frequency in epochs (0 to disable)
   seed: 42  # Eval seed
