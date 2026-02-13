@@ -274,7 +274,9 @@ class BagelAdapter(BaseAdapter):
         """Set all target components to evaluation mode."""
         super().eval()  # Set base adapter mode
         self.transformer.eval()
+        self.pipeline.bagel.eval()
         self.pipeline.vae.eval()
+        self.pipeline.vit.eval()
         self.pipeline.llm2vae.eval()
         self.pipeline.vae2llm.eval()
         self.pipeline.latent_pos_embed.eval()
@@ -292,11 +294,7 @@ class BagelAdapter(BaseAdapter):
         super().train(mode)  # Set base adapter mode
         if mode:
             self.transformer.train()
-            self.pipeline.vae.train()
-            self.pipeline.llm2vae.train()
-            self.pipeline.vae2llm.train()
-            self.pipeline.latent_pos_embed.train()
-            self.pipeline.time_embedder.train()
+            self.pipeline.bagel.train()
     
     @contextmanager
     def _eval_mode(self, module: nn.Module):
