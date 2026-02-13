@@ -575,7 +575,7 @@ class BagelAdapter(BaseAdapter):
         cfg_img_packed_key_value_indexes: Optional[torch.LongTensor] = None,
         cfg_type: str = "parallel",
     ):  
-        packed_text_embedding = self.pipeline.transformer.embed_tokens(packed_text_ids)
+        packed_text_embedding = self.pipeline.transformer.model.embed_tokens(packed_text_ids)
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.pipeline.bagel.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
