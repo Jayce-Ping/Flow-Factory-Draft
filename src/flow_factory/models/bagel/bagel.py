@@ -249,7 +249,7 @@ class BagelAdapter(BaseAdapter):
     @property
     def inference_modules(self) -> List[str]:
         """Modules needed for inference: the full Bagel model + VAE."""
-        return ["transformer", "vae"]
+        return ["transformer", "vae", 'llm2vae', 'vae2llm', 'latent_pos_embed', 'time_embedder']
 
     # ─────────────── Convenience accessors ───────────────
 
