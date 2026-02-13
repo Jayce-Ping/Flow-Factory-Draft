@@ -165,7 +165,7 @@ class BagelAdapter(BaseAdapter):
     def _init_tokenizer_and_transforms(self):
         """Initialize tokenizer, special tokens, and image transforms."""
         from .modeling.qwen2 import Qwen2Tokenizer
-        from .data.data_utils import add_special_tokens
+        from .data_utils import add_special_tokens
         from .data.transforms import ImageTransform
 
         self._tokenizer = Qwen2Tokenizer.from_pretrained(self._model_path)
@@ -350,7 +350,7 @@ class BagelAdapter(BaseAdapter):
         Returns:
             Dict with ``condition_images`` key, or None if no images.
         """
-        from .data.data_utils import pil_img2rgb
+        from .data_utils import pil_img2rgb
 
         if images is None:
             return None
@@ -484,7 +484,7 @@ class BagelAdapter(BaseAdapter):
     @staticmethod
     def _pil_img2rgb(img: Image.Image) -> Image.Image:
         """Convert PIL image to RGB, importing lazily."""
-        from .data.data_utils import pil_img2rgb
+        from .data_utils import pil_img2rgb
         return pil_img2rgb(img)
 
     # ─── _update_context_text ───

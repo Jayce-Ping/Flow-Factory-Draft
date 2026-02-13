@@ -11,7 +11,7 @@ from torch.nn.attention.flex_attention import create_block_mask
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 
-from ...data.data_utils import (
+from ...data_utils import (
     create_sparse_mask, 
     get_flattened_position_ids_extrapolate, 
     get_flattened_position_ids_interpolate,
