@@ -22,7 +22,7 @@ from torch.nn.functional import scaled_dot_product_attention
 from transformers.utils import ModelOutput
 
 from flash_attn import flash_attn_varlen_func
-from modeling.qwen2.modeling_qwen2 import (
+from ..qwen2.modeling_qwen2 import (
     Qwen2Attention, 
     Qwen2MLP, 
     Qwen2PreTrainedModel, 
@@ -31,8 +31,8 @@ from modeling.qwen2.modeling_qwen2 import (
     apply_rotary_pos_emb,
 )
 
-from modeling.qwen2.configuration_qwen2 import Qwen2Config as _Qwen2Config
-from modeling.cache_utils.taylorseer import (
+from ..qwen2.configuration_qwen2 import Qwen2Config as _Qwen2Config
+from ..cache_utils.taylorseer import (
     cal_type, taylor_cache_init, derivative_approximation, taylor_formula,
 )
 

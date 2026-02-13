@@ -151,9 +151,9 @@ class BagelAdapter(BaseAdapter):
 
     def _init_tokenizer_and_transforms(self):
         """Initialize tokenizer, special tokens, and image transforms."""
-        from modeling.qwen2 import Qwen2Tokenizer
-        from data.data_utils import add_special_tokens
-        from data.transforms import ImageTransform
+        from .modeling.qwen2 import Qwen2Tokenizer
+        from .data.data_utils import add_special_tokens
+        from .data.transforms import ImageTransform
 
         self._tokenizer = Qwen2Tokenizer.from_pretrained(self._model_path)
         self._tokenizer, self.new_token_ids, _ = add_special_tokens(self._tokenizer)
@@ -287,7 +287,7 @@ class BagelAdapter(BaseAdapter):
         Returns:
             Dict with ``condition_images`` key, or None if no images.
         """
-        from data.data_utils import pil_img2rgb
+        from .data.data_utils import pil_img2rgb
 
         if images is None:
             return None
@@ -379,8 +379,8 @@ class BagelAdapter(BaseAdapter):
         Returns:
             Tuple of (gen_context, cfg_text_context, cfg_img_context)
         """
-        from modeling.bagel.qwen2_navit import NaiveCache
-        from data.data_utils import pil_img2rgb
+        from .modeling.bagel.qwen2_navit import NaiveCache
+        from .data.data_utils import pil_img2rgb
 
         bagel = self._unwrap(self.bagel_model)
         num_layers = bagel.config.llm_config.num_hidden_layers
@@ -421,10 +421,12 @@ class BagelAdapter(BaseAdapter):
 
         return gen_context, cfg_text_context, cfg_img_context
 
+    # ─── _update_context_text ───
     @torch.no_grad()
     def _update_context_text(self, text: str, gen_context: Dict) -> Dict:
         """Add text tokens to the KV-cache context."""
         bagel = self._unwrap(self.bagel_model)
+        device = self.device
         kv_lens = gen_context["kv_lens"]
         ropes = gen_context["ropes"]
 
@@ -435,11 +437,18 @@ class BagelAdapter(BaseAdapter):
             tokenizer=self._tokenizer,
             new_token_ids=self.new_token_ids,
         )
+        # ★ Move all tensors to model device before forward
+        generation_input = {
+            k: v.to(device) if isinstance(v, torch.Tensor) else v
+            for k, v in generation_input.items()
+        }
         past_key_values = bagel.forward_cache_update_text(
             gen_context["past_key_values"], **generation_input
         )
         return {"kv_lens": kv_lens, "ropes": ropes, "past_key_values": past_key_values}
 
+
+    # ─── _update_context_image ───
     @torch.no_grad()
     def _update_context_image(
         self,
@@ -451,6 +460,7 @@ class BagelAdapter(BaseAdapter):
         """Add image tokens (ViT + VAE) to the KV-cache context."""
         bagel = self._unwrap(self.bagel_model)
         vae_model = self.get_component("vae")
+        device = self.device
         kv_lens = gen_context["kv_lens"]
         ropes = gen_context["ropes"]
         past_key_values = gen_context["past_key_values"]
@@ -463,6 +473,11 @@ class BagelAdapter(BaseAdapter):
                 transforms=self.vae_transform,
                 new_token_ids=self.new_token_ids,
             )
+            # ★ Move all tensors to model device
+            gen_input = {
+                k: v.to(device) if isinstance(v, torch.Tensor) else v
+                for k, v in gen_input.items()
+            }
             past_key_values = bagel.forward_cache_update_vae(
                 vae_model, past_key_values, **gen_input
             )
@@ -475,6 +490,11 @@ class BagelAdapter(BaseAdapter):
                 transforms=self.vit_transform,
                 new_token_ids=self.new_token_ids,
             )
+            # ★ Move all tensors to model device
+            gen_input = {
+                k: v.to(device) if isinstance(v, torch.Tensor) else v
+                for k, v in gen_input.items()
+            }
             past_key_values = bagel.forward_cache_update_vit(
                 past_key_values, **gen_input
             )
@@ -547,18 +567,20 @@ class BagelAdapter(BaseAdapter):
                 curr_rope=gen_ctx["ropes"],
                 image_sizes=[image_shape],
                 new_token_ids=self.new_token_ids,
-                generators=[generator] if generator else None,
+                device=device
             )
 
             cfg_text_gen_input = bagel.prepare_vae_latent_cfg(
                 curr_kvlens=cfg_text_ctx["kv_lens"],
                 curr_rope=cfg_text_ctx["ropes"],
                 image_sizes=[image_shape],
+                device=device,
             )
             cfg_img_gen_input = bagel.prepare_vae_latent_cfg(
                 curr_kvlens=cfg_img_ctx["kv_lens"],
                 curr_rope=cfg_img_ctx["ropes"],
                 image_sizes=[image_shape],
+                device=device
             )
 
             # 3. Run denoising loop
@@ -760,7 +782,8 @@ class BagelAdapter(BaseAdapter):
                 cfg_type="parallel",
             )
 
-            # SDE step with log_prob
+            # Scheduler step
+            # TODO: use output = self.scheduler.step(....)
             t_next = timesteps_step[i + 1] if i + 1 < len(timesteps_step) else t * 0
             x_t, log_prob, _, _ = bagel._sde_step_with_logprob(
                 v_t,

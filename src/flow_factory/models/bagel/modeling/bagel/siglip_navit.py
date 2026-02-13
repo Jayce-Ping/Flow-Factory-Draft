@@ -9,13 +9,54 @@
 #
 # This modified file is released under the same license.
 
+import logging
+
 import torch
 from torch import nn
 
 from transformers.activations import ACT2FN
-from modeling.siglip.configuration_siglip import SiglipVisionConfig as _SiglipVisionConfig
-from modeling.siglip.modeling_siglip import SiglipAttention, SiglipPreTrainedModel
-from flash_attn import flash_attn_varlen_func
+from ..siglip.configuration_siglip import SiglipVisionConfig as _SiglipVisionConfig
+from ..siglip.modeling_siglip import SiglipAttention, SiglipPreTrainedModel
+
+logger = logging.getLogger(__name__)
+
+# ── Optional flash-attn ─────────────────────────────────────────────────────
+try:
+    from flash_attn import flash_attn_varlen_func
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
+    logger.info(
+        "flash_attn not installed — falling back to "
+        "torch.nn.functional.scaled_dot_product_attention."
+    )
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _sdpa_varlen(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+) -> torch.Tensor:
+    """SDPA fallback for variable-length packed sequences.
+
+    Splits the packed ``(total_tokens, H, D)`` tensors along *cu_seqlens*,
+    runs ``F.scaled_dot_product_attention`` per sub-sequence, and re-packs.
+    """
+    num_seqs = cu_seqlens.numel() - 1
+    chunks = []
+    for i in range(num_seqs):
+        s, e = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
+        # (seq, H, D) → (1, H, seq, D)
+        q = query[s:e].transpose(0, 1).unsqueeze(0)
+        k = key[s:e].transpose(0, 1).unsqueeze(0)
+        v = value[s:e].transpose(0, 1).unsqueeze(0)
+        o = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=False)
+        chunks.append(o.squeeze(0).transpose(0, 1))   # → (seq, H, D)
+    return torch.cat(chunks, dim=0)
 
 
 class SiglipVisionConfig(_SiglipVisionConfig):
@@ -196,6 +237,12 @@ class SiglipVisionEmbeddings(nn.Module):
 
 
 class SiglipFlashAttention2(SiglipAttention):
+    """Siglip variable-length attention with optional flash-attn backend.
+
+    Uses ``flash_attn_varlen_func`` when *flash_attn* is installed, otherwise
+    falls back to ``F.scaled_dot_product_attention`` with per-sequence splitting.
+    """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -229,16 +276,23 @@ class SiglipFlashAttention2(SiglipAttention):
             query_states = torch.cat([qh, qw], dim=-1)
             key_states = torch.cat([kh, kw], dim=-1)
 
-        attn_output = flash_attn_varlen_func(
-            query_states.to(torch.bfloat16),
-            key_states.to(torch.bfloat16),
-            value_states.to(torch.bfloat16),
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-            causal=False,
-        )
+        if FLASH_ATTN_AVAILABLE:
+            attn_output = flash_attn_varlen_func(
+                query_states.to(torch.bfloat16),
+                key_states.to(torch.bfloat16),
+                value_states.to(torch.bfloat16),
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                causal=False,
+            )
+        else:
+            attn_output = _sdpa_varlen(
+                query_states, key_states, value_states,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
 
         attn_output = self.out_proj(attn_output.reshape(total_q_len, -1))
         return attn_output

@@ -19,10 +19,44 @@ Component Mapping:
 from __future__ import annotations
 
 import os
-from typing import Optional, Dict, Any, List
+import logging
+from typing import Optional, Any
 
 import torch
 import torch.nn as nn
+
+logger = logging.getLogger(__name__)
+
+
+def _resolve_model_path(model_path: str, **kwargs) -> str:
+    """Resolve *model_path* to a local directory.
+
+    If *model_path* is already an existing local directory it is returned
+    as-is.  Otherwise it is treated as a HuggingFace Hub repo-id
+    (e.g. ``"ByteDance-Seed/BAGEL-7B-MoT"``) and downloaded via
+    ``huggingface_hub.snapshot_download``.
+
+    Accepted ``kwargs`` forwarded to ``snapshot_download``:
+        revision, cache_dir, token, local_dir, allow_patterns,
+        ignore_patterns, force_download, resume_download …
+    """
+    if os.path.isdir(model_path):
+        return model_path
+
+    from huggingface_hub import snapshot_download
+
+    # Filter kwargs that snapshot_download accepts
+    _SNAPSHOT_KEYS = {
+        "revision", "cache_dir", "token", "local_dir",
+        "allow_patterns", "ignore_patterns",
+        "force_download", "resume_download", "local_files_only",
+    }
+    dl_kwargs = {k: v for k, v in kwargs.items() if k in _SNAPSHOT_KEYS}
+
+    logger.info("Downloading Bagel checkpoint from HuggingFace Hub: %s", model_path)
+    local_dir = snapshot_download(repo_id=model_path, **dl_kwargs)
+    logger.info("Checkpoint cached at: %s", local_dir)
+    return local_dir
 
 
 class BagelPseudoPipeline:
@@ -77,31 +111,45 @@ class BagelPseudoPipeline:
         **kwargs,
     ) -> "BagelPseudoPipeline":
         """
-        Construct Bagel components from a pretrained checkpoint directory.
+        Construct Bagel components from a pretrained checkpoint.
 
-        Expected directory layout (BAGEL-7B-MoT style):
+        ``model_path`` can be either:
+          - A **local directory** containing Bagel checkpoint files, or
+          - A **HuggingFace Hub repo-id** (e.g. ``"ByteDance-Seed/BAGEL-7B-MoT"``),
+            which will be automatically downloaded and cached.
+
+        Expected directory layout (BAGEL-7B-MoT style)::
+
             model_path/
             ├── llm_config.json
             ├── vit_config.json
             ├── ae.safetensors        # VAE weights
             ├── ema.safetensors       # Bagel model weights
-            ├── tokenizer files ...
-            └── ...
+            ├── tokenizer files …
+            └── …
 
         Args:
-            model_path: Path to the Bagel model checkpoint directory.
+            model_path: Local path **or** HuggingFace repo-id.
             vae_path: Optional separate path for VAE weights.
-                      Defaults to ``model_path/ae.safetensors``.
+                      Defaults to ``<model_path>/ae.safetensors``.
             low_cpu_mem_usage: If True, use ``init_empty_weights`` to defer
                                weight materialization (for multi-GPU dispatch).
+            **kwargs: Extra arguments.  HuggingFace download keys
+                      (``revision``, ``cache_dir``, ``token``, …) are
+                      forwarded to ``snapshot_download``; model-building
+                      keys (``layer_module``, ``latent_patch_size``, …)
+                      are used directly.
         """
-        from modeling.bagel import (
+        from .modeling.bagel import (
             BagelConfig, Bagel,
             Qwen2Config, Qwen2ForCausalLM,
             SiglipVisionConfig, SiglipVisionModel,
         )
-        from modeling.autoencoder import load_ae
+        from .modeling.autoencoder import load_ae
         from safetensors.torch import load_file
+
+        # ── Resolve to local directory (download if needed) ──────────
+        model_path = _resolve_model_path(model_path, **kwargs)
 
         # ---- LLM Config ----
         llm_config = Qwen2Config.from_json_file(

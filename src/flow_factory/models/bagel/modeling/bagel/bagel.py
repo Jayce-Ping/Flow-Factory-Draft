@@ -11,7 +11,7 @@ from torch.nn.attention.flex_attention import create_block_mask
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 
-from data.data_utils import (
+from ...data.data_utils import (
     create_sparse_mask, 
     get_flattened_position_ids_extrapolate, 
     get_flattened_position_ids_interpolate,
@@ -19,7 +19,7 @@ from data.data_utils import (
 )
 from .qwen2_navit import NaiveCache
 from .modeling_utils import MLPconnector, TimestepEmbedder, PositionEmbedding
-from modeling.cache_utils.taylorseer import cache_init
+from ..cache_utils.taylorseer import cache_init
 
 from tqdm import tqdm
 
@@ -549,7 +549,8 @@ class Bagel(PreTrainedModel):
 
         return past_key_values
 
-    def prepare_vae_latent(self, curr_kvlens, curr_rope, image_sizes, new_token_ids):
+    def prepare_vae_latent(self, curr_kvlens, curr_rope, image_sizes, new_token_ids, device=None):
+        device = device or torch.device("cpu")
         packed_text_ids, packed_text_indexes = list(), list()
         packed_vae_position_ids, packed_vae_token_indexes, packed_init_noises = list(), list(), list()
         packed_position_ids, packed_seqlens, packed_indexes = list(), list(), list()
@@ -593,21 +594,22 @@ class Bagel(PreTrainedModel):
             packed_seqlens.append(num_image_tokens + 2)
 
         generation_input = {
-            "packed_text_ids": torch.tensor(packed_text_ids, dtype=torch.long),
-            "packed_text_indexes": torch.tensor(packed_text_indexes, dtype=torch.long),
-            "packed_init_noises": torch.cat(packed_init_noises, dim=0),
-            "packed_vae_position_ids": torch.cat(packed_vae_position_ids, dim=0),
-            "packed_vae_token_indexes": torch.tensor(packed_vae_token_indexes, dtype=torch.long),
-            "packed_seqlens": torch.tensor(packed_seqlens, dtype=torch.int),
-            "packed_position_ids": torch.tensor(packed_position_ids, dtype=torch.long),
-            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
-            "packed_indexes": torch.tensor(packed_indexes, dtype=torch.long),
-            "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
+            "packed_text_ids": torch.tensor(packed_text_ids, dtype=torch.long, device=device),
+            "packed_text_indexes": torch.tensor(packed_text_indexes, dtype=torch.long, device=device),
+            "packed_init_noises": torch.cat(packed_init_noises, dim=0).to(device=device),
+            "packed_vae_position_ids": torch.cat(packed_vae_position_ids, dim=0).to(device=device),
+            "packed_vae_token_indexes": torch.tensor(packed_vae_token_indexes, dtype=torch.long, device=device),
+            "packed_seqlens": torch.tensor(packed_seqlens, dtype=torch.int, device=device),
+            "packed_position_ids": torch.tensor(packed_position_ids, dtype=torch.long, device=device),
+            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int, device=device),
+            "packed_indexes": torch.tensor(packed_indexes, dtype=torch.long, device=device),
+            "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long, device=device),
         }
 
         return generation_input
 
-    def prepare_vae_latent_cfg(self, curr_kvlens, curr_rope, image_sizes):
+    def prepare_vae_latent_cfg(self, curr_kvlens, curr_rope, image_sizes, device=None):
+        device = device or torch.device("cpu")
         packed_position_ids, packed_indexes, packed_key_value_indexes = list(), list(), list()
 
         query_curr = curr = 0
@@ -632,10 +634,10 @@ class Bagel(PreTrainedModel):
             packed_position_ids.extend([curr_position_id] * (num_image_tokens + 2))
 
         generation_input = {
-            "cfg_packed_position_ids": torch.tensor(packed_position_ids, dtype=torch.long),
-            "cfg_key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
-            "cfg_packed_query_indexes": torch.tensor(packed_indexes, dtype=torch.long),
-            "cfg_packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
+            "cfg_packed_position_ids": torch.tensor(packed_position_ids, dtype=torch.long, device=device),
+            "cfg_key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int, device=device),
+            "cfg_packed_query_indexes": torch.tensor(packed_indexes, dtype=torch.long, device=device),
+            "cfg_packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long, device=device),
         }
 
         return generation_input
@@ -813,7 +815,7 @@ class Bagel(PreTrainedModel):
                 "packed_text_indexes": packed_text_indexes
             }
         
-        if self.language_model.model.enable_taylorseer:
+        if getattr(self.language_model.model, "enable_taylorseer", False):
             self.language_model.model.cache_dic = model_pred_cache_dic
             self.language_model.model.current = model_pred_current
 
@@ -833,7 +835,7 @@ class Bagel(PreTrainedModel):
         v_t = v_t[packed_vae_token_indexes]
 
         if cfg_text_scale > 1.0:
-            if self.language_model.model.enable_taylorseer:
+            if getattr(self.language_model.model, "enable_taylorseer", False):
                 self.language_model.model.cache_dic = model_pred_text_cache_dic
                 self.language_model.model.current = model_pred_text_current
             cfg_text_output = self.language_model.forward_inference(
@@ -852,7 +854,7 @@ class Bagel(PreTrainedModel):
             cfg_text_v_t = cfg_text_v_t[packed_vae_token_indexes]
 
         if cfg_img_scale > 1.0:
-            if self.language_model.model.enable_taylorseer:
+            if getattr(self.language_model.model, "enable_taylorseer", False):
                 self.language_model.model.cache_dic = model_pred_img_cache_dic
                 self.language_model.model.current = model_pred_img_current
             cfg_img_output = self.language_model.forward_inference(
