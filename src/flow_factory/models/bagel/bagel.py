@@ -265,12 +265,12 @@ class BagelAdapter(BaseAdapter):
     @property
     def preprocessing_modules(self) -> List[str]:
         """Modules needed for preprocessing (tokenization uses CPU, VAE for decode)."""
-        return ["vae"]
+        return ["vae", "vit"]
 
     @property
     def inference_modules(self) -> List[str]:
         """Modules needed for inference: the full Bagel model + VAE."""
-        return ["transformer", "vae", 'llm2vae', 'vae2llm', 'latent_pos_embed', 'time_embedder']
+        return ["transformer", "vit", "vae", 'llm2vae', 'vae2llm', 'latent_pos_embed', 'time_embedder']
 
     # ─────────────── Convenience accessors ───────────────
 
@@ -339,9 +339,9 @@ class BagelAdapter(BaseAdapter):
 
     def standardize_images(
         self,
-        images: Union[ImageSingle, ImageBatch, MultiImageBatch],
+        images: Union[ImageSingle, ImageBatch],
         output_type: Literal['pil', 'pt', 'np'] = 'pil',
-    ) -> MultiImageBatch:
+    ) -> ImageBatch:
         """
         Standardize input images to a consistent format.
 
@@ -353,9 +353,7 @@ class BagelAdapter(BaseAdapter):
             A standardized batch of images in the specified format.
         """
         if isinstance(images, Image.Image):
-            images = [[images]]
-        elif isinstance(images, list) and all(isinstance(img, Image.Image) for img in images):
-            images = [[img] for img in images]
+            images = [images]
 
         standardized = standardize_image_batch(images, output_type=output_type)
         return standardized
@@ -364,6 +362,7 @@ class BagelAdapter(BaseAdapter):
         self,
         images: Union[ImageSingle, ImageBatch, MultiImageBatch],
         condition_image_size : Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
+        device : Optional[torch.device] = None
     ) -> Optional[Dict[str, List[List[torch.Tensor]]]]:
         """
         Pre-process condition images for Bagel I2I tasks.
@@ -382,7 +381,12 @@ class BagelAdapter(BaseAdapter):
             if isinstance(condition_image_size, int) else condition_image_size
         )
 
-        pil_images : List[List[Image.Image]] = self.standardize_images(images, output_type='pil')
+        device = device or self.pipeline.vae.device
+
+        pil_images : List[List[Image.Image]] = [
+            self.standardize_images(imgs, output_type='pil')
+            for imgs in images
+        ]
         max_area = condition_image_size[0] * condition_image_size[1]
         processed_images = []
         for imgs in pil_images:
@@ -396,13 +400,12 @@ class BagelAdapter(BaseAdapter):
                 multiple_of = self.pipeline._bagel_config.vit_config.patch_size
                 w = w // multiple_of * multiple_of
                 h = h // multiple_of * multiple_of
-                print(f"Resize to {(h, w)}")
                 img_resized = img.resize((w, h), resample=Image.BICUBIC)
                 processed_imgs.append(img_resized)
             processed_images.append(processed_imgs)
 
         processed_images_tensor: List[List[torch.Tensor]] = [
-            [pil_image_to_tensor(img).squeeze(0) for img in imgs]  # (1,C,H,W) -> (C,H,W)
+            [pil_image_to_tensor(img).squeeze(0).to(device) for img in imgs]  # (1,C,H,W) -> (C,H,W)
             for imgs in processed_images
         ]
 
@@ -516,12 +519,6 @@ class BagelAdapter(BaseAdapter):
 
         return gen_context, cfg_text_context, cfg_img_context
 
-    @staticmethod
-    def _pil_img2rgb(img: Image.Image) -> Image.Image:
-        """Convert PIL image to RGB, importing lazily."""
-        from .data_utils import pil_img2rgb
-        return pil_img2rgb(img)
-
     # ─── _update_context_text ───
     @torch.no_grad()
     def _update_context_text(self, text: str, gen_context: Dict) -> Dict:
@@ -555,7 +552,7 @@ class BagelAdapter(BaseAdapter):
     @torch.no_grad()
     def _update_context_image(
         self,
-        image_tensor,
+        image,
         gen_context: Dict,
         vae: bool = True,
         vit: bool = True,
@@ -570,12 +567,13 @@ class BagelAdapter(BaseAdapter):
         kv_lens = gen_context["kv_lens"]
         ropes = gen_context["ropes"]
         past_key_values = gen_context["past_key_values"]
+        image = self.standardize_images(image, output_type='pil')[0]
 
         if vae:
             gen_input, kv_lens, ropes = bagel.prepare_vae_images(
                 curr_kvlens=kv_lens,
                 curr_rope=ropes,
-                images=[image_tensor],
+                images=[image],
                 transforms=self.vae_transform,
                 new_token_ids=self.new_token_ids,
             )
@@ -591,7 +589,7 @@ class BagelAdapter(BaseAdapter):
             gen_input, kv_lens, ropes = bagel.prepare_vit_images(
                 curr_kvlens=kv_lens,
                 curr_rope=ropes,
-                images=[image_tensor],
+                images=[image],
                 transforms=self.vit_transform,
                 new_token_ids=self.new_token_ids,
             )
@@ -753,6 +751,7 @@ class BagelAdapter(BaseAdapter):
         # Condition images for I2I
         images: Optional[Union[ImageSingle, ImageBatch, MultiImageBatch]] = None,
         condition_images: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None, # pre-encoded condition images from encode_image()
+        condition_image_size: Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
         # CFG params
         cfg_text_scale: float = 4.0,
         cfg_img_scale: float = 1.5,
@@ -783,9 +782,17 @@ class BagelAdapter(BaseAdapter):
         device = self.device
         bagel = self.pipeline.bagel
         image_shape = (height, width)
-        if condition_images is None and images is not None:
-            encoded = self.encode_image(images)
-            condition_images = encoded["condition_images"] if encoded else None
+        is_i2i = (condition_images is not None or images is not None)
+        if is_i2i:
+            if condition_images is None:
+                encoded = self.encode_image(images, condition_image_size, device)
+                condition_images = encoded["condition_images"] if encoded else None
+            else:
+                condition_images = [
+                    [t.to(device) for t in imgs] for imgs in condition_images
+                ]
+
+        
 
         samples = []
 
