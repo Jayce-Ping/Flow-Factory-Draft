@@ -84,6 +84,8 @@ class BagelPseudoPipeline:
         self.llm2vae = self.bagel.llm2vae
         self.latent_pos_embed = self.bagel.latent_pos_embed
         self.time_embedder = self.bagel.time_embedder
+        self.connector = self.bagel.connector
+        self.vit_pos_embed = self.bagel.vit_pos_embed
 
         # Store the original BagelConfig for reference
         self._bagel_config = config or getattr(self.bagel, "config", None)
