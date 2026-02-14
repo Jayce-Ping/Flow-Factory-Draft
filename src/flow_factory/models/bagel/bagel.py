@@ -42,7 +42,7 @@ from copy import deepcopy
 from typing import Union, List, Dict, Any, Optional, Tuple, Literal, ClassVar
 from dataclasses import dataclass, field
 from collections import defaultdict
-
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -66,6 +66,16 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
     create_callback_collector,
 )
+from ...utils.image import (
+    ImageSingle,
+    ImageBatch,
+    MultiImageBatch,
+    is_image,
+    is_image_batch,
+    is_multi_image_batch,
+    standardize_image_batch,
+    pil_image_to_tensor,
+)
 from ...utils.logger_utils import setup_logger
 
 from .pipeline import BagelPseudoPipeline
@@ -74,6 +84,7 @@ from .modeling.bagel.qwen2_navit import NaiveCache
 
 logger = setup_logger(__name__)
 
+CONDITION_IMAGE_SIZE = (1024, 1024)
 
 # ============================================================================
 # Sample Dataclasses
@@ -133,6 +144,16 @@ class BagelI2ISample(I2ISample):
     cfg_img_generation_input: Optional[Dict[str, torch.Tensor]] = None
     image_shape: Optional[Tuple[int, int]] = None
 
+
+def calculate_dimensions(target_area, ratio):
+    # Calculate width and height based on target area and aspect ratio (height / width)
+    height = math.sqrt(target_area * ratio)
+    width = height / ratio
+
+    width = round(width / 32) * 32
+    height = round(height / 32) * 32
+
+    return width, height
 
 # ============================================================================
 # BagelAdapter
@@ -295,27 +316,6 @@ class BagelAdapter(BaseAdapter):
         if mode:
             self.transformer.train()
             self.pipeline.bagel.train()
-    
-    @contextmanager
-    def _eval_mode(self, module: nn.Module):
-        """
-        Temporarily switch a module to eval mode, restoring afterwards.
-
-        This is required because Bagel's Qwen2Model.forward() dispatches to
-        ``forward_train()`` vs ``forward_inference()`` based on ``self.training``.
-        We always need the inference dispatch (packed_query_sequence / KV-cache
-        API), even during RL training.
-
-        Note: eval mode only affects dropout / batchnorm; autograd is
-        **not** affected, so gradients still flow normally.
-        """
-        was_training = module.training
-        module.eval()
-        try:
-            yield
-        finally:
-            if was_training:
-                module.train()
 
     # ======================== Encoding ========================
 
@@ -337,10 +337,34 @@ class BagelAdapter(BaseAdapter):
             prompt = [prompt]
         return {"prompt": prompt}
 
+    def standardize_images(
+        self,
+        images: Union[ImageSingle, ImageBatch, MultiImageBatch],
+        output_type: Literal['pil', 'pt', 'np'] = 'pil',
+    ) -> MultiImageBatch:
+        """
+        Standardize input images to a consistent format.
+
+        Args:
+            images: Single PIL image, list of PIL images, or list of list of PIL images.
+            output_type: Desired output format ('pil', 'pt', or 'np').
+
+        Returns:
+            A standardized batch of images in the specified format.
+        """
+        if isinstance(images, Image.Image):
+            images = [[images]]
+        elif isinstance(images, list) and all(isinstance(img, Image.Image) for img in images):
+            images = [[img] for img in images]
+
+        standardized = standardize_image_batch(images, output_type=output_type)
+        return standardized
+
     def encode_image(
         self,
-        images: Union[Image.Image, List[Image.Image], List[List[Image.Image]]],
-    ) -> Optional[Dict[str, Any]]:
+        images: Union[ImageSingle, ImageBatch, MultiImageBatch],
+        condition_image_size : Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
+    ) -> Optional[Dict[str, List[List[torch.Tensor]]]]:
         """
         Pre-process condition images for Bagel I2I tasks.
 
@@ -350,23 +374,39 @@ class BagelAdapter(BaseAdapter):
         Returns:
             Dict with ``condition_images`` key, or None if no images.
         """
-        from .data_utils import pil_img2rgb
-
         if images is None:
             return None
 
-        # Normalize to List[List[Image.Image]]
-        if isinstance(images, Image.Image):
-            images = [[images]]
-        elif isinstance(images, list) and all(isinstance(img, Image.Image) for img in images):
-            images = [[img] for img in images]
+        condition_image_size = (
+            (condition_image_size, condition_image_size)
+            if isinstance(condition_image_size, int) else condition_image_size
+        )
 
-        # Convert to RGB
-        processed = [
-            [pil_img2rgb(img) for img in img_list]
-            for img_list in images
+        pil_images : List[List[Image.Image]] = self.standardize_images(images, output_type='pil')
+        max_area = condition_image_size[0] * condition_image_size[1]
+        processed_images = []
+        for imgs in pil_images:
+            processed_imgs = []
+            for img in imgs:
+                w, h = img.size
+                # Resize such that area is smaller than condition_image_size, keeping aspect ratio
+                if h * w > max_area:
+                    w, h = calculate_dimensions(max_area, h / w)
+                # Ensure dimensions are multiples of the ViT patch size (14 for Bagel's ViT)
+                multiple_of = self.pipeline._bagel_config.vit_config.patch_size
+                w = w // multiple_of * multiple_of
+                h = h // multiple_of * multiple_of
+                print(f"Resize to {(h, w)}")
+                img_resized = img.resize((w, h), resample=Image.BICUBIC)
+                processed_imgs.append(img_resized)
+            processed_images.append(processed_imgs)
+
+        processed_images_tensor: List[List[torch.Tensor]] = [
+            [pil_image_to_tensor(img).squeeze(0) for img in imgs]  # (1,C,H,W) -> (C,H,W)
+            for imgs in processed_images
         ]
-        return {"condition_images": processed}
+
+        return {"condition_images": processed_images_tensor}
 
     def encode_video(self, videos: Any) -> None:
         """Bagel does not support video input; raise NotImplementedError."""
@@ -422,7 +462,7 @@ class BagelAdapter(BaseAdapter):
     def _build_gen_context(
         self,
         prompt: str,
-        condition_images: Optional[List[Image.Image]] = None,
+        condition_images: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
         think: bool = False,
     ) -> Tuple[Dict, Dict, Dict]:
         """
@@ -452,32 +492,27 @@ class BagelAdapter(BaseAdapter):
         cfg_text_context = _init_ctx()
         cfg_img_context = _init_ctx()
 
-        # ── Must use eval mode for Qwen2 dispatch (forward_inference) ──
-        with self._eval_mode(bagel):
-            # --- Optional thinking prompt ---
-            if think:
-                system_prompt = (
-                    "You should first think about the planning process in the mind "
-                    "and then generate the image.\nThe planning process is enclosed "
-                    "within <think> </think> tags."
-                )
-                gen_context = self._update_context_text(system_prompt, gen_context)
-                cfg_img_context = self._update_context_text(system_prompt, cfg_img_context)
+        # --- Optional thinking prompt ---
+        if think:
+            system_prompt = (
+                "You should first think about the planning process in the mind "
+                "and then generate the image.\nThe planning process is enclosed "
+                "within <think> </think> tags."
+            )
+            gen_context = self._update_context_text(system_prompt, gen_context)
+            cfg_img_context = self._update_context_text(system_prompt, cfg_img_context)
 
-            # --- Process interleaved inputs ---
-            # For I2I: images go first, then text
-            if condition_images:
-                for img in condition_images:
-                    img_tensor = self.vae_transform.resize_transform(
-                        self._pil_img2rgb(img)
-                    )
-                    gen_context = self._update_context_image(img_tensor, gen_context)
-                    cfg_text_context = deepcopy(gen_context)
+        # --- Process interleaved inputs ---
+        # For I2I: images go first, then text
+        if condition_images is not None:
+            for img_tensor in condition_images:
+                gen_context = self._update_context_image(img_tensor, gen_context)
+                cfg_text_context = deepcopy(gen_context)
 
-            # Text always comes last (before generation)
-            cfg_text_context = deepcopy(gen_context)
-            gen_context = self._update_context_text(prompt, gen_context)
-            cfg_img_context = self._update_context_text(prompt, cfg_img_context)
+        # Text always comes last (before generation)
+        cfg_text_context = deepcopy(gen_context)
+        gen_context = self._update_context_text(prompt, gen_context)
+        cfg_img_context = self._update_context_text(prompt, cfg_img_context)
 
         return gen_context, cfg_text_context, cfg_img_context
 
@@ -493,7 +528,6 @@ class BagelAdapter(BaseAdapter):
         """Add text tokens to the KV-cache context.
         
         IMPORTANT: Caller must ensure the model is in eval mode
-        (via ``self._eval_mode``) for correct Qwen2 dispatch.
         """
         bagel = self.pipeline.bagel
         device = self.device
@@ -529,7 +563,6 @@ class BagelAdapter(BaseAdapter):
         """Add image tokens (ViT + VAE) to the KV-cache context.
         
         IMPORTANT: Caller must ensure the model is in eval mode
-        (via ``self._eval_mode``) for correct Qwen2 dispatch.
         """
         bagel = self.pipeline.bagel
         vae_model = self.pipeline.vae
@@ -718,7 +751,8 @@ class BagelAdapter(BaseAdapter):
         # Prompt
         prompt: Union[str, List[str]] = None,
         # Condition images for I2I
-        condition_images: Optional[List[List[Image.Image]]] = None,
+        images: Optional[Union[ImageSingle, ImageBatch, MultiImageBatch]] = None,
+        condition_images: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None, # pre-encoded condition images from encode_image()
         # CFG params
         cfg_text_scale: float = 4.0,
         cfg_img_scale: float = 1.5,
@@ -749,6 +783,9 @@ class BagelAdapter(BaseAdapter):
         device = self.device
         bagel = self.pipeline.bagel
         image_shape = (height, width)
+        if condition_images is None and images is not None:
+            encoded = self.encode_image(images)
+            condition_images = encoded["condition_images"] if encoded else None
 
         samples = []
 
@@ -1073,7 +1110,7 @@ class BagelAdapter(BaseAdapter):
         ],
         # ── Context rebuild (training path) ──
         prompt: Optional[Union[str, List[str]]] = None,
-        condition_images: Optional[List[List[Image.Image]]] = None,
+        condition_images: Optional[List[torch.Tensor]] = None,  # List of (C,H,W) tensors in [0,1]
         image_shape: Optional[Tuple[int, int]] = None,
         **kwargs,
     ) -> SDESchedulerOutput:
@@ -1115,9 +1152,7 @@ class BagelAdapter(BaseAdapter):
             with torch.no_grad():
                 gen_ctx, cfg_text_ctx, cfg_img_ctx = self._build_gen_context(
                     prompt=prompt[0],
-                    condition_images=(
-                        condition_images[0] if condition_images else None
-                    ),
+                    condition_images=condition_images,
                 )
 
                 # Prepare packed latent generation inputs

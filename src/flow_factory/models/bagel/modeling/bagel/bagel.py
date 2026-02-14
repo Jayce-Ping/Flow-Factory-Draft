@@ -315,7 +315,7 @@ class Bagel(PreTrainedModel):
             curr += 1
             _curr += 1
 
-            image_tensor = transforms(image)
+            image_tensor = transforms(image) if not isinstance(image, torch.Tensor) else image
             vit_position_ids = self.get_flattened_position_ids(
                 image_tensor.size(1), image_tensor.size(2), 
                 self.vit_patch_size, 
@@ -434,7 +434,7 @@ class Bagel(PreTrainedModel):
             curr += 1
             _curr += 1
 
-            image_tensor = transforms(image)
+            image_tensor = transforms(image) if not isinstance(image, torch.Tensor) else image
             vae_image_tensors.append(image_tensor)
             vae_posiiton_ids = self.get_flattened_position_ids(
                 image_tensor.size(1), image_tensor.size(2),

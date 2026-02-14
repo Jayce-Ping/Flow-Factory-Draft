@@ -73,7 +73,7 @@ class BagelPseudoPipeline:
         bagel: Bagel,
         vae: nn.Module,
         scheduler: Optional[Any] = None,
-        config: Optional[Any] = None,
+        config: Optional[BagelConfig] = None,
     ):
         self.bagel = bagel
         self.transformer = bagel.language_model
