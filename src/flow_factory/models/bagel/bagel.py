@@ -633,16 +633,16 @@ class BagelAdapter(BaseAdapter):
             )
 
         # 5. Unpack final latent
-        H, W = image_shape
-        ds = self.pipeline.latent_downsample
-        p = self.pipeline.latent_patch_size
-        ch = self.pipeline.latent_channel
-        h, w = H // ds, W // ds
-        unpacked = x_t.reshape(1, h, w, p, p, ch)
-        unpacked = torch.einsum("nhwpqc->nchpwq", unpacked).reshape(1, ch, h * p, w * p)
+        # H, W = image_shape
+        # ds = self.pipeline.latent_downsample
+        # p = self.pipeline.latent_patch_size
+        # ch = self.pipeline.latent_channel
+        # h, w = H // ds, W // ds
+        # unpacked = x_t.reshape(1, h, w, p, p, ch)
+        # unpacked = torch.einsum("nhwpqc->nchpwq", unpacked).reshape(1, ch, h * p, w * p)
 
         return {
-            "unpacked_latent": unpacked[0].float(),
+            "final_packed_latent": x_t,
             "all_latents": latent_collector.get_result(),
             "all_log_probs": (
                 log_prob_collector.get_result() if log_prob_collector else None
@@ -807,9 +807,10 @@ class BagelAdapter(BaseAdapter):
             noise_pred=v_t,
             timestep=t,
             latents=latents,
-            t_next=t_next,
+            timestep_next=t_next,
             next_latents=next_latents,
             noise_level=noise_level,
+            return_dict=True,
             compute_log_prob=compute_log_prob,
             return_kwargs=return_kwargs,
         )
@@ -916,19 +917,24 @@ class BagelAdapter(BaseAdapter):
             )
 
             # 4. Decode
-            final_latent = result["unpacked_latent"]
+            final_latent = result["final_packed_latent"]
             image = self.decode_latents(final_latent, image_shape=image_shape)
 
             # 5. Build sample
             SampleCls = BagelI2ISample if is_i2i else BagelSample
             sample = SampleCls(
-                prompt=cur_prompt,
-                image=image,
-                all_latents=result["all_latents"],
-                all_log_probs=result["all_log_probs"],
+                # Denoising trajectory
                 timesteps=result["timesteps"],
+                all_latents=result["all_latents"],
+                log_probs=result["all_log_probs"],
                 latent_index_map=result["latent_index_map"],
                 log_prob_index_map=result["log_prob_index_map"],
+                # Generated image & metadata
+                image=image,
+                height=height,
+                width=width,
+                # Prompt
+                prompt=cur_prompt,
                 packed_text_ids=gen_input["packed_text_ids"],
                 packed_text_indexes=gen_input["packed_text_indexes"],
                 packed_vae_position_ids=gen_input["packed_vae_position_ids"],
