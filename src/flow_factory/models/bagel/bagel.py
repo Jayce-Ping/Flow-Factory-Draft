@@ -641,8 +641,8 @@ class BagelAdapter(BaseAdapter):
         log_prob_index_map = log_prob_collector.get_index_map() if compute_log_prob else None
         return {
             "final_packed_latent": x_t,
-            "all_latents": torch.stack([lat[b] for lat in all_latents], dim=0) if all_latents is not None else None,
-            "all_log_probs": torch.stack([lp[b] for lp in all_log_probs], dim=0) if all_log_probs is not None else None,
+            "all_latents": all_latents,
+            "all_log_probs": all_log_probs,
             "timesteps": timesteps,
             "latent_index_map": latent_index_map,
             "log_prob_index_map": log_prob_index_map,
@@ -919,8 +919,8 @@ class BagelAdapter(BaseAdapter):
             sample = SampleCls(
                 # Denoising trajectory
                 timesteps=result["timesteps"],
-                all_latents=result["all_latents"],
-                log_probs=result["all_log_probs"],
+                all_latents=torch.stack([lat[0] for lat in result['all_latents']], dim=0) if result['all_latents'] is not None else None,
+                log_probs=torch.stack([lp[0] for lp in result['all_log_probs']], dim=0) if result['all_log_probs'] is not None else None,
                 latent_index_map=result["latent_index_map"],
                 log_prob_index_map=result["log_prob_index_map"],
                 # Generated image & metadata
