@@ -240,7 +240,8 @@ class ZImageAdapter(BaseAdapter):
             negative_prompt_embeds = encoded['negative_prompt_embeds'] if do_classifier_free_guidance else None
         else:
             prompt_embeds = [pe.to(device) for pe in prompt_embeds]
-            negative_prompt_embeds = [npe.to(device) for npe in negative_prompt_embeds]
+            if negative_prompt_embeds is not None:
+                negative_prompt_embeds = [npe.to(device) for npe in negative_prompt_embeds]
 
         batch_size = len(prompt_embeds)
         num_channels_latents = self.pipeline.transformer.in_channels

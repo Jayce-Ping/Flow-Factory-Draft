@@ -322,7 +322,8 @@ class Wan2_V2V_Adapter(BaseAdapter):
             negative_prompt_embeds = encoded.get("negative_prompt_embeds", None)
         else:
             prompt_embeds = prompt_embeds.to(device)
-            negative_prompt_embeds = negative_prompt_embeds.to(device)
+            if negative_prompt_embeds is not None:
+                negative_prompt_embeds = negative_prompt_embeds.to(device)
 
         batch_size = prompt_embeds.shape[0]
 
