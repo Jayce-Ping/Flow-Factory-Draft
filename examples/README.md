@@ -10,7 +10,7 @@ examples/{algorithm}/{finetune_type}/{model_type}/{variant}.yaml
 
 | Level | Description | Examples |
 |-------|-------------|---------|
-| `algorithm` | Training algorithm | `grpo`, `nft`, `awm`, `dgpo`, `dpo` |
+| `algorithm` | Training algorithm | `grpo`, `nft`, `awm`, `dgpo`, `dpo`, `crd` |
 | `finetune_type` | Parameter-efficient or full | `lora`, `full` |
 | `model_type` | Model family (underscore-separated) | `flux1`, `sd3_5`, `wan21`, `ltx2` |
 | `variant` | Config variant | `default.yaml`, `nocfg.yaml`, `t2v.yaml` |
@@ -33,6 +33,8 @@ We welcome community contributions! Here's what you can contribute and how:
 If you've tested a model–algorithm combination and confirmed reward improvement, submit a PR with:
 - The config YAML following the directory structure above
 - A brief note in the PR description about hardware used and observed reward trend
+
+> **Example**: [#145 — LTX-2.3 + PickScore](https://github.com/X-GenGroup/Flow-Factory/pull/145) added a GRPO + LoRA config for text-to-audio-video, with a training curve (8×H200, 18h) confirming reward improvement.
 
 ### Custom Reward Models
 

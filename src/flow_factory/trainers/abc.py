@@ -411,3 +411,18 @@ class BaseTrainer(ABC):
             resume_type=resume_type,
         )
         self.accelerator.wait_for_everyone()
+
+    def cleanup(self) -> None:
+        """Initiate non-blocking shutdown of async reward workers.
+
+        Called on KeyboardInterrupt to cancel pending futures and signal
+        executor threads to stop. This does NOT wait for threads to finish;
+        the caller is expected to follow with os._exit() which will forcefully
+        reclaim all resources including GPU memory.
+        """
+        for buf in (
+            getattr(self, 'reward_buffer', None),
+            getattr(self, 'eval_reward_buffer', None),
+        ):
+            if buf is not None:
+                buf.shutdown(wait=False, cancel_futures=True)
