@@ -1470,11 +1470,17 @@ class BaseAdapter(ABC):
             3. Otherwise, parse as ``owner/repo[/subfolder][@revision]`` and download
                via Hugging Face Hub.
 
-        Multi-node-safe: the download is gated on ``is_local_main_process`` (one
-        process per node), not ``is_main_process`` (one global). This populates the
-        per-node HF cache exactly once on non-shared filesystems; on shared
-        filesystems, ``huggingface_hub``'s per-blob ``WeakFileLock`` dedupes the
-        concurrent ``snapshot_download`` calls so only one node transfers bytes.
+        Multi-node-safe: all ranks call ``snapshot_download`` directly. Hugging
+        Face Hub's per-blob ``WeakFileLock`` serializes concurrent calls within
+        each filesystem domain (cross-node on POSIX-locking shared FS, per-node
+        on non-shared FS), so exactly one rank per filesystem domain actually
+        transfers bytes. Un-gated (rather than ``is_local_main_process`` plus a
+        barrier) so a failed download raises uniformly on every affected rank
+        instead of leaving siblings deadlocked at a barrier the failing rank
+        never reaches. Residual hazard: a rare single-rank transient failure
+        (e.g. one node's network blip) can produce asymmetric progress, in
+        which case the surviving ranks will eventually trip the NCCL watchdog
+        on the final barrier below.
 
         Args:
             path: Local filesystem path or HF spec (with or without ``hf://`` prefix).
@@ -1493,19 +1499,8 @@ class BaseAdapter(ABC):
 
         repo_id, subfolder, revision = parse_hf_checkpoint_path(spec)
 
-        if self.accelerator.is_local_main_process:
-            local_path = download_hf_checkpoint(repo_id, subfolder, revision)
-            logger.info(
-                f"[local rank 0 / global rank {self.accelerator.process_index}] "
-                f"resolved checkpoint '{path}' -> {local_path}"
-            )
-        self.accelerator.wait_for_everyone()
-
-        # All ranks call again; on the populated cache this is a metadata-only
-        # path lookup. Narrow re-raise for the specific HF-Hub failure modes so
-        # users see a single actionable message instead of a raw HTTPError.
         try:
-            return download_hf_checkpoint(repo_id, subfolder, revision)
+            local_path = download_hf_checkpoint(repo_id, subfolder, revision)
         except (RepositoryNotFoundError, HfHubHTTPError) as e:
             raise FileNotFoundError(
                 f"Checkpoint {path!r} not found locally and could not be fetched "
@@ -1513,6 +1508,20 @@ class BaseAdapter(ABC):
                 f"revision={revision!r}). For private repos, ensure HF_TOKEN is set "
                 f"on ALL nodes."
             ) from e
+
+        # Sync after download so downstream loaders enter the lockstep dispatch
+        # together. On symmetric failure every rank raises above before this
+        # barrier is reached, so no deadlock; the residual asymmetric-failure
+        # case is documented in the docstring.
+        self.accelerator.wait_for_everyone()
+
+        if self.accelerator.is_local_main_process:
+            logger.info(
+                f"[local rank 0 / global rank {self.accelerator.process_index}] "
+                f"resolved checkpoint '{path}' -> {local_path}"
+            )
+
+        return local_path
 
     @staticmethod
     def load_sharded_checkpoint(checkpoint_dir: str, index_file: str) -> Dict[str, torch.Tensor]:

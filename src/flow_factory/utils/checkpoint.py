@@ -189,6 +189,17 @@ def parse_hf_checkpoint_path(path: str) -> Tuple[str, Optional[str], Optional[st
             f"(expected at least 'owner/repo', got {len(parts)} non-empty segments)"
         )
 
+    # Reject path-traversal segments. Without this, a spec like
+    # 'owner/repo/..' would resolve via os.path.join to a directory outside
+    # the snapshot root and let downstream loaders read from unintended
+    # locations. Backslashes are rejected to block Windows-style traversal.
+    for seg in parts:
+        if seg in (".", "..") or "\\" in seg:
+            raise ValueError(
+                f"invalid segment {seg!r} in HF checkpoint path: {path!r} "
+                f"('.', '..', and backslashes are not allowed)"
+            )
+
     repo_id = "/".join(parts[:2])
     subfolder = "/".join(parts[2:]) if len(parts) > 2 else None
     return repo_id, subfolder, revision
