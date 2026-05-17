@@ -24,7 +24,7 @@ model:
   target_modules: "default"
   model_name_or_path: "black-forest-labs/FLUX.1-dev"
   model_type: "flux1"
-  resume_path: null
+  resume_path: null # Local path or HF repo id (e.g. 'owner/repo[/subdir][@rev]') for previous checkpoint/lora adapter
   resume_type: null
 
 log:

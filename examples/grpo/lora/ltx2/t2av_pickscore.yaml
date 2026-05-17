@@ -25,7 +25,7 @@ model:
   target_modules: "default"  # 28 Linear layers per block (video/audio attn + cross-modal attn + FFN)
   model_name_or_path: "dg845/LTX-2.3-Diffusers"  # Options: Lightricks/LTX-2, dg845/LTX-2.3-Diffusers
   model_type: "ltx2_t2av"
-  resume_path: null  # Path to load previous checkpoint/lora adapter
+  resume_path: null # Local path or HF repo id (e.g. 'owner/repo[/subdir][@rev]') for previous checkpoint/lora adapter
   resume_type: null  # Options: lora, full, state. Null to auto-detect based on `finetune_type`
   # attn_backend: '_flash_3_hub'  # Attention backend.
 

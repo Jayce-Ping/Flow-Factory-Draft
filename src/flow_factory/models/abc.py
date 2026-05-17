@@ -38,6 +38,7 @@ from diffusers.schedulers.scheduling_utils import SchedulerMixin
 from peft import get_peft_model, LoraConfig, PeftModel
 
 from huggingface_hub import split_torch_state_dict_into_shards
+from huggingface_hub.errors import RepositoryNotFoundError, HfHubHTTPError
 from accelerate import Accelerator, DistributedType
 from accelerate.state import PartialState
 from accelerate.utils.modeling import (
@@ -58,6 +59,9 @@ from ..utils.checkpoint import (
     mapping_lora_state_dict,
     infer_lora_config,
     infer_target_modules,
+    parse_hf_checkpoint_path,
+    download_hf_checkpoint,
+    HF_PATH_PREFIX,
 )
 from ..samples import BaseSample
 from ..ema import EMAModuleWrapper
@@ -1455,6 +1459,61 @@ class BaseAdapter(ABC):
             logger.info(f"Checkpoint saved successfully to {save_directory}")
 
     # -------------------------------------------- Load -------------------------------------------
+    def _resolve_checkpoint_path(self, path: str) -> str:
+        """
+        Resolve `path` to a local directory, downloading from Hugging Face Hub when needed.
+
+        Resolution order:
+            1. If `path` starts with ``hf://``, strip the prefix and force HF download
+               (lets users override a colliding local directory).
+            2. Otherwise, if `path` exists locally, return it as-is.
+            3. Otherwise, parse as ``owner/repo[/subfolder][@revision]`` and download
+               via Hugging Face Hub.
+
+        Multi-node-safe: the download is gated on ``is_local_main_process`` (one
+        process per node), not ``is_main_process`` (one global). This populates the
+        per-node HF cache exactly once on non-shared filesystems; on shared
+        filesystems, ``huggingface_hub``'s per-blob ``WeakFileLock`` dedupes the
+        concurrent ``snapshot_download`` calls so only one node transfers bytes.
+
+        Args:
+            path: Local filesystem path or HF spec (with or without ``hf://`` prefix).
+
+        Returns:
+            Absolute local directory path ready for the existing checkpoint loaders.
+
+        Raises:
+            FileNotFoundError: When the spec is neither a local path nor a reachable HF repo.
+        """
+        force_hf = path.startswith(HF_PATH_PREFIX)
+        spec = path[len(HF_PATH_PREFIX):] if force_hf else path
+
+        if not force_hf and os.path.exists(spec):
+            return spec
+
+        repo_id, subfolder, revision = parse_hf_checkpoint_path(spec)
+
+        if self.accelerator.is_local_main_process:
+            local_path = download_hf_checkpoint(repo_id, subfolder, revision)
+            logger.info(
+                f"[local rank 0 / global rank {self.accelerator.process_index}] "
+                f"resolved checkpoint '{path}' -> {local_path}"
+            )
+        self.accelerator.wait_for_everyone()
+
+        # All ranks call again; on the populated cache this is a metadata-only
+        # path lookup. Narrow re-raise for the specific HF-Hub failure modes so
+        # users see a single actionable message instead of a raw HTTPError.
+        try:
+            return download_hf_checkpoint(repo_id, subfolder, revision)
+        except (RepositoryNotFoundError, HfHubHTTPError) as e:
+            raise FileNotFoundError(
+                f"Checkpoint {path!r} not found locally and could not be fetched "
+                f"from Hugging Face Hub (repo={repo_id!r}, subfolder={subfolder!r}, "
+                f"revision={revision!r}). For private repos, ensure HF_TOKEN is set "
+                f"on ALL nodes."
+            ) from e
+
     @staticmethod
     def load_sharded_checkpoint(checkpoint_dir: str, index_file: str) -> Dict[str, torch.Tensor]:
         """Load sharded safetensors checkpoint."""
@@ -1674,8 +1733,11 @@ class BaseAdapter(ABC):
                 - None: Auto-detect based on checkpoint directory contents
         """
         path = os.path.expanduser(path)
+        path = self._resolve_checkpoint_path(path)
         if not os.path.exists(path):
-            raise FileNotFoundError(f"Checkpoint path not found: {path}")
+            raise FileNotFoundError(
+                f"Checkpoint path not found locally or on Hugging Face Hub: {path!r}"
+            )
 
         # Auto-detect if not specified
         if resume_type is None:

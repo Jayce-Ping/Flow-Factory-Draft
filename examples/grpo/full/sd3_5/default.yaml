@@ -21,7 +21,7 @@ model:
   target_modules: "default" # Options: all, default, or list of module names like ["to_k", "to_q", "to_v", "to_out.0"]
   model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"  # HuggingFace model ID or local path
   model_type: "sd3-5"  # Options: flux1, flux1-kontext, flux2, qwenimage, qwenimage-edit, sd3-5
-  resume_path: null # Path to load previous checkpoint/lora adapter
+  resume_path: null # Local path or HF repo id (e.g. 'owner/repo[/subdir][@rev]') for previous checkpoint/lora adapter
   resume_type: null # Options: lora, full, state. Null to auto-detect based on `finetune_type`
 
 log:

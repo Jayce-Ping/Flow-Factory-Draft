@@ -60,6 +60,7 @@ git status             # Modified files
 - [ ] English comments and docstrings
 - [ ] Apache 2.0 license header on new files
 - [ ] No unnecessary wildcard imports (except `hparams`)
+- [ ] **Top-level imports only** — no `import` / `from ... import ...` inside function or method bodies (constraint #22). Exceptions: documented optional deps via `try/except ImportError`, or genuine unresolvable circular imports.
 
 ### Documentation
 - [ ] `guidance/` docs updated if behavior changed

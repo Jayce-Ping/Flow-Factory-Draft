@@ -23,7 +23,7 @@ model:
   target_modules: "default" # Options: all, default, or list of module names like ["to_k", "to_q", "to_v", "to_out.0"]
   model_name_or_path: "black-forest-labs/FLUX.2-dev"  # HuggingFace model ID or local path
   model_type: "flux2"
-  resume_path: null # Path to load previous checkpoint/lora adapter
+  resume_path: null # Local path or HF repo id (e.g. 'owner/repo[/subdir][@rev]') for previous checkpoint/lora adapter
   resume_type: null # Options: lora, full, state. Null to auto-detect based on `finetune_type`
 
 log:

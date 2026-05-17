@@ -131,6 +131,7 @@ The adapter sets inference dtype for frozen components and training dtype for tr
 - Use relative imports within `flow_factory` package (e.g., `from ..hparams import *`)
 - Use absolute imports for external packages
 - Follow existing wildcard import patterns for `hparams`
+- **Top-level imports only**: All `import` / `from ... import ...` statements MUST live at the top of the module, never inside function bodies, methods, `__init__`, or conditional branches. Sanctioned exceptions: (a) optional dependencies wrapped in `try/except ImportError` (e.g., `deepspeed`, `xformers`); (b) backend-gated imports where the target symbol is only resolvable under a specific runtime backend already selected by a preceding feature check (e.g., DeepSpeed/FSDP submodules guarded by `is_deepspeed()` / `is_fsdp2()` in `models/abc.py`); (c) genuine unresolvable circular imports documented inline. Lazy imports added merely for "import speed" or "to keep the module light" are NOT acceptable — every hard dependency already runs through Python's import machinery on a typical import path. Inline imports hide the dependency surface from readers, `isort`, and static-analysis tools, and re-execute on every call in hot loops.
 
 ### 23. Type Annotations
 All public methods must have type annotations. Use `typing` module types (`List`, `Dict`, `Optional`, `Tuple`, `Union`) for Python 3.10 compatibility.
