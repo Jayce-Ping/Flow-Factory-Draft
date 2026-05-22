@@ -23,12 +23,16 @@ launcher (``cli.py``) and the runtime config reconciliation
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, get_args
 
 if TYPE_CHECKING:
     from accelerate import Accelerator
 
     from ..hparams import Arguments
+
+# Valid mixed-precision values accepted by Arguments.mixed_precision
+_MixedPrecisionType = Literal["no", "fp16", "bf16"]
+_VALID_MIXED_PRECISION: tuple[str, ...] = get_args(_MixedPrecisionType)
 
 
 # ========================================================================
@@ -67,7 +71,8 @@ def reconcile_config(config: "Arguments", accelerator: "Accelerator") -> None:
     """
     # Authoritative values from accelerator
     config.num_processes = accelerator.num_processes
-    config.mixed_precision = accelerator.mixed_precision  # type: ignore[assignment]
+    if accelerator.mixed_precision in _VALID_MIXED_PRECISION:
+        config.mixed_precision = accelerator.mixed_precision  # type: narrow[Literal]
     config.process_index = accelerator.process_index
     config.local_process_index = accelerator.local_process_index
 
