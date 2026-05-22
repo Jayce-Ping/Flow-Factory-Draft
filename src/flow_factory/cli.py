@@ -22,31 +22,11 @@ import logging
 import torch
 import yaml
 
+from .utils.env_utils import ENV_VAR_MAPPINGS, env_lookup
+
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')
 logger = logging.getLogger(__name__)
-
-
-# ========================================================================
-# Multi-node environment variable mapping table.
-# Supports multiple cluster scheduler naming conventions (ordered by priority).
-# ========================================================================
-_ENV_VAR_MAPPINGS = {
-    "master_ip":      ["MASTER_IP", "MASTER_ADDR", "CHIEF_IP"],
-    "master_port":    ["MASTER_PORT"],
-    "machine_rank":   ["MACHINE_RANK", "NODE_RANK", "INDEX"],
-    "num_machines":   ["NUM_MACHINES", "NUM_NODES", "HOST_NUM"],
-    "gpus_per_node":  ["GPUS_PER_NODE", "HOST_GPU_NUM"],
-}
-
-
-def _env_lookup(key: str) -> str | None:
-    """Look up a value from environment variable mapping by priority."""
-    for env_name in _ENV_VAR_MAPPINGS.get(key, []):
-        val = os.environ.get(env_name)
-        if val is not None and val != "":
-            return val
-    return None
 
 
 def resolve_multinode_env() -> dict:
@@ -56,8 +36,8 @@ def resolve_multinode_env() -> dict:
     Returns a dict containing only successfully resolved fields.
     Returns an empty dict if not in a multi-node environment (i.e. key variables missing).
     """
-    master_ip = _env_lookup("master_ip")
-    num_machines_str = _env_lookup("num_machines")
+    master_ip = env_lookup("master_ip")
+    num_machines_str = env_lookup("num_machines")
 
     # Consider it a multi-node environment only when both master_ip and num_machines > 1 are present
     if not master_ip or not num_machines_str:
@@ -73,17 +53,17 @@ def resolve_multinode_env() -> dict:
     }
 
     # Optional: machine_rank
-    rank_str = _env_lookup("machine_rank")
+    rank_str = env_lookup("machine_rank")
     if rank_str is not None:
         env_config["machine_rank"] = int(rank_str)
 
     # Optional: master_port
-    port_str = _env_lookup("master_port")
+    port_str = env_lookup("master_port")
     if port_str is not None:
         env_config["main_process_port"] = int(port_str)
 
     # Optional: gpus_per_node -> used to compute num_processes
-    gpus_str = _env_lookup("gpus_per_node")
+    gpus_str = env_lookup("gpus_per_node")
     if gpus_str is not None:
         env_config["num_processes"] = num_machines * int(gpus_str)
 
@@ -183,7 +163,7 @@ def train_cli():
                 logger.error(
                     f"main_process_ip is required for multi-node training. "
                     f"Provide it via one of:\n"
-                    f"  1. Environment variable: {', '.join(_ENV_VAR_MAPPINGS['master_ip'])}\n"
+                    f"  1. Environment variable: {', '.join(ENV_VAR_MAPPINGS['master_ip'])}\n"
                     f"  2. CLI argument: --main_process_ip <ip>\n"
                     f"  3. accelerate config_file with main_process_ip set"
                 )

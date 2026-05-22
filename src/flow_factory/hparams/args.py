@@ -64,6 +64,31 @@ class Arguments(ArgABC):
         default='bf16',
         metadata={"help": "Mixed precision setting for training."},
     )
+    # Runtime distributed fields (populated by reconcile_config after accelerator creation)
+    process_index: Optional[int] = field(
+        default=None,
+        metadata={"help": "Global process index (set at runtime by reconcile_config)."},
+    )
+    local_process_index: Optional[int] = field(
+        default=None,
+        metadata={"help": "Local process index on this node (set at runtime)."},
+    )
+    num_machines: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of machines detected from environment."},
+    )
+    gpus_per_node: Optional[int] = field(
+        default=None,
+        metadata={"help": "GPUs per node (num_processes // num_machines)."},
+    )
+    machine_rank: Optional[int] = field(
+        default=None,
+        metadata={"help": "Rank of the current machine (set at runtime)."},
+    )
+    main_process_ip: Optional[str] = field(
+        default=None,
+        metadata={"help": "IP of the master node (set at runtime from env vars)."},
+    )
     # Nested argument groups
     data_args: DataArguments = field(
         default_factory=DataArguments,
