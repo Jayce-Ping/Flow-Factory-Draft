@@ -50,7 +50,8 @@ def get_training_args_class(identifier: str) -> Type[TrainingArguments]:
     1. Registry lookup: 'grpo' -> GRPOTrainingArguments
     2. Direct python path: 'my_package.hparams.CustomTrainingArgs' -> CustomTrainingArgs
 
-    Falls back to base TrainingArguments if lookup fails.
+    Raises ImportError if the identifier is not found in the registry
+    and cannot be resolved as a python import path.
     """
     identifier_lower = identifier.lower()
 
