@@ -59,6 +59,7 @@ class EvaluationArguments(ArgABC):
         default=10,
         metadata={"help": "Evaluation frequency (in epochs). 0 for no evaluation."},
     )
+
     def __post_init__(self):
         if not self.resolution:
             logger.warning("`resolution` is not set, using default (512, 512).")
@@ -76,17 +77,17 @@ class EvaluationArguments(ArgABC):
 
         # height/width override
         if self.height is not None and self.resolution[0] != self.height:
-                logger.warning(
-                    f"Both `resolution={self.resolution}` and `height={self.height}` are set. "
-                    f"Using height to override: ({self.height}, {self.resolution[1]})."
-                )
-                self.resolution = (self.height, self.resolution[1])
+            logger.warning(
+                f"Both `resolution={self.resolution}` and `height={self.height}` are set. "
+                f"Using height to override: ({self.height}, {self.resolution[1]})."
+            )
+            self.resolution = (self.height, self.resolution[1])
         if self.width is not None and self.resolution[1] != self.width:
-                logger.warning(
-                    f"Both `resolution={self.resolution}` and `width={self.width}` are set. "
-                    f"Using width to override: ({self.resolution[0]}, {self.width})."
-                )
-                self.resolution = (self.resolution[0], self.width)
+            logger.warning(
+                f"Both `resolution={self.resolution}` and `width={self.width}` are set. "
+                f"Using width to override: ({self.resolution[0]}, {self.width})."
+            )
+            self.resolution = (self.resolution[0], self.width)
 
         # Final assignment
         self.height, self.width = self.resolution
@@ -267,17 +268,17 @@ class TrainingArguments(ArgABC):
             self.resolution = (self.resolution, self.resolution)
 
         if self.height is not None and self.resolution[0] != self.height:
-                logger.warning(
-                    f"Both `resolution={self.resolution}` and `height={self.height}` are set. "
-                    f"Using height to override: ({self.height}, {self.resolution[1]})."
-                )
-                self.resolution = (self.height, self.resolution[1])
+            logger.warning(
+                f"Both `resolution={self.resolution}` and `height={self.height}` are set. "
+                f"Using height to override: ({self.height}, {self.resolution[1]})."
+            )
+            self.resolution = (self.height, self.resolution[1])
         if self.width is not None and self.resolution[1] != self.width:
-                logger.warning(
-                    f"Both `resolution={self.resolution}` and `width={self.width}` are set. "
-                    f"Using width to override: ({self.resolution[0]}, {self.width})."
-                )
-                self.resolution = (self.resolution[0], self.width)
+            logger.warning(
+                f"Both `resolution={self.resolution}` and `width={self.width}` are set. "
+                f"Using width to override: ({self.resolution[0]}, {self.width})."
+            )
+            self.resolution = (self.resolution[0], self.width)
 
         self.height, self.width = self.resolution
 
@@ -290,7 +291,7 @@ class TrainingArguments(ArgABC):
         # Placeholder values are set here so the fields exist; they will be
         # overwritten by _align_batch_geometry() before any consumer reads them.
         world_size = get_world_size()
-        logger.info("World Size:" + str(world_size))
+        logger.info(f"World Size: {world_size}")
 
         sample_num_per_iteration = world_size * self.per_device_batch_size
         self.num_batches_per_epoch = (
