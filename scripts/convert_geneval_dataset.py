@@ -6,7 +6,10 @@ Input format (DiffusionNFT):
     {"tag": "...", "include": [...], "prompt": "...", "exclude": [...]}
 
 Output format (Flow-Factory):
-    {"prompt": "...", "geneval_metadata": "<JSON string of full metadata>"}
+    {"prompt": "...", "include": "<JSON string>", "exclude": "<JSON string>", "tag": "..."}
+
+The include/exclude fields are stored as JSON strings to avoid Arrow
+serialization issues with heterogeneous nested structs.
 
 Usage:
     python scripts/convert_geneval_dataset.py
@@ -37,10 +40,12 @@ def process_geneval(input_path: str, output_path: str) -> tuple:
                 duplicates += 1
                 continue
             seen_prompts.add(prompt)
-            # Convert: store full metadata as JSON string to avoid Arrow issues
+            # Store include/exclude as JSON strings (Arrow-safe)
             output_record = {
                 "prompt": prompt,
-                "geneval_metadata": json.dumps(record, ensure_ascii=False),
+                "include": json.dumps(record["include"], ensure_ascii=False),
+                "exclude": json.dumps(record.get("exclude"), ensure_ascii=False),
+                "tag": record.get("tag", "unknown"),
             }
             unique_records.append(output_record)
 
@@ -68,8 +73,6 @@ def main():
         return
 
     print("Processing GenEval dataset...")
-    print(f"  Input:  {train_input}")
-    print(f"  Output: {train_output}")
 
     train_unique, train_dups = process_geneval(train_input, train_output)
     print(f"  Train: {train_unique} unique prompts, {train_dups} duplicates removed")
@@ -77,8 +80,6 @@ def main():
     if os.path.exists(test_input):
         test_unique, test_dups = process_geneval(test_input, test_output)
         print(f"  Test:  {test_unique} unique prompts, {test_dups} duplicates removed")
-    else:
-        print(f"  WARNING: {test_input} not found, skipping test set.")
 
     print("Done!")
 

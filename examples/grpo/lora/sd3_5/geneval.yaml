@@ -97,27 +97,25 @@ eval:
   seed: 42  # Eval seed
 
 # Reward Model Configuration
+# GenEval uses Mask2Former (mmdet 3.x) + CLIP for compositional evaluation.
+# Returns continuous reward in [0, 1] based on object count/color/position accuracy.
 rewards:
   - name: "geneval"
     reward_model: "geneval"
     batch_size: 32
     device: "cuda"
     dtype: bfloat16
-    # GenEval-specific options:
-    ckpt_path: "reward_ckpts"  # Directory containing mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco_*.pth
-    reward_type: "score"  # Continuous 0-1 reward used for policy gradient (same as DiffusionNFT)
-    threshold: 0.3  # Object detection confidence threshold
-    counting_threshold: 0.9  # Higher threshold for counting tasks
-    max_objects: 16  # Max detections per class
-    nms_threshold: 1.0  # NMS IoU threshold (1.0 = disabled)
-    position_threshold: 0.1  # Position relation tolerance
+    # Optional overrides (defaults work out of the box with mmdet model zoo):
+    # detector_config: "mask2former_swin-s-p4-w7-224_8xb2-lsj-50e_coco"
+    # detector_checkpoint: "https://download.openmmlab.com/..."  # auto-downloaded
+    # clip_model: "ViT-L-14"
+    # detection_threshold: 0.3
+    # counting_threshold: 0.9
 
-# Optional Evaluation Reward Models, default to all training reward models if not specified
+# Optional Evaluation Reward Models
 eval_rewards:
   - name: "geneval"
     reward_model: "geneval"
     batch_size: 32
     device: "cuda"
     dtype: bfloat16
-    ckpt_path: "reward_ckpts"
-    reward_type: "score"  # Continuous score for eval too; strict accuracy logged in extra_info

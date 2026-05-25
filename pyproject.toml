@@ -76,8 +76,8 @@ nvidia = [
 geneval = [
     "openmim",
     "mmengine",
+    "mmdet>=3.3.0",
     "open_clip_torch",
-    "clip_benchmark",
 ]
 
 all = [
