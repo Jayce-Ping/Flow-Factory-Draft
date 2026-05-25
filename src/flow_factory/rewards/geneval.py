@@ -22,7 +22,7 @@ Evaluates generated images on:
 - Spatial relationships (above/below/left/right)
 - Object exclusion (penalize unwanted objects)
 
-Based on the GenEval evaluation from DiffusionNFT (https://arxiv.org/pdf/2509.16117).
+Based on the GenEval benchmark (https://github.com/djghosh13/geneval).
 
 Dependencies:
     bash scripts/install_geneval_deps.sh
