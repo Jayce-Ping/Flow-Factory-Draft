@@ -4,7 +4,7 @@
 # Install GenEval reward model dependencies (mmcv + mmdet + open_clip)
 #
 # Requirements:
-#   - Python 3.10 (tested; other versions may work but are unsupported)
+#   - Python 3.10 or 3.12 (tested)
 #   - PyTorch >= 2.0 with CUDA
 #   - CUDA toolkit (nvcc) for mmcv CUDA ops compilation
 #   - uv (recommended) or pip
@@ -39,9 +39,8 @@ fi
 
 PY_VERSION=$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 
-if [[ "$PY_VERSION" != "3.10" ]]; then
-    warn "Python ${PY_VERSION} detected. This script has only been tested with Python 3.10."
-    warn "mmcv compilation may fail on other versions (pkg_resources removed in 3.12+)."
+if [[ "$PY_VERSION" != "3.10" && "$PY_VERSION" != "3.12" ]]; then
+    warn "Python ${PY_VERSION} detected. This script has only been tested with Python 3.10 and 3.12."
     warn "Proceeding anyway..."
     echo ""
 fi
