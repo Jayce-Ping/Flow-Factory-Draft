@@ -78,7 +78,7 @@ export MAX_JOBS=${MAX_JOBS:-$(nproc)}
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0;8.6;8.9;9.0}"
 info "  TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}, MAX_JOBS=${MAX_JOBS}"
 
-$PIP install -e "${MMCV_BUILD_DIR}/mmcv" --no-build-isolation
+$PIP install "${MMCV_BUILD_DIR}/mmcv" --no-build-isolation
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 3: Install mmdetection
@@ -89,7 +89,7 @@ if [ ! -d "${MMCV_BUILD_DIR}/mmdetection" ]; then
     git clone --depth 1 -b main https://github.com/open-mmlab/mmdetection.git "${MMCV_BUILD_DIR}/mmdetection"
 fi
 
-$PIP install -e "${MMCV_BUILD_DIR}/mmdetection" --no-build-isolation
+$PIP install "${MMCV_BUILD_DIR}/mmdetection" --no-build-isolation
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 4: Install open_clip_torch
