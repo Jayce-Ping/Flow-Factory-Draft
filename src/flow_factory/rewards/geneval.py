@@ -142,6 +142,12 @@ class GenEvalRewardModel(PointwiseRewardModel):
     def __init__(self, config: RewardArguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
 
+        if self.device.type != "cuda":
+            logger.warning(
+                "GenEval is configured on CPU but requires CUDA for Mask2Former inference. "
+                "Set `device: cuda` in your reward config."
+            )
+
         # Extract config params (extra_kwargs from YAML config)
         self._detection_threshold = getattr(
             config, "detection_threshold", DEFAULT_DETECTION_THRESHOLD
