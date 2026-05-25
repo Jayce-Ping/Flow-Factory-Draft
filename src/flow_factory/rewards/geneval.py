@@ -57,7 +57,6 @@ COLORS = [
 
 DEFAULT_DETECTION_THRESHOLD = 0.3
 DEFAULT_COUNTING_THRESHOLD = 0.9
-DEFAULT_NMS_THRESHOLD = 1.0
 DEFAULT_MAX_OBJECTS = 16
 
 # Default paths (relative to project root)
@@ -150,7 +149,6 @@ class GenEvalRewardModel(PointwiseRewardModel):
         self._counting_threshold = getattr(
             config, "counting_threshold", DEFAULT_COUNTING_THRESHOLD
         )
-        self._nms_threshold = getattr(config, "nms_threshold", DEFAULT_NMS_THRESHOLD)
         self._max_objects = getattr(config, "max_objects", DEFAULT_MAX_OBJECTS)
 
         object_names_path = getattr(
@@ -181,7 +179,7 @@ class GenEvalRewardModel(PointwiseRewardModel):
         except ImportError:
             raise ImportError(
                 "mmdet is required for GenEval reward. "
-                "Install with: pip install mmdet mmengine"
+                "Install with: bash scripts/install_geneval_deps.sh"
             )
 
         self._inference_detector = inference_detector
@@ -248,7 +246,7 @@ class GenEvalRewardModel(PointwiseRewardModel):
         except ImportError:
             raise ImportError(
                 "open_clip_torch is required for GenEval color classification. "
-                "Install with: pip install open_clip_torch"
+                "Install with: bash scripts/install_geneval_deps.sh"
             )
 
         clip_model_name = getattr(config, "clip_model", DEFAULT_CLIP_MODEL)
