@@ -25,7 +25,7 @@ Evaluates generated images on:
 Based on the GenEval evaluation from DiffusionNFT (https://arxiv.org/pdf/2509.16117).
 
 Dependencies:
-    pip install mmdet mmengine open_clip_torch
+    bash scripts/install_geneval_deps.sh
 """
 from __future__ import annotations
 

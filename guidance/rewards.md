@@ -38,6 +38,7 @@ Flow-Factory supports two paradigms for computing rewards:
 | `PickScore` | Pointwise | CLIP-based aesthetic scoring | [PickScore](https://huggingface.co/yuvalkirstain/PickScore_v1) |
 | `CLIP` | Pointwise | Image-text cosine similarity | [CLIP](https://huggingface.co/openai/clip-vit-large-patch14) |
 | `PickScore_Rank` | Groupwise | Ranking-based reward using PickScore | [PickScore](https://huggingface.co/yuvalkirstain/PickScore_v1) |
+| `GenEval` | Pointwise | Compositional T2I evaluation (object count, color, position) via Mask2Former + CLIP | [DiffusionNFT](https://arxiv.org/pdf/2509.16117) |
 | `vllm_evaluate` | Pointwise | VLM with a binary Yes/No question; reward from logprobs via OpenAI-compatible API | [VLM-as-Judge](#vlm-as-judge) |
 | `rational_rewards_t2i` | Pointwise | T2I rubric judge (remote VLM); see [VLM-as-Judge](#vlm-as-judge) and [Example: Rational Rewards](#example-rational-rewards) | [Rational Rewards](https://github.com/TIGER-AI-Lab/RationalRewards) |
 | `rational_rewards_edit` | Pointwise | Image-edit rubric (source + edited). Same setup family as T2I variant | [Rational Rewards](https://github.com/TIGER-AI-Lab/RationalRewards) |
