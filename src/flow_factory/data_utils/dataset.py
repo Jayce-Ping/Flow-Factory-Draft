@@ -477,7 +477,10 @@ class GeneralDataset(Dataset):
 
         # 7. Prepare final results
         batch_dict = {**batch, **final_res}
-        # Add the rest info to `metadata` key, dict[list] -> list[dict]
+        # Pack non-preprocess fields into `metadata` column (dict[list] -> list[dict]).
+        # These are injected into sample.extra_kwargs by BaseTrainer._inject_batch_metadata
+        # and forwarded to reward models as kwargs. Complex values (nested lists/dicts)
+        # must be stored as JSON strings in the source JSONL for Arrow compatibility.
         batch_dict['metadata'] = [
             {k: v[idx] for k,v in batch.items() if k not in PREPROCESS_KEYS}
             for idx in range(len(batch['prompt']))

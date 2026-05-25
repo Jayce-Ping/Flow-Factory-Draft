@@ -115,7 +115,11 @@ class PointwiseRewardModel(BaseRewardModel):
                 - List[List[List[Image.Image]]]: each innermost list corresponds to one condition video (PIL Images).
                 - If `use_tensor_inputs` is True and **all condition videos are resized the same**, this will be a list of torch.Tensors (num_conditions, T, C, H, W).
                 - If `use_tensor_inputs` is True and **condition videos have varying sizes**, this will be a list of lists of torch.Tensors (T, C, H, W).
-            **kwargs: Additional fields from Sample
+            **kwargs: Additional fields from sample.extra_kwargs, passed automatically
+                by RewardProcessor via filter_kwargs. Dataset metadata fields (e.g.
+                ``include``, ``tag``) arrive here as strings — the reward model is
+                responsible for parsing complex values with ``json.loads()`` as needed.
+                See ``guidance/rewards.md`` "Dataset Metadata Convention" for details.
         Returns:
             RewardModelOutput with rewards shape (batch_size,)
         """

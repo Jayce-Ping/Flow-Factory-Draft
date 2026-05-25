@@ -439,9 +439,14 @@ class BaseTrainer(ABC):
     ) -> None:
         """Inject dataset metadata into generated samples' extra_kwargs.
 
-        When the dataset stores per-sample metadata (e.g. ``geneval_metadata``),
-        this method copies it from the dataloader batch into samples so that
-        downstream reward models can access it via ``sample.extra_kwargs``.
+        Bridges the gap between dataset JSONL fields and reward model kwargs:
+        non-preprocess fields from the dataloader batch are copied into each
+        sample's ``extra_kwargs``, making them accessible to reward models via
+        ``filter_kwargs(model.__call__, **sample)``.
+
+        Convention: complex metadata values are stored as JSON strings in the
+        JSONL for Arrow serialization safety. Reward models parse them with
+        ``json.loads()`` as needed.
 
         No-op when ``batch['metadata']`` is absent or empty.
 

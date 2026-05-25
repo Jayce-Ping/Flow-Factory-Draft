@@ -263,6 +263,39 @@ rewards:
     batch_size: 16
 ```
 
+### Dataset Metadata Convention
+
+Reward models can declare extra parameters in `__call__` (beyond `prompt`/`image`/`video`) to receive **per-sample metadata** from the dataset. The data flows as:
+
+```
+JSONL field → Dataset "metadata" column → sample.extra_kwargs → reward __call__ kwargs
+```
+
+**Arrow serialization constraint:** Non-primitive metadata (nested dicts, variable-length lists) **must** be stored as JSON strings in the JSONL. Arrow cannot serialize heterogeneous nested structs — different rows with different sub-fields will crash `Dataset.map()`.
+
+```jsonl
+{"prompt": "a red car", "include": "[{\"class\":\"car\",\"count\":1,\"color\":\"red\"}]", "tag": "colors"}
+```
+
+The reward model parses these strings internally:
+
+```python
+class MyMetadataReward(PointwiseRewardModel):
+    required_fields = ("image", "prompt", "include")  # Declare metadata fields
+
+    def __call__(self, prompt, image=None, include=None, **kwargs):
+        for i in range(len(prompt)):
+            spec = json.loads(include[i]) if isinstance(include[i], str) else include[i]
+            # ... use spec for evaluation
+```
+
+**Rules:**
+1. Flat scalars (`str`, `int`, `float`) can be stored directly in JSONL.
+2. Complex values (lists, nested dicts) → `json.dumps()` in JSONL, `json.loads()` in reward model.
+3. Fields listed in `required_fields` are checked during reward computation; missing fields raise errors.
+
+See `src/flow_factory/rewards/geneval.py` for a complete example (GenEval uses `include`/`exclude`/`tag`).
+
 ## Multi-Reward Training
 
 Train with multiple reward signals by adding entries to `rewards`:
