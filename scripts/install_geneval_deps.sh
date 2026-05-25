@@ -69,7 +69,7 @@ MMCV_BUILD_DIR="${REPO_ROOT}/.geneval_build"
 mkdir -p "${MMCV_BUILD_DIR}"
 
 if [ ! -d "${MMCV_BUILD_DIR}/mmcv" ]; then
-    git clone --depth 1 -b main https://github.com/open-mmlab/mmcv.git "${MMCV_BUILD_DIR}/mmcv"
+    git clone --depth 1 -b v2.1.0 https://github.com/open-mmlab/mmcv.git "${MMCV_BUILD_DIR}/mmcv"
 fi
 
 export MMCV_WITH_OPS=1
@@ -86,7 +86,7 @@ $PIP install "${MMCV_BUILD_DIR}/mmcv" --no-build-isolation
 info "Step 3/4: Installing mmdetection..."
 
 if [ ! -d "${MMCV_BUILD_DIR}/mmdetection" ]; then
-    git clone --depth 1 -b main https://github.com/open-mmlab/mmdetection.git "${MMCV_BUILD_DIR}/mmdetection"
+    git clone --depth 1 -b v3.3.0 https://github.com/open-mmlab/mmdetection.git "${MMCV_BUILD_DIR}/mmdetection"
 fi
 
 $PIP install "${MMCV_BUILD_DIR}/mmdetection" --no-build-isolation
