@@ -496,7 +496,7 @@ class BaseTrainer(ABC):
             trajectory_indices: Which timestep positions to store in each sample.
                 ``[-1]`` = final latent only (default for most algorithms).
                 Full list = store all (GRPO needs this for PPO ratio).
-                ``None`` is treated as ``[-1]``.
+                ``None`` = no trajectory recording (used during evaluation).
             **extra_inference_kwargs: Forwarded to ``adapter.inference()``
                 after ``filter_kwargs``. Common keys: ``generator``.
 
@@ -506,9 +506,6 @@ class BaseTrainer(ABC):
         self.adapter.rollout()
         if reward_buffer is not None:
             reward_buffer.clear()
-
-        if trajectory_indices is None:
-            trajectory_indices = [-1]
 
         samples: List[BaseSample] = []
         data_iter = iter(self.dataloader)

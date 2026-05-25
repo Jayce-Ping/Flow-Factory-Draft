@@ -143,8 +143,8 @@ class GenEvalRewardModel(PointwiseRewardModel):
         super().__init__(config, accelerator)
 
         if self.device.type != "cuda":
-            logger.warning(
-                "GenEval is configured on CPU but requires CUDA for Mask2Former inference. "
+            raise ValueError(
+                "GenEval requires CUDA (Mask2Former uses CUDA-only ops). "
                 "Set `device: cuda` in your reward config."
             )
 
