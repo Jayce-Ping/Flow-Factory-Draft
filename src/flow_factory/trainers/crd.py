@@ -260,54 +260,6 @@ class CRDTrainer(BaseTrainer):
         else:
             raise ValueError(f"Unknown time_sampling_strategy: {time_sampling_strategy}. Available: {available}")
 
-    # ========================= Evaluation Loop =========================
-
-    def evaluate(self) -> None:
-        """Evaluation loop."""
-        if self.test_dataloader is None:
-            return
-
-        self.adapter.eval()
-        self.eval_reward_buffer.clear()
-
-        with torch.no_grad(), self.autocast(), self.adapter.use_ema_parameters():
-            all_samples: List[BaseSample] = []
-
-            for batch in tqdm(
-                self.test_dataloader,
-                desc='Evaluating',
-                disable=not self.show_progress_bar,
-            ):
-                generator = create_generator_by_prompt(batch['prompt'], self.training_args.seed)
-                inference_kwargs = {
-                    'compute_log_prob': False,
-                    'generator': generator,
-                    'trajectory_indices': None,  # No need to store trajectories during evaluation
-                    **self.eval_args,
-                }
-                inference_kwargs.update(**batch)
-                inference_kwargs = filter_kwargs(self.adapter.inference, **inference_kwargs)
-                samples = self.adapter.inference(**inference_kwargs)
-                all_samples.extend(samples)
-                self.eval_reward_buffer.add_samples(samples)
-
-            rewards = self.eval_reward_buffer.finalize(store_to_samples=True, split='pointwise')
-
-            # Gather and log rewards
-            rewards = {key: torch.as_tensor(value).to(self.accelerator.device) for key, value in rewards.items()}
-            gathered_rewards = {
-                key: self.accelerator.gather(value).cpu().numpy()
-                for key, value in rewards.items()
-            }
-
-            # Log statistics
-            if self.accelerator.is_main_process:
-                _log_data = {f'eval/reward_{key}_mean': np.mean(value) for key, value in gathered_rewards.items()}
-                _log_data.update({f'eval/reward_{key}_std': np.std(value) for key, value in gathered_rewards.items()})
-                _log_data['eval_samples'] = all_samples
-                self.log_data(_log_data, step=self.step)
-            self.accelerator.wait_for_everyone()
-
     # ========================= Advantage Computation =========================
 
     def compute_advantages(
@@ -432,34 +384,12 @@ class CRDTrainer(BaseTrainer):
     # ========================= Sampling =========================
 
     def sample(self) -> List[BaseSample]:
-        """Generate rollouts. Only keeps final latents (like NFT)."""
-        self.adapter.rollout()
-        self.reward_buffer.clear()
-        samples = []
-        data_iter = iter(self.dataloader)
-
-        with torch.no_grad(), self.autocast():
-            for _ in tqdm(
-                range(self.training_args.num_batches_per_epoch),
-                desc=f'Epoch {self.epoch} Sampling',
-                disable=not self.show_progress_bar,
-            ):
-                batch = next(data_iter)
-                sample_kwargs = {
-                    **self.training_args,
-                    'compute_log_prob': False,
-                    'trajectory_indices': [-1],  # Only keep final latents
-                    **batch,
-                }
-                sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
-                sample_batch = self.adapter.inference(**sample_kwargs)
-                # Deterministic D2H so reward_buffer sees CPU-resident samples
-                # (no-op when offload_samples_to_cpu is False).
-                self._maybe_offload_samples_to_cpu(sample_batch)
-                samples.extend(sample_batch)
-                self.reward_buffer.add_samples(sample_batch)
-
-        return samples
+        """Generate rollouts for CRD (final latents only)."""
+        return self.generate_samples(
+            reward_buffer=self.reward_buffer,
+            compute_log_prob=False,
+            trajectory_indices=[-1],
+        )
 
     # ========================= Forward Pass Helpers =========================
 

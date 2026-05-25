@@ -23,6 +23,7 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from dataclasses import dataclass
+from tqdm import tqdm
 from PIL import Image
 from diffusers.utils.outputs import BaseOutput
 from accelerate import Accelerator
@@ -36,6 +37,7 @@ from ..advantage import AdvantageProcessor
 from ..logger import load_logger, LogFormatter
 from ..samples import BaseSample
 from ..utils.logger_utils import setup_logger
+from ..utils.base import filter_kwargs, create_generator_by_prompt
 
 logger = setup_logger(__name__)
 
@@ -357,11 +359,6 @@ class BaseTrainer(ABC):
         """Update policy model"""
         pass
 
-    @abstractmethod
-    def evaluate(self):
-        """Evaluation for one epoch."""
-        pass
-
     def _maybe_offload_samples_to_cpu(self, samples: List[BaseSample]) -> None:
         """Move every sample's tensor fields to CPU when ``offload_samples_to_cpu`` is enabled.
 
@@ -386,6 +383,199 @@ class BaseTrainer(ABC):
             return
         for sample in samples:
             sample.to('cpu')
+
+    def sample_batch(
+        self,
+        batch: Dict[str, Any],
+        reward_buffer: Optional[RewardBuffer] = None,
+        **extra_inference_kwargs,
+    ) -> List[BaseSample]:
+        """Unified single-batch sampling pipeline.
+
+        Encapsulates the standard post-inference steps that every trainer
+        repeats in its sampling loop:
+
+            1. Merge training/eval args + batch + extra kwargs
+            2. ``filter_kwargs`` → ``adapter.inference()``
+            3. Inject dataset metadata into samples
+            4. Optionally offload samples to CPU
+            5. Optionally feed samples into a ``RewardBuffer``
+
+        Subclasses may override this method to customize the per-batch
+        pipeline (e.g. adding custom post-processing or using a different
+        inference call). The default implementation is sufficient for most
+        algorithms.
+
+        Args:
+            batch: DataLoader batch dict (contains prompt, metadata, etc.)
+            reward_buffer: If provided, ``add_samples()`` is called automatically.
+            **extra_inference_kwargs: Passed to ``adapter.inference()`` after
+                filtering. Common keys: ``compute_log_prob``,
+                ``trajectory_indices``, ``generator``.
+
+        Returns:
+            List of generated ``BaseSample`` instances with metadata injected.
+        """
+        sample_kwargs = {**self.training_args, **extra_inference_kwargs, **batch}
+        sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
+        sample_batch = self.adapter.inference(**sample_kwargs)
+
+        # Inject dataset metadata (e.g. geneval_metadata) into samples' extra_kwargs
+        self._inject_batch_metadata(sample_batch, batch)
+
+        # Offload to CPU before reward buffer sees them
+        self._maybe_offload_samples_to_cpu(sample_batch)
+
+        # Feed into reward buffer for async/sync reward computation
+        if reward_buffer is not None:
+            reward_buffer.add_samples(sample_batch)
+
+        return sample_batch
+
+    @staticmethod
+    def _inject_batch_metadata(
+        samples: List[BaseSample],
+        batch: Dict[str, Any],
+    ) -> None:
+        """Inject dataset metadata into generated samples' extra_kwargs.
+
+        When the dataset stores per-sample metadata (e.g. ``geneval_metadata``),
+        this method copies it from the dataloader batch into samples so that
+        downstream reward models can access it via ``sample.extra_kwargs``.
+
+        No-op when ``batch['metadata']`` is absent or empty.
+
+        Args:
+            samples: Generated samples from ``adapter.inference()``.
+            batch: The dataloader batch dict (may contain a ``metadata`` key).
+        """
+        metadata_list = batch.get('metadata')
+        if not metadata_list or not samples:
+            return
+        batch_size = len(metadata_list)
+        samples_per_prompt = len(samples) // batch_size
+        if samples_per_prompt == 0:
+            return
+        for i, sample in enumerate(samples):
+            batch_idx = i // samples_per_prompt
+            if batch_idx < batch_size:
+                meta = metadata_list[batch_idx]
+                if isinstance(meta, dict):
+                    sample.extra_kwargs.update(meta)
+
+    # ============================ Public Sampling API ============================
+
+    def generate_samples(
+        self,
+        reward_buffer: Optional[RewardBuffer] = None,
+        compute_log_prob: bool = False,
+        trajectory_indices: Optional[List[int]] = None,
+        **extra_inference_kwargs,
+    ) -> List[BaseSample]:
+        """Complete one epoch of sample generation.
+
+        Standard pipeline::
+
+            adapter.rollout() → clear buffer → loop(dataloader) {
+                sample_batch() → extend samples
+            }
+
+        Subclasses call this from their ``sample()`` method with
+        algorithm-specific parameters. For fully custom sampling logic
+        (e.g. paired generation), override this method directly.
+
+        Args:
+            reward_buffer: Buffer for reward computation. Cleared at start
+                and fed after each batch automatically.
+            compute_log_prob: Whether to store log-probabilities during inference.
+            trajectory_indices: Which timestep positions to store in each sample.
+                ``[-1]`` = final latent only (default for most algorithms).
+                Full list = store all (GRPO needs this for PPO ratio).
+                ``None`` is treated as ``[-1]``.
+            **extra_inference_kwargs: Forwarded to ``adapter.inference()``
+                after ``filter_kwargs``. Common keys: ``generator``.
+
+        Returns:
+            All generated samples for this epoch.
+        """
+        self.adapter.rollout()
+        if reward_buffer is not None:
+            reward_buffer.clear()
+
+        if trajectory_indices is None:
+            trajectory_indices = [-1]
+
+        samples: List[BaseSample] = []
+        data_iter = iter(self.dataloader)
+
+        with torch.no_grad(), self.autocast():
+            for _ in tqdm(
+                range(self.training_args.num_batches_per_epoch),
+                desc=f'Epoch {self.epoch} Sampling',
+                disable=not self.show_progress_bar,
+            ):
+                batch = next(data_iter)
+                sample_batch = self.sample_batch(
+                    batch,
+                    reward_buffer=reward_buffer,
+                    compute_log_prob=compute_log_prob,
+                    trajectory_indices=trajectory_indices,
+                    **extra_inference_kwargs,
+                )
+                samples.extend(sample_batch)
+
+        return samples
+
+    def evaluate(self) -> None:
+        """Evaluation loop: generate samples with eval settings and log reward statistics.
+
+        Uses EMA parameters (if available) and eval-specific config (resolution,
+        inference steps, guidance scale). Rewards are gathered across all ranks
+        and logged as mean/std.
+
+        Subclasses can override for custom evaluation logic. This method is a
+        no-op when ``self.test_dataloader`` is None.
+        """
+        if self.test_dataloader is None:
+            return
+
+        self.adapter.eval()
+        self.eval_reward_buffer.clear()
+
+        with torch.no_grad(), self.autocast(), self.adapter.use_ema_parameters():
+            all_samples: List[BaseSample] = []
+
+            for batch in tqdm(
+                self.test_dataloader,
+                desc='Evaluating',
+                disable=not self.show_progress_bar,
+            ):
+                generator = create_generator_by_prompt(batch['prompt'], self.training_args.seed)
+                samples = self.sample_batch(
+                    batch,
+                    reward_buffer=self.eval_reward_buffer,
+                    compute_log_prob=False,
+                    generator=generator,
+                    trajectory_indices=None,
+                    **self.eval_args,
+                )
+                all_samples.extend(samples)
+
+            rewards = self.eval_reward_buffer.finalize(store_to_samples=True, split='pointwise')
+
+            # Gather across ranks and log
+            rewards = {k: torch.as_tensor(v).to(self.accelerator.device) for k, v in rewards.items()}
+            gathered_rewards = {
+                k: self.accelerator.gather(v).cpu().numpy()
+                for k, v in rewards.items()
+            }
+
+            if self.accelerator.is_main_process:
+                _log_data = {f'eval/reward_{k}_mean': np.mean(v) for k, v in gathered_rewards.items()}
+                _log_data.update({f'eval/reward_{k}_std': np.std(v) for k, v in gathered_rewards.items()})
+                _log_data['eval_samples'] = all_samples
+                self.log_data(_log_data, step=self.step)
+            self.accelerator.wait_for_everyone()
 
     def save_checkpoint(self, save_directory: str, epoch: Optional[int] = None):
         """Save trainer state to a specific path."""

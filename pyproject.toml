@@ -73,6 +73,13 @@ nvidia = [
     "nvidia-ml-py",
 ]
 
+geneval = [
+    "openmim",
+    "mmengine",
+    "open_clip_torch",
+    "clip_benchmark",
+]
+
 all = [
     "flow-factory[deepspeed,quantization]",
 ]
