@@ -126,6 +126,10 @@ class CRDTrainingArguments(TrainingArguments):
 
     def __post_init__(self):
         super().__post_init__()
+        # Ensure float types for fields used in arithmetic (guard against YAML string parsing).
+        self.kl_beta = float(self.kl_beta)
+        self.time_shift = float(self.time_shift)
+
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
         if not self.num_train_timesteps or self.num_train_timesteps <= 0:
             self.num_train_timesteps = max(1, int(

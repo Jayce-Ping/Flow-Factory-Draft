@@ -112,7 +112,7 @@ class ModelArguments(ArgABC):
         },
     )
 
-    def __post_init__(self):        
+    def __post_init__(self):
         if isinstance(self.master_weight_dtype, str):
             self.master_weight_dtype = dtype_map[self.master_weight_dtype]
 
@@ -125,8 +125,12 @@ class ModelArguments(ArgABC):
             if self.target_modules not in ['all', 'default']:
                 self.target_modules = [self.target_modules]
 
+        # Ensure numeric types (guard against YAML string parsing).
+        self.lora_rank = int(self.lora_rank)
         if self.lora_alpha is None:
             self.lora_alpha = 2 * self.lora_rank
+        else:
+            self.lora_alpha = int(self.lora_alpha)
 
         self.resume_path = os.path.expanduser(self.resume_path) if self.resume_path is not None else None
 

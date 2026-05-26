@@ -98,6 +98,13 @@ class DGPOTrainingArguments(GRPOTrainingArguments):
 
     def __post_init__(self):
         super().__post_init__()
+        # Ensure float types for fields used in arithmetic (guard against YAML string parsing).
+        self.dpo_beta = float(self.dpo_beta)
+        self.kl_cfg = float(self.kl_cfg)
+        self.ema_ref_max_decay = float(self.ema_ref_max_decay)
+        self.ema_ref_ramp_rate = float(self.ema_ref_ramp_rate)
+        self.time_shift = float(self.time_shift)
+
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
         if not self.num_train_timesteps or self.num_train_timesteps <= 0:
             self.num_train_timesteps = max(1, int(self.num_inference_steps * (self.timestep_range[1] - self.timestep_range[0])))

@@ -81,6 +81,12 @@ class DPOTrainingArguments(TrainingArguments):
 
     def __post_init__(self):
         super().__post_init__()
+        # Ensure float types for fields used in arithmetic (guard against YAML string parsing).
+        self.beta = float(self.beta)
+        self.logit_mean = float(self.logit_mean)
+        self.logit_std = float(self.logit_std)
+        self.time_shift = float(self.time_shift)
+
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
         if not self.num_train_timesteps or self.num_train_timesteps <= 0:
             self.num_train_timesteps = max(1, int(
