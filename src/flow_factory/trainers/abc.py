@@ -31,7 +31,7 @@ from accelerate.utils import set_seed, ProjectConfiguration
 
 from ..hparams import *
 from ..models.abc import BaseAdapter
-from ..data_utils.loader import get_dataloader
+from ..data_utils.loader import get_dataloader, get_eval_dataloaders
 from ..rewards import load_reward_model, BaseRewardModel, MultiRewardLoader, RewardProcessor, RewardBuffer
 from ..advantage import AdvantageProcessor
 from ..logger import load_logger, LogFormatter
@@ -125,11 +125,19 @@ class BaseTrainer(ABC):
         # NOTE: This bug persists even with this context manager. DONOT USE ZeRO-3.
         # A possible solution: use DeepSpeed GatherParamter manually in the reward_model's `forward`.
 
+        # Collect eval dataset names for per-dataset reward routing
+        eval_dataset_names = (
+            [ed.name for ed in self.config.eval_datasets]
+            if self.config.eval_datasets
+            else []
+        )
+
         # Initialize all reward model instances
         self.reward_loader = MultiRewardLoader(
             reward_args=self.config.reward_args,
             accelerator=self.accelerator,
             eval_reward_args=self.config.eval_reward_args,
+            eval_dataset_names=eval_dataset_names,
         ).load()
         # Get training & eval reward models
         self.reward_models = self.reward_loader.get_training_reward_models()
@@ -162,6 +170,28 @@ class BaseTrainer(ABC):
             self.eval_reward_processor, self.training_args.group_size,
         )
 
+        # Per-eval-dataset reward processors and buffers (multi-eval mode)
+        self.eval_dataset_reward_processors: Dict[str, RewardProcessor] = {}
+        self.eval_dataset_reward_buffers: Dict[str, RewardBuffer] = {}
+
+        if self.config.eval_datasets:
+            for ed in self.config.eval_datasets:
+                ds_models = self.reward_loader.get_eval_dataset_reward_models(ed.name)
+                ds_configs = self.reward_loader.get_eval_dataset_reward_configs(ed.name)
+                if ds_models:
+                    ds_processor = RewardProcessor(
+                        accelerator=self.accelerator,
+                        reward_models=ds_models,
+                        reward_configs=ds_configs,
+                        tokenizer=self.adapter.tokenizer,
+                        group_on_same_rank=group_on_same_rank,
+                        verbose=self.log_args.verbose,
+                    )
+                    self.eval_dataset_reward_processors[ed.name] = ds_processor
+                    self.eval_dataset_reward_buffers[ed.name] = RewardBuffer(
+                        ds_processor, self.training_args.group_size,
+                    )
+
         # Initialize advantage processor
         self.advantage_processor = AdvantageProcessor(
             accelerator=self.accelerator,
@@ -188,6 +218,20 @@ class BaseTrainer(ABC):
             accelerator=self.accelerator,
             preprocess_func=self.adapter.preprocess_func,
         )
+
+        # Multi-eval-dataset support: load additional eval dataloaders
+        if self.config.eval_datasets:
+            self.eval_dataloaders: Dict[str, DataLoader] = get_eval_dataloaders(
+                eval_datasets=self.config.eval_datasets,
+                config=self.config,
+                accelerator=self.accelerator,
+                preprocess_func=self.adapter.preprocess_func,
+            )
+            # In multi-eval mode, disable the legacy single test_dataloader
+            test_dataloader = None
+        else:
+            self.eval_dataloaders = {}
+
         # Offload text-encoder after dataloader encoding
         self.adapter.off_load_components(
             components=self.adapter.preprocessing_modules,
@@ -249,8 +293,8 @@ class BaseTrainer(ABC):
         # Dynamically get all trainable modules from target_module_map
         trainable_module_names = list(self.adapter.target_module_map.keys())
         trainable_modules = [
-            getattr(self.adapter, name) 
-            for name in trainable_module_names 
+            getattr(self.adapter, name)
+            for name in trainable_module_names
             if hasattr(self.adapter, name) and getattr(self.adapter, name) is not None
         ]
         # Prepare trainable modules + optimizer + test_dataloader
@@ -268,9 +312,16 @@ class BaseTrainer(ABC):
         if self.test_dataloader is not None:
             self.test_dataloader = prepared[len(trainable_modules) + 1]
 
+        # Prepare multi-eval dataloaders
+        if self.eval_dataloaders:
+            for name in list(self.eval_dataloaders.keys()):
+                self.eval_dataloaders[name] = self.accelerator.prepare(
+                    self.eval_dataloaders[name]
+                )
+
         # Load inference modules, excluding already-prepared ones
         self._load_inference_components(trainable_module_names)
-        
+
         # Initialize reward model
         self._init_reward_model()
 
@@ -529,18 +580,22 @@ class BaseTrainer(ABC):
         return samples
 
     def evaluate(self) -> None:
-        """Evaluation loop: generate samples with eval settings and log reward statistics.
+        """Evaluation loop: supports both single-dataset (legacy) and multi-dataset modes.
 
         Uses EMA parameters (if available) and eval-specific config (resolution,
         inference steps, guidance scale). Rewards are gathered across all ranks
         and logged as mean/std.
 
-        Subclasses can override for custom evaluation logic. This method is a
-        no-op when ``self.test_dataloader`` is None.
+        Dispatches to ``_evaluate_multi_dataset()`` when ``eval_dataloaders`` is
+        populated, otherwise falls back to the legacy single-test-dataloader path.
         """
-        if self.test_dataloader is None:
-            return
+        if self.eval_dataloaders:
+            self._evaluate_multi_dataset()
+        elif self.test_dataloader is not None:
+            self._evaluate_single_dataset()
 
+    def _evaluate_single_dataset(self) -> None:
+        """Legacy single-dataset evaluation (unchanged behavior)."""
         self.adapter.eval()
         self.eval_reward_buffer.clear()
 
@@ -579,6 +634,69 @@ class BaseTrainer(ABC):
                 self.log_data(_log_data, step=self.step)
             self.accelerator.wait_for_everyone()
 
+    def _evaluate_multi_dataset(self) -> None:
+        """Evaluate across multiple eval datasets, each with its own reward set.
+
+        For each eval dataset:
+        1. Generate samples using the dataset's DataLoader.
+        2. Compute rewards via the dataset-specific RewardBuffer.
+        3. Gather rewards across ranks.
+        4. Log metrics under ``eval/{dataset_name}/reward_{name}_{stat}``.
+        """
+        self.adapter.eval()
+        all_log_data: Dict[str, Any] = {}
+
+        with torch.no_grad(), self.autocast(), self.adapter.use_ema_parameters():
+            for dataset_name, dataloader in self.eval_dataloaders.items():
+                buffer = self.eval_dataset_reward_buffers.get(dataset_name)
+                if buffer is None:
+                    logger.warning(
+                        f"No reward buffer for eval dataset '{dataset_name}', skipping."
+                    )
+                    continue
+                buffer.clear()
+                all_samples: List[BaseSample] = []
+
+                for batch in tqdm(
+                    dataloader,
+                    desc=f'Eval/{dataset_name}',
+                    disable=not self.show_progress_bar,
+                ):
+                    generator = create_generator_by_prompt(
+                        batch['prompt'], self.training_args.seed
+                    )
+                    samples = self.sample_batch(
+                        batch,
+                        reward_buffer=buffer,
+                        compute_log_prob=False,
+                        generator=generator,
+                        trajectory_indices=None,
+                        **self.eval_args,
+                    )
+                    all_samples.extend(samples)
+
+                rewards = buffer.finalize(store_to_samples=True, split='pointwise')
+
+                # Gather across ranks
+                rewards_tensors = {
+                    k: torch.as_tensor(v).to(self.accelerator.device)
+                    for k, v in rewards.items()
+                }
+                gathered_rewards = {
+                    k: self.accelerator.gather(v).cpu().numpy()
+                    for k, v in rewards_tensors.items()
+                }
+
+                if self.accelerator.is_main_process:
+                    for k, v in gathered_rewards.items():
+                        all_log_data[f'eval/{dataset_name}/reward_{k}_mean'] = np.mean(v)
+                        all_log_data[f'eval/{dataset_name}/reward_{k}_std'] = np.std(v)
+                    all_log_data[f'eval/{dataset_name}/samples'] = all_samples
+
+        if self.accelerator.is_main_process and all_log_data:
+            self.log_data(all_log_data, step=self.step)
+        self.accelerator.wait_for_everyone()
+
     def save_checkpoint(self, save_directory: str, epoch: Optional[int] = None):
         """Save trainer state to a specific path."""
         if epoch is not None:
@@ -616,5 +734,10 @@ class BaseTrainer(ABC):
             getattr(self, 'reward_buffer', None),
             getattr(self, 'eval_reward_buffer', None),
         ):
+            if buf is not None:
+                buf.shutdown(wait=False, cancel_futures=True)
+
+        # Shutdown multi-eval-dataset reward buffers
+        for buf in getattr(self, 'eval_dataset_reward_buffers', {}).values():
             if buf is not None:
                 buf.shutdown(wait=False, cancel_futures=True)

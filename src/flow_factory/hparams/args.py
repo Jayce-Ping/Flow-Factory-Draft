@@ -20,7 +20,7 @@ Supports loading from YAML files with nested structure.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field, fields
-from typing import Any, Literal, Optional
+from typing import Any, List, Literal, Optional
 import yaml
 from datetime import datetime
 import math
@@ -31,6 +31,7 @@ from .model_args import ModelArguments
 from .scheduler_args import SchedulerArguments
 from .training_args import TrainingArguments, EvaluationArguments, get_training_args_class
 from .reward_args import RewardArguments, MultiRewardArguments
+from .eval_dataset_args import EvalDatasetArguments
 from .log_args import LogArguments
 from ..utils.logger_utils import setup_logger
 from ..utils.dist import get_world_size
@@ -122,16 +123,61 @@ class Arguments(ArgABC):
         default=None,
         metadata={"help": "Arguments for multiple evaluation reward configurations."},
     )
+    eval_datasets: Optional[List[EvalDatasetArguments]] = field(
+        default=None,
+        metadata={
+            "help": "List of evaluation dataset configurations. "
+                    "When provided, enables multi-eval-dataset mode where each dataset "
+                    "is independently preprocessed and evaluated with its applicable rewards "
+                    "(determined by the `datasets` field in eval_rewards entries)."
+        },
+    )
 
     def __post_init__(self):
         if self.log_args.run_name is None:
             time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.log_args.run_name = f"{self.model_args.model_type}_{self.model_args.finetune_type}_{self.training_args.trainer_type}_{time_stamp}"
 
+        self._validate_eval_datasets()
         self._resolve_scheduler_sde_defaults()
         self._resolve_sampler_type()
         self._align_batch_geometry()
         self._adjust_gradient_accumulation()
+
+    def _validate_eval_datasets(self) -> None:
+        """Validate eval_datasets configuration and reward routing.
+
+        Checks:
+        - No duplicate eval dataset names.
+        - All ``datasets`` references in ``eval_reward_args`` point to declared
+          eval dataset names.
+        - Warns if ``eval_datasets`` is set alongside legacy ``eval_reward_args``
+          without ``datasets`` routing (ambiguous).
+        """
+        if not self.eval_datasets:
+            return
+
+        # Check for duplicate names
+        names = [ed.name for ed in self.eval_datasets]
+        if len(names) != len(set(names)):
+            dupes = [n for n in names if names.count(n) > 1]
+            raise ValueError(
+                f"Duplicate eval_datasets names detected: {sorted(set(dupes))}. "
+                "Each eval dataset must have a unique name."
+            )
+
+        # Validate reward → dataset routing
+        if self.eval_reward_args:
+            valid_names = set(names)
+            for reward_cfg in self.eval_reward_args.reward_configs:
+                if reward_cfg.datasets is not None:
+                    unknown = set(reward_cfg.datasets) - valid_names
+                    if unknown:
+                        raise ValueError(
+                            f"eval_rewards entry '{reward_cfg.name}' references unknown "
+                            f"eval dataset(s): {sorted(unknown)}. "
+                            f"Valid eval dataset names are: {sorted(valid_names)}."
+                        )
 
     def _resolve_sampler_type(self) -> None:
         """Choose the distributed sampler strategy.
@@ -464,7 +510,7 @@ class Arguments(ArgABC):
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         result = {}
-        
+
         for f in fields(self):
             value = getattr(self, f.name)
             if value is None:
@@ -473,6 +519,9 @@ class Arguments(ArgABC):
                 # Remove '_args' suffix for nested configs
                 key = f.name.replace('_args', '')
                 result[key] = value.to_dict()
+            elif isinstance(value, list) and value and isinstance(value[0], ArgABC):
+                # List of ArgABC instances (e.g. eval_datasets)
+                result[f.name] = [item.to_dict() for item in value]
             else:
                 result[f.name] = value
 
@@ -501,20 +550,34 @@ class Arguments(ArgABC):
             'eval_rewards': ('eval_reward_args', MultiRewardArguments),
         }
 
+        # Special list-of-dataclass keys (not single ArgABC instances)
+        list_keys = {
+            'eval_datasets': ('eval_datasets', EvalDatasetArguments),
+        }
+
         # 3. Build init kwargs
         init_kwargs = {}
         extras = {}
-        
+
         valid_field_names = {f.name for f in fields(cls)}
 
         for k, v in args_dict.items():
             if k in nested_map:
                 arg_name, arg_cls = nested_map[k]
                 init_kwargs[arg_name] = arg_cls.from_dict(v)
-            
+
+            elif k in list_keys:
+                arg_name, item_cls = list_keys[k]
+                if isinstance(v, list):
+                    init_kwargs[arg_name] = [item_cls.from_dict(item) for item in v]
+                else:
+                    raise ValueError(
+                        f"Expected a list for '{k}', got {type(v).__name__}."
+                    )
+
             elif k in valid_field_names:
                 init_kwargs[k] = v
-            
+
             else:
                 extras[k] = v
 

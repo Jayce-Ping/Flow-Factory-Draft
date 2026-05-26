@@ -16,13 +16,14 @@
 import json
 import os
 import shutil
-from typing import Literal, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
 
 from ..data_utils.dataset import PreprocessCallable
 from ..hparams import Arguments
+from ..hparams.eval_dataset_args import EvalDatasetArguments
 from ..utils.base import filter_kwargs
 from ..utils.logger_utils import setup_logger
 from .dataset import GeneralDataset
@@ -304,3 +305,102 @@ def get_dataloader(
         )
 
     return dataloader, test_dataloader
+
+
+def get_eval_dataloaders(
+    eval_datasets: List[EvalDatasetArguments],
+    config: Arguments,
+    accelerator: Accelerator,
+    preprocess_func: Optional[PreprocessCallable] = None,
+) -> Dict[str, DataLoader]:
+    """
+    Create DataLoaders for multiple evaluation datasets.
+
+    Each dataset is independently preprocessed and cached using its own
+    ``dataset_dir`` and a unique cache fingerprint (includes the eval dataset
+    name to prevent collisions).
+
+    Args:
+        eval_datasets: List of evaluation dataset configurations.
+        config: Full configuration object (for model info, data args, eval args).
+        accelerator: Accelerator for distributed preprocessing.
+        preprocess_func: Model adapter's preprocessing function.
+
+    Returns:
+        Dict mapping eval dataset name → DataLoader, ready for evaluation.
+    """
+    data_args = config.data_args
+    eval_args = config.eval_args
+
+    enable_distributed = accelerator.num_processes > 1 and data_args.enable_preprocess
+    preprocess_parallelism = getattr(data_args, 'preprocess_parallelism', 'local')
+
+    eval_dataloaders: Dict[str, DataLoader] = {}
+
+    for ed in eval_datasets:
+        # Check that the split file exists
+        if not GeneralDataset.check_exists(ed.dataset_dir, ed.split):
+            logger.warning(
+                f"Eval dataset '{ed.name}': split '{ed.split}' not found in "
+                f"'{ed.dataset_dir}', skipping."
+            )
+            continue
+
+        # Build base kwargs for this eval dataset
+        base_kwargs = {
+            "dataset_dir": ed.dataset_dir,
+            "cache_dir": data_args.cache_dir,
+            "preprocessing_batch_size": data_args.preprocessing_batch_size,
+            "enable_preprocess": data_args.enable_preprocess,
+            "force_reprocess": data_args.force_reprocess,
+            "preprocess_func": preprocess_func,
+            "extra_hash_strs": [
+                config.model_args.model_type,
+                config.model_args.model_name_or_path,
+                f"eval_{ed.name}",  # Unique cache per eval dataset
+            ],
+        }
+
+        # Apply per-dataset overrides (fall back to data_args defaults)
+        if ed.image_dir is not None:
+            base_kwargs["image_dir"] = ed.image_dir
+        if ed.video_dir is not None:
+            base_kwargs["video_dir"] = ed.video_dir
+        if ed.audio_dir is not None:
+            base_kwargs["audio_dir"] = ed.audio_dir
+        if ed.max_dataset_size is not None:
+            base_kwargs["max_dataset_size"] = ed.max_dataset_size
+
+        # Build preprocess kwargs (eval-specific settings)
+        if preprocess_func:
+            eval_preprocess_kwargs = (
+                filter_kwargs(preprocess_func, **data_args) if preprocess_func else {}
+            ).copy()
+            eval_preprocess_kwargs.update(
+                {
+                    'is_train': False,
+                    **eval_args,
+                }
+            )
+            eval_preprocess_kwargs = filter_kwargs(preprocess_func, **eval_preprocess_kwargs)
+            base_kwargs["preprocess_kwargs"] = eval_preprocess_kwargs
+
+        # Create/load dataset
+        dataset = _create_or_load_dataset(
+            split=ed.split,
+            accelerator=accelerator,
+            base_kwargs=base_kwargs,
+            enable_distributed=enable_distributed,
+            preprocess_parallelism=preprocess_parallelism,
+        )
+
+        # Create DataLoader
+        eval_dataloaders[ed.name] = DataLoader(
+            dataset,
+            batch_size=eval_args.per_device_batch_size,
+            shuffle=False,
+            num_workers=data_args.dataloader_num_workers,
+            collate_fn=GeneralDataset.collate_fn,
+        )
+
+    return eval_dataloaders

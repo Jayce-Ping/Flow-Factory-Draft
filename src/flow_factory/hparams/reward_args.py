@@ -127,6 +127,15 @@ class RewardArguments(ArgABC):
                           "Set >1 for IO-bound models (e.g. API calls) to enable concurrent requests."},
     )
 
+    datasets: Optional[List[str]] = field(
+        default=None,
+        metadata={
+            "help": "List of eval dataset names this reward applies to. "
+                    "When None (default), the reward applies to ALL eval datasets. "
+                    "Only relevant for eval_rewards; ignored for training rewards."
+        },
+    )
+
     def __post_init__(self):
         if isinstance(self.dtype, str):
             self.dtype = dtype_map[self.dtype]
