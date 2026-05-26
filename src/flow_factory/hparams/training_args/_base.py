@@ -298,6 +298,9 @@ class TrainingArguments(ArgABC):
         self.unique_sample_num_per_epoch = int(self.unique_sample_num_per_epoch)
         self.group_size = int(self.group_size)
         self.num_inference_steps = int(self.num_inference_steps)
+        self.gradient_step_per_epoch = int(self.gradient_step_per_epoch)
+        self.num_inner_epochs = int(self.num_inner_epochs)
+        self.ema_update_interval = int(self.ema_update_interval)
 
         sample_num_per_iteration = world_size * self.per_device_batch_size
         self.num_batches_per_epoch = (

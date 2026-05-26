@@ -104,6 +104,8 @@ class DGPOTrainingArguments(GRPOTrainingArguments):
         self.ema_ref_max_decay = float(self.ema_ref_max_decay)
         self.ema_ref_ramp_rate = float(self.ema_ref_ramp_rate)
         self.time_shift = float(self.time_shift)
+        self.num_train_timesteps = int(self.num_train_timesteps)
+        self.switch_ema_ref = int(self.switch_ema_ref)
 
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
         if not self.num_train_timesteps or self.num_train_timesteps <= 0:

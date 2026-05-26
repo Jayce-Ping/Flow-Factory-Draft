@@ -90,6 +90,7 @@ class NFTTrainingArguments(TrainingArguments):
         self.nft_beta = float(self.nft_beta)
         self.kl_beta = float(self.kl_beta)
         self.time_shift = float(self.time_shift)
+        self.num_train_timesteps = int(self.num_train_timesteps)
 
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
 
