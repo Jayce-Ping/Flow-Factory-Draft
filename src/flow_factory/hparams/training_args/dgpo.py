@@ -18,17 +18,38 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, Union, Tuple
 
-from .grpo import GRPOTrainingArguments
-from ._base import _standardize_timestep_range
+from ._base import TrainingArguments, _standardize_clip_range, _standardize_timestep_range
 
 
 @dataclass
-class DGPOTrainingArguments(GRPOTrainingArguments):
+class DGPOTrainingArguments(TrainingArguments):
     r"""Training arguments for DGPO (Direct Group Preference Optimization).
 
-    Extends GRPO with group-level DPO loss, shared noise, DSM clipping,
+    Combines group-level DPO loss with PPO-style clipping, shared noise,
     and per-timestep training controls.
     """
+
+    # --- Group-wise advantage & clipping (same semantics as GRPO) ---
+    advantage_aggregation: Literal['sum', 'gdpo'] = field(
+        default='gdpo',
+        metadata={"help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo']."},
+    )
+    clip_range: tuple[float, float] = field(
+        default=(-1e-4, 1e-4),
+        metadata={"help": "Clipping range for PPO/DSM ratio."},
+    )
+    adv_clip_range: tuple[float, float] = field(
+        default=(-5.0, 5.0),
+        metadata={"help": "Clipping range for advantages."},
+    )
+    kl_type: Literal['v-based', 'x-based'] = field(
+        default='v-based',
+        metadata={"help": "Type of KL divergence. DGPO defaults to 'v-based'."},
+    )
+    kl_beta: float = field(
+        default=0,
+        metadata={"help": "KL penalty beta. 0 to disable."},
+    )
 
     # DGPO core
     dpo_beta: float = field(
@@ -98,6 +119,11 @@ class DGPOTrainingArguments(GRPOTrainingArguments):
 
     def __post_init__(self):
         super().__post_init__()
+        # Guard kl_beta against scientific-notation strings (e.g. "1e-3").
+        self.kl_beta = float(self.kl_beta)
+        self.clip_range = _standardize_clip_range(self.clip_range, 'clip_range')
+        self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, 'adv_clip_range')
+
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
         if not self.num_train_timesteps or self.num_train_timesteps <= 0:
             self.num_train_timesteps = max(1, int(self.num_inference_steps * (self.timestep_range[1] - self.timestep_range[0])))
