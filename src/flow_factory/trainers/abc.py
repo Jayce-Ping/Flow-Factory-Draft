@@ -173,8 +173,10 @@ class BaseTrainer(ABC):
         # Per-eval-dataset reward processors and buffers (multi-eval mode)
         self.eval_dataset_reward_processors: Dict[str, RewardProcessor] = {}
         self.eval_dataset_reward_buffers: Dict[str, RewardBuffer] = {}
+        self._eval_dataset_configs: Dict[str, Any] = {}
 
         if self.config.eval_datasets:
+            self._eval_dataset_configs = {ed.name: ed for ed in self.config.eval_datasets}
             for ed in self.config.eval_datasets:
                 ds_models = self.reward_loader.get_eval_dataset_reward_models(ed.name)
                 ds_configs = self.reward_loader.get_eval_dataset_reward_configs(ed.name)
@@ -643,14 +645,11 @@ class BaseTrainer(ABC):
         2. Compute rewards via the dataset-specific RewardBuffer.
         3. Gather rewards across ranks.
         4. Log metrics under ``eval/{dataset_name}/reward_{name}_{stat}``.
+
+        Logs are flushed per-dataset to avoid holding all generated samples
+        in memory simultaneously.
         """
         self.adapter.eval()
-        all_log_data: Dict[str, Any] = {}
-
-        # Build name → EvalDatasetArguments lookup
-        eval_dataset_configs = {
-            ed.name: ed for ed in self.config.eval_datasets
-        }
 
         with torch.no_grad(), self.autocast(), self.adapter.use_ema_parameters():
             for dataset_name, dataloader in self.eval_dataloaders.items():
@@ -664,7 +663,7 @@ class BaseTrainer(ABC):
                 all_samples: List[BaseSample] = []
 
                 # Merge per-dataset eval overrides with shared eval_args
-                ed_config = eval_dataset_configs[dataset_name]
+                ed_config = self._eval_dataset_configs[dataset_name]
                 eval_kwargs = ed_config.get_merged_eval_kwargs(self.eval_args)
 
                 for batch in tqdm(
@@ -697,14 +696,15 @@ class BaseTrainer(ABC):
                     for k, v in rewards_tensors.items()
                 }
 
+                # Log per-dataset immediately to avoid accumulating all samples in memory
                 if self.accelerator.is_main_process:
+                    log_data: Dict[str, Any] = {}
                     for k, v in gathered_rewards.items():
-                        all_log_data[f'eval/{dataset_name}/reward_{k}_mean'] = np.mean(v)
-                        all_log_data[f'eval/{dataset_name}/reward_{k}_std'] = np.std(v)
-                    all_log_data[f'eval/{dataset_name}/samples'] = all_samples
+                        log_data[f'eval/{dataset_name}/reward_{k}_mean'] = np.mean(v)
+                        log_data[f'eval/{dataset_name}/reward_{k}_std'] = np.std(v)
+                    log_data[f'eval/{dataset_name}/samples'] = all_samples
+                    self.log_data(log_data, step=self.step)
 
-        if self.accelerator.is_main_process and all_log_data:
-            self.log_data(all_log_data, step=self.step)
         self.accelerator.wait_for_everyone()
 
     def save_checkpoint(self, save_directory: str, epoch: Optional[int] = None):

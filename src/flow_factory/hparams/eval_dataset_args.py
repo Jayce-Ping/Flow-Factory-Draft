@@ -22,7 +22,7 @@ and optional per-dataset eval generation overrides.
 from __future__ import annotations
 import yaml
 from dataclasses import dataclass, field
-from typing import Any, Optional, List, Tuple, Union
+from typing import Any, ClassVar, Optional, List, Tuple, Union
 
 from .abc import ArgABC
 
@@ -111,6 +111,9 @@ class EvalDatasetArguments(ArgABC):
         metadata={"help": "Override guidance scale. None inherits from eval section."},
     )
 
+    # Fields that can override shared EvaluationArguments when not None
+    _EVAL_OVERRIDE_FIELDS: ClassVar[tuple] = ('num_inference_steps', 'guidance_scale')
+
     def get_merged_eval_kwargs(self, base_eval_args) -> dict[str, Any]:
         """
         Merge per-dataset overrides with shared EvaluationArguments.
@@ -128,25 +131,23 @@ class EvalDatasetArguments(ArgABC):
         # Start with all shared eval args
         merged = dict(base_eval_args)
 
-        # Override with per-dataset values (only non-None)
+        # Override scalar fields (data-driven: add new fields to _EVAL_OVERRIDE_FIELDS)
+        for name in self._EVAL_OVERRIDE_FIELDS:
+            val = getattr(self, name, None)
+            if val is not None:
+                merged[name] = val
+
+        # Resolution requires special handling (expands to height/width)
         if self.resolution is not None:
             merged['resolution'] = self.resolution
-            # Resolve height/width from resolution
             if isinstance(self.resolution, int):
                 merged['height'] = self.resolution
                 merged['width'] = self.resolution
             elif isinstance(self.resolution, (list, tuple)) and len(self.resolution) >= 2:
                 merged['height'] = self.resolution[0]
                 merged['width'] = self.resolution[1]
-        if self.num_inference_steps is not None:
-            merged['num_inference_steps'] = self.num_inference_steps
-        if self.guidance_scale is not None:
-            merged['guidance_scale'] = self.guidance_scale
 
         return merged
-
-    def to_dict(self) -> dict[str, Any]:
-        return super().to_dict()
 
     def __str__(self) -> str:
         """Pretty print configuration as YAML."""
