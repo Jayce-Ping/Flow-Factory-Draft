@@ -638,13 +638,19 @@ class BaseTrainer(ABC):
         """Evaluate across multiple eval datasets, each with its own reward set.
 
         For each eval dataset:
-        1. Generate samples using the dataset's DataLoader.
+        1. Generate samples using the dataset's DataLoader with per-dataset
+           eval overrides (resolution, guidance_scale, num_inference_steps).
         2. Compute rewards via the dataset-specific RewardBuffer.
         3. Gather rewards across ranks.
         4. Log metrics under ``eval/{dataset_name}/reward_{name}_{stat}``.
         """
         self.adapter.eval()
         all_log_data: Dict[str, Any] = {}
+
+        # Build name → EvalDatasetArguments lookup
+        eval_dataset_configs = {
+            ed.name: ed for ed in self.config.eval_datasets
+        }
 
         with torch.no_grad(), self.autocast(), self.adapter.use_ema_parameters():
             for dataset_name, dataloader in self.eval_dataloaders.items():
@@ -656,6 +662,10 @@ class BaseTrainer(ABC):
                     continue
                 buffer.clear()
                 all_samples: List[BaseSample] = []
+
+                # Merge per-dataset eval overrides with shared eval_args
+                ed_config = eval_dataset_configs[dataset_name]
+                eval_kwargs = ed_config.get_merged_eval_kwargs(self.eval_args)
 
                 for batch in tqdm(
                     dataloader,
@@ -671,7 +681,7 @@ class BaseTrainer(ABC):
                         compute_log_prob=False,
                         generator=generator,
                         trajectory_indices=None,
-                        **self.eval_args,
+                        **eval_kwargs,
                     )
                     all_samples.extend(samples)
 
