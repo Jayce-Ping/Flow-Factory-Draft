@@ -58,7 +58,7 @@ class GRPOTrainingArguments(TrainingArguments):
 
     def __post_init__(self):
         super().__post_init__()
-        # Ensure float types for fields used in arithmetic (guard against YAML string parsing).
+        # Guard kl_beta against scientific-notation strings (e.g. "1e-3" from CLI overrides).
         self.kl_beta = float(self.kl_beta)
         self.clip_range = _standardize_clip_range(self.clip_range, 'clip_range')
         self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, 'adv_clip_range')

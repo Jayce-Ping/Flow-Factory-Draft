@@ -66,28 +66,28 @@ class EvaluationArguments(ArgABC):
             self.resolution = (512, 512)
         elif isinstance(self.resolution, (list, tuple)):
             if len(self.resolution) == 1:
-                self.resolution = (int(self.resolution[0]), int(self.resolution[0]))
+                self.resolution = (self.resolution[0], self.resolution[0])
             elif len(self.resolution) > 2:
                 logger.warning(f"`resolution` has {len(self.resolution)} elements, only using the first two: ({self.resolution[0]}, {self.resolution[1]}).")
-                self.resolution = (int(self.resolution[0]), int(self.resolution[1]))
+                self.resolution = (self.resolution[0], self.resolution[1])
             else:  # len == 2
-                self.resolution = (int(self.resolution[0]), int(self.resolution[1]))
+                self.resolution = (self.resolution[0], self.resolution[1])
         else:  # int
-            self.resolution = (int(self.resolution), int(self.resolution))
+            self.resolution = (self.resolution, self.resolution)
 
         # height/width override
-        if self.height is not None and self.resolution[0] != int(self.height):
+        if self.height is not None and self.resolution[0] != self.height:
             logger.warning(
                 f"Both `resolution={self.resolution}` and `height={self.height}` are set. "
                 f"Using height to override: ({self.height}, {self.resolution[1]})."
             )
-            self.resolution = (int(self.height), self.resolution[1])
-        if self.width is not None and self.resolution[1] != int(self.width):
+            self.resolution = (self.height, self.resolution[1])
+        if self.width is not None and self.resolution[1] != self.width:
             logger.warning(
                 f"Both `resolution={self.resolution}` and `width={self.width}` are set. "
                 f"Using width to override: ({self.resolution[0]}, {self.width})."
             )
-            self.resolution = (self.resolution[0], int(self.width))
+            self.resolution = (self.resolution[0], self.width)
 
         # Final assignment
         self.height, self.width = self.resolution
@@ -258,27 +258,27 @@ class TrainingArguments(ArgABC):
             self.resolution = (512, 512)
         elif isinstance(self.resolution, (list, tuple)):
             if len(self.resolution) == 1:
-                self.resolution = (int(self.resolution[0]), int(self.resolution[0]))
+                self.resolution = (self.resolution[0], self.resolution[0])
             elif len(self.resolution) > 2:
                 logger.warning(f"`resolution` has {len(self.resolution)} elements, only using the first two: ({self.resolution[0]}, {self.resolution[1]}).")
-                self.resolution = (int(self.resolution[0]), int(self.resolution[1]))
+                self.resolution = (self.resolution[0], self.resolution[1])
             else:
-                self.resolution = (int(self.resolution[0]), int(self.resolution[1]))
+                self.resolution = (self.resolution[0], self.resolution[1])
         else:
-            self.resolution = (int(self.resolution), int(self.resolution))
+            self.resolution = (self.resolution, self.resolution)
 
-        if self.height is not None and self.resolution[0] != int(self.height):
+        if self.height is not None and self.resolution[0] != self.height:
             logger.warning(
                 f"Both `resolution={self.resolution}` and `height={self.height}` are set. "
                 f"Using height to override: ({self.height}, {self.resolution[1]})."
             )
-            self.resolution = (int(self.height), self.resolution[1])
-        if self.width is not None and self.resolution[1] != int(self.width):
+            self.resolution = (self.height, self.resolution[1])
+        if self.width is not None and self.resolution[1] != self.width:
             logger.warning(
                 f"Both `resolution={self.resolution}` and `width={self.width}` are set. "
                 f"Using width to override: ({self.resolution[0]}, {self.width})."
             )
-            self.resolution = (self.resolution[0], int(self.width))
+            self.resolution = (self.resolution[0], self.width)
 
         self.height, self.width = self.resolution
 
@@ -292,15 +292,6 @@ class TrainingArguments(ArgABC):
         # overwritten by _align_batch_geometry() before any consumer reads them.
         world_size = get_world_size()
         logger.info(f"World Size: {world_size}")
-
-        # Ensure numeric types for fields used in arithmetic below.
-        self.per_device_batch_size = int(self.per_device_batch_size)
-        self.unique_sample_num_per_epoch = int(self.unique_sample_num_per_epoch)
-        self.group_size = int(self.group_size)
-        self.num_inference_steps = int(self.num_inference_steps)
-        self.gradient_step_per_epoch = int(self.gradient_step_per_epoch)
-        self.num_inner_epochs = int(self.num_inner_epochs)
-        self.ema_update_interval = int(self.ema_update_interval)
 
         sample_num_per_iteration = world_size * self.per_device_batch_size
         self.num_batches_per_epoch = (
@@ -322,14 +313,12 @@ class TrainingArguments(ArgABC):
                 )
 
         # --- Optimizer defaults ---
-        # Explicit float() casts defend against YAML delivering scientific-notation
-        # values (e.g. 1e-4, 1e-8) as strings in certain loaders/edge cases.
+        # Explicit float() casts guard against scientific-notation values (e.g. 1e-4)
+        # arriving as strings from non-standard config sources or future CLI overrides.
         self.adam_betas = (float(self.adam_betas[0]), float(self.adam_betas[1]))
         self.adam_weight_decay = float(self.adam_weight_decay)
         self.adam_epsilon = float(self.adam_epsilon)
         self.max_grad_norm = float(self.max_grad_norm)
-        self.ema_decay = float(self.ema_decay)
-        self.guidance_scale = float(self.guidance_scale)
 
         if self.learning_rate is None:
             if 'lora' in self.trainer_type.lower():

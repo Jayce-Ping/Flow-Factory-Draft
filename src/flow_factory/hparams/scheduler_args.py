@@ -57,14 +57,6 @@ class SchedulerArguments(ArgABC):
         available_dynamics = ["Flow-SDE", 'Dance-SDE', 'CPS', 'ODE']
         assert self.dynamics_type in available_dynamics, f"Invalid dynamics type {self.dynamics_type}. Must be one of {available_dynamics}."
 
-        # Ensure numeric types (guard against YAML string parsing).
-        self.noise_level = float(self.noise_level)
-        self.seed = int(self.seed)
-        if self.num_sde_steps is not None:
-            self.num_sde_steps = int(self.num_sde_steps)
-        if self.sde_steps is not None:
-            self.sde_steps = [int(s) for s in self.sde_steps]
-
         # ODE has no stochastic steps — zero out SDE-related fields
         if self.dynamics_type == 'ODE':
             self.sde_steps = []

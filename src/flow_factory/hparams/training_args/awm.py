@@ -98,12 +98,8 @@ class AWMTrainingArguments(TrainingArguments):
     def __post_init__(self):
         super().__post_init__()
 
-        # Ensure float types for fields used in arithmetic (guard against YAML string parsing).
-        self.ema_kl_beta = float(self.ema_kl_beta)
+        # Guard kl_beta against scientific-notation strings (e.g. "1e-3" from CLI overrides).
         self.kl_beta = float(self.kl_beta)
-        self.ghuber_power = float(self.ghuber_power)
-        self.time_shift = float(self.time_shift)
-        self.num_train_timesteps = int(self.num_train_timesteps)
 
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
 
