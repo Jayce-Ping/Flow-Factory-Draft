@@ -134,10 +134,63 @@ class Arguments(ArgABC):
         # unknown-name check is against the user's raw input, not the
         # expanded list) and BEFORE any consumer reads the field.
         self._resolve_reward_dataset_routing()
+        # Stamp every `data.datasets[*]` entry with a stable monotonic
+        # `source_id` matching its list position. Read by the dataloader
+        # / trainer / gate everywhere a transport-friendly form of the
+        # source string is wanted. Populates `data_args.source_id_to_name`.
+        self._assign_source_ids()
+        # Translate every `RewardArguments.datasets: List[str]` into the
+        # `_datasets_resolved: frozenset[int]` cache used by the hot-path
+        # gate. Trivially deterministic on every rank because IDs come
+        # from the same shared config.
+        self._resolve_reward_dataset_ids()
         self._resolve_scheduler_sde_defaults()
         self._resolve_sampler_type()
         self._align_batch_geometry()
         self._adjust_gradient_accumulation()
+
+    def _assign_source_ids(self) -> None:
+        """Stamp each ``data.datasets[*]`` entry with a stable monotonic id.
+
+        The id is just the entry's index in ``data.datasets``; with YAML
+        being deterministic and every rank receiving the same config dict,
+        this gives identical id assignments on every rank with no extra
+        sync.
+
+        No-op when ``data.datasets`` is unset (legacy single-source mode);
+        consumers fall back to the legacy "source is None -> applies to
+        all" path.
+        """
+        if not self.data_args.datasets:
+            return
+        for source_id, ds in enumerate(self.data_args.datasets):
+            ds.source_id = source_id
+
+    def _resolve_reward_dataset_ids(self) -> None:
+        """Populate ``RewardArguments._datasets_resolved`` (``frozenset[int]``).
+
+        Hot-path callers (the reward gate) do an ``int in frozenset[int]``
+        membership check instead of an ``str in List[str]`` scan plus a
+        string allocation for ``__source__``. Builds the cache once at
+        config-load time so the runtime gate stays O(1).
+
+        Consumers that bypass ``Arguments`` entirely (e.g. tests
+        constructing a stand-alone ``RewardProcessor``) leave the cache
+        as ``None`` and the gate falls back to the string form — same
+        observable behavior.
+        """
+        if not self.data_args.datasets:
+            return
+        name_to_id = self.data_args.source_name_to_id
+        for rc in list(self.reward_args) + list(self.eval_reward_args or []):
+            # `datasets` was resolved to a concrete `List[str]` upstream by
+            # `_resolve_reward_dataset_routing`; the names are guaranteed to
+            # be in the registry because they passed `_validate_dataset_routing`.
+            assert rc.datasets is not None, (
+                "Internal error: RewardArguments.datasets not resolved before "
+                "_resolve_reward_dataset_ids; check Arguments.__post_init__ ordering."
+            )
+            rc._datasets_resolved = frozenset(name_to_id[n] for n in rc.datasets)
 
     def _resolve_reward_dataset_routing(self) -> None:
         """Replace ``RewardArguments.datasets is None`` with the explicit list.

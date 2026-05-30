@@ -96,25 +96,28 @@ class RewardProcessor:
           here (resolved by ``Arguments._resolve_reward_dataset_routing``).
           As a defensive fallback for callers that construct a
           ``RewardProcessor`` outside the ``Arguments`` flow, ``None`` is
-          also treated as "applies to every sample" — same semantics as the
-          unresolved sentinel.
-        - When the sample has no ``__source__`` field (legacy single-source
-          mode), absence is treated as "applies" -- preserves byte-identical
-          behavior for configs that don't use ``data.datasets``.
-        - Otherwise the sample's ``__source__`` must be in the reward's
-          ``datasets`` list.
+          also treated as "applies to every sample".
+        - When the sample has no source (``source is None`` AND
+          ``source_id is None``), absence is treated as "applies" -
+          preserves byte-identical behavior for legacy single-source mode.
+        - Otherwise we prefer the small-int form
+          (``sample.source_id in cfg._datasets_resolved``) when available,
+          falling back to the string form
+          (``sample.source in cfg.datasets``) when the id resolver
+          hasn't run (direct test instantiation of ``RewardProcessor``).
         """
         cfg = self.reward_configs.get(name)
         if cfg is None or cfg.datasets is None:
             return True
-        # Plain attribute access — sample.extra_kwargs is a dataclass field
-        # with a default factory, so it's always present on a real BaseSample.
-        # Avoid object.__getattribute__ here: bypassing BaseSample.__getattr__
-        # is only legitimate inside __getattr__ itself (to break recursion).
-        src = sample.extra_kwargs.get('__source__')
-        if src is None:
-            return True  # legacy: no source on the sample -> always apply
-        return src in cfg.datasets
+        # Legacy single-source: no source bookkeeping at all -> every reward
+        # applies (this is what the legacy GRPO behavior expected).
+        if sample.source_id is None and sample.source is None:
+            return True
+        # Hot path: int-set membership when both sides have ids.
+        if sample.source_id is not None and cfg._datasets_resolved is not None:
+            return sample.source_id in cfg._datasets_resolved
+        # Fallback: string-list membership.
+        return sample.source in cfg.datasets
 
     @staticmethod
     def _scatter_with_nan_padding(
@@ -299,8 +302,8 @@ class RewardProcessor:
         mask = [self._reward_applies(name, s) for s in group_samples]
         self._mark_applicable(group_samples, mask, name)
 
-        # Group homogeneity check: K repeats of the same prompt MUST share __source__.
-        sources = {s.extra_kwargs.get('__source__') for s in group_samples}
+        # Group homogeneity check: K repeats of the same prompt MUST share the source.
+        sources = {s.source for s in group_samples}
         if len(sources) > 1:
             raise RuntimeError(
                 f"Groupwise reward '{name}' received a group with mixed sources "
@@ -500,10 +503,15 @@ class RewardProcessor:
         for model in models.values():
             required_fields.update(model.required_fields)
 
-        # Always include extra_kwargs — the gate needs `__source__` (which
-        # lives there) on the gathered side. `gather_samples` recognises
-        # 'extra_kwargs' as a sentinel and gathers every entry under it.
-        required_fields.add('extra_kwargs')
+        # Always include the typed source bookkeeping — the gate needs
+        # `source` (and ideally `source_id`) on the gathered side.  Now
+        # that they're real dataclass fields on `BaseSample`, gathering
+        # them directly is cheaper than dragging the whole `extra_kwargs`
+        # dict across ranks (the latter forces every extra key to be
+        # packed/unpacked, which is wasteful when we only need one or
+        # two of them).
+        required_fields.add('source')
+        required_fields.add('source_id')
 
         # Optimize: use prompt_ids instead of prompt strings for communication
         needs_decode = False

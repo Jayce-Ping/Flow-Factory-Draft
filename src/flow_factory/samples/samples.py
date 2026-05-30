@@ -102,11 +102,27 @@ class BaseSample:
     negative_prompt : Optional[str] = None
     negative_prompt_ids : Optional[torch.Tensor] = None
     negative_prompt_embeds : Optional[torch.Tensor] = None
+
+    # --- Multi-source training bookkeeping ---
+    # Populated by `BaseTrainer._inject_batch_metadata` for every sample
+    # produced under `data.datasets`. Both fields are None in legacy
+    # single-source mode (no `data.datasets`); the reward gate treats
+    # `source_id is None` as "applies to every reward" so byte-identical
+    # legacy behavior is preserved.
+    #
+    # `source` is the human-readable name (used for log keys / metric prefixes /
+    # debugging); `source_id` is the small monotonic int assigned by
+    # `Arguments._assign_source_ids` and is the form used in hot-path
+    # comparisons (set membership in `RewardArguments._datasets_resolved`,
+    # cross-rank gather of an int8/int16 vector instead of strings).
+    source: Optional[str] = field(default=None, repr=False, compare=False)
+    source_id: Optional[int] = field(default=None, repr=False, compare=False)
+
     extra_kwargs : Dict[str, Any] = field(default_factory=dict)
 
     # Set of reward names that COULD have applied to this sample given
     # the current routing config (i.e. whose ``RewardArguments.datasets``
-    # contained this sample's ``__source__``, or was None).  Populated
+    # contained this sample's ``source``, or was None).  Populated
     # by ``RewardProcessor`` whenever a reward is computed.  Read by
     # ``AdvantageProcessor`` to aggregate authoritatively rather than
     # relying on ``np.isnan`` (which would silently mask in-model NaN

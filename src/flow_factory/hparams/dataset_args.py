@@ -264,6 +264,14 @@ class DatasetArguments(ArgABC):
         metadata={"help": "Eval participation (None = not used for eval)."},
     )
 
+    # Stable monotonic integer assigned by `Arguments._assign_source_ids`
+    # based on this entry's position in `data.datasets`.  Used as the
+    # transport-friendly form of `source` everywhere a string would
+    # otherwise be hot-path overhead (per-sample tensor for cross-rank
+    # gather, set-membership in `RewardArguments._datasets_resolved`).
+    # `None` until alignment runs.
+    source_id: Optional[int] = field(default=None, repr=True)
+
     # Fields that, when not None, override DataArguments-level paths for
     # the per-source GeneralDataset construction.  Drives the
     # data-driven override pattern.

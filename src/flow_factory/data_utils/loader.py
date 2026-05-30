@@ -299,7 +299,11 @@ def get_dataloader(
                 num_batches_per_source=num_batches_per_source,
                 seed=training_args.seed,
             )
-            train_loader = MultiSourceTrainDataLoader(per_source_loaders, scheduler)
+            train_loader = MultiSourceTrainDataLoader(
+                per_source_loaders,
+                scheduler,
+                source_name_to_id=data_args.source_name_to_id,
+            )
         else:
             # `data.datasets` set but no entry has `train: enabled` ->
             # eval-only run. Trainers that need a train loop must
@@ -572,9 +576,17 @@ class MultiSourceTrainDataLoader:
         self,
         dataloaders_by_source: Dict[str, DataLoader],
         scheduler: WeightedSourceBatchScheduler,
+        source_name_to_id: Optional[Dict[str, int]] = None,
     ):
         self._loaders_by_source = dataloaders_by_source
         self._scheduler = scheduler
+        # Optional name -> id mapping; when present, every batch carries
+        # both `__source__` (str, for logs/debugging) and `__source_id__`
+        # (int, for hot-path gate + cross-rank gather). Resolved by
+        # `Arguments._assign_source_ids` and read here from
+        # `data_args.source_name_to_id`. None means "id form not configured" —
+        # the str form alone is emitted (legacy behavior).
+        self._source_name_to_id = source_name_to_id or {}
         self._iters: Dict[str, Iterator] = {}
 
     @property
@@ -604,6 +616,11 @@ class MultiSourceTrainDataLoader:
             B = self._infer_batch_size(batch)
             batch = dict(batch)
             batch["__source__"] = [src] * B
+            # Emit the small-int form too when the registry is configured,
+            # so `_inject_batch_metadata` populates `BaseSample.source_id`
+            # for hot-path comparisons. Falls back gracefully when not set.
+            if self._source_name_to_id:
+                batch["__source_id__"] = [self._source_name_to_id[src]] * B
             yield batch
 
     def __len__(self) -> int:

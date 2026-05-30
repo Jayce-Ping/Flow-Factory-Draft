@@ -253,15 +253,11 @@ class AdvantageProcessor:
         local_mask = np.zeros((R, B), dtype=bool)
         for j, s in enumerate(samples):
             # Plain attribute access: applicable_rewards is a dataclass
-            # field with a default factory; extra_kwargs likewise. Avoid
-            # object.__getattribute__ — bypassing BaseSample.__getattr__
-            # is only legitimate inside __getattr__ itself (to break
-            # recursion).
+            # field with a default factory; source / source_id likewise.
             applicable = s.applicable_rewards
-            extras = s.extra_kwargs
-            has_source = '__source__' in extras
+            has_source = s.source is not None or s.source_id is not None
             if not applicable and not has_source:
-                # Legacy single-source path: no source tag and no bookkeeping.
+                # Legacy single-source path: no source bookkeeping at all.
                 # Honour the original "every reward applies" invariant so
                 # existing configs are byte-identical.
                 local_mask[:, j] = True

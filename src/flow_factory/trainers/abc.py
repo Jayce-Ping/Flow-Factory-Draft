@@ -520,25 +520,28 @@ class BaseTrainer(ABC):
         JSONL for Arrow serialization safety. Reward models parse them with
         ``json.loads()`` as needed.
 
-        Also propagates the per-batch ``__source__`` (multi-source training
-        only — populated by ``MultiSourceTrainDataLoader`` in
-        ``data_utils/loader.py``).  Drives both the ``RewardProcessor``
-        gate and the ``AdvantageProcessor`` applicability mask.
+        Also propagates the per-batch ``__source__`` / ``__source_id__``
+        (multi-source training only — populated by
+        ``MultiSourceTrainDataLoader`` in ``data_utils/loader.py``) onto
+        the typed ``BaseSample.source`` / ``BaseSample.source_id`` fields.
+        Drives both the ``RewardProcessor`` gate and the
+        ``AdvantageProcessor`` applicability mask.
 
-        No-op when ``batch['metadata']`` AND ``batch['__source__']`` are both
-        absent or empty.
+        No-op when ``batch['metadata']``, ``batch['__source__']`` and
+        ``batch['__source_id__']`` are all absent or empty.
 
         Args:
             samples: Generated samples from ``adapter.inference()``.
             batch: The dataloader batch dict (may contain ``metadata`` /
-                ``__source__`` keys).
+                ``__source__`` / ``__source_id__`` keys).
         """
         # Per-prompt ratio used for both metadata and __source__ broadcasting.
         # Some adapters generate K replicates per prompt (group_size > 1) so
         # one batch row maps to several samples.
         sources = batch.get('__source__')
+        source_ids = batch.get('__source_id__')
         metadata_list = batch.get('metadata')
-        if not metadata_list and not sources:
+        if not metadata_list and not sources and not source_ids:
             return
         if not samples:
             return
@@ -548,6 +551,8 @@ class BaseTrainer(ABC):
             B = len(metadata_list)
         elif sources:
             B = len(sources)
+        elif source_ids:
+            B = len(source_ids)
         else:
             return
         samples_per_prompt = len(samples) // B
@@ -566,7 +571,9 @@ class BaseTrainer(ABC):
                 # Homogeneous within a batch in this PR; per-sample shape
                 # leaves room for future PRs that may interleave within a
                 # batch without a code change.
-                sample.extra_kwargs['__source__'] = sources[batch_idx]
+                sample.source = sources[batch_idx]
+            if source_ids:
+                sample.source_id = source_ids[batch_idx]
 
     # ============================ Public Sampling API ============================
 
@@ -640,20 +647,20 @@ class BaseTrainer(ABC):
                 samples.extend(sample_batch)
 
         # Multi-source invariant: every sample produced under
-        # `data.datasets` MUST carry __source__ in extra_kwargs.  An empty
+        # `data.datasets` MUST carry source bookkeeping.  An empty
         # `train_dataloaders_by_source` means we're in legacy mode, so the
         # check is skipped.  This catches a trainer that overrode
         # generate_samples but bypassed sample_batch / _inject_batch_metadata.
         if self.train_dataloaders_by_source and samples:
             missing = [
                 i for i, s in enumerate(samples)
-                if '__source__' not in s.extra_kwargs
+                if s.source is None
             ]
             if missing:
                 raise RuntimeError(
                     f"Multi-source training: {len(missing)} sample(s) at indices "
                     f"{missing[:5]}{'...' if len(missing) > 5 else ''} are missing "
-                    "`__source__` in extra_kwargs. Did a trainer override "
+                    "`source`. Did a trainer override "
                     "`generate_samples` without going through `sample_batch` "
                     "(which calls `_inject_batch_metadata`)?"
                 )

@@ -154,6 +154,16 @@ class RewardArguments(ArgABC):
         },
     )
 
+    # Hot-path cache of `datasets` resolved into source-ids. Populated by
+    # `Arguments._resolve_reward_dataset_ids` after both `datasets` and
+    # `data.datasets[*].source_id` are concrete. Used by the reward gate
+    # (`RewardProcessor._reward_applies`) for O(1) `int in frozenset[int]`
+    # comparison, replacing string lookups in the inner loop. `None`
+    # until that resolver runs (consumers fall back to the string form).
+    _datasets_resolved: Optional[frozenset] = field(
+        default=None, repr=False, compare=False,
+    )
+
     def __post_init__(self):
         if isinstance(self.dtype, str):
             self.dtype = dtype_map[self.dtype]

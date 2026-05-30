@@ -148,6 +148,31 @@ class DataArguments(ArgABC):
         """Datasets that opt into evaluation (have `eval: enabled`)."""
         return [d for d in (self.datasets or []) if d.is_eval_source]
 
+    # ------------------------------------------------------------------
+    # Source-id registry (populated by Arguments._assign_source_ids;
+    # public for trainers, log builders, and reward routing).
+    # ------------------------------------------------------------------
+
+    @property
+    def source_id_to_name(self) -> List[str]:
+        """Stable mapping ``source_id (int) -> source name (str)``.
+
+        Established once in :meth:`Arguments._assign_source_ids` after
+        dataset canonicalization; identical on every rank because YAML
+        parsing is deterministic and every rank receives the same
+        config dict. Returns ``[]`` in legacy single-source mode (no
+        ``data.datasets``) — consumers should treat the empty list as
+        "no source-id space defined" and fall back to legacy behavior.
+        """
+        if self.datasets is None:
+            return []
+        return [d.name for d in self.datasets]
+
+    @property
+    def source_name_to_id(self) -> dict[str, int]:
+        """Inverse mapping built lazily from :attr:`source_id_to_name`."""
+        return {n: i for i, n in enumerate(self.source_id_to_name)}
+
     def to_dict(self) -> dict[str, Any]:
         return super().to_dict()
 
