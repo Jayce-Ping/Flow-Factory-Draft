@@ -63,7 +63,7 @@ train:
   adv_clip_range: 5.0
   resolution: 512
   num_inference_steps: 20
-  guidance_scale: 2.5
+  guidance_scale: 1.0
   per_device_batch_size: 1
   group_size: 16
   global_std: false
@@ -83,7 +83,7 @@ scheduler:
 eval:
   resolution: 512
   per_device_batch_size: 1
-  guidance_scale: 2.5
+  guidance_scale: 1.0
   num_inference_steps: 28
   eval_freq: 10
   seed: 42

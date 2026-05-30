@@ -75,8 +75,8 @@ train:
   resolution: [384, 720]  # Can be int or [height, width]
   num_frames: 1 # Training frames
   num_inference_steps: 12  # Number of timesteps
-  guidance_scale: 4.0  # Guidance scale for sampling
-  guidance_scale_2: 3.0  # Guidance scale for sampling
+  guidance_scale: 1.0  # Guidance scale for sampling
+  guidance_scale_2: 1.0  # Guidance scale for sampling
 
   # Batch and sampling
   per_device_batch_size: 1  # Batch size per device
@@ -108,8 +108,8 @@ eval:
   resolution: [720, 1280]  # Evaluation resolution
   num_frames: 1 # Evaluation frames
   per_device_batch_size: 1  # Eval batch size
-  guidance_scale: 4.0  # Guidance scale for sampling
-  guidance_scale_2: 3.0  # Guidance scale for sampling
+  guidance_scale: 1.0  # Guidance scale for sampling
+  guidance_scale_2: 1.0  # Guidance scale for sampling
   num_inference_steps: 28  # Number of eval timesteps
   eval_freq: 20  # Eval frequency in epochs (0 to disable)
   seed: 42  # Eval seed (defaults to training seed)

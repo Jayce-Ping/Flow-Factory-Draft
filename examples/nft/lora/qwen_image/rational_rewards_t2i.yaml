@@ -65,7 +65,7 @@ train:
   resolution: 512
   condition_image_size: 512
   num_inference_steps: 30
-  guidance_scale: 4.0
+  guidance_scale: 1.0
   per_device_batch_size: 1
   group_size: 16
   global_std: false
@@ -86,7 +86,7 @@ eval:
   resolution: 512
   condition_image_size: 512
   per_device_batch_size: 1
-  guidance_scale: 4.0
+  guidance_scale: 1.0
   num_inference_steps: 40
   eval_freq: 10
   seed: 42

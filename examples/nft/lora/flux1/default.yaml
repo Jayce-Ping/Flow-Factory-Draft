@@ -69,7 +69,7 @@ train:
   # Sampling
   resolution: 384  # Can be int or [height, width]
   num_inference_steps: 8  # Number of timesteps
-  guidance_scale: 3.5  # Guidance scale for sampling
+  guidance_scale: 1.0  # Guidance scale for sampling
 
   # Batch and sampling
   per_device_batch_size: 1  # Batch size per device
@@ -100,7 +100,7 @@ scheduler:
 eval:
   resolution: 1024  # Evaluation resolution
   per_device_batch_size: 1  # Eval batch size
-  guidance_scale: 3.5  # Guidance scale for sampling
+  guidance_scale: 1.0  # Guidance scale for sampling
   num_inference_steps: 28  # Number of eval timesteps
   eval_freq: 20  # Eval frequency in epochs (0 to disable)
   seed: 42  # Eval seed (defaults to training seed)
