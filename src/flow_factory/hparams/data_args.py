@@ -17,6 +17,7 @@ import yaml
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, Optional, Tuple, Union, List, Iterable
 from .abc import ArgABC
+from .dataset_args import DatasetArguments
 
 
 @dataclass
@@ -97,8 +98,55 @@ class DataArguments(ArgABC):
         },
     )
 
+    datasets: Optional[List[DatasetArguments]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Unified list of dataset folders. Each entry opts into "
+                "training (`train:` sub-block) and/or evaluation (`eval:` sub-block); "
+                "shared `image_dir` / `video_dir` / `audio_dir` apply to both splits. "
+                "When set, the legacy `dataset_dir` is ignored for any split that has a "
+                "matching dataset entry. See `DatasetArguments` for the per-entry schema."
+            )
+        },
+    )
+
     def __post_init__(self):
         self.dataset = self.dataset_dir
+
+        # Coerce list-of-dict -> list-of-DatasetArguments
+        # (`ArgABC.from_dict` does NOT recurse into nested list-of-ArgABC fields).
+        # Idempotent: re-running on already-coerced entries is a no-op.
+        if self.datasets is not None:
+            coerced: List[DatasetArguments] = []
+            for item in self.datasets:
+                if isinstance(item, DatasetArguments):
+                    coerced.append(item)
+                elif isinstance(item, dict):
+                    coerced.append(DatasetArguments.from_dict(item))
+                else:
+                    raise TypeError(
+                        f"data.datasets entry must be dict or DatasetArguments, "
+                        f"got {type(item).__name__}."
+                    )
+            # Treat empty list like None so downstream `if data_args.datasets:` works.
+            self.datasets = coerced or None
+
+    # ------------------------------------------------------------------
+    # Per-split convenience accessors (filter `datasets` by participation).
+    # Trainers and the data-loader read these instead of branching on the
+    # nested `train:` / `eval:` blocks themselves.
+    # ------------------------------------------------------------------
+
+    @property
+    def training_datasets(self) -> List[DatasetArguments]:
+        """Datasets that opt into training (have `train: enabled`)."""
+        return [d for d in (self.datasets or []) if d.is_training_source]
+
+    @property
+    def eval_datasets(self) -> List[DatasetArguments]:
+        """Datasets that opt into evaluation (have `eval: enabled`)."""
+        return [d for d in (self.datasets or []) if d.is_eval_source]
 
     def to_dict(self) -> dict[str, Any]:
         return super().to_dict()

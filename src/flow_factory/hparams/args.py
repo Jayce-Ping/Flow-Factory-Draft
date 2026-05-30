@@ -139,6 +139,7 @@ class Arguments(ArgABC):
             self.log_args.run_name = f"{self.model_args.model_type}_{self.model_args.finetune_type}_{self.training_args.trainer_type}_{time_stamp}"
 
         self._validate_eval_datasets()
+        self._validate_dataset_routing()
         self._resolve_scheduler_sde_defaults()
         self._resolve_sampler_type()
         self._align_batch_geometry()
@@ -178,6 +179,125 @@ class Arguments(ArgABC):
                             f"eval dataset(s): {sorted(unknown)}. "
                             f"Valid eval dataset names are: {sorted(valid_names)}."
                         )
+
+    def _validate_dataset_routing(self) -> None:
+        """Validate the unified ``data.datasets`` schema and reward routing.
+
+        Single source of truth for cross-cutting checks involving the new
+        :class:`DatasetArguments` list.  Covers:
+
+        * Mutual exclusion with the legacy single ``data.dataset_dir`` path
+          when the user has actually customized that field (we cannot
+          reject the dataclass default ``"data"`` itself, as many configs
+          set it explicitly).
+        * Uniqueness of dataset names across the ``data.datasets`` list.
+        * Disjointness from the legacy top-level ``eval_datasets`` field
+          (if still in use) — both share the metric-key namespace.
+        * ``train.weight > 0`` for every training participant.
+        * Cross-validation of every ``RewardArguments.datasets`` entry
+          against the union of declared training / eval dataset names.
+          Training rewards must reference training-source names; eval
+          rewards must reference eval-source names.
+        """
+        tds_unified = self.data_args.datasets or []
+        if not tds_unified:
+            return
+
+        # Mutual exclusion with the legacy single-source `data.dataset_dir`.
+        # Detect "user actually customized dataset_dir" by comparing with
+        # the dataclass default; this lets us tolerate configs that always
+        # write `dataset_dir: data` (the default) as a noop.
+        from dataclasses import fields as _fields
+        default_dataset_dir = next(
+            (f.default for f in _fields(self.data_args.__class__) if f.name == "dataset_dir"),
+            None,
+        )
+        if (
+            default_dataset_dir is not None
+            and self.data_args.dataset_dir != default_dataset_dir
+        ):
+            raise ValueError(
+                "Both `data.dataset_dir` (custom value: "
+                f"{self.data_args.dataset_dir!r}) and `data.datasets` are set. "
+                "These are mutually exclusive — pick one. If you intended "
+                "multi-source training, remove `data.dataset_dir`."
+            )
+
+        # Unique names within the unified list.
+        names = [d.name for d in tds_unified]
+        if len(names) != len(set(names)):
+            dupes = sorted({n for n in names if names.count(n) > 1})
+            raise ValueError(
+                f"Duplicate `data.datasets` names: {dupes}. "
+                "Each dataset entry must have a unique name."
+            )
+        unified_names = set(names)
+
+        # Disjointness from the legacy top-level eval_datasets field.
+        # (Removed in step 4; shim still injects them as DatasetArguments
+        # under data.datasets, so a clash here means YAML duplication.)
+        if self.eval_datasets:
+            legacy_eval_names = {ed.name for ed in self.eval_datasets}
+            clash = unified_names & legacy_eval_names
+            if clash:
+                raise ValueError(
+                    f"`data.datasets` and the legacy top-level `eval_datasets:` overlap on "
+                    f"name(s): {sorted(clash)}. Pick one location — they share the "
+                    "metric-key namespace."
+                )
+
+        # Weight > 0 for every training participant.
+        bad_weights: list[tuple[str, float | None]] = []
+        for d in tds_unified:
+            if not d.is_training_source:
+                continue
+            assert d.train is not None  # narrows for type-checkers
+            w = d.train.weight
+            if w is None or w <= 0:
+                bad_weights.append((d.name, w))
+        if bad_weights:
+            raise ValueError(
+                f"All training datasets must have train.weight > 0; got: {bad_weights}. "
+                "Set `train.weight: 1.0` for uniform mixing."
+            )
+
+        # Cross-validate reward `datasets` references.
+        train_names = {d.name for d in tds_unified if d.is_training_source}
+        eval_names_unified = {d.name for d in tds_unified if d.is_eval_source}
+        legacy_eval_names = {ed.name for ed in (self.eval_datasets or [])}
+        eval_names = eval_names_unified | legacy_eval_names
+
+        # Training rewards: `datasets` must reference TRAINING-source names.
+        for rc in self.reward_args:
+            if rc.datasets is None:
+                continue
+            if not train_names:
+                raise ValueError(
+                    f"Reward '{rc.name}' has datasets={rc.datasets!r} but no training "
+                    "dataset is configured under `data.datasets`. Either remove "
+                    "`datasets` from this reward or define training datasets it can route to."
+                )
+            unknown = set(rc.datasets) - train_names
+            if unknown:
+                raise ValueError(
+                    f"Reward '{rc.name}' references unknown training dataset(s): "
+                    f"{sorted(unknown)}. Valid training dataset names: {sorted(train_names)}."
+                )
+
+        # Eval rewards: `datasets` must reference EVAL-source names.
+        # (Eval rewards may legitimately point at legacy top-level
+        # `eval_datasets` entries as long as they share the same name
+        # space — handled by the union above.)
+        if self.eval_reward_args and eval_names:
+            for rc in self.eval_reward_args:
+                if rc.datasets is None:
+                    continue
+                unknown = set(rc.datasets) - eval_names
+                if unknown:
+                    raise ValueError(
+                        f"Eval reward '{rc.name}' references unknown eval dataset(s): "
+                        f"{sorted(unknown)}. Valid eval dataset names: {sorted(eval_names)}."
+                    )
 
     def _resolve_sampler_type(self) -> None:
         """Choose the distributed sampler strategy.
