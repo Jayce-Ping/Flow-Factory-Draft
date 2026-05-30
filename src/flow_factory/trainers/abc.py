@@ -31,7 +31,11 @@ from accelerate.utils import set_seed, ProjectConfiguration
 
 from ..hparams import *
 from ..models.abc import BaseAdapter
-from ..data_utils.loader import get_dataloader, get_eval_dataloaders
+from ..data_utils.loader import (
+    get_train_dataloader,
+    get_eval_dataloaders,
+    _build_legacy_test_dataloader,
+)
 from ..rewards import load_reward_model, BaseRewardModel, MultiRewardLoader, RewardProcessor, RewardBuffer
 from ..advantage import AdvantageProcessor
 from ..logger import load_logger, LogFormatter
@@ -226,21 +230,29 @@ class BaseTrainer(ABC):
             components=self.adapter.preprocessing_modules,
             device=self.accelerator.device
         )
-        # Multi-source train mode (data.datasets) yields a
-        # `MultiSourceTrainDataLoader` for `dataloader` and the
-        # per-source dict for `train_dataloaders_by_source`.  Legacy
-        # single-source mode returns the plain DataLoader and an empty
-        # dict.  We expose the per-source dict on the trainer so the
-        # future DiffusionOPDTrainer can drive its own balanced sampling
+        # Train side: `get_train_dataloader` yields the wrapped
+        # MultiSourceTrainDataLoader (or a plain DataLoader for the
+        # legacy single-source path) plus the per-source dict.  We
+        # expose the per-source dict on the trainer so the future
+        # DiffusionOPDTrainer can drive its own balanced sampling
         # without re-deriving the partition.
-        dataloader, test_dataloader, train_dataloaders_by_source = get_dataloader(
+        dataloader, train_dataloaders_by_source = get_train_dataloader(
             config=self.config,
             accelerator=self.accelerator,
             preprocess_func=self.adapter.preprocess_func,
         )
         self.train_dataloaders_by_source: Dict[str, DataLoader] = train_dataloaders_by_source
 
-        # Multi-eval-dataset support: load additional eval dataloaders
+        # Eval side: when `data.datasets` declares any eval-eligible
+        # entry (which now includes the canonicalized legacy
+        # `data.dataset_dir` whenever a `test.jsonl` exists), the
+        # multi-eval pipeline owns it.  The legacy single-test path
+        # below is a transitional bridge: it remains active only when
+        # no eval-eligible entry was declared (i.e. genuinely train-only
+        # configs).  Step 3 of the merge plan folds the bridge into
+        # `get_eval_dataloaders` and deletes
+        # `_build_legacy_test_dataloader` outright.
+        test_dataloader: Optional[DataLoader] = None
         if self.config.data_args.eval_datasets:
             self.eval_dataloaders: Dict[str, DataLoader] = get_eval_dataloaders(
                 eval_datasets=self.config.data_args.eval_datasets,
@@ -248,10 +260,25 @@ class BaseTrainer(ABC):
                 accelerator=self.accelerator,
                 preprocess_func=self.adapter.preprocess_func,
             )
-            # In multi-eval mode, disable the legacy single test_dataloader
-            test_dataloader = None
         else:
             self.eval_dataloaders = {}
+            # Build the legacy single test_dataloader only when no
+            # eval-eligible entry was canonicalized — i.e. configs that
+            # never had a test.jsonl in the first place.  This branch
+            # disappears in step 3.
+            test_dataloader = _build_legacy_test_dataloader(
+                config=self.config,
+                accelerator=self.accelerator,
+                preprocess_func=self.adapter.preprocess_func,
+                base_kwargs=self._build_legacy_test_base_kwargs(),
+                enable_distributed=(
+                    self.accelerator.num_processes > 1
+                    and self.config.data_args.enable_preprocess
+                ),
+                preprocess_parallelism=getattr(
+                    self.config.data_args, 'preprocess_parallelism', 'local',
+                ),
+            )
 
         # Offload text-encoder after dataloader encoding
         self.adapter.off_load_components(
@@ -261,6 +288,33 @@ class BaseTrainer(ABC):
         self.accelerator.wait_for_everyone()
 
         return dataloader, test_dataloader
+
+    def _build_legacy_test_base_kwargs(self) -> dict:
+        """Mirror of the `base_kwargs` previously assembled inside
+        `get_dataloader`, used only by the transitional
+        `_build_legacy_test_dataloader` call in `_init_dataloader`.
+
+        Lifted to a method so `_init_dataloader` reads cleanly; gone
+        entirely once step 3 routes legacy through `get_eval_dataloaders`.
+        """
+        from ..data_utils.dataset import GeneralDataset
+        from ..utils.base import filter_kwargs
+        data_args = self.config.data_args
+        preprocess_func = self.adapter.preprocess_func
+        base_kwargs = {
+            "preprocess_func": preprocess_func,
+            "preprocess_kwargs": (
+                filter_kwargs(preprocess_func, **data_args)
+                if preprocess_func else None
+            ),
+            'extra_hash_strs': [
+                self.config.model_args.model_type,
+                self.config.model_args.model_name_or_path,
+            ],
+        }
+        base_kwargs.update(filter_kwargs(GeneralDataset.__init__, **data_args))
+        base_kwargs['force_reprocess'] = data_args.force_reprocess
+        return base_kwargs
     
     def _init_optimizer(self) -> torch.optim.Optimizer:
         """Initialize optimizer."""

@@ -200,19 +200,18 @@ def _create_or_load_dataset(
     return GeneralDataset.load_merged(merged_cache_path)
 
 
-def get_dataloader(
+def get_train_dataloader(
     config: Arguments,
     accelerator: Accelerator,
     preprocess_func: Optional[PreprocessCallable] = None,
     **kwargs,
 ) -> Tuple[
     Union[DataLoader, "MultiSourceTrainDataLoader", None],
-    Optional[DataLoader],
     Dict[str, DataLoader],
 ]:
-    """Factory for the training + (legacy) test DataLoaders.
+    """Factory for the training DataLoader(s).
 
-    Returns a 3-tuple ``(train_loader, test_loader, train_loaders_by_source)``:
+    Returns a 2-tuple ``(train_loader, train_loaders_by_source)``:
 
     * ``train_loader`` — either a plain ``torch.utils.data.DataLoader``
       (legacy single-source) or a :class:`MultiSourceTrainDataLoader`
@@ -220,13 +219,13 @@ def get_dataloader(
       ``set_epoch`` so trainers don't have to branch.  ``None`` only
       when ``data.datasets`` is set but no entry has ``train: enabled``
       (eval-only run; trainers should respect that).
-    * ``test_loader`` — legacy single-test ``test.jsonl`` DataLoader, or
-      ``None``.  In multi-source mode this is also ``None`` (eval is
-      driven by :func:`get_eval_dataloaders`).
     * ``train_loaders_by_source`` — ``Dict[str, DataLoader]`` keyed
       by training-dataset name in multi-source mode; empty ``{}`` in
       legacy mode.  Exposed publicly for the future DiffusionOPD
       trainer (which iterates per-source independently).
+
+    The eval / test path is fully owned by :func:`get_eval_dataloaders`;
+    callers requesting an eval loader must invoke it explicitly.
 
     Args:
         config: Full ``Arguments`` configuration object.
@@ -325,21 +324,12 @@ def get_dataloader(
                 batch_size=training_args.per_device_batch_size,
             )
 
-    # ------------------------------------------------------------------
-    # Legacy single test_dataloader (test.jsonl under data.dataset_dir).
-    # In multi-source / multi-eval mode the trainer will instead build
-    # its eval dataloaders via `get_eval_dataloaders`.
-    # ------------------------------------------------------------------
-    test_loader = _build_legacy_test_dataloader(
-        config=config,
-        accelerator=accelerator,
-        preprocess_func=preprocess_func,
-        base_kwargs=base_kwargs,
-        enable_distributed=enable_distributed,
-        preprocess_parallelism=preprocess_parallelism,
-    )
+    # The legacy single-test path lives in `_build_legacy_test_dataloader`
+    # and is invoked from `BaseTrainer._init_dataloader` only as a
+    # transitional bridge; it'll be folded into `get_eval_dataloaders`
+    # in the next commit.
 
-    return train_loader, test_loader, train_loaders_by_source
+    return train_loader, train_loaders_by_source
 
 
 def _build_legacy_test_dataloader(

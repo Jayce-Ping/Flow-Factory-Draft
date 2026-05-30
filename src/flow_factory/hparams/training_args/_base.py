@@ -264,7 +264,7 @@ class TrainingArguments(ArgABC):
             "help": (
                 "[INTERNAL] Set by `Arguments._align_batch_geometry` when multi-source "
                 "training is configured: maps source name -> aligned per-source "
-                "unique_sample_num_per_epoch. Read by data_utils.get_dataloader."
+                "unique_sample_num_per_epoch. Read by data_utils.get_train_dataloader."
             )
         },
     )
