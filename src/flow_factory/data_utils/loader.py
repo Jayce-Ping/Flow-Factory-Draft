@@ -212,18 +212,18 @@ def get_dataloader(
 ]:
     """Factory for the training + (legacy) test DataLoaders.
 
-    Returns a 3-tuple ``(train_dl, test_dl, train_dataloaders_by_source)``:
+    Returns a 3-tuple ``(train_loader, test_loader, train_loaders_by_source)``:
 
-    * ``train_dl`` — either a plain ``torch.utils.data.DataLoader``
+    * ``train_loader`` — either a plain ``torch.utils.data.DataLoader``
       (legacy single-source) or a :class:`MultiSourceTrainDataLoader`
       (multi-source).  Both expose ``__iter__`` / ``__len__`` /
       ``set_epoch`` so trainers don't have to branch.  ``None`` only
       when ``data.datasets`` is set but no entry has ``train: enabled``
       (eval-only run; trainers should respect that).
-    * ``test_dl`` — legacy single-test ``test.jsonl`` DataLoader, or
+    * ``test_loader`` — legacy single-test ``test.jsonl`` DataLoader, or
       ``None``.  In multi-source mode this is also ``None`` (eval is
       driven by :func:`get_eval_dataloaders`).
-    * ``train_dataloaders_by_source`` — ``Dict[str, DataLoader]`` keyed
+    * ``train_loaders_by_source`` — ``Dict[str, DataLoader]`` keyed
       by training-dataset name in multi-source mode; empty ``{}`` in
       legacy mode.  Exposed publicly for the future DiffusionOPD
       trainer (which iterates per-source independently).
@@ -263,14 +263,14 @@ def get_dataloader(
     # ------------------------------------------------------------------
     # Train path: dispatch on `data.datasets`.
     # ------------------------------------------------------------------
-    train_dl: Union[DataLoader, "MultiSourceTrainDataLoader", None]
-    train_dataloaders_by_source: Dict[str, DataLoader] = {}
+    train_loader: Union[DataLoader, "MultiSourceTrainDataLoader", None]
+    train_loaders_by_source: Dict[str, DataLoader] = {}
 
     if data_args.datasets:
         # Multi-source mode (or unified-schema single-source — both flow
         # through `_load_per_source_train_dataloaders`).
         if data_args.training_datasets:
-            per_source_dls = _load_per_source_train_dataloaders(
+            per_source_loaders = _load_per_source_train_dataloaders(
                 training_datasets=data_args.training_datasets,
                 config=config,
                 accelerator=accelerator,
@@ -279,11 +279,11 @@ def get_dataloader(
                 enable_distributed=enable_distributed,
                 preprocess_parallelism=preprocess_parallelism,
             )
-            train_dataloaders_by_source = per_source_dls
+            train_loaders_by_source = per_source_loaders
 
             num_batches_per_source = {
-                name: dl.batch_sampler.num_batches_per_epoch  # type: ignore[union-attr]
-                for name, dl in per_source_dls.items()
+                name: loader.batch_sampler.num_batches_per_epoch  # type: ignore[union-attr]
+                for name, loader in per_source_loaders.items()
             }
             total = sum(num_batches_per_source.values())
             if total != training_args.num_batches_per_epoch:
@@ -299,12 +299,12 @@ def get_dataloader(
                 num_batches_per_source=num_batches_per_source,
                 seed=training_args.seed,
             )
-            train_dl = MultiSourceTrainDataLoader(per_source_dls, scheduler)
+            train_loader = MultiSourceTrainDataLoader(per_source_loaders, scheduler)
         else:
             # `data.datasets` set but no entry has `train: enabled` ->
             # eval-only run. Trainers that need a train loop must
             # respect this (e.g. raise / skip start()).
-            train_dl = None
+            train_loader = None
     else:
         # Legacy single-source path (byte-identical to the pre-refactor
         # implementation).
@@ -320,7 +320,7 @@ def get_dataloader(
             config=config,
             accelerator=accelerator,
         )
-        train_dl = DataLoader(
+        train_loader = DataLoader(
             dataset,
             batch_sampler=sampler,
             num_workers=data_args.dataloader_num_workers,
@@ -333,7 +333,7 @@ def get_dataloader(
     # In multi-source / multi-eval mode the trainer will instead build
     # its eval dataloaders via `get_eval_dataloaders`.
     # ------------------------------------------------------------------
-    test_dataloader = _build_legacy_test_dataloader(
+    test_loader = _build_legacy_test_dataloader(
         config=config,
         accelerator=accelerator,
         preprocess_func=preprocess_func,
@@ -342,7 +342,7 @@ def get_dataloader(
         preprocess_parallelism=preprocess_parallelism,
     )
 
-    return train_dl, test_dataloader, train_dataloaders_by_source
+    return train_loader, test_loader, train_loaders_by_source
 
 
 def _build_legacy_test_dataloader(
@@ -573,20 +573,20 @@ class MultiSourceTrainDataLoader:
         dataloaders_by_source: Dict[str, DataLoader],
         scheduler: WeightedSourceBatchScheduler,
     ):
-        self._dl_by_source = dataloaders_by_source
+        self._loaders_by_source = dataloaders_by_source
         self._scheduler = scheduler
         self._iters: Dict[str, Iterator] = {}
 
     @property
     def dataloaders_by_source(self) -> Dict[str, DataLoader]:
         """Public access for OPD-style consumers."""
-        return self._dl_by_source
+        return self._loaders_by_source
 
     def _ensure_iters(self) -> None:
         """Lazily refresh per-source iterators (after set_epoch / first use)."""
-        for name, dl in self._dl_by_source.items():
+        for name, loader in self._loaders_by_source.items():
             if name not in self._iters:
-                self._iters[name] = iter(dl)
+                self._iters[name] = iter(loader)
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         self._ensure_iters()
@@ -598,7 +598,7 @@ class MultiSourceTrainDataLoader:
                 # implementations yield indefinitely), so this should
                 # never trigger.  Defensive refresh — keeps the contract
                 # robust against future sampler swaps.
-                self._iters[src] = iter(self._dl_by_source[src])
+                self._iters[src] = iter(self._loaders_by_source[src])
                 batch = next(self._iters[src])
 
             B = self._infer_batch_size(batch)
@@ -612,8 +612,8 @@ class MultiSourceTrainDataLoader:
     def set_epoch(self, epoch: int) -> None:
         """Reseed the schedule and propagate to per-source samplers."""
         self._scheduler.set_epoch(epoch)
-        for dl in self._dl_by_source.values():
-            sampler = getattr(dl, "batch_sampler", None) or getattr(dl, "sampler", None)
+        for loader in self._loaders_by_source.values():
+            sampler = getattr(loader, "batch_sampler", None) or getattr(loader, "sampler", None)
             if sampler is not None and hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(epoch)
         # Force fresh iters next epoch.
