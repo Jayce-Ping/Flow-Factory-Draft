@@ -102,6 +102,15 @@ class DatasetTrainSpec(ArgABC):
         metadata={"help": "Cap on training samples for this source (None = inherit DataArguments.max_dataset_size)."},
     )
 
+    # ---- Resolved values written by `Arguments._align_unique_sample_num` ----
+    # The aligned per-source ``unique_sample_num_per_epoch`` (= M_i) and
+    # ``num_batches_per_epoch`` are stamped here so they appear in
+    # ``print(config)`` and so the data layer reads the canonical
+    # location instead of a private dict on ``TrainingArguments``.
+    # ``None`` until alignment runs (legacy / single-source / not-yet-resolved).
+    unique_sample_num_per_epoch: Optional[int] = field(default=None, repr=True)
+    num_batches_per_epoch: Optional[int] = field(default=None, repr=True)
+
     def __post_init__(self) -> None:
         # Coerce float-but-integer-valued weights silently (`1.0` is fine);
         # reject genuine non-integer floats.  Concrete `weight > 0`

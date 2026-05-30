@@ -128,6 +128,12 @@ class Arguments(ArgABC):
             time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.log_args.run_name = f"{self.model_args.model_type}_{self.model_args.finetune_type}_{self.training_args.trainer_type}_{time_stamp}"
 
+        # Canonicalize legacy `data.dataset_dir` into a synthetic 1-entry
+        # `data.datasets` list so the rest of the pipeline only handles
+        # one shape (collapses single/multi-source dispatch downstream).
+        # This is a NO-OP when the user already configured `data.datasets`.
+        self._canonicalize_legacy_dataset_dir()
+
         self._validate_dataset_routing()
         # Resolve `RewardArguments.datasets is None` -> concrete list of
         # applicable dataset names. Must run AFTER validation (so the
@@ -148,6 +154,61 @@ class Arguments(ArgABC):
         self._resolve_sampler_type()
         self._align_batch_geometry()
         self._adjust_gradient_accumulation()
+
+    def _canonicalize_legacy_dataset_dir(self) -> None:
+        """Promote legacy ``data.dataset_dir`` into a synthetic ``data.datasets``.
+
+        After this method returns, ``data.datasets`` is the single source
+        of truth for everywhere downstream — single- and multi-source
+        configurations flow through identical code paths.
+
+        Rules:
+
+        * If ``data.datasets`` is already populated, do nothing (the
+          mutual-exclusion validator runs next and will reject any
+          conflict).
+        * Otherwise build a 1-entry list with ``name="default"``,
+          ``dataset_dir`` from the legacy field, and:
+            - ``train`` enabled (every legacy run had a training dataset).
+            - ``eval`` enabled iff ``test.jsonl`` / ``test.txt`` exists
+              under the legacy ``dataset_dir``; otherwise ``eval=None``.
+
+        We set ``self._legacy_canonicalized = True`` so the mutex
+        validator knows this synthetic list does NOT conflict with the
+        user's legacy ``dataset_dir`` (they're the same source described
+        twice — by definition).
+        """
+        self._legacy_canonicalized = False
+        if self.data_args.datasets:
+            return  # explicit user config wins
+        from .dataset_args import DatasetArguments, DatasetTrainSpec, DatasetEvalSpec
+        from dataclasses import fields as _fields
+        default_dataset_dir = next(
+            (f.default for f in _fields(self.data_args.__class__) if f.name == "dataset_dir"),
+            None,
+        )
+        if self.data_args.dataset_dir == default_dataset_dir:
+            return  # no legacy field -> let downstream handle the no-data error
+        # Probe for a test split so eval-enabled is set correctly for
+        # legacy runs that DO have a test.jsonl.
+        from ..data_utils.dataset import GeneralDataset
+        eval_spec = (
+            DatasetEvalSpec()
+            if GeneralDataset.check_exists(self.data_args.dataset_dir, "test")
+            else None
+        )
+        self.data_args.datasets = [
+            DatasetArguments(
+                name="default",
+                dataset_dir=self.data_args.dataset_dir,
+                image_dir=self.data_args.image_dir,
+                video_dir=self.data_args.video_dir,
+                audio_dir=self.data_args.audio_dir,
+                train=DatasetTrainSpec(weight=1),
+                eval=eval_spec,
+            )
+        ]
+        self._legacy_canonicalized = True
 
     def _assign_source_ids(self) -> None:
         """Stamp each ``data.datasets[*]`` entry with a stable monotonic id.
@@ -260,13 +321,17 @@ class Arguments(ArgABC):
         # Detect "user actually customized dataset_dir" by comparing with
         # the dataclass default; this lets us tolerate configs that always
         # write `dataset_dir: data` (the default) as a noop.
+        # Skip this check when we synthesised `data.datasets` ourselves
+        # in `_canonicalize_legacy_dataset_dir` — the legacy `dataset_dir`
+        # IS the source for the synthetic single entry, not a conflict.
         from dataclasses import fields as _fields
         default_dataset_dir = next(
             (f.default for f in _fields(self.data_args.__class__) if f.name == "dataset_dir"),
             None,
         )
         if (
-            default_dataset_dir is not None
+            not getattr(self, "_legacy_canonicalized", False)
+            and default_dataset_dir is not None
             and self.data_args.dataset_dir != default_dataset_dir
         ):
             raise ValueError(
@@ -674,6 +739,10 @@ class Arguments(ArgABC):
                 if N == 1
                 else None
             )
+            # Also stamp the resolved M_i onto each training spec so
+            # `print(config)` reflects the final geometry.
+            if N == 1:
+                tds[0].train.unique_sample_num_per_epoch = ta.unique_sample_num_per_epoch  # type: ignore[union-attr]
             return
 
         # Multi-source partition (N >= 2).
@@ -708,6 +777,11 @@ class Arguments(ArgABC):
             self._warn_and_assign_unique_sample_num(final_total, sampler_name, extra)
         # Always stash the partition for the data layer to consume.
         ta._per_source_unique_sample_num = partition
+        # Also stamp resolved M_i onto each training spec so the printed
+        # config shows the final geometry per-source.
+        for d in tds:
+            assert d.train is not None
+            d.train.unique_sample_num_per_epoch = partition[d.name]
 
     @staticmethod
     def _partition_unique_sample_num(

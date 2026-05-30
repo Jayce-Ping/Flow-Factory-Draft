@@ -261,26 +261,45 @@ def get_dataloader(
     )
 
     # ------------------------------------------------------------------
-    # Train path: dispatch on `data.datasets`.
+    # Train path: always go through the per-source loader builder.
+    # `Arguments._canonicalize_legacy_dataset_dir` promotes the legacy
+    # single-`data.dataset_dir` config into a synthetic 1-entry
+    # `data.datasets`, so single- and multi-source flow through identical
+    # code here.  The only branch is "wrap in MultiSourceTrainDataLoader
+    # or not": for a single training source we hand back the underlying
+    # plain DataLoader to keep batches lean (no per-batch __source__
+    # injection) and the legacy iteration shape.
     # ------------------------------------------------------------------
     train_loader: Union[DataLoader, "MultiSourceTrainDataLoader", None]
     train_loaders_by_source: Dict[str, DataLoader] = {}
 
-    if data_args.datasets:
-        # Multi-source mode (or unified-schema single-source — both flow
-        # through `_load_per_source_train_dataloaders`).
-        if data_args.training_datasets:
-            per_source_loaders = _load_per_source_train_dataloaders(
-                training_datasets=data_args.training_datasets,
-                config=config,
-                accelerator=accelerator,
-                base_kwargs=base_kwargs,
-                train_preprocess_kwargs=train_preprocess_kwargs,
-                enable_distributed=enable_distributed,
-                preprocess_parallelism=preprocess_parallelism,
-            )
-            train_loaders_by_source = per_source_loaders
+    training_specs = data_args.training_datasets  # property
+    if not training_specs:
+        # `data.datasets` declares no training-eligible entry -> eval-only
+        # run. Trainers that need a train loop must respect this.
+        train_loader = None
+    else:
+        per_source_loaders = _load_per_source_train_dataloaders(
+            training_datasets=training_specs,
+            config=config,
+            accelerator=accelerator,
+            base_kwargs=base_kwargs,
+            train_preprocess_kwargs=train_preprocess_kwargs,
+            enable_distributed=enable_distributed,
+            preprocess_parallelism=preprocess_parallelism,
+        )
+        train_loaders_by_source = per_source_loaders
 
+        if len(per_source_loaders) == 1:
+            # Single training source (whether the user wrote it as a
+            # legacy `data.dataset_dir` or as a 1-entry `data.datasets`):
+            # skip the wrapper and hand back the underlying DataLoader so
+            # batches don't carry __source__ / __source_id__ keys. Reward
+            # gate then falls through to the legacy "applies to all"
+            # behavior; metric keys, cache fingerprints, and sample
+            # schemas stay byte-identical to the pre-refactor flow.
+            train_loader = next(iter(per_source_loaders.values()))
+        else:
             num_batches_per_source = {
                 name: loader.batch_sampler.num_batches_per_epoch  # type: ignore[union-attr]
                 for name, loader in per_source_loaders.items()
@@ -304,33 +323,6 @@ def get_dataloader(
                 scheduler,
                 source_name_to_id=data_args.source_name_to_id,
             )
-        else:
-            # `data.datasets` set but no entry has `train: enabled` ->
-            # eval-only run. Trainers that need a train loop must
-            # respect this (e.g. raise / skip start()).
-            train_loader = None
-    else:
-        # Legacy single-source path (byte-identical to the pre-refactor
-        # implementation).
-        dataset = _create_or_load_dataset(
-            split="train",
-            accelerator=accelerator,
-            base_kwargs={**base_kwargs, 'preprocess_kwargs': train_preprocess_kwargs},
-            enable_distributed=enable_distributed,
-            preprocess_parallelism=preprocess_parallelism,
-        )
-        sampler = get_data_sampler(
-            dataset=dataset,
-            config=config,
-            accelerator=accelerator,
-        )
-        train_loader = DataLoader(
-            dataset,
-            batch_sampler=sampler,
-            num_workers=data_args.dataloader_num_workers,
-            pin_memory=True,
-            collate_fn=GeneralDataset.collate_fn,
-        )
 
     # ------------------------------------------------------------------
     # Legacy single test_dataloader (test.jsonl under data.dataset_dir).
@@ -390,6 +382,28 @@ def _build_legacy_test_dataloader(
     )
 
 
+def _per_source_arguments_view(config: Arguments, source_M: int) -> Arguments:
+    """Return a shallow ``Arguments`` view with per-source ``M_i`` patched in.
+
+    `get_data_sampler` reads
+    ``config.training_args.unique_sample_num_per_epoch`` and
+    ``config.training_args.group_size`` to size per-source samplers.
+    For multi-source training each source has its own resolved
+    ``M_i`` — but we don't want to mutate the shared ``training_args``
+    in-place (that would corrupt the global counter the trainer reads).
+
+    Solution: shallow-copy ``training_args`` with the per-source value
+    swapped in, leaving every other field aliased.  ``data_args`` and
+    everything else remain aliased — only the one piece of state the
+    sampler reads is replaced.
+    """
+    import copy
+    view = copy.copy(config)
+    view.training_args = copy.copy(config.training_args)
+    view.training_args.unique_sample_num_per_epoch = source_M
+    return view
+
+
 def _load_per_source_train_dataloaders(
     *,
     training_datasets: List[DatasetArguments],
@@ -440,8 +454,16 @@ def _load_per_source_train_dataloaders(
 
         # Cache fingerprint must include the source name so two sources
         # sharing a dataset_dir with different overrides get separate caches.
+        # Skip the token when there's only one training source so caches
+        # produced by the legacy code path (no `train_source:` token) are
+        # still hits after the canonicalization upgrade — keeps existing
+        # ~/.cache/flow_factory/datasets/* directories valid for users
+        # whose configs flip from `data.dataset_dir` to a 1-entry
+        # `data.datasets` (or stay on the legacy field, which is
+        # canonicalized to a 1-entry list).
         extra = list(base_kwargs.get("extra_hash_strs", []))
-        extra.append(f"train_source:{d.name}")
+        if len(training_datasets) > 1:
+            extra.append(f"train_source:{d.name}")
         per_kwargs["extra_hash_strs"] = extra
 
         # Per-source max_dataset_size override (DataArguments default
@@ -457,12 +479,18 @@ def _load_per_source_train_dataloaders(
             preprocess_parallelism=preprocess_parallelism,
         )
 
-        M_i = per_source_M.get(d.name)
+        M_i = spec.unique_sample_num_per_epoch
+        if M_i is None:
+            # Fallback: read from the legacy private dict on training_args
+            # in case the alignment refactor missed a code path. Should
+            # never trigger after step 5+7 + the per-spec writeback in
+            # `_align_unique_sample_num`.
+            M_i = per_source_M.get(d.name)
         if M_i is None:
             raise RuntimeError(
-                f"Internal error: training_args._per_source_unique_sample_num "
-                f"is missing source '{d.name}'. "
-                f"Known: {sorted(per_source_M.keys())}."
+                f"Internal error: per-source unique_sample_num_per_epoch "
+                f"is missing for source '{d.name}'. "
+                f"Did `Arguments._align_batch_geometry` run?"
             )
         if M_i > len(dataset):
             raise ValueError(
@@ -473,11 +501,16 @@ def _load_per_source_train_dataloaders(
                 f"or grow the dataset."
             )
 
+        # Build a per-source view of `Arguments` so `get_data_sampler`
+        # reads the correct `unique_sample_num_per_epoch` from `config`
+        # without an out-of-band kwarg.  This restores the symmetry the
+        # rest of the pipeline relies on: every quantity the sampler
+        # uses lives in the config it's handed.
+        per_source_config = _per_source_arguments_view(config, source_M=M_i)
         sampler = get_data_sampler(
             dataset=dataset,
-            config=config,
+            config=per_source_config,
             accelerator=accelerator,
-            unique_sample_num=M_i,
         )
         out[d.name] = DataLoader(
             dataset,
@@ -486,6 +519,10 @@ def _load_per_source_train_dataloaders(
             pin_memory=True,
             collate_fn=GeneralDataset.collate_fn,
         )
+        # Mirror the resolved per-source `num_batches_per_epoch` onto
+        # the spec so `print(config)` shows it. The `M_i` writeback
+        # already happened in `Arguments._align_unique_sample_num`.
+        spec.num_batches_per_epoch = sampler.num_batches_per_epoch  # type: ignore[union-attr]
         logger.info(
             f"Multi-source: built DataLoader for '{d.name}' "
             f"(samples={len(dataset)}, M_i={M_i}, "

@@ -13,8 +13,6 @@
 # limitations under the License.
 
 # src/flow_factory/data_utils/sampler_loader.py
-from typing import Optional
-
 from torch.utils.data import Sampler, Dataset
 from accelerate import Accelerator
 
@@ -36,30 +34,24 @@ def get_data_sampler(
     dataset: Dataset,
     config: Arguments,
     accelerator: Accelerator,
-    *,
-    unique_sample_num: Optional[int] = None,
 ) -> Sampler:
     """
     Factory function to create the appropriate distributed sampler.
 
+    Reads ``config.training_args.unique_sample_num_per_epoch`` as the
+    final, resolved value: ``Arguments._align_batch_geometry`` writes
+    aligned values back onto ``training_args`` (and onto each
+    ``DatasetTrainSpec``), so ``print(config)`` reflects the same
+    quantities the sampler uses. To build a per-source sampler in
+    multi-source mode, callers pass a *view* ``Arguments`` whose
+    ``training_args.unique_sample_num_per_epoch`` has already been
+    swapped to the per-source ``M_i`` (see
+    ``_per_source_arguments_view`` in ``data_utils/loader.py``); this
+    function never accepts an out-of-band override.
+
     The sampler strategy is determined by ``config.data_args.sampler_type``,
     which is resolved in ``Arguments._resolve_sampler_type()`` and aligned in
     ``Arguments._align_batch_geometry()`` during ``__post_init__``.
-
-    Args:
-        dataset: The dataset to sample from.
-        config: The full ``Arguments`` configuration object.
-        accelerator: HuggingFace Accelerator (provides world size + rank).
-        unique_sample_num: Optional override for ``unique_sample_num_per_epoch``.
-            When ``None`` (default), the sampler reads
-            ``training_args.unique_sample_num_per_epoch`` — the legacy
-            single-source / aggregate value.  Multi-source callers pass
-            the per-source ``M_i`` from
-            ``training_args._per_source_unique_sample_num`` so each
-            per-source sampler emits exactly its allocated batches per
-            epoch.  Must be a positive multiple of the relevant alignment
-            step (``Arguments._partition_unique_sample_num`` guarantees
-            this when set by the multi-source path).
 
     Returns:
         - GroupContiguousSampler when resolved type is ``"group_contiguous"``
@@ -76,16 +68,11 @@ def get_data_sampler(
         raise ValueError(
             f"Unknown sampler_type={sampler_type!r}. Expected one of {sorted(SAMPLER_REGISTRY)}."
         )
-    resolved_M = (
-        unique_sample_num
-        if unique_sample_num is not None
-        else training_args.unique_sample_num_per_epoch
-    )
     return sampler_cls(
         dataset=dataset,
         batch_size=training_args.per_device_batch_size,
         group_size=training_args.group_size,
-        unique_sample_num=resolved_M,
+        unique_sample_num=training_args.unique_sample_num_per_epoch,
         num_replicas=accelerator.num_processes,
         rank=accelerator.process_index,
         seed=training_args.seed,
