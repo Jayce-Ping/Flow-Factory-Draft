@@ -125,19 +125,20 @@ class BaseTrainer(ABC):
         # NOTE: This bug persists even with this context manager. DONOT USE ZeRO-3.
         # A possible solution: use DeepSpeed GatherParamter manually in the reward_model's `forward`.
 
-        # Collect eval dataset names for per-dataset reward routing
-        eval_dataset_names = (
-            [ed.name for ed in self.config.data_args.eval_datasets]
-            if self.config.data_args.eval_datasets
-            else []
-        )
-        # Collect training dataset names (mirror of eval_dataset_names) so
-        # MultiRewardLoader can pre-compute the per-source reward routing
-        # used by the runtime reward gate (step 9) and any future trainer
-        # that needs "which rewards apply to source S?" lookups.
+        # Collect training dataset names so MultiRewardLoader can pre-compute
+        # the per-source reward routing used by the runtime reward gate
+        # and any future trainer that needs "which rewards apply to source S?"
+        # lookups.  Training is the primary path; eval names follow.
         training_dataset_names = (
             [td.name for td in self.config.data_args.training_datasets]
             if self.config.data_args.training_datasets
+            else []
+        )
+        # Collect eval dataset names for per-eval-dataset reward routing
+        # (mirror of the training-side bookkeeping).
+        eval_dataset_names = (
+            [ed.name for ed in self.config.data_args.eval_datasets]
+            if self.config.data_args.eval_datasets
             else []
         )
 
@@ -145,9 +146,9 @@ class BaseTrainer(ABC):
         self.reward_loader = MultiRewardLoader(
             reward_args=self.config.reward_args,
             accelerator=self.accelerator,
+            training_dataset_names=training_dataset_names,
             eval_reward_args=self.config.eval_reward_args,
             eval_dataset_names=eval_dataset_names,
-            training_dataset_names=training_dataset_names,
         ).load()
         # Get training & eval reward models
         self.reward_models = self.reward_loader.get_training_reward_models()
