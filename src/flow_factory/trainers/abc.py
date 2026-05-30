@@ -683,64 +683,12 @@ class BaseTrainer(ABC):
         return samples
 
     def evaluate(self) -> None:
-        """Evaluation loop: supports both single-dataset (legacy) and multi-dataset modes.
+        """Evaluation loop: a single, unified per-dataset path.
 
-        Uses EMA parameters (if available) and eval-specific config (resolution,
-        inference steps, guidance scale). Rewards are gathered across all ranks
-        and logged as mean/std.
+        For every eval-eligible entry in ``data.datasets`` (which now
+        includes the canonicalized legacy ``data.dataset_dir`` when a
+        ``test.jsonl`` exists):
 
-        Dispatches to ``_evaluate_multi_dataset()`` when ``eval_dataloaders`` is
-        populated, otherwise falls back to the legacy single-test-dataloader path.
-        """
-        if self.eval_dataloaders:
-            self._evaluate_multi_dataset()
-        elif self.test_dataloader is not None:
-            self._evaluate_single_dataset()
-
-    def _evaluate_single_dataset(self) -> None:
-        """Legacy single-dataset evaluation (unchanged behavior)."""
-        self.adapter.eval()
-        self.eval_reward_buffer.clear()
-
-        with torch.no_grad(), self.autocast(), self.adapter.use_ema_parameters():
-            all_samples: List[BaseSample] = []
-
-            for batch in tqdm(
-                self.test_dataloader,
-                desc='Evaluating',
-                disable=not self.show_progress_bar,
-            ):
-                generator = create_generator_by_prompt(batch['prompt'], self.training_args.seed)
-                samples = self.sample_batch(
-                    batch,
-                    reward_buffer=self.eval_reward_buffer,
-                    compute_log_prob=False,
-                    generator=generator,
-                    trajectory_indices=None,
-                    **self.eval_args,
-                )
-                all_samples.extend(samples)
-
-            rewards = self.eval_reward_buffer.finalize(store_to_samples=True, split='pointwise')
-
-            # Gather across ranks and log
-            rewards = {k: torch.as_tensor(v).to(self.accelerator.device) for k, v in rewards.items()}
-            gathered_rewards = {
-                k: self.accelerator.gather(v).cpu().numpy()
-                for k, v in rewards.items()
-            }
-
-            if self.accelerator.is_main_process:
-                _log_data = {f'eval/reward_{k}_mean': np.mean(v) for k, v in gathered_rewards.items()}
-                _log_data.update({f'eval/reward_{k}_std': np.std(v) for k, v in gathered_rewards.items()})
-                _log_data['eval_samples'] = all_samples
-                self.log_data(_log_data, step=self.step)
-            self.accelerator.wait_for_everyone()
-
-    def _evaluate_multi_dataset(self) -> None:
-        """Evaluate across multiple eval datasets, each with its own reward set.
-
-        For each eval dataset:
         1. Generate samples using the dataset's DataLoader with per-dataset
            eval overrides (resolution, guidance_scale, num_inference_steps).
         2. Compute rewards via the dataset-specific RewardBuffer.
@@ -748,8 +696,14 @@ class BaseTrainer(ABC):
         4. Log metrics under ``eval/{dataset_name}/reward_{name}_{stat}``.
 
         Logs are flushed per-dataset to avoid holding all generated samples
-        in memory simultaneously.
+        in memory simultaneously.  Uses EMA parameters (if available) and
+        eval-specific config (resolution, inference steps, guidance scale).
+
+        No-op when ``self.eval_dataloaders`` is empty.
         """
+        if not self.eval_dataloaders:
+            return
+
         self.adapter.eval()
 
         with torch.no_grad(), self.autocast(), self.adapter.use_ema_parameters():
@@ -765,7 +719,7 @@ class BaseTrainer(ABC):
 
                 # Merge per-dataset eval overrides with shared eval_args
                 ed_config = self._eval_dataset_configs[dataset_name]
-                eval_kwargs = ed_config.get_merged_eval_kwargs(self.eval_args)
+                eval_kwargs = ed_config.eval.get_merged_eval_kwargs(self.eval_args) if ed_config.eval else dict(self.eval_args)
 
                 for batch in tqdm(
                     dataloader,
@@ -805,6 +759,8 @@ class BaseTrainer(ABC):
                         log_data[f'eval/{dataset_name}/reward_{k}_std'] = np.std(v)
                     log_data[f'eval/{dataset_name}/samples'] = all_samples
                     self.log_data(log_data, step=self.step)
+
+        self.accelerator.wait_for_everyone()
 
         self.accelerator.wait_for_everyone()
 
