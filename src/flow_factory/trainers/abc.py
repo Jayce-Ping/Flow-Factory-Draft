@@ -157,8 +157,8 @@ class BaseTrainer(ABC):
         self.reward_models = self.reward_loader.get_training_reward_models()
         self.eval_reward_models = self.reward_loader.get_eval_reward_models()
         train_reward_configs = self.reward_loader.get_reward_configs('train')
-        eval_reward_configs = self.reward_loader.get_reward_configs('eval')
-        # Initialize reward processor
+        # Initialize reward processor (training side only — eval-side
+        # processors are per-dataset, built below).
         group_on_same_rank = self.config.data_args.sampler_type == "group_contiguous"
         self.reward_processor = RewardProcessor(
             accelerator=self.accelerator,
@@ -168,23 +168,16 @@ class BaseTrainer(ABC):
             group_on_same_rank=group_on_same_rank,
             verbose=self.log_args.verbose,
         )
-        self.eval_reward_processor = RewardProcessor(
-            accelerator=self.accelerator,
-            reward_models=self.eval_reward_models,
-            reward_configs=eval_reward_configs,
-            tokenizer=self.adapter.tokenizer, # For prompt encoding/decoding
-            group_on_same_rank=group_on_same_rank,
-            verbose=self.log_args.verbose,
-        )
-        # Initialize reward buffers
+        # Initialize the training-side reward buffer.
         self.reward_buffer = RewardBuffer(
             self.reward_processor, self.training_args.group_size,
         )
-        self.eval_reward_buffer = RewardBuffer(
-            self.eval_reward_processor, self.training_args.group_size,
-        )
 
-        # Per-eval-dataset reward processors and buffers (multi-eval mode)
+        # Per-eval-dataset reward processors and buffers.  Eval is now
+        # always per-dataset (the legacy single `eval_reward_buffer`
+        # was retired with the unified `evaluate()` path); the loop
+        # below builds one processor + buffer per eval-eligible entry,
+        # which `evaluate()` then iterates.
         self.eval_dataset_reward_processors: Dict[str, RewardProcessor] = {}
         self.eval_dataset_reward_buffers: Dict[str, RewardBuffer] = {}
         self._eval_dataset_configs: Dict[str, Any] = {}
@@ -223,7 +216,7 @@ class BaseTrainer(ABC):
 
         return self.reward_models, self.eval_reward_models
 
-    def _init_dataloader(self) -> Tuple[Optional[DataLoader], Union[None, DataLoader]]:
+    def _init_dataloader(self) -> Optional[DataLoader]:
         # Move text-encoder & vae to GPU for dataloader encoding
         self.adapter.on_load_components(
             components=self.adapter.preprocessing_modules,
@@ -242,23 +235,19 @@ class BaseTrainer(ABC):
         )
         self.train_dataloaders_by_source: Dict[str, DataLoader] = train_dataloaders_by_source
 
-        # Eval side: a single, unified path.  The legacy
+        # Eval side: a single, unified per-dataset path.  The legacy
         # `data.dataset_dir` -> 1-entry `data.datasets` canonicalization
         # in `Arguments._canonicalize_legacy_dataset_dir` already
         # populates a `DatasetEvalSpec()` when `test.jsonl` exists, so
         # `get_eval_dataloaders` handles BOTH the legacy and the
-        # multi-eval cases.  When no eval-eligible entry exists at all
-        # the dict is empty and `evaluate()` becomes a no-op.
+        # multi-eval cases.  When no eval-eligible entry exists the
+        # dict is empty and `evaluate()` becomes a no-op.
         self.eval_dataloaders: Dict[str, DataLoader] = get_eval_dataloaders(
             eval_datasets=self.config.data_args.eval_datasets,
             config=self.config,
             accelerator=self.accelerator,
             preprocess_func=self.adapter.preprocess_func,
         )
-        # `test_dataloader` is now permanently None — kept as a return
-        # slot for one more commit so subclasses that override
-        # `_init_dataloader` don't break in lock-step; step 5 drops it.
-        test_dataloader: Optional[DataLoader] = None
 
         # Offload text-encoder after dataloader encoding
         self.adapter.off_load_components(
@@ -267,7 +256,7 @@ class BaseTrainer(ABC):
 
         self.accelerator.wait_for_everyone()
 
-        return dataloader, test_dataloader
+        return dataloader
     
     def _init_optimizer(self) -> torch.optim.Optimizer:
         """Initialize optimizer."""
@@ -315,7 +304,7 @@ class BaseTrainer(ABC):
             self._synchronize_frozen_components()
 
         # Init dataloader and optimizer
-        self.dataloader, self.test_dataloader = self._init_dataloader()
+        self.dataloader = self._init_dataloader()
         self.optimizer = self._init_optimizer()
         # Prepare everything with accelerator
         # Dynamically get all trainable modules from target_module_map
@@ -325,10 +314,8 @@ class BaseTrainer(ABC):
             for name in trainable_module_names
             if hasattr(self.adapter, name) and getattr(self.adapter, name) is not None
         ]
-        # Prepare trainable modules + optimizer + test_dataloader
+        # Prepare trainable modules + optimizer
         to_prepare = trainable_modules + [self.optimizer]
-        if self.test_dataloader is not None:
-            to_prepare.append(self.test_dataloader)
 
         prepared = self.accelerator.prepare(*to_prepare)
         # Here, `self.dataloader` is not prepared since it has been handled with DistributedKRepeatSampler
@@ -337,8 +324,6 @@ class BaseTrainer(ABC):
                 self.adapter.set_component(name, prepared[i])
 
         self.optimizer = prepared[len(trainable_modules)]
-        if self.test_dataloader is not None:
-            self.test_dataloader = prepared[len(trainable_modules) + 1]
 
         # Prepare multi-eval dataloaders
         if self.eval_dataloaders:
@@ -797,14 +782,12 @@ class BaseTrainer(ABC):
         the caller is expected to follow with os._exit() which will forcefully
         reclaim all resources including GPU memory.
         """
-        for buf in (
-            getattr(self, 'reward_buffer', None),
-            getattr(self, 'eval_reward_buffer', None),
-        ):
-            if buf is not None:
-                buf.shutdown(wait=False, cancel_futures=True)
+        # Training-side reward buffer.
+        train_buf = getattr(self, 'reward_buffer', None)
+        if train_buf is not None:
+            train_buf.shutdown(wait=False, cancel_futures=True)
 
-        # Shutdown multi-eval-dataset reward buffers
+        # Per-eval-dataset reward buffers.
         for buf in getattr(self, 'eval_dataset_reward_buffers', {}).values():
             if buf is not None:
                 buf.shutdown(wait=False, cancel_futures=True)

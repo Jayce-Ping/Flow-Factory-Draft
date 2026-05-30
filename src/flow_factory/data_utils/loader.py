@@ -324,10 +324,8 @@ def get_train_dataloader(
                 batch_size=training_args.per_device_batch_size,
             )
 
-    # The legacy single-test path lives in `_build_legacy_test_dataloader`
-    # and is invoked from `BaseTrainer._init_dataloader` only as a
-    # transitional bridge; it'll be folded into `get_eval_dataloaders`
-    # in the next commit.
+    # The eval / test path is fully owned by `get_eval_dataloaders`;
+    # callers requesting an eval loader must invoke it explicitly.
 
     return train_loader, train_loaders_by_source
 
