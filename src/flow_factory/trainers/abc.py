@@ -127,8 +127,8 @@ class BaseTrainer(ABC):
 
         # Collect eval dataset names for per-dataset reward routing
         eval_dataset_names = (
-            [ed.name for ed in self.config.eval_datasets]
-            if self.config.eval_datasets
+            [ed.name for ed in self.config.data_args.eval_datasets]
+            if self.config.data_args.eval_datasets
             else []
         )
 
@@ -175,9 +175,9 @@ class BaseTrainer(ABC):
         self.eval_dataset_reward_buffers: Dict[str, RewardBuffer] = {}
         self._eval_dataset_configs: Dict[str, Any] = {}
 
-        if self.config.eval_datasets:
-            self._eval_dataset_configs = {ed.name: ed for ed in self.config.eval_datasets}
-            for ed in self.config.eval_datasets:
+        if self.config.data_args.eval_datasets:
+            self._eval_dataset_configs = {ed.name: ed for ed in self.config.data_args.eval_datasets}
+            for ed in self.config.data_args.eval_datasets:
                 ds_models = self.reward_loader.get_eval_dataset_reward_models(ed.name)
                 ds_configs = self.reward_loader.get_eval_dataset_reward_configs(ed.name)
                 if ds_models:
@@ -222,9 +222,9 @@ class BaseTrainer(ABC):
         )
 
         # Multi-eval-dataset support: load additional eval dataloaders
-        if self.config.eval_datasets:
+        if self.config.data_args.eval_datasets:
             self.eval_dataloaders: Dict[str, DataLoader] = get_eval_dataloaders(
-                eval_datasets=self.config.eval_datasets,
+                eval_datasets=self.config.data_args.eval_datasets,
                 config=self.config,
                 accelerator=self.accelerator,
                 preprocess_func=self.adapter.preprocess_func,

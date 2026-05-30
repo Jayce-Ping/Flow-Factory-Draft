@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 
 from ..data_utils.dataset import PreprocessCallable
 from ..hparams import Arguments
-from ..hparams.eval_dataset_args import EvalDatasetArguments
+from ..hparams.dataset_args import DatasetArguments
 from ..utils.base import filter_kwargs
 from ..utils.logger_utils import setup_logger
 from .dataset import GeneralDataset
@@ -308,7 +308,7 @@ def get_dataloader(
 
 
 def get_eval_dataloaders(
-    eval_datasets: List[EvalDatasetArguments],
+    eval_datasets: List[DatasetArguments],
     config: Arguments,
     accelerator: Accelerator,
     preprocess_func: Optional[PreprocessCallable] = None,
@@ -321,7 +321,9 @@ def get_eval_dataloaders(
     name to prevent collisions).
 
     Args:
-        eval_datasets: List of evaluation dataset configurations.
+        eval_datasets: List of evaluation-eligible dataset configurations
+            (typically ``config.data_args.eval_datasets`` — the property
+            returning ``[d for d in data.datasets if d.is_eval_source]``).
         config: Full configuration object (for model info, data args, eval args).
         accelerator: Accelerator for distributed preprocessing.
         preprocess_func: Model adapter's preprocessing function.
@@ -345,10 +347,18 @@ def get_eval_dataloaders(
     eval_dataloaders: Dict[str, DataLoader] = {}
 
     for ed in eval_datasets:
+        # Each entry is a DatasetArguments; its eval-only block carries
+        # the split / size / sampling overrides.
+        spec = ed.eval
+        if spec is None or not spec.enabled:
+            # Defensive: caller should have already filtered via the
+            # `is_eval_source` property, but keep this safety net.
+            continue
+
         # Check that the split file exists
-        if not GeneralDataset.check_exists(ed.dataset_dir, ed.split):
+        if not GeneralDataset.check_exists(ed.dataset_dir, spec.split):
             logger.warning(
-                f"Eval dataset '{ed.name}': split '{ed.split}' not found in "
+                f"Eval dataset '{ed.name}': split '{spec.split}' not found in "
                 f"'{ed.dataset_dir}', skipping."
             )
             continue
@@ -365,17 +375,20 @@ def get_eval_dataloaders(
         }
         base_kwargs.update(filter_kwargs(GeneralDataset.__init__, **data_args))
 
-        # Override dataset_dir and per-dataset fields
+        # Override dataset_dir, per-dataset media-root overrides, and the
+        # eval-spec-level max_dataset_size (if set).
         base_kwargs["dataset_dir"] = ed.dataset_dir
         base_kwargs["force_reprocess"] = data_args.force_reprocess
-        for field_name in ("image_dir", "video_dir", "audio_dir", "max_dataset_size"):
+        for field_name in ("image_dir", "video_dir", "audio_dir"):
             val = getattr(ed, field_name, None)
             if val is not None:
                 base_kwargs[field_name] = val
+        if spec.max_dataset_size is not None:
+            base_kwargs["max_dataset_size"] = spec.max_dataset_size
 
         # Create/load dataset
         dataset = _create_or_load_dataset(
-            split=ed.split,
+            split=spec.split,
             accelerator=accelerator,
             base_kwargs=base_kwargs,
             enable_distributed=enable_distributed,

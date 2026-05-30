@@ -20,7 +20,7 @@ Supports loading from YAML files with nested structure.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field, fields
-from typing import Any, List, Literal, Optional
+from typing import Any, Literal, Optional
 import yaml
 from datetime import datetime
 import math
@@ -31,7 +31,6 @@ from .model_args import ModelArguments
 from .scheduler_args import SchedulerArguments
 from .training_args import TrainingArguments, EvaluationArguments, get_training_args_class
 from .reward_args import RewardArguments, MultiRewardArguments
-from .eval_dataset_args import EvalDatasetArguments
 from .log_args import LogArguments
 from ..utils.logger_utils import setup_logger
 from ..utils.dist import get_world_size
@@ -123,62 +122,17 @@ class Arguments(ArgABC):
         default=None,
         metadata={"help": "Arguments for multiple evaluation reward configurations."},
     )
-    eval_datasets: Optional[List[EvalDatasetArguments]] = field(
-        default=None,
-        metadata={
-            "help": "List of evaluation dataset configurations. "
-                    "When provided, enables multi-eval-dataset mode where each dataset "
-                    "is independently preprocessed and evaluated with its applicable rewards "
-                    "(determined by the `datasets` field in eval_rewards entries)."
-        },
-    )
 
     def __post_init__(self):
         if self.log_args.run_name is None:
             time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.log_args.run_name = f"{self.model_args.model_type}_{self.model_args.finetune_type}_{self.training_args.trainer_type}_{time_stamp}"
 
-        self._validate_eval_datasets()
         self._validate_dataset_routing()
         self._resolve_scheduler_sde_defaults()
         self._resolve_sampler_type()
         self._align_batch_geometry()
         self._adjust_gradient_accumulation()
-
-    def _validate_eval_datasets(self) -> None:
-        """Validate eval_datasets configuration and reward routing.
-
-        Checks:
-        - No duplicate eval dataset names.
-        - All ``datasets`` references in ``eval_reward_args`` point to declared
-          eval dataset names.
-        - Warns if ``eval_datasets`` is set alongside legacy ``eval_reward_args``
-          without ``datasets`` routing (ambiguous).
-        """
-        if not self.eval_datasets:
-            return
-
-        # Check for duplicate names
-        names = [ed.name for ed in self.eval_datasets]
-        if len(names) != len(set(names)):
-            dupes = [n for n in names if names.count(n) > 1]
-            raise ValueError(
-                f"Duplicate eval_datasets names detected: {sorted(set(dupes))}. "
-                "Each eval dataset must have a unique name."
-            )
-
-        # Validate reward → dataset routing
-        if self.eval_reward_args:
-            valid_names = set(names)
-            for reward_cfg in self.eval_reward_args.reward_configs:
-                if reward_cfg.datasets is not None:
-                    unknown = set(reward_cfg.datasets) - valid_names
-                    if unknown:
-                        raise ValueError(
-                            f"eval_rewards entry '{reward_cfg.name}' references unknown "
-                            f"eval dataset(s): {sorted(unknown)}. "
-                            f"Valid eval dataset names are: {sorted(valid_names)}."
-                        )
 
     def _validate_dataset_routing(self) -> None:
         """Validate the unified ``data.datasets`` schema and reward routing.
@@ -191,8 +145,6 @@ class Arguments(ArgABC):
           reject the dataclass default ``"data"`` itself, as many configs
           set it explicitly).
         * Uniqueness of dataset names across the ``data.datasets`` list.
-        * Disjointness from the legacy top-level ``eval_datasets`` field
-          (if still in use) — both share the metric-key namespace.
         * ``train.weight > 0`` for every training participant.
         * Cross-validation of every ``RewardArguments.datasets`` entry
           against the union of declared training / eval dataset names.
@@ -231,20 +183,6 @@ class Arguments(ArgABC):
                 f"Duplicate `data.datasets` names: {dupes}. "
                 "Each dataset entry must have a unique name."
             )
-        unified_names = set(names)
-
-        # Disjointness from the legacy top-level eval_datasets field.
-        # (Removed in step 4; shim still injects them as DatasetArguments
-        # under data.datasets, so a clash here means YAML duplication.)
-        if self.eval_datasets:
-            legacy_eval_names = {ed.name for ed in self.eval_datasets}
-            clash = unified_names & legacy_eval_names
-            if clash:
-                raise ValueError(
-                    f"`data.datasets` and the legacy top-level `eval_datasets:` overlap on "
-                    f"name(s): {sorted(clash)}. Pick one location — they share the "
-                    "metric-key namespace."
-                )
 
         # Weight > 0 for every training participant.
         bad_weights: list[tuple[str, float | None]] = []
@@ -263,9 +201,7 @@ class Arguments(ArgABC):
 
         # Cross-validate reward `datasets` references.
         train_names = {d.name for d in tds_unified if d.is_training_source}
-        eval_names_unified = {d.name for d in tds_unified if d.is_eval_source}
-        legacy_eval_names = {ed.name for ed in (self.eval_datasets or [])}
-        eval_names = eval_names_unified | legacy_eval_names
+        eval_names = {d.name for d in tds_unified if d.is_eval_source}
 
         # Training rewards: `datasets` must reference TRAINING-source names.
         for rc in self.reward_args:
@@ -285,9 +221,6 @@ class Arguments(ArgABC):
                 )
 
         # Eval rewards: `datasets` must reference EVAL-source names.
-        # (Eval rewards may legitimately point at legacy top-level
-        # `eval_datasets` entries as long as they share the same name
-        # space — handled by the union above.)
         if self.eval_reward_args and eval_names:
             for rc in self.eval_reward_args:
                 if rc.datasets is None:
@@ -687,11 +620,6 @@ class Arguments(ArgABC):
             'eval_rewards': ('eval_reward_args', MultiRewardArguments),
         }
 
-        # Special list-of-dataclass keys (not single ArgABC instances)
-        list_keys = {
-            'eval_datasets': ('eval_datasets', EvalDatasetArguments),
-        }
-
         # 3. Build init kwargs
         init_kwargs = {}
         extras = {}
@@ -702,15 +630,6 @@ class Arguments(ArgABC):
             if k in nested_map:
                 arg_name, arg_cls = nested_map[k]
                 init_kwargs[arg_name] = arg_cls.from_dict(v)
-
-            elif k in list_keys:
-                arg_name, item_cls = list_keys[k]
-                if isinstance(v, list):
-                    init_kwargs[arg_name] = [item_cls.from_dict(item) for item in v]
-                else:
-                    raise ValueError(
-                        f"Expected a list for '{k}', got {type(v).__name__}."
-                    )
 
             elif k in valid_field_names:
                 init_kwargs[k] = v
