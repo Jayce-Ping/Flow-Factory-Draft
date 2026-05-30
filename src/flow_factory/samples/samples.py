@@ -18,7 +18,7 @@ import os
 import re
 import json
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, Tuple, List, Union, Literal, Iterable, ClassVar
+from typing import Dict, Any, Optional, Set, Tuple, List, Union, Literal, Iterable, ClassVar
 from dataclasses import dataclass, field, asdict, fields
 import hashlib
 import numpy as np
@@ -103,6 +103,15 @@ class BaseSample:
     negative_prompt_ids : Optional[torch.Tensor] = None
     negative_prompt_embeds : Optional[torch.Tensor] = None
     extra_kwargs : Dict[str, Any] = field(default_factory=dict)
+
+    # Set of reward names that COULD have applied to this sample given
+    # the current routing config (i.e. whose ``RewardArguments.datasets``
+    # contained this sample's ``__source__``, or was None).  Populated
+    # by ``RewardProcessor`` whenever a reward is computed.  Read by
+    # ``AdvantageProcessor`` to aggregate authoritatively rather than
+    # relying on ``np.isnan`` (which would silently mask in-model NaN
+    # bugs).  See plan §6 for the design.
+    applicable_rewards: Set[str] = field(default_factory=set, repr=False, compare=False)
 
     _unique_id: Optional[int] = field(default=None, repr=False, compare=False)
 
