@@ -129,10 +129,58 @@ class Arguments(ArgABC):
             self.log_args.run_name = f"{self.model_args.model_type}_{self.model_args.finetune_type}_{self.training_args.trainer_type}_{time_stamp}"
 
         self._validate_dataset_routing()
+        # Resolve `RewardArguments.datasets is None` -> concrete list of
+        # applicable dataset names. Must run AFTER validation (so the
+        # unknown-name check is against the user's raw input, not the
+        # expanded list) and BEFORE any consumer reads the field.
+        self._resolve_reward_dataset_routing()
         self._resolve_scheduler_sde_defaults()
         self._resolve_sampler_type()
         self._align_batch_geometry()
         self._adjust_gradient_accumulation()
+
+    def _resolve_reward_dataset_routing(self) -> None:
+        """Replace ``RewardArguments.datasets is None`` with the explicit list.
+
+        After this method returns, every reward's ``datasets`` field is a
+        concrete ``List[str]``:
+
+        * ``datasets=None`` (user wrote ``null`` or omitted the field) is
+          replaced with the full list of applicable dataset names for that
+          reward's side (training rewards -> training-source names; eval
+          rewards -> eval-source names).
+        * ``datasets=[]`` (explicit empty list) is left as-is and a warning
+          is emitted, because the reward will never fire — almost certainly
+          a misconfiguration but the user is allowed to express it.
+        * ``datasets=[name1, ...]`` (explicit non-empty list) is left as-is
+          (validation already ran).
+
+        Consumers (RewardProcessor, MultiRewardLoader,
+        AdvantageProcessor, log builders) can therefore read ``datasets``
+        as a concrete list without any ``is None`` short-circuit.
+        """
+        train_names = [d.name for d in self.data_args.training_datasets]
+        eval_names = [d.name for d in self.data_args.eval_datasets]
+
+        def _resolve_one_side(reward_args, applicable_universe, side: str) -> None:
+            if not reward_args:
+                return
+            for rc in reward_args:
+                if rc.datasets is None:
+                    # Eager copy: rewards never share their `datasets` list
+                    # so mutating one cannot bleed into another.
+                    rc.datasets = list(applicable_universe)
+                elif len(rc.datasets) == 0:
+                    logger.warning(
+                        f"{side} reward '{rc.name}' has `datasets: []` — "
+                        "it will never fire. If you intended 'apply to every "
+                        "dataset', omit the field or set it to null."
+                    )
+                # else: explicit non-empty list, leave alone (validation
+                # already confirmed every name is in the universe).
+
+        _resolve_one_side(self.reward_args, train_names, side="Training")
+        _resolve_one_side(self.eval_reward_args, eval_names, side="Eval")
 
     def _validate_dataset_routing(self) -> None:
         """Validate the unified ``data.datasets`` schema and reward routing.

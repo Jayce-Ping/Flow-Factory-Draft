@@ -130,9 +130,27 @@ class RewardArguments(ArgABC):
     datasets: Optional[List[str]] = field(
         default=None,
         metadata={
-            "help": "List of eval dataset names this reward applies to. "
-                    "When None (default), the reward applies to ALL eval datasets. "
-                    "Only relevant for eval_rewards; ignored for training rewards."
+            "help": (
+                "List of dataset names this reward applies to. The interpretation "
+                "depends on whether this reward is in `rewards:` (training) or "
+                "`eval_rewards:` (eval):\n"
+                "  - In `rewards:`: matches `data.datasets[*].name` of "
+                "    training-eligible entries. \n"
+                "  - In `eval_rewards:`: matches `data.datasets[*].name` of "
+                "    eval-eligible entries.\n"
+                "User-facing semantics:\n"
+                "  - `None` (default) or omitted: 'apply to every dataset of "
+                "    my side'. After `Arguments.__post_init__` runs, this "
+                "    sentinel is RESOLVED into the explicit list of applicable "
+                "    dataset names — so the in-memory and printed config show "
+                "    the concrete list, not `null`.\n"
+                "  - `[]` (empty list): 'apply to no dataset'. Honoured as-is "
+                "    with a warning ('this reward will never fire').\n"
+                "  - `[name1, name2, ...]`: explicit list, validated.\n"
+                "Post-resolution invariant: `datasets` is ALWAYS a "
+                "`List[str]` after `Arguments.__post_init__`. Consumers should "
+                "never need to handle `None`."
+            )
         },
     )
 

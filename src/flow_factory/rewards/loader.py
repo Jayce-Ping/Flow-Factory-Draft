@@ -235,8 +235,13 @@ class MultiRewardLoader:
 
         For each training dataset name, determines which TRAINING rewards
         apply to it (using each ``RewardArguments.datasets`` field).
-        ``datasets is None`` means "applies to every source"; an explicit
-        list means "applies only to listed sources".
+
+        Contract: ``RewardArguments.datasets`` is normally resolved by
+        :meth:`Arguments._resolve_reward_dataset_routing` into a
+        concrete ``List[str]`` before this method runs. ``None`` is
+        accepted defensively (as "applies to every source") for callers
+        that construct a ``MultiRewardLoader`` outside the ``Arguments``
+        flow, e.g. in tests.
 
         When ``training_dataset_names`` is empty (legacy single-source mode),
         this is a no-op.
@@ -264,9 +269,10 @@ class MultiRewardLoader:
     def _build_eval_dataset_mappings(self) -> None:
         """Build per-eval-dataset reward routing from the ``datasets`` field.
 
-        For each eval dataset name, determines which eval rewards apply to it:
-        - If a reward's ``datasets`` is None → applies to ALL eval datasets.
-        - If a reward's ``datasets`` is a list → applies only to listed datasets.
+        Same contract as :meth:`_build_training_dataset_mappings`:
+        ``RewardArguments.datasets`` is normally a concrete ``List[str]``
+        post-resolution; ``None`` is accepted defensively (as "applies to
+        every dataset") for direct callers.
 
         When no eval_dataset_names are configured, this is a no-op (legacy mode).
         """
@@ -279,7 +285,6 @@ class MultiRewardLoader:
 
             for reward_name, identity_key in self._eval_name_to_key.items():
                 reward_cfg = self._eval_name_to_config[reward_name]
-                # Check if this reward applies to this dataset
                 applies = (
                     reward_cfg.datasets is None
                     or dataset_name in reward_cfg.datasets

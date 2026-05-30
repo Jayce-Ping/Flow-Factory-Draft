@@ -92,7 +92,12 @@ class RewardProcessor:
 
         Routing rules:
 
-        - ``RewardArguments.datasets is None`` -> applies to every sample.
+        - ``RewardArguments.datasets`` is normally a concrete ``List[str]``
+          here (resolved by ``Arguments._resolve_reward_dataset_routing``).
+          As a defensive fallback for callers that construct a
+          ``RewardProcessor`` outside the ``Arguments`` flow, ``None`` is
+          also treated as "applies to every sample" — same semantics as the
+          unresolved sentinel.
         - When the sample has no ``__source__`` field (legacy single-source
           mode), absence is treated as "applies" -- preserves byte-identical
           behavior for configs that don't use ``data.datasets``.
