@@ -180,7 +180,7 @@ class BaseTrainer(ABC):
         # which `evaluate()` then iterates.
         self.eval_dataset_reward_processors: Dict[str, RewardProcessor] = {}
         self.eval_dataset_reward_buffers: Dict[str, RewardBuffer] = {}
-        self._eval_dataset_configs: Dict[str, Any] = {}
+        self._eval_dataset_configs: Dict[str, "DatasetArguments"] = {}
 
         if self.config.data_args.eval_datasets:
             self._eval_dataset_configs = {ed.name: ed for ed in self.config.data_args.eval_datasets}
@@ -235,13 +235,9 @@ class BaseTrainer(ABC):
         )
         self.train_dataloaders_by_source: Dict[str, DataLoader] = train_dataloaders_by_source
 
-        # Eval side: a single, unified per-dataset path.  The legacy
-        # `data.dataset_dir` -> 1-entry `data.datasets` canonicalization
-        # in `Arguments._canonicalize_legacy_dataset_dir` already
-        # populates a `DatasetEvalSpec()` when `test.jsonl` exists, so
-        # `get_eval_dataloaders` handles BOTH the legacy and the
-        # multi-eval cases.  When no eval-eligible entry exists the
-        # dict is empty and `evaluate()` becomes a no-op.
+        # Eval side: unified per-dataset path.  When no eval-eligible
+        # entry exists in `data.datasets` the dict is empty and
+        # `evaluate()` becomes a no-op.
         self.eval_dataloaders: Dict[str, DataLoader] = get_eval_dataloaders(
             eval_datasets=self.config.data_args.eval_datasets,
             config=self.config,
@@ -505,6 +501,28 @@ class BaseTrainer(ABC):
         return sample_batch
 
     @staticmethod
+    def _augment_batch_with_source(
+        batch: Dict[str, Any],
+        source_name: str,
+        source_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Stamp source routing keys onto a batch dict for downstream propagation.
+
+        Plain DataLoaders (eval, future standalone sampling) lack the
+        automatic ``__source__`` / ``__source_id__`` injection that
+        ``MultiSourceTrainDataLoader`` provides.  Call this before
+        ``sample_batch`` so ``_inject_batch_metadata`` can propagate
+        source onto every generated sample via its existing K-repeat
+        broadcast logic.
+        """
+        batch = dict(batch)
+        B = len(batch["prompt"])
+        batch["__source__"] = [source_name] * B
+        if source_id is not None:
+            batch["__source_id__"] = [source_id] * B
+        return batch
+
+    @staticmethod
     def _inject_batch_metadata(
         samples: List[BaseSample],
         batch: Dict[str, Any],
@@ -711,6 +729,9 @@ class BaseTrainer(ABC):
                     desc=f'Eval/{dataset_name}',
                     disable=not self.show_progress_bar,
                 ):
+                    batch = self._augment_batch_with_source(
+                        batch, dataset_name, ed_config.source_id
+                    )
                     generator = create_generator_by_prompt(
                         batch['prompt'], self.training_args.seed
                     )
@@ -744,8 +765,6 @@ class BaseTrainer(ABC):
                         log_data[f'eval/{dataset_name}/reward_{k}_std'] = np.std(v)
                     log_data[f'eval/{dataset_name}/samples'] = all_samples
                     self.log_data(log_data, step=self.step)
-
-        self.accelerator.wait_for_everyone()
 
         self.accelerator.wait_for_everyone()
 

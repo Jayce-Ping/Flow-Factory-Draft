@@ -24,7 +24,11 @@ log:
 
 # Data Configuration
 data:
-  dataset_dir: "dataset/pickscore"  # config.dataset = "dataset/pickscore"
+  datasets:
+    - name: default  # Unique identifier (used in metrics, caching, reward routing)
+      dataset_dir: "dataset/pickscore"  # Folder with train.jsonl / test.jsonl
+      train: { weight: 1 }  # Training participation; weight controls multi-source mixing ratio
+      eval: {}  # Eval participation (inherits shared `eval:` section settings)
   preprocessing_batch_size: 16
   dataloader_num_workers: 16
   force_reprocess: false

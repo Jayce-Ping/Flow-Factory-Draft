@@ -600,6 +600,62 @@ class AdvantageProcessor:
     # Log payloads (trainers pass to ``log_data``)
     # ------------------------------------------------------------------
 
+    def _build_base_log_stats(
+        self,
+        gathered_rewards: Dict[str, np.ndarray],
+        group_indices: np.ndarray,
+        applicable: Optional[np.ndarray],
+        reward_keys: Optional[List[str]],
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict[str, bool]]]:
+        """Shared boilerplate for both log-data builders.
+
+        Returns (stat_arrays, r_applicable) where stat_arrays is ready
+        for ``_batch_reduce_stats`` and r_applicable maps each reward
+        key to its boolean mask over gathered samples.
+        """
+        keys_sorted = sorted(gathered_rewards.keys())
+        if applicable is not None and reward_keys is not None:
+            r_applicable = {k: applicable[reward_keys.index(k)] for k in keys_sorted}
+        else:
+            r_applicable = {k: np.ones(len(gathered_rewards[k]), dtype=bool) for k in keys_sorted}
+
+        stat_arrays: Dict[str, np.ndarray] = {}
+        for key in keys_sorted:
+            mask_k = r_applicable[key]
+            stat_arrays[f"reward_{key}"] = gathered_rewards[key][mask_k]
+
+        for key in keys_sorted:
+            mask_k = r_applicable[key]
+            group_means, group_stds = RewardProcessor.compute_group_reward_stats(
+                gathered_rewards[key][mask_k], group_indices[mask_k]
+            )
+            stat_arrays[f"reward_{key}_g_stds"] = group_stds
+            stat_arrays[f"reward_{key}_g_means"] = group_means
+
+        return stat_arrays, r_applicable
+
+    def _unpack_per_reward_log_data(
+        self,
+        all_stats: Dict[str, Dict[str, float]],
+        gathered_rewards: Dict[str, np.ndarray],
+    ) -> Dict[str, Any]:
+        """Unpack per-reward stats common to both log-data builders."""
+        _log_data: Dict[str, Any] = {}
+        keys_sorted = sorted(gathered_rewards.keys())
+        for key in keys_sorted:
+            reward_stats = all_stats[f"reward_{key}"]
+            _log_data[f"train/reward_{key}_mean"] = reward_stats["mean"]
+            _log_data[f"train/reward_{key}_std"] = reward_stats["std"]
+
+        for key in keys_sorted:
+            group_std_stats = all_stats[f"reward_{key}_g_stds"]
+            group_mean_stats = all_stats[f"reward_{key}_g_means"]
+            _log_data[f"train/reward_{key}_group_std_mean"] = group_std_stats["mean"]
+            _log_data[f"train/reward_{key}_group_std_max"] = group_std_stats["max"]
+            _log_data[f"train/reward_{key}_group_std_min"] = group_std_stats["min"]
+            _log_data[f"train/reward_{key}_group_mean_std"] = group_mean_stats["std"]
+        return _log_data
+
     def _build_weighted_sum_log_data(
         self,
         gathered_rewards: Dict[str, np.ndarray],
@@ -610,71 +666,25 @@ class AdvantageProcessor:
         applicable: Optional[np.ndarray] = None,
         reward_keys: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        _log_data: Dict[str, Any] = {}
-        keys_sorted = sorted(gathered_rewards.keys())
+        stat_arrays, r_applicable = self._build_base_log_stats(
+            gathered_rewards, group_indices, applicable, reward_keys
+        )
 
-        # Build per-reward applicability column index for stat masking.
-        # When `applicable` is None (legacy) every position is "applicable"
-        # so the masked stats degenerate to the original behaviour.
-        if applicable is not None and reward_keys is not None:
-            r_applicable = {k: applicable[reward_keys.index(k)] for k in keys_sorted}
-        else:
-            r_applicable = {k: np.ones(len(gathered_rewards[k]), dtype=bool) for k in keys_sorted}
-
-        # Collect all arrays for batched global stats — restricted to applicable.
-        stat_arrays: Dict[str, np.ndarray] = {}
-
-        for key in keys_sorted:
-            mask_k = r_applicable[key]
-            stat_arrays[f"reward_{key}"] = gathered_rewards[key][mask_k]
-
-        # Per-reward group-level distributions (applicable subset only).
-        for key in keys_sorted:
-            mask_k = r_applicable[key]
-            group_means, group_stds = RewardProcessor.compute_group_reward_stats(
-                gathered_rewards[key][mask_k], group_indices[mask_k]
-            )
-            stat_arrays[f"reward_{key}_g_stds"] = group_stds
-            stat_arrays[f"reward_{key}_g_means"] = group_means
-
-        # Aggregated (weighted-sum) reward — already source-aware (NaN
-        # at non-applicable positions was zero-weighted in compute_weighted_sum).
         stat_arrays["reward_agg"] = aggregated_rewards
-
-        # Aggregated reward group-level distributions
         agg_group_means, agg_group_stds = RewardProcessor.compute_group_reward_stats(
             aggregated_rewards, group_indices
         )
         stat_arrays["reward_agg_g_stds"] = agg_group_stds
         stat_arrays["reward_agg_g_means"] = agg_group_means
-
-        # Advantage distribution
         stat_arrays["adv"] = advantages
         stat_arrays["adv_abs"] = np.abs(advantages)
 
-        # Batched reduce (3 all-reduce calls when group_on_same_rank)
         all_stats = self._batch_reduce_stats(stat_arrays)
 
-        # Unpack per-reward stats
-        for key in keys_sorted:
-            reward_stats = all_stats[f"reward_{key}"]
-            _log_data[f"train/reward_{key}_mean"] = reward_stats["mean"]
-            _log_data[f"train/reward_{key}_std"] = reward_stats["std"]
-
-        # Unpack aggregated reward stats
+        _log_data = self._unpack_per_reward_log_data(all_stats, gathered_rewards)
         _log_data["train/reward_mean"] = all_stats["reward_agg"]["mean"]
         _log_data["train/reward_std"] = all_stats["reward_agg"]["std"]
 
-        # Unpack per-reward group stats
-        for key in keys_sorted:
-            group_std_stats = all_stats[f"reward_{key}_g_stds"]
-            group_mean_stats = all_stats[f"reward_{key}_g_means"]
-            _log_data[f"train/reward_{key}_group_std_mean"] = group_std_stats["mean"]
-            _log_data[f"train/reward_{key}_group_std_max"] = group_std_stats["max"]
-            _log_data[f"train/reward_{key}_group_std_min"] = group_std_stats["min"]
-            _log_data[f"train/reward_{key}_group_mean_std"] = group_mean_stats["std"]
-
-        # Unpack aggregated reward group stats
         agg_group_std_stats = all_stats["reward_agg_g_stds"]
         agg_group_mean_stats = all_stats["reward_agg_g_means"]
         _log_data["train/reward_group_std_mean"] = agg_group_std_stats["mean"]
@@ -706,61 +716,24 @@ class AdvantageProcessor:
         applicable: Optional[np.ndarray] = None,
         reward_keys: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        _log_data: Dict[str, Any] = {}
-        keys_sorted = sorted(gathered_rewards.keys())
+        stat_arrays, r_applicable = self._build_base_log_stats(
+            gathered_rewards, group_indices, applicable, reward_keys
+        )
 
-        if applicable is not None and reward_keys is not None:
-            r_applicable = {k: applicable[reward_keys.index(k)] for k in keys_sorted}
-        else:
-            r_applicable = {k: np.ones(len(gathered_rewards[k]), dtype=bool) for k in keys_sorted}
-
-        # Collect all arrays for batched global stats — restricted to applicable.
-        stat_arrays: Dict[str, np.ndarray] = {}
-
-        for key in keys_sorted:
-            mask_k = r_applicable[key]
-            stat_arrays[f"reward_{key}"] = gathered_rewards[key][mask_k]
-
-        for key in keys_sorted:
-            mask_k = r_applicable[key]
-            group_means, group_stds = RewardProcessor.compute_group_reward_stats(
-                gathered_rewards[key][mask_k], group_indices[mask_k]
-            )
-            stat_arrays[f"reward_{key}_g_stds"] = group_stds
-            stat_arrays[f"reward_{key}_g_means"] = group_means
-
-        # Advantage distribution
         stat_arrays["adv"] = advantages
         stat_arrays["adv_abs"] = np.abs(advantages)
 
-        # Batched reduce (3 all-reduce calls when group_on_same_rank)
         all_stats = self._batch_reduce_stats(stat_arrays)
 
-        # Unpack per-reward stats
-        for key in keys_sorted:
-            reward_stats = all_stats[f"reward_{key}"]
-            _log_data[f"train/reward_{key}_mean"] = reward_stats["mean"]
-            _log_data[f"train/reward_{key}_std"] = reward_stats["std"]
+        _log_data = self._unpack_per_reward_log_data(all_stats, gathered_rewards)
 
-        # Per-reward zero-std ratio (count-based; requires separate all-reduce each).
-        # Use the applicable subset so per-source rewards aren't dragged
-        # toward zero by NaN-padded non-applicable positions.
+        keys_sorted = sorted(gathered_rewards.keys())
         for key in keys_sorted:
             mask_k = r_applicable[key]
             _log_data[f"train/reward_{key}_zero_std_ratio"] = self._metric_zero_std_ratio(
                 gathered_rewards[key][mask_k], group_indices[mask_k]
             )
 
-        # Unpack per-reward group stats
-        for key in keys_sorted:
-            group_std_stats = all_stats[f"reward_{key}_g_stds"]
-            group_mean_stats = all_stats[f"reward_{key}_g_means"]
-            _log_data[f"train/reward_{key}_group_std_mean"] = group_std_stats["mean"]
-            _log_data[f"train/reward_{key}_group_std_max"] = group_std_stats["max"]
-            _log_data[f"train/reward_{key}_group_std_min"] = group_std_stats["min"]
-            _log_data[f"train/reward_{key}_group_mean_std"] = group_mean_stats["std"]
-
-        # Unpack advantage stats
         adv_stats = all_stats["adv"]
         _log_data.update({
             "train/batch_norm_mean": bn_mean,

@@ -170,8 +170,12 @@ class DataArguments(ArgABC):
 
     @property
     def source_name_to_id(self) -> dict[str, int]:
-        """Inverse mapping built lazily from :attr:`source_id_to_name`."""
-        return {n: i for i, n in enumerate(self.source_id_to_name)}
+        """Inverse mapping, cached after first access."""
+        cached = getattr(self, '_source_name_to_id_cache', None)
+        if cached is None:
+            cached = {n: i for i, n in enumerate(self.source_id_to_name)}
+            object.__setattr__(self, '_source_name_to_id_cache', cached)
+        return cached
 
     def to_dict(self) -> dict[str, Any]:
         return super().to_dict()

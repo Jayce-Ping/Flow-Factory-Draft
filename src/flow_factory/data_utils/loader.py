@@ -260,14 +260,10 @@ def get_train_dataloader(
     )
 
     # ------------------------------------------------------------------
-    # Train path: always go through the per-source loader builder.
-    # `Arguments._canonicalize_legacy_dataset_dir` promotes the legacy
-    # single-`data.dataset_dir` config into a synthetic 1-entry
-    # `data.datasets`, so single- and multi-source flow through identical
-    # code here.  The only branch is "wrap in MultiSourceTrainDataLoader
-    # or not": for a single training source we hand back the underlying
-    # plain DataLoader to keep batches lean (no per-batch __source__
-    # injection) and the legacy iteration shape.
+    # Train path: go through the per-source loader builder.  All configs
+    # use `data.datasets` (the unified schema).  For a single training
+    # source we hand back the underlying plain DataLoader to keep batches
+    # lean (no per-batch __source__ injection).
     # ------------------------------------------------------------------
     train_loader: Union[DataLoader, "MultiSourceTrainDataLoader", None]
     train_loaders_by_source: Dict[str, DataLoader] = {}
@@ -330,28 +326,6 @@ def get_train_dataloader(
     return train_loader, train_loaders_by_source
 
 
-def _per_source_arguments_view(config: Arguments, source_M: int) -> Arguments:
-    """Return a shallow ``Arguments`` view with per-source ``M_i`` patched in.
-
-    `get_data_sampler` reads
-    ``config.training_args.unique_sample_num_per_epoch`` and
-    ``config.training_args.group_size`` to size per-source samplers.
-    For multi-source training each source has its own resolved
-    ``M_i`` — but we don't want to mutate the shared ``training_args``
-    in-place (that would corrupt the global counter the trainer reads).
-
-    Solution: shallow-copy ``training_args`` with the per-source value
-    swapped in, leaving every other field aliased.  ``data_args`` and
-    everything else remain aliased — only the one piece of state the
-    sampler reads is replaced.
-    """
-    import copy
-    view = copy.copy(config)
-    view.training_args = copy.copy(config.training_args)
-    view.training_args.unique_sample_num_per_epoch = source_M
-    return view
-
-
 def _load_per_source_train_dataloaders(
     *,
     training_datasets: List[DatasetArguments],
@@ -365,7 +339,7 @@ def _load_per_source_train_dataloaders(
     """Build one DataLoader per declared training source.
 
     Reads the per-source aligned ``M_i`` from
-    ``training_args._per_source_unique_sample_num`` (set by
+    ``DatasetTrainSpec.unique_sample_num_per_epoch`` (set by
     ``Arguments._align_unique_sample_num``).  Each per-source DataLoader
     is fingerprinted with ``train_source:{name}`` so caches don't
     collide across sources that share a ``dataset_dir`` with different
@@ -379,39 +353,25 @@ def _load_per_source_train_dataloaders(
     * Sum of per-source batch counts equals
       ``training_args.num_batches_per_epoch`` (asserted by caller).
     """
-    training_args = config.training_args
-    per_source_M: Optional[Dict[str, int]] = training_args._per_source_unique_sample_num
-    if per_source_M is None:
-        # Should not happen — alignment always populates this when
-        # `data.datasets` is set with at least one training source.
-        raise RuntimeError(
-            "Internal error: training_args._per_source_unique_sample_num is None "
-            "but multi-source training was requested. "
-            "Did Arguments._align_batch_geometry run?"
-        )
-
     out: Dict[str, DataLoader] = {}
     for d in training_datasets:
         spec = d.train
-        assert spec is not None, "is_training_source filter should have caught this."
+        if spec is None:
+            raise RuntimeError(
+                f"Internal error: dataset '{d.name}' passed to "
+                "_load_per_source_train_dataloaders with train=None. "
+                "The is_training_source filter should have excluded it."
+            )
 
         # Per-source media-root + dataset_dir overrides.
         per_kwargs = dict(base_kwargs)
         per_kwargs.update(d.get_dataset_overrides())
         per_kwargs["force_reprocess"] = config.data_args.force_reprocess
 
-        # Cache fingerprint must include the source name so two sources
-        # sharing a dataset_dir with different overrides get separate caches.
-        # Skip the token when there's only one training source so caches
-        # produced by the legacy code path (no `train_source:` token) are
-        # still hits after the canonicalization upgrade — keeps existing
-        # ~/.cache/flow_factory/datasets/* directories valid for users
-        # whose configs flip from `data.dataset_dir` to a 1-entry
-        # `data.datasets` (or stay on the legacy field, which is
-        # canonicalized to a 1-entry list).
+        # Cache fingerprint includes the source name so two sources sharing
+        # a dataset_dir with different overrides get separate caches.
         extra = list(base_kwargs.get("extra_hash_strs", []))
-        if len(training_datasets) > 1:
-            extra.append(f"train_source:{d.name}")
+        extra.append(f"train_source:{d.name}")
         per_kwargs["extra_hash_strs"] = extra
 
         # Per-source max_dataset_size override (DataArguments default
@@ -429,12 +389,6 @@ def _load_per_source_train_dataloaders(
 
         M_i = spec.unique_sample_num_per_epoch
         if M_i is None:
-            # Fallback: read from the legacy private dict on training_args
-            # in case the alignment refactor missed a code path. Should
-            # never trigger after step 5+7 + the per-spec writeback in
-            # `_align_unique_sample_num`.
-            M_i = per_source_M.get(d.name)
-        if M_i is None:
             raise RuntimeError(
                 f"Internal error: per-source unique_sample_num_per_epoch "
                 f"is missing for source '{d.name}'. "
@@ -449,16 +403,15 @@ def _load_per_source_train_dataloaders(
                 f"or grow the dataset."
             )
 
-        # Build a per-source view of `Arguments` so `get_data_sampler`
-        # reads the correct `unique_sample_num_per_epoch` from `config`
-        # without an out-of-band kwarg.  This restores the symmetry the
-        # rest of the pipeline relies on: every quantity the sampler
-        # uses lives in the config it's handed.
-        per_source_config = _per_source_arguments_view(config, source_M=M_i)
         sampler = get_data_sampler(
             dataset=dataset,
-            config=per_source_config,
-            accelerator=accelerator,
+            sampler_type=config.data_args.sampler_type,
+            batch_size=config.training_args.per_device_batch_size,
+            group_size=config.training_args.group_size,
+            unique_sample_num=M_i,
+            num_replicas=accelerator.num_processes,
+            rank=accelerator.process_index,
+            seed=config.training_args.seed,
         )
         out[d.name] = DataLoader(
             dataset,
@@ -516,7 +469,6 @@ class WeightedSourceBatchScheduler:
     def _build(self) -> None:
         """Materialise the per-epoch shuffled name sequence."""
         flat: List[str] = []
-        # Stable order across runs/ranks: iterate sources alphabetically.
         for name in sorted(self._counts.keys()):
             flat.extend([name] * self._counts[name])
 
@@ -525,7 +477,7 @@ class WeightedSourceBatchScheduler:
             return
 
         g = torch.Generator()
-        g.manual_seed(self._seed + self._epoch)
+        g.manual_seed(hash((self._seed, self._epoch, "multi_source_schedule")) & 0xFFFF_FFFF_FFFF_FFFF)
         perm = torch.randperm(len(flat), generator=g).tolist()
         self._schedule = [flat[i] for i in perm]
 
@@ -598,15 +550,7 @@ class MultiSourceTrainDataLoader:
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         self._ensure_iters()
         for src in self._scheduler:
-            try:
-                batch = next(self._iters[src])
-            except StopIteration:
-                # Per-source samplers are cyclic by design (all three
-                # implementations yield indefinitely), so this should
-                # never trigger.  Defensive refresh — keeps the contract
-                # robust against future sampler swaps.
-                self._iters[src] = iter(self._loaders_by_source[src])
-                batch = next(self._iters[src])
+            batch = next(self._iters[src])
 
             B = (
                 self._batch_size
@@ -724,12 +668,8 @@ def get_eval_dataloaders(
 
         # Override dataset_dir, per-dataset media-root overrides, and the
         # eval-spec-level max_dataset_size (if set).
-        base_kwargs["dataset_dir"] = ed.dataset_dir
+        base_kwargs.update(ed.get_dataset_overrides())
         base_kwargs["force_reprocess"] = data_args.force_reprocess
-        for field_name in ("image_dir", "video_dir", "audio_dir"):
-            val = getattr(ed, field_name, None)
-            if val is not None:
-                base_kwargs[field_name] = val
         if spec.max_dataset_size is not None:
             base_kwargs["max_dataset_size"] = spec.max_dataset_size
 

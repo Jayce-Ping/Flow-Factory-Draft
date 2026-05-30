@@ -20,7 +20,7 @@ Factory functions using registry pattern for extensibility.
 Supports both single reward and multi-reward loading with automatic deduplication.
 """
 from __future__ import annotations
-from typing import Dict, List, Optional, Literal
+from typing import Dict, List, Optional, Literal, Tuple
 from dataclasses import dataclass, field
 import logging
 
@@ -220,81 +220,66 @@ class MultiRewardLoader:
             self._eval_name_to_key = self._training_name_to_key.copy()
             self._eval_name_to_config = self._training_name_to_config.copy()
 
-        # Build per-training-dataset reward mappings (training is the primary
-        # path; eval is a check on top of training, so resolve training first).
-        self._build_training_dataset_mappings()
+        # Build per-training-dataset reward mappings
+        self._training_dataset_reward_keys, self._training_dataset_reward_configs = (
+            self._build_dataset_reward_mappings(
+                self._training_dataset_names,
+                self._training_name_to_key,
+                self._training_name_to_config,
+            )
+        )
         # Build per-eval-dataset reward mappings
-        self._build_eval_dataset_mappings()
+        self._eval_dataset_reward_keys, self._eval_dataset_reward_configs = (
+            self._build_dataset_reward_mappings(
+                self._eval_dataset_names,
+                self._eval_name_to_key,
+                self._eval_name_to_config,
+            )
+        )
 
         self._loaded = True
         # logger.info(self.summary())
         return self
 
-    def _build_training_dataset_mappings(self) -> None:
-        """Build per-training-dataset reward routing.
+    @staticmethod
+    def _build_dataset_reward_mappings(
+        dataset_names: List[str],
+        name_to_key: Dict[str, tuple],
+        name_to_config: Dict[str, 'RewardArguments'],
+    ) -> Tuple[Dict[str, Dict[str, tuple]], Dict[str, Dict[str, 'RewardArguments']]]:
+        """Build per-dataset reward routing for a set of dataset names.
 
-        For each training dataset name, determines which TRAINING rewards
-        apply to it (using each ``RewardArguments.datasets`` field).
-
-        Contract: ``RewardArguments.datasets`` is normally resolved by
-        :meth:`Arguments._resolve_reward_dataset_routing` into a
-        concrete ``List[str]`` before this method runs. ``None`` is
-        accepted defensively (as "applies to every source") for callers
+        For each dataset name, determines which rewards apply to it
+        (using each ``RewardArguments.datasets`` field).  ``None`` is
+        accepted defensively as "applies to every source" for callers
         that construct a ``MultiRewardLoader`` outside the ``Arguments``
-        flow, e.g. in tests.
+        flow.
 
-        When ``training_dataset_names`` is empty (legacy single-source mode),
-        this is a no-op.
+        Returns:
+            Tuple of (keys_mapping, configs_mapping) where each maps
+            dataset_name -> {reward_name -> identity_key/config}.
         """
-        if not self._training_dataset_names:
-            return
+        keys_mapping: Dict[str, Dict[str, tuple]] = {}
+        configs_mapping: Dict[str, Dict[str, 'RewardArguments']] = {}
 
-        for dataset_name in self._training_dataset_names:
-            ds_reward_keys: Dict[str, tuple] = {}
-            ds_reward_configs: Dict[str, 'RewardArguments'] = {}
+        for dataset_name in dataset_names:
+            ds_keys: Dict[str, tuple] = {}
+            ds_configs: Dict[str, 'RewardArguments'] = {}
 
-            for reward_name, identity_key in self._training_name_to_key.items():
-                reward_cfg = self._training_name_to_config[reward_name]
+            for reward_name, identity_key in name_to_key.items():
+                reward_cfg = name_to_config[reward_name]
                 applies = (
                     reward_cfg.datasets is None
                     or dataset_name in reward_cfg.datasets
                 )
                 if applies:
-                    ds_reward_keys[reward_name] = identity_key
-                    ds_reward_configs[reward_name] = reward_cfg
+                    ds_keys[reward_name] = identity_key
+                    ds_configs[reward_name] = reward_cfg
 
-            self._training_dataset_reward_keys[dataset_name] = ds_reward_keys
-            self._training_dataset_reward_configs[dataset_name] = ds_reward_configs
+            keys_mapping[dataset_name] = ds_keys
+            configs_mapping[dataset_name] = ds_configs
 
-    def _build_eval_dataset_mappings(self) -> None:
-        """Build per-eval-dataset reward routing from the ``datasets`` field.
-
-        Same contract as :meth:`_build_training_dataset_mappings`:
-        ``RewardArguments.datasets`` is normally a concrete ``List[str]``
-        post-resolution; ``None`` is accepted defensively (as "applies to
-        every dataset") for direct callers.
-
-        When no eval_dataset_names are configured, this is a no-op (legacy mode).
-        """
-        if not self._eval_dataset_names:
-            return
-
-        for dataset_name in self._eval_dataset_names:
-            ds_reward_keys: Dict[str, tuple] = {}
-            ds_reward_configs: Dict[str, 'RewardArguments'] = {}
-
-            for reward_name, identity_key in self._eval_name_to_key.items():
-                reward_cfg = self._eval_name_to_config[reward_name]
-                applies = (
-                    reward_cfg.datasets is None
-                    or dataset_name in reward_cfg.datasets
-                )
-                if applies:
-                    ds_reward_keys[reward_name] = identity_key
-                    ds_reward_configs[reward_name] = reward_cfg
-
-            self._eval_dataset_reward_keys[dataset_name] = ds_reward_keys
-            self._eval_dataset_reward_configs[dataset_name] = ds_reward_configs
+        return keys_mapping, configs_mapping
 
     def get_rewards_models(self, split : Literal['train', 'eval']) -> Dict[str, BaseRewardModel]:
         """

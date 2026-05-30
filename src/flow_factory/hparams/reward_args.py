@@ -160,7 +160,7 @@ class RewardArguments(ArgABC):
     # (`RewardProcessor._reward_applies`) for O(1) `int in frozenset[int]`
     # comparison, replacing string lookups in the inner loop. `None`
     # until that resolver runs (consumers fall back to the string form).
-    _datasets_resolved: Optional[frozenset] = field(
+    _datasets_resolved: Optional[frozenset[int]] = field(
         default=None, repr=False, compare=False,
     )
 

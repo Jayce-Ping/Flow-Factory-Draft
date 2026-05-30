@@ -19,11 +19,14 @@ Main arguments class that encapsulates all configurations.
 Supports loading from YAML files with nested structure.
 """
 from __future__ import annotations
-from dataclasses import dataclass, field, fields
-from typing import Any, Literal, Optional
-import yaml
-from datetime import datetime
+import copy
 import math
+import warnings
+from dataclasses import dataclass, field, fields
+from datetime import datetime
+from typing import Any, Literal, Optional
+
+import yaml
 
 from .abc import ArgABC
 from .data_args import DataArguments
@@ -128,12 +131,6 @@ class Arguments(ArgABC):
             time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.log_args.run_name = f"{self.model_args.model_type}_{self.model_args.finetune_type}_{self.training_args.trainer_type}_{time_stamp}"
 
-        # Canonicalize legacy `data.dataset_dir` into a synthetic 1-entry
-        # `data.datasets` list so the rest of the pipeline only handles
-        # one shape (collapses single/multi-source dispatch downstream).
-        # This is a NO-OP when the user already configured `data.datasets`.
-        self._canonicalize_legacy_dataset_dir()
-
         self._validate_dataset_routing()
         # Resolve `RewardArguments.datasets is None` -> concrete list of
         # applicable dataset names. Must run AFTER validation (so the
@@ -158,61 +155,6 @@ class Arguments(ArgABC):
         self._resolve_sampler_type()
         self._align_batch_geometry()
         self._adjust_gradient_accumulation()
-
-    def _canonicalize_legacy_dataset_dir(self) -> None:
-        """Promote legacy ``data.dataset_dir`` into a synthetic ``data.datasets``.
-
-        After this method returns, ``data.datasets`` is the single source
-        of truth for everywhere downstream — single- and multi-source
-        configurations flow through identical code paths.
-
-        Rules:
-
-        * If ``data.datasets`` is already populated, do nothing (the
-          mutual-exclusion validator runs next and will reject any
-          conflict).
-        * Otherwise build a 1-entry list with ``name="default"``,
-          ``dataset_dir`` from the legacy field, and:
-            - ``train`` enabled (every legacy run had a training dataset).
-            - ``eval`` enabled iff ``test.jsonl`` / ``test.txt`` exists
-              under the legacy ``dataset_dir``; otherwise ``eval=None``.
-
-        We set ``self._legacy_canonicalized = True`` so the mutex
-        validator knows this synthetic list does NOT conflict with the
-        user's legacy ``dataset_dir`` (they're the same source described
-        twice — by definition).
-        """
-        self._legacy_canonicalized = False
-        if self.data_args.datasets:
-            return  # explicit user config wins
-        from .dataset_args import DatasetArguments, DatasetTrainSpec, DatasetEvalSpec
-        from dataclasses import fields as _fields
-        default_dataset_dir = next(
-            (f.default for f in _fields(self.data_args.__class__) if f.name == "dataset_dir"),
-            None,
-        )
-        if self.data_args.dataset_dir == default_dataset_dir:
-            return  # no legacy field -> let downstream handle the no-data error
-        # Probe for a test split so eval-enabled is set correctly for
-        # legacy runs that DO have a test.jsonl.
-        from ..data_utils.dataset import GeneralDataset
-        eval_spec = (
-            DatasetEvalSpec()
-            if GeneralDataset.check_exists(self.data_args.dataset_dir, "test")
-            else None
-        )
-        self.data_args.datasets = [
-            DatasetArguments(
-                name="default",
-                dataset_dir=self.data_args.dataset_dir,
-                image_dir=self.data_args.image_dir,
-                video_dir=self.data_args.video_dir,
-                audio_dir=self.data_args.audio_dir,
-                train=DatasetTrainSpec(weight=1),
-                eval=eval_spec,
-            )
-        ]
-        self._legacy_canonicalized = True
 
     def _assign_source_ids(self) -> None:
         """Stamp each ``data.datasets[*]`` entry with a stable monotonic id.
@@ -251,10 +193,11 @@ class Arguments(ArgABC):
             # `datasets` was resolved to a concrete `List[str]` upstream by
             # `_resolve_reward_dataset_routing`; the names are guaranteed to
             # be in the registry because they passed `_validate_dataset_routing`.
-            assert rc.datasets is not None, (
-                "Internal error: RewardArguments.datasets not resolved before "
-                "_resolve_reward_dataset_ids; check Arguments.__post_init__ ordering."
-            )
+            if rc.datasets is None:
+                raise RuntimeError(
+                    "Internal error: RewardArguments.datasets not resolved before "
+                    "_resolve_reward_dataset_ids; check Arguments.__post_init__ ordering."
+                )
             rc._datasets_resolved = frozenset(name_to_id[n] for n in rc.datasets)
 
     def _resolve_reward_dataset_routing(self) -> None:
@@ -359,28 +302,21 @@ class Arguments(ArgABC):
         if not tds_unified:
             return
 
-        # Mutual exclusion with the legacy single-source `data.dataset_dir`.
-        # Detect "user actually customized dataset_dir" by comparing with
-        # the dataclass default; this lets us tolerate configs that always
-        # write `dataset_dir: data` (the default) as a noop.
-        # Skip this check when we synthesised `data.datasets` ourselves
-        # in `_canonicalize_legacy_dataset_dir` — the legacy `dataset_dir`
-        # IS the source for the synthetic single entry, not a conflict.
-        from dataclasses import fields as _fields
+        # Mutual exclusion: `data.dataset_dir` (non-default) conflicts
+        # with `data.datasets`. Users must migrate to the unified schema.
         default_dataset_dir = next(
-            (f.default for f in _fields(self.data_args.__class__) if f.name == "dataset_dir"),
+            (f.default for f in fields(self.data_args.__class__) if f.name == "dataset_dir"),
             None,
         )
         if (
-            not getattr(self, "_legacy_canonicalized", False)
-            and default_dataset_dir is not None
+            default_dataset_dir is not None
             and self.data_args.dataset_dir != default_dataset_dir
         ):
             raise ValueError(
                 "Both `data.dataset_dir` (custom value: "
                 f"{self.data_args.dataset_dir!r}) and `data.datasets` are set. "
-                "These are mutually exclusive — pick one. If you intended "
-                "multi-source training, remove `data.dataset_dir`."
+                "These are mutually exclusive. Use `data.datasets` exclusively — "
+                "move `dataset_dir` into each dataset entry's `dataset_dir` field."
             )
 
         # Unique names within the unified list.
@@ -397,9 +333,13 @@ class Arguments(ArgABC):
         for d in tds_unified:
             if not d.is_training_source:
                 continue
-            assert d.train is not None  # narrows for type-checkers
+            if d.train is None:
+                raise RuntimeError(
+                    f"Internal error: dataset '{d.name}' reports is_training_source=True "
+                    "but has train=None."
+                )
             w = d.train.weight
-            if w is None or w <= 0:
+            if w <= 0:
                 bad_weights.append((d.name, w))
         if bad_weights:
             raise ValueError(
@@ -429,10 +369,16 @@ class Arguments(ArgABC):
                 )
 
         # Eval rewards: `datasets` must reference EVAL-source names.
-        if self.eval_reward_args and eval_names:
+        if self.eval_reward_args:
             for rc in self.eval_reward_args:
                 if rc.datasets is None:
                     continue
+                if not eval_names:
+                    raise ValueError(
+                        f"Eval reward '{rc.name}' has datasets={rc.datasets!r} but no eval "
+                        "dataset is configured under `data.datasets`. Either remove "
+                        "`datasets` from this eval reward or define eval datasets it can route to."
+                    )
                 unknown = set(rc.datasets) - eval_names
                 if unknown:
                     raise ValueError(
@@ -773,15 +719,7 @@ class Arguments(ArgABC):
             if new_M != ta.unique_sample_num_per_epoch:
                 extra = extra_line_for_legacy(new_M) if extra_line_for_legacy else ""
                 self._warn_and_assign_unique_sample_num(new_M, sampler_name, extra)
-            # Stash a 1-entry partition when single-source multi-dataset
-            # mode is configured (N == 1) — keeps the data layer's
-            # downstream lookup uniform.  None when fully legacy.
-            ta._per_source_unique_sample_num = (
-                {tds[0].name: ta.unique_sample_num_per_epoch}
-                if N == 1
-                else None
-            )
-            # Also stamp the resolved M_i onto each training spec so
+            # Stamp the resolved M_i onto each training spec so
             # `print(config)` reflects the final geometry.
             if N == 1:
                 tds[0].train.unique_sample_num_per_epoch = ta.unique_sample_num_per_epoch  # type: ignore[union-attr]
@@ -808,7 +746,11 @@ class Arguments(ArgABC):
         per_source_unit = target_total // W_sum   # multiple of `step` by construction
         partition = {d.name: per_source_unit * w for d, w in zip(tds, weights)}
         final_total = sum(partition.values())
-        assert final_total == target_total, (final_total, target_total, partition)
+        if final_total != target_total:
+            raise RuntimeError(
+                f"Internal error: partition sum ({final_total}) != target_total "
+                f"({target_total}). partition={partition}."
+            )
 
         if final_total != original_M:
             breakdown = ", ".join(f"{n}={v}" for n, v in sorted(partition.items()))
@@ -817,85 +759,15 @@ class Arguments(ArgABC):
                 f"sum(weight)={W_sum}): {breakdown}\n  "
             )
             self._warn_and_assign_unique_sample_num(final_total, sampler_name, extra)
-        # Always stash the partition for the data layer to consume.
-        ta._per_source_unique_sample_num = partition
-        # Also stamp resolved M_i onto each training spec so the printed
+        # Stamp resolved M_i onto each training spec so the printed
         # config shows the final geometry per-source.
         for d in tds:
-            assert d.train is not None
-            d.train.unique_sample_num_per_epoch = partition[d.name]
-
-    @staticmethod
-    def _partition_unique_sample_num(
-        target_total: int,
-        step: int,
-        training_datasets,
-    ) -> "dict[str, int]":
-        """Partition ``target_total`` across training datasets by ``train.weight``.
-
-        Algorithm (deterministic, total over all valid inputs):
-
-        1. Raw allocation:   ``M_i_raw = target_total * w_i / sum(w_j)``.
-        2. Step-floor:       ``M_i = max(step, floor(M_i_raw / step) * step)``.
-           The ``max(step, ...)`` floor prevents ``weight=1`` from rounding
-           to zero (which would silently drop the source).
-        3. Distribute the deficit ``target_total - sum(M_i)`` by ``±step``
-           bumps, ranked by largest fractional remainder
-           ``(M_i_raw - M_i) * sign(deficit)``.  Names break ties so the
-           allocation is reproducible across runs / ranks.
-
-        Edge cases (all flow through the same path; no try/except):
-
-        * ``N == 1`` — caller short-circuits before reaching here.
-        * Highly uneven weights (e.g. ``(1, 999)``) — the small source
-          still gets the ``step`` minimum.
-        * Total too small (``target_total < N * step``) — caller already
-          bumped ``target_total`` to ``N * step`` before calling.
-        """
-        weights = {d.name: float(d.train.weight) for d in training_datasets}  # type: ignore[union-attr]
-        total_w = sum(weights.values())
-        # Step 1+2: raw allocation -> step-floor with `step` minimum.
-        raw = {n: target_total * w / total_w for n, w in weights.items()}
-        partition = {n: max(step, (int(r) // step) * step) for n, r in raw.items()}
-
-        # Step 3: distribute deficit by largest fractional remainder.
-        deficit = target_total - sum(partition.values())
-        # Sort by `name` first so deterministic across runs; then by remainder.
-        names_sorted = sorted(weights.keys())
-
-        while deficit != 0:
-            sign = 1 if deficit > 0 else -1
-            # Sort sources by remainder relevance:
-            #   - sign > 0 (need to add)    -> largest positive remainder first
-            #   - sign < 0 (need to remove) -> largest "overshoot" first (most-negative remainder)
-            ordered = sorted(
-                names_sorted,
-                key=lambda n: (raw[n] - partition[n]) * sign,
-                reverse=True,
-            )
-            progressed = False
-            for n in ordered:
-                new_val = partition[n] + sign * step
-                if new_val < step:
-                    continue          # never go below the step minimum
-                partition[n] = new_val
-                deficit -= sign * step
-                progressed = True
-                if deficit == 0:
-                    break
-            if not progressed:
-                # Mathematically unreachable when target_total >= N*step,
-                # but guard against pathological inputs (e.g., negative
-                # target) so we never spin forever.
+            if d.train is None:
                 raise RuntimeError(
-                    "Internal error: could not partition "
-                    f"unique_sample_num_per_epoch={target_total} across "
-                    f"{len(weights)} sources at step={step}; "
-                    f"current partition={partition}, deficit={deficit}."
+                    f"Internal error: training dataset '{d.name}' has train=None "
+                    "during partition writeback."
                 )
-        return partition
-
-
+            d.train.unique_sample_num_per_epoch = partition[d.name]
 
     def _adjust_gradient_accumulation(self) -> None:
         """Adjust gradient accumulation for per-timestep losses.
@@ -1083,9 +955,7 @@ class Arguments(ArgABC):
             new_dict.pop('eval_datasets', None)
             return new_dict
 
-        import warnings as _warnings
-        import copy as _copy
-        _warnings.warn(
+        warnings.warn(
             "Top-level `eval_datasets:` is deprecated and will be removed in a "
             "future release. Move each entry under `data.datasets:` and put "
             "its eval-specific fields (split / num_inference_steps / "
@@ -1098,7 +968,7 @@ class Arguments(ArgABC):
 
         # Deep-copy so we never mutate the caller's dict (or its
         # nested data/datasets list, which we may extend in place below).
-        new_dict = _copy.deepcopy(args_dict)
+        new_dict = copy.deepcopy(args_dict)
         data_dict = new_dict.get('data') or {}
         if not isinstance(data_dict, dict):
             data_dict = {}

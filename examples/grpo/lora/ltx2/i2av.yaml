@@ -8,15 +8,18 @@ main_process_port: 29500
 mixed_precision: "bf16"  # Options: no, fp16, bf16
 
 # Data Configuration
-# Dataset must include an `image` column mapping prompts to conditioning image filenames.
-# Images are loaded from `image_dir` (default: "{dataset_dir}/images").
 data:
-  dataset_dir: "dataset/sharegpt4o_image_mini"
+  datasets:
+    - name: default  # Unique identifier (used in metrics, caching, reward routing)
+      dataset_dir: "dataset/sharegpt4o_image_mini"  # Folder with train.jsonl / test.jsonl
+      train:  # Training participation config
+        weight: 1  # Mixing weight (integer); ratio with other sources determines batch allocation
+        max_dataset_size: 1024  # Cap on number of training samples for this source
+      eval: {}  # Eval participation (inherits shared `eval:` section settings)
   preprocessing_batch_size: 4  # Batch size for preprocessing
   dataloader_num_workers: 8  # Number of workers for DataLoader
   force_reprocess: true  # Force reprocessing of the dataset
   cache_dir: "~/.cache/flow_factory/datasets"  # Cache directory for preprocessed datasets
-  max_dataset_size: 1024  # Limit the maximum number of samples in the dataset
   sampler_type: "auto"  # Options: auto, distributed_k_repeat, group_contiguous
 
 # Model Configuration

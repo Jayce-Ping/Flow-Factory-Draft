@@ -244,31 +244,22 @@ class RewardProcessor:
         return result
     
     # ============================ Single-batch / Single-group Helpers ============================
-    def _compute_pointwise_batch(
-        self, name: str, model: PointwiseRewardModel, batch_samples: List[BaseSample]
+    def _gated_compute(
+        self, name: str, model: BaseRewardModel, samples: List[BaseSample]
     ) -> torch.Tensor:
-        """Compute pointwise rewards for a single batch.
+        """Shared gate + compute + NaN-pad for both pointwise and groupwise paths.
 
-        Returns a (batch_size,) tensor with NaN at positions whose
-        ``__source__`` is not in this reward's ``datasets`` list (so
-        cross-rank gather participants stay shape-uniform — see plan
-        §6).  At applicable positions the value MUST be finite; an
-        in-model NaN there is surfaced loudly via
-        ``_scatter_with_nan_padding``'s assertion.
-
-        Marks each applicable sample's ``applicable_rewards`` set so
-        ``AdvantageProcessor`` can aggregate authoritatively without
-        sniffing NaN.
+        Returns a ``(len(samples),)`` tensor with NaN at non-applicable
+        positions and finite model scores at applicable positions.
+        Updates ``sample.applicable_rewards`` for every applicable sample.
         """
-        mask = [self._reward_applies(name, s) for s in batch_samples]
-        # Mark applicable bookkeeping FIRST so even an entirely-non-applicable
-        # batch (no-op here) is consistent for the aggregation contract.
-        self._mark_applicable(batch_samples, mask, name)
+        mask = [self._reward_applies(name, s) for s in samples]
+        self._mark_applicable(samples, mask, name)
 
         if not any(mask):
-            return torch.full((len(batch_samples),), float('nan'), dtype=torch.float32)
+            return torch.full((len(samples),), float('nan'), dtype=torch.float32)
 
-        sub_samples = [s for s, m in zip(batch_samples, mask) if m]
+        sub_samples = [s for s, m in zip(samples, mask) if m]
         filtered_fields = filter_kwargs(model.__call__, **sub_samples[0])
         sub_input: Dict[str, List[Any]] = {
             k: [getattr(s, k) for s in sub_samples]
@@ -276,9 +267,6 @@ class RewardProcessor:
             if all(getattr(s, k) is not None for s in sub_samples)
         }
         sub_input = self._convert_media_format(sub_input, model)
-        # Move tensor leaves onto the reward model's device (no-op when samples
-        # are already on `model.device`; required when samples are CPU-resident
-        # via the offload pipeline). Sample objects are not mutated.
         sub_input = move_tensors_to_device(sub_input, model.device)
         output = model(**sub_input)
         sub_scores = torch.as_tensor(
@@ -286,46 +274,18 @@ class RewardProcessor:
             dtype=torch.float32,
         )
         return self._scatter_with_nan_padding(sub_scores, mask, reward_name=name)
+
+    def _compute_pointwise_batch(
+        self, name: str, model: PointwiseRewardModel, batch_samples: List[BaseSample]
+    ) -> torch.Tensor:
+        """Compute pointwise rewards for a single batch with source-aware gating."""
+        return self._gated_compute(name, model, batch_samples)
 
     def _compute_groupwise_group(
         self, name: str, model: GroupwiseRewardModel, group_samples: List[BaseSample]
     ) -> torch.Tensor:
-        """Compute groupwise rewards for one complete group.
-
-        Returns a (group_size,) tensor with NaN at non-applicable
-        positions.  Same gating semantics as ``_compute_pointwise_batch``
-        (see plan §6).
-
-        Note: under the exact-divisibility allocator
-        (``num_batches_per_epoch % sum(weights) == 0``) every batch — and
-        therefore every group of K repeats within it — comes from a
-        single source by construction.  We don't re-assert that here
-        beyond the per-sample mask itself; mixed sources within a group
-        would require BOTH a sampler change AND a batch-level mixing
-        change, in which case the per-sample mask handles it correctly
-        anyway (NaN-pad applies positions independently).
-        """
-        mask = [self._reward_applies(name, s) for s in group_samples]
-        self._mark_applicable(group_samples, mask, name)
-
-        if not any(mask):
-            return torch.full((len(group_samples),), float('nan'), dtype=torch.float32)
-
-        sub_samples = [s for s, m in zip(group_samples, mask) if m]
-        fields = filter_kwargs(model.__call__, **sub_samples[0])
-        sub_input: Dict[str, List[Any]] = {
-            k: [getattr(s, k) for s in sub_samples]
-            for k in fields
-            if all(getattr(s, k) is not None for s in sub_samples)
-        }
-        sub_input = self._convert_media_format(sub_input, model)
-        sub_input = move_tensors_to_device(sub_input, model.device)
-        output = model(**sub_input)
-        sub_scores = torch.as_tensor(
-            output.rewards if hasattr(output, 'rewards') else output,
-            dtype=torch.float32,
-        )
-        return self._scatter_with_nan_padding(sub_scores, mask, reward_name=name)
+        """Compute groupwise rewards for one complete group with source-aware gating."""
+        return self._gated_compute(name, model, group_samples)
 
     # ============================ Public API ============================
     def compute_rewards(
