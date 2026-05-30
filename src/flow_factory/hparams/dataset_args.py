@@ -69,9 +69,17 @@ class DatasetTrainSpec(ArgABC):
         enabled: When False, the dataset is excluded from training even
             when this block is present.
         split: Which JSONL/TXT split file to load (typically ``"train"``).
-        weight: Mixing weight for this source.  Must be ``> 0``.  Sources
-            with larger weights surface more often in the per-step
-            schedule.  Uniform mixing = all weights equal.
+        weight: Mixing weight for this source.  Must be a positive
+            integer.  Sources with larger weights surface more often in
+            the per-step schedule.  Per-source batches-per-epoch is
+            ``num_batches_per_epoch * weight_i / sum(weights)`` — that
+            quotient must be an exact integer, which we guarantee by
+            requiring integer weights AND aligning
+            ``num_batches_per_epoch`` so it is divisible by
+            ``sum(weights)`` (see ``Arguments._align_unique_sample_num``).
+            Uniform mixing = all weights equal.  Float values that are
+            integer-valued (e.g. ``1.0``) are silently coerced; non-integer
+            floats raise.
         max_dataset_size: Per-source cap on number of training samples
             (None = inherit ``DataArguments.max_dataset_size``).
     """
@@ -84,9 +92,10 @@ class DatasetTrainSpec(ArgABC):
         default="train",
         metadata={"help": "Split file for training (default: 'train' -> train.jsonl / train.txt)."},
     )
-    weight: float = field(
-        default=1.0,
-        metadata={"help": "Mixing weight (must be > 0). Per-step source selection probability."},
+    weight: int = field(
+        default=1,
+        metadata={"help": "Mixing weight (positive integer). Used as the LCM denominator for "
+                          "per-source batch allocation; ensures every batch comes from a single source."},
     )
     max_dataset_size: Optional[int] = field(
         default=None,
@@ -94,10 +103,23 @@ class DatasetTrainSpec(ArgABC):
     )
 
     def __post_init__(self) -> None:
-        # Concrete weight validation lives in
-        # ``Arguments._validate_dataset_routing`` so we can raise with
-        # the full per-source context. Here we only normalise the type.
-        self.weight = float(self.weight)
+        # Coerce float-but-integer-valued weights silently (`1.0` is fine);
+        # reject genuine non-integer floats.  Concrete `weight > 0`
+        # validation lives in Arguments._validate_dataset_routing so we
+        # can raise with the full per-source context.
+        if isinstance(self.weight, float):
+            if self.weight.is_integer():
+                self.weight = int(self.weight)
+            else:
+                raise ValueError(
+                    f"DatasetTrainSpec.weight must be an integer, got {self.weight!r}. "
+                    "Use integer weights so per-source batches-per-epoch is exact "
+                    "(weight=1 + weight=3 -> 1:3 ratio, no rounding)."
+                )
+        elif not isinstance(self.weight, int) or isinstance(self.weight, bool):
+            raise TypeError(
+                f"DatasetTrainSpec.weight must be int (got {type(self.weight).__name__}: {self.weight!r})."
+            )
 
     def __str__(self) -> str:
         return yaml.dump(self.to_dict(), default_flow_style=False, sort_keys=False, indent=2)

@@ -36,7 +36,7 @@ data:
     - name: geneval
       dataset_dir: "dataset/geneval"
       train:
-        weight: 1.0
+        weight: 1
         # max_dataset_size: 5000   # uncomment to cap training samples
       eval:
         # Per-eval-dataset overrides — None (default) inherits from `eval:` below.
@@ -48,7 +48,7 @@ data:
     - name: pickscore
       dataset_dir: "dataset/pickscore"
       train:
-        weight: 3.0
+        weight: 3
       eval: null
 
 # Model Configuration

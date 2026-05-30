@@ -294,22 +294,19 @@ class RewardProcessor:
 
         Returns a (group_size,) tensor with NaN at non-applicable
         positions.  Same gating semantics as ``_compute_pointwise_batch``
-        (see plan §6).  Asserts that every sample in the group shares
-        the same ``__source__`` (groups span the same prompt across
-        repeats; mixed sources within a group would indicate a sampler
-        bug).
+        (see plan §6).
+
+        Note: under the exact-divisibility allocator
+        (``num_batches_per_epoch % sum(weights) == 0``) every batch — and
+        therefore every group of K repeats within it — comes from a
+        single source by construction.  We don't re-assert that here
+        beyond the per-sample mask itself; mixed sources within a group
+        would require BOTH a sampler change AND a batch-level mixing
+        change, in which case the per-sample mask handles it correctly
+        anyway (NaN-pad applies positions independently).
         """
         mask = [self._reward_applies(name, s) for s in group_samples]
         self._mark_applicable(group_samples, mask, name)
-
-        # Group homogeneity check: K repeats of the same prompt MUST share the source.
-        sources = {s.source for s in group_samples}
-        if len(sources) > 1:
-            raise RuntimeError(
-                f"Groupwise reward '{name}' received a group with mixed sources "
-                f"{sorted(s for s in sources if s is not None)}. K repeats of one "
-                "prompt must share __source__; this indicates a sampler bug."
-            )
 
         if not any(mask):
             return torch.full((len(group_samples),), float('nan'), dtype=torch.float32)

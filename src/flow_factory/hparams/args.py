@@ -643,13 +643,12 @@ class Arguments(ArgABC):
           standard "adjusted" warning when the value changes.  Behaviour
           is byte-identical to the pre-refactor code paths.
 
-        * **Multi-source (N >= 2)** — partition the (rounded-up) total
-          across the training-eligible datasets in proportion to each
-          ``train.weight``, with a ``step`` floor that prevents any
-          source from collapsing to ``M_i = 0``.  See
-          :meth:`_partition_unique_sample_num` for the deterministic
-          allocator (no try/except, no exceptions in the happy path —
-          just the existing "round up + warn" idiom extended per-source).
+        * **Multi-source (N >= 2)** — exact allocator: round the total
+          up to a multiple of ``step * sum(weights)`` so per-source
+          ``M_i = M_total * w_i / sum(weights)`` is itself a positive
+          integer multiple of ``step``.  Geometric consequence: every
+          batch comes from a single source (no per-batch homogeneity
+          contract to defend at runtime; it falls out of the math).
 
         ``extra_line_for_legacy`` is a one-shot text producer for the
         legacy path's per-sampler constraint description; it's only
@@ -678,19 +677,33 @@ class Arguments(ArgABC):
             return
 
         # Multi-source partition (N >= 2).
-        # Step 1: target total = round_up(M, step), AND >= N * step
-        # (every source needs at least one alignment step; bump M when the
-        # user-specified value is too small to fit N sources).
+        # Step 1: target total = M rounded up so that
+        #   (a) M_total is a multiple of `step` (per-source sampler constraint), and
+        #   (b) M_total is a multiple of `step * sum(weights)` so the per-source
+        #       allocation `M_i = M_total * w_i / sum(weights)` is itself a positive
+        #       integer multiple of `step` -- no remainder loop, no rounding drift,
+        #       and every batch is geometrically guaranteed to come from a single
+        #       source (`num_batches_per_epoch % sum(weights) == 0` -> the scheduler
+        #       can place each source's quota exactly).
         original_M = ta.unique_sample_num_per_epoch
-        target_total = max(self._round_up_to_step(original_M, step), N * step)
-        # Step 2-5: deterministic per-source allocator.
-        partition = self._partition_unique_sample_num(target_total, step, tds)
+        weights = [int(d.train.weight) for d in tds]   # type: ignore[union-attr]
+        W_sum = sum(weights)
+        if W_sum <= 0:
+            # _validate_dataset_routing should have caught this; assert defensively.
+            raise ValueError(f"sum(train.weight) must be > 0; got weights={weights}.")
+        partition_step = step * W_sum
+        target_total = max(self._round_up_to_step(original_M, partition_step), partition_step)
+        # Exact allocation: M_i = (target_total / sum(w)) * w_i = step * j * w_i.
+        per_source_unit = target_total // W_sum   # multiple of `step` by construction
+        partition = {d.name: per_source_unit * w for d, w in zip(tds, weights)}
         final_total = sum(partition.values())
+        assert final_total == target_total, (final_total, target_total, partition)
 
         if final_total != original_M:
             breakdown = ", ".join(f"{n}={v}" for n, v in sorted(partition.items()))
             extra = (
-                f"  multi-source partition ({len(tds)} sources): {breakdown}\n  "
+                f"  multi-source partition ({len(tds)} sources, "
+                f"sum(weight)={W_sum}): {breakdown}\n  "
             )
             self._warn_and_assign_unique_sample_num(final_total, sampler_name, extra)
         # Always stash the partition for the data layer to consume.
