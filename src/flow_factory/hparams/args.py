@@ -140,6 +140,10 @@ class Arguments(ArgABC):
         # unknown-name check is against the user's raw input, not the
         # expanded list) and BEFORE any consumer reads the field.
         self._resolve_reward_dataset_routing()
+        # With routing concrete, fail-fast when a training source has NO
+        # applicable training reward — the user almost certainly meant
+        # to add the source name to some reward's `datasets` list.
+        self._validate_every_source_has_a_reward()
         # Stamp every `data.datasets[*]` entry with a stable monotonic
         # `source_id` matching its list position. Read by the dataloader
         # / trainer / gate everywhere a transport-friendly form of the
@@ -295,6 +299,44 @@ class Arguments(ArgABC):
 
         _resolve_one_side(self.reward_args, train_names, side="Training")
         _resolve_one_side(self.eval_reward_args, eval_names, side="Eval")
+
+    def _validate_every_source_has_a_reward(self) -> None:
+        """Inverse routing check: every training/eval source must be covered.
+
+        ``_resolve_reward_dataset_routing`` already turned every reward's
+        ``datasets`` into a concrete list.  Now, for each declared
+        training source, check that AT LEAST ONE training reward routes
+        to it; same for the eval side.  A source with no applicable
+        reward would silently produce all-NaN advantages at runtime
+        (caught only later by ``AdvantageProcessor``'s ``weight_sum == 0``
+        guard) — much better to fail at config-load time with a clear
+        message naming the missing source.
+
+        Skipped when no rewards are configured on the relevant side
+        (legitimate for eval-only or sample-only runs).
+        """
+        train_names = [d.name for d in self.data_args.training_datasets]
+        eval_names = [d.name for d in self.data_args.eval_datasets]
+
+        def _check_side(reward_args, source_names, side: str) -> None:
+            if not reward_args or not source_names:
+                return
+            covered: set[str] = set()
+            for rc in reward_args:
+                # `rc.datasets` is concrete post-resolver.
+                covered.update(rc.datasets or [])
+            uncovered = [n for n in source_names if n not in covered]
+            if uncovered:
+                raise ValueError(
+                    f"{side} source(s) {uncovered!r} have NO applicable {side.lower()} "
+                    f"reward — every reward's `datasets` field excludes them. Either "
+                    f"add at least one of these names to a reward's `datasets`, set "
+                    f"that reward's `datasets` to `null` (= apply to every source), "
+                    f"or drop the dataset entry from `data.datasets`."
+                )
+
+        _check_side(self.reward_args, train_names, side="Training")
+        _check_side(self.eval_reward_args, eval_names, side="Eval")
 
     def _validate_dataset_routing(self) -> None:
         """Validate the unified ``data.datasets`` schema and reward routing.
@@ -1017,8 +1059,10 @@ class Arguments(ArgABC):
         ``eval_datasets`` is removed from the input dict so the rest of
         ``from_dict`` sees the canonical schema only.
 
-        Idempotent for fully-migrated configs.  Does not mutate the
-        caller's dict (a shallow copy is returned).
+        Idempotent for fully-migrated configs.  We deep-copy the input
+        before mutating so the caller's dict (e.g. a YAML round-trip
+        cache held by a test harness) is never modified — defensive, since
+        we mutate nested ``data.datasets`` lists below.
 
         Notes:
         - Eval-only datasets (no ``train:`` block) are perfectly valid
@@ -1040,6 +1084,7 @@ class Arguments(ArgABC):
             return new_dict
 
         import warnings as _warnings
+        import copy as _copy
         _warnings.warn(
             "Top-level `eval_datasets:` is deprecated and will be removed in a "
             "future release. Move each entry under `data.datasets:` and put "
@@ -1051,9 +1096,12 @@ class Arguments(ArgABC):
             stacklevel=3,
         )
 
-        # Shallow copy so we don't mutate the caller's dict.
-        new_dict = dict(args_dict)
-        data_dict = dict(new_dict.get('data', {}) or {})
+        # Deep-copy so we never mutate the caller's dict (or its
+        # nested data/datasets list, which we may extend in place below).
+        new_dict = _copy.deepcopy(args_dict)
+        data_dict = new_dict.get('data') or {}
+        if not isinstance(data_dict, dict):
+            data_dict = {}
         existing_datasets: list = list(data_dict.get('datasets') or [])
         # Index existing entries by name for in-place merge below.
         by_name: dict[str, dict] = {}

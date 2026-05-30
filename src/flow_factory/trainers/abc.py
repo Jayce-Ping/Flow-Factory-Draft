@@ -492,6 +492,14 @@ class BaseTrainer(ABC):
         sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
         sample_batch = self.adapter.inference(**sample_kwargs)
 
+        # Defensively reset applicable_rewards on every newly produced sample.
+        # The factory default is an empty set, but if any future trainer
+        # reuses sample objects across epochs (e.g. a sample buffer), stale
+        # bookkeeping from prior epochs would corrupt aggregation.  Cheap
+        # to do unconditionally; makes the contract explicit.
+        for s in sample_batch:
+            s.applicable_rewards = set()
+
         # Inject dataset metadata (e.g. geneval_metadata) into samples' extra_kwargs
         self._inject_batch_metadata(sample_batch, batch)
 

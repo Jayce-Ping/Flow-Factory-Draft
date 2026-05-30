@@ -241,19 +241,24 @@ class AdvantageProcessor:
         would silently mask in-model NaN bugs).
 
         Legacy back-compat: when a sample's ``applicable_rewards`` set
-        is empty AND the sample carries no ``__source__`` (i.e. came
-        from the legacy single-source path that never updates the
-        bookkeeping), every reward is treated as applicable.  Multi-
-        source mode populates ``applicable_rewards`` even for samples
-        whose source matches no rewards (that case raises
-        ``RuntimeError`` below).
+        is empty AND the sample carries no ``source`` / ``source_id``
+        (i.e. came from the legacy single-source path that never updates
+        the bookkeeping), every reward is treated as applicable.
+
+        TODO(perf): the distributed gather here is independent of
+        :meth:`collect_group_rewards` — both run once per advantage
+        compute.  Future optimisation: pack ``source_id`` as an extra
+        column in :meth:`collect_group_rewards`'s payload and recompute
+        the mask LOCALLY on every rank from the gathered ``source_id``s
+        + ``cfg._datasets_resolved`` (item 6's frozenset[int] cache).
+        Saves one collective per epoch; not transformative on its own
+        but composes with future per-source logging which would otherwise
+        re-gather the same data.
         """
         R = len(reward_keys)
         B = len(samples)
         local_mask = np.zeros((R, B), dtype=bool)
         for j, s in enumerate(samples):
-            # Plain attribute access: applicable_rewards is a dataclass
-            # field with a default factory; source / source_id likewise.
             applicable = s.applicable_rewards
             has_source = s.source is not None or s.source_id is not None
             if not applicable and not has_source:

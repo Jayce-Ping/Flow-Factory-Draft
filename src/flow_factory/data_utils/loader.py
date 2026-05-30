@@ -322,6 +322,7 @@ def get_dataloader(
                 per_source_loaders,
                 scheduler,
                 source_name_to_id=data_args.source_name_to_id,
+                batch_size=training_args.per_device_batch_size,
             )
 
     # ------------------------------------------------------------------
@@ -544,6 +545,11 @@ class WeightedSourceBatchScheduler:
     All ranks see the same list every epoch (constructor takes only seed +
     counts; no rank-dependent randomness).
 
+    The input dict's iteration order is **ignored** — sources are processed
+    in ``sorted(name)`` order so the generated schedule is byte-identical
+    across runs and across rank-zero re-runs (no insertion-order
+    dependence).  Combined with the seed, this yields total reproducibility.
+
     Why a list, not a stream:
 
     - We need ``__len__`` for ``tqdm`` and exact-length validation.
@@ -614,6 +620,7 @@ class MultiSourceTrainDataLoader:
         dataloaders_by_source: Dict[str, DataLoader],
         scheduler: WeightedSourceBatchScheduler,
         source_name_to_id: Optional[Dict[str, int]] = None,
+        batch_size: Optional[int] = None,
     ):
         self._loaders_by_source = dataloaders_by_source
         self._scheduler = scheduler
@@ -624,6 +631,10 @@ class MultiSourceTrainDataLoader:
         # `data_args.source_name_to_id`. None means "id form not configured" —
         # the str form alone is emitted (legacy behavior).
         self._source_name_to_id = source_name_to_id or {}
+        # Explicit batch size when known (item 7's exact-divisibility
+        # geometry guarantees every batch is exactly `per_device_batch_size`).
+        # When None, fall back to the per-batch heuristic in `_infer_batch_size`.
+        self._batch_size = batch_size
         self._iters: Dict[str, Iterator] = {}
 
     @property
@@ -650,7 +661,11 @@ class MultiSourceTrainDataLoader:
                 self._iters[src] = iter(self._loaders_by_source[src])
                 batch = next(self._iters[src])
 
-            B = self._infer_batch_size(batch)
+            B = (
+                self._batch_size
+                if self._batch_size is not None
+                else self._infer_batch_size(batch)
+            )
             batch = dict(batch)
             batch["__source__"] = [src] * B
             # Emit the small-int form too when the registry is configured,
