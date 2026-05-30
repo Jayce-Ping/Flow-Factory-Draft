@@ -16,8 +16,9 @@
 import json
 import os
 import shutil
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Literal, Optional, Tuple, Union
 
+import torch
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
 
@@ -204,107 +205,437 @@ def get_dataloader(
     accelerator: Accelerator,
     preprocess_func: Optional[PreprocessCallable] = None,
     **kwargs,
-) -> Tuple[DataLoader, Union[DataLoader, None]]:
-    """
-    Factory to create DDP/FSDP compatible DataLoader with distributed preprocessing.
-    
-    Features:
-        - Automatic distributed preprocessing across multiple GPUs
-        - Intelligent caching (reuses preprocessed data on subsequent runs)
-        - Supports both train and test splits
-        - Custom sampler for GRPO-style grouped sampling
-    
+) -> Tuple[
+    Union[DataLoader, "MultiSourceTrainDataLoader", None],
+    Optional[DataLoader],
+    Dict[str, DataLoader],
+]:
+    """Factory for the training + (legacy) test DataLoaders.
+
+    Returns a 3-tuple ``(train_dl, test_dl, train_dataloaders_by_source)``:
+
+    * ``train_dl`` — either a plain ``torch.utils.data.DataLoader``
+      (legacy single-source) or a :class:`MultiSourceTrainDataLoader`
+      (multi-source).  Both expose ``__iter__`` / ``__len__`` /
+      ``set_epoch`` so trainers don't have to branch.  ``None`` only
+      when ``data.datasets`` is set but no entry has ``train: enabled``
+      (eval-only run; trainers should respect that).
+    * ``test_dl`` — legacy single-test ``test.jsonl`` DataLoader, or
+      ``None``.  In multi-source mode this is also ``None`` (eval is
+      driven by :func:`get_eval_dataloaders`).
+    * ``train_dataloaders_by_source`` — ``Dict[str, DataLoader]`` keyed
+      by training-dataset name in multi-source mode; empty ``{}`` in
+      legacy mode.  Exposed publicly for the future DiffusionOPD
+      trainer (which iterates per-source independently).
+
     Args:
-        config: Configuration object containing all arguments
-        accelerator: Accelerator for distributed training
-        preprocess_func: Function to preprocess batches
-        **kwargs: Additional arguments (ignored)
-        
-    Returns:
-        Tuple of (train_dataloader, test_dataloader)
-        test_dataloader is None if test split doesn't exist
+        config: Full ``Arguments`` configuration object.
+        accelerator: Accelerator for distributed preprocessing & sampling.
+        preprocess_func: Adapter's batch-preprocessing function.
+        **kwargs: Reserved for future use (currently ignored).
     """
     data_args = config.data_args
     training_args = config.training_args
-    eval_args = config.eval_args
 
-    # Determine if distributed preprocessing is needed
     enable_distributed = accelerator.num_processes > 1 and data_args.enable_preprocess
     preprocess_parallelism = getattr(data_args, 'preprocess_parallelism', 'local')
 
-    # Common dataset kwargs
+    # Common dataset kwargs (shared across legacy / multi-source paths).
     base_kwargs = {
         "preprocess_func": preprocess_func,
-        "preprocess_kwargs": filter_kwargs(preprocess_func, **data_args) if preprocess_func else None, # Preprocess kwargs
-        'extra_hash_strs': [config.model_args.model_type, config.model_args.model_name_or_path], # Use model info to differentiate caches
+        "preprocess_kwargs": filter_kwargs(preprocess_func, **data_args) if preprocess_func else None,
+        'extra_hash_strs': [
+            config.model_args.model_type,
+            config.model_args.model_name_or_path,
+        ],
     }
     base_kwargs.update(filter_kwargs(GeneralDataset.__init__, **data_args))
     base_kwargs['force_reprocess'] = data_args.force_reprocess
 
-    # === CREATE/LOAD TRAIN DATASET ===
-    train_preprocess_kwargs = base_kwargs.get('preprocess_kwargs', {}).copy()
-    train_preprocess_kwargs.update(
-        {
-            'is_train': True,
-            **training_args,
-        }
-    )
-    # Use algorithm-aware guidance scale for preprocessing — ensures negative
-    # prompts are encoded when any optimizer-time CFG scale needs them
-    # (e.g., DGPO kl_cfg > 1.0 with training guidance_scale = 1.0).
+    # Train preprocess kwargs (algorithm-aware guidance scale, etc.).
+    train_preprocess_kwargs = (base_kwargs.get('preprocess_kwargs') or {}).copy()
+    train_preprocess_kwargs.update({'is_train': True, **training_args})
     train_preprocess_kwargs['guidance_scale'] = training_args.get_preprocess_guidance_scale()
-    train_preprocess_kwargs = filter_kwargs(preprocess_func, **train_preprocess_kwargs)
-    dataset = _create_or_load_dataset(
-        split="train",
+    train_preprocess_kwargs = (
+        filter_kwargs(preprocess_func, **train_preprocess_kwargs) if preprocess_func else train_preprocess_kwargs
+    )
+
+    # ------------------------------------------------------------------
+    # Train path: dispatch on `data.datasets`.
+    # ------------------------------------------------------------------
+    train_dl: Union[DataLoader, "MultiSourceTrainDataLoader", None]
+    train_dataloaders_by_source: Dict[str, DataLoader] = {}
+
+    if data_args.datasets:
+        # Multi-source mode (or unified-schema single-source — both flow
+        # through `_load_per_source_train_dataloaders`).
+        if data_args.training_datasets:
+            per_source_dls = _load_per_source_train_dataloaders(
+                training_datasets=data_args.training_datasets,
+                config=config,
+                accelerator=accelerator,
+                base_kwargs=base_kwargs,
+                train_preprocess_kwargs=train_preprocess_kwargs,
+                enable_distributed=enable_distributed,
+                preprocess_parallelism=preprocess_parallelism,
+            )
+            train_dataloaders_by_source = per_source_dls
+
+            num_batches_per_source = {
+                name: dl.batch_sampler.num_batches_per_epoch  # type: ignore[union-attr]
+                for name, dl in per_source_dls.items()
+            }
+            total = sum(num_batches_per_source.values())
+            if total != training_args.num_batches_per_epoch:
+                # Caught by alignment math — but log clearly if it ever drifts.
+                logger.warning(
+                    f"Multi-source partition produced {total} batches/epoch but "
+                    f"training_args.num_batches_per_epoch = "
+                    f"{training_args.num_batches_per_epoch}. "
+                    "This indicates a partitioning bug; "
+                    "tqdm and gradient accumulation will use the dataloader's actual length."
+                )
+            scheduler = WeightedSourceBatchScheduler(
+                num_batches_per_source=num_batches_per_source,
+                seed=training_args.seed,
+            )
+            train_dl = MultiSourceTrainDataLoader(per_source_dls, scheduler)
+        else:
+            # `data.datasets` set but no entry has `train: enabled` ->
+            # eval-only run. Trainers that need a train loop must
+            # respect this (e.g. raise / skip start()).
+            train_dl = None
+    else:
+        # Legacy single-source path (byte-identical to the pre-refactor
+        # implementation).
+        dataset = _create_or_load_dataset(
+            split="train",
+            accelerator=accelerator,
+            base_kwargs={**base_kwargs, 'preprocess_kwargs': train_preprocess_kwargs},
+            enable_distributed=enable_distributed,
+            preprocess_parallelism=preprocess_parallelism,
+        )
+        sampler = get_data_sampler(
+            dataset=dataset,
+            config=config,
+            accelerator=accelerator,
+        )
+        train_dl = DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            num_workers=data_args.dataloader_num_workers,
+            pin_memory=True,
+            collate_fn=GeneralDataset.collate_fn,
+        )
+
+    # ------------------------------------------------------------------
+    # Legacy single test_dataloader (test.jsonl under data.dataset_dir).
+    # In multi-source / multi-eval mode the trainer will instead build
+    # its eval dataloaders via `get_eval_dataloaders`.
+    # ------------------------------------------------------------------
+    test_dataloader = _build_legacy_test_dataloader(
+        config=config,
         accelerator=accelerator,
-        base_kwargs={**base_kwargs, 'preprocess_kwargs': train_preprocess_kwargs},
+        preprocess_func=preprocess_func,
+        base_kwargs=base_kwargs,
         enable_distributed=enable_distributed,
         preprocess_parallelism=preprocess_parallelism,
     )
 
-    # === CREATE TRAIN DATALOADER ===
-    sampler = get_data_sampler(
-        dataset=dataset,
-        config=config,
-        accelerator=accelerator,
+    return train_dl, test_dataloader, train_dataloaders_by_source
+
+
+def _build_legacy_test_dataloader(
+    *,
+    config: Arguments,
+    accelerator: Accelerator,
+    preprocess_func: Optional[PreprocessCallable],
+    base_kwargs: dict,
+    enable_distributed: bool,
+    preprocess_parallelism: Literal["global", "local"],
+) -> Optional[DataLoader]:
+    """Build the legacy ``test.jsonl`` DataLoader from ``data.dataset_dir``.
+
+    Returns ``None`` when no ``test.jsonl`` exists under
+    ``data.dataset_dir``.  Existing behaviour preserved for back-compat.
+    """
+    data_args = config.data_args
+    eval_args = config.eval_args
+
+    if not GeneralDataset.check_exists(data_args.dataset, "test"):
+        return None
+
+    test_preprocess_kwargs = (base_kwargs.get('preprocess_kwargs') or {}).copy()
+    test_preprocess_kwargs.update({'is_train': False, **eval_args})
+    test_preprocess_kwargs = (
+        filter_kwargs(preprocess_func, **test_preprocess_kwargs) if preprocess_func else test_preprocess_kwargs
     )
-    
-    dataloader = DataLoader(
-        dataset,
-        batch_sampler=sampler,
+    test_dataset = _create_or_load_dataset(
+        split="test",
+        accelerator=accelerator,
+        base_kwargs={**base_kwargs, 'preprocess_kwargs': test_preprocess_kwargs},
+        enable_distributed=enable_distributed,
+        preprocess_parallelism=preprocess_parallelism,
+    )
+    return DataLoader(
+        test_dataset,
+        batch_size=eval_args.per_device_batch_size,
+        shuffle=False,
         num_workers=data_args.dataloader_num_workers,
-        pin_memory=True,
         collate_fn=GeneralDataset.collate_fn,
     )
 
-    # === CREATE/LOAD TEST DATASET ===
-    test_dataloader = None
-    if GeneralDataset.check_exists(data_args.dataset, "test"):
-        test_preprocess_kwargs = base_kwargs.get('preprocess_kwargs', {}).copy()
-        test_preprocess_kwargs.update(
-            {
-                'is_train': False,
-                **eval_args,
-            }
+
+def _load_per_source_train_dataloaders(
+    *,
+    training_datasets: List[DatasetArguments],
+    config: Arguments,
+    accelerator: Accelerator,
+    base_kwargs: dict,
+    train_preprocess_kwargs: dict,
+    enable_distributed: bool,
+    preprocess_parallelism: Literal["global", "local"],
+) -> Dict[str, DataLoader]:
+    """Build one DataLoader per declared training source.
+
+    Reads the per-source aligned ``M_i`` from
+    ``training_args._per_source_unique_sample_num`` (set by
+    ``Arguments._align_unique_sample_num``).  Each per-source DataLoader
+    is fingerprinted with ``train_source:{name}`` so caches don't
+    collide across sources that share a ``dataset_dir`` with different
+    overrides.
+
+    Sanity checks (raised here rather than in alignment so we have
+    dataset lengths available):
+
+    * ``M_i <= len(per_source_dataset)`` — otherwise raise with
+      actionable advice.
+    * Sum of per-source batch counts equals
+      ``training_args.num_batches_per_epoch`` (asserted by caller).
+    """
+    training_args = config.training_args
+    per_source_M: Optional[Dict[str, int]] = training_args._per_source_unique_sample_num
+    if per_source_M is None:
+        # Should not happen — alignment always populates this when
+        # `data.datasets` is set with at least one training source.
+        raise RuntimeError(
+            "Internal error: training_args._per_source_unique_sample_num is None "
+            "but multi-source training was requested. "
+            "Did Arguments._align_batch_geometry run?"
         )
-        test_preprocess_kwargs = filter_kwargs(preprocess_func, **test_preprocess_kwargs)
-        test_dataset = _create_or_load_dataset(
-            split="test",
+
+    out: Dict[str, DataLoader] = {}
+    for d in training_datasets:
+        spec = d.train
+        assert spec is not None, "is_training_source filter should have caught this."
+
+        # Per-source media-root + dataset_dir overrides.
+        per_kwargs = dict(base_kwargs)
+        per_kwargs.update(d.get_dataset_overrides())
+        per_kwargs["force_reprocess"] = config.data_args.force_reprocess
+
+        # Cache fingerprint must include the source name so two sources
+        # sharing a dataset_dir with different overrides get separate caches.
+        extra = list(base_kwargs.get("extra_hash_strs", []))
+        extra.append(f"train_source:{d.name}")
+        per_kwargs["extra_hash_strs"] = extra
+
+        # Per-source max_dataset_size override (DataArguments default
+        # acts as fallback via base_kwargs.update).
+        if spec.max_dataset_size is not None:
+            per_kwargs["max_dataset_size"] = spec.max_dataset_size
+
+        dataset = _create_or_load_dataset(
+            split=spec.split,
             accelerator=accelerator,
-            base_kwargs={**base_kwargs, 'preprocess_kwargs': test_preprocess_kwargs},
+            base_kwargs={**per_kwargs, 'preprocess_kwargs': train_preprocess_kwargs},
             enable_distributed=enable_distributed,
             preprocess_parallelism=preprocess_parallelism,
         )
-        
-        test_dataloader = DataLoader(
-            test_dataset,
-            batch_size=eval_args.per_device_batch_size,
-            shuffle=False,
-            num_workers=data_args.dataloader_num_workers,
+
+        M_i = per_source_M.get(d.name)
+        if M_i is None:
+            raise RuntimeError(
+                f"Internal error: training_args._per_source_unique_sample_num "
+                f"is missing source '{d.name}'. "
+                f"Known: {sorted(per_source_M.keys())}."
+            )
+        if M_i > len(dataset):
+            raise ValueError(
+                f"Training dataset '{d.name}': aligned per-source "
+                f"unique_sample_num_per_epoch (M_i = {M_i}) exceeds dataset "
+                f"size ({len(dataset)}). Either lower this source's "
+                f"`train.weight`, lower `train.unique_sample_num_per_epoch`, "
+                f"or grow the dataset."
+            )
+
+        sampler = get_data_sampler(
+            dataset=dataset,
+            config=config,
+            accelerator=accelerator,
+            unique_sample_num=M_i,
+        )
+        out[d.name] = DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            num_workers=config.data_args.dataloader_num_workers,
+            pin_memory=True,
             collate_fn=GeneralDataset.collate_fn,
         )
+        logger.info(
+            f"Multi-source: built DataLoader for '{d.name}' "
+            f"(samples={len(dataset)}, M_i={M_i}, "
+            f"batches/epoch={sampler.num_batches_per_epoch})"  # type: ignore[union-attr]
+        )
 
-    return dataloader, test_dataloader
+    return out
+
+
+# ============================================================================
+# Multi-source train DataLoader components
+# ============================================================================
+
+class WeightedSourceBatchScheduler:
+    """Deterministic shared-across-ranks list of source names, length per epoch.
+
+    Built by repeating each source's ``num_batches_per_source[name]`` times
+    and shuffling under a ``torch.Generator`` seeded by ``seed + epoch``.
+    All ranks see the same list every epoch (constructor takes only seed +
+    counts; no rank-dependent randomness).
+
+    Why a list, not a stream:
+
+    - We need ``__len__`` for ``tqdm`` and exact-length validation.
+    - Mid-epoch checkpointing can record an integer step index and resume
+      from there.
+    - The "effective num_batches_per_epoch" is checked against
+      ``training_args.num_batches_per_epoch`` once at build time.
+    """
+
+    def __init__(self, num_batches_per_source: Dict[str, int], seed: int):
+        self._counts: Dict[str, int] = dict(num_batches_per_source)
+        self._seed = int(seed)
+        self._epoch = 0
+        self._schedule: List[str] = []
+        self._build()
+
+    def _build(self) -> None:
+        """Materialise the per-epoch shuffled name sequence."""
+        flat: List[str] = []
+        # Stable order across runs/ranks: iterate sources alphabetically.
+        for name in sorted(self._counts.keys()):
+            flat.extend([name] * self._counts[name])
+
+        if not flat:
+            self._schedule = []
+            return
+
+        g = torch.Generator()
+        g.manual_seed(self._seed + self._epoch)
+        perm = torch.randperm(len(flat), generator=g).tolist()
+        self._schedule = [flat[i] for i in perm]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._schedule)
+
+    def __len__(self) -> int:
+        return len(self._schedule)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Reseed the shuffle for the given epoch."""
+        self._epoch = int(epoch)
+        self._build()
+
+
+class MultiSourceTrainDataLoader:
+    """Iterate per-source DataLoaders in a weighted, shuffled order.
+
+    Wraps a ``Dict[str, DataLoader]`` plus a
+    :class:`WeightedSourceBatchScheduler`.  Each yielded batch dict is
+    augmented with ``__source__: List[str]`` of length ``B`` (homogeneous
+    in this PR; the per-sample shape leaves room for future PRs that
+    might interleave within a batch without code changes).
+
+    Key contracts (consumed by ``BaseTrainer``):
+
+    - ``__len__`` == ``num_batches_per_epoch`` (so existing
+      ``tqdm(range(num_batches_per_epoch))`` keeps working unchanged).
+    - ``set_epoch(epoch)`` reseeds the schedule AND propagates to every
+      per-source ``batch_sampler.set_epoch(epoch)``, then drops cached
+      iters so the next ``__iter__()`` starts fresh.
+    - ``dataloaders_by_source`` exposes the underlying per-source dict
+      so the future ``DiffusionOPDTrainer`` can drive its own balanced
+      per-teacher sampling without going through the global scheduler.
+    """
+
+    def __init__(
+        self,
+        dataloaders_by_source: Dict[str, DataLoader],
+        scheduler: WeightedSourceBatchScheduler,
+    ):
+        self._dl_by_source = dataloaders_by_source
+        self._scheduler = scheduler
+        self._iters: Dict[str, Iterator] = {}
+
+    @property
+    def dataloaders_by_source(self) -> Dict[str, DataLoader]:
+        """Public access for OPD-style consumers."""
+        return self._dl_by_source
+
+    def _ensure_iters(self) -> None:
+        """Lazily refresh per-source iterators (after set_epoch / first use)."""
+        for name, dl in self._dl_by_source.items():
+            if name not in self._iters:
+                self._iters[name] = iter(dl)
+
+    def __iter__(self) -> Iterator[Dict[str, Any]]:
+        self._ensure_iters()
+        for src in self._scheduler:
+            try:
+                batch = next(self._iters[src])
+            except StopIteration:
+                # Per-source samplers are cyclic by design (all three
+                # implementations yield indefinitely), so this should
+                # never trigger.  Defensive refresh — keeps the contract
+                # robust against future sampler swaps.
+                self._iters[src] = iter(self._dl_by_source[src])
+                batch = next(self._iters[src])
+
+            B = self._infer_batch_size(batch)
+            batch = dict(batch)
+            batch["__source__"] = [src] * B
+            yield batch
+
+    def __len__(self) -> int:
+        return len(self._scheduler)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Reseed the schedule and propagate to per-source samplers."""
+        self._scheduler.set_epoch(epoch)
+        for dl in self._dl_by_source.values():
+            sampler = getattr(dl, "batch_sampler", None) or getattr(dl, "sampler", None)
+            if sampler is not None and hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(epoch)
+        # Force fresh iters next epoch.
+        self._iters.clear()
+
+    @staticmethod
+    def _infer_batch_size(batch: Dict[str, Any]) -> int:
+        """Best-effort batch-size inference from a dataloader batch dict.
+
+        Prefers ``prompt`` (length-bearing list of strings used by every
+        adapter), falls back to the first length-bearing value found.
+        """
+        if "prompt" in batch and hasattr(batch["prompt"], "__len__"):
+            return len(batch["prompt"])
+        for v in batch.values():
+            if hasattr(v, "__len__"):
+                try:
+                    return len(v)
+                except TypeError:
+                    continue
+        return 1
+
 
 
 def get_eval_dataloaders(

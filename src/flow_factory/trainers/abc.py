@@ -215,11 +215,19 @@ class BaseTrainer(ABC):
             components=self.adapter.preprocessing_modules,
             device=self.accelerator.device
         )
-        dataloader, test_dataloader = get_dataloader(
+        # Multi-source train mode (data.datasets) yields a
+        # `MultiSourceTrainDataLoader` for `dataloader` and the
+        # per-source dict for `train_dataloaders_by_source`.  Legacy
+        # single-source mode returns the plain DataLoader and an empty
+        # dict.  We expose the per-source dict on the trainer so the
+        # future DiffusionOPDTrainer can drive its own balanced sampling
+        # without re-deriving the partition.
+        dataloader, test_dataloader, train_dataloaders_by_source = get_dataloader(
             config=self.config,
             accelerator=self.accelerator,
             preprocess_func=self.adapter.preprocess_func,
         )
+        self.train_dataloaders_by_source: Dict[str, DataLoader] = train_dataloaders_by_source
 
         # Multi-eval-dataset support: load additional eval dataloaders
         if self.config.data_args.eval_datasets:
