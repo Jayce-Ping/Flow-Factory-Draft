@@ -651,7 +651,24 @@ class Arguments(ArgABC):
 
     @classmethod
     def from_dict(cls, args_dict: dict[str, Any]) -> Arguments:
-        """Create Arguments instance from dictionary."""
+        """Create Arguments instance from dictionary.
+
+        Side effects: a top-level ``eval_datasets:`` key (legacy schema
+        introduced earlier on this branch) is migrated into
+        ``data.datasets[*].eval`` with a :class:`DeprecationWarning`.
+        The migration shim is removed in a future release; in the
+        meantime callers should prefer the unified ``data.datasets:``
+        list (each entry opts into training and/or evaluation via its
+        ``train`` / ``eval`` sub-blocks).
+        """
+        # 0. Top-level eval_datasets deprecation shim
+        # ------------------------------------------------
+        # Migrate `eval_datasets: [...]` (top level) into
+        # `data.datasets: [{name, dataset_dir, ..., eval: {...}}]`.
+        # We keep the migrated dict shape consistent with the new schema
+        # so the rest of `from_dict` (and `Arguments.__post_init__`) does
+        # not need to know about the legacy location.
+        args_dict = cls._migrate_legacy_eval_datasets(args_dict)
 
         # 1. Resolve TrainingArguments subclass based on trainer_type
         train_dict = args_dict.get('train', {})
@@ -728,8 +745,117 @@ class Arguments(ArgABC):
         """
         with open(yaml_file, 'r', encoding='utf-8') as f:
             args_dict = yaml.safe_load(f)
-        
+
         return cls.from_dict(args_dict)
+
+    @staticmethod
+    def _migrate_legacy_eval_datasets(args_dict: dict[str, Any]) -> dict[str, Any]:
+        """Auto-migrate the legacy top-level ``eval_datasets:`` YAML key.
+
+        Converts each legacy ``EvalDatasetArguments``-shaped dict into a
+        ``DatasetArguments`` entry under ``data.datasets`` whose
+        ``eval:`` sub-block carries the same overrides.  Top-level
+        ``eval_datasets`` is removed from the input dict so the rest of
+        ``from_dict`` sees the canonical schema only.
+
+        Idempotent for fully-migrated configs.  Does not mutate the
+        caller's dict (a shallow copy is returned).
+
+        Notes:
+        - Eval-only datasets (no ``train:`` block) are perfectly valid
+          under the unified schema, so no fabricated ``train:`` field is
+          inserted.
+        - When a ``data.datasets`` entry with the same ``name`` is
+          already present, the migration MERGES the legacy ``eval:``
+          fields into it (rather than creating a duplicate, which
+          would trip the duplicate-name validator).
+        """
+        if 'eval_datasets' not in args_dict:
+            return args_dict
+
+        legacy = args_dict['eval_datasets']
+        if not isinstance(legacy, list) or not legacy:
+            # Empty list or weird shape — drop and let the validator complain.
+            new_dict = dict(args_dict)
+            new_dict.pop('eval_datasets', None)
+            return new_dict
+
+        import warnings as _warnings
+        _warnings.warn(
+            "Top-level `eval_datasets:` is deprecated and will be removed in a "
+            "future release. Move each entry under `data.datasets:` and put "
+            "its eval-specific fields (split / num_inference_steps / "
+            "guidance_scale / resolution / max_dataset_size) inside an `eval:` "
+            "sub-block. The shared `dataset_dir` / `image_dir` / `video_dir` / "
+            "`audio_dir` move to the parent dataset entry.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+
+        # Shallow copy so we don't mutate the caller's dict.
+        new_dict = dict(args_dict)
+        data_dict = dict(new_dict.get('data', {}) or {})
+        existing_datasets: list = list(data_dict.get('datasets') or [])
+        # Index existing entries by name for in-place merge below.
+        by_name: dict[str, dict] = {}
+        for i, d in enumerate(existing_datasets):
+            if isinstance(d, dict) and 'name' in d:
+                by_name[d['name']] = d
+
+        # Field categorisation: the legacy EvalDatasetArguments dataclass
+        # carries both parent-level fields (name / dataset_dir / media
+        # roots) and DatasetEvalSpec-level fields. Split accordingly.
+        _PARENT_KEYS = {"name", "dataset_dir", "image_dir", "video_dir", "audio_dir"}
+        _EVAL_SPEC_KEYS = {
+            "split", "max_dataset_size",
+            "resolution", "num_inference_steps", "guidance_scale",
+        }
+
+        for entry in legacy:
+            if not isinstance(entry, dict):
+                raise TypeError(
+                    f"Legacy `eval_datasets:` entries must be dicts, got "
+                    f"{type(entry).__name__}."
+                )
+            name = entry.get('name')
+            if not name:
+                raise ValueError(
+                    "Legacy `eval_datasets:` entry is missing a `name`. "
+                    "Migrate manually to the unified `data.datasets:` schema."
+                )
+
+            parent_fields = {k: v for k, v in entry.items() if k in _PARENT_KEYS}
+            eval_fields = {k: v for k, v in entry.items() if k in _EVAL_SPEC_KEYS}
+            unknown = set(entry) - _PARENT_KEYS - _EVAL_SPEC_KEYS
+            if unknown:
+                # Surface unknown keys as DatasetArguments extras (extra_kwargs)
+                # rather than silently dropping them.  Same shape as ArgABC.
+                parent_fields.setdefault('extra_kwargs', {}).update(
+                    {k: entry[k] for k in unknown}
+                )
+
+            if name in by_name:
+                # Merge eval-spec fields into existing entry's `eval` block.
+                target = by_name[name]
+                eval_block = target.get('eval')
+                if eval_block is None:
+                    target['eval'] = eval_fields
+                elif isinstance(eval_block, dict):
+                    # Newer schema wins on conflict (defensive — should be rare).
+                    eval_block_merged = {**eval_fields, **eval_block}
+                    target['eval'] = eval_block_merged
+                # Don't overwrite parent fields when merging — the unified
+                # entry is authoritative.
+            else:
+                # Create a fresh dataset entry from the legacy fields.
+                migrated = {**parent_fields, 'eval': eval_fields}
+                existing_datasets.append(migrated)
+                by_name[name] = migrated
+
+        data_dict['datasets'] = existing_datasets
+        new_dict['data'] = data_dict
+        new_dict.pop('eval_datasets', None)
+        return new_dict
     
     def __str__(self) -> str:
         """Pretty print configuration as YAML."""
