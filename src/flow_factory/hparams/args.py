@@ -429,26 +429,34 @@ class Arguments(ArgABC):
         """``DistributedKRepeatSampler``: only the base
         ``unique_sample_num_per_epoch * group_size`` divisibility constraint.
         """
-        ta = self.training_args
-        step = self._base_unique_sample_step()
-        new_unique_sample_num = self._round_up_to_step(ta.unique_sample_num_per_epoch, step)
-        if new_unique_sample_num != ta.unique_sample_num_per_epoch:
-            self._warn_and_assign_unique_sample_num(new_unique_sample_num, "DistributedKRepeatSampler")
+        self._align_unique_sample_num(
+            sampler_name="DistributedKRepeatSampler",
+            base_step_func=self._base_unique_sample_step,
+        )
 
     def _align_for_group_contiguous(self) -> None:
         """``GroupContiguousSampler``: base constraint + ``unique_sample_num_per_epoch % num_replicas == 0``."""
-        ta = self.training_args
         world_size = get_world_size()
-        step = math.lcm(self._base_unique_sample_step(), world_size)
-        new_unique_sample_num = self._round_up_to_step(ta.unique_sample_num_per_epoch, step)
-        if new_unique_sample_num != ta.unique_sample_num_per_epoch:
-            extra_line = (
-                f"  1) unique_sample_num_per_epoch({new_unique_sample_num}) "
+
+        def _step() -> int:
+            return math.lcm(self._base_unique_sample_step(), world_size)
+
+        # Per-sampler `extra_line` so the warning explains why the alignment
+        # bumps `M` further than the base step.  Lazily formatted inside the
+        # primitive so the per-sampler-specific text only fires on the
+        # legacy (single-source) path; the multi-source path includes a
+        # source-breakdown line of its own.
+        def _extra(new_M: int) -> str:
+            return (
+                f"  1) unique_sample_num_per_epoch({new_M}) "
                 f"% num_replicas({world_size}) == 0\n  2)"
             )
-            self._warn_and_assign_unique_sample_num(
-                new_unique_sample_num, "GroupContiguousSampler", extra_line,
-            )
+
+        self._align_unique_sample_num(
+            sampler_name="GroupContiguousSampler",
+            base_step_func=_step,
+            extra_line_for_legacy=_extra,
+        )
 
     def _align_for_group_distributed(self) -> None:
         """``GroupDistributedSampler``: first align ``group_size`` so that
@@ -509,10 +517,154 @@ class Arguments(ArgABC):
             ta.group_size = new_group_size
 
         # Now do the shared unique_sample_num_per_epoch alignment with the aligned group_size.
-        step = self._base_unique_sample_step()
-        new_unique_sample_num = self._round_up_to_step(ta.unique_sample_num_per_epoch, step)
-        if new_unique_sample_num != ta.unique_sample_num_per_epoch:
-            self._warn_and_assign_unique_sample_num(new_unique_sample_num, "GroupDistributedSampler")
+        self._align_unique_sample_num(
+            sampler_name="GroupDistributedSampler",
+            base_step_func=self._base_unique_sample_step,
+        )
+
+    # ---------------------------------------------------------------------
+    # Shared alignment primitive (legacy + multi-source dispatch)
+    # ---------------------------------------------------------------------
+    def _align_unique_sample_num(
+        self,
+        *,
+        sampler_name: str,
+        base_step_func,
+        extra_line_for_legacy=None,
+    ) -> None:
+        """Shared core for the three per-sampler ``_align_for_*`` helpers.
+
+        Dispatches on whether ``data.datasets`` declares more than one
+        training-eligible source:
+
+        * **Legacy / single-source** — round ``unique_sample_num_per_epoch``
+          up to the next multiple of ``base_step_func()``; emit the
+          standard "adjusted" warning when the value changes.  Behaviour
+          is byte-identical to the pre-refactor code paths.
+
+        * **Multi-source (N >= 2)** — partition the (rounded-up) total
+          across the training-eligible datasets in proportion to each
+          ``train.weight``, with a ``step`` floor that prevents any
+          source from collapsing to ``M_i = 0``.  See
+          :meth:`_partition_unique_sample_num` for the deterministic
+          allocator (no try/except, no exceptions in the happy path —
+          just the existing "round up + warn" idiom extended per-source).
+
+        ``extra_line_for_legacy`` is a one-shot text producer for the
+        legacy path's per-sampler constraint description; it's only
+        invoked on the single-source code path so the multi-source
+        warning can supply its own per-source breakdown without
+        duplicating the sampler-specific blurb.
+        """
+        ta = self.training_args
+        step = base_step_func()
+        tds = self.data_args.training_datasets  # property; List[DatasetArguments]
+        N = len(tds)
+
+        if N <= 1:
+            new_M = self._round_up_to_step(ta.unique_sample_num_per_epoch, step)
+            if new_M != ta.unique_sample_num_per_epoch:
+                extra = extra_line_for_legacy(new_M) if extra_line_for_legacy else ""
+                self._warn_and_assign_unique_sample_num(new_M, sampler_name, extra)
+            # Stash a 1-entry partition when single-source multi-dataset
+            # mode is configured (N == 1) — keeps the data layer's
+            # downstream lookup uniform.  None when fully legacy.
+            ta._per_source_unique_sample_num = (
+                {tds[0].name: ta.unique_sample_num_per_epoch}
+                if N == 1
+                else None
+            )
+            return
+
+        # Multi-source partition (N >= 2).
+        # Step 1: target total = round_up(M, step), AND >= N * step
+        # (every source needs at least one alignment step; bump M when the
+        # user-specified value is too small to fit N sources).
+        original_M = ta.unique_sample_num_per_epoch
+        target_total = max(self._round_up_to_step(original_M, step), N * step)
+        # Step 2-5: deterministic per-source allocator.
+        partition = self._partition_unique_sample_num(target_total, step, tds)
+        final_total = sum(partition.values())
+
+        if final_total != original_M:
+            breakdown = ", ".join(f"{n}={v}" for n, v in sorted(partition.items()))
+            extra = (
+                f"  multi-source partition ({len(tds)} sources): {breakdown}\n  "
+            )
+            self._warn_and_assign_unique_sample_num(final_total, sampler_name, extra)
+        # Always stash the partition for the data layer to consume.
+        ta._per_source_unique_sample_num = partition
+
+    @staticmethod
+    def _partition_unique_sample_num(
+        target_total: int,
+        step: int,
+        training_datasets,
+    ) -> "dict[str, int]":
+        """Partition ``target_total`` across training datasets by ``train.weight``.
+
+        Algorithm (deterministic, total over all valid inputs):
+
+        1. Raw allocation:   ``M_i_raw = target_total * w_i / sum(w_j)``.
+        2. Step-floor:       ``M_i = max(step, floor(M_i_raw / step) * step)``.
+           The ``max(step, ...)`` floor prevents ``weight=1`` from rounding
+           to zero (which would silently drop the source).
+        3. Distribute the deficit ``target_total - sum(M_i)`` by ``±step``
+           bumps, ranked by largest fractional remainder
+           ``(M_i_raw - M_i) * sign(deficit)``.  Names break ties so the
+           allocation is reproducible across runs / ranks.
+
+        Edge cases (all flow through the same path; no try/except):
+
+        * ``N == 1`` — caller short-circuits before reaching here.
+        * Highly uneven weights (e.g. ``(1, 999)``) — the small source
+          still gets the ``step`` minimum.
+        * Total too small (``target_total < N * step``) — caller already
+          bumped ``target_total`` to ``N * step`` before calling.
+        """
+        weights = {d.name: float(d.train.weight) for d in training_datasets}  # type: ignore[union-attr]
+        total_w = sum(weights.values())
+        # Step 1+2: raw allocation -> step-floor with `step` minimum.
+        raw = {n: target_total * w / total_w for n, w in weights.items()}
+        partition = {n: max(step, (int(r) // step) * step) for n, r in raw.items()}
+
+        # Step 3: distribute deficit by largest fractional remainder.
+        deficit = target_total - sum(partition.values())
+        # Sort by `name` first so deterministic across runs; then by remainder.
+        names_sorted = sorted(weights.keys())
+
+        while deficit != 0:
+            sign = 1 if deficit > 0 else -1
+            # Sort sources by remainder relevance:
+            #   - sign > 0 (need to add)    -> largest positive remainder first
+            #   - sign < 0 (need to remove) -> largest "overshoot" first (most-negative remainder)
+            ordered = sorted(
+                names_sorted,
+                key=lambda n: (raw[n] - partition[n]) * sign,
+                reverse=True,
+            )
+            progressed = False
+            for n in ordered:
+                new_val = partition[n] + sign * step
+                if new_val < step:
+                    continue          # never go below the step minimum
+                partition[n] = new_val
+                deficit -= sign * step
+                progressed = True
+                if deficit == 0:
+                    break
+            if not progressed:
+                # Mathematically unreachable when target_total >= N*step,
+                # but guard against pathological inputs (e.g., negative
+                # target) so we never spin forever.
+                raise RuntimeError(
+                    "Internal error: could not partition "
+                    f"unique_sample_num_per_epoch={target_total} across "
+                    f"{len(weights)} sources at step={step}; "
+                    f"current partition={partition}, deficit={deficit}."
+                )
+        return partition
+
 
 
     def _adjust_gradient_accumulation(self) -> None:

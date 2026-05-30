@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import yaml
 from dataclasses import dataclass, field
-from typing import Any, Literal, Union, Optional, Tuple
+from typing import Any, Dict, Literal, Union, Optional, Tuple
 
 from ..abc import ArgABC
 from ...utils.dist import get_world_size
@@ -249,6 +249,24 @@ class TrainingArguments(ArgABC):
             "Default fp16 uses `float16`. It's recommended to use fp16 for both precision and memory efficiency. "
             "Options: bf16, fp16, fp32, None (use model-native dtype)."
         )},
+    )
+
+    # --- Multi-source partition (set by Arguments._align_batch_geometry) ---
+    # Populated only when `data.datasets` declares more than one training
+    # source.  Maps each training-source name to its per-source aligned
+    # ``unique_sample_num_per_epoch`` (``M_i``).  ``None`` in the legacy
+    # single-source path so existing consumers see no change.
+    # NOT a public configuration knob — it's overwritten by alignment.
+    _per_source_unique_sample_num: Optional[Dict[str, int]] = field(
+        default=None,
+        repr=False,
+        metadata={
+            "help": (
+                "[INTERNAL] Set by `Arguments._align_batch_geometry` when multi-source "
+                "training is configured: maps source name -> aligned per-source "
+                "unique_sample_num_per_epoch. Read by data_utils.get_dataloader."
+            )
+        },
     )
 
     def __post_init__(self):
