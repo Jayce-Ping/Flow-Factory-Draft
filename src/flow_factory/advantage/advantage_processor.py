@@ -221,6 +221,65 @@ class AdvantageProcessor:
             _unique_ids, group_indices = np.unique(gathered_ids, return_inverse=True)
             return collected_rewards, group_indices
 
+    def collect_applicability_mask(
+        self,
+        samples: List[BaseSample],
+        reward_keys: List[str],
+    ) -> np.ndarray:
+        """Gather the per-(reward, sample) applicability matrix.
+
+        Mirrors :meth:`collect_group_rewards` topology:
+
+        - ``group_contiguous`` (local): no communication; matrix shape
+          ``(R, B_local)``.
+        - ``distributed_k_repeat``: all per-rank ``(R, B)`` matrices are
+          packed and gathered, returning ``(R, W*B)`` ordered the same
+          way as :meth:`collect_group_rewards` so positions align.
+
+        Used by aggregation as the *authoritative* source of which
+        positions a reward applies to (NOT ``np.isnan(rewards)``, which
+        would silently mask in-model NaN bugs).
+
+        Legacy back-compat: when a sample's ``applicable_rewards`` set
+        is empty AND the sample carries no ``__source__`` (i.e. came
+        from the legacy single-source path that never updates the
+        bookkeeping), every reward is treated as applicable.  Multi-
+        source mode populates ``applicable_rewards`` even for samples
+        whose source matches no rewards (that case raises
+        ``RuntimeError`` below).
+        """
+        R = len(reward_keys)
+        B = len(samples)
+        local_mask = np.zeros((R, B), dtype=bool)
+        for j, s in enumerate(samples):
+            try:
+                applicable = object.__getattribute__(s, 'applicable_rewards')
+            except AttributeError:
+                applicable = set()
+            try:
+                extras = object.__getattribute__(s, 'extra_kwargs')
+            except AttributeError:
+                extras = {}
+            has_source = '__source__' in extras
+            if not applicable and not has_source:
+                # Legacy single-source path: no source tag and no bookkeeping.
+                # Honour the original "every reward applies" invariant so
+                # existing configs are byte-identical.
+                local_mask[:, j] = True
+            else:
+                for i, name in enumerate(reward_keys):
+                    local_mask[i, j] = (name in applicable)
+
+        if self.group_on_same_rank:
+            return local_mask
+
+        # distributed_k_repeat: pack as float (gather requires tensor),
+        # transpose to (B, R) so row-i-after-gather still corresponds
+        # to sample i (gather concatenates along dim 0 = ranks).
+        packed = torch.from_numpy(local_mask.T.astype(np.float32)).to(self.accelerator.device)
+        gathered = self.accelerator.gather(packed).cpu().numpy()  # (W*B, R)
+        return gathered.T.astype(bool)  # (R, W*B)
+
     def _to_local(
         self,
         values: np.ndarray,
@@ -324,12 +383,23 @@ class AdvantageProcessor:
         aggregated reward per sample.  Advantages are then group-normalised
         (subtract per-group mean, divide by std).
 
+        **Source-aware aggregation** (plan §6.4): the per-sample
+        applicability matrix from :meth:`collect_applicability_mask` is
+        the authoritative source of truth.  NaN at applicable positions
+        is asserted to be a model bug (loud failure); NaN at
+        non-applicable positions is honored as "this reward doesn't
+        contribute to this sample".  Samples with NO applicable reward
+        raise -- a misconfigured `RewardArguments.datasets` shouldn't
+        silently produce zero advantages.
+
         **Algorithm**:
 
         1. **Collect** — call :meth:`collect_group_rewards` to obtain
            reward arrays and group assignments.
         2. **Aggregate** — compute
-           ``r_agg[i] = sum_k(reward_k[i] * weight_k)`` for each sample.
+           ``r_agg[i] = sum_k(reward_k[i] * weight_k * applicable_k_i)``.
+           NaN values at non-applicable positions are zero-weighted; NaN
+           at applicable positions raises.
         3. **Group-normalise** — for each group *g*:
            ``advantage[i] = (r_agg[i] - mean(r_agg[g])) / std``
            where *std* is either the global std across all samples (when
@@ -338,32 +408,50 @@ class AdvantageProcessor:
            :meth:`_to_local`.
         5. **Store** — optionally write advantages into each sample's
            ``extra_kwargs['advantage']``.
-
-        Parameters
-        ----------
-        samples : list[BaseSample]
-            Samples on the current rank.
-        rewards : dict[str, Tensor]
-            Per-reward-model reward tensors aligned with *samples*.
-        store_to_samples : bool
-            If ``True``, write the computed advantage into each sample's
-            ``extra_kwargs['advantage']`` field.
-
-        Returns
-        -------
-        torch.Tensor
-            Advantages for the local rank, shape ``(len(samples),)``.
         """
-        gathered_rewards, group_indices = self.collect_group_rewards(
-            samples, rewards
+        gathered_rewards, group_indices = self.collect_group_rewards(samples, rewards)
+        reward_keys = list(gathered_rewards.keys())
+        # Authoritative applicability matrix, shape (R, S) where S matches
+        # gathered_rewards' shape.
+        applicable = self.collect_applicability_mask(samples, reward_keys)
+
+        S = len(next(iter(gathered_rewards.values())))
+        weights = np.array(
+            [self.reward_weights[k] for k in reward_keys], dtype=np.float64
         )
 
-        # Aggregate rewards with weights
-        aggregated_rewards = np.zeros_like(
-            next(iter(gathered_rewards.values())), dtype=np.float64
-        )
-        for key, reward_array in gathered_rewards.items():
-            aggregated_rewards += reward_array * self.reward_weights[key]
+        # Bug-detection: NaN at applicable position == reward-model bug.
+        stack = np.stack(
+            [gathered_rewards[k].astype(np.float64) for k in reward_keys], axis=0
+        )  # (R, S)
+        nan_mask = ~np.isfinite(stack)
+        bug_positions = nan_mask & applicable
+        if bug_positions.any():
+            r_idx, s_idx = np.where(bug_positions)
+            offenders = sorted({reward_keys[i] for i in r_idx})
+            raise RuntimeError(
+                f"NaN/Inf reward at APPLICABLE positions for reward(s) "
+                f"{offenders} (sample indices {sorted(set(s_idx.tolist()))[:10]}{'...' if len(s_idx) > 10 else ''}). "
+                "This is a reward-model bug, not a routing miss; "
+                "aggregation refuses to silently mask it."
+            )
+
+        # Aggregate: weighted sum over applicable rewards only.
+        # Non-applicable positions: contribute 0 (mask is False).
+        contrib = np.where(applicable, stack, 0.0) * weights[:, None]
+        aggregated_rewards = contrib.sum(axis=0)  # (S,)
+
+        # Per-sample applicable weight sum -> sanity check.
+        weight_per_s = (applicable * weights[:, None]).sum(axis=0)  # (S,)
+        if (weight_per_s == 0).any():
+            bad = np.where(weight_per_s == 0)[0].tolist()
+            raise RuntimeError(
+                "AdvantageProcessor: samples at indices "
+                f"{bad[:10]}{'...' if len(bad) > 10 else ''} have NO applicable "
+                "reward (weight_sum == 0). Check that "
+                "`RewardArguments.datasets` covers every training source — "
+                "at least one reward must apply to every source."
+            )
 
         # Group-normalise
         _unique_ids, _counts = np.unique(group_indices, return_counts=True)
@@ -386,7 +474,8 @@ class AdvantageProcessor:
             advantages[mask] = (group_rewards - mean) / std
 
         self._pending_advantage_metrics = self._build_weighted_sum_log_data(
-            gathered_rewards, group_indices, aggregated_rewards, advantages, samples
+            gathered_rewards, group_indices, aggregated_rewards, advantages, samples,
+            applicable=applicable, reward_keys=reward_keys,
         )
 
         # Scatter & store
@@ -414,63 +503,90 @@ class AdvantageProcessor:
         prevents a single high-variance reward from dominating the advantage
         signal.
 
+        **Source-aware aggregation**: per-reward group statistics are
+        computed only over applicable group members.  Under the
+        homogeneous-batch design (plan §6.7) a reward is either
+        applicable to ALL K samples of a group or to NONE — so GDPO's
+        per-(reward, group) normalisation either fires or is skipped
+        entirely for that pair.  Mixed applicability within a group is
+        an asserted error (caught upstream in
+        ``_compute_groupwise_group``).
+
         **Algorithm**:
 
         1. **Collect** — call :meth:`collect_group_rewards` to obtain
-           reward arrays and group assignments.
-        2. **Per-reward group normalisation** — for each reward *k* and
-           each group *g*:
-           ``norm_k[i] = (reward_k[i] - mean(reward_k[g])) / std(reward_k[g])``
-           then scale by the reward weight:
-           ``adv_k[i] = norm_k[i] * weight_k``.
-        3. **Combine** — sum per-reward advantages:
-           ``combined[i] = sum_k(adv_k[i])``.
-        4. **Batch normalisation** — compute global mean and std of the
-           combined advantages and normalise:
-           ``advantage[i] = (combined[i] - global_mean) / global_std``.
-        5. **To-local** — convert back to local-rank tensor via
-           :meth:`_to_local`.
+           reward arrays and group assignments; also gather the
+           per-(reward, sample) applicability matrix.
+        2. **Per-reward, per-group, per-applicable normalisation**.
+        3. **Combine** — sum per-reward normalised contributions.
+        4. **Batch normalisation** — compute global mean and std and
+           normalise.
+        5. **To-local** — convert back to local-rank tensor.
         6. **Store** — optionally write advantages into each sample's
            ``extra_kwargs['advantage']``.
-
-        Parameters
-        ----------
-        samples : list[BaseSample]
-            Samples on the current rank.
-        rewards : dict[str, Tensor]
-            Per-reward-model reward tensors aligned with *samples*.
-        store_to_samples : bool
-            If ``True``, write the computed advantage into each sample's
-            ``extra_kwargs['advantage']`` field.
-
-        Returns
-        -------
-        torch.Tensor
-            Advantages for the local rank, shape ``(len(samples),)``.
         """
-        gathered_rewards, group_indices = self.collect_group_rewards(
-            samples, rewards
-        )
+        gathered_rewards, group_indices = self.collect_group_rewards(samples, rewards)
+        reward_keys = list(gathered_rewards.keys())
+        applicable = self.collect_applicability_mask(samples, reward_keys)
+        S = len(group_indices)
 
-        # Per-reward group-wise normalisation
+        # Bug-detection: NaN at applicable position == reward-model bug.
+        stack = np.stack(
+            [gathered_rewards[k].astype(np.float64) for k in reward_keys], axis=0
+        )
+        nan_mask = ~np.isfinite(stack)
+        bug_positions = nan_mask & applicable
+        if bug_positions.any():
+            r_idx, _s_idx = np.where(bug_positions)
+            offenders = sorted({reward_keys[i] for i in r_idx})
+            raise RuntimeError(
+                f"GDPO: NaN/Inf reward at APPLICABLE positions for reward(s) "
+                f"{offenders}. This is a reward-model bug, not a routing miss."
+            )
+
+        # Per-reward group-wise normalisation, restricted to applicable samples.
         all_reward_advantages = []
-        for key, reward_array in gathered_rewards.items():
+        for r_idx, key in enumerate(reward_keys):
+            reward_array = gathered_rewards[key]
+            r_applicable = applicable[r_idx]
             reward_adv = np.zeros_like(reward_array, dtype=np.float64)
             for group_id in np.unique(group_indices):
-                mask = group_indices == group_id
-                group_rewards = reward_array[mask]
+                gmask = group_indices == group_id
+                in_group_applicable = gmask & r_applicable
+                if not in_group_applicable.any():
+                    # Reward doesn't apply to this entire group; contribute 0.
+                    continue
+                # Group homogeneity invariant: applicable_in_group is either
+                # all-True (and equals gmask) or all-False (already returned).
+                # The asserted invariant is enforced upstream; if it slips
+                # we still proceed with whatever applicable subset exists.
+                group_rewards = reward_array[in_group_applicable]
                 mean = np.mean(group_rewards)
                 std = max(np.std(group_rewards), 1e-6)
-                reward_adv[mask] = (group_rewards - mean) / std
+                # Write normalised values only at applicable positions in this group.
+                reward_adv[in_group_applicable] = (group_rewards - mean) / std
             all_reward_advantages.append(reward_adv * self.reward_weights[key])
 
-        # Combine and batch normalise
+        # Combine and batch normalise. Samples with no applicable reward
+        # would aggregate to 0 here -- guard upfront so misconfigs are loud.
+        weight_per_s = (applicable * np.array(
+            [self.reward_weights[k] for k in reward_keys], dtype=np.float64
+        )[:, None]).sum(axis=0)
+        if (weight_per_s == 0).any():
+            bad = np.where(weight_per_s == 0)[0].tolist()
+            raise RuntimeError(
+                "GDPO: samples at indices "
+                f"{bad[:10]}{'...' if len(bad) > 10 else ''} have NO applicable "
+                "reward. Check `RewardArguments.datasets` coverage."
+            )
+
         combined_advantages = np.sum(all_reward_advantages, axis=0)
         bn_mean, bn_std = self._global_mean_std(combined_advantages)
         advantages = (combined_advantages - bn_mean) / bn_std
 
         self._pending_advantage_metrics = self._build_gdpo_log_data(
-            gathered_rewards, group_indices, advantages, bn_mean, bn_std, samples
+            gathered_rewards, group_indices, advantages, bn_mean, bn_std, samples,
+            applicable=applicable, reward_keys=reward_keys,
         )
 
         # Scatter & store
@@ -491,26 +607,38 @@ class AdvantageProcessor:
         aggregated_rewards: np.ndarray,
         advantages: np.ndarray,
         samples: List[BaseSample],
+        applicable: Optional[np.ndarray] = None,
+        reward_keys: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         _log_data: Dict[str, Any] = {}
-        reward_keys = sorted(gathered_rewards.keys())
+        keys_sorted = sorted(gathered_rewards.keys())
 
-        # Collect all arrays for batched global stats
+        # Build per-reward applicability column index for stat masking.
+        # When `applicable` is None (legacy) every position is "applicable"
+        # so the masked stats degenerate to the original behaviour.
+        if applicable is not None and reward_keys is not None:
+            r_applicable = {k: applicable[reward_keys.index(k)] for k in keys_sorted}
+        else:
+            r_applicable = {k: np.ones(len(gathered_rewards[k]), dtype=bool) for k in keys_sorted}
+
+        # Collect all arrays for batched global stats — restricted to applicable.
         stat_arrays: Dict[str, np.ndarray] = {}
 
-        # Per-reward raw scores
-        for key in reward_keys:
-            stat_arrays[f"reward_{key}"] = gathered_rewards[key]
+        for key in keys_sorted:
+            mask_k = r_applicable[key]
+            stat_arrays[f"reward_{key}"] = gathered_rewards[key][mask_k]
 
-        # Per-reward group-level distributions
-        for key in reward_keys:
+        # Per-reward group-level distributions (applicable subset only).
+        for key in keys_sorted:
+            mask_k = r_applicable[key]
             group_means, group_stds = RewardProcessor.compute_group_reward_stats(
-                gathered_rewards[key], group_indices
+                gathered_rewards[key][mask_k], group_indices[mask_k]
             )
             stat_arrays[f"reward_{key}_g_stds"] = group_stds
             stat_arrays[f"reward_{key}_g_means"] = group_means
 
-        # Aggregated (weighted-sum) reward
+        # Aggregated (weighted-sum) reward — already source-aware (NaN
+        # at non-applicable positions was zero-weighted in compute_weighted_sum).
         stat_arrays["reward_agg"] = aggregated_rewards
 
         # Aggregated reward group-level distributions
@@ -528,7 +656,7 @@ class AdvantageProcessor:
         all_stats = self._batch_reduce_stats(stat_arrays)
 
         # Unpack per-reward stats
-        for key in reward_keys:
+        for key in keys_sorted:
             reward_stats = all_stats[f"reward_{key}"]
             _log_data[f"train/reward_{key}_mean"] = reward_stats["mean"]
             _log_data[f"train/reward_{key}_std"] = reward_stats["std"]
@@ -538,7 +666,7 @@ class AdvantageProcessor:
         _log_data["train/reward_std"] = all_stats["reward_agg"]["std"]
 
         # Unpack per-reward group stats
-        for key in reward_keys:
+        for key in keys_sorted:
             group_std_stats = all_stats[f"reward_{key}_g_stds"]
             group_mean_stats = all_stats[f"reward_{key}_g_means"]
             _log_data[f"train/reward_{key}_group_std_mean"] = group_std_stats["mean"]
@@ -575,21 +703,28 @@ class AdvantageProcessor:
         bn_mean: float,
         bn_std: float,
         samples: List[BaseSample],
+        applicable: Optional[np.ndarray] = None,
+        reward_keys: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         _log_data: Dict[str, Any] = {}
-        reward_keys = sorted(gathered_rewards.keys())
+        keys_sorted = sorted(gathered_rewards.keys())
 
-        # Collect all arrays for batched global stats
+        if applicable is not None and reward_keys is not None:
+            r_applicable = {k: applicable[reward_keys.index(k)] for k in keys_sorted}
+        else:
+            r_applicable = {k: np.ones(len(gathered_rewards[k]), dtype=bool) for k in keys_sorted}
+
+        # Collect all arrays for batched global stats — restricted to applicable.
         stat_arrays: Dict[str, np.ndarray] = {}
 
-        # Per-reward raw scores
-        for key in reward_keys:
-            stat_arrays[f"reward_{key}"] = gathered_rewards[key]
+        for key in keys_sorted:
+            mask_k = r_applicable[key]
+            stat_arrays[f"reward_{key}"] = gathered_rewards[key][mask_k]
 
-        # Per-reward group-level distributions
-        for key in reward_keys:
+        for key in keys_sorted:
+            mask_k = r_applicable[key]
             group_means, group_stds = RewardProcessor.compute_group_reward_stats(
-                gathered_rewards[key], group_indices
+                gathered_rewards[key][mask_k], group_indices[mask_k]
             )
             stat_arrays[f"reward_{key}_g_stds"] = group_stds
             stat_arrays[f"reward_{key}_g_means"] = group_means
@@ -602,19 +737,22 @@ class AdvantageProcessor:
         all_stats = self._batch_reduce_stats(stat_arrays)
 
         # Unpack per-reward stats
-        for key in reward_keys:
+        for key in keys_sorted:
             reward_stats = all_stats[f"reward_{key}"]
             _log_data[f"train/reward_{key}_mean"] = reward_stats["mean"]
             _log_data[f"train/reward_{key}_std"] = reward_stats["std"]
 
-        # Per-reward zero-std ratio (count-based; requires separate all-reduce each)
-        for key in reward_keys:
+        # Per-reward zero-std ratio (count-based; requires separate all-reduce each).
+        # Use the applicable subset so per-source rewards aren't dragged
+        # toward zero by NaN-padded non-applicable positions.
+        for key in keys_sorted:
+            mask_k = r_applicable[key]
             _log_data[f"train/reward_{key}_zero_std_ratio"] = self._metric_zero_std_ratio(
-                gathered_rewards[key], group_indices
+                gathered_rewards[key][mask_k], group_indices[mask_k]
             )
 
         # Unpack per-reward group stats
-        for key in reward_keys:
+        for key in keys_sorted:
             group_std_stats = all_stats[f"reward_{key}_g_stds"]
             group_mean_stats = all_stats[f"reward_{key}_g_means"]
             _log_data[f"train/reward_{key}_group_std_mean"] = group_std_stats["mean"]
