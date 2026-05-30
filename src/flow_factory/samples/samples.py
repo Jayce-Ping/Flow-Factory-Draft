@@ -200,7 +200,16 @@ class BaseSample:
         return cls(**known, extra_kwargs=extra)
     
     def __getattr__(self, key: str) -> Any:
-        """Access attributes. Check extra_kwargs if not found."""
+        """Access attributes. Check extra_kwargs if not found.
+
+        Note for callers: do NOT use ``object.__getattribute__(sample, ...)``
+        to bypass this fallback — plain ``sample.<key>`` already does the
+        right thing (real dataclass fields short-circuit before this method
+        runs; only "missing" lookups fall through to ``extra_kwargs``).
+        ``object.__getattribute__`` is appropriate ONLY inside this method
+        body to avoid infinite recursion when reading ``extra_kwargs``
+        itself.
+        """
         try:
             extra = object.__getattribute__(self, 'extra_kwargs')
         except AttributeError:

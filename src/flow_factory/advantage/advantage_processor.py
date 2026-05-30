@@ -252,14 +252,13 @@ class AdvantageProcessor:
         B = len(samples)
         local_mask = np.zeros((R, B), dtype=bool)
         for j, s in enumerate(samples):
-            try:
-                applicable = object.__getattribute__(s, 'applicable_rewards')
-            except AttributeError:
-                applicable = set()
-            try:
-                extras = object.__getattribute__(s, 'extra_kwargs')
-            except AttributeError:
-                extras = {}
+            # Plain attribute access: applicable_rewards is a dataclass
+            # field with a default factory; extra_kwargs likewise. Avoid
+            # object.__getattribute__ — bypassing BaseSample.__getattr__
+            # is only legitimate inside __getattr__ itself (to break
+            # recursion).
+            applicable = s.applicable_rewards
+            extras = s.extra_kwargs
             has_source = '__source__' in extras
             if not applicable and not has_source:
                 # Legacy single-source path: no source tag and no bookkeeping.

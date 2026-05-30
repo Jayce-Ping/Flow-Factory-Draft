@@ -102,12 +102,11 @@ class RewardProcessor:
         cfg = self.reward_configs.get(name)
         if cfg is None or cfg.datasets is None:
             return True
-        # Inline access — sample.extra_kwargs is a regular dict; no fallback.
-        try:
-            extras = object.__getattribute__(sample, 'extra_kwargs')
-        except AttributeError:
-            extras = {}
-        src = extras.get('__source__')
+        # Plain attribute access — sample.extra_kwargs is a dataclass field
+        # with a default factory, so it's always present on a real BaseSample.
+        # Avoid object.__getattribute__ here: bypassing BaseSample.__getattr__
+        # is only legitimate inside __getattr__ itself (to break recursion).
+        src = sample.extra_kwargs.get('__source__')
         if src is None:
             return True  # legacy: no source on the sample -> always apply
         return src in cfg.datasets
