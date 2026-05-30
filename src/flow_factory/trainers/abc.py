@@ -131,6 +131,15 @@ class BaseTrainer(ABC):
             if self.config.data_args.eval_datasets
             else []
         )
+        # Collect training dataset names (mirror of eval_dataset_names) so
+        # MultiRewardLoader can pre-compute the per-source reward routing
+        # used by the runtime reward gate (step 9) and any future trainer
+        # that needs "which rewards apply to source S?" lookups.
+        training_dataset_names = (
+            [td.name for td in self.config.data_args.training_datasets]
+            if self.config.data_args.training_datasets
+            else []
+        )
 
         # Initialize all reward model instances
         self.reward_loader = MultiRewardLoader(
@@ -138,6 +147,7 @@ class BaseTrainer(ABC):
             accelerator=self.accelerator,
             eval_reward_args=self.config.eval_reward_args,
             eval_dataset_names=eval_dataset_names,
+            training_dataset_names=training_dataset_names,
         ).load()
         # Get training & eval reward models
         self.reward_models = self.reward_loader.get_training_reward_models()
