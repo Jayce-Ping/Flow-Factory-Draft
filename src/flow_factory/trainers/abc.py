@@ -34,7 +34,6 @@ from ..models.abc import BaseAdapter
 from ..data_utils.loader import (
     get_train_dataloader,
     get_eval_dataloaders,
-    _build_legacy_test_dataloader,
 )
 from ..rewards import load_reward_model, BaseRewardModel, MultiRewardLoader, RewardProcessor, RewardBuffer
 from ..advantage import AdvantageProcessor
@@ -224,7 +223,7 @@ class BaseTrainer(ABC):
 
         return self.reward_models, self.eval_reward_models
 
-    def _init_dataloader(self) -> Tuple[DataLoader, Union[None, DataLoader]]:
+    def _init_dataloader(self) -> Tuple[Optional[DataLoader], Union[None, DataLoader]]:
         # Move text-encoder & vae to GPU for dataloader encoding
         self.adapter.on_load_components(
             components=self.adapter.preprocessing_modules,
@@ -243,42 +242,23 @@ class BaseTrainer(ABC):
         )
         self.train_dataloaders_by_source: Dict[str, DataLoader] = train_dataloaders_by_source
 
-        # Eval side: when `data.datasets` declares any eval-eligible
-        # entry (which now includes the canonicalized legacy
-        # `data.dataset_dir` whenever a `test.jsonl` exists), the
-        # multi-eval pipeline owns it.  The legacy single-test path
-        # below is a transitional bridge: it remains active only when
-        # no eval-eligible entry was declared (i.e. genuinely train-only
-        # configs).  Step 3 of the merge plan folds the bridge into
-        # `get_eval_dataloaders` and deletes
-        # `_build_legacy_test_dataloader` outright.
+        # Eval side: a single, unified path.  The legacy
+        # `data.dataset_dir` -> 1-entry `data.datasets` canonicalization
+        # in `Arguments._canonicalize_legacy_dataset_dir` already
+        # populates a `DatasetEvalSpec()` when `test.jsonl` exists, so
+        # `get_eval_dataloaders` handles BOTH the legacy and the
+        # multi-eval cases.  When no eval-eligible entry exists at all
+        # the dict is empty and `evaluate()` becomes a no-op.
+        self.eval_dataloaders: Dict[str, DataLoader] = get_eval_dataloaders(
+            eval_datasets=self.config.data_args.eval_datasets,
+            config=self.config,
+            accelerator=self.accelerator,
+            preprocess_func=self.adapter.preprocess_func,
+        )
+        # `test_dataloader` is now permanently None — kept as a return
+        # slot for one more commit so subclasses that override
+        # `_init_dataloader` don't break in lock-step; step 5 drops it.
         test_dataloader: Optional[DataLoader] = None
-        if self.config.data_args.eval_datasets:
-            self.eval_dataloaders: Dict[str, DataLoader] = get_eval_dataloaders(
-                eval_datasets=self.config.data_args.eval_datasets,
-                config=self.config,
-                accelerator=self.accelerator,
-                preprocess_func=self.adapter.preprocess_func,
-            )
-        else:
-            self.eval_dataloaders = {}
-            # Build the legacy single test_dataloader only when no
-            # eval-eligible entry was canonicalized — i.e. configs that
-            # never had a test.jsonl in the first place.  This branch
-            # disappears in step 3.
-            test_dataloader = _build_legacy_test_dataloader(
-                config=self.config,
-                accelerator=self.accelerator,
-                preprocess_func=self.adapter.preprocess_func,
-                base_kwargs=self._build_legacy_test_base_kwargs(),
-                enable_distributed=(
-                    self.accelerator.num_processes > 1
-                    and self.config.data_args.enable_preprocess
-                ),
-                preprocess_parallelism=getattr(
-                    self.config.data_args, 'preprocess_parallelism', 'local',
-                ),
-            )
 
         # Offload text-encoder after dataloader encoding
         self.adapter.off_load_components(
@@ -288,33 +268,6 @@ class BaseTrainer(ABC):
         self.accelerator.wait_for_everyone()
 
         return dataloader, test_dataloader
-
-    def _build_legacy_test_base_kwargs(self) -> dict:
-        """Mirror of the `base_kwargs` previously assembled inside
-        `get_dataloader`, used only by the transitional
-        `_build_legacy_test_dataloader` call in `_init_dataloader`.
-
-        Lifted to a method so `_init_dataloader` reads cleanly; gone
-        entirely once step 3 routes legacy through `get_eval_dataloaders`.
-        """
-        from ..data_utils.dataset import GeneralDataset
-        from ..utils.base import filter_kwargs
-        data_args = self.config.data_args
-        preprocess_func = self.adapter.preprocess_func
-        base_kwargs = {
-            "preprocess_func": preprocess_func,
-            "preprocess_kwargs": (
-                filter_kwargs(preprocess_func, **data_args)
-                if preprocess_func else None
-            ),
-            'extra_hash_strs': [
-                self.config.model_args.model_type,
-                self.config.model_args.model_name_or_path,
-            ],
-        }
-        base_kwargs.update(filter_kwargs(GeneralDataset.__init__, **data_args))
-        base_kwargs['force_reprocess'] = data_args.force_reprocess
-        return base_kwargs
     
     def _init_optimizer(self) -> torch.optim.Optimizer:
         """Initialize optimizer."""

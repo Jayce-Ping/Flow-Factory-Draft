@@ -332,47 +332,6 @@ def get_train_dataloader(
     return train_loader, train_loaders_by_source
 
 
-def _build_legacy_test_dataloader(
-    *,
-    config: Arguments,
-    accelerator: Accelerator,
-    preprocess_func: Optional[PreprocessCallable],
-    base_kwargs: dict,
-    enable_distributed: bool,
-    preprocess_parallelism: Literal["global", "local"],
-) -> Optional[DataLoader]:
-    """Build the legacy ``test.jsonl`` DataLoader from ``data.dataset_dir``.
-
-    Returns ``None`` when no ``test.jsonl`` exists under
-    ``data.dataset_dir``.  Existing behaviour preserved for back-compat.
-    """
-    data_args = config.data_args
-    eval_args = config.eval_args
-
-    if not GeneralDataset.check_exists(data_args.dataset, "test"):
-        return None
-
-    test_preprocess_kwargs = (base_kwargs.get('preprocess_kwargs') or {}).copy()
-    test_preprocess_kwargs.update({'is_train': False, **eval_args})
-    test_preprocess_kwargs = (
-        filter_kwargs(preprocess_func, **test_preprocess_kwargs) if preprocess_func else test_preprocess_kwargs
-    )
-    test_dataset = _create_or_load_dataset(
-        split="test",
-        accelerator=accelerator,
-        base_kwargs={**base_kwargs, 'preprocess_kwargs': test_preprocess_kwargs},
-        enable_distributed=enable_distributed,
-        preprocess_parallelism=preprocess_parallelism,
-    )
-    return DataLoader(
-        test_dataset,
-        batch_size=eval_args.per_device_batch_size,
-        shuffle=False,
-        num_workers=data_args.dataloader_num_workers,
-        collate_fn=GeneralDataset.collate_fn,
-    )
-
-
 def _per_source_arguments_view(config: Arguments, source_M: int) -> Arguments:
     """Return a shallow ``Arguments`` view with per-source ``M_i`` patched in.
 
