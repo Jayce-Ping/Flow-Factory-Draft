@@ -1,0 +1,164 @@
+# Multi-source training example: weighted interleaving + per-source reward routing.
+#
+# This config exercises the unified `data.datasets:` schema introduced in
+# the multi-eval-dataset PR (PR #168 / branch feat/multi-eval-dataset).
+# Two training datasets are interleaved by weight (1:3 -> ~25%/75% of
+# batches per epoch), and each reward declares which source(s) it applies
+# to via the `datasets:` field.
+#
+# To use this config, replace the `dataset_dir` paths below with two real
+# folders that each contain `train.jsonl` (and optionally `test.jsonl`).
+# Then launch with `accelerate launch -m flow_factory.cli.train --config <path>`.
+#
+# Environment Configuration
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# Data Configuration — unified `datasets:` list.
+# Each entry opts into training (`train:`) and/or evaluation (`eval:`).
+# `name` is the routing key everywhere: __source__ tag on samples, cache
+# fingerprint, metric key prefix, and the value referenced by
+# `RewardArguments.datasets` below.
+data:
+  cache_dir: "~/.cache/flow_factory/datasets"
+  preprocessing_batch_size: 8
+  dataloader_num_workers: 16
+  force_reprocess: true
+  preprocess_parallelism: local
+  sampler_type: "auto"
+
+  datasets:
+    # Source 1: GenEval-style (T2I prompts with object-presence metadata).
+    # Participates in BOTH training and evaluation.
+    - name: geneval
+      dataset_dir: "dataset/geneval"
+      train:
+        weight: 1.0
+        # max_dataset_size: 5000   # uncomment to cap training samples
+      eval:
+        # Per-eval-dataset overrides — None (default) inherits from `eval:` below.
+        num_inference_steps: 28
+        guidance_scale: 5.0
+
+    # Source 2: PickScore preference dataset (T2I prompts, weight 3x).
+    # Training-only here; eval is null.
+    - name: pickscore
+      dataset_dir: "dataset/pickscore"
+      train:
+        weight: 3.0
+      eval: null
+
+# Model Configuration
+model:
+  finetune_type: 'lora'
+  lora_rank: 64
+  lora_alpha: 128
+  target_modules: "default"
+  model_name_or_path: "black-forest-labs/FLUX.2-klein-base-9B"
+  model_type: "flux2-klein"
+
+log:
+  run_name: null
+  project: "Flow-Factory"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 20
+  save_model_only: true
+
+# Training Configuration
+train:
+  trainer_type: 'grpo'
+  advantage_aggregation: 'gdpo'
+  clip_range: 1.0e-4
+  adv_clip_range: 5.0
+  kl_type: 'v-based'
+  kl_beta: 0
+  ref_param_device: 'cuda'
+
+  resolution: 384
+  condition_image_size: 384
+  num_inference_steps: 8
+  guidance_scale: 4.0
+
+  per_device_batch_size: 1
+  group_size: 16
+  global_std: false
+  unique_sample_num_per_epoch: 48      # partitioned across sources by weight
+  gradient_step_per_epoch: 2
+  gradient_accumulation_steps: auto
+
+  learning_rate: 3.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  ema_decay: 0.9
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  enable_gradient_checkpointing: false
+  offload_samples_to_cpu: false
+
+  seed: 42
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "Flow-SDE"
+  noise_level: 0.7
+  num_sde_steps: 1
+  sde_steps: [1, 2, 3]
+  seed: 42
+
+# Evaluation settings (defaults for any data.datasets[*].eval entry; can be
+# overridden per-dataset via the `eval:` sub-block in `data.datasets`).
+eval:
+  resolution: 1024
+  condition_image_size: 1024
+  per_device_batch_size: 1
+  guidance_scale: 4.0
+  num_inference_steps: 28
+  eval_freq: 20
+  seed: 42
+
+# Training Reward Model Configuration.
+#
+# Each entry's `datasets:` field selects which training source(s) the
+# reward applies to. None (default) means "applies to every source"
+# (the legacy GRPO behaviour with a single training dataset).
+#
+# When a reward isn't applicable to a batch's __source__, the reward
+# call is GATED OUT cleanly: the model is invoked only on applicable
+# samples, and non-applicable positions get a NaN placeholder so
+# cross-rank gather participants stay shape-uniform (no deadlock).
+# Aggregation in AdvantageProcessor uses `sample.applicable_rewards`
+# as the source of truth — a NaN at an APPLICABLE position raises
+# loudly so reward-model bugs don't silently zero out advantages.
+rewards:
+  - name: "pickscore_overall"
+    reward_model: "PickScore"
+    weight: 1.0
+    batch_size: 16
+    device: "cuda"
+    dtype: bfloat16
+    # No `datasets:` -> applies to every training source.
+
+  - name: "geneval_score"
+    reward_model: "GenEval"
+    weight: 1.0
+    batch_size: 4
+    device: "cuda"
+    dtype: bfloat16
+    # Routed only to the geneval source; pickscore batches will see NaN
+    # at the geneval_score positions (and zero contribution to advantages).
+    datasets: ["geneval"]
+
+# Optional eval-time reward routing (mirrors training-side semantics).
+# eval_rewards:
+#   - name: "geneval_score"
+#     reward_model: "GenEval"
+#     batch_size: 4
+#     datasets: ["geneval"]   # only fires on geneval eval samples
