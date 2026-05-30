@@ -519,25 +519,53 @@ class BaseTrainer(ABC):
         JSONL for Arrow serialization safety. Reward models parse them with
         ``json.loads()`` as needed.
 
-        No-op when ``batch['metadata']`` is absent or empty.
+        Also propagates the per-batch ``__source__`` (multi-source training
+        only — populated by ``MultiSourceTrainDataLoader`` in
+        ``data_utils/loader.py``).  Drives both the ``RewardProcessor``
+        gate and the ``AdvantageProcessor`` applicability mask.
+
+        No-op when ``batch['metadata']`` AND ``batch['__source__']`` are both
+        absent or empty.
 
         Args:
             samples: Generated samples from ``adapter.inference()``.
-            batch: The dataloader batch dict (may contain a ``metadata`` key).
+            batch: The dataloader batch dict (may contain ``metadata`` /
+                ``__source__`` keys).
         """
+        # Per-prompt ratio used for both metadata and __source__ broadcasting.
+        # Some adapters generate K replicates per prompt (group_size > 1) so
+        # one batch row maps to several samples.
+        sources = batch.get('__source__')
         metadata_list = batch.get('metadata')
-        if not metadata_list or not samples:
+        if not metadata_list and not sources:
             return
-        batch_size = len(metadata_list)
-        samples_per_prompt = len(samples) // batch_size
+        if not samples:
+            return
+
+        # Pick a length-bearing reference for the broadcast ratio.
+        if metadata_list:
+            B = len(metadata_list)
+        elif sources:
+            B = len(sources)
+        else:
+            return
+        samples_per_prompt = len(samples) // B
         if samples_per_prompt == 0:
             return
+
         for i, sample in enumerate(samples):
             batch_idx = i // samples_per_prompt
-            if batch_idx < batch_size:
+            if batch_idx >= B:
+                continue
+            if metadata_list:
                 meta = metadata_list[batch_idx]
                 if isinstance(meta, dict):
                     sample.extra_kwargs.update(meta)
+            if sources:
+                # Homogeneous within a batch in this PR; per-sample shape
+                # leaves room for future PRs that may interleave within a
+                # batch without a code change.
+                sample.extra_kwargs['__source__'] = sources[batch_idx]
 
     # ============================ Public Sampling API ============================
 
@@ -573,10 +601,23 @@ class BaseTrainer(ABC):
 
         Returns:
             All generated samples for this epoch.
+
+        Note:
+            Trainers that override ``generate_samples`` instead of just
+            ``sample()`` must still call :meth:`sample_batch` per batch
+            so :meth:`_inject_batch_metadata` propagates ``__source__``
+            onto every sample.  An end-of-loop runtime check verifies
+            this in multi-source mode.
         """
         self.adapter.rollout()
         if reward_buffer is not None:
             reward_buffer.clear()
+
+        # Multi-source: reseed the per-source schedule + every per-source
+        # sampler so replays of the same epoch are reproducible. No-op
+        # for the bare DataLoader (no `set_epoch`).
+        if hasattr(self.dataloader, "set_epoch"):
+            self.dataloader.set_epoch(self.epoch)
 
         samples: List[BaseSample] = []
         data_iter = iter(self.dataloader)
@@ -596,6 +637,25 @@ class BaseTrainer(ABC):
                     **extra_inference_kwargs,
                 )
                 samples.extend(sample_batch)
+
+        # Multi-source invariant: every sample produced under
+        # `data.datasets` MUST carry __source__ in extra_kwargs.  An empty
+        # `train_dataloaders_by_source` means we're in legacy mode, so the
+        # check is skipped.  This catches a trainer that overrode
+        # generate_samples but bypassed sample_batch / _inject_batch_metadata.
+        if self.train_dataloaders_by_source and samples:
+            missing = [
+                i for i, s in enumerate(samples)
+                if '__source__' not in s.extra_kwargs
+            ]
+            if missing:
+                raise RuntimeError(
+                    f"Multi-source training: {len(missing)} sample(s) at indices "
+                    f"{missing[:5]}{'...' if len(missing) > 5 else ''} are missing "
+                    "`__source__` in extra_kwargs. Did a trainer override "
+                    "`generate_samples` without going through `sample_batch` "
+                    "(which calls `_inject_batch_metadata`)?"
+                )
 
         return samples
 
