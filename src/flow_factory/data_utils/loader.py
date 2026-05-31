@@ -426,8 +426,9 @@ def _load_per_source_train_dataloaders(
         spec.num_batches_per_epoch = sampler.num_batches_per_epoch  # type: ignore[union-attr]
         logger.info(
             f"Multi-source: built DataLoader for '{d.name}' "
-            f"(samples={len(dataset)}, M_i={M_i}, "
-            f"batches/epoch={sampler.num_batches_per_epoch})"  # type: ignore[union-attr]
+            f"(dataset_size={len(dataset)}, "
+            f"unique_sample_num_per_epoch={M_i}, "
+            f"num_batches_per_epoch={sampler.num_batches_per_epoch})"  # type: ignore[union-attr]
         )
 
     return out
