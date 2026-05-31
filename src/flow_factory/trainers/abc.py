@@ -216,18 +216,17 @@ class BaseTrainer(ABC):
 
         return self.reward_models, self.eval_reward_models
 
-    def _init_dataloader(self) -> Optional[DataLoader]:
-        # Move text-encoder & vae to GPU for dataloader encoding
+    def _init_dataloader(self) -> Tuple[Optional[Union[DataLoader, "MultiSourceTrainDataLoader"]], Dict[str, DataLoader]]:
+        """Build train and eval dataloaders.
+
+        Returns:
+            Tuple of (train_dataloader, eval_dataloaders_by_name).
+        """
         self.adapter.on_load_components(
             components=self.adapter.preprocessing_modules,
             device=self.accelerator.device
         )
-        # Train side: `get_train_dataloader` yields the wrapped
-        # MultiSourceTrainDataLoader (or a plain DataLoader for the
-        # legacy single-source path) plus the per-source dict.  We
-        # expose the per-source dict on the trainer so the future
-        # DiffusionOPDTrainer can drive its own balanced sampling
-        # without re-deriving the partition.
+
         dataloader, train_dataloaders_by_source = get_train_dataloader(
             config=self.config,
             accelerator=self.accelerator,
@@ -235,24 +234,20 @@ class BaseTrainer(ABC):
         )
         self.train_dataloaders_by_source: Dict[str, DataLoader] = train_dataloaders_by_source
 
-        # Eval side: unified per-dataset path.  When no eval-eligible
-        # entry exists in `data.datasets` the dict is empty and
-        # `evaluate()` becomes a no-op.
-        self.eval_dataloaders: Dict[str, DataLoader] = get_eval_dataloaders(
+        eval_dataloaders = get_eval_dataloaders(
             eval_datasets=self.config.data_args.eval_datasets,
             config=self.config,
             accelerator=self.accelerator,
             preprocess_func=self.adapter.preprocess_func,
         )
 
-        # Offload text-encoder after dataloader encoding
         self.adapter.off_load_components(
             components=self.adapter.preprocessing_modules,
         )
 
         self.accelerator.wait_for_everyone()
 
-        return dataloader
+        return dataloader, eval_dataloaders
     
     def _init_optimizer(self) -> torch.optim.Optimizer:
         """Initialize optimizer."""
@@ -300,33 +295,30 @@ class BaseTrainer(ABC):
             self._synchronize_frozen_components()
 
         # Init dataloader and optimizer
-        self.dataloader = self._init_dataloader()
+        self.dataloader, eval_dataloaders = self._init_dataloader()
         self.optimizer = self._init_optimizer()
-        # Prepare everything with accelerator
-        # Dynamically get all trainable modules from target_module_map
+
+        # Prepare trainable modules + optimizer + eval dataloaders in one call.
+        # Train dataloader is NOT prepared (handled by custom distributed sampler).
         trainable_module_names = list(self.adapter.target_module_map.keys())
         trainable_modules = [
             getattr(self.adapter, name)
             for name in trainable_module_names
             if hasattr(self.adapter, name) and getattr(self.adapter, name) is not None
         ]
-        # Prepare trainable modules + optimizer
-        to_prepare = trainable_modules + [self.optimizer]
+        eval_dl_names = list(eval_dataloaders.keys())
+        eval_dl_list = [eval_dataloaders[n] for n in eval_dl_names]
+        to_prepare = trainable_modules + [self.optimizer] + eval_dl_list
 
         prepared = self.accelerator.prepare(*to_prepare)
-        # Here, `self.dataloader` is not prepared since it has been handled with DistributedKRepeatSampler
+
         for i, name in enumerate(trainable_module_names):
             if hasattr(self.adapter, name) and getattr(self.adapter, name) is not None:
                 self.adapter.set_component(name, prepared[i])
 
         self.optimizer = prepared[len(trainable_modules)]
-
-        # Prepare multi-eval dataloaders
-        if self.eval_dataloaders:
-            for name in list(self.eval_dataloaders.keys()):
-                self.eval_dataloaders[name] = self.accelerator.prepare(
-                    self.eval_dataloaders[name]
-                )
+        prepared_eval_dls = prepared[len(trainable_modules) + 1:]
+        self.eval_dataloaders: Dict[str, DataLoader] = dict(zip(eval_dl_names, prepared_eval_dls))
 
         # Load inference modules, excluding already-prepared ones
         self._load_inference_components(trainable_module_names)
