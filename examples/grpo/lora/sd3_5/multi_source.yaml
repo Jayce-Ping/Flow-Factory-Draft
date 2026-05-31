@@ -122,10 +122,10 @@ eval:
   seed: 42  # Eval random seed
 
 # Reward Model Configuration
-# Per-source routing via `datasets:` field:
+# Per-source routing via `applicable_datasets:` field:
 #   - geneval_reward: applies to geneval only
 #   - ocr_reward: applies to ocr only
-#   - pick_score: applies to all three sources (datasets omitted = applies to all)
+#   - pick_score: applies to all three sources (applicable_datasets omitted = applies to all)
 rewards:
   - name: "geneval_reward"  # Unique reward identifier (appears in log keys)
     reward_model: "GenEval"  # Reward model class (from registry)
@@ -133,7 +133,7 @@ rewards:
     batch_size: 16  # Inference batch size for this reward model
     device: "cuda"  # Device to run reward model on
     dtype: bfloat16  # Precision for reward model inference
-    datasets: ["geneval"]  # Only fires on geneval source batches
+    applicable_datasets: ["geneval"]  # Only fires on geneval source batches
 
   - name: "ocr_reward"  # Unique reward identifier (appears in log keys)
     reward_model: "OCR"  # Reward model class (from registry)
@@ -141,7 +141,7 @@ rewards:
     batch_size: 16  # Inference batch size for this reward model
     device: "cuda"  # Device to run reward model on
     dtype: bfloat16  # Precision for reward model inference
-    datasets: ["ocr"]  # Only fires on ocr source batches
+    applicable_datasets: ["ocr"]  # Only fires on ocr source batches
 
   - name: "pick_score"  # Unique reward identifier (appears in log keys)
     reward_model: "PickScore"  # Reward model class (from registry)
@@ -149,7 +149,7 @@ rewards:
     batch_size: 16  # Inference batch size for this reward model
     device: "cuda"  # Device to run reward model on
     dtype: bfloat16  # Precision for reward model inference
-    # datasets omitted -> applies to ALL training sources (geneval, ocr, pickscore)
+    # applicable_datasets omitted -> applies to ALL training sources (geneval, ocr, pickscore)
 
 # Eval Reward Models
 # Same routing logic: geneval gets geneval+pickscore, ocr gets ocr+pickscore, pickscore gets pickscore
@@ -159,18 +159,18 @@ eval_rewards:
     batch_size: 32  # Larger batch for eval (no gradient, more memory available)
     device: "cuda"  # Device to run reward model on
     dtype: bfloat16  # Precision for reward model inference
-    datasets: ["geneval"]  # Only scores geneval eval samples
+    applicable_datasets: ["geneval"]  # Only scores geneval eval samples
 
   - name: "ocr_reward"  # Eval reward identifier
     reward_model: "OCR"  # Same model as training, may use larger batch
     batch_size: 32  # Larger batch for eval (no gradient, more memory available)
     device: "cuda"  # Device to run reward model on
     dtype: bfloat16  # Precision for reward model inference
-    datasets: ["ocr"]  # Only scores ocr eval samples
+    applicable_datasets: ["ocr"]  # Only scores ocr eval samples
 
   - name: "pick_score"  # Eval reward identifier
     reward_model: "PickScore"  # Same model as training, may use larger batch
     batch_size: 32  # Larger batch for eval (no gradient, more memory available)
     device: "cuda"  # Device to run reward model on
     dtype: bfloat16  # Precision for reward model inference
-    # datasets omitted -> applies to all eval sources (geneval, ocr, pickscore)
+    # applicable_datasets omitted -> applies to all eval sources (geneval, ocr, pickscore)

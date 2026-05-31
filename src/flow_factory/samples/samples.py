@@ -121,7 +121,7 @@ class BaseSample:
     extra_kwargs : Dict[str, Any] = field(default_factory=dict)
 
     # Set of reward names that COULD have applied to this sample given
-    # the current routing config (i.e. whose ``RewardArguments.datasets``
+    # the current routing config (i.e. whose ``RewardArguments.applicable_datasets``
     # contained this sample's ``source``, or was None).  Populated
     # by ``RewardProcessor`` whenever a reward is computed.  Read by
     # ``AdvantageProcessor`` to aggregate authoritatively rather than

@@ -41,7 +41,7 @@ YAML example::
           eval:  null            # not used for eval
 
 Reward routing references each dataset by ``name`` via
-``RewardArguments.datasets``.  The ``__source__`` carried on every sample
+``RewardArguments.applicable_datasets``.  The ``__source__`` carried on every sample
 is exactly this name.
 """
 from __future__ import annotations
@@ -56,7 +56,7 @@ from .abc import ArgABC
 
 # Names appear in metric keys (``train/source/{name}/...``), in cache
 # fingerprints (``train_source:{name}``), and as the routing key for
-# ``RewardArguments.datasets`` — so we constrain the alphabet to
+# ``RewardArguments.applicable_datasets`` — so we constrain the alphabet to
 # something safe across all three contexts.
 _NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_\-.]*$")
 
@@ -241,7 +241,7 @@ class DatasetArguments(ArgABC):
         name: Unique dataset identifier.  Used as ``__source__`` on every
             sample, in cache fingerprints, in metric keys
             (``train/source/{name}/...`` and ``eval/{name}/...``), and
-            as the routing key for ``RewardArguments.datasets``.  Must
+            as the routing key for ``RewardArguments.applicable_datasets``.  Must
             match ``^[A-Za-z0-9_][A-Za-z0-9_\\-.]*$``.
         dataset_dir: Folder containing the split JSONL/TXT files plus
             (by default) ``images/`` / ``videos/`` / ``audios/`` media

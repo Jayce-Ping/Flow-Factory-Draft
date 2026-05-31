@@ -250,7 +250,7 @@ class MultiRewardLoader:
         """Build per-dataset reward routing for a set of dataset names.
 
         For each dataset name, determines which rewards apply to it
-        (using each ``RewardArguments.datasets`` field).  ``None`` is
+        (using each ``RewardArguments.applicable_datasets`` field).  ``None`` is
         accepted defensively as "applies to every source" for callers
         that construct a ``MultiRewardLoader`` outside the ``Arguments``
         flow.
@@ -269,8 +269,8 @@ class MultiRewardLoader:
             for reward_name, identity_key in name_to_key.items():
                 reward_cfg = name_to_config[reward_name]
                 applies = (
-                    reward_cfg.datasets is None
-                    or dataset_name in reward_cfg.datasets
+                    reward_cfg.applicable_datasets is None
+                    or dataset_name in reward_cfg.applicable_datasets
                 )
                 if applies:
                     ds_keys[reward_name] = identity_key

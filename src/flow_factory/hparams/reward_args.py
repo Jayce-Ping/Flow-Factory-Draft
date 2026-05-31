@@ -127,7 +127,7 @@ class RewardArguments(ArgABC):
                           "Set >1 for IO-bound models (e.g. API calls) to enable concurrent requests."},
     )
 
-    datasets: Optional[List[str]] = field(
+    applicable_datasets: Optional[List[str]] = field(
         default=None,
         metadata={
             "help": (
@@ -147,19 +147,20 @@ class RewardArguments(ArgABC):
                 "  - `[]` (empty list): 'apply to no dataset'. Honoured as-is "
                 "    with a warning ('this reward will never fire').\n"
                 "  - `[name1, name2, ...]`: explicit list, validated.\n"
-                "Post-resolution invariant: `datasets` is ALWAYS a "
+                "Post-resolution invariant: `applicable_datasets` is ALWAYS a "
                 "`List[str]` after `Arguments.__post_init__`. Consumers should "
                 "never need to handle `None`."
             )
         },
     )
 
-    # Hot-path cache of `datasets` resolved into source-ids. Populated by
-    # `Arguments._resolve_reward_dataset_ids` after both `datasets` and
-    # `data.datasets[*].source_id` are concrete. Used by the reward gate
-    # (`RewardProcessor._reward_applies`) for O(1) `int in frozenset[int]`
-    # comparison, replacing string lookups in the inner loop. `None`
-    # until that resolver runs (consumers fall back to the string form).
+    # Hot-path cache of `applicable_datasets` resolved into source-ids.
+    # Populated by `Arguments._resolve_reward_dataset_ids` after both
+    # `applicable_datasets` and `data.datasets[*].source_id` are concrete.
+    # Used by the reward gate (`RewardProcessor._reward_applies`) for
+    # O(1) `int in frozenset[int]` comparison, replacing string lookups
+    # in the inner loop. `None` until that resolver runs (consumers fall
+    # back to the string form).
     _datasets_resolved: Optional[frozenset[int]] = field(
         default=None, repr=False, compare=False,
     )

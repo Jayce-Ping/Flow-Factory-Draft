@@ -92,22 +92,24 @@ class RewardProcessor:
 
         Routing rules:
 
-        - ``RewardArguments.datasets`` is normally a concrete ``List[str]``
-          here (resolved by ``Arguments._resolve_reward_dataset_routing``).
-          As a defensive fallback for callers that construct a
-          ``RewardProcessor`` outside the ``Arguments`` flow, ``None`` is
-          also treated as "applies to every sample".
+        - ``RewardArguments.applicable_datasets`` is normally a concrete
+          ``List[str]`` here (resolved by
+          ``Arguments._resolve_reward_dataset_routing``).  As a defensive
+          fallback for callers that construct a ``RewardProcessor`` outside
+          the ``Arguments`` flow, ``None`` is also treated as "applies to
+          every sample".
         - When the sample has no source (``source is None`` AND
           ``source_id is None``), absence is treated as "applies" -
           preserves byte-identical behavior for legacy single-source mode.
         - Otherwise we prefer the small-int form
           (``sample.source_id in cfg._datasets_resolved``) when available,
           falling back to the string form
-          (``sample.source in cfg.datasets``) when the id resolver
-          hasn't run (direct test instantiation of ``RewardProcessor``).
+          (``sample.source in cfg.applicable_datasets``) when the id
+          resolver hasn't run (direct test instantiation of
+          ``RewardProcessor``).
         """
         cfg = self.reward_configs.get(name)
-        if cfg is None or cfg.datasets is None:
+        if cfg is None or cfg.applicable_datasets is None:
             return True
         # Legacy single-source: no source bookkeeping at all -> every reward
         # applies (this is what the legacy GRPO behavior expected).
@@ -117,7 +119,7 @@ class RewardProcessor:
         if sample.source_id is not None and cfg._datasets_resolved is not None:
             return sample.source_id in cfg._datasets_resolved
         # Fallback: string-list membership.
-        return sample.source in cfg.datasets
+        return sample.source in cfg.applicable_datasets
 
     @staticmethod
     def _scatter_with_nan_padding(

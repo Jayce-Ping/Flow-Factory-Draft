@@ -389,7 +389,7 @@ class AdvantageProcessor:
         is asserted to be a model bug (loud failure); NaN at
         non-applicable positions is honored as "this reward doesn't
         contribute to this sample".  Samples with NO applicable reward
-        raise -- a misconfigured `RewardArguments.datasets` shouldn't
+        raise -- a misconfigured `RewardArguments.applicable_datasets` shouldn't
         silently produce zero advantages.
 
         **Algorithm**:
@@ -449,7 +449,7 @@ class AdvantageProcessor:
                 "AdvantageProcessor: samples at indices "
                 f"{bad[:10]}{'...' if len(bad) > 10 else ''} have NO applicable "
                 "reward (weight_sum == 0). Check that "
-                "`RewardArguments.datasets` covers every training source — "
+                "`RewardArguments.applicable_datasets` covers every training source — "
                 "at least one reward must apply to every source."
             )
 
@@ -577,7 +577,7 @@ class AdvantageProcessor:
             raise RuntimeError(
                 "GDPO: samples at indices "
                 f"{bad[:10]}{'...' if len(bad) > 10 else ''} have NO applicable "
-                "reward. Check `RewardArguments.datasets` coverage."
+                "reward. Check `RewardArguments.applicable_datasets` coverage."
             )
 
         combined_advantages = np.sum(all_reward_advantages, axis=0)

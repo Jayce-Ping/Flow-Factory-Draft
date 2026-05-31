@@ -132,21 +132,21 @@ class Arguments(ArgABC):
             self.log_args.run_name = f"{self.model_args.model_type}_{self.model_args.finetune_type}_{self.training_args.trainer_type}_{time_stamp}"
 
         self._validate_dataset_routing()
-        # Resolve `RewardArguments.datasets is None` -> concrete list of
-        # applicable dataset names. Must run AFTER validation (so the
+        # Resolve `RewardArguments.applicable_datasets is None` -> concrete
+        # list of applicable dataset names. Must run AFTER validation (so the
         # unknown-name check is against the user's raw input, not the
         # expanded list) and BEFORE any consumer reads the field.
         self._resolve_reward_dataset_routing()
         # With routing concrete, fail-fast when a training source has NO
         # applicable training reward — the user almost certainly meant
-        # to add the source name to some reward's `datasets` list.
+        # to add the source name to some reward's `applicable_datasets` list.
         self._validate_every_source_has_a_reward()
         # Stamp every `data.datasets[*]` entry with a stable monotonic
         # `source_id` matching its list position. Read by the dataloader
         # / trainer / gate everywhere a transport-friendly form of the
         # source string is wanted. Populates `data_args.source_id_to_name`.
         self._assign_source_ids()
-        # Translate every `RewardArguments.datasets: List[str]` into the
+        # Translate every `RewardArguments.applicable_datasets: List[str]` into the
         # `_datasets_resolved: frozenset[int]` cache used by the hot-path
         # gate. Trivially deterministic on every rank because IDs come
         # from the same shared config.
@@ -190,18 +190,18 @@ class Arguments(ArgABC):
             return
         name_to_id = self.data_args.source_name_to_id
         for rc in list(self.reward_args) + list(self.eval_reward_args or []):
-            # `datasets` was resolved to a concrete `List[str]` upstream by
+            # `applicable_datasets` was resolved to a concrete `List[str]` upstream by
             # `_resolve_reward_dataset_routing`; the names are guaranteed to
             # be in the registry because they passed `_validate_dataset_routing`.
-            if rc.datasets is None:
+            if rc.applicable_datasets is None:
                 raise RuntimeError(
-                    "Internal error: RewardArguments.datasets not resolved before "
+                    "Internal error: RewardArguments.applicable_datasets not resolved before "
                     "_resolve_reward_dataset_ids; check Arguments.__post_init__ ordering."
                 )
-            rc._datasets_resolved = frozenset(name_to_id[n] for n in rc.datasets)
+            rc._datasets_resolved = frozenset(name_to_id[n] for n in rc.applicable_datasets)
 
     def _resolve_reward_dataset_routing(self) -> None:
-        """Replace ``RewardArguments.datasets is None`` with the explicit list.
+        """Replace ``RewardArguments.applicable_datasets is None`` with the explicit list.
 
         After this method returns, every reward's ``datasets`` field is a
         concrete ``List[str]``:
@@ -227,11 +227,11 @@ class Arguments(ArgABC):
             if not reward_args:
                 return
             for rc in reward_args:
-                if rc.datasets is None:
-                    # Eager copy: rewards never share their `datasets` list
+                if rc.applicable_datasets is None:
+                    # Eager copy: rewards never share their `applicable_datasets` list
                     # so mutating one cannot bleed into another.
-                    rc.datasets = list(applicable_universe)
-                elif len(rc.datasets) == 0:
+                    rc.applicable_datasets = list(applicable_universe)
+                elif len(rc.applicable_datasets) == 0:
                     logger.warning(
                         f"{side} reward '{rc.name}' has `datasets: []` — "
                         "it will never fire. If you intended 'apply to every "
@@ -266,15 +266,15 @@ class Arguments(ArgABC):
                 return
             covered: set[str] = set()
             for rc in reward_args:
-                # `rc.datasets` is concrete post-resolver.
-                covered.update(rc.datasets or [])
+                # `rc.applicable_datasets` is concrete post-resolver.
+                covered.update(rc.applicable_datasets or [])
             uncovered = [n for n in source_names if n not in covered]
             if uncovered:
                 raise ValueError(
                     f"{side} source(s) {uncovered!r} have NO applicable {side.lower()} "
-                    f"reward — every reward's `datasets` field excludes them. Either "
-                    f"add at least one of these names to a reward's `datasets`, set "
-                    f"that reward's `datasets` to `null` (= apply to every source), "
+                    f"reward — every reward's `applicable_datasets` field excludes them. Either "
+                    f"add at least one of these names to a reward's `applicable_datasets`, set "
+                    f"that reward's `applicable_datasets` to `null` (= apply to every source), "
                     f"or drop the dataset entry from `data.datasets`."
                 )
 
@@ -293,7 +293,7 @@ class Arguments(ArgABC):
           set it explicitly).
         * Uniqueness of dataset names across the ``data.datasets`` list.
         * ``train.weight > 0`` for every training participant.
-        * Cross-validation of every ``RewardArguments.datasets`` entry
+        * Cross-validation of every ``RewardArguments.applicable_datasets`` entry
           against the union of declared training / eval dataset names.
           Training rewards must reference training-source names; eval
           rewards must reference eval-source names.
@@ -347,39 +347,39 @@ class Arguments(ArgABC):
                 "Set `train.weight: 1.0` for uniform mixing."
             )
 
-        # Cross-validate reward `datasets` references.
+        # Cross-validate reward `applicable_datasets` references.
         train_names = {d.name for d in tds_unified if d.is_training_source}
         eval_names = {d.name for d in tds_unified if d.is_eval_source}
 
-        # Training rewards: `datasets` must reference TRAINING-source names.
+        # Training rewards: `applicable_datasets` must reference TRAINING-source names.
         for rc in self.reward_args:
-            if rc.datasets is None:
+            if rc.applicable_datasets is None:
                 continue
             if not train_names:
                 raise ValueError(
-                    f"Reward '{rc.name}' has datasets={rc.datasets!r} but no training "
+                    f"Reward '{rc.name}' has applicable_datasets={rc.applicable_datasets!r} but no training "
                     "dataset is configured under `data.datasets`. Either remove "
-                    "`datasets` from this reward or define training datasets it can route to."
+                    "`applicable_datasets` from this reward or define training datasets it can route to."
                 )
-            unknown = set(rc.datasets) - train_names
+            unknown = set(rc.applicable_datasets) - train_names
             if unknown:
                 raise ValueError(
                     f"Reward '{rc.name}' references unknown training dataset(s): "
                     f"{sorted(unknown)}. Valid training dataset names: {sorted(train_names)}."
                 )
 
-        # Eval rewards: `datasets` must reference EVAL-source names.
+        # Eval rewards: `applicable_datasets` must reference EVAL-source names.
         if self.eval_reward_args:
             for rc in self.eval_reward_args:
-                if rc.datasets is None:
+                if rc.applicable_datasets is None:
                     continue
                 if not eval_names:
                     raise ValueError(
-                        f"Eval reward '{rc.name}' has datasets={rc.datasets!r} but no eval "
+                        f"Eval reward '{rc.name}' has applicable_datasets={rc.applicable_datasets!r} but no eval "
                         "dataset is configured under `data.datasets`. Either remove "
-                        "`datasets` from this eval reward or define eval datasets it can route to."
+                        "`applicable_datasets` from this eval reward or define eval datasets it can route to."
                     )
-                unknown = set(rc.datasets) - eval_names
+                unknown = set(rc.applicable_datasets) - eval_names
                 if unknown:
                     raise ValueError(
                         f"Eval reward '{rc.name}' references unknown eval dataset(s): "
