@@ -2,10 +2,18 @@
 
 ## Unreleased — `feat/multi-eval-dataset`
 
-**Range:** `652f7315..15c3943f` (28 commits, all 2026-05-26 … 2026-05-30)
+**Range:** `652f7315..HEAD` (2026-05-26 … 2026-05-31)
 **Repo:** [X-GenGroup/Flow-Factory](https://github.com/X-GenGroup/Flow-Factory)
 **Branch:** `feat/multi-eval-dataset`
-**PR:** _TBD — to be filled in when opened_
+**PR:** [#168](https://github.com/X-GenGroup/Flow-Factory/pull/168)
+
+> Note: the commit table below covers the original `f2b2100..15c3943` stack.
+> A later review round (see "Post-review hardening" at the end) removed the
+> `_canonicalize_legacy_dataset_dir` shim, migrated all examples to
+> `data.datasets`, renamed `RewardArguments.datasets` →
+> `applicable_datasets`, and added per-dataset reward weights — so some
+> paragraphs below describing the legacy-canonicalization behavior are
+> superseded by that section.
 
 ### Commit ranges by phase
 
@@ -55,13 +63,14 @@
 
 #### Eval metric key rename
 
-The legacy single-test eval path now flows through the same per-dataset
-pipeline as the multi-eval path. Configs that previously used the
-legacy `data.dataset_dir` (with a `test.jsonl` alongside) are
-auto-promoted by `Arguments._canonicalize_legacy_dataset_dir` to a
-1-entry `data.datasets` list whose entry is named `default`, so the
-unified `evaluate()` routes them through the same per-dataset machinery
-as any explicit `data.datasets` config.
+All eval now flows through the unified per-dataset `evaluate()`. Configs
+declare datasets explicitly via `data.datasets` (each entry named, e.g.
+`default`); the eval metric keys are namespaced by that dataset name.
+(Earlier on this branch a `_canonicalize_legacy_dataset_dir` shim
+auto-promoted a bare `data.dataset_dir`; that shim was later removed —
+see "Post-review hardening" — and bare `data.dataset_dir` is now
+rejected, so the `default` namespace simply reflects the dataset entry's
+name.)
 
 Consequence — eval metric keys move from:
 
@@ -138,14 +147,17 @@ ships.
 
 Landed in: `5f84e05` (step 3 of plan).
 
-#### `RewardArguments.datasets` semantic change
+#### `RewardArguments.applicable_datasets` semantic change
 
-`None` (the user-supplied default) is now eagerly resolved at config
-load time to the explicit list of applicable side names — so
-`print(config)` shows a concrete `List[str]` instead of `null`. Empty
-list `[]` is honored as "this reward never fires" with a warning.
+The reward-routing field (named `datasets` when first introduced, later
+renamed to `applicable_datasets`) is eagerly resolved at config load
+time: `None` (the user-supplied default) becomes the explicit list of
+applicable side names — so `print(config)` shows a concrete `List[str]`
+instead of `null`. Empty list `[]` is honored as "this reward never
+fires" with a warning.
 
-Landed in: `6be080f` (review item 9).
+Landed in: `6be080f` (review item 9); renamed to `applicable_datasets`
+in the post-review hardening round.
 
 #### Integer `train.weight` required
 
@@ -171,8 +183,8 @@ flow is byte-identical for configs that don't opt into multi-source:
 - **Multi-source training:** weight-based interleaving with exact
   per-batch source homogeneity, weighted scheduler, per-source
   DataLoaders.
-- **Source-aware reward routing:** `RewardArguments.datasets` extends
-  to training rewards (was eval-only before this branch).
+- **Source-aware reward routing:** `RewardArguments.applicable_datasets`
+  extends to training rewards (was eval-only before this branch).
 - **Source bookkeeping on samples:** `BaseSample.source: Optional[str]`
   + `BaseSample.source_id: Optional[int]` first-class typed fields;
   `_datasets_resolved: frozenset[int]` cache on `RewardArguments` for
@@ -201,18 +213,60 @@ flow is byte-identical for configs that don't opt into multi-source:
 - **One train data factory** (`get_train_dataloader`) + one eval data
   factory (`get_eval_dataloaders`); legacy single-test path
   (`_build_legacy_test_dataloader`) deleted (`b360984`).
-- **Single config canonicalization pass**
-  (`Arguments._canonicalize_legacy_dataset_dir`) in `__post_init__` so
-  every downstream consumer sees only the unified schema (`94f28ba`).
+- **Single config validation pass** (`Arguments._validate_dataset_routing`
+  + resolvers) in `__post_init__` so every downstream consumer sees only
+  the unified `data.datasets` schema (`94f28ba`). (An earlier
+  `_canonicalize_legacy_dataset_dir` shim was removed in the post-review
+  hardening round; the only remaining config migration is
+  `_migrate_legacy_eval_datasets()` for the top-level `eval_datasets:`
+  key.)
 - **Latent bug fix**: `_evaluate_multi_dataset` was calling
   `get_merged_eval_kwargs` on the parent `DatasetArguments` (carrying
-  over from the legacy `EvalDatasetArguments` shape where the method
+  over from the legacy eval-dataset shape where the method
   lived on the parent). Method actually lives on `DatasetEvalSpec`
   (the inner sub-block) — so per-dataset eval overrides would have
   raised `AttributeError`. Fixed during the eval-merge unification
   (`b4717f4`).
-- **Pre-PR latent-cache compatibility**: when `len(training_datasets)
-  == 1` the per-source loader skips the `train_source:{name}` token
-  in `extra_hash_strs`, so caches built by the legacy single-source
-  code path remain hits after the canonicalization upgrade
-  (`94f28ba`). One-time reprocess only applies to the eval/test side.
+- **Pre-PR latent-cache compatibility** (superseded): the per-source
+  loader originally skipped the `train_source:{name}` token in
+  `extra_hash_strs` when `len(training_datasets) == 1`. The post-review
+  hardening round removed that skip (the token is now always included),
+  since the legacy `data.dataset_dir` path no longer exists.
+
+---
+
+### Post-review hardening (after `15c3943`)
+
+A second review round (PR #168) tightened the implementation. Net effect:
+the legacy single-source path is gone entirely and all configs use
+`data.datasets`.
+
+- **Legacy `data.dataset_dir` removed**: `_canonicalize_legacy_dataset_dir`
+  deleted; bare `data.dataset_dir` (without `data.datasets`) is now
+  rejected with a clear error. All 60 example YAMLs migrated to the
+  `data.datasets` schema with inline parameter docs.
+- **`RewardArguments.datasets` → `applicable_datasets`**: field renamed
+  for clarity (the reward gate, loader, and advantage routing follow).
+- **Per-dataset reward weights**: `RewardArguments.weight` accepts a
+  scalar or a `{dataset: weight}` dict, so the same reward can contribute
+  differently per source (e.g. PickScore 0.2 on GenEval/OCR, 1.0 on its
+  own dataset). Resolved to a fully-expanded dict at config load.
+- **Metadata transport**: per-sample JSONL metadata is carried as a single
+  JSON string (`sample.metadata`) instead of flattened keys, so
+  heterogeneous metadata across sources no longer breaks
+  `BaseSample.stack`. Reward models parse via `json.loads` (GenEval
+  updated; `required_fields` now `("image", "prompt", "metadata")`).
+- **Communication optimizations**: the three advantage-stage gathers were
+  merged into one (`source_id` piggybacks on the rewards+`unique_id`
+  gather; applicability mask and per-source weight matrix are derived
+  locally from config); M groupwise reward reductions packed into one
+  NCCL `reduce`; group normalization (GRPO + GDPO) and post-reduce NaN
+  fill vectorized with `np.bincount` / fancy indexing.
+- **`get_data_sampler`** refactored to a pure factory (no `Arguments`
+  dependency); `_init_dataloader` returns `(train, eval)` and eval
+  dataloaders are prepared in the single `accelerator.prepare()` call.
+- **Dead code removed**: `eval_dataset_args.py` (the unused
+  `EvalDatasetArguments` class), `_partition_unique_sample_num`,
+  `_per_source_unique_sample_num`, `_encode_prompts`.
+- **Eval-only guard**: `generate_samples()` now raises a clear error if no
+  training dataloader exists (eval-only `data.datasets`).

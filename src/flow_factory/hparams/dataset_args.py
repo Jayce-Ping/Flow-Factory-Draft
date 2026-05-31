@@ -141,10 +141,9 @@ class DatasetTrainSpec(ArgABC):
 class DatasetEvalSpec(ArgABC):
     """Per-dataset evaluation participation.
 
-    Mirrors the override surface of the legacy
-    :class:`flow_factory.hparams.eval_dataset_args.EvalDatasetArguments`,
-    minus ``name`` / ``dataset_dir`` / media-root fields (those live on
-    the parent :class:`DatasetArguments`).
+    Carries the per-dataset eval override surface (split / size / sampling
+    overrides), minus ``name`` / ``dataset_dir`` / media-root fields (those
+    live on the parent :class:`DatasetArguments`).
 
     Attributes:
         enabled: When False, the dataset is excluded from evaluation
@@ -182,8 +181,7 @@ class DatasetEvalSpec(ArgABC):
     )
 
     # Scalar fields that override the corresponding ``EvaluationArguments``
-    # value when not None. Mirrors the data-driven ClassVar pattern used in
-    # the legacy ``EvalDatasetArguments``.
+    # value when not None (data-driven ClassVar pattern).
     _EVAL_OVERRIDE_FIELDS: ClassVar[tuple] = ("num_inference_steps", "guidance_scale")
 
     def get_merged_eval_kwargs(self, base_eval_args) -> dict[str, Any]:

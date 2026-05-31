@@ -304,28 +304,28 @@ class BaseTrainer(ABC):
 
         # Prepare trainable modules + optimizer + eval dataloaders in one call.
         # Train dataloader is NOT prepared (handled by custom distributed sampler).
-        trainable_module_names = list(self.adapter.target_module_map.keys())
-        trainable_modules = [
-            getattr(self.adapter, name)
-            for name in trainable_module_names
-            if hasattr(self.adapter, name) and getattr(self.adapter, name) is not None
-        ]
+        # Use the adapter's canonical accessors so names and modules align by
+        # construction (both iterate `target_module_map` in the same order) and
+        # property-less components (e.g. `transformer_2`) resolve via get_component.
+        trainable_names = self.adapter.trainable_component_names
+        trainable_modules = self.adapter.trainable_components
         eval_dataloader_names = list(eval_dataloaders.keys())
         eval_dataloader_list = [eval_dataloaders[n] for n in eval_dataloader_names]
         to_prepare = trainable_modules + [self.optimizer] + eval_dataloader_list
 
         prepared = self.accelerator.prepare(*to_prepare)
 
-        for i, name in enumerate(trainable_module_names):
-            if hasattr(self.adapter, name) and getattr(self.adapter, name) is not None:
-                self.adapter.set_component(name, prepared[i])
+        # Explicit slice (not implicit zip truncation): prepared also holds the
+        # optimizer + eval dataloaders after the trainable-module prefix.
+        for name, module in zip(trainable_names, prepared[:len(trainable_modules)]):
+            self.adapter.set_component(name, module)
 
         self.optimizer = prepared[len(trainable_modules)]
         prepared_eval_dataloaders = prepared[len(trainable_modules) + 1:]
         self.eval_dataloaders: Dict[str, DataLoader] = dict(zip(eval_dataloader_names, prepared_eval_dataloaders))
 
         # Load inference modules, excluding already-prepared ones
-        self._load_inference_components(trainable_module_names)
+        self._load_inference_components(trainable_names)
 
         # Initialize reward model
         self._init_reward_model()
@@ -631,6 +631,13 @@ class BaseTrainer(ABC):
             onto every sample.  An end-of-loop runtime check verifies
             this in multi-source mode.
         """
+        if self.dataloader is None:
+            raise RuntimeError(
+                "generate_samples() called but no training dataloader exists. "
+                "`data.datasets` has no entry with `train: enabled` (eval-only "
+                "config); a trainer should not enter the sampling loop here."
+            )
+
         self.adapter.rollout()
         if reward_buffer is not None:
             reward_buffer.clear()

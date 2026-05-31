@@ -960,7 +960,7 @@ class Arguments(ArgABC):
     def _migrate_legacy_eval_datasets(args_dict: dict[str, Any]) -> dict[str, Any]:
         """Auto-migrate the legacy top-level ``eval_datasets:`` YAML key.
 
-        Converts each legacy ``EvalDatasetArguments``-shaped dict into a
+        Converts each legacy top-level ``eval_datasets:`` entry dict into a
         ``DatasetArguments`` entry under ``data.datasets`` whose
         ``eval:`` sub-block carries the same overrides.  Top-level
         ``eval_datasets`` is removed from the input dict so the rest of
@@ -1014,7 +1014,7 @@ class Arguments(ArgABC):
             if isinstance(d, dict) and 'name' in d:
                 by_name[d['name']] = d
 
-        # Field categorisation: the legacy EvalDatasetArguments dataclass
+        # Field categorisation: a legacy top-level eval_datasets entry
         # carries both parent-level fields (name / dataset_dir / media
         # roots) and DatasetEvalSpec-level fields. Split accordingly.
         _PARENT_KEYS = {"name", "dataset_dir", "image_dir", "video_dir", "audio_dir"}
