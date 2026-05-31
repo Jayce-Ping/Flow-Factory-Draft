@@ -667,12 +667,14 @@ class BaseTrainer(ABC):
                 )
                 samples.extend(sample_batch)
 
-        # Multi-source invariant: every sample produced under
-        # `data.datasets` MUST carry source bookkeeping.  An empty
-        # `train_dataloaders_by_source` means we're in legacy mode, so the
-        # check is skipped.  This catches a trainer that overrode
-        # generate_samples but bypassed sample_batch / _inject_batch_metadata.
-        if self.train_dataloaders_by_source and samples:
+        # Multi-source invariant: when more than one training source is
+        # active, batches flow through `MultiSourceTrainDataLoader`, which
+        # injects `__source__` so every sample carries `source`. Single-source
+        # configs use a bare DataLoader (no injection) and the reward gate
+        # treats `source is None` as "applies to all" — so the check must NOT
+        # fire there. This catches a trainer that overrode generate_samples
+        # but bypassed sample_batch / _inject_batch_metadata.
+        if len(self.train_dataloaders_by_source) > 1 and samples:
             missing = [
                 i for i, s in enumerate(samples)
                 if s.source is None
