@@ -58,11 +58,11 @@ class MyPointwiseRewardModel(PointwiseRewardModel):
                 - each element is a tensor with batch dimension, scaled in [0, 1].
 
         Note:
-            To receive per-sample dataset metadata, add named parameters to this
-            signature (e.g. ``include: Optional[List[str]] = None``). These fields
-            are automatically collected from sample.extra_kwargs by RewardProcessor.
-            Complex metadata (nested dicts/lists) arrives as JSON strings — use
-            ``json.loads()`` to parse. See GenEval for a full example.
+            Dataset metadata is available via ``metadata: Optional[List[str]] = None``
+            parameter. Each element is a JSON string containing all non-preprocess
+            JSONL columns for that sample. Parse with ``json.loads(metadata[i])``
+            to access fields like ``include``, ``tag``, etc. See GenEvalRewardModel
+            for a full example.
 
         Returns:
             RewardModelOutput: Contains rewards tensor and any extra information.
@@ -113,6 +113,13 @@ class MyGroupwiseRewardModel(GroupwiseRewardModel):
             condition_videos (Optional[List[List[List[Image.Image]]] | torch.Tensor]): Optional list of condition videos. The length is equal to `group_size`.
                 - each element is a list of videos, where each video is a list of frames. If only one condition video per prompt, this will be a list of single-element lists.
                 - each element is a tensor with batch dimension, scaled in [0, 1].
+
+        Note:
+            Dataset metadata is available via ``metadata: Optional[List[str]] = None``
+            parameter. Each element is a JSON string containing all non-preprocess
+            JSONL columns for that sample. Parse with ``json.loads(metadata[i])``
+            to access fields. See GenEvalRewardModel for a full example.
+
         Returns:
             RewardModelOutput: Contains rewards tensor and any extra information.
         """

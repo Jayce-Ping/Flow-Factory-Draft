@@ -48,8 +48,10 @@ class AdvantageProcessor:
     ----------
     accelerator : Accelerator
         HuggingFace Accelerator instance for distributed ops.
-    reward_weights : dict[str, float]
-        Mapping from reward name to its aggregation weight.
+    reward_weights : dict[str, dict[str, float]]
+        Mapping from reward name to per-dataset weights
+        (``{reward_name: {dataset_name: weight}}``).  Resolved by
+        ``Arguments._resolve_reward_weights`` from scalar or dict form.
     group_size : int
         Number of repeated samples per unique prompt (K).
     global_std : bool
@@ -72,11 +74,12 @@ class AdvantageProcessor:
     def __init__(
         self,
         accelerator: Accelerator,
-        reward_weights: Dict[str, float],
+        reward_weights: Dict[str, Dict[str, float]],
         group_size: int,
         global_std: bool = True,
         sampler_type: str = "distributed_k_repeat",
         verbose: bool = True,
+        source_id_to_name: Optional[List[str]] = None,
     ):
         self.accelerator = accelerator
         self.reward_weights = reward_weights
@@ -84,6 +87,7 @@ class AdvantageProcessor:
         self.global_std = global_std
         self.sampler_type = sampler_type
         self.verbose = verbose
+        self._source_id_to_name = source_id_to_name or []
 
         self.group_on_same_rank = sampler_type == "group_contiguous"
         self._pending_advantage_metrics: Optional[Dict[str, Any]] = None
@@ -155,130 +159,135 @@ class AdvantageProcessor:
         self,
         samples: List[BaseSample],
         rewards: Dict[str, torch.Tensor],
-    ) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
-        """Collect rewards and group indices, respecting sampler topology.
+    ) -> Tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray]:
+        """Collect rewards, group indices, and source IDs in one gather.
 
-        Automatically selects between two code paths based on the sampler type:
+        ``group_contiguous``: no communication; arrays are local ``(B,)``.
+        ``distributed_k_repeat``: rewards + ``unique_id`` + ``source_id``
+        are packed into a single ``(B, N+2)`` tensor and gathered with
+        one ``accelerator.gather()`` call. Arrays are global ``(W*B,)``.
 
-        - ``group_contiguous``: no cross-rank communication.  Rewards are
-          converted to NumPy locally and group indices are derived from
-          ``sample.unique_id``.  Returned arrays have shape ``(B,)`` (local).
-        - ``distributed_k_repeat``: all per-reward tensors and the
-          ``unique_id`` vector are packed into a single ``(B, N+1)`` tensor
-          and gathered with one ``accelerator.gather()`` call.  Returned
-          arrays have shape ``(W*B,)`` (global, ordered by rank index).
-
-        Whether the returned arrays are local or global is an internal detail
-        handled by :meth:`_to_local`.  Callers should not branch on it.
-
-        Parameters
-        ----------
-        samples : list[BaseSample]
-            Samples on the current rank.  Only ``sample.unique_id`` is read.
-        rewards : dict[str, Tensor]
-            Mapping from reward name to a 1-D tensor of reward values,
-            aligned with *samples*.
-
-        Returns
-        -------
-        collected_rewards : dict[str, np.ndarray]
-            Mapping from reward name to a NumPy array of reward values.
-        group_indices : np.ndarray
-            Integer array mapping each element to its prompt group
-            (contiguous integers starting from 0).
+        Returns:
+            collected_rewards: ``{reward_name: np.ndarray}``
+            group_indices: integer array mapping each sample to its group
+            gathered_source_ids: integer array of source IDs (``-1`` = legacy)
         """
         if self.group_on_same_rank:
-            # group_contiguous: all K copies on same rank, no communication needed.
-            # Rewards arrive as cpu tensors; convert directly to numpy.
             collected_rewards = {
                 key: torch.as_tensor(value).cpu().numpy() for key, value in rewards.items()
             }
             unique_ids = np.array([s.unique_id for s in samples], dtype=np.int64)
             _unique_ids, group_indices = np.unique(unique_ids, return_inverse=True)
-            return collected_rewards, group_indices
+            source_ids = np.array(
+                [s.source_id if s.source_id is not None else -1 for s in samples],
+                dtype=np.int64,
+            )
+            return collected_rewards, group_indices, source_ids
         else:
-            # distributed_k_repeat: move to device for accelerator.gather()
             rewards = {
                 key: torch.as_tensor(value).to(self.accelerator.device)
                 for key, value in rewards.items()
             }
             reward_keys = list(rewards.keys())
+            device = self.accelerator.device
             unique_ids = torch.tensor(
-                [s.unique_id for s in samples],
-                dtype=torch.int64,
-                device=self.accelerator.device,
+                [s.unique_id for s in samples], dtype=torch.int64, device=device,
             )
+            local_source_ids = torch.tensor(
+                [s.source_id if s.source_id is not None else -1 for s in samples],
+                dtype=torch.int64, device=device,
+            )
+            # Pack: [reward_0, ..., reward_{N-1}, unique_id, source_id]
             columns = [rewards[k].view(-1).float() for k in reward_keys]
             columns.append(unique_ids.float())
-            packed = torch.stack(columns, dim=1)  # (B, N+1)
+            columns.append(local_source_ids.float())
+            packed = torch.stack(columns, dim=1)  # (B, N+2)
 
-            gathered = self.accelerator.gather(packed).cpu().numpy()  # (W*B, N+1)
+            gathered = self.accelerator.gather(packed).cpu().numpy()  # (W*B, N+2)
 
             collected_rewards = {
                 key: gathered[:, i] for i, key in enumerate(reward_keys)
             }
-            gathered_ids = gathered[:, -1].astype(np.int64)
+            gathered_ids = gathered[:, -2].astype(np.int64)
             _unique_ids, group_indices = np.unique(gathered_ids, return_inverse=True)
-            return collected_rewards, group_indices
+            source_ids = gathered[:, -1].astype(np.int64)
+            return collected_rewards, group_indices, source_ids
 
-    def collect_applicability_mask(
+    def build_source_aware_matrices(
         self,
         samples: List[BaseSample],
         reward_keys: List[str],
-    ) -> np.ndarray:
-        """Gather the per-(reward, sample) applicability matrix.
+        gathered_source_ids: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Build ``(R, S)`` applicability mask and weight matrix locally.
 
-        Mirrors :meth:`collect_group_rewards` topology:
+        Uses ``applicable_rewards`` from local samples (``group_contiguous``)
+        or derives applicability from ``gathered_source_ids`` + config-level
+        ``_datasets_resolved`` (``distributed_k_repeat``). Weight matrix
+        is computed from ``gathered_source_ids`` + ``reward_weights`` with
+        zero communication.
 
-        - ``group_contiguous`` (local): no communication; matrix shape
-          ``(R, B_local)``.
-        - ``distributed_k_repeat``: all per-rank ``(R, B)`` matrices are
-          packed and gathered, returning ``(R, W*B)`` ordered the same
-          way as :meth:`collect_group_rewards` so positions align.
+        Args:
+            samples: Local samples (used in ``group_contiguous`` path).
+            reward_keys: Ordered list of reward names.
+            gathered_source_ids: Source IDs from ``collect_group_rewards``.
 
-        Used by aggregation as the *authoritative* source of which
-        positions a reward applies to (NOT ``np.isnan(rewards)``, which
-        would silently mask in-model NaN bugs).
-
-        Legacy back-compat: when a sample's ``applicable_rewards`` set
-        is empty AND the sample carries no ``source`` / ``source_id``
-        (i.e. came from the legacy single-source path that never updates
-        the bookkeeping), every reward is treated as applicable.
-
-        TODO(perf): the distributed gather here is independent of
-        :meth:`collect_group_rewards` — both run once per advantage
-        compute.  Future optimisation: pack ``source_id`` as an extra
-        column in :meth:`collect_group_rewards`'s payload and recompute
-        the mask LOCALLY on every rank from the gathered ``source_id``s
-        + ``cfg._datasets_resolved`` (item 6's frozenset[int] cache).
-        Saves one collective per epoch; not transformative on its own
-        but composes with future per-source logging which would otherwise
-        re-gather the same data.
+        Returns:
+            Tuple of ``(applicable, weight_matrix)`` both shape ``(R, S)``.
         """
         R = len(reward_keys)
-        B = len(samples)
-        local_mask = np.zeros((R, B), dtype=bool)
-        for j, s in enumerate(samples):
-            applicable = s.applicable_rewards
-            has_source = s.source is not None or s.source_id is not None
-            if not applicable and not has_source:
-                # Legacy single-source path: no source bookkeeping at all.
-                # Honour the original "every reward applies" invariant so
-                # existing configs are byte-identical.
-                local_mask[:, j] = True
-            else:
-                for i, name in enumerate(reward_keys):
-                    local_mask[i, j] = (name in applicable)
+        S = len(gathered_source_ids)
 
         if self.group_on_same_rank:
-            return local_mask
+            local_mask = np.zeros((R, len(samples)), dtype=bool)
+            for j, s in enumerate(samples):
+                applicable = s.applicable_rewards
+                has_source = s.source is not None or s.source_id is not None
+                if not applicable and not has_source:
+                    local_mask[:, j] = True
+                else:
+                    for i, name in enumerate(reward_keys):
+                        local_mask[i, j] = (name in applicable)
+            sources = [s.source for s in samples]
+            weight_matrix = self._weights_from_sources(reward_keys, sources)
+            return local_mask, weight_matrix
 
-        # distributed_k_repeat: pack as float (gather requires tensor),
-        # transpose to (B, R) so row-i-after-gather still corresponds
-        # to sample i (gather concatenates along dim 0 = ranks).
-        packed = torch.from_numpy(local_mask.T.astype(np.float32)).to(self.accelerator.device)
-        gathered = self.accelerator.gather(packed).cpu().numpy()  # (W*B, R)
-        return gathered.T.astype(bool)  # (R, W*B)
+        # Distributed: derive applicability from gathered source_ids +
+        # config-level reward routing (no communication needed).
+        source_names = [
+            self._source_id_to_name[sid] if 0 <= sid < len(self._source_id_to_name) else None
+            for sid in gathered_source_ids
+        ]
+        applicable = np.zeros((R, S), dtype=bool)
+        for j, src in enumerate(source_names):
+            if src is None:
+                applicable[:, j] = True
+            else:
+                for i, key in enumerate(reward_keys):
+                    per_ds = self.reward_weights[key]
+                    applicable[i, j] = (src in per_ds)
+
+        weight_matrix = self._weights_from_sources(reward_keys, source_names)
+        return applicable, weight_matrix
+
+    def _weights_from_sources(
+        self,
+        reward_keys: List[str],
+        sources: List[Optional[str]],
+    ) -> np.ndarray:
+        """Build ``(R, S)`` weight matrix from source names (no communication)."""
+        R = len(reward_keys)
+        S = len(sources)
+        matrix = np.ones((R, S), dtype=np.float64)
+        for r_idx, key in enumerate(reward_keys):
+            per_ds = self.reward_weights[key]
+            default_w = next(iter(per_ds.values()))
+            for s_idx, src in enumerate(sources):
+                if src is not None and src in per_ds:
+                    matrix[r_idx, s_idx] = per_ds[src]
+                else:
+                    matrix[r_idx, s_idx] = default_w
+        return matrix
 
     def _to_local(
         self,
@@ -366,6 +375,45 @@ class AdvantageProcessor:
             return global_zero_std_ratio(self.accelerator, rewards, group_indices)
         return RewardProcessor.compute_group_zero_std_ratio(rewards, group_indices)
 
+    @staticmethod
+    def _group_normalize(
+        values: np.ndarray,
+        group_indices: np.ndarray,
+        mask: Optional[np.ndarray] = None,
+        eps: float = 1e-6,
+    ) -> np.ndarray:
+        """Per-group zero-mean unit-variance normalization (vectorized).
+
+        Args:
+            values: ``(S,)`` array of values to normalize.
+            group_indices: ``(S,)`` integer group assignments.
+            mask: ``(S,)`` boolean; only masked-in positions participate.
+                ``None`` means all positions participate.
+            eps: Minimum std to avoid division by zero.
+
+        Returns:
+            ``(S,)`` normalized values (0 at non-participating positions).
+        """
+        S = len(values)
+        num_groups = group_indices.max() + 1
+        if mask is None:
+            mask = np.ones(S, dtype=bool)
+
+        masked_vals = np.where(mask, values, 0.0)
+        counts = np.bincount(group_indices, weights=mask.astype(np.float64), minlength=num_groups)
+        sums = np.bincount(group_indices, weights=masked_vals, minlength=num_groups)
+        safe_counts = np.maximum(counts, 1.0)
+        means = sums / safe_counts
+
+        residuals = np.where(mask, values - means[group_indices], 0.0)
+        sq_sums = np.bincount(group_indices, weights=residuals ** 2, minlength=num_groups)
+        stds = np.sqrt(sq_sums / safe_counts)
+        stds = np.maximum(stds, eps)
+
+        result = np.zeros(S, dtype=np.float64)
+        result[mask] = residuals[mask] / stds[group_indices[mask]]
+        return result
+
     # ------------------------------------------------------------------
     # Strategy: weighted sum (default GRPO)
     # ------------------------------------------------------------------
@@ -384,7 +432,7 @@ class AdvantageProcessor:
         (subtract per-group mean, divide by std).
 
         **Source-aware aggregation** (plan §6.4): the per-sample
-        applicability matrix from :meth:`collect_applicability_mask` is
+        applicability matrix from :meth:`build_source_aware_matrices` is
         the authoritative source of truth.  NaN at applicable positions
         is asserted to be a model bug (loud failure); NaN at
         non-applicable positions is honored as "this reward doesn't
@@ -409,15 +457,10 @@ class AdvantageProcessor:
         5. **Store** — optionally write advantages into each sample's
            ``extra_kwargs['advantage']``.
         """
-        gathered_rewards, group_indices = self.collect_group_rewards(samples, rewards)
+        gathered_rewards, group_indices, source_ids = self.collect_group_rewards(samples, rewards)
         reward_keys = list(gathered_rewards.keys())
-        # Authoritative applicability matrix, shape (R, S) where S matches
-        # gathered_rewards' shape.
-        applicable = self.collect_applicability_mask(samples, reward_keys)
-
-        S = len(next(iter(gathered_rewards.values())))
-        weights = np.array(
-            [self.reward_weights[k] for k in reward_keys], dtype=np.float64
+        applicable, weight_matrix = self.build_source_aware_matrices(
+            samples, reward_keys, source_ids
         )
 
         # Bug-detection: NaN at applicable position == reward-model bug.
@@ -437,12 +480,11 @@ class AdvantageProcessor:
             )
 
         # Aggregate: weighted sum over applicable rewards only.
-        # Non-applicable positions: contribute 0 (mask is False).
-        contrib = np.where(applicable, stack, 0.0) * weights[:, None]
+        contrib = np.where(applicable, stack, 0.0) * weight_matrix
         aggregated_rewards = contrib.sum(axis=0)  # (S,)
 
         # Per-sample applicable weight sum -> sanity check.
-        weight_per_s = (applicable * weights[:, None]).sum(axis=0)  # (S,)
+        weight_per_s = (applicable * weight_matrix).sum(axis=0)  # (S,)
         if (weight_per_s == 0).any():
             bad = np.where(weight_per_s == 0)[0].tolist()
             raise RuntimeError(
@@ -453,25 +495,16 @@ class AdvantageProcessor:
                 "at least one reward must apply to every source."
             )
 
-        # Group-normalise
-        _unique_ids, _counts = np.unique(group_indices, return_counts=True)
-        advantages = np.zeros_like(aggregated_rewards, dtype=np.float64)
-
+        # Group-normalise (vectorized via bincount)
         if self.global_std:
             _, std = self._global_mean_std(aggregated_rewards)
-
-        for group_id in np.unique(group_indices):
-            mask = group_indices == group_id
-            group_rewards = aggregated_rewards[mask]
-            if len(group_rewards) != self.group_size:
-                raise RuntimeError(
-                    f"Group size mismatch: expected {self.group_size}, got {len(group_rewards)} "
-                    f"for group {group_id} in rank {self.accelerator.process_index}"
-                )
-            mean = np.mean(group_rewards, axis=0, keepdims=True)
-            if not self.global_std:
-                std = max(np.std(group_rewards, axis=0, keepdims=True), 1e-6)
-            advantages[mask] = (group_rewards - mean) / std
+            num_groups = group_indices.max() + 1
+            sums = np.bincount(group_indices, weights=aggregated_rewards, minlength=num_groups)
+            counts = np.bincount(group_indices, minlength=num_groups)
+            means = sums / np.maximum(counts, 1)
+            advantages = (aggregated_rewards - means[group_indices]) / std
+        else:
+            advantages = self._group_normalize(aggregated_rewards, group_indices)
 
         self._pending_advantage_metrics = self._build_weighted_sum_log_data(
             gathered_rewards, group_indices, aggregated_rewards, advantages, samples,
@@ -525,10 +558,11 @@ class AdvantageProcessor:
         6. **Store** — optionally write advantages into each sample's
            ``extra_kwargs['advantage']``.
         """
-        gathered_rewards, group_indices = self.collect_group_rewards(samples, rewards)
+        gathered_rewards, group_indices, source_ids = self.collect_group_rewards(samples, rewards)
         reward_keys = list(gathered_rewards.keys())
-        applicable = self.collect_applicability_mask(samples, reward_keys)
-        S = len(group_indices)
+        applicable, weight_matrix = self.build_source_aware_matrices(
+            samples, reward_keys, source_ids
+        )
 
         # Bug-detection: NaN at applicable position == reward-model bug.
         stack = np.stack(
@@ -547,31 +581,15 @@ class AdvantageProcessor:
         # Per-reward group-wise normalisation, restricted to applicable samples.
         all_reward_advantages = []
         for r_idx, key in enumerate(reward_keys):
-            reward_array = gathered_rewards[key]
+            reward_array = gathered_rewards[key].astype(np.float64)
             r_applicable = applicable[r_idx]
-            reward_adv = np.zeros_like(reward_array, dtype=np.float64)
-            for group_id in np.unique(group_indices):
-                gmask = group_indices == group_id
-                in_group_applicable = gmask & r_applicable
-                if not in_group_applicable.any():
-                    # Reward doesn't apply to this entire group; contribute 0.
-                    continue
-                # Group homogeneity invariant: applicable_in_group is either
-                # all-True (and equals gmask) or all-False (already returned).
-                # The asserted invariant is enforced upstream; if it slips
-                # we still proceed with whatever applicable subset exists.
-                group_rewards = reward_array[in_group_applicable]
-                mean = np.mean(group_rewards)
-                std = max(np.std(group_rewards), 1e-6)
-                # Write normalised values only at applicable positions in this group.
-                reward_adv[in_group_applicable] = (group_rewards - mean) / std
-            all_reward_advantages.append(reward_adv * self.reward_weights[key])
+            reward_adv = self._group_normalize(
+                reward_array, group_indices, mask=r_applicable
+            )
+            all_reward_advantages.append(reward_adv * weight_matrix[r_idx])
 
-        # Combine and batch normalise. Samples with no applicable reward
-        # would aggregate to 0 here -- guard upfront so misconfigs are loud.
-        weight_per_s = (applicable * np.array(
-            [self.reward_weights[k] for k in reward_keys], dtype=np.float64
-        )[:, None]).sum(axis=0)
+        # Combine and batch normalise.
+        weight_per_s = (applicable * weight_matrix).sum(axis=0)
         if (weight_per_s == 0).any():
             bad = np.where(weight_per_s == 0)[0].tolist()
             raise RuntimeError(

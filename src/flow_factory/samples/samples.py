@@ -400,12 +400,16 @@ class BaseSample:
         if not samples:
             raise ValueError("No samples to stack.")
         
-        sample_cls = type(samples[0]) # Dynamically use the sample's class
+        sample_cls = type(samples[0])
         sample_dicts = [s.to_dict() for s in samples]
-        
+
+        all_keys: set = set()
+        for d in sample_dicts:
+            all_keys.update(d.keys())
+
         return {
-            key: sample_cls._stack_values(key, [d[key] for d in sample_dicts])
-            for key in sample_dicts[0].keys()
+            key: sample_cls._stack_values(key, [d.get(key) for d in sample_dicts])
+            for key in all_keys
         }
 
 

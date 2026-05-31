@@ -94,9 +94,19 @@ class RewardArguments(ArgABC):
         },
     )
 
-    weight: float = field(
+    weight: Union[float, Dict[str, float]] = field(
         default=1.0,
-        metadata={"help": "Weight for reward aggregation (reserved for future use)."},
+        metadata={
+            "help": (
+                "Aggregation weight for this reward. Two forms:\n"
+                "  - float (e.g. ``1.0``): same weight on every applicable dataset.\n"
+                "  - dict (e.g. ``{geneval: 2.0, ocr: 0.5}``): per-dataset weight.\n"
+                "    Every key must be in ``applicable_datasets``. Missing keys are\n"
+                "    filled with ``1.0`` by the resolver.\n"
+                "After ``Arguments.__post_init__``, the dict form is always fully\n"
+                "expanded (one entry per applicable dataset)."
+            )
+        },
     )
 
     dtype: Union[Literal['float16', 'bfloat16', 'float32'], torch.dtype] = field(

@@ -116,10 +116,12 @@ class PointwiseRewardModel(BaseRewardModel):
                 - If `use_tensor_inputs` is True and **all condition videos are resized the same**, this will be a list of torch.Tensors (num_conditions, T, C, H, W).
                 - If `use_tensor_inputs` is True and **condition videos have varying sizes**, this will be a list of lists of torch.Tensors (T, C, H, W).
             **kwargs: Additional fields from sample.extra_kwargs, passed automatically
-                by RewardProcessor via filter_kwargs. Dataset metadata fields (e.g.
-                ``include``, ``tag``) arrive here as strings — the reward model is
-                responsible for parsing complex values with ``json.loads()`` as needed.
-                See ``guidance/rewards.md`` "Dataset Metadata Convention" for details.
+                by RewardProcessor via filter_kwargs. Dataset metadata is delivered
+                as a single ``metadata: str`` (JSON-encoded dict) containing all
+                non-preprocess JSONL columns. Reward models that need metadata
+                fields should accept a ``metadata`` parameter and call
+                ``json.loads(metadata)`` to parse. See GenEvalRewardModel for a
+                full example.
         Returns:
             RewardModelOutput with rewards shape (batch_size,)
         """
@@ -174,7 +176,11 @@ class GroupwiseRewardModel(BaseRewardModel):
                 - List[List[List[Image.Image]]]: each innermost list corresponds to one condition video (PIL Images).
                 - If `use_tensor_inputs` is True and **all condition videos are resized the same**, this will be a list of torch.Tensors (num_conditions, T, C, H, W).
                 - If `use_tensor_inputs` is True and **condition videos have varying sizes**, this will be a list of lists of torch.Tensors (T, C, H, W).
-            **kwargs: Additional fields from Sample
+            **kwargs: Additional fields from sample.extra_kwargs, passed automatically
+                by RewardProcessor via filter_kwargs. Dataset metadata is delivered
+                as a single ``metadata: str`` (JSON-encoded dict). Parse with
+                ``json.loads(metadata)`` to access fields. See GenEvalRewardModel
+                for a full example.
         Returns:
             RewardModelOutput with rewards shape (group_size,)
             Rewards must align with the order of input samples.

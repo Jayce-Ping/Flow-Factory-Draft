@@ -145,7 +145,10 @@ rewards:
 
   - name: "pick_score"  # Unique reward identifier (appears in log keys)
     reward_model: "PickScore"  # Reward model class (from registry)
-    weight: 1  # Contribution weight in advantage aggregation
+    weight:  # Per-dataset weight (dict form): controls contribution per source
+      geneval: 0.2
+      ocr: 0.2
+      pickscore: 1.0
     batch_size: 16  # Inference batch size for this reward model
     device: "cuda"  # Device to run reward model on
     dtype: bfloat16  # Precision for reward model inference

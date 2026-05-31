@@ -137,7 +137,7 @@ class GenEvalRewardModel(PointwiseRewardModel):
         counting_threshold: stricter threshold for counting (default: 0.9)
     """
 
-    required_fields: Tuple[str, ...] = ("image", "prompt", "include")
+    required_fields: Tuple[str, ...] = ("image", "prompt", "metadata")
 
     def __init__(self, config: RewardArguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
@@ -461,9 +461,7 @@ class GenEvalRewardModel(PointwiseRewardModel):
         prompt: List[str],
         image: Optional[List[Image.Image]] = None,
         video: Optional[List[List[Image.Image]]] = None,
-        include: Optional[List[Any]] = None,
-        exclude: Optional[List[Any]] = None,
-        tag: Optional[List[str]] = None,
+        metadata: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> RewardModelOutput:
         """Compute GenEval rewards for a batch of images.
@@ -471,9 +469,9 @@ class GenEvalRewardModel(PointwiseRewardModel):
         Args:
             prompt: Text prompts (batch_size,).
             image: Generated PIL images (batch_size,).
-            include: Per-sample include metadata (batch_size,).
-            exclude: Per-sample exclude metadata (batch_size,). May be None.
-            tag: Per-sample evaluation tag (batch_size,). Informational only.
+            metadata: Per-sample metadata JSON strings (batch_size,).
+                Each JSON object should contain ``include`` (required),
+                and optionally ``exclude`` and ``tag``.
 
         Returns:
             RewardModelOutput with rewards in [0, 1].
@@ -483,9 +481,9 @@ class GenEvalRewardModel(PointwiseRewardModel):
 
         if image is None:
             raise ValueError("GenEval reward requires image input.")
-        if include is None:
+        if metadata is None:
             raise ValueError(
-                "GenEval reward requires 'include' metadata. "
+                "GenEval reward requires 'metadata' containing 'include'. "
                 "Ensure dataset JSONL contains 'include' field."
             )
 
@@ -494,24 +492,29 @@ class GenEvalRewardModel(PointwiseRewardModel):
 
         batch_size = len(image)
         rewards = []
+        tags: Optional[List[str]] = None
 
-        # Disable AMP: mmdet's ms_deform_attn CUDA kernel does not support bf16,
-        # and CLIP weights are loaded as fp32. Without this guard, bf16 autocast
-        # from the trainer's eval loop would cause runtime errors.
         with torch.amp.autocast("cuda", enabled=False):
             for i in range(batch_size):
-                inc = include[i] if include else []
-                exc = exclude[i] if exclude and i < len(exclude) else None
-                # Support JSON-stringified include/exclude (Arrow-safe dataset format)
+                meta = metadata[i] if metadata else "{}"
+                if isinstance(meta, str):
+                    meta = json.loads(meta)
+                inc = meta.get("include", [])
+                exc = meta.get("exclude", None)
+                tag = meta.get("tag", None)
                 if isinstance(inc, str):
                     inc = json.loads(inc)
                 if isinstance(exc, str):
                     exc = json.loads(exc) or None
+                if tag is not None:
+                    if tags is None:
+                        tags = []
+                    tags.append(tag)
                 reward = self._evaluate_single(image[i], inc, exc)
                 rewards.append(reward)
 
         extra_info = {}
-        if tag is not None:
-            extra_info["tags"] = tag
+        if tags is not None:
+            extra_info["tags"] = tags
 
         return RewardModelOutput(rewards=rewards, extra_info=extra_info)

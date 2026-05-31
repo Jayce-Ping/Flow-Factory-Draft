@@ -521,23 +521,13 @@ class RewardProcessor:
                 applicable[g_idx] = self._reward_applies(name, groups[uid][0])
             per_group_applicable[name] = applicable
 
-        # 5. Compute rewards per model
-        results: Dict[str, torch.Tensor] = {}
+        # 5. Compute rewards per model (accumulate for batched reduce).
+        model_names = list(models.keys())
+        reward_columns: List[torch.Tensor] = []
 
         for name, model in models.items():
-            # Initialize with zeros - only the owning rank fills its groups.
-            # Non-owning ranks contribute zeros that are consumed by reduce(sum);
-            # post-reduce we overwrite non-applicable group positions with NaN.
             all_rewards = torch.zeros(num_gathered, dtype=torch.float32, device=device)
             applicable_groups = per_group_applicable[name]
-
-            # Mark applicable_rewards on every rank's gathered view (no
-            # rank-dependent skew; aggregation reads this set authoritatively).
-            for g_idx, applies in enumerate(applicable_groups):
-                if applies:
-                    uid = group_keys[g_idx]
-                    for s in groups[uid]:
-                        s.applicable_rewards.add(name)
 
             desc = f'Epoch {epoch} Groupwise Rewards: {name}' if epoch is not None else f'Groupwise Rewards: {name}'
             pbar = tqdm(
@@ -549,13 +539,9 @@ class RewardProcessor:
                 uid = group_keys[group_idx]
                 group_list = groups[uid]
 
-                # Skip non-applicable groups entirely; the zero contribution
-                # is fine (other ranks also contribute 0) — post-reduce we
-                # overwrite the position with NaN.
                 if not applicable_groups[group_idx]:
                     continue
 
-                # Prepare group input
                 fields = filter_kwargs(model.__call__, **group_list[0])
                 group_input = {
                     k: [getattr(s, k) for s in group_list]
@@ -564,14 +550,12 @@ class RewardProcessor:
                 }
                 group_input = self._convert_media_format(group_input, model)
 
-                # Compute rewards
                 output = model(**group_input)
                 group_rewards = torch.as_tensor(
                     output.rewards if hasattr(output, 'rewards') else output,
                     device=device, dtype=torch.float32,
                 )
 
-                # Sanity: model must produce finite scores at applicable positions.
                 if not torch.isfinite(group_rewards).all():
                     bad = (~torch.isfinite(group_rewards)).nonzero(as_tuple=True)[0].tolist()
                     raise RuntimeError(
@@ -580,24 +564,23 @@ class RewardProcessor:
                         "not a routing miss."
                     )
 
-                # Fill positions belonging to this group
                 mask_t = (inverse == group_idx)
                 all_rewards[mask_t] = group_rewards
 
-            # 6. All-reduce SUM: each position has value from exactly one rank.
-            # All ranks call reduce on a same-shape tensor regardless of source
-            # coverage -> no deadlock.
-            all_rewards = self.accelerator.reduce(all_rewards, reduction='sum')
+            reward_columns.append(all_rewards)
 
-            # 6b. Overwrite non-applicable group positions with NaN.  The
-            # owning rank wrote 0 there (skip clause above); the other
-            # ranks wrote 0 at those positions too.  Sum is 0 -> set to NaN
-            # so AdvantageProcessor can rely on the wire-format invariant.
-            cpu = all_rewards.cpu()
-            for g_idx, applies in enumerate(applicable_groups):
-                if not applies:
-                    pos_t = (inverse == g_idx)
-                    cpu[pos_t] = float('nan')
+        # 6. Batched all-reduce: pack M reward vectors into (W*B, M),
+        # reduce once, then unpack. M sequential NCCL calls -> 1.
+        packed_rewards = torch.stack(reward_columns, dim=1)  # (W*B, M)
+        packed_rewards = self.accelerator.reduce(packed_rewards, reduction='sum')
+
+        # 6b. NaN-fill non-applicable group positions + unpack.
+        results: Dict[str, torch.Tensor] = {}
+        for m_idx, name in enumerate(model_names):
+            cpu = packed_rewards[:, m_idx].cpu()
+            applicable_groups = per_group_applicable[name]
+            nan_mask = ~applicable_groups[inverse]
+            cpu[nan_mask] = float('nan')
             results[name] = cpu
 
         # 7. Scatter back to local rank
@@ -622,17 +605,6 @@ class RewardProcessor:
             for ids in prompt_ids_list
         ]
 
-    def _encode_prompts(self, prompts: List[str]) -> List[torch.Tensor]:
-        """Encode strings to prompt_ids."""
-        if self.tokenizer is None:
-            raise ValueError("Cannot encode prompts: tokenizer not provided")
-        
-        return [
-            self.tokenizer(text, return_tensors='pt', padding=False, truncation=True)
-            .input_ids.squeeze(0)
-            for text in prompts
-        ]
-    
     # ============================ Helper Functions ============================
     @staticmethod
     def compute_group_zero_std_ratio(

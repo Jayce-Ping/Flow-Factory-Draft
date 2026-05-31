@@ -137,6 +137,10 @@ class Arguments(ArgABC):
         # unknown-name check is against the user's raw input, not the
         # expanded list) and BEFORE any consumer reads the field.
         self._resolve_reward_dataset_routing()
+        # Normalize `weight` from scalar/dict -> fully-expanded dict keyed
+        # by applicable dataset names. Must run AFTER routing resolution
+        # (so `applicable_datasets` is concrete).
+        self._resolve_reward_weights()
         # With routing concrete, fail-fast when a training source has NO
         # applicable training reward — the user almost certainly meant
         # to add the source name to some reward's `applicable_datasets` list.
@@ -242,6 +246,37 @@ class Arguments(ArgABC):
 
         _resolve_one_side(self.reward_args, train_names, side="Training")
         _resolve_one_side(self.eval_reward_args, eval_names, side="Eval")
+
+    def _resolve_reward_weights(self) -> None:
+        """Normalize ``RewardArguments.weight`` to a fully-expanded dict.
+
+        After this method returns, every reward's ``weight`` is a
+        ``Dict[str, float]`` keyed by its applicable dataset names.
+
+        * ``weight: 1.0`` (scalar) -> ``{ds1: 1.0, ds2: 1.0, ...}``
+        * ``weight: {ds1: 2.0}`` (partial dict) -> ``{ds1: 2.0, ds2: 1.0, ...}``
+          (missing keys filled with ``1.0``)
+
+        Validates that every key in the dict form is a known applicable
+        dataset name.  Skipped when ``applicable_datasets`` is ``None``
+        (pre-resolution; should not happen after routing resolution).
+        """
+        all_rewards = list(self.reward_args) + list(self.eval_reward_args or [])
+        for rc in all_rewards:
+            if rc.applicable_datasets is None:
+                continue
+            if isinstance(rc.weight, dict):
+                unknown = set(rc.weight.keys()) - set(rc.applicable_datasets)
+                if unknown:
+                    raise ValueError(
+                        f"Reward '{rc.name}' has per-dataset weight keys "
+                        f"{sorted(unknown)} that are not in its "
+                        f"applicable_datasets={rc.applicable_datasets!r}."
+                    )
+                expanded = {ds: rc.weight.get(ds, 1.0) for ds in rc.applicable_datasets}
+                rc.weight = expanded
+            else:
+                rc.weight = {ds: float(rc.weight) for ds in rc.applicable_datasets}
 
     def _validate_every_source_has_a_reward(self) -> None:
         """Inverse routing check: every training/eval source must be covered.

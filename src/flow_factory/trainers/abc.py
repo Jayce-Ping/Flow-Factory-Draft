@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # src/flow_factory/trainers/abc.py
+import json
 import os
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, Tuple, List, Union, Literal
@@ -201,7 +202,9 @@ class BaseTrainer(ABC):
                         ds_processor, self.training_args.group_size,
                     )
 
-        # Initialize advantage processor
+        # Initialize advantage processor.
+        # `cfg.weight` is a Dict[str, float] after `_resolve_reward_weights`,
+        # so reward_weights is Dict[reward_name, Dict[dataset_name, float]].
         self.advantage_processor = AdvantageProcessor(
             accelerator=self.accelerator,
             reward_weights={
@@ -212,6 +215,7 @@ class BaseTrainer(ABC):
             global_std=getattr(self.training_args, 'global_std', True),
             sampler_type=self.config.data_args.sampler_type,
             verbose=self.log_args.verbose,
+            source_id_to_name=self.config.data_args.source_id_to_name,
         )
 
         return self.reward_models, self.eval_reward_models
@@ -576,7 +580,7 @@ class BaseTrainer(ABC):
             if metadata_list:
                 meta = metadata_list[batch_idx]
                 if isinstance(meta, dict):
-                    sample.extra_kwargs.update(meta)
+                    sample.extra_kwargs['metadata'] = json.dumps(meta)
             if sources:
                 # Homogeneous within a batch in this PR; per-sample shape
                 # leaves room for future PRs that may interleave within a
