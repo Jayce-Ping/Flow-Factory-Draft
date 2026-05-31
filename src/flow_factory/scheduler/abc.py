@@ -152,3 +152,61 @@ class SDESchedulerMixin(ABC):
     def get_noise_level_for_sigma(self, sigma: float) -> float:
         """Get noise level for specific sigma value."""
         ...
+
+    # ==================== Distillation / KL ====================
+    def get_kl_divergence_denominator(
+        self,
+        std_dev_t: Optional[torch.Tensor],
+        dt: Optional[torch.Tensor],
+        eps: float = 1e-8,
+    ) -> Union[float, torch.Tensor]:
+        """Transition variance ``sigma_bar^2`` for the pathwise per-step KL.
+
+        Distillation trainers (e.g. DiffusionOPD) match the student mean
+        ``mu_S`` to a teacher mean ``mu_T`` along the rollout via
+        ``loss = 0.5 * ||mu_S - mu_T||^2 / denom`` where ``denom`` is the
+        variance of the Gaussian transition ``N(mu, sigma_bar^2)`` that
+        this scheduler's :meth:`step` defines for the active
+        ``dynamics_type``:
+
+        =============  ========================  ================================
+        dynamics_type  denom                     transition sampled in ``step``
+        =============  ========================  ================================
+        ODE            ``1.0``                   deterministic (mean matching)
+        Flow-SDE       ``std_dev_t**2 * (-dt)``  ``mu + std_dev_t*sqrt(-dt)*eps``
+        Dance-SDE      ``std_dev_t**2 * (-dt)``  ``mu + std_dev_t*sqrt(-dt)*eps``
+        CPS            ``std_dev_t**2``          ``mu + std_dev_t*eps``
+        =============  ========================  ================================
+
+        For ``ODE`` it returns the scalar ``1.0`` without touching
+        ``std_dev_t``/``dt`` (which are zero/``None`` under ODE), so the
+        same loss expression is dynamics-agnostic. Non-ODE results are
+        clamped to ``>= eps`` to avoid div-by-zero at near-deterministic
+        steps.
+
+        Args:
+            std_dev_t: Per-sample std from the student ``step`` output.
+            dt: Per-sample ``sigma_next - sigma`` (negative) from ``step``.
+            eps: Lower clamp for the (non-ODE) denominator.
+
+        Returns:
+            ``1.0`` for ODE, otherwise a tensor broadcastable against the
+            per-element squared error.
+        """
+        if self.dynamics_type == "ODE":
+            return 1.0
+        if not isinstance(std_dev_t, torch.Tensor):
+            raise ValueError(
+                f"get_kl_divergence_denominator requires a `std_dev_t` tensor for "
+                f"dynamics_type={self.dynamics_type!r}, got {type(std_dev_t).__name__}. "
+                "Ensure the student step() returns 'std_dev_t' (and 'dt')."
+            )
+        if self.dynamics_type == "CPS":
+            return (std_dev_t.float() ** 2).clamp_min(eps)
+        # Flow-SDE / Dance-SDE: Euler-Maruyama transition variance std_dev_t^2 * (-dt).
+        if not isinstance(dt, torch.Tensor):
+            raise ValueError(
+                f"get_kl_divergence_denominator requires a `dt` tensor for "
+                f"dynamics_type={self.dynamics_type!r}, got {type(dt).__name__}."
+            )
+        return (std_dev_t.float() ** 2 * (-dt.float())).clamp_min(eps)

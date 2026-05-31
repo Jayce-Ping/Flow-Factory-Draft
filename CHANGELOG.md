@@ -1,5 +1,62 @@
 # Changelog
 
+## Unreleased — `feat/diffusion-opd`
+
+**Branch:** `feat/diffusion-opd` (off `main` @ `#168`)
+**Repo:** [X-GenGroup/Flow-Factory](https://github.com/X-GenGroup/Flow-Factory)
+
+Adds **DiffusionOPD** ([paper](https://arxiv.org/abs/2605.15055)), a multi-teacher
+on-policy distillation trainer built on the multi-dataset infrastructure from
+#168. One LoRA teacher per training source is distilled into a single student
+along the student's own rollout trajectories via a closed-form per-step KL
+(pathwise mean-matching), supporting **both ODE and SDE** dynamics.
+
+### Added
+
+- **`trainer_type: diffusion-opd`** — `DiffusionOPDTrainer`
+  (`trainers/opd/trainer.py`), registered in `trainers/registry.py`. Uses a
+  2-pass `optimize()`: PASS 1 (`no_grad`) caches each teacher's per-step
+  transition mean `mu_T` on its routed samples with **one weight swap per
+  teacher**; PASS 2 runs a student-only gradient loop matching each sample's
+  `mu_S` to its own cached `mu_T` (per-step loss `kl_div_j`). Reuses the GRPO
+  trajectory-replay primitives and the `sample() → optimize()` lifecycle.
+  Rewards are used only for eval monitoring.
+- **`DiffusionOPDTrainingArguments` + `TeacherConfig`**
+  (`hparams/training_args/opd.py`): `teachers` (list of
+  `{path, name, applicable_datasets, guidance_scale}`) and
+  `teacher_param_device`. Registered under key `diffusion-opd`; exported from
+  `hparams`. Overrides `get_preprocess_guidance_scale()` to cover the max of the
+  student and any per-teacher CFG. The schema permits several teachers to share
+  a dataset (for a future multi-teacher/ensemble trainer); the current
+  `DiffusionOPDTrainer` enforces one teacher per dataset.
+- **`SDESchedulerMixin.get_kl_divergence_denominator(std_dev_t, dt)`**
+  (`scheduler/abc.py`): centralizes the per-dynamics transition variance so the
+  distillation loss is dynamics-agnostic — `1.0` for ODE,
+  `std_dev_t²·(-dt)` for Flow-SDE/Dance-SDE, `std_dev_t²` for CPS (clamped to
+  `>= eps`).
+- **`trainers/opd/common.py`** — `load_teachers`: loads each teacher LoRA into a
+  named-parameter snapshot (snapshot student → `_load_lora` → `add_named_parameters`
+  → restore student) with a clear LoRA-architecture compatibility error. LoRA
+  teachers only; full-parameter teachers deferred.
+- **`Arguments._validate_teacher_sources`** (`hparams/args.py`): fail-fast config
+  validation that every teacher `applicable_datasets` entry is a declared training
+  dataset. The one-teacher-per-dataset rule is enforced in `DiffusionOPDTrainer`
+  (not here), keeping the schema reusable. No-op for non-OPD trainers.
+- **Examples** under `examples/opd/lora/sd3_5/`: `DiffusionOPD_aligned.yaml`
+  (3 Hugging Face teachers — GenEval/OCR/Aes — aligned to the upstream `mopd`
+  recipe: `group_size=1`, `per_device_batch_size=3`, the Aes teacher distilled
+  on the `pickscore` dataset, per-teacher CFG 4.5/4.5/1.0) and
+  `geneval_pickscore_ocr.yaml` (3 local-checkpoint teachers). Both default to
+  `dynamics_type: ODE`; switch to `Flow-SDE` + `noise_level > 0` for SDE
+  distillation.
+
+### Docs
+
+- `guidance/algorithms.md`: new "DiffusionOPD: On-Policy Distillation" section +
+  reference [14].
+- `README.md` / `examples/README.md`: list the `diffusion-opd` trainer and the
+  new `opd` examples.
+
 ## Unreleased — `feat/multi-eval-dataset`
 
 **Range:** `652f7315..HEAD` (2026-05-26 … 2026-05-31)

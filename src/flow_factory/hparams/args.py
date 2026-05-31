@@ -155,6 +155,11 @@ class Arguments(ArgABC):
         # gate. Trivially deterministic on every rank because IDs come
         # from the same shared config.
         self._resolve_reward_dataset_ids()
+        # DiffusionOPD teacher routing (no-op for other trainers): each teacher's
+        # `applicable_datasets` must reference declared training datasets. The
+        # one-teacher-per-dataset rule is enforced in DiffusionOPDTrainer, not here
+        # (the config schema stays permissive for a future multi-teacher trainer).
+        self._validate_teacher_sources()
         self._resolve_scheduler_sde_defaults()
         self._resolve_sampler_type()
         self._align_batch_geometry()
@@ -315,6 +320,40 @@ class Arguments(ArgABC):
 
         _check_side(self.reward_args, train_names, side="Training")
         _check_side(self.eval_reward_args, eval_names, side="Eval")
+
+    def _validate_teacher_sources(self) -> None:
+        """Validate DiffusionOPD teacher routing (OPD trainer only).
+
+        Every ``TeacherConfig.applicable_datasets`` entry must reference a
+        declared training dataset (``data.datasets[*].name`` with training
+        enabled). The schema deliberately permits several teachers to share a
+        dataset; the one-teacher-per-dataset constraint is enforced by
+        ``DiffusionOPDTrainer`` (not here), so a future multi-teacher/ensemble
+        trainer can reuse this config unchanged.
+
+        No-op for non-OPD trainers (their ``TrainingArguments`` has no
+        ``teachers`` attribute).
+        """
+        ta = self.training_args
+        teachers = getattr(ta, "teachers", None)
+        if not teachers:
+            return
+
+        train_names = {d.name for d in self.data_args.training_datasets}
+        if not train_names:
+            raise ValueError(
+                "DiffusionOPD requires `data.datasets` with at least one training dataset, "
+                "but none were found. Declare each teacher's dataset under `data.datasets`."
+            )
+
+        for i, teacher in enumerate(teachers):
+            unknown = [d for d in teacher.applicable_datasets if d not in train_names]
+            if unknown:
+                raise ValueError(
+                    f"DiffusionOPD teacher[{i}] (name={teacher.name!r}, path={teacher.path!r}) references "
+                    f"dataset(s) {unknown} not in training datasets {sorted(train_names)}. "
+                    "Each `applicable_datasets` entry must match a `data.datasets[*].name` whose `train` is enabled."
+                )
 
     def _validate_dataset_routing(self) -> None:
         """Validate the unified ``data.datasets`` schema and reward routing.

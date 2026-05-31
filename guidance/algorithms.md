@@ -23,6 +23,8 @@
 
 - [CRD: Centered Reward Distillation](#crd-centered-reward-distillation)
 
+- [DiffusionOPD: On-Policy Distillation](#diffusionopd-on-policy-distillation)
+
 - [References](#references)
 
 ## Overview
@@ -481,6 +483,66 @@ train:
 | `> 0` | Softmax temperature | Dual-direction: `softmax(adv/τ)` and `softmax(-adv/τ)` |
 
 
+## DiffusionOPD: On-Policy Distillation
+
+This algorithm is introduced in [[14]](#ref14). **DiffusionOPD** is a *decoupled-paradigm* multi-task distillation method: instead of jointly optimizing several rewards from scratch, it first trains one task-specialized **teacher** per task (e.g. GenEval, OCR, aesthetics) and then distills their capabilities into a single unified **student** along the student's own rollout trajectories. This reduces reward conflict and catastrophic forgetting relative to multi-reward RL.
+
+Unlike the policy-gradient algorithms above, the loss is a closed-form **per-step KL on the denoising transition** — a pathwise mean-matching objective that covers both stochastic SDE samplers and deterministic ODE samplers:
+
+```
+kl_div_j = 0.5 * || mu_S - mu_T ||^2 / denom
+```
+
+where `mu_S` / `mu_T` are the student / teacher transition means at the student-visited state `x_j`, and `denom` is the scheduler's transition variance for the active dynamics (centralized in `scheduler.get_kl_divergence_denominator`):
+
+| `dynamics_type` | `denom` | resulting `kl_div_j` |
+|---|---|---|
+| `ODE` | `1.0` | pure mean matching: `0.5 * ||μ_S − μ_T||²` |
+| `Flow-SDE`, `Dance-SDE` | `std_dev_t² · (-dt)` | Gaussian transition KL: `||μ_S − μ_T||² / (2 σ̄²)` |
+| `CPS` | `std_dev_t²` | `||μ_S − μ_T||² / (2 std_dev_t²)` |
+
+There is no loss-scaling coefficient (DiffusionOPD has no REINFORCE term). Rewards are used **only** for periodic eval monitoring (`evaluate()`), never in the distillation loss.
+
+### How it works (2-pass per epoch)
+
+Built directly on the multi-dataset infrastructure (`data.datasets`, per-source `source`/`source_id`, `train_dataloaders_by_source`), so each teacher is routed to one or more training datasets:
+
+1. **`sample()`** — the student rolls out on-policy trajectories over the multi-source dataloader (each sample tagged with its `source`), reusing the standard sampling pipeline.
+2. **`optimize()` PASS 1** (`no_grad`) — for each teacher (exactly **one** weight swap, via the named-parameter snapshot), forward over its routed samples' stored states `x_j` and cache the teacher means `mu_T` on each sample.
+3. **`optimize()` PASS 2** (student params only) — a standard gradient loop forwards the student at the same `x_j`, matching each sample's `mu_S` to its own cached `mu_T` (a micro-batch may mix teachers; the batch-mean is an implicit per-teacher KL averaged over the batch).
+
+Teacher swaps are thus **M-per-epoch** (one per teacher), the gradient loop runs with student params only (no autocast-cache toggling, no DDP bypass), and the loss is a clean student-vs-cached-target MSE.
+
+### Teacher loading
+
+Teachers are **LoRA-only** (full-parameter teachers are deferred). Each teacher checkpoint is loaded into a named-parameter snapshot and **must share the student's LoRA architecture** (same `target_components` / target modules, compatible rank/alpha), because it is loaded into the student's active adapter slot. Local paths and Hugging Face Hub repo ids are both accepted.
+
+To use this algorithm, set:
+
+```yaml
+train:
+  trainer_type: 'diffusion-opd'
+
+  teachers:
+    - name: "geneval-teacher"           # unique id (named snapshot + log keys)
+      path: "quanhaol/GenEval-Teacher"  # local path or HF repo id (PEFT LoRA)
+      applicable_datasets: [geneval]    # distill on geneval rollouts
+      # guidance_scale: 4.5             # (optional) per-teacher CFG override (null = student CFG)
+    - name: "ocr-teacher"
+      path: "quanhaol/OCR-Teacher"
+      applicable_datasets: [ocr]
+
+  teacher_param_device: 'cuda'  # teacher snapshot device: 'cuda' (fast swaps) / 'cpu' (low VRAM)
+  guidance_scale: 1.0           # student CFG for rollout + forward
+
+scheduler:
+  dynamics_type: "ODE"  # mean matching; switch to Flow-SDE + noise_level>0 for SDE distillation
+  noise_level: 0.0
+```
+
+Each teacher's `applicable_datasets` must reference declared `data.datasets[*].name` entries (validated at config load). The config schema allows several teachers to share a dataset for a future multi-teacher/ensemble trainer, but the current `DiffusionOPDTrainer` requires exactly one teacher per dataset and raises otherwise. See [`examples/opd/lora/sd3_5/`](../examples/opd/lora/sd3_5/) for two complete configs (HF teachers and local-checkpoint teachers).
+
+
 ## References
 
 * <a name="ref1"></a>[1] [**Flow-GRPO:** Training Flow Matching Models via Online RL](https://arxiv.org/abs/2505.05470)
@@ -496,3 +558,4 @@ train:
 * <a name="ref11"></a>[11] [**Diffusion-DPO**: Diffusion Model Alignment Using Direct Preference Optimization](https://arxiv.org/abs/2311.12908)
 * <a name="ref12"></a>[12] [**TDM-R1**: Reinforcing Few-Step Diffusion Models with Non-Differentiable Reward](https://arxiv.org/abs/2510.08425)
 * <a name="ref13"></a>[13] [**CRD**: Diffusion Reinforcement Learning via Centered Reward Distillation](https://arxiv.org/abs/2603.14128)
+* <a name="ref14"></a>[14] [**DiffusionOPD**: A Unified Perspective of On-Policy Distillation in Diffusion Models](https://arxiv.org/abs/2605.15055)

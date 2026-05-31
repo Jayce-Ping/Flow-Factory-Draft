@@ -28,6 +28,7 @@ from .awm import AWMTrainingArguments
 from .dpo import DPOTrainingArguments
 from .dgpo import DGPOTrainingArguments
 from .crd import CRDTrainingArguments
+from .opd import DiffusionOPDTrainingArguments, TeacherConfig
 
 __all__ = [
     "EvaluationArguments",
@@ -38,6 +39,8 @@ __all__ = [
     "DPOTrainingArguments",
     "DGPOTrainingArguments",
     "CRDTrainingArguments",
+    "DiffusionOPDTrainingArguments",
+    "TeacherConfig",
     "get_training_args_class",
     "list_registered_training_args",
 ]

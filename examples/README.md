@@ -10,7 +10,7 @@ examples/{algorithm}/{finetune_type}/{model_type}/{variant}.yaml
 
 | Level | Description | Examples |
 |-------|-------------|---------|
-| `algorithm` | Training algorithm | `grpo`, `nft`, `awm`, `dgpo`, `dpo`, `crd` |
+| `algorithm` | Training algorithm | `grpo`, `nft`, `awm`, `dgpo`, `dpo`, `crd`, `opd` |
 | `finetune_type` | Parameter-efficient or full | `lora`, `full` |
 | `model_type` | Model family (underscore-separated) | `flux1`, `sd3_5`, `wan21`, `ltx2` |
 | `variant` | Config variant | `default.yaml`, `nocfg.yaml`, `t2v.yaml` |
@@ -23,6 +23,8 @@ examples/{algorithm}/{finetune_type}/{model_type}/{variant}.yaml
 ```bash
 ff-train examples/grpo/lora/flux1/default.yaml
 ```
+
+**DiffusionOPD (`opd`)**: multi-teacher on-policy distillation. Each config declares one LoRA `teacher` per `data.datasets` entry; teachers must share the student's LoRA architecture. See [`opd/lora/sd3_5/DiffusionOPD_aligned.yaml`](opd/lora/sd3_5/DiffusionOPD_aligned.yaml) (Hugging Face teachers, aligned to the upstream `mopd` recipe) and [`opd/lora/sd3_5/geneval_pickscore_ocr.yaml`](opd/lora/sd3_5/geneval_pickscore_ocr.yaml) (local-checkpoint teachers), plus the [Algorithm Guidance](../guidance/algorithms.md#diffusionopd-on-policy-distillation).
 
 ## Contributing
 

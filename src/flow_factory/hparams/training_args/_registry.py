@@ -25,6 +25,7 @@ from .awm import AWMTrainingArguments
 from .dpo import DPOTrainingArguments
 from .dgpo import DGPOTrainingArguments
 from .crd import CRDTrainingArguments
+from .opd import DiffusionOPDTrainingArguments
 
 
 # ============================================================================
@@ -39,6 +40,7 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     'dgpo': DGPOTrainingArguments,
     'dpo': DPOTrainingArguments,
     'crd': CRDTrainingArguments,
+    'diffusion-opd': DiffusionOPDTrainingArguments,
 }
 
 
