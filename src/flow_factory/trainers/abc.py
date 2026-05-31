@@ -306,9 +306,9 @@ class BaseTrainer(ABC):
             for name in trainable_module_names
             if hasattr(self.adapter, name) and getattr(self.adapter, name) is not None
         ]
-        eval_dl_names = list(eval_dataloaders.keys())
-        eval_dl_list = [eval_dataloaders[n] for n in eval_dl_names]
-        to_prepare = trainable_modules + [self.optimizer] + eval_dl_list
+        eval_dataloader_names = list(eval_dataloaders.keys())
+        eval_dataloader_list = [eval_dataloaders[n] for n in eval_dataloader_names]
+        to_prepare = trainable_modules + [self.optimizer] + eval_dataloader_list
 
         prepared = self.accelerator.prepare(*to_prepare)
 
@@ -317,8 +317,8 @@ class BaseTrainer(ABC):
                 self.adapter.set_component(name, prepared[i])
 
         self.optimizer = prepared[len(trainable_modules)]
-        prepared_eval_dls = prepared[len(trainable_modules) + 1:]
-        self.eval_dataloaders: Dict[str, DataLoader] = dict(zip(eval_dl_names, prepared_eval_dls))
+        prepared_eval_dataloaders = prepared[len(trainable_modules) + 1:]
+        self.eval_dataloaders: Dict[str, DataLoader] = dict(zip(eval_dataloader_names, prepared_eval_dataloaders))
 
         # Load inference modules, excluding already-prepared ones
         self._load_inference_components(trainable_module_names)
