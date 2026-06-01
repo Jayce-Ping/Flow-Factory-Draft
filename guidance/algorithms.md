@@ -524,12 +524,12 @@ train:
   trainer_type: 'diffusion-opd'
 
   teachers:
-    - name: "geneval-teacher"           # unique id (named snapshot + log keys)
-      path: "quanhaol/GenEval-Teacher"  # local path or HF repo id (PEFT LoRA)
-      applicable_datasets: [geneval]    # distill on geneval rollouts
-      # guidance_scale: 4.5             # (optional) per-teacher CFG override (null = student CFG)
+    - name: "geneval-teacher"                            # unique id (named snapshot + log keys)
+      path: "quanhaol/DiffusionOPD/GenEvalTeacher/lora"  # local path or HF spec owner/repo[/subfolder][@rev]
+      applicable_datasets: [geneval]                     # distill on geneval rollouts
+      # guidance_scale: 4.5                              # (optional) per-teacher CFG override (null = student CFG)
     - name: "ocr-teacher"
-      path: "quanhaol/OCR-Teacher"
+      path: "quanhaol/DiffusionOPD/OCRTeacher/lora"
       applicable_datasets: [ocr]
 
   teacher_param_device: 'cuda'  # teacher snapshot device: 'cuda' (fast swaps) / 'cpu' (low VRAM)

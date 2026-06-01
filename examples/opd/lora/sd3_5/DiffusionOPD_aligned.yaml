@@ -5,12 +5,18 @@
 # Three task-specialized teachers are distilled into one student LoRA along the
 # student's own ODE rollout trajectories.
 #
+# All official checkpoints live under ONE repo, quanhaol/DiffusionOPD, as
+# subfolders (each teacher's LoRA is in <Teacher>/lora; the released distilled
+# student is in Student/lora). Flow-Factory loads a subfolder via the
+# owner/repo/subfolder path spec.
+#
 # Teacher -> dataset mapping (NOTE: upstream applies the Aesthetics teacher to
 # the `pickscore` prompt set — "aesthetic" IS the pickscore task here):
-#   - quanhaol/Aes-Teacher      -> dataset `pickscore`   (guidance_scale 4.5)
-#   - quanhaol/OCR-Teacher      -> dataset `ocr`         (guidance_scale 4.5)
-#   - quanhaol/GenEval-Teacher  -> dataset `geneval`     (guidance_scale 1.0)
-# Each must share the student's LoRA architecture (target modules, rank/alpha).
+#   - quanhaol/DiffusionOPD/AesTeacher/lora     -> dataset `pickscore`  (guidance_scale 4.5)
+#   - quanhaol/DiffusionOPD/OCRTeacher/lora     -> dataset `ocr`        (guidance_scale 4.5)
+#   - quanhaol/DiffusionOPD/GenEvalTeacher/lora -> dataset `geneval`    (guidance_scale 1.0)
+# Each must share the student's LoRA architecture; these teachers are r=32,
+# lora_alpha=64 with SD3.5 attention target modules — matching the student below.
 #
 # Batch geometry (matches upstream `mopd` on 8 GPUs):
 #   num_image_per_prompt=1   -> group_size=1
@@ -92,15 +98,15 @@ train:
   # ---- Teachers: one HF LoRA per dataset, distilled into the student ----
   teachers:
     - name: "aes-teacher"  # Aesthetics teacher; upstream applies it to the pickscore prompt set
-      path: "quanhaol/Aes-Teacher"  # HF Hub PEFT LoRA checkpoint
+      path: "quanhaol/DiffusionOPD/AesTeacher/lora"  # HF subfolder spec (owner/repo/subfolder)
       applicable_datasets: [pickscore]  # Distill this teacher on pickscore rollouts
       guidance_scale: 4.5  # Teacher CFG for its forward (upstream pickscore_teacher_gs)
     - name: "ocr-teacher"  # Unique teacher id (named snapshot + log keys)
-      path: "quanhaol/OCR-Teacher"  # HF Hub PEFT LoRA checkpoint
+      path: "quanhaol/DiffusionOPD/OCRTeacher/lora"  # HF subfolder spec (owner/repo/subfolder)
       applicable_datasets: [ocr]  # Distill this teacher on ocr rollouts
       guidance_scale: 4.5  # Teacher CFG for its forward (upstream ocr_teacher_gs)
     - name: "geneval-teacher"  # Unique teacher id (named snapshot + log keys)
-      path: "quanhaol/GenEval-Teacher"  # HF Hub PEFT LoRA checkpoint
+      path: "quanhaol/DiffusionOPD/GenEvalTeacher/lora"  # HF subfolder spec (owner/repo/subfolder)
       applicable_datasets: [geneval]  # Distill this teacher on geneval rollouts
       guidance_scale: 1.0  # Teacher queried at its no-CFG distribution (upstream geneval_teacher_gs)
 
