@@ -144,7 +144,7 @@ train:
   adam_betas: [0.9, 0.999]  # AdamW momentum coefficients (beta1, beta2)
   adam_epsilon: 1.0e-8  # AdamW epsilon for numerical stability
   max_grad_norm: 1.0  # Max gradient norm for gradient clipping
-  max_epochs: 200  # Stop after this many epochs (-1 / null = unbounded)
+  max_epochs: 500  # Stop after this many epochs (-1 / null = unbounded)
 
   ema_decay: 0.9  # EMA decay rate for model weights (0 to disable)
   ema_update_interval: 4  # Update EMA every N epochs
