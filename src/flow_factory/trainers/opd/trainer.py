@@ -24,6 +24,11 @@ dynamics-agnostic.
 Reference:
 [1] On-Policy Distillation of Diffusion Models — https://github.com/ali-vilab/DiffusionOPD
 
+The distilled denoising steps are selected by ``train.timestep_range`` (a
+fraction band of the trajectory step indices; default 0.99 = upstream
+``timestep_fraction``), NOT the SDE-only ``scheduler.train_timesteps`` (which is
+empty under ODE). See ``_select_train_step_indices``.
+
 Design (2-pass, per epoch):
   sample()    -> student rolls out on-policy trajectories (tagged by source),
                  reusing the standard ``generate_samples`` pipeline.
@@ -165,13 +170,16 @@ class DiffusionOPDTrainer(BaseTrainer):
     def sample(self) -> List[BaseSample]:
         """Roll out on-policy student trajectories over the multi-source dataloader.
 
-        Stores the trajectory positions needed for per-step distillation
-        (current + next latents at every training timestep). Rewards are not
-        used by the distillation loss, so no reward buffer is attached;
-        reward monitoring is left to :meth:`evaluate`.
+        Stores only the trajectory positions needed for the distilled step band
+        (``timestep_range``): current + next latents for each step in the band.
+        Rewards are not used by the distillation loss, so no reward buffer is
+        attached; reward monitoring is left to :meth:`evaluate`.
         """
+        train_step_indices = self._select_train_step_indices(
+            self.training_args.num_inference_steps, self.training_args.timestep_range
+        )
         trajectory_indices = compute_trajectory_indices(
-            train_timestep_indices=self.adapter.scheduler.train_timesteps,
+            train_timestep_indices=train_step_indices,
             num_inference_steps=self.training_args.num_inference_steps,
         )
         return self.generate_samples(
@@ -194,7 +202,11 @@ class DiffusionOPDTrainer(BaseTrainer):
         # Train-mode dynamics for BOTH passes (scheduler.is_eval=False) so the SDE
         # transition means are computed consistently for teacher and student.
         self.adapter.train()
-        train_timesteps = self.adapter.scheduler.train_timesteps
+        # Distilled denoising-step band from `timestep_range` (see `_select_train_step_indices`).
+        # Same indices the rollout stored in `sample()`, so the replay aligns.
+        train_timesteps = self._select_train_step_indices(
+            self.training_args.num_inference_steps, self.training_args.timestep_range
+        )
 
         self._precompute_teacher_targets(samples, train_timesteps)
         self._distill(samples, train_timesteps)
@@ -359,6 +371,30 @@ class DiffusionOPDTrainer(BaseTrainer):
                                 loss_info = defaultdict(list)
 
     # =============================== Helpers ===============================
+    @staticmethod
+    def _select_train_step_indices(
+        num_inference_steps: int,
+        timestep_range: Union[float, Tuple[float, float]],
+    ) -> torch.Tensor:
+        """Trajectory step indices to distill on, from ``timestep_range``.
+
+        ``timestep_range=(frac_lo, frac_hi)`` (a bare float ``f`` is treated as
+        ``(0, f)``) selects the contiguous band of denoising transitions
+        ``[int(T*frac_lo), int(T*frac_hi))`` where ``T = num_inference_steps``.
+        Default ``0.99`` reproduces upstream DiffusionOPD's ``timestep_fraction``
+        (distill the first 99% of steps, ``int(10*0.99)=9`` -> indices ``[0..8]``,
+        skipping the near-clean tail). Deterministic and dynamics-agnostic, so it
+        does NOT use the SDE-only ``scheduler.train_timesteps`` (empty under ODE),
+        and gives identical indices in ``sample()`` and ``optimize()``.
+        """
+        if isinstance(timestep_range, (int, float)):
+            frac_lo, frac_hi = 0.0, float(timestep_range)
+        else:
+            frac_lo, frac_hi = timestep_range
+        lo = int(num_inference_steps * frac_lo)
+        hi = max(lo + 1, int(num_inference_steps * frac_hi))
+        return torch.arange(lo, hi, dtype=torch.long)
+
     def _teacher_index_for_sample(self, sample: BaseSample) -> int:
         """Resolve a sample's teacher index from its dataset (``sample.source``).
 

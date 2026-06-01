@@ -23,10 +23,10 @@ entries) via :class:`TeacherConfig.applicable_datasets`.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Tuple, Union
 
 from ..abc import ArgABC
-from ._base import TrainingArguments
+from ._base import TrainingArguments, _standardize_timestep_range
 
 
 @dataclass
@@ -95,9 +95,26 @@ class DiffusionOPDTrainingArguments(TrainingArguments):
             "help": "Device to store teacher LoRA snapshots ('cuda' = fast swaps, 'cpu' = lower VRAM)."
         },
     )
+    timestep_range: Union[float, Tuple[float, float]] = field(
+        default=0.99,
+        metadata={
+            "help": (
+                "Fraction band of denoising transitions to distill, along the denoise axis "
+                "1000->0. A float ``f`` means the band ``[0, f]`` (the first ``f``-fraction of "
+                "steps, skipping the near-clean tail); a tuple is an explicit ``[lo, hi]`` band. "
+                "Default 0.99 matches upstream DiffusionOPD's ``timestep_fraction``. "
+                "Dynamics-agnostic (does not use the SDE-only ``scheduler.train_timesteps``)."
+            )
+        },
+    )
 
     def __post_init__(self):
         super().__post_init__()
+
+        # Standardize to (frac_lo, frac_hi); a float f -> (0.0, f). Mirrors NFT's
+        # `timestep_range` convention so the trainer can derive distillation-step
+        # indices from a fraction band.
+        self.timestep_range = _standardize_timestep_range(self.timestep_range)
 
         # Coerce dict entries -> TeacherConfig (ArgABC.from_dict does not recurse
         # into nested list-of-ArgABC fields).

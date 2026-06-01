@@ -103,6 +103,7 @@ train:
   resolution: 512  # Training resolution. Can be int or [height, width]
   num_inference_steps: 10  # Number of denoising timesteps in the on-policy rollout
   guidance_scale: 1.0  # Student CFG for rollout + forward (1.0 = no guidance)
+  timestep_range: 0.99  # Distill the first 99% of denoising steps (upstream timestep_fraction); float f -> band [0, f]
 
   per_device_batch_size: 8  # Batch size per GPU device
   group_size: 1  # Rollouts generated per prompt (under SDE these differ; under ODE they are identical)

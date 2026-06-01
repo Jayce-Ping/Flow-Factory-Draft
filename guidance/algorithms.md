@@ -513,6 +513,8 @@ Built directly on the multi-dataset infrastructure (`data.datasets`, per-source 
 
 Teacher swaps are thus **M-per-epoch** (one per teacher), the gradient loop runs with student params only (no autocast-cache toggling, no DDP bypass), and the loss is a clean student-vs-cached-target MSE.
 
+Which denoising steps are distilled is set by `train.timestep_range` (default `0.99`), the same fraction idiom NFT uses: a float `f` selects the band `[0, f]` of the trajectory's step indices (the first `f`-fraction of denoising steps, skipping the near-clean tail), and a tuple is an explicit `[lo, hi]` band. This reproduces upstream DiffusionOPD's `timestep_fraction` and is **dynamics-agnostic** — it selects by trajectory step index rather than the SDE-only stochastic-step set, so it works identically under ODE and SDE.
+
 ### Teacher loading
 
 Teachers are **LoRA-only** (full-parameter teachers are deferred). Each teacher checkpoint is loaded into a named-parameter snapshot and **must share the student's LoRA architecture** (same `target_components` / target modules, compatible rank/alpha), because it is loaded into the student's active adapter slot. Local paths and Hugging Face Hub repo ids are both accepted.
@@ -534,6 +536,7 @@ train:
 
   teacher_param_device: 'cuda'  # teacher snapshot device: 'cuda' (fast swaps) / 'cpu' (low VRAM)
   guidance_scale: 1.0           # student CFG for rollout + forward
+  timestep_range: 0.99          # distill the first 99% of denoising steps (upstream timestep_fraction)
 
 scheduler:
   dynamics_type: "ODE"  # mean matching; switch to Flow-SDE + noise_level>0 for SDE distillation
