@@ -50,7 +50,7 @@ import math
 import os
 from collections import defaultdict
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import torch
 import tqdm as tqdm_
@@ -58,9 +58,9 @@ import tqdm as tqdm_
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from ...hparams import DiffusionOPDTrainingArguments
+from ...hparams.training_args.opd import resolve_distill_step_band
 from ...samples import BaseSample
 from ...utils.base import create_generator, filter_kwargs
-from ...utils.dist import reduce_loss_info
 from ...utils.logger_utils import setup_logger
 from ...utils.trajectory_collector import compute_trajectory_indices
 from ..abc import BaseTrainer
@@ -286,7 +286,13 @@ class DiffusionOPDTrainer(BaseTrainer):
             shuffled_samples = [samples[i] for i in perm]
 
             self.adapter.train()
-            loss_info: Dict[str, Any] = defaultdict(list)
+            # Per-teacher KL accumulators over the current gradient-accumulation window.
+            # Fixed (num_teachers,) shape so the cross-rank reduce in `_log_distill_metrics`
+            # is collective-safe regardless of which teachers each rank's micro-batches held.
+            num_teachers = len(self._teacher_names)
+            teacher_kl_sum = torch.zeros(num_teachers, device=device)
+            teacher_kl_count = torch.zeros(num_teachers, device=device)
+            grad_norm = None
 
             with self.autocast():
                 for batch_idx in tqdm(
@@ -301,6 +307,12 @@ class DiffusionOPDTrainer(BaseTrainer):
                         s.to(device)
                         for s in shuffled_samples[start : start + per_device_batch_size]
                     ]
+                    # Teacher index per sample in this (possibly source-mixed) micro-batch.
+                    teacher_idx = torch.tensor(
+                        [self._teacher_index_for_sample(s) for s in batch_samples],
+                        device=device,
+                        dtype=torch.long,
+                    )  # (B,)
                     batch = BaseSample.stack(batch_samples)
                     # extra_kwargs tensors are not moved by BaseSample.to(); move explicitly.
                     mu_teacher_all = batch["mu_teacher"]
@@ -330,10 +342,7 @@ class DiffusionOPDTrainer(BaseTrainer):
                                 return_kwargs=["next_latents_mean", "std_dev_t", "dt"],
                             )
                             # Each sample is matched to ITS OWN routed teacher: mu_teacher
-                            # was cached per-sample in PASS 1, so a micro-batch may mix
-                            # teachers. The batch-mean below is therefore an (implicit)
-                            # per-teacher KL averaged over the batch, weighted by each
-                            # teacher's sample count -- not all-teachers-vs-student.
+                            # was cached per-sample in PASS 1, so a micro-batch may mix teachers.
                             mu_T = mu_teacher_all[:, idx]  # (B, *latent) this sample's teacher mean
                             # Per-sample MSE between student and teacher transition means.
                             per_sample_mse = (
@@ -348,11 +357,17 @@ class DiffusionOPDTrainer(BaseTrainer):
                                 denom = denom.reshape(per_sample_mse.shape[0], -1).mean(
                                     dim=1
                                 )  # (B,)
-                            # (B,) / (B,) -> (B,); 0.5 * mean over batch -> scalar.
-                            kl_div_j = 0.5 * (per_sample_mse / denom).mean()
+                            per_sample_kl = 0.5 * (per_sample_mse / denom)  # (B,)
+                            loss = per_sample_kl.mean()  # scalar (mean over batch)
 
-                            self.accelerator.backward(kl_div_j)
-                            loss_info["kl_div_j"].append(kl_div_j.detach())
+                            self.accelerator.backward(loss)
+
+                            # Accumulate per-teacher KL sums/counts for logging (detached).
+                            with torch.no_grad():
+                                teacher_kl_sum.index_add_(0, teacher_idx, per_sample_kl.detach())
+                                teacher_kl_count.index_add_(
+                                    0, teacher_idx, torch.ones_like(per_sample_kl)
+                                )
 
                             if self.accelerator.sync_gradients:
                                 grad_norm = self.accelerator.clip_grad_norm_(
@@ -361,16 +376,47 @@ class DiffusionOPDTrainer(BaseTrainer):
                                 )
                                 self.optimizer.step()
                                 self.optimizer.zero_grad()
-                                loss_info = reduce_loss_info(self.accelerator, loss_info)
-                                loss_info["grad_norm"] = grad_norm
-                                self.log_data(
-                                    {f"train/{k}": v for k, v in loss_info.items()},
-                                    step=self.step,
+                                self._log_distill_metrics(
+                                    teacher_kl_sum, teacher_kl_count, grad_norm
                                 )
                                 self.step += 1
-                                loss_info = defaultdict(list)
+                                teacher_kl_sum.zero_()
+                                teacher_kl_count.zero_()
 
     # =============================== Helpers ===============================
+    def _log_distill_metrics(
+        self,
+        teacher_kl_sum: torch.Tensor,
+        teacher_kl_count: torch.Tensor,
+        grad_norm: Optional[torch.Tensor],
+    ) -> None:
+        """Globally reduce per-teacher KL sums/counts and log per-teacher + overall means.
+
+        Logs one ``train/kl_div_{teacher_name}`` per teacher seen this window
+        (the KL averaged over that teacher's samples x timesteps) plus the
+        overall ``train/kl_div`` (averaged across all teachers). The reduce
+        operates on fixed ``(num_teachers,)`` tensors, identical on every rank,
+        so it is collective-safe even when teachers are unevenly distributed
+        across ranks/micro-batches.
+        """
+        # Pack sum + count into one tensor so the cross-rank reduction is a single
+        # collective (the pack-and-reduce idiom used across utils/dist.py).
+        packed = torch.stack([teacher_kl_sum, teacher_kl_count])  # (2, num_teachers)
+        packed = cast(torch.Tensor, self.accelerator.reduce(packed, reduction="sum"))
+        g_sum, g_count = packed[0], packed[1]
+
+        metrics: Dict[str, Any] = {}
+        total_count = g_count.sum()
+        if total_count > 0:
+            metrics["kl_div"] = g_sum.sum() / total_count
+        for teacher_idx, name in enumerate(self._teacher_names):
+            if g_count[teacher_idx] > 0:
+                metrics[f"kl_div_{name}"] = g_sum[teacher_idx] / g_count[teacher_idx]
+        if grad_norm is not None:
+            metrics["grad_norm"] = grad_norm
+
+        self.log_data({f"train/{k}": v for k, v in metrics.items()}, step=self.step)
+
     @staticmethod
     def _select_train_step_indices(
         num_inference_steps: int,
@@ -385,14 +431,11 @@ class DiffusionOPDTrainer(BaseTrainer):
         (distill the first 99% of steps, ``int(10*0.99)=9`` -> indices ``[0..8]``,
         skipping the near-clean tail). Deterministic and dynamics-agnostic, so it
         does NOT use the SDE-only ``scheduler.train_timesteps`` (empty under ODE),
-        and gives identical indices in ``sample()`` and ``optimize()``.
+        and gives identical indices in ``sample()`` and ``optimize()``. The band
+        comes from :func:`resolve_distill_step_band`, the same resolver
+        ``get_num_train_timesteps`` uses for the gradient-accumulation count.
         """
-        if isinstance(timestep_range, (int, float)):
-            frac_lo, frac_hi = 0.0, float(timestep_range)
-        else:
-            frac_lo, frac_hi = timestep_range
-        lo = int(num_inference_steps * frac_lo)
-        hi = max(lo + 1, int(num_inference_steps * frac_hi))
+        lo, hi = resolve_distill_step_band(num_inference_steps, timestep_range)
         return torch.arange(lo, hi, dtype=torch.long)
 
     def _teacher_index_for_sample(self, sample: BaseSample) -> int:

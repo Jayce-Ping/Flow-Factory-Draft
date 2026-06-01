@@ -107,7 +107,7 @@ train:
 
   per_device_batch_size: 8  # Batch size per GPU device
   group_size: 1  # Rollouts generated per prompt (under SDE these differ; under ODE they are identical)
-  unique_sample_num_per_epoch: 144  # Total unique prompts per epoch (48 per source * 3 sources)
+  unique_sample_num_per_epoch: 72  # Total unique prompts per epoch (24 per source * 3 sources)
   num_inner_epochs: 1  # Reuse epochs over the (fixed) on-policy trajectories
   gradient_step_per_epoch: 1  # Number of gradient updates per epoch
   gradient_accumulation_steps: auto  # Options: auto, or positive integer

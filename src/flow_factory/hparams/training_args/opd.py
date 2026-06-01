@@ -23,10 +23,32 @@ entries) via :class:`TeacherConfig.applicable_datasets`.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional, Tuple, Union
+from typing import Any, List, Literal, Optional, Tuple, Union
 
 from ..abc import ArgABC
 from ._base import TrainingArguments, _standardize_timestep_range
+
+
+def resolve_distill_step_band(
+    num_inference_steps: int,
+    timestep_range: Union[float, Tuple[float, float]],
+) -> Tuple[int, int]:
+    """Resolve ``timestep_range`` to the ``[lo, hi)`` denoising-step index band.
+
+    Single source of truth for which trajectory steps DiffusionOPD distills:
+    a bare float ``f`` means ``(0, f)``; ``(frac_lo, frac_hi)`` maps to
+    ``[int(T*frac_lo), int(T*frac_hi))`` with ``T = num_inference_steps``,
+    clamped to at least one step. Used both by
+    :meth:`DiffusionOPDTrainingArguments.get_num_train_timesteps` (gradient-
+    accumulation math) and the trainer's per-step loop, so the two never drift.
+    """
+    if isinstance(timestep_range, (int, float)):
+        frac_lo, frac_hi = 0.0, float(timestep_range)
+    else:
+        frac_lo, frac_hi = timestep_range
+    lo = int(num_inference_steps * frac_lo)
+    hi = max(lo + 1, int(num_inference_steps * frac_hi))
+    return lo, hi
 
 
 @dataclass
@@ -171,3 +193,15 @@ class DiffusionOPDTrainingArguments(TrainingArguments):
             if teacher.guidance_scale is not None
         ]
         return max(scales)
+
+    def get_num_train_timesteps(self, args: Any) -> int:
+        """Per-micro-batch backward count = number of distilled denoising steps.
+
+        The optimize loop runs one ``accelerator.backward`` per distilled step
+        (``timestep_range`` band), so the gradient-accumulation math must scale
+        by this count for ``gradient_step_per_epoch`` to hold (mirrors GRPO
+        returning ``num_sde_steps``). Without this override the base returns 1
+        and the trainer takes ``num_distill_steps``x too many optimizer steps.
+        """
+        lo, hi = resolve_distill_step_band(self.num_inference_steps, self.timestep_range)
+        return hi - lo
