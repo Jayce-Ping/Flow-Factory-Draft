@@ -464,13 +464,6 @@ def get_eval_dataloaders(
     enable_distributed = accelerator.num_processes > 1 and data_args.enable_preprocess
     preprocess_parallelism = getattr(data_args, 'preprocess_parallelism', 'local')
 
-    # Pre-compute eval preprocess kwargs (invariant across datasets)
-    base_preprocess_kwargs = None
-    if preprocess_func:
-        base_preprocess_kwargs = filter_kwargs(preprocess_func, **data_args).copy()
-        base_preprocess_kwargs.update({'is_train': False, **eval_args})
-        base_preprocess_kwargs = filter_kwargs(preprocess_func, **base_preprocess_kwargs)
-
     eval_dataloaders: Dict[str, DataLoader] = {}
 
     for ed in eval_datasets:
@@ -481,6 +474,19 @@ def get_eval_dataloaders(
             # Defensive: caller should have already filtered via the
             # `is_eval_source` property, but keep this safety net.
             continue
+
+        # Per-dataset eval preprocess kwargs: merge this dataset's eval
+        # overrides (notably `guidance_scale`) with the shared EvaluationArguments
+        # via the same `get_merged_eval_kwargs` used by `BaseTrainer.evaluate`.
+        # This keeps Stage 1 (encode_prompt) consistent with Stage 2 (inference):
+        # a dataset evaluated at guidance_scale > 1.0 must cache negative prompt
+        # embeds during preprocessing, otherwise CFG is silently disabled at eval.
+        per_preprocess_kwargs = None
+        if preprocess_func:
+            merged_eval = spec.get_merged_eval_kwargs(eval_args)
+            per_preprocess_kwargs = filter_kwargs(preprocess_func, **data_args).copy()
+            per_preprocess_kwargs.update({'is_train': False, **merged_eval})
+            per_preprocess_kwargs = filter_kwargs(preprocess_func, **per_preprocess_kwargs)
 
         # Check that the split file exists
         if not GeneralDataset.check_exists(ed.dataset_dir, spec.split):
@@ -493,7 +499,7 @@ def get_eval_dataloaders(
         # Start with filter_kwargs from data_args (same pattern as get_dataloader)
         base_kwargs = {
             "preprocess_func": preprocess_func,
-            "preprocess_kwargs": base_preprocess_kwargs,
+            "preprocess_kwargs": per_preprocess_kwargs,
             "extra_hash_strs": [
                 config.model_args.model_type,
                 config.model_args.model_name_or_path,
