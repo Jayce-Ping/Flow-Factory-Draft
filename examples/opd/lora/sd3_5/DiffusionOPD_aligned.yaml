@@ -1,7 +1,7 @@
 # DiffusionOPD reproduction (mopd): multi-task on-policy distillation on SD3.5.
 #
 # Aligned to the upstream `mopd` recipe in
-# https://github.com/ali-vilab/DiffusionOPD/blob/8797d5717d9503edc8cec0705aed5354c203e547/config/opd.py
+# https://github.com/ali-vilab/DiffusionOPD/blob/8797d5717d9503edc8cec0705aed5354c203e547/config/opd.py#L34
 # Three task-specialized teachers are distilled into one student LoRA along the
 # student's own ODE rollout trajectories.
 #

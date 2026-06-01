@@ -365,6 +365,20 @@ class Arguments(ArgABC):
                     "Each `applicable_datasets` entry must match a `data.datasets[*].name` whose `train` is enabled."
                 )
 
+        # Reverse check: every active training dataset must be claimed by at
+        # least one teacher (mirrors `_validate_every_source_has_a_reward`).
+        # The one-teacher-per-dataset (no-overlap) rule stays in
+        # DiffusionOPDTrainer; here we only require full coverage so an
+        # uncovered dataset fails at config parse, not mid-rollout.
+        covered = {ds for t in teachers for ds in t.applicable_datasets}
+        uncovered = sorted(train_names - covered)
+        if uncovered:
+            raise ValueError(
+                f"DiffusionOPD training dataset(s) {uncovered} are not distilled by any teacher. "
+                f"Each `data.datasets[*].name` with `train.enabled` must appear in exactly one "
+                f"teacher's `applicable_datasets`. Declared teachers cover: {sorted(covered)}."
+            )
+
     def _validate_dataset_routing(self) -> None:
         """Validate the unified ``data.datasets`` schema and reward routing.
 
