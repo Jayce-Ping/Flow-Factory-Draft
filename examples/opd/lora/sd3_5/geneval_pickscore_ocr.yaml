@@ -88,13 +88,13 @@ train:
   # ---- Teachers: one LoRA per dataset, distilled into the student ----
   teachers:
     - name: "teacher-geneval"  # Unique teacher id (named snapshot + log keys)
-      path: "~/checkpoints/dppo_geneval_teacher/checkpoints/checkpoint-600"  # Teacher LoRA checkpoint
+      path: "Jayce-Ping/GenEval-Teacher"  # Teacher LoRA checkpoint
       applicable_datasets: [geneval]  # Distill this teacher on geneval rollouts
     - name: "teacher-pickscore"  # Unique teacher id (named snapshot + log keys)
-      path: "~/checkpoints/dppo_pickscore_teacher/checkpoints/checkpoint-1500"  # Teacher LoRA checkpoint
+      path: "Jayce-Ping/Pickscore-Teacher"  # Teacher LoRA checkpoint
       applicable_datasets: [pickscore]  # Distill this teacher on pickscore rollouts
     - name: "teacher-ocr"  # Unique teacher id (named snapshot + log keys)
-      path: "~/checkpoints/dppo_ocr_teacher/checkpoints/checkpoint-220"  # Teacher LoRA checkpoint
+      path: "Jayce-Ping/OCR-Teacher"  # Teacher LoRA checkpoint
       applicable_datasets: [ocr]  # Distill this teacher on ocr rollouts
 
   teacher_param_device: 'cuda'  # Teacher snapshot storage: 'cuda' (fast swaps) or 'cpu' (low VRAM)
