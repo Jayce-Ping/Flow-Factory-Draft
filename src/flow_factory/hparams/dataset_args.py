@@ -44,15 +44,16 @@ Reward routing references each dataset by ``name`` via
 ``RewardArguments.applicable_datasets``.  The ``__source__`` carried on every sample
 is exactly this name.
 """
+
 from __future__ import annotations
 
 import re
-import yaml
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, List, Optional, Tuple, Union
 
-from .abc import ArgABC
+import yaml
 
+from .abc import ArgABC
 
 # Names appear in metric keys (``train/source/{name}/...``), in cache
 # fingerprints (``train_source:{name}``), and as the routing key for
@@ -86,7 +87,9 @@ class DatasetTrainSpec(ArgABC):
 
     enabled: bool = field(
         default=True,
-        metadata={"help": "Set False to keep this dataset configured but exclude it from training."},
+        metadata={
+            "help": "Set False to keep this dataset configured but exclude it from training."
+        },
     )
     split: str = field(
         default="train",
@@ -94,12 +97,16 @@ class DatasetTrainSpec(ArgABC):
     )
     weight: int = field(
         default=1,
-        metadata={"help": "Mixing weight (positive integer). Used as the LCM denominator for "
-                          "per-source batch allocation; ensures every batch comes from a single source."},
+        metadata={
+            "help": "Mixing weight (positive integer). Used as the LCM denominator for "
+            "per-source batch allocation; ensures every batch comes from a single source."
+        },
     )
     max_dataset_size: Optional[int] = field(
         default=None,
-        metadata={"help": "Cap on training samples for this source (None = inherit DataArguments.max_dataset_size)."},
+        metadata={
+            "help": "Cap on training samples for this source (None = inherit DataArguments.max_dataset_size)."
+        },
     )
 
     # ---- Resolved values written by `Arguments._align_unique_sample_num` ----
@@ -157,7 +164,9 @@ class DatasetEvalSpec(ArgABC):
 
     enabled: bool = field(
         default=True,
-        metadata={"help": "Set False to keep this dataset configured but exclude it from evaluation."},
+        metadata={
+            "help": "Set False to keep this dataset configured but exclude it from evaluation."
+        },
     )
     split: str = field(
         default="test",
@@ -169,7 +178,9 @@ class DatasetEvalSpec(ArgABC):
     )
     resolution: Optional[Union[int, Tuple[int, int], List[int]]] = field(
         default=None,
-        metadata={"help": "Override eval resolution for this dataset. None inherits shared eval.resolution."},
+        metadata={
+            "help": "Override eval resolution for this dataset. None inherits shared eval.resolution."
+        },
     )
     num_inference_steps: Optional[int] = field(
         default=None,
@@ -208,13 +219,13 @@ class DatasetEvalSpec(ArgABC):
 
         # Resolution requires special handling (expands to height/width)
         if self.resolution is not None:
-            merged['resolution'] = self.resolution
+            merged["resolution"] = self.resolution
             if isinstance(self.resolution, int):
-                merged['height'] = self.resolution
-                merged['width'] = self.resolution
+                merged["height"] = self.resolution
+                merged["width"] = self.resolution
             elif isinstance(self.resolution, (list, tuple)) and len(self.resolution) >= 2:
-                merged['height'] = self.resolution[0]
-                merged['width'] = self.resolution[1]
+                merged["height"] = self.resolution[0]
+                merged["width"] = self.resolution[1]
 
         return merged
 
@@ -266,7 +277,9 @@ class DatasetArguments(ArgABC):
 
     name: str = field(
         default="default",
-        metadata={"help": "Unique dataset name (used in metric keys, cache fingerprints, reward routing)."},
+        metadata={
+            "help": "Unique dataset name (used in metric keys, cache fingerprints, reward routing)."
+        },
     )
     dataset_dir: str = field(
         default="data",

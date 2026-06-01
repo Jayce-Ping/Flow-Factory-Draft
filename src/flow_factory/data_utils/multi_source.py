@@ -20,6 +20,7 @@ DataLoader that drives one underlying DataLoader per training source. These
 are composed by ``data_utils.loader.get_train_dataloader`` when more than one
 training source is declared.
 """
+
 from typing import Any, Dict, Iterator, List, Optional
 
 import torch
@@ -66,7 +67,9 @@ class WeightedSourceBatchScheduler:
             return
 
         g = torch.Generator()
-        g.manual_seed(hash((self._seed, self._epoch, "multi_source_schedule")) & 0xFFFF_FFFF_FFFF_FFFF)
+        g.manual_seed(
+            hash((self._seed, self._epoch, "multi_source_schedule")) & 0xFFFF_FFFF_FFFF_FFFF
+        )
         perm = torch.randperm(len(flat), generator=g).tolist()
         self._schedule = [flat[i] for i in perm]
 
@@ -141,11 +144,7 @@ class MultiSourceTrainDataLoader:
         for src in self._scheduler:
             batch = next(self._iters[src])
 
-            B = (
-                self._batch_size
-                if self._batch_size is not None
-                else self._infer_batch_size(batch)
-            )
+            B = self._batch_size if self._batch_size is not None else self._infer_batch_size(batch)
             batch = dict(batch)
             batch["__source__"] = [src] * B
             # Emit the small-int form too when the registry is configured,
