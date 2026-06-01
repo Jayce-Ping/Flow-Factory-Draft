@@ -32,7 +32,12 @@ from .abc import ArgABC
 from .data_args import DataArguments
 from .model_args import ModelArguments
 from .scheduler_args import SchedulerArguments
-from .training_args import TrainingArguments, EvaluationArguments, get_training_args_class
+from .training_args import (
+    DiffusionOPDTrainingArguments,
+    EvaluationArguments,
+    TrainingArguments,
+    get_training_args_class,
+)
 from .reward_args import RewardArguments, MultiRewardArguments
 from .log_args import LogArguments
 from ..utils.logger_utils import setup_logger
@@ -331,11 +336,16 @@ class Arguments(ArgABC):
         ``DiffusionOPDTrainer`` (not here), so a future multi-teacher/ensemble
         trainer can reuse this config unchanged.
 
-        No-op for non-OPD trainers (their ``TrainingArguments`` has no
-        ``teachers`` attribute).
+        Gated on ``isinstance(DiffusionOPDTrainingArguments)`` so it is a no-op
+        for non-OPD trainers. (A plain ``getattr(ta, "teachers", ...)`` would be
+        unsafe: ``ArgABC.__getattr__`` falls back to ``extra_kwargs``, so a stray
+        ``teachers:`` key in a non-OPD YAML would be picked up here and raise a
+        confusing error.)
         """
         ta = self.training_args
-        teachers = getattr(ta, "teachers", None)
+        if not isinstance(ta, DiffusionOPDTrainingArguments):
+            return
+        teachers = ta.teachers
         if not teachers:
             return
 
