@@ -24,8 +24,6 @@ examples/{algorithm}/{finetune_type}/{model_type}/{variant}.yaml
 ff-train examples/grpo/lora/flux1/default.yaml
 ```
 
-**DiffusionOPD (`opd`)**: multi-teacher on-policy distillation. Each config declares one LoRA `teacher` per `data.datasets` entry; teachers must share the student's LoRA architecture. See [`opd/lora/sd3_5/DiffusionOPD_aligned.yaml`](opd/lora/sd3_5/DiffusionOPD_aligned.yaml) (Hugging Face teachers, aligned to the upstream `mopd` recipe) and [`opd/lora/sd3_5/geneval_pickscore_ocr.yaml`](opd/lora/sd3_5/geneval_pickscore_ocr.yaml) (local-checkpoint teachers), plus the [Algorithm Guidance](../guidance/algorithms.md#diffusionopd-on-policy-distillation).
-
 ## Contributing
 
 We welcome community contributions! Here's what you can contribute and how:
