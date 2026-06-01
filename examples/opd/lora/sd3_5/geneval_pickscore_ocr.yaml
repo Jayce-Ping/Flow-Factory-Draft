@@ -26,14 +26,16 @@ num_processes: 8  # Number of GPU processes to launch
 main_process_port: 29500  # Port for distributed communication
 mixed_precision: "bf16"  # Options: no, fp16, bf16
 
-# Data Configuration — 3 sources, one teacher each (weighted 1:1:1)
+# Data Configuration — 3 training sources (geneval / pickscore / ocr), weighted 1:1:1.
+# Below them, three eval-only *_no-cfg aliases (same test split, guidance_scale=1.0)
+# isolate the effect of classifier-free guidance at eval time; they do not train.
 data:
   datasets:
     - name: geneval  # Unique identifier (source tag, metrics, reward + teacher routing)
       dataset_dir: "dataset/geneval"  # Folder with train.jsonl / test.jsonl
       train:  # Training participation config
         weight: 1  # Mixing weight (integer); ratio with other sources sets batch allocation
-        max_dataset_size: 1024  # Cap on number of training prompts for this source
+        max_dataset_size: null  # Cap on number of training prompts for this source
       eval:  # Eval participation (overrides shared `eval:` section below)
         num_inference_steps: 40  # Override eval inference steps for this dataset
         guidance_scale: 4.5  # Override eval guidance scale for this dataset
@@ -42,7 +44,7 @@ data:
       dataset_dir: "dataset/pickscore"  # Folder with train.jsonl / test.jsonl
       train:  # Training participation config
         weight: 1  # Mixing weight (integer); ratio with other sources sets batch allocation
-        max_dataset_size: 1024  # Cap on number of training prompts for this source
+        max_dataset_size: null  # Cap on number of training prompts for this source
       eval:  # Eval participation (overrides shared `eval:` section below)
         num_inference_steps: 40  # Override eval inference steps for this dataset
         guidance_scale: 4.5  # Override eval guidance scale for this dataset
@@ -51,10 +53,35 @@ data:
       dataset_dir: "dataset/ocr"  # Folder with train.jsonl / test.jsonl
       train:  # Training participation config
         weight: 1  # Mixing weight (integer); ratio with other sources sets batch allocation
-        max_dataset_size: 1024  # Cap on number of training prompts for this source
+        max_dataset_size: null  # Cap on number of training prompts for this source
       eval:  # Eval participation (overrides shared `eval:` section below)
         num_inference_steps: 40  # Override eval inference steps for this dataset
         guidance_scale: 4.5  # Override eval guidance scale for this dataset
+
+    # --- Eval-only no-CFG ablations (guidance_scale=1.0 vs 4.5 above) ---
+    # Same dataset_dir and test split as the matching source; train: null avoids
+    # loading train.jsonl twice. Compare W&B keys eval/{name}/... to measure CFG impact.
+
+    - name: geneval_no-cfg
+      dataset_dir: "dataset/geneval"
+      train: null
+      eval:
+        num_inference_steps: 40
+        guidance_scale: 1.0
+
+    - name: pickscore_no-cfg
+      dataset_dir: "dataset/pickscore"
+      train: null
+      eval:
+        num_inference_steps: 40
+        guidance_scale: 1.0
+
+    - name: ocr_no-cfg
+      dataset_dir: "dataset/ocr"
+      train: null
+      eval:
+        num_inference_steps: 40
+        guidance_scale: 1.0
 
   preprocessing_batch_size: 8  # Batch size for preprocessing
   dataloader_num_workers: 16  # Number of workers for DataLoader
@@ -174,18 +201,18 @@ eval_rewards:
     batch_size: 32  # Larger batch for eval (no gradient, more memory available)
     device: "cuda"  # Device to run reward model on
     dtype: float32  # Precision for reward model inference
-    applicable_datasets: ["geneval"]  # Only scores geneval eval samples
+    applicable_datasets: ["geneval", "geneval_no-cfg"]  # CFG and no-CFG eval tracks
 
   - name: "ocr"  # Eval reward identifier
     reward_model: "OCR"  # Reward model class (from registry)
     batch_size: 32  # Larger batch for eval (no gradient, more memory available)
     device: "cuda"  # Device to run reward model on
     dtype: bfloat16  # Precision for reward model inference
-    applicable_datasets: ["ocr"]  # Only scores ocr eval samples
+    applicable_datasets: ["ocr", "ocr_no-cfg"]
 
   - name: "pick_score"  # Eval reward identifier
     reward_model: "PickScore"  # Reward model class (from registry)
     batch_size: 32  # Larger batch for eval (no gradient, more memory available)
     device: "cuda"  # Device to run reward model on
     dtype: bfloat16  # Precision for reward model inference
-    # applicable_datasets omitted -> applies to all eval sources (geneval, pickscore, ocr)
+    # applicable_datasets omitted -> all eval sources (incl. *_no-cfg aliases)
