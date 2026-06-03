@@ -50,10 +50,18 @@ def _json_safe(obj: Any) -> Any:
     """Recursively coerce a config dict into a JSON-serializable form.
 
     Defense-in-depth for ``Arguments.to_dict`` export sinks (wandb / SwanLab
-    config, ``json.dumps``). ``set`` / ``frozenset`` (e.g. user values placed in
-    a reward's ``extra_kwargs``) are converted to a sorted list; other values
-    pass through unchanged. Internal ``_``-prefixed dataclass fields are already
-    dropped by :meth:`ArgABC.to_dict`, so this is purely a safety net.
+    config, ``json.dumps``):
+
+    - ``dict``: recurse into values.
+    - ``list`` / ``tuple``: recurse into elements; both normalize to ``list``
+      (so a ``set`` nested inside a tuple is still coerced).
+    - ``set`` / ``frozenset`` (e.g. user values placed in a reward's
+      ``extra_kwargs``): convert to a ``list`` sorted by ``repr`` for
+      deterministic output.
+    - any other value: returned unchanged.
+
+    Internal ``_``-prefixed dataclass fields are already dropped by
+    :meth:`ArgABC.to_dict`, so this is purely a safety net.
     """
     if isinstance(obj, dict):
         return {k: _json_safe(v) for k, v in obj.items()}
