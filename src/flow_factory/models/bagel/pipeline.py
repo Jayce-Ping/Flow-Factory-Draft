@@ -18,12 +18,13 @@ Component Mapping:
 """
 from __future__ import annotations
 
-import os
 import logging
-from typing import Optional, Any
+import os
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
+
 from .modeling.bagel import Bagel
 
 logger = logging.getLogger(__name__)
@@ -48,9 +49,15 @@ def _resolve_model_path(model_path: str, **kwargs) -> str:
 
     # Filter kwargs that snapshot_download accepts
     _SNAPSHOT_KEYS = {
-        "revision", "cache_dir", "token", "local_dir",
-        "allow_patterns", "ignore_patterns",
-        "force_download", "resume_download", "local_files_only",
+        "revision",
+        "cache_dir",
+        "token",
+        "local_dir",
+        "allow_patterns",
+        "ignore_patterns",
+        "force_download",
+        "resume_download",
+        "local_files_only",
     }
     dl_kwargs = {k: v for k, v in kwargs.items() if k in _SNAPSHOT_KEYS}
 
@@ -102,6 +109,14 @@ class BagelPseudoPipeline:
         except StopIteration:
             return torch.bfloat16
 
+    @property
+    def components(self) -> Dict[str, nn.Module]:
+        """Return default modules managed like DiffusionPipeline components."""
+        return {
+            "bagel": self.bagel,
+            "vae": self.vae,
+        }
+
     @classmethod
     def from_pretrained(
         cls,
@@ -140,33 +155,31 @@ class BagelPseudoPipeline:
                       keys (``layer_module``, ``latent_patch_size``, …)
                       are used directly.
         """
-        from .modeling.bagel import (
-            BagelConfig, Bagel,
-            Qwen2Config, Qwen2ForCausalLM,
-            SiglipVisionConfig, SiglipVisionModel,
-        )
-        from .modeling.autoencoder import load_ae
         from safetensors.torch import load_file
+
+        from .modeling.autoencoder import load_ae
+        from .modeling.bagel import (
+            Bagel,
+            BagelConfig,
+            Qwen2Config,
+            Qwen2ForCausalLM,
+            SiglipVisionConfig,
+            SiglipVisionModel,
+        )
 
         # ── Resolve to local directory (download if needed) ──────────
         model_path = _resolve_model_path(model_path, **kwargs)
 
         # ---- LLM Config ----
-        llm_config = Qwen2Config.from_json_file(
-            os.path.join(model_path, "llm_config.json")
-        )
+        llm_config = Qwen2Config.from_json_file(os.path.join(model_path, "llm_config.json"))
         llm_config.qk_norm = True
         llm_config.tie_word_embeddings = False
         llm_config.layer_module = kwargs.get("layer_module", "Qwen2MoTDecoderLayer")
 
         # ---- ViT Config ----
-        vit_config = SiglipVisionConfig.from_json_file(
-            os.path.join(model_path, "vit_config.json")
-        )
+        vit_config = SiglipVisionConfig.from_json_file(os.path.join(model_path, "vit_config.json"))
         vit_config.rope = kwargs.get("vit_rope", False)
-        vit_config.num_hidden_layers = (
-            vit_config.num_hidden_layers - 1
-        )  # Default for inference
+        vit_config.num_hidden_layers = vit_config.num_hidden_layers - 1  # Default for inference
 
         # ---- VAE ----
         ae_path = vae_path or os.path.join(model_path, "ae.safetensors")
