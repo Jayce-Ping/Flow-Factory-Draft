@@ -169,7 +169,7 @@ class BaseAdapter(ABC):
         """Hook for additional initialization after main trainer's `accelerator.prepare`."""
         # Full training-state resume must happen here: accelerator.prepare() has now
         # registered the trainable modules and optimizer, so accelerator.load_state()
-        # can actually restore model + optimizer + scheduler + RNG.
+        # can actually restore model + optimizer + RNG (and any other prepared objects).
         if self.model_args.resume_path and self.model_args.resume_type == 'state':
             self.load_checkpoint(self.model_args.resume_path, resume_type='state')
         self._init_ema()
@@ -1750,7 +1750,7 @@ class BaseAdapter(ABC):
             resume_type: Type of checkpoint to load.
                 - 'lora': Load LoRA adapters only
                 - 'full': Load full model weights
-                - 'state': Load full training state (model + optimizer + scheduler + RNG)
+                - 'state': Load full training state (model + optimizer + RNG)
                 - None: Auto-detect based on checkpoint directory contents
         """
         path = self._resolve_checkpoint_path(path)
