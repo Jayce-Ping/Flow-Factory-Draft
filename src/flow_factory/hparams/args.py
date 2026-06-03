@@ -46,6 +46,24 @@ from ..utils.dist import get_world_size
 logger = setup_logger(__name__, rank_zero_only=True)
 
 
+def _json_safe(obj: Any) -> Any:
+    """Recursively coerce a config dict into a JSON-serializable form.
+
+    Defense-in-depth for ``Arguments.to_dict`` export sinks (wandb / SwanLab
+    config, ``json.dumps``). ``set`` / ``frozenset`` (e.g. user values placed in
+    a reward's ``extra_kwargs``) are converted to a sorted list; other values
+    pass through unchanged. Internal ``_``-prefixed dataclass fields are already
+    dropped by :meth:`ArgABC.to_dict`, so this is purely a safety net.
+    """
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, (set, frozenset)):
+        return sorted((_json_safe(v) for v in obj), key=repr)
+    return obj
+
+
 @dataclass
 class Arguments(ArgABC):
     """
@@ -917,6 +935,9 @@ class Arguments(ArgABC):
         result = {}
 
         for f in fields(self):
+            # Internal/runtime fields (e.g. distributed cache) never export.
+            if f.name.startswith("_"):
+                continue
             value = getattr(self, f.name)
             if value is None:
                 continue
@@ -932,7 +953,10 @@ class Arguments(ArgABC):
 
         extras = result.pop("extra_kwargs", {})
         result.update(extras)
-        return result
+        # Final JSON-safe pass: coerce any nested set/frozenset (e.g. from
+        # extra_kwargs) so the exported config survives json.dumps and any
+        # logging backend that serializes it.
+        return _json_safe(result)
 
     @classmethod
     def from_dict(cls, args_dict: dict[str, Any]) -> Arguments:
