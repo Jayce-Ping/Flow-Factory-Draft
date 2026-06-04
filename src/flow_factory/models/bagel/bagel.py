@@ -337,7 +337,11 @@ class BagelAdapter(BaseAdapter):
         return {"condition_images": processed}
 
     def encode_video(self, videos: Any) -> None:
-        """Bagel does not support video input; raise NotImplementedError."""
+        """No-op: Bagel consumes no video modality, so encoding returns None.
+
+        Returning ``None`` signals ``preprocess_func`` to skip video
+        integration (see constraint #12).
+        """
         return None
 
     # ======================== Decoding ========================
@@ -582,13 +586,13 @@ class BagelAdapter(BaseAdapter):
                 "packed_text_indexes": packed_text_indexes
             }
         output = self.transformer(
-            packed_query_sequence=packed_sequence, # packed_sequence.shape=[1026, 3584]
-            query_lens=packed_seqlens,   # packed_seqlens=tensor([1026])
-            packed_query_position_ids=packed_position_ids,  # packed_position_ids.shape=[1026]
-            packed_query_indexes=packed_indexes,    # packed_indexes.shape=[1026]
-            past_key_values=past_key_values,     
-            key_values_lens=key_values_lens,    # key_values_lens=tensor([9])
-            packed_key_value_indexes=packed_key_value_indexes,   # packed_key_value_indexes.shape=[9]
+            packed_query_sequence=packed_sequence,
+            query_lens=packed_seqlens,
+            packed_query_position_ids=packed_position_ids,
+            packed_query_indexes=packed_indexes,
+            past_key_values=past_key_values,
+            key_values_lens=key_values_lens,
+            packed_key_value_indexes=packed_key_value_indexes,
             update_past_key_values=False,
             is_causal=False,
             **extra_inputs,
@@ -599,7 +603,7 @@ class BagelAdapter(BaseAdapter):
             cfg_text_output = self.transformer(
                 packed_query_sequence=packed_sequence,
                 query_lens=packed_seqlens,
-                packed_query_position_ids=cfg_text_packed_position_ids,   # cfg_text_packed_position_ids.shape=[1026]
+                packed_query_position_ids=cfg_text_packed_position_ids,
                 packed_query_indexes=cfg_text_packed_query_indexes,
                 past_key_values=cfg_text_past_key_values,
                 key_values_lens=cfg_text_key_values_lens,
@@ -653,7 +657,7 @@ class BagelAdapter(BaseAdapter):
                     norm_v_t = torch.norm(v_t, dim=-1, keepdim=True)
                     norm_v_t_ = torch.norm(v_t_, dim=-1, keepdim=True)
                 else:
-                    raise NotImplementedError(f"{cfg_renorm_type} is not suppoprted")
+                    raise NotImplementedError(f"{cfg_renorm_type} is not supported")
                 scale = (norm_v_t / (norm_v_t_ + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
                 v_t = v_t_ * scale
         else:
