@@ -73,11 +73,6 @@ nvidia = [
     "nvidia-ml-py",
 ]
 
-bagel = [
-    "flash-attn>=2.5.8",
-    "opencv-python",
-]
-
 geneval = [
     "mmcv>=2.0.0,<2.2.0",
     "mmengine",
