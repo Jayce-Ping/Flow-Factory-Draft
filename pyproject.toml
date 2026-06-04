@@ -30,12 +30,12 @@ dependencies = [
     "torchaudio>=2.4.0",
     
     # Hugging Face Ecosystem
-    "transformers==4.49.0", # 4.49.0 for bagel
+    "transformers>=4.57.1",  # Compatible with both v4.x and v5.x
     "diffusers>=0.36.0",
     "accelerate>=1.11.0",
     "peft>=0.17.0",
     "datasets>=3.3.2",
-    "tokenizers>=0.21.4",
+    "tokenizers>=0.22.1",
     "huggingface-hub>=0.35.3",
 
     # Critical for T5/Flux
@@ -51,10 +51,6 @@ dependencies = [
     "pyyaml>=6.0",
     "requests>=2.31.0",
     "tqdm",
-
-    # Bagel requires flash-attn
-    "flash-attn>=2.5.8",
-    "opencv-python"
 ]
 
 [project.optional-dependencies]
@@ -75,6 +71,11 @@ swanlab = [ "swanlab" ]
 nvidia = [
     "xformers>=0.0.27",
     "nvidia-ml-py",
+]
+
+bagel = [
+    "flash-attn>=2.5.8",
+    "opencv-python",
 ]
 
 geneval = [

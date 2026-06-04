@@ -25,6 +25,7 @@ pyproject.toml
 │   ├── wandb           Weights & Biases tracking
 │   ├── swanlab         SwanLab tracking
 │   ├── nvidia          xformers, nvidia-ml-py
+│   ├── bagel           flash-attn, opencv-python
 │   └── all             deepspeed + quantization
 └── [tool.*]            black, isort config
 ```
@@ -54,6 +55,9 @@ pyproject.toml
 
 ### transformers
 - Used for text encoders (T5, CLIP). Flow-Factory does not patch transformers internals — standard HuggingFace loading is used.
+
+### bagel extra
+- Bagel remains a registered model adapter, but its heavyweight runtime packages are optional. Install with `pip install -e ".[bagel]"` before using `model_type: "bagel"`.
 
 ### accelerate
 - Primary distributed backend. `accelerator.prepare()` is used for trainable modules and optimizer only (constraint #9).
