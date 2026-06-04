@@ -29,13 +29,26 @@ Determine your algorithm's characteristics:
 
 ### Step 1 — Define Algorithm-Specific Arguments
 
-Add a new `TrainingArguments` subclass in `src/flow_factory/hparams/training_args.py`:
+Create a new file `src/flow_factory/hparams/training_args/my_algo.py`:
 
 ```python
+from __future__ import annotations
+from dataclasses import dataclass, field
+
+from ._base import TrainingArguments
+
+
+@dataclass
 class MyAlgoTrainingArguments(TrainingArguments):
     """Training arguments specific to MyAlgo."""
-    my_specific_param: float = 0.1
-    another_param: int = 10
+    my_specific_param: float = field(
+        default=0.1,
+        metadata={"help": "Description of param."},
+    )
+    another_param: int = field(
+        default=10,
+        metadata={"help": "Description of param."},
+    )
 ```
 
 If the algorithm uses a different CFG `guidance_scale` at optimize time than at sampling/rollout time (e.g., `kl_cfg` for a reference-model branch), override `get_preprocess_guidance_scale()` so the data preprocessing stage encodes negative prompts:
@@ -50,17 +63,31 @@ See `topics/adapter_conventions.md` "Classifier-Free Guidance (CFG) Convention" 
 
 ### Step 2 — Register in Argument Resolver
 
-Update `get_training_args_class()` in `hparams/training_args.py`:
+Update three files in `src/flow_factory/hparams/training_args/`:
+
+**a)** Add import + registry entry in `_registry.py`:
 
 ```python
-def get_training_args_class(trainer_type: str):
-    mapping = {
-        'grpo': GRPOTrainingArguments,
-        'nft': NFTTrainingArguments,
-        'awm': AWMTrainingArguments,
-        'my_algo': MyAlgoTrainingArguments,  # Add this
-    }
-    return mapping.get(trainer_type, TrainingArguments)
+from .my_algo import MyAlgoTrainingArguments
+
+_TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
+    ...
+    'my_algo': MyAlgoTrainingArguments,  # Add this
+}
+```
+
+**b)** Add re-export in `__init__.py`:
+
+```python
+from .my_algo import MyAlgoTrainingArguments
+# Also add to __all__
+```
+
+**c)** Add re-export in `src/flow_factory/hparams/__init__.py`:
+
+```python
+from .training_args import MyAlgoTrainingArguments
+# Also add to __all__
 ```
 
 ## Phase 3: Trainer Implementation
@@ -179,7 +206,7 @@ rewards:
 ## Common Pitfalls
 
 1. **Not subclassing `TrainingArguments`** — algorithm-specific params won't be parsed from YAML
-2. **Forgetting `get_training_args_class` update** — falls back to base `TrainingArguments`, losing custom params
+2. **Forgetting `_registry.py` + `__init__.py` updates** — falls back to base `TrainingArguments`, losing custom params
 3. **Using ODE with coupled paradigm** — no log-probabilities available, silent incorrect gradients
 4. **Not calling `self.should_continue_training()`** — infinite loop if `max_epochs` is set
 5. **Duplicating `_initialization()` logic** — already called in `BaseTrainer.__init__`; don't re-prepare modules

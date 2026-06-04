@@ -477,7 +477,13 @@ class GeneralDataset(Dataset):
 
         # 7. Prepare final results
         batch_dict = {**batch, **final_res}
-        # Add the rest info to `metadata` key, dict[list] -> list[dict]
+        # Pack non-preprocess fields into `metadata` column (dict[list] -> list[dict]).
+        # At sample time, BaseTrainer._inject_batch_metadata stores each per-sample
+        # dict as a single JSON string under `sample.extra_kwargs['metadata']`.
+        # Reward models that need metadata fields call `json.loads(sample.metadata)`
+        # to access them (see GenEvalRewardModel for a full example).
+        # Complex values (nested lists/dicts) in the source JSONL must already be
+        # stored as JSON strings for Arrow compatibility.
         batch_dict['metadata'] = [
             {k: v[idx] for k,v in batch.items() if k not in PREPROCESS_KEYS}
             for idx in range(len(batch['prompt']))

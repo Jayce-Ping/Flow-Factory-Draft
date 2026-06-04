@@ -99,6 +99,10 @@ ff-train multinode_examples/train.yaml \
 
 ## Notes
 
+- The training config is **reconciled at runtime** with actual distributed metadata
+  (`num_processes`, ranks, `main_process_port`, `num_machines`, etc.) from Accelerate
+  and cluster environment variables. W&B / SwanLab / TensorBoard run configs therefore
+  reflect the true runtime state, not only the training YAML snapshot.
 - The YAML `num_processes` field acts as a **fallback** only. When env vars are detected, the actual
   process count is computed dynamically as `num_nodes * gpus_per_node`.
 - If your cluster scheduler uses non-standard env var names, map them manually before launching:

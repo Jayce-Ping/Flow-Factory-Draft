@@ -38,6 +38,7 @@ from diffusers.schedulers.scheduling_utils import SchedulerMixin
 from peft import get_peft_model, LoraConfig, PeftModel
 
 from huggingface_hub import split_torch_state_dict_into_shards
+from huggingface_hub.errors import RepositoryNotFoundError, HfHubHTTPError
 from accelerate import Accelerator, DistributedType
 from accelerate.state import PartialState
 from accelerate.utils.modeling import (
@@ -58,6 +59,9 @@ from ..utils.checkpoint import (
     mapping_lora_state_dict,
     infer_lora_config,
     infer_target_modules,
+    parse_hf_checkpoint_path,
+    download_hf_checkpoint,
+    HF_PATH_PREFIX,
 )
 from ..samples import BaseSample
 from ..ema import EMAModuleWrapper
@@ -125,12 +129,19 @@ class BaseAdapter(ABC):
         # Cache target module mapping
         self.target_module_map = self._init_target_module_map()
 
-        # Load checkpoint
-        if self.model_args.resume_path:
+        # Load checkpoint.
+        # 'lora'/'full' load into the unwrapped pipeline modules here (before prepare()).
+        # 'state' is deferred to post_init(): accelerator.load_state() only restores into
+        # modules/optimizer registered by accelerator.prepare(), which the trainer runs later.
+        if self.model_args.resume_path and self.model_args.resume_type != 'state':
             self.load_checkpoint(
                 self.model_args.resume_path,
                 resume_type=self.model_args.resume_type
             )
+
+        # Merge LoRA adapters into base model when transitioning to full fine-tuning
+        if self.model_args.resume_path and self.model_args.finetune_type != 'lora':
+            self._merge_lora_if_needed()
 
         # Freeze non-trainable components
         self._freeze_components()
@@ -156,6 +167,11 @@ class BaseAdapter(ABC):
     # ================================== Post Init =================================
     def post_init(self):
         """Hook for additional initialization after main trainer's `accelerator.prepare`."""
+        # Full training-state resume must happen here: accelerator.prepare() has now
+        # registered the trainable modules and optimizer, so accelerator.load_state()
+        # can actually restore model + optimizer + RNG (and any other prepared objects).
+        if self.model_args.resume_path and self.model_args.resume_type == 'state':
+            self.load_checkpoint(self.model_args.resume_path, resume_type='state')
         self._init_ema()
         self._init_ref_parameters()
 
@@ -1451,6 +1467,74 @@ class BaseAdapter(ABC):
             logger.info(f"Checkpoint saved successfully to {save_directory}")
 
     # -------------------------------------------- Load -------------------------------------------
+    def _resolve_checkpoint_path(self, path: str) -> str:
+        """
+        Resolve `path` to a local directory, downloading from Hugging Face Hub when needed.
+
+        Resolution order:
+            1. If `path` starts with ``hf://``, strip the prefix and force HF download
+               (lets users override a colliding local directory).
+            2. Otherwise, if `path` exists locally, return it as-is.
+            3. Otherwise, parse as ``owner/repo[/subfolder][@revision]`` and download
+               via Hugging Face Hub.
+
+        Multi-node-safe: all ranks call ``snapshot_download`` directly. Hugging
+        Face Hub's per-blob ``WeakFileLock`` serializes concurrent calls within
+        each filesystem domain (cross-node on POSIX-locking shared FS, per-node
+        on non-shared FS), so exactly one rank per filesystem domain actually
+        transfers bytes. Un-gated (rather than ``is_local_main_process`` plus a
+        barrier) so a failed download raises uniformly on every affected rank
+        instead of leaving siblings deadlocked at a barrier the failing rank
+        never reaches. Residual hazard: a rare single-rank transient failure
+        (e.g. one node's network blip) can produce asymmetric progress, in
+        which case the surviving ranks will eventually trip the NCCL watchdog
+        on the final barrier below.
+
+        Args:
+            path: Local filesystem path or HF spec (with or without ``hf://`` prefix).
+
+        Returns:
+            Absolute local directory path ready for the existing checkpoint loaders.
+
+        Raises:
+            FileNotFoundError: When the spec is neither a local path nor a reachable HF repo.
+        """
+        # Normalize leading ``~`` for local-path inputs; no-op for HF specs since
+        # ``expanduser`` only acts on a leading ``~``.
+        path = os.path.expanduser(path)
+        force_hf = path.startswith(HF_PATH_PREFIX)
+
+        # Local path wins unless an explicit ``hf://`` prefix forces remote.
+        if not force_hf and os.path.exists(path):
+            return path
+
+        # ``parse_hf_checkpoint_path`` handles the ``hf://`` prefix internally.
+        repo_id, subfolder, revision = parse_hf_checkpoint_path(path)
+
+        try:
+            local_path = download_hf_checkpoint(repo_id, subfolder, revision)
+        except (RepositoryNotFoundError, HfHubHTTPError) as e:
+            raise FileNotFoundError(
+                f"Checkpoint {path!r} not found locally and could not be fetched "
+                f"from Hugging Face Hub (repo={repo_id!r}, subfolder={subfolder!r}, "
+                f"revision={revision!r}). For private repos, ensure HF_TOKEN is set "
+                f"on ALL nodes."
+            ) from e
+
+        # Sync after download so downstream loaders enter the lockstep dispatch
+        # together. On symmetric failure every rank raises above before this
+        # barrier is reached, so no deadlock; the residual asymmetric-failure
+        # case is documented in the docstring.
+        self.accelerator.wait_for_everyone()
+
+        if self.accelerator.is_local_main_process:
+            logger.info(
+                f"[local rank 0 / global rank {self.accelerator.process_index}] "
+                f"resolved checkpoint '{path}' -> {local_path}"
+            )
+
+        return local_path
+
     @staticmethod
     def load_sharded_checkpoint(checkpoint_dir: str, index_file: str) -> Dict[str, torch.Tensor]:
         """Load sharded safetensors checkpoint."""
@@ -1628,6 +1712,29 @@ class BaseAdapter(ABC):
         if self.accelerator.is_main_process:
             logger.info("Training state loaded successfully.")
 
+    def _detect_checkpoint_type(self, path: str) -> Literal['lora', 'full']:
+        """
+        Auto-detect checkpoint format by inspecting directory contents.
+
+        Checks whether the checkpoint directory (or component subdirectories)
+        contains LoRA adapter files (adapter_config.json). Falls back to 'full'
+        if no LoRA signature files are found.
+        """
+        paths_to_check = (
+            [os.path.join(path, comp_name) for comp_name in self.model_args.target_components]
+            if len(self.model_args.target_components) > 1
+            else [path]
+        )
+        for check_path in paths_to_check:
+            if os.path.exists(os.path.join(check_path, LORA_ADAPTER_CONFIG_NAME)):
+                if self.accelerator.is_main_process:
+                    logger.info(f"Auto-detected LoRA checkpoint at {check_path}")
+                return 'lora'
+
+        if self.accelerator.is_main_process:
+            logger.info(f"Auto-detected full model checkpoint at {path}")
+        return 'full'
+
     def load_checkpoint(
         self,
         path: str,
@@ -1636,25 +1743,21 @@ class BaseAdapter(ABC):
     ) -> None:
         """
         Load checkpoint for target components.
-        
+
         Args:
-            path: Checkpoint directory path
-            model_only: If True, load only model weights. If False, load full training state
-                        (model, optimizer, scheduler, RNG states) for resuming training.
+            path: Checkpoint directory path.
             strict: Whether to strictly enforce state_dict key matching (only for full model).
             resume_type: Type of checkpoint to load.
                 - 'lora': Load LoRA adapters only
-                - 'full': Load full model weights  
-                - 'state': Load full training state (model + optimizer + scheduler + RNG)
-                - None: Auto-detect based on finetune_type
+                - 'full': Load full model weights
+                - 'state': Load full training state (model + optimizer + RNG)
+                - None: Auto-detect based on checkpoint directory contents
         """
-        path = os.path.expanduser(path)
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Checkpoint path not found: {path}")
-        
+        path = self._resolve_checkpoint_path(path)
+
         # Auto-detect if not specified
         if resume_type is None:
-            resume_type = self.model_args.finetune_type  # 'lora' or 'full'
+            resume_type = self._detect_checkpoint_type(path)
         
         if resume_type == 'state':
             self._load_training_state(path)
@@ -1669,6 +1772,28 @@ class BaseAdapter(ABC):
         
         if self.accelerator.is_main_process:
             logger.info(f"Checkpoint loaded successfully from {path} (type={resume_type})")
+
+    def _merge_lora_if_needed(self) -> None:
+        """
+        Merge LoRA adapters into base model weights when transitioning from
+        LoRA checkpoint to full fine-tuning.
+
+        Ensures the model is a plain nn.Module (not PeftModel) before entering
+        the full training pipeline. The LoRA weights are permanently fused into
+        the base model via merge_and_unload().
+        """
+        for comp_name in self.model_args.target_components:
+            component = self.get_component(comp_name)
+            unwrapped = self.accelerator.unwrap_model(component)
+
+            if isinstance(unwrapped, PeftModel):
+                merged = unwrapped.merge_and_unload()
+                self.set_component(comp_name, merged)
+                if hasattr(self.pipeline, comp_name):
+                    setattr(self.pipeline, comp_name, merged)
+
+                if self.accelerator.is_main_process:
+                    logger.info(f"Merged LoRA adapter into base model for {comp_name}")
 
     # ============================== Freezing Components ==============================
     def _freeze_text_encoders(self):

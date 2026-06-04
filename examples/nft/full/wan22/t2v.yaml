@@ -11,12 +11,17 @@ mixed_precision: "bf16"  # Options: no, fp16, bf16
 
 # Data Configuration
 data:
-  dataset_dir: "dataset/pickscore"  # Path to dataset folder
+  datasets:
+    - name: default  # Unique identifier (used in metrics, caching, reward routing)
+      dataset_dir: "dataset/pickscore"  # Folder with train.jsonl / test.jsonl
+      train:  # Training participation config
+        weight: 1  # Mixing weight (integer); ratio with other sources determines batch allocation
+        max_dataset_size: 1000  # Cap on number of training samples for this source
+      eval: {}  # Eval participation (inherits shared `eval:` section settings)
   preprocessing_batch_size: 32  # Batch size for preprocessing
   dataloader_num_workers: 16  # Number of workers for DataLoader
   force_reprocess: true  # Force reprocessing of the dataset
   cache_dir: "~/.cache/flow_factory/datasets" # Cache directory for preprocessed datasets
-  max_dataset_size: 1000  # Limit the maximum number of samples in the dataset
   sampler_type: "auto"  # Options: auto, distributed_k_repeat, group_contiguous
 
 # Model Configuration
@@ -26,7 +31,7 @@ model:
   target_modules: "default"
   model_name_or_path: "Wan-AI/Wan2.2-T2V-A14B-Diffusers"  # Wan-AI/Wan2.1-T2V-14B-Diffusers / Wan-AI/Wan2.2-T2V-A14B-Diffusers
   model_type: "wan2_t2v"  # wan2_t2v, wan2_i2v, wan2_v2v
-  resume_path: null # Path to load previous checkpoint/lora adapter
+  resume_path: null # Local path or HF repo id (e.g. 'owner/repo[/subdir][@rev]') for previous checkpoint/lora adapter
   resume_type: null # Options: lora, full, state. Null to auto-detect based on `finetune_type`
 
 log:
@@ -71,8 +76,8 @@ train:
   resolution: [384, 720]  # Can be int or [height, width]
   num_frames: 1 # Training frames
   num_inference_steps: 12  # Number of timesteps
-  guidance_scale: 4.0  # Guidance scale for sampling
-  guidance_scale_2: 3.0  # Guidance scale for sampling
+  guidance_scale: 1.0  # Guidance scale for sampling
+  guidance_scale_2: 1.0  # Guidance scale for sampling
 
   # Batch and sampling
   per_device_batch_size: 1  # Batch size per device
@@ -104,7 +109,7 @@ eval:
   resolution: 480  # Evaluation resolution
   num_frames: 13 # Evaluation frames
   per_device_batch_size: 1  # Eval batch size
-  guidance_scale: 5.0  # Guidance scale for sampling
+  guidance_scale: 1.0  # Guidance scale for sampling
   num_inference_steps: 20  # Number of eval timesteps
   eval_freq: 20  # Eval frequency in epochs (0 to disable)
   seed: 42  # Eval seed (defaults to training seed)

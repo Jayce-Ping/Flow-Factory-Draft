@@ -33,6 +33,8 @@ _TRAINER_REGISTRY: Dict[str, str] = {
     'awm': 'flow_factory.trainers.awm.AWMTrainer',
     'dgpo': 'flow_factory.trainers.dgpo.DGPOTrainer',
     'dpo': 'flow_factory.trainers.dpo.DPOTrainer',
+    'crd': 'flow_factory.trainers.crd.CRDTrainer',
+    'diffusion-opd': 'flow_factory.trainers.opd.trainer.DiffusionOPDTrainer',
 }
 
 

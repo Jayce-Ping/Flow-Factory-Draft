@@ -14,9 +14,10 @@
 
 # src/flow_factory/hparams/data_args.py
 import yaml
-from dataclasses import asdict, dataclass, field
-from typing import Any, Literal, Optional, Tuple, Union, List, Iterable
+from dataclasses import dataclass, field
+from typing import Any, Literal, Optional, List
 from .abc import ArgABC
+from .dataset_args import DatasetArguments
 
 
 @dataclass
@@ -97,8 +98,84 @@ class DataArguments(ArgABC):
         },
     )
 
+    datasets: Optional[List[DatasetArguments]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Unified list of dataset folders. Each entry opts into "
+                "training (`train:` sub-block) and/or evaluation (`eval:` sub-block); "
+                "shared `image_dir` / `video_dir` / `audio_dir` apply to both splits. "
+                "When set, the legacy `dataset_dir` is ignored for any split that has a "
+                "matching dataset entry. See `DatasetArguments` for the per-entry schema."
+            )
+        },
+    )
+
     def __post_init__(self):
         self.dataset = self.dataset_dir
+
+        # Coerce list-of-dict -> list-of-DatasetArguments
+        # (`ArgABC.from_dict` does NOT recurse into nested list-of-ArgABC fields).
+        # Idempotent: re-running on already-coerced entries is a no-op.
+        if self.datasets is not None:
+            coerced: List[DatasetArguments] = []
+            for item in self.datasets:
+                if isinstance(item, DatasetArguments):
+                    coerced.append(item)
+                elif isinstance(item, dict):
+                    coerced.append(DatasetArguments.from_dict(item))
+                else:
+                    raise TypeError(
+                        f"data.datasets entry must be dict or DatasetArguments, "
+                        f"got {type(item).__name__}."
+                    )
+            # Treat empty list like None so downstream `if data_args.datasets:` works.
+            self.datasets = coerced or None
+
+    # ------------------------------------------------------------------
+    # Per-split convenience accessors (filter `datasets` by participation).
+    # Trainers and the data-loader read these instead of branching on the
+    # nested `train:` / `eval:` blocks themselves.
+    # ------------------------------------------------------------------
+
+    @property
+    def training_datasets(self) -> List[DatasetArguments]:
+        """Datasets that opt into training (have `train: enabled`)."""
+        return [d for d in (self.datasets or []) if d.is_training_source]
+
+    @property
+    def eval_datasets(self) -> List[DatasetArguments]:
+        """Datasets that opt into evaluation (have `eval: enabled`)."""
+        return [d for d in (self.datasets or []) if d.is_eval_source]
+
+    # ------------------------------------------------------------------
+    # Source-id registry (populated by Arguments._assign_source_ids;
+    # public for trainers, log builders, and reward routing).
+    # ------------------------------------------------------------------
+
+    @property
+    def source_id_to_name(self) -> List[str]:
+        """Stable mapping ``source_id (int) -> source name (str)``.
+
+        Established once in :meth:`Arguments._assign_source_ids` after
+        dataset canonicalization; identical on every rank because YAML
+        parsing is deterministic and every rank receives the same
+        config dict. Returns ``[]`` in legacy single-source mode (no
+        ``data.datasets``) — consumers should treat the empty list as
+        "no source-id space defined" and fall back to legacy behavior.
+        """
+        if self.datasets is None:
+            return []
+        return [d.name for d in self.datasets]
+
+    @property
+    def source_name_to_id(self) -> dict[str, int]:
+        """Inverse mapping, cached after first access."""
+        cached = getattr(self, '_source_name_to_id_cache', None)
+        if cached is None:
+            cached = {n: i for i, n in enumerate(self.source_id_to_name)}
+            object.__setattr__(self, '_source_name_to_id_cache', cached)
+        return cached
 
     def to_dict(self) -> dict[str, Any]:
         return super().to_dict()

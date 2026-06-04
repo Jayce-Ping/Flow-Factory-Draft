@@ -16,16 +16,18 @@
 import json
 import os
 import shutil
-from typing import Literal, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
 
 from ..data_utils.dataset import PreprocessCallable
 from ..hparams import Arguments
+from ..hparams.dataset_args import DatasetArguments
 from ..utils.base import filter_kwargs
 from ..utils.logger_utils import setup_logger
 from .dataset import GeneralDataset
+from .multi_source import MultiSourceTrainDataLoader, WeightedSourceBatchScheduler
 from .sampler_loader import get_data_sampler
 
 logger = setup_logger(__name__, rank_zero_only=False)
@@ -198,109 +200,337 @@ def _create_or_load_dataset(
     return GeneralDataset.load_merged(merged_cache_path)
 
 
-def get_dataloader(
+def get_train_dataloader(
     config: Arguments,
     accelerator: Accelerator,
     preprocess_func: Optional[PreprocessCallable] = None,
     **kwargs,
-) -> Tuple[DataLoader, Union[DataLoader, None]]:
-    """
-    Factory to create DDP/FSDP compatible DataLoader with distributed preprocessing.
-    
-    Features:
-        - Automatic distributed preprocessing across multiple GPUs
-        - Intelligent caching (reuses preprocessed data on subsequent runs)
-        - Supports both train and test splits
-        - Custom sampler for GRPO-style grouped sampling
-    
+) -> Tuple[
+    Union[DataLoader, "MultiSourceTrainDataLoader", None],
+    Dict[str, DataLoader],
+]:
+    """Factory for the training DataLoader(s).
+
+    Returns a 2-tuple ``(train_loader, train_loaders_by_source)``:
+
+    * ``train_loader`` — either a plain ``torch.utils.data.DataLoader``
+      (legacy single-source) or a :class:`MultiSourceTrainDataLoader`
+      (multi-source).  Both expose ``__iter__`` / ``__len__`` /
+      ``set_epoch`` so trainers don't have to branch.  ``None`` only
+      when ``data.datasets`` is set but no entry has ``train: enabled``
+      (eval-only run; trainers should respect that).
+    * ``train_loaders_by_source`` — ``Dict[str, DataLoader]`` keyed
+      by training-dataset name in multi-source mode; empty ``{}`` in
+      legacy mode.  Exposed publicly for the future DiffusionOPD
+      trainer (which iterates per-source independently).
+
+    The eval / test path is fully owned by :func:`get_eval_dataloaders`;
+    callers requesting an eval loader must invoke it explicitly.
+
     Args:
-        config: Configuration object containing all arguments
-        accelerator: Accelerator for distributed training
-        preprocess_func: Function to preprocess batches
-        **kwargs: Additional arguments (ignored)
-        
-    Returns:
-        Tuple of (train_dataloader, test_dataloader)
-        test_dataloader is None if test split doesn't exist
+        config: Full ``Arguments`` configuration object.
+        accelerator: Accelerator for distributed preprocessing & sampling.
+        preprocess_func: Adapter's batch-preprocessing function.
+        **kwargs: Reserved for future use (currently ignored).
     """
     data_args = config.data_args
     training_args = config.training_args
-    eval_args = config.eval_args
 
-    # Determine if distributed preprocessing is needed
     enable_distributed = accelerator.num_processes > 1 and data_args.enable_preprocess
     preprocess_parallelism = getattr(data_args, 'preprocess_parallelism', 'local')
 
-    # Common dataset kwargs
+    # Common dataset kwargs (shared across legacy / multi-source paths).
     base_kwargs = {
         "preprocess_func": preprocess_func,
-        "preprocess_kwargs": filter_kwargs(preprocess_func, **data_args) if preprocess_func else None, # Preprocess kwargs
-        'extra_hash_strs': [config.model_args.model_type, config.model_args.model_name_or_path], # Use model info to differentiate caches
+        "preprocess_kwargs": filter_kwargs(preprocess_func, **data_args) if preprocess_func else None,
+        'extra_hash_strs': [
+            config.model_args.model_type,
+            config.model_args.model_name_or_path,
+        ],
     }
     base_kwargs.update(filter_kwargs(GeneralDataset.__init__, **data_args))
     base_kwargs['force_reprocess'] = data_args.force_reprocess
 
-    # === CREATE/LOAD TRAIN DATASET ===
-    train_preprocess_kwargs = base_kwargs.get('preprocess_kwargs', {}).copy()
-    train_preprocess_kwargs.update(
-        {
-            'is_train': True,
-            **training_args,
-        }
-    )
-    # Use algorithm-aware guidance scale for preprocessing — ensures negative
-    # prompts are encoded when any optimizer-time CFG scale needs them
-    # (e.g., DGPO kl_cfg > 1.0 with training guidance_scale = 1.0).
+    # Train preprocess kwargs (algorithm-aware guidance scale, etc.).
+    train_preprocess_kwargs = (base_kwargs.get('preprocess_kwargs') or {}).copy()
+    train_preprocess_kwargs.update({'is_train': True, **training_args})
     train_preprocess_kwargs['guidance_scale'] = training_args.get_preprocess_guidance_scale()
-    train_preprocess_kwargs = filter_kwargs(preprocess_func, **train_preprocess_kwargs)
-    dataset = _create_or_load_dataset(
-        split="train",
-        accelerator=accelerator,
-        base_kwargs={**base_kwargs, 'preprocess_kwargs': train_preprocess_kwargs},
-        enable_distributed=enable_distributed,
-        preprocess_parallelism=preprocess_parallelism,
+    train_preprocess_kwargs = (
+        filter_kwargs(preprocess_func, **train_preprocess_kwargs) if preprocess_func else train_preprocess_kwargs
     )
 
-    # === CREATE TRAIN DATALOADER ===
-    sampler = get_data_sampler(
-        dataset=dataset,
-        config=config,
-        accelerator=accelerator,
-    )
-    
-    dataloader = DataLoader(
-        dataset,
-        batch_sampler=sampler,
-        num_workers=data_args.dataloader_num_workers,
-        pin_memory=True,
-        collate_fn=GeneralDataset.collate_fn,
-    )
+    # ------------------------------------------------------------------
+    # Train path: go through the per-source loader builder.  All configs
+    # use `data.datasets` (the unified schema).  For a single training
+    # source we hand back the underlying plain DataLoader to keep batches
+    # lean (no per-batch __source__ injection).
+    # ------------------------------------------------------------------
+    train_loader: Union[DataLoader, "MultiSourceTrainDataLoader", None]
+    train_loaders_by_source: Dict[str, DataLoader] = {}
 
-    # === CREATE/LOAD TEST DATASET ===
-    test_dataloader = None
-    if GeneralDataset.check_exists(data_args.dataset, "test"):
-        test_preprocess_kwargs = base_kwargs.get('preprocess_kwargs', {}).copy()
-        test_preprocess_kwargs.update(
-            {
-                'is_train': False,
-                **eval_args,
-            }
-        )
-        test_preprocess_kwargs = filter_kwargs(preprocess_func, **test_preprocess_kwargs)
-        test_dataset = _create_or_load_dataset(
-            split="test",
+    training_specs = data_args.training_datasets  # property
+    if not training_specs:
+        # `data.datasets` declares no training-eligible entry -> eval-only
+        # run. Trainers that need a train loop must respect this.
+        train_loader = None
+    else:
+        per_source_loaders = _load_per_source_train_dataloaders(
+            training_datasets=training_specs,
+            config=config,
             accelerator=accelerator,
-            base_kwargs={**base_kwargs, 'preprocess_kwargs': test_preprocess_kwargs},
+            base_kwargs=base_kwargs,
+            train_preprocess_kwargs=train_preprocess_kwargs,
             enable_distributed=enable_distributed,
             preprocess_parallelism=preprocess_parallelism,
         )
-        
-        test_dataloader = DataLoader(
-            test_dataset,
+        train_loaders_by_source = per_source_loaders
+
+        if len(per_source_loaders) == 1:
+            # Single training source (whether the user wrote it as a
+            # legacy `data.dataset_dir` or as a 1-entry `data.datasets`):
+            # skip the wrapper and hand back the underlying DataLoader so
+            # batches don't carry __source__ / __source_id__ keys. Reward
+            # gate then falls through to the legacy "applies to all"
+            # behavior; metric keys, cache fingerprints, and sample
+            # schemas stay byte-identical to the pre-refactor flow.
+            train_loader = next(iter(per_source_loaders.values()))
+        else:
+            num_batches_per_source = {
+                name: loader.batch_sampler.num_batches_per_epoch  # type: ignore[union-attr]
+                for name, loader in per_source_loaders.items()
+            }
+            total = sum(num_batches_per_source.values())
+            if total != training_args.num_batches_per_epoch:
+                # Caught by alignment math — but log clearly if it ever drifts.
+                logger.warning(
+                    f"Multi-source partition produced {total} batches/epoch but "
+                    f"training_args.num_batches_per_epoch = "
+                    f"{training_args.num_batches_per_epoch}. "
+                    "This indicates a partitioning bug; "
+                    "tqdm and gradient accumulation will use the dataloader's actual length."
+                )
+            scheduler = WeightedSourceBatchScheduler(
+                num_batches_per_source=num_batches_per_source,
+                seed=training_args.seed,
+            )
+            train_loader = MultiSourceTrainDataLoader(
+                per_source_loaders,
+                scheduler,
+                source_name_to_id=data_args.source_name_to_id,
+                batch_size=training_args.per_device_batch_size,
+            )
+
+    # The eval / test path is fully owned by `get_eval_dataloaders`;
+    # callers requesting an eval loader must invoke it explicitly.
+
+    return train_loader, train_loaders_by_source
+
+
+def _load_per_source_train_dataloaders(
+    *,
+    training_datasets: List[DatasetArguments],
+    config: Arguments,
+    accelerator: Accelerator,
+    base_kwargs: dict,
+    train_preprocess_kwargs: dict,
+    enable_distributed: bool,
+    preprocess_parallelism: Literal["global", "local"],
+) -> Dict[str, DataLoader]:
+    """Build one DataLoader per declared training source.
+
+    Reads the per-source aligned ``M_i`` from
+    ``DatasetTrainSpec.unique_sample_num_per_epoch`` (set by
+    ``Arguments._align_unique_sample_num``).  Each per-source DataLoader
+    is fingerprinted with ``train_source:{name}`` so caches don't
+    collide across sources that share a ``dataset_dir`` with different
+    overrides.
+
+    Sanity checks (raised here rather than in alignment so we have
+    dataset lengths available):
+
+    * ``M_i <= len(per_source_dataset)`` — otherwise raise with
+      actionable advice.
+    * Sum of per-source batch counts equals
+      ``training_args.num_batches_per_epoch`` (asserted by caller).
+    """
+    out: Dict[str, DataLoader] = {}
+    for d in training_datasets:
+        spec = d.train
+        if spec is None:
+            raise RuntimeError(
+                f"Internal error: dataset '{d.name}' passed to "
+                "_load_per_source_train_dataloaders with train=None. "
+                "The is_training_source filter should have excluded it."
+            )
+
+        # Per-source media-root + dataset_dir overrides.
+        per_kwargs = dict(base_kwargs)
+        per_kwargs.update(d.get_dataset_overrides())
+        per_kwargs["force_reprocess"] = config.data_args.force_reprocess
+
+        # Cache fingerprint includes the source name so two sources sharing
+        # a dataset_dir with different overrides get separate caches.
+        extra = list(base_kwargs.get("extra_hash_strs", []))
+        extra.append(f"train_source:{d.name}")
+        per_kwargs["extra_hash_strs"] = extra
+
+        # Per-source max_dataset_size override (DataArguments default
+        # acts as fallback via base_kwargs.update).
+        if spec.max_dataset_size is not None:
+            per_kwargs["max_dataset_size"] = spec.max_dataset_size
+
+        dataset = _create_or_load_dataset(
+            split=spec.split,
+            accelerator=accelerator,
+            base_kwargs={**per_kwargs, 'preprocess_kwargs': train_preprocess_kwargs},
+            enable_distributed=enable_distributed,
+            preprocess_parallelism=preprocess_parallelism,
+        )
+
+        M_i = spec.unique_sample_num_per_epoch
+        if M_i is None:
+            raise RuntimeError(
+                f"Internal error: per-source unique_sample_num_per_epoch "
+                f"is missing for source '{d.name}'. "
+                f"Did `Arguments._align_batch_geometry` run?"
+            )
+        if M_i > len(dataset):
+            raise ValueError(
+                f"Training dataset '{d.name}': aligned per-source "
+                f"unique_sample_num_per_epoch (M_i = {M_i}) exceeds dataset "
+                f"size ({len(dataset)}). Either lower this source's "
+                f"`train.weight`, lower `train.unique_sample_num_per_epoch`, "
+                f"or grow the dataset."
+            )
+
+        sampler = get_data_sampler(
+            dataset=dataset,
+            sampler_type=config.data_args.sampler_type,
+            batch_size=config.training_args.per_device_batch_size,
+            group_size=config.training_args.group_size,
+            unique_sample_num=M_i,
+            num_replicas=accelerator.num_processes,
+            rank=accelerator.process_index,
+            seed=config.training_args.seed,
+        )
+        out[d.name] = DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            num_workers=config.data_args.dataloader_num_workers,
+            pin_memory=True,
+            collate_fn=GeneralDataset.collate_fn,
+        )
+        # Mirror the resolved per-source `num_batches_per_epoch` onto
+        # the spec so `print(config)` shows it. The `M_i` writeback
+        # already happened in `Arguments._align_unique_sample_num`.
+        spec.num_batches_per_epoch = sampler.num_batches_per_epoch  # type: ignore[union-attr]
+        logger.info(
+            f"Multi-source: built DataLoader for '{d.name}' "
+            f"(dataset_size={len(dataset)}, "
+            f"unique_sample_num_per_epoch={M_i}, "
+            f"num_batches_per_epoch={sampler.num_batches_per_epoch})"  # type: ignore[union-attr]
+        )
+
+    return out
+
+
+def get_eval_dataloaders(
+    eval_datasets: List[DatasetArguments],
+    config: Arguments,
+    accelerator: Accelerator,
+    preprocess_func: Optional[PreprocessCallable] = None,
+) -> Dict[str, DataLoader]:
+    """
+    Create DataLoaders for multiple evaluation datasets.
+
+    Each dataset is independently preprocessed and cached using its own
+    ``dataset_dir`` and a unique cache fingerprint (includes the eval dataset
+    name to prevent collisions).
+
+    Args:
+        eval_datasets: List of evaluation-eligible dataset configurations
+            (typically ``config.data_args.eval_datasets`` — the property
+            returning ``[d for d in data.datasets if d.is_eval_source]``).
+        config: Full configuration object (for model info, data args, eval args).
+        accelerator: Accelerator for distributed preprocessing.
+        preprocess_func: Model adapter's preprocessing function.
+
+    Returns:
+        Dict mapping eval dataset name → DataLoader, ready for evaluation.
+    """
+    data_args = config.data_args
+    eval_args = config.eval_args
+
+    enable_distributed = accelerator.num_processes > 1 and data_args.enable_preprocess
+    preprocess_parallelism = getattr(data_args, 'preprocess_parallelism', 'local')
+
+    eval_dataloaders: Dict[str, DataLoader] = {}
+
+    for ed in eval_datasets:
+        # Each entry is a DatasetArguments; its eval-only block carries
+        # the split / size / sampling overrides.
+        spec = ed.eval
+        if spec is None or not spec.enabled:
+            # Defensive: caller should have already filtered via the
+            # `is_eval_source` property, but keep this safety net.
+            continue
+
+        # Per-dataset eval preprocess kwargs: merge this dataset's eval
+        # overrides (notably `guidance_scale`) with the shared EvaluationArguments
+        # via the same `get_merged_eval_kwargs` used by `BaseTrainer.evaluate`.
+        # This keeps Stage 1 (encode_prompt) consistent with Stage 2 (inference):
+        # a dataset evaluated at guidance_scale > 1.0 must cache negative prompt
+        # embeds during preprocessing, otherwise CFG is silently disabled at eval.
+        per_preprocess_kwargs = None
+        if preprocess_func:
+            merged_eval = spec.get_merged_eval_kwargs(eval_args)
+            per_preprocess_kwargs = filter_kwargs(preprocess_func, **data_args).copy()
+            per_preprocess_kwargs.update({'is_train': False, **merged_eval})
+            per_preprocess_kwargs = filter_kwargs(preprocess_func, **per_preprocess_kwargs)
+
+        # Check that the split file exists
+        if not GeneralDataset.check_exists(ed.dataset_dir, spec.split):
+            logger.warning(
+                f"Eval dataset '{ed.name}': split '{spec.split}' not found in "
+                f"'{ed.dataset_dir}', skipping."
+            )
+            continue
+
+        # Start with filter_kwargs from data_args (same pattern as get_dataloader)
+        base_kwargs = {
+            "preprocess_func": preprocess_func,
+            "preprocess_kwargs": per_preprocess_kwargs,
+            "extra_hash_strs": [
+                config.model_args.model_type,
+                config.model_args.model_name_or_path,
+                f"eval_{ed.name}",
+            ],
+        }
+        base_kwargs.update(filter_kwargs(GeneralDataset.__init__, **data_args))
+
+        # Override dataset_dir, per-dataset media-root overrides, and the
+        # eval-spec-level max_dataset_size (if set).
+        base_kwargs.update(ed.get_dataset_overrides())
+        base_kwargs["force_reprocess"] = data_args.force_reprocess
+        if spec.max_dataset_size is not None:
+            base_kwargs["max_dataset_size"] = spec.max_dataset_size
+
+        # Create/load dataset
+        dataset = _create_or_load_dataset(
+            split=spec.split,
+            accelerator=accelerator,
+            base_kwargs=base_kwargs,
+            enable_distributed=enable_distributed,
+            preprocess_parallelism=preprocess_parallelism,
+        )
+
+        # Create DataLoader
+        eval_dataloaders[ed.name] = DataLoader(
+            dataset,
             batch_size=eval_args.per_device_batch_size,
             shuffle=False,
             num_workers=data_args.dataloader_num_workers,
             collate_fn=GeneralDataset.collate_fn,
         )
 
-    return dataloader, test_dataloader
+    return eval_dataloaders

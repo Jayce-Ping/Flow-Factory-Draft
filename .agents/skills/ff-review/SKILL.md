@@ -60,6 +60,7 @@ git status             # Modified files
 - [ ] English comments and docstrings
 - [ ] Apache 2.0 license header on new files
 - [ ] No unnecessary wildcard imports (except `hparams`)
+- [ ] **Top-level imports only** (constraint #22) — see that file for the three sanctioned exceptions (optional deps via `try/except ImportError`, backend-gated runtime feature checks like DeepSpeed/FSDP, unresolvable circular imports).
 
 ### Documentation
 - [ ] `guidance/` docs updated if behavior changed

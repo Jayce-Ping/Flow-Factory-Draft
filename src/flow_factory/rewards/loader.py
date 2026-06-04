@@ -20,7 +20,7 @@ Factory functions using registry pattern for extensibility.
 Supports both single reward and multi-reward loading with automatic deduplication.
 """
 from __future__ import annotations
-from typing import Dict, List, Optional, Literal
+from typing import Dict, List, Optional, Literal, Tuple
 from dataclasses import dataclass, field
 import logging
 
@@ -111,27 +111,49 @@ class MultiRewardLoader:
         self,
         reward_args: MultiRewardArguments,
         accelerator: Accelerator,
+        training_dataset_names: Optional[List[str]] = None,
         eval_reward_args: Optional[MultiRewardArguments] = None,
+        eval_dataset_names: Optional[List[str]] = None,
     ):
         """
         Initialize the MultiRewardLoader.
-        
+
         Args:
             reward_args: Training reward configurations.
             accelerator: Accelerator instance for distributed setup.
+            training_dataset_names: Names of training datasets for per-training-
+                dataset reward routing. When provided, builds per-dataset
+                mappings using the ``datasets`` field in each training reward
+                config. When None, no per-training-dataset routing is built
+                (legacy single-source mode — every reward applies to every
+                training sample).
             eval_reward_args: Evaluation reward configurations.
                 If None, training rewards are used for evaluation.
+            eval_dataset_names: Names of eval datasets for per-eval-dataset
+                reward routing. When provided, builds per-dataset mappings
+                using the ``datasets`` field in each eval reward config.
         """
         self.reward_args = reward_args
         self.eval_reward_args = eval_reward_args
         self.accelerator = accelerator
-        
+        self._training_dataset_names = training_dataset_names or []
+        self._eval_dataset_names = eval_dataset_names or []
+
         # Internal state
         self._cache: Dict[tuple, RewardModelHandle] = {}
         self._training_name_to_key: Dict[str, tuple] = {}
         self._eval_name_to_key: Dict[str, tuple] = {}
         self._training_name_to_config: Dict[str, RewardArguments] = {}
         self._eval_name_to_config: Dict[str, RewardArguments] = {}
+        # Per-training-dataset mappings.  Used by the future
+        # DiffusionOPDTrainer to ask "which rewards apply to teacher T's
+        # source set?" and by the reward gate to short-circuit when an
+        # entire batch's source has no applicable reward.
+        self._training_dataset_reward_keys: Dict[str, Dict[str, tuple]] = {}
+        self._training_dataset_reward_configs: Dict[str, Dict[str, RewardArguments]] = {}
+        # Per-eval-dataset mappings: dataset_name → {reward_name → identity_key}
+        self._eval_dataset_reward_keys: Dict[str, Dict[str, tuple]] = {}
+        self._eval_dataset_reward_configs: Dict[str, Dict[str, RewardArguments]] = {}
         self._loaded = False
     
     def load(self) -> MultiRewardLoader:
@@ -197,11 +219,68 @@ class MultiRewardLoader:
         if not self.eval_reward_args or len(self.eval_reward_args) == 0:
             self._eval_name_to_key = self._training_name_to_key.copy()
             self._eval_name_to_config = self._training_name_to_config.copy()
-        
+
+        # Build per-training-dataset reward mappings
+        self._training_dataset_reward_keys, self._training_dataset_reward_configs = (
+            self._build_dataset_reward_mappings(
+                self._training_dataset_names,
+                self._training_name_to_key,
+                self._training_name_to_config,
+            )
+        )
+        # Build per-eval-dataset reward mappings
+        self._eval_dataset_reward_keys, self._eval_dataset_reward_configs = (
+            self._build_dataset_reward_mappings(
+                self._eval_dataset_names,
+                self._eval_name_to_key,
+                self._eval_name_to_config,
+            )
+        )
+
         self._loaded = True
         # logger.info(self.summary())
         return self
-    
+
+    @staticmethod
+    def _build_dataset_reward_mappings(
+        dataset_names: List[str],
+        name_to_key: Dict[str, tuple],
+        name_to_config: Dict[str, 'RewardArguments'],
+    ) -> Tuple[Dict[str, Dict[str, tuple]], Dict[str, Dict[str, 'RewardArguments']]]:
+        """Build per-dataset reward routing for a set of dataset names.
+
+        For each dataset name, determines which rewards apply to it
+        (using each ``RewardArguments.applicable_datasets`` field).  ``None`` is
+        accepted defensively as "applies to every source" for callers
+        that construct a ``MultiRewardLoader`` outside the ``Arguments``
+        flow.
+
+        Returns:
+            Tuple of (keys_mapping, configs_mapping) where each maps
+            dataset_name -> {reward_name -> identity_key/config}.
+        """
+        keys_mapping: Dict[str, Dict[str, tuple]] = {}
+        configs_mapping: Dict[str, Dict[str, 'RewardArguments']] = {}
+
+        for dataset_name in dataset_names:
+            ds_keys: Dict[str, tuple] = {}
+            ds_configs: Dict[str, 'RewardArguments'] = {}
+
+            for reward_name, identity_key in name_to_key.items():
+                reward_cfg = name_to_config[reward_name]
+                applies = (
+                    reward_cfg.applicable_datasets is None
+                    or dataset_name in reward_cfg.applicable_datasets
+                )
+                if applies:
+                    ds_keys[reward_name] = identity_key
+                    ds_configs[reward_name] = reward_cfg
+
+            keys_mapping[dataset_name] = ds_keys
+            configs_mapping[dataset_name] = ds_configs
+
+        return keys_mapping, configs_mapping
+
     def get_rewards_models(self, split : Literal['train', 'eval']) -> Dict[str, BaseRewardModel]:
         """
         Get reward models for the specified split.
@@ -241,9 +320,97 @@ class MultiRewardLoader:
         """Get evaluation reward models."""
         self._ensure_loaded()
         return {
-            name: self._cache[key].model 
+            name: self._cache[key].model
             for name, key in self._eval_name_to_key.items()
         }
+
+    def get_training_dataset_reward_models(self, dataset_name: str) -> Dict[str, BaseRewardModel]:
+        """Get TRAINING reward models applicable to a specific training dataset.
+
+        Used by the future ``DiffusionOPDTrainer`` to ask "which rewards
+        apply to teacher T's source set?" and by validation logic that
+        wants to fail-fast if a training source has no applicable
+        reward.
+
+        Args:
+            dataset_name: Name of the training dataset (as declared in
+                ``data.datasets[*].name``).
+
+        Returns:
+            Dict mapping reward name → model instance for rewards that
+            apply to the given training source.
+
+        Raises:
+            KeyError: If ``dataset_name`` was not registered during loading
+                (i.e., it isn't in ``training_dataset_names`` passed to
+                ``__init__``).
+        """
+        self._ensure_loaded()
+        if dataset_name not in self._training_dataset_reward_keys:
+            raise KeyError(
+                f"Unknown training dataset '{dataset_name}'. "
+                f"Known datasets: {sorted(self._training_dataset_reward_keys.keys())}"
+            )
+        return {
+            name: self._cache[key].model
+            for name, key in self._training_dataset_reward_keys[dataset_name].items()
+        }
+
+    def get_training_dataset_reward_configs(self, dataset_name: str) -> Dict[str, 'RewardArguments']:
+        """Get TRAINING reward configs applicable to a specific training dataset.
+
+        Mirror of :meth:`get_eval_dataset_reward_configs` for the
+        training side.
+        """
+        self._ensure_loaded()
+        if dataset_name not in self._training_dataset_reward_configs:
+            raise KeyError(
+                f"Unknown training dataset '{dataset_name}'. "
+                f"Known datasets: {sorted(self._training_dataset_reward_configs.keys())}"
+            )
+        return self._training_dataset_reward_configs[dataset_name].copy()
+
+    def get_eval_dataset_reward_models(self, dataset_name: str) -> Dict[str, BaseRewardModel]:
+        """Get reward models applicable to a specific eval dataset.
+
+        Args:
+            dataset_name: Name of the eval dataset (as declared in eval_datasets config).
+
+        Returns:
+            Dict mapping reward name → model instance for rewards that apply
+            to the given dataset.
+
+        Raises:
+            KeyError: If dataset_name was not registered during loading.
+        """
+        self._ensure_loaded()
+        if dataset_name not in self._eval_dataset_reward_keys:
+            raise KeyError(
+                f"Unknown eval dataset '{dataset_name}'. "
+                f"Known datasets: {sorted(self._eval_dataset_reward_keys.keys())}"
+            )
+        return {
+            name: self._cache[key].model
+            for name, key in self._eval_dataset_reward_keys[dataset_name].items()
+        }
+
+    def get_eval_dataset_reward_configs(self, dataset_name: str) -> Dict[str, 'RewardArguments']:
+        """Get reward configs applicable to a specific eval dataset.
+
+        Args:
+            dataset_name: Name of the eval dataset.
+
+        Returns:
+            Dict mapping reward name → RewardArguments for rewards that apply
+            to the given dataset.
+        """
+        self._ensure_loaded()
+        if dataset_name not in self._eval_dataset_reward_configs:
+            raise KeyError(
+                f"Unknown eval dataset '{dataset_name}'. "
+                f"Known datasets: {sorted(self._eval_dataset_reward_configs.keys())}"
+            )
+        return self._eval_dataset_reward_configs[dataset_name].copy()
     
     def get(self, name: str, source: str = 'train') -> Optional[BaseRewardModel]:
         """
@@ -317,4 +484,8 @@ class MultiRewardLoader:
         self._eval_name_to_key.clear()
         self._training_name_to_config.clear()
         self._eval_name_to_config.clear()
+        self._eval_dataset_reward_keys.clear()
+        self._eval_dataset_reward_configs.clear()
+        self._training_dataset_reward_keys.clear()
+        self._training_dataset_reward_configs.clear()
         self._loaded = False

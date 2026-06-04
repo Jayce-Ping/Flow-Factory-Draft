@@ -27,6 +27,7 @@ from .abc import BaseTrainer
 from .registry import get_trainer_class, list_registered_trainers
 from ..hparams import Arguments
 from ..utils.logger_utils import setup_logger
+from ..utils.env_utils import reconcile_config
 
 logger = setup_logger(__name__)
 
@@ -68,6 +69,9 @@ def load_trainer(config: Arguments) -> BaseTrainer:
         kwargs_handlers=[ddp_kwargs],
     )
     set_seed(config.training_args.seed, device_specific=True)
+
+    # Reconcile config with runtime distributed state (before any consumer reads it)
+    reconcile_config(config, accelerator)
 
     # Initialize model adapter
     adapter = load_model(config=config, accelerator=accelerator)

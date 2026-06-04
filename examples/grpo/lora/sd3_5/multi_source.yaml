@@ -1,0 +1,179 @@
+# Multi-source training: geneval + ocr + pickscore with per-source reward routing.
+#
+# Training datasets (3 sources, weighted 1:1:1):
+#   - geneval:   evaluated with geneval + pickscore rewards
+#   - ocr:       evaluated with ocr + pickscore rewards
+#   - pickscore: evaluated with pickscore only
+#
+# Eval: geneval dataset uses geneval+pickscore, ocr uses ocr+pickscore,
+#       pickscore uses pickscore only.
+
+# Environment Configuration
+launcher: "accelerate"  # Options: accelerate
+config_file: config/deepspeed/deepspeed_zero2.yaml  # Path to distributed config file
+num_processes: 8  # Number of GPU processes to launch
+main_process_port: 29500  # Port for distributed communication
+mixed_precision: "bf16"  # Options: no, fp16, bf16
+
+# Data Configuration
+data:
+  datasets:
+    - name: geneval  # Unique identifier (used in metrics, caching, reward routing)
+      dataset_dir: "dataset/geneval"  # Folder with train.jsonl / test.jsonl
+      train:  # Training participation config
+        weight: 1  # Mixing weight (integer); ratio with other sources determines batch allocation
+        max_dataset_size: 1024  # Cap on number of training samples for this source
+      eval:  # Eval participation (overrides shared `eval:` section below)
+        num_inference_steps: 40  # Override eval inference steps for this dataset
+        guidance_scale: 1.0  # Override eval guidance scale for this dataset
+
+    - name: ocr  # Unique identifier (used in metrics, caching, reward routing)
+      dataset_dir: "dataset/ocr"  # Folder with train.jsonl / test.jsonl
+      train:  # Training participation config
+        weight: 1  # Mixing weight (integer); ratio with other sources determines batch allocation
+        max_dataset_size: 1024  # Cap on number of training samples for this source
+      eval:  # Eval participation (overrides shared `eval:` section below)
+        num_inference_steps: 40  # Override eval inference steps for this dataset
+        guidance_scale: 1.0  # Override eval guidance scale for this dataset
+
+    - name: pickscore  # Unique identifier (used in metrics, caching, reward routing)
+      dataset_dir: "dataset/pickscore"  # Folder with train.jsonl / test.jsonl
+      train:  # Training participation config
+        weight: 1  # Mixing weight (integer); ratio with other sources determines batch allocation
+        max_dataset_size: 1024  # Cap on number of training samples for this source
+      eval:  # Eval participation (overrides shared `eval:` section below)
+        num_inference_steps: 40  # Override eval inference steps for this dataset
+        guidance_scale: 1.0  # Override eval guidance scale for this dataset
+
+  preprocessing_batch_size: 8  # Batch size for preprocessing
+  dataloader_num_workers: 16  # Number of workers for DataLoader
+  force_reprocess: false  # Force reprocessing of the dataset (ignores cache)
+  cache_dir: "~/.cache/flow_factory/datasets"  # Cache directory for preprocessed datasets
+  sampler_type: "auto"  # Options: auto, distributed_k_repeat, group_contiguous
+
+# Model Configuration
+model:
+  finetune_type: 'lora'  # Options: full, lora
+  lora_rank: 32  # LoRA rank dimension
+  lora_alpha: 64  # LoRA scaling factor (typically 2x rank)
+  target_modules: "default"  # Options: all, default, or list of module names
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"  # HuggingFace model ID or local path
+  model_type: "sd3-5"  # Model type identifier for adapter selection
+  resume_path: null  # Path or HF repo for checkpoint resume (null = train from scratch)
+  resume_type: null  # Options: lora, full, state. Null to auto-detect
+
+log:
+  run_name: null  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
+  project: "Flow-Factory"  # Project name for logging backend
+  logging_backend: "wandb"  # Options: wandb, swanlab, tensorboard, none
+  save_dir: "saves/"  # Directory to save model checkpoints and logs
+  save_freq: 20  # Save frequency in epochs (0 to disable)
+  save_model_only: true  # Save only model weights (not optimizer/scheduler state)
+
+# Training Configuration
+train:
+  trainer_type: 'grpo'  # Options: grpo, grpo-guard, nft, awm, dpo, dgpo
+  advantage_aggregation: 'sum'  # Options: sum (weighted-sum), gdpo (per-reward group-norm)
+  clip_range: 1.0e-4  # PPO/GRPO policy ratio clipping range
+  adv_clip_range: 5.0  # Advantage clipping range (prevents extreme updates)
+  kl_type: 'v-based'  # Options: x-based, v-based (KL divergence formulation)
+  kl_beta: 0  # KL coefficient (0 = disabled, saves memory; ~1e-3 for v-based)
+  ref_param_device: 'cuda'  # Device for reference model params. Options: cpu, cuda
+
+  resolution: 512  # Training resolution. Can be int or [height, width]
+  num_inference_steps: 10  # Number of denoising timesteps during sampling
+  guidance_scale: 1.0  # Classifier-free guidance scale (1.0 = no guidance)
+
+  per_device_batch_size: 8  # Batch size per GPU device
+  group_size: 16  # Number of samples generated per prompt (K in GRPO)
+  global_std: true  # Use global std for advantage normalization (vs per-group)
+  unique_sample_num_per_epoch: 144  # Total unique prompts per epoch (48 per source * 3 sources)
+  gradient_step_per_epoch: 2  # Number of gradient updates per epoch
+  gradient_accumulation_steps: auto  # Options: auto, or positive integer
+
+  learning_rate: 3.0e-4  # Initial learning rate for AdamW optimizer
+  adam_weight_decay: 1.0e-4  # AdamW weight decay regularization
+  adam_betas: [0.9, 0.999]  # AdamW momentum coefficients (beta1, beta2)
+  adam_epsilon: 1.0e-8  # AdamW epsilon for numerical stability
+  max_grad_norm: 1.0  # Max gradient norm for gradient clipping
+
+  ema_decay: 0.99  # EMA decay rate for model weights (0 to disable)
+  ema_update_interval: 4  # Update EMA every N epochs
+  ema_device: "cuda"  # Device to store EMA model. Options: cpu, cuda
+
+  enable_gradient_checkpointing: false  # Trade compute for memory savings
+  seed: 42  # Random seed for reproducibility
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "CPS"  # Options: Flow-SDE, Dance-SDE, CPS, ODE
+  noise_level: 0.8  # Noise injection level for SDE-based dynamics
+  num_sde_steps: 3  # Number of stochastic steps per training iteration
+  sde_steps: [0, 1, 2, 3, 4]  # Candidate timestep indices for stochastic steps
+  seed: 42  # Scheduler seed (for noise step selection)
+
+# Evaluation settings (shared defaults; per-dataset overrides above take precedence)
+eval:
+  resolution: 512  # Evaluation image resolution
+  per_device_batch_size: 8  # Eval batch size per device
+  guidance_scale: 1.0  # Eval guidance scale
+  num_inference_steps: 40  # Eval denoising steps (more steps = higher quality)
+  eval_freq: 20  # Run evaluation every N epochs (0 to disable)
+  seed: 42  # Eval random seed
+
+# Reward Model Configuration
+# Per-source routing via `applicable_datasets:` field:
+#   - geneval_reward: applies to geneval only
+#   - ocr_reward: applies to ocr only
+#   - pick_score: applies to all three sources (applicable_datasets omitted = applies to all)
+rewards:
+  - name: "geneval_reward"  # Unique reward identifier (appears in log keys)
+    reward_model: "GenEval"  # Reward model class (from registry)
+    weight: 1  # Contribution weight in advantage aggregation
+    batch_size: 16  # Inference batch size for this reward model
+    device: "cuda"  # Device to run reward model on
+    dtype: bfloat16  # Precision for reward model inference
+    applicable_datasets: ["geneval"]  # Only fires on geneval source batches
+
+  - name: "ocr_reward"  # Unique reward identifier (appears in log keys)
+    reward_model: "OCR"  # Reward model class (from registry)
+    weight: 1  # Contribution weight in advantage aggregation
+    batch_size: 16  # Inference batch size for this reward model
+    device: "cuda"  # Device to run reward model on
+    dtype: bfloat16  # Precision for reward model inference
+    applicable_datasets: ["ocr"]  # Only fires on ocr source batches
+
+  - name: "pick_score"  # Unique reward identifier (appears in log keys)
+    reward_model: "PickScore"  # Reward model class (from registry)
+    weight:  # Per-dataset weight (dict form): controls contribution per source
+      geneval: 0.2
+      ocr: 0.2
+      pickscore: 1.0
+    batch_size: 16  # Inference batch size for this reward model
+    device: "cuda"  # Device to run reward model on
+    dtype: bfloat16  # Precision for reward model inference
+    # applicable_datasets omitted -> applies to ALL training sources (geneval, ocr, pickscore)
+
+# Eval Reward Models
+# Same routing logic: geneval gets geneval+pickscore, ocr gets ocr+pickscore, pickscore gets pickscore
+eval_rewards:
+  - name: "geneval_reward"  # Eval reward identifier
+    reward_model: "GenEval"  # Same model as training, may use larger batch
+    batch_size: 32  # Larger batch for eval (no gradient, more memory available)
+    device: "cuda"  # Device to run reward model on
+    dtype: bfloat16  # Precision for reward model inference
+    applicable_datasets: ["geneval"]  # Only scores geneval eval samples
+
+  - name: "ocr_reward"  # Eval reward identifier
+    reward_model: "OCR"  # Same model as training, may use larger batch
+    batch_size: 32  # Larger batch for eval (no gradient, more memory available)
+    device: "cuda"  # Device to run reward model on
+    dtype: bfloat16  # Precision for reward model inference
+    applicable_datasets: ["ocr"]  # Only scores ocr eval samples
+
+  - name: "pick_score"  # Eval reward identifier
+    reward_model: "PickScore"  # Same model as training, may use larger batch
+    batch_size: 32  # Larger batch for eval (no gradient, more memory available)
+    device: "cuda"  # Device to run reward model on
+    dtype: bfloat16  # Precision for reward model inference
+    # applicable_datasets omitted -> applies to all eval sources (geneval, ocr, pickscore)

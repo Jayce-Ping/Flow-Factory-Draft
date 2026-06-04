@@ -1,0 +1,204 @@
+# DiffusionOPD reproduction (mopd): multi-task on-policy distillation on SD3.5.
+#
+# Aligned to the upstream `mopd` recipe in
+# https://github.com/ali-vilab/DiffusionOPD/blob/8797d5717d9503edc8cec0705aed5354c203e547/config/opd.py#L34
+# Three task-specialized teachers are distilled into one student LoRA along the
+# student's own ODE rollout trajectories.
+#
+# All official checkpoints live under ONE repo, quanhaol/DiffusionOPD, as
+# subfolders (each teacher's LoRA is in <Teacher>/lora; the released distilled
+# student is in Student/lora). Flow-Factory loads a subfolder via the
+# owner/repo/subfolder path spec.
+#
+# Teacher -> dataset mapping (NOTE: upstream applies the Aesthetics teacher to
+# the `pickscore` prompt set — "aesthetic" IS the pickscore task here):
+#   - quanhaol/DiffusionOPD/AesTeacher/lora     -> dataset `pickscore`  (guidance_scale 4.5)
+#   - quanhaol/DiffusionOPD/OCRTeacher/lora     -> dataset `ocr`        (guidance_scale 4.5)
+#   - quanhaol/DiffusionOPD/GenEvalTeacher/lora -> dataset `geneval`    (guidance_scale 1.0)
+# Each must share the student's LoRA architecture; these teachers are r=32,
+# lora_alpha=64 with SD3.5 attention target modules — matching the student below.
+#
+# Batch geometry (matches upstream `mopd` on 8 GPUs):
+#   num_image_per_prompt=1   -> group_size=1
+#   train_batch_size=3       -> per_device_batch_size=3
+#   num_batches_per_epoch=3  -> 1 batch per teacher/dataset, so
+#   unique_sample_num_per_epoch = num_gpus(8) * num_batches_per_epoch(3) * per_device_batch_size(3) / group_size(1)
+#                              = 72  (== 24 prompts/teacher * 3 teachers)
+#
+# To distill under SDE instead of ODE, set `scheduler.dynamics_type` to an SDE
+# variant (e.g. Flow-SDE) and `scheduler.noise_level > 0`; the per-step loss
+# picks up the transition-variance denominator automatically.
+
+# Environment Configuration
+launcher: "accelerate"  # Options: accelerate
+config_file: config/deepspeed/deepspeed_zero2.yaml  # Path to distributed config file
+num_processes: 8  # Number of GPU processes to launch (geometry above assumes 8)
+main_process_port: 29500  # Port for distributed communication
+mixed_precision: "bf16"  # Options: no, fp16, bf16 (upstream used fp16; bf16 is the FF default)
+
+# Data Configuration — 3 datasets, one teacher each (weighted 1:1:1)
+data:
+  datasets:
+    - name: pickscore  # Aesthetics task in upstream mopd (served by the Aes teacher)
+      dataset_dir: "dataset/pickscore"  # Folder with train.jsonl / test.jsonl
+      train:  # Training participation config
+        weight: 1  # Mixing weight (integer); ratio with other datasets sets batch allocation
+        max_dataset_size: null  # No cap on training prompts (matches upstream mopd: full prompt set)
+      eval:  # Eval participation (overrides shared `eval:` section below)
+        num_inference_steps: 40  # Override eval inference steps for this dataset
+        guidance_scale: 4.5  # Eval samples the student at its CFG (4.5)
+
+    - name: ocr  # Unique identifier (dataset tag, metrics, reward + teacher routing)
+      dataset_dir: "dataset/ocr"  # Folder with train.jsonl / test.jsonl
+      train:  # Training participation config
+        weight: 1  # Mixing weight (integer); ratio with other datasets sets batch allocation
+        max_dataset_size: null  # No cap on training prompts (matches upstream mopd: full prompt set)
+      eval:  # Eval participation (overrides shared `eval:` section below)
+        num_inference_steps: 40  # Override eval inference steps for this dataset
+        guidance_scale: 4.5  # Eval samples the student at its CFG (4.5)
+
+    - name: geneval  # Unique identifier (dataset tag, metrics, reward + teacher routing)
+      dataset_dir: "dataset/geneval"  # Folder with train.jsonl / test.jsonl
+      train:  # Training participation config
+        weight: 1  # Mixing weight (integer); ratio with other datasets sets batch allocation
+        max_dataset_size: null  # No cap on training prompts (matches upstream mopd: full prompt set)
+      eval:  # Eval participation (overrides shared `eval:` section below)
+        num_inference_steps: 40  # Override eval inference steps for this dataset
+        guidance_scale: 4.5  # Eval samples the student at its CFG (4.5)
+
+  preprocessing_batch_size: 8  # Batch size for preprocessing
+  dataloader_num_workers: 16  # Number of workers for DataLoader
+  force_reprocess: false  # Force reprocessing of the dataset (ignores cache)
+  cache_dir: "~/.cache/flow_factory/datasets"  # Cache directory for preprocessed datasets
+  sampler_type: "auto"  # Options: auto, distributed_k_repeat, group_contiguous
+
+# Model Configuration (student LoRA)
+model:
+  finetune_type: 'lora'  # Options: full, lora (DiffusionOPD currently supports LoRA teachers only)
+  lora_rank: 32  # LoRA rank dimension (must match the teacher checkpoints' rank)
+  lora_alpha: 64  # LoRA scaling factor (typically 2x rank)
+  target_modules: "default"  # Options: all, default, or list of module names
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"  # HuggingFace model ID or local path
+  model_type: "sd3-5"  # Model type identifier for adapter selection
+  resume_path: null  # Path or HF repo for checkpoint resume (null = train from scratch)
+  resume_type: null  # Options: lora, full, state. Null to auto-detect
+
+log:
+  run_name: null  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
+  project: "Flow-Factory"  # Project name for logging backend
+  logging_backend: "wandb"  # Options: wandb, swanlab, tensorboard, none
+  save_dir: "saves/"  # Directory to save model checkpoints and logs
+  save_freq: 30  # Save frequency in epochs (0 to disable) — upstream mopd save_freq
+  save_model_only: true  # Save only model weights (not optimizer/scheduler state)
+
+# Training Configuration
+train:
+  trainer_type: 'diffusion-opd'  # On-policy distillation trainer
+
+  # ---- Teachers: one HF LoRA per dataset, distilled into the student ----
+  teachers:
+    - name: "aes-teacher"  # Aesthetics teacher; upstream applies it to the pickscore prompt set
+      path: "quanhaol/DiffusionOPD/AesTeacher/lora"  # HF subfolder spec (owner/repo/subfolder)
+      applicable_datasets: [pickscore]  # Distill this teacher on pickscore rollouts
+      guidance_scale: 4.5  # Teacher CFG for its forward (upstream pickscore_teacher_gs)
+    - name: "ocr-teacher"  # Unique teacher id (named snapshot + log keys)
+      path: "quanhaol/DiffusionOPD/OCRTeacher/lora"  # HF subfolder spec (owner/repo/subfolder)
+      applicable_datasets: [ocr]  # Distill this teacher on ocr rollouts
+      guidance_scale: 4.5  # Teacher CFG for its forward (upstream ocr_teacher_gs)
+    - name: "geneval-teacher"  # Unique teacher id (named snapshot + log keys)
+      path: "quanhaol/DiffusionOPD/GenEvalTeacher/lora"  # HF subfolder spec (owner/repo/subfolder)
+      applicable_datasets: [geneval]  # Distill this teacher on geneval rollouts
+      guidance_scale: 1.0  # Teacher queried at its no-CFG distribution (upstream geneval_teacher_gs)
+
+  teacher_param_device: 'cuda'  # Teacher snapshot storage: 'cuda' (fast swaps) or 'cpu' (low VRAM)
+
+  resolution: 512  # Training resolution. Can be int or [height, width]
+  num_inference_steps: 10  # Number of denoising timesteps in the on-policy rollout
+  guidance_scale: 4.5  # Student CFG for rollout + forward (upstream sample.guidance_scale)
+  timestep_range: 0.99  # Distill the first 99% of denoising steps (upstream timestep_fraction); float f -> band [0, f]
+
+  per_device_batch_size: 3  # Batch size per GPU device (upstream train_batch_size)
+  group_size: 1  # Rollouts generated per prompt (upstream num_image_per_prompt = 1)
+  unique_sample_num_per_epoch: 72  # 24 prompts/teacher * 3 teachers (see geometry note in header)
+  num_inner_epochs: 1  # Reuse epochs over the (fixed) on-policy trajectories
+  gradient_step_per_epoch: 1  # One optimizer step per epoch (accumulate the 3 per-dataset batches)
+  gradient_accumulation_steps: auto  # Options: auto, or positive integer
+
+  learning_rate: 3.0e-4  # Initial learning rate for AdamW optimizer
+  adam_weight_decay: 1.0e-4  # AdamW weight decay regularization
+  adam_betas: [0.9, 0.999]  # AdamW momentum coefficients (beta1, beta2)
+  adam_epsilon: 1.0e-8  # AdamW epsilon for numerical stability
+  max_grad_norm: 1.0  # Max gradient norm for gradient clipping
+  max_epochs: 500  # Stop after this many epochs (-1 / null = unbounded)
+
+  ema_decay: 0.99  # EMA decay rate for model weights (0 to disable)
+  ema_update_interval: 4  # Update EMA every N epochs
+  ema_device: "cuda"  # Device to store EMA model. Options: cpu, cuda
+
+  enable_gradient_checkpointing: false  # Trade compute for memory savings
+  offload_samples_to_cpu: false  # Offload rollout samples (+ cached teacher means) to CPU
+  seed: 42  # Random seed for reproducibility
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "ODE"  # ODE distillation (mean matching). Switch to Flow-SDE + noise_level>0 for SDE.
+  noise_level: 0.0  # Noise injection level (0.0 for ODE; >0 enables SDE transition matching)
+  seed: 42  # Scheduler seed (for noise step selection)
+
+# Evaluation settings (shared defaults; per-dataset overrides above take precedence)
+eval:
+  resolution: 512  # Evaluation image resolution
+  per_device_batch_size: 16  # Eval batch size per device (upstream test_batch_size)
+  guidance_scale: 4.5  # Eval guidance scale (student CFG)
+  num_inference_steps: 40  # Eval denoising steps (more steps = higher quality)
+  eval_freq: 30  # Run evaluation every N epochs (0 to disable) — upstream mopd eval_freq
+  seed: 42  # Eval random seed
+
+# Reward Model Configuration (monitoring only — NOT used by the distillation loss)
+# Routing via `applicable_datasets`: geneval -> geneval, ocr -> ocr,
+# pick_score -> all three datasets (covers the `pickscore` dataset and provides
+# a general-quality signal on the others).
+rewards:
+  - name: "geneval"  # Reward identifier (appears in log keys)
+    reward_model: "GenEval"  # Reward model class (from registry)
+    batch_size: 32  # Inference batch size for this reward model
+    device: "cuda"  # Device to run reward model on
+    dtype: float32  # Precision for reward model inference
+    applicable_datasets: ["geneval"]  # Only fires on geneval source batches
+
+  - name: "ocr"  # Reward identifier (appears in log keys)
+    reward_model: "OCR"  # Reward model class (from registry)
+    batch_size: 32  # Inference batch size for this reward model
+    device: "cuda"  # Device to run reward model on
+    dtype: bfloat16  # Precision for reward model inference
+    applicable_datasets: ["ocr"]  # Only fires on ocr source batches
+
+  - name: "pick_score"  # General image-quality reward (covers the pickscore dataset)
+    reward_model: "PickScore"  # Reward model class (from registry)
+    batch_size: 32  # Inference batch size for this reward model
+    device: "cuda"  # Device to run reward model on
+    dtype: bfloat16  # Precision for reward model inference
+    # applicable_datasets omitted -> applies to ALL training datasets (pickscore, ocr, geneval)
+
+# Eval Reward Models (same routing as training rewards)
+eval_rewards:
+  - name: "geneval"  # Eval reward identifier
+    reward_model: "GenEval"  # Reward model class (from registry)
+    batch_size: 32  # Larger batch for eval (no gradient, more memory available)
+    device: "cuda"  # Device to run reward model on
+    dtype: float32  # Precision for reward model inference
+    applicable_datasets: ["geneval"]  # Only scores geneval eval samples
+
+  - name: "ocr"  # Eval reward identifier
+    reward_model: "OCR"  # Reward model class (from registry)
+    batch_size: 32  # Larger batch for eval (no gradient, more memory available)
+    device: "cuda"  # Device to run reward model on
+    dtype: bfloat16  # Precision for reward model inference
+    applicable_datasets: ["ocr"]  # Only scores ocr eval samples
+
+  - name: "pick_score"  # Eval reward identifier (covers the pickscore dataset)
+    reward_model: "PickScore"  # Reward model class (from registry)
+    batch_size: 32  # Larger batch for eval (no gradient, more memory available)
+    device: "cuda"  # Device to run reward model on
+    dtype: bfloat16  # Precision for reward model inference
+    # applicable_datasets omitted -> applies to all eval datasets (pickscore, ocr, geneval)

@@ -14,14 +14,12 @@
 
 # src/flow_factory/data_utils/sampler_loader.py
 from torch.utils.data import Sampler, Dataset
-from accelerate import Accelerator
 
 from .sampler import (
     DistributedKRepeatSampler,
     GroupContiguousSampler,
     GroupDistributedSampler,
 )
-from ..hparams import Arguments
 
 SAMPLER_REGISTRY = {
     "distributed_k_repeat": DistributedKRepeatSampler,
@@ -32,26 +30,28 @@ SAMPLER_REGISTRY = {
 
 def get_data_sampler(
     dataset: Dataset,
-    config: Arguments,
-    accelerator: Accelerator,
+    *,
+    sampler_type: str,
+    batch_size: int,
+    group_size: int,
+    unique_sample_num: int,
+    num_replicas: int,
+    rank: int,
+    seed: int,
 ) -> Sampler:
-    """
-    Factory function to create the appropriate distributed sampler.
+    """Factory function to create the appropriate distributed sampler.
 
-    The sampler strategy is determined by ``config.data_args.sampler_type``,
-    which is resolved in ``Arguments._resolve_sampler_type()`` and aligned in
-    ``Arguments._align_batch_geometry()`` during ``__post_init__``.
+    All parameters are passed as explicit primitives so this function
+    has no dependency on the ``Arguments`` config object.  The resolved
+    per-source ``unique_sample_num`` flows naturally from
+    ``DatasetTrainSpec.unique_sample_num_per_epoch`` (written by
+    ``Arguments._align_batch_geometry``).
 
     Returns:
-        - GroupContiguousSampler when resolved type is ``"group_contiguous"``
-          (keeps each group's samples on the same rank)
-        - GroupDistributedSampler when resolved type is ``"group_distributed"``
-          (split each group evenly across ranks)
-        - DistributedKRepeatSampler when resolved type is ``"distributed_k_repeat"``
-          (default behavior)
+        - GroupContiguousSampler when ``sampler_type == "group_contiguous"``
+        - GroupDistributedSampler when ``sampler_type == "group_distributed"``
+        - DistributedKRepeatSampler when ``sampler_type == "distributed_k_repeat"``
     """
-    training_args = config.training_args
-    sampler_type = config.data_args.sampler_type
     sampler_cls = SAMPLER_REGISTRY.get(sampler_type)
     if sampler_cls is None:
         raise ValueError(
@@ -59,10 +59,10 @@ def get_data_sampler(
         )
     return sampler_cls(
         dataset=dataset,
-        batch_size=training_args.per_device_batch_size,
-        group_size=training_args.group_size,
-        unique_sample_num=training_args.unique_sample_num_per_epoch,
-        num_replicas=accelerator.num_processes,
-        rank=accelerator.process_index,
-        seed=training_args.seed,
+        batch_size=batch_size,
+        group_size=group_size,
+        unique_sample_num=unique_sample_num,
+        num_replicas=num_replicas,
+        rank=rank,
+        seed=seed,
     )

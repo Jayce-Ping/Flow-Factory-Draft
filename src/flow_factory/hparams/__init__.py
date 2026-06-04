@@ -26,9 +26,13 @@ from .training_args import (
     AWMTrainingArguments,
     DGPOTrainingArguments,
     DPOTrainingArguments,
+    CRDTrainingArguments,
+    DiffusionOPDTrainingArguments,
+    TeacherConfig,
     get_training_args_class,
 )
 from .reward_args import RewardArguments, MultiRewardArguments
+from .dataset_args import DatasetArguments, DatasetTrainSpec, DatasetEvalSpec
 from .log_args import LogArguments
 
 
@@ -43,8 +47,14 @@ __all__ = [
     "AWMTrainingArguments",
     "DGPOTrainingArguments",
     "DPOTrainingArguments",
+    "CRDTrainingArguments",
+    "DiffusionOPDTrainingArguments",
+    "TeacherConfig",
     "get_training_args_class",
     "RewardArguments",
     "MultiRewardArguments",
+    "DatasetArguments",
+    "DatasetTrainSpec",
+    "DatasetEvalSpec",
     "LogArguments",
 ]

@@ -804,88 +804,14 @@ class DGPOTrainer(BaseTrainer):
             self.adapter.ema_step(step=self.epoch)
             self.epoch += 1
 
-    # =========================== Evaluation ============================
-    def evaluate(self) -> None:
-        """Evaluation loop (kept GRPO-equivalent: always use sampling EMA)."""
-        if self.test_dataloader is None:
-            return
-
-        self.adapter.eval()
-        self.eval_reward_buffer.clear()
-
-        with torch.no_grad(), self.autocast(), self.adapter.use_ema_parameters():
-            all_samples: List[BaseSample] = []
-
-            for batch in tqdm(
-                self.test_dataloader,
-                desc="Evaluating",
-                disable=not self.show_progress_bar,
-            ):
-                generator = create_generator_by_prompt(batch["prompt"], self.training_args.seed)
-                inference_kwargs = {
-                    "compute_log_prob": False,
-                    "generator": generator,
-                    "trajectory_indices": None,
-                    **self.eval_args,
-                }
-                inference_kwargs.update(**batch)
-                inference_kwargs = filter_kwargs(self.adapter.inference, **inference_kwargs)
-                samples = self.adapter.inference(**inference_kwargs)
-                all_samples.extend(samples)
-                self.eval_reward_buffer.add_samples(samples)
-
-            rewards = self.eval_reward_buffer.finalize(store_to_samples=True, split="pointwise")
-            rewards = {
-                key: torch.as_tensor(value).to(self.accelerator.device)
-                for key, value in rewards.items()
-            }
-            gathered_rewards: Dict[str, np.ndarray] = {}
-            for key, value in rewards.items():
-                gathered: torch.Tensor = self.accelerator.gather(value)  # type: ignore[assignment]
-                gathered_rewards[key] = gathered.cpu().numpy()
-
-            if self.accelerator.is_main_process:
-                log_data: Dict[str, Any] = {
-                    f"eval/reward_{key}_mean": np.mean(value)
-                    for key, value in gathered_rewards.items()
-                }
-                log_data.update(
-                    {
-                        f"eval/reward_{key}_std": np.std(value)
-                        for key, value in gathered_rewards.items()
-                    }
-                )
-                log_data["eval_samples"] = all_samples
-                self.log_data(log_data, step=self.step)
-            self.accelerator.wait_for_everyone()
-
     # =========================== Sampling (Stages 2-3) ============================
     def sample(self) -> List[BaseSample]:
-        """Generate rollouts for DGPO (ODE sampling, final latents only)."""
-        self.adapter.rollout()
-        self.reward_buffer.clear()
-        samples = []
-        data_iter = iter(self.dataloader)
-
-        with torch.no_grad(), self.autocast():
-            for _ in tqdm(
-                range(self.training_args.num_batches_per_epoch),
-                desc=f"Epoch {self.epoch} Sampling",
-                disable=not self.show_progress_bar,
-            ):
-                batch = next(data_iter)
-                sample_kwargs = {
-                    **self.training_args,
-                    "compute_log_prob": False,
-                    "trajectory_indices": [-1],
-                    **batch,
-                }
-                sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
-                sample_batch = self.adapter.inference(**sample_kwargs)
-                samples.extend(sample_batch)
-                self.reward_buffer.add_samples(sample_batch)
-
-        return samples
+        """Generate rollouts for DGPO (final latents only)."""
+        return self.generate_samples(
+            reward_buffer=self.reward_buffer,
+            compute_log_prob=False,
+            trajectory_indices=[-1],
+        )
 
     # =========================== Reward / Advantage (Stages 4-5) ============================
     def prepare_feedback(self, samples: List[BaseSample]) -> None:

@@ -24,6 +24,7 @@ import torch
 from typing import Dict, Optional, List, Tuple, Literal
 
 from safetensors.torch import save_file, load_file
+from huggingface_hub import snapshot_download
 
 def mapping_lora_state_dict(
         state_dict: Dict[str, torch.Tensor],
@@ -138,3 +139,120 @@ def infer_target_modules(
             target_modules.add(match.group(1))
     
     return sorted(target_modules)
+
+
+# ================================ Hugging Face Hub ================================
+HF_PATH_PREFIX = "hf://"
+
+
+def parse_hf_checkpoint_path(path: str) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    Parse a Hugging Face checkpoint path spec into ``(repo_id, subfolder, revision)``.
+
+    Accepts both bare and ``hf://``-prefixed specs:
+      - ``owner/repo``                          -> (``owner/repo``,  None,           None)
+      - ``hf://owner/repo``                     -> (``owner/repo``,  None,           None)
+      - ``owner/repo/sub/dir``                  -> (``owner/repo``,  ``sub/dir``,    None)
+      - ``owner/repo@v1.0``                     -> (``owner/repo``,  None,           ``v1.0``)
+      - ``hf://owner/repo/sub/dir@v1.0``        -> (``owner/repo``,  ``sub/dir``,    ``v1.0``)
+
+    Args:
+        path: A bare or ``hf://``-prefixed checkpoint spec.
+
+    Returns:
+        Tuple of (repo_id, subfolder, revision); subfolder and revision are ``None`` when absent.
+
+    Raises:
+        ValueError: If the spec lacks the ``owner/repo`` form (at minimum two path segments).
+    """
+    if not isinstance(path, str):
+        raise TypeError(
+            f"expected str for path, got {type(path).__name__}: {path!r}"
+        )
+
+    spec = path[len(HF_PATH_PREFIX):] if path.startswith(HF_PATH_PREFIX) else path
+
+    # Split off optional @revision (revision token cannot contain '/' or '@').
+    revision: Optional[str] = None
+    if "@" in spec:
+        spec, revision = spec.rsplit("@", 1)
+        if not revision or "/" in revision:
+            raise ValueError(
+                f"invalid revision in HF checkpoint path: {path!r} "
+                f"(expected 'owner/repo[/subfolder][@revision]', got revision={revision!r})"
+            )
+
+    parts = [p for p in spec.split("/") if p]
+    if len(parts) < 2:
+        raise ValueError(
+            f"invalid HF checkpoint path: {path!r} "
+            f"(expected at least 'owner/repo', got {len(parts)} non-empty segments)"
+        )
+
+    # Reject path-traversal segments. Without this, a spec like
+    # 'owner/repo/..' would resolve via os.path.join to a directory outside
+    # the snapshot root and let downstream loaders read from unintended
+    # locations. Backslashes are rejected to block Windows-style traversal.
+    for seg in parts:
+        if seg in (".", "..") or "\\" in seg:
+            raise ValueError(
+                f"invalid segment {seg!r} in HF checkpoint path: {path!r} "
+                f"('.', '..', and backslashes are not allowed)"
+            )
+
+    repo_id = "/".join(parts[:2])
+    subfolder = "/".join(parts[2:]) if len(parts) > 2 else None
+    return repo_id, subfolder, revision
+
+
+def download_hf_checkpoint(
+    repo_id: str,
+    subfolder: Optional[str] = None,
+    revision: Optional[str] = None,
+) -> str:
+    """
+    Download a Hugging Face checkpoint snapshot and return the local directory path.
+
+    Thin wrapper over ``huggingface_hub.snapshot_download``. When ``subfolder`` is
+    provided, restricts the download to that subtree via ``allow_patterns`` and
+    returns the path joined with the subfolder so the caller receives the directory
+    layout that the existing local-checkpoint loaders expect.
+
+    Authentication is taken from the standard ``HF_TOKEN`` / ``HUGGING_FACE_HUB_TOKEN``
+    environment variables (and the local ``~/.cache/huggingface/token`` cache). For
+    multi-node training the token must be available on every node.
+
+    Args:
+        repo_id: HF repository identifier in ``owner/repo`` form.
+        subfolder: Optional subdirectory within the repo to fetch.
+        revision: Optional git revision (branch, tag, or commit SHA).
+
+    Returns:
+        Absolute local directory path containing the snapshot (with ``subfolder`` appended when set).
+    """
+    if not isinstance(repo_id, str) or "/" not in repo_id:
+        raise ValueError(
+            f"expected 'owner/repo' for repo_id, got {repo_id!r}"
+        )
+
+    allow_patterns: Optional[List[str]] = None
+    if subfolder:
+        # Match the subfolder itself plus everything beneath it.
+        allow_patterns = [f"{subfolder}/*", f"{subfolder}/**"]
+
+    local_root = snapshot_download(
+        repo_id=repo_id,
+        revision=revision,
+        allow_patterns=allow_patterns,
+    )
+
+    if subfolder:
+        local_path = os.path.join(local_root, subfolder)
+        if not os.path.isdir(local_path):
+            raise FileNotFoundError(
+                f"HF snapshot for repo_id={repo_id!r} (revision={revision!r}) did not "
+                f"contain expected subfolder {subfolder!r}; downloaded root={local_root!r}"
+            )
+        return local_path
+
+    return local_root

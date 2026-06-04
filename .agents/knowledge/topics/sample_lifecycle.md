@@ -28,7 +28,7 @@ The producer (`_maybe_offload_samples_to_cpu`, `BaseTrainer` in `trainers/abc.py
 
 ## Switch: `offload_samples_to_cpu`
 
-Defined on `TrainingArguments` (`hparams/training_args.py`). Default `False`: legacy GPU-resident behaviour. Setting `True` activates the full producer + consumer pipeline.
+Defined on `TrainingArguments` (`hparams/training_args/_base.py`). Default `False`: legacy GPU-resident behaviour. Setting `True` activates the full producer + consumer pipeline.
 
 | Setting | Sample location after `sample()` | `optimize()` per-batch reload | Reward path |
 |---------|----------------------------------|-------------------------------|-------------|

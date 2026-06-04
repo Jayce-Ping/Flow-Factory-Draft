@@ -66,11 +66,20 @@ class ArgABC(ABC):
         return cls(**init_data)
 
     def to_dict(self) -> dict[str, Any]:
-        """Convert to dict, flattening extra_kwargs into the root."""
+        """Convert to dict, flattening extra_kwargs into the root.
+
+        Fields whose names start with ``_`` are runtime/internal caches
+        (e.g. ``RewardArguments._datasets_resolved``) and are omitted from
+        the export so they never leak into config sinks (wandb / SwanLab
+        config, YAML dump, checkpoint metadata).
+        """
         d = asdict(self)
         extras = d.pop("extra_kwargs", {})
+        for key in list(d):
+            if key.startswith("_"):
+                del d[key]
         # Merge extras back into the main dict for a clean export
-        d.update(extras) 
+        d.update(extras)
         return d
 
     def __getattr__(self, name: str) -> Any:

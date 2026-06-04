@@ -7,14 +7,20 @@ num_processes: 8
 main_process_port: 29500
 mixed_precision: "bf16"
 
+# Data Configuration
 data:
-  dataset_dir: "dataset/pickscore"
+  datasets:
+    - name: default  # Unique identifier (used in metrics, caching, reward routing)
+      dataset_dir: "dataset/pickscore"  # Folder with train.jsonl / test.jsonl
+      train:  # Training participation config
+        weight: 1  # Mixing weight (integer); ratio with other sources determines batch allocation
+        max_dataset_size: 10000  # Cap on number of training samples for this source
+      eval: {}  # Eval participation (inherits shared `eval:` section settings)
   enable_preprocess: false
   preprocessing_batch_size: 8
   dataloader_num_workers: 16
   force_reprocess: false
   cache_dir: "~/.cache/flow_factory/datasets"
-  max_dataset_size: 10000
   sampler_type: "auto"
 
 model:
@@ -24,7 +30,7 @@ model:
   target_modules: "default"
   model_name_or_path: "black-forest-labs/FLUX.1-dev"
   model_type: "flux1"
-  resume_path: null
+  resume_path: null # Local path or HF repo id (e.g. 'owner/repo[/subdir][@rev]') for previous checkpoint/lora adapter
   resume_type: null
 
 log:
@@ -57,7 +63,7 @@ train:
   adv_clip_range: 5.0
   resolution: 512
   num_inference_steps: 20
-  guidance_scale: 2.5
+  guidance_scale: 1.0
   per_device_batch_size: 1
   group_size: 16
   global_std: false
@@ -77,7 +83,7 @@ scheduler:
 eval:
   resolution: 512
   per_device_batch_size: 1
-  guidance_scale: 2.5
+  guidance_scale: 1.0
   num_inference_steps: 28
   eval_freq: 10
   seed: 42

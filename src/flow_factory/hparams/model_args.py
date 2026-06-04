@@ -80,7 +80,15 @@ class ModelArguments(ArgABC):
 
     resume_path : Optional[str] = field(
         default=None,
-        metadata={"help": "Resume from checkpoint directory."}
+        metadata={
+            "help": "Resume from checkpoint. Accepts either a local directory or a "
+                    "Hugging Face repo spec ('owner/repo[/subfolder][@revision]', or "
+                    "explicit 'hf://owner/repo[/subfolder][@revision]'). When a local "
+                    "path doesn't exist, falls back to Hugging Face Hub download. "
+                    "Multi-node: HF_TOKEN must be set on every node; downloads happen "
+                    "once per node; consider HF_HUB_ENABLE_HF_TRANSFER=1 for large "
+                    "checkpoints to avoid NCCL watchdog timeouts."
+        }
     )
 
     resume_type : Optional[Literal['lora', 'full', 'state']] = field(
@@ -104,7 +112,7 @@ class ModelArguments(ArgABC):
         },
     )
 
-    def __post_init__(self):        
+    def __post_init__(self):
         if isinstance(self.master_weight_dtype, str):
             self.master_weight_dtype = dtype_map[self.master_weight_dtype]
 
