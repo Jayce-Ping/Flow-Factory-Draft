@@ -74,10 +74,12 @@ from ...utils.trajectory_collector import (
 )
 from ...utils.logger_utils import setup_logger
 
-from .data.data_utils import pil_img2rgb
+from .data.data_utils import pil_img2rgb, add_special_tokens
+from .data.transforms import ImageTransform
 from .pipeline import BagelPseudoPipeline
 from .modeling.bagel import Bagel
 from .modeling.bagel.qwen2_navit import NaiveCache
+from .modeling.qwen2 import Qwen2Tokenizer
 
 logger = setup_logger(__name__)
 
@@ -147,10 +149,6 @@ class BagelAdapter(BaseAdapter):
 
     def _init_tokenizer_and_transforms(self):
         """Initialize tokenizer, special tokens, and image transforms."""
-        from .modeling.qwen2 import Qwen2Tokenizer
-        from .data.data_utils import add_special_tokens
-        from .data.transforms import ImageTransform
-
         self._tokenizer = Qwen2Tokenizer.from_pretrained(self._model_path)
         self._tokenizer, self.new_token_ids, _ = add_special_tokens(self._tokenizer)
 

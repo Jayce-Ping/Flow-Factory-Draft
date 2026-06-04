@@ -24,8 +24,19 @@ from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
+from accelerate import init_empty_weights
+from huggingface_hub import snapshot_download
+from safetensors.torch import load_file
 
-from .modeling.bagel import Bagel
+from .modeling.autoencoder import load_ae
+from .modeling.bagel import (
+    Bagel,
+    BagelConfig,
+    Qwen2Config,
+    Qwen2ForCausalLM,
+    SiglipVisionConfig,
+    SiglipVisionModel,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +55,6 @@ def _resolve_model_path(model_path: str, **kwargs) -> str:
     """
     if os.path.isdir(model_path):
         return model_path
-
-    from huggingface_hub import snapshot_download
 
     # Filter kwargs that snapshot_download accepts
     _SNAPSHOT_KEYS = {
@@ -155,18 +164,6 @@ class BagelPseudoPipeline:
                       keys (``layer_module``, ``latent_patch_size``, …)
                       are used directly.
         """
-        from safetensors.torch import load_file
-
-        from .modeling.autoencoder import load_ae
-        from .modeling.bagel import (
-            Bagel,
-            BagelConfig,
-            Qwen2Config,
-            Qwen2ForCausalLM,
-            SiglipVisionConfig,
-            SiglipVisionModel,
-        )
-
         # ── Resolve to local directory (download if needed) ──────────
         model_path = _resolve_model_path(model_path, **kwargs)
 
@@ -200,8 +197,6 @@ class BagelPseudoPipeline:
 
         # ---- Build Models ----
         if low_cpu_mem_usage:
-            from accelerate import init_empty_weights
-
             with init_empty_weights():
                 language_model = Qwen2ForCausalLM(llm_config)
                 vit_model = SiglipVisionModel(vit_config)
