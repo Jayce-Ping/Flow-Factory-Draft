@@ -7,7 +7,7 @@ mixed_precision: "bf16"  # Options: no, fp16, bf16
 
 log:
   run_name: null  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
-  project: "Flow-Factory-Bagel"  # Project name for logging
+  project: "Flow-Factory"  # Project name for logging
   logging_backend: "wandb"  # Options: wandb, swanlab, tensorboard, none
   save_dir: "saves"  # Directory to save model checkpoints and logs
   save_freq: 20  # Save frequency in epochs (0 to disable)
@@ -104,20 +104,21 @@ scheduler:
 eval:
   resolution: 1024  # Evaluation resolution
   per_device_batch_size: 1  # Eval batch size
-  num_inference_steps: 28  # Number of eval timesteps
+  num_inference_steps: 50  # Number of eval timesteps
   eval_freq: 20  # Eval frequency in epochs (0 to disable)
   seed: 42  # Eval seed (defaults to training seed)
 
   # Bagel-specific generation params (passed to inference/forward via **training_args)
-  cfg_text_scale: 4.0
-  cfg_img_scale: 1.0
-  cfg_interval: [0.0, 1.0]
+  cfg_text_scale: 3.0
+  cfg_img_scale: 1.5
+  cfg_interval: [0.4, 1.0]
   cfg_renorm_min: 0.0
   cfg_renorm_type: global
+  timestep_shift: 3.0
 
 # Reward Model Configuration
 rewards:
-  - name: "pick_score"
+  - name: "pickscore"
     reward_model: "PickScore"
     weight: 1  # Weight of this reward model
     batch_size: 16
@@ -126,7 +127,7 @@ rewards:
 
 # Optional Evaluation Reward Models
 eval_rewards:
-  - name: "pick_score"
+  - name: "pickscore"
     reward_model: "PickScore"
     weight: 1  # Weight of this reward model
     batch_size: 32
