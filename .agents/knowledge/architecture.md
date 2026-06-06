@@ -122,6 +122,7 @@ All three registries map string keys → lazy import paths. Resolution: registry
 | `wan2_v2v` | `Wan2_V2V_Adapter` | Video-to-Video |
 | `ltx2_t2av` | `LTX2_T2AV_Adapter` | Text-to-Audio-Video |
 | `ltx2_i2av` | `LTX2_I2AV_Adapter` | Image-to-Audio-Video |
+| `bagel` | `BagelAdapter` | Text-to-Image & Image(s)-to-Image (T2I batched via NaViT packing; I2I per-sample fallback — see `topics/adapter_conventions.md`) |
 
 **Reward Models** (`rewards/registry.py`):
 | Key | Class | Type |
