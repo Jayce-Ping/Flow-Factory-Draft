@@ -267,10 +267,11 @@ The following reward models are pre-registered and ready to use:
 | `vllm_evaluate` | Pointwise | VLM Yes/No judge + logprobs over an OpenAI-compatible API | [Rewards: VLM-as-Judge](guidance/rewards.md#vlm-as-judge) |
 | `rational_rewards_t2i` | Pointwise | A reasoning reward model that provides multi-aspect reward for text-to-image; parsed aspects → scalar in [0, 1] | [RationalRewards-8B-T2I](https://huggingface.co/TIGER-Lab/RationalRewards-8B-T2I) |
 | `rational_rewards_edit` | Pointwise | A reasoning reward model that provides multi-aspect reward for image edit; four aspects → scalar in [0, 1] | [RationalRewards-8B-Edit](https://huggingface.co/TIGER-Lab/RationalRewards-8B-Edit) |
+| `qwen_image_bench` | Pointwise | Qwen-Image-Bench "Q-Judger"; hierarchical 5-dim / 56-facet scoring with per-prompt `dims_en` → scalar in [0, 1] | [Qwen-Image-Bench](https://github.com/QwenLM/Qwen-Image-Bench) |
 
 > **GenEval** requires extra dependencies (mmcv, mmdet, open_clip). Install with: `bash scripts/install_geneval_deps.sh` (Python 3.10 recommended). See [guidance/rewards.md](guidance/rewards.md#dataset-metadata-convention) for dataset format.
 
-> **VLM-as-Judge** (remote vLLM / OpenAI-style HTTP) is covered in [guidance/rewards.md#vlm-as-judge](guidance/rewards.md#vlm-as-judge) (`vllm_evaluate`, Rational Rewards, async tips). For [RationalRewards](https://github.com/TIGER-AI-Lab/RationalRewards) specifically, serve the judge with [`scripts/start_vllm_rational_reward.sh`](scripts/start_vllm_rational_reward.sh) and set YAML `api_base_url` / `vlm_model` to match `--served-model-name` (defaults: `RationalRewards-8B-T2I` / `RationalRewards-8B-Edit`).
+> **VLM-as-Judge** (remote vLLM / OpenAI-style HTTP) is covered in [guidance/rewards.md#vlm-as-judge](guidance/rewards.md#vlm-as-judge) (`vllm_evaluate`, Rational Rewards, `qwen_image_bench`, async tips). For [RationalRewards](https://github.com/TIGER-AI-Lab/RationalRewards) specifically, serve the judge with [`scripts/start_vllm_rational_reward.sh`](scripts/start_vllm_rational_reward.sh) and set YAML `api_base_url` / `vlm_model` to match `--served-model-name` (defaults: `RationalRewards-8B-T2I` / `RationalRewards-8B-Edit`). For [Qwen-Image-Bench](https://github.com/QwenLM/Qwen-Image-Bench), use [`scripts/start_vllm_qwen_image_bench.sh`](scripts/start_vllm_qwen_image_bench.sh) and build the dataset with `python dataset/qwen_image_bench/prepare.py`.
 
 ## Using Built-in Reward Models
 

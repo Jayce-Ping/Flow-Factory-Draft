@@ -134,6 +134,7 @@ All three registries map string keys → lazy import paths. Resolution: registry
 | `vllm_evaluate` | `VLMEvaluateRewardModel` | Pointwise |
 | `rational_rewards_t2i` | `RationalRewardsT2I` | Pointwise |
 | `rational_rewards_edit` | `RationalRewardsEdit` | Pointwise |
+| `qwen_image_bench` | `QwenImageBenchRewardModel` | Pointwise |
 
 ---
 

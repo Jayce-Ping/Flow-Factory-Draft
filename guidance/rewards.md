@@ -42,6 +42,7 @@ Flow-Factory supports two paradigms for computing rewards:
 | `vllm_evaluate` | Pointwise | VLM with a binary Yes/No question; reward from logprobs via OpenAI-compatible API | [VLM-as-Judge](#vlm-as-judge) |
 | `rational_rewards_t2i` | Pointwise | T2I rubric judge (remote VLM); see [VLM-as-Judge](#vlm-as-judge) and [Example: Rational Rewards](#example-rational-rewards) | [Rational Rewards](https://github.com/TIGER-AI-Lab/RationalRewards) |
 | `rational_rewards_edit` | Pointwise | Image-edit rubric (source + edited). Same setup family as T2I variant | [Rational Rewards](https://github.com/TIGER-AI-Lab/RationalRewards) |
+| `qwen_image_bench` | Pointwise | Qwen-Image-Bench "Q-Judger" (remote VLM); hierarchical 5-dim / 56-facet scoring, faithful per-prompt `dims_en`; see [VLM-as-Judge](#vlm-as-judge) and [Example: Qwen-Image-Bench](#example-qwen-image-bench) | [Qwen-Image-Bench](https://github.com/QwenLM/Qwen-Image-Bench) |
 
 ## VLM-as-Judge
 
@@ -51,6 +52,7 @@ Flow-Factory supports two paradigms for computing rewards:
 
 - **`vllm_evaluate`** (registry key: ``vllm_evaluate``) asks a short **Yes/No** question, reads **logprobs** from the completion, and returns a scalar reward. It fits when you want a light judge prompt and no rubric parsing in Python.
 - **`rational_rewards_t2i`** and **`rational_rewards_edit`** (keys: ``rational_rewards_t2i``, ``rational_rewards_edit``) send a **long structured rubric** in the user message, parse the assistant reply into per-aspect scores, then aggregate. They follow the same HTTP/OpenAI client pattern; deployment steps for serving the weights are illustrated below under **Example: Rational Rewards**.
+- **`qwen_image_bench`** (key: ``qwen_image_bench``) runs the [Qwen-Image-Bench](https://github.com/QwenLM/Qwen-Image-Bench) "Q-Judger". It scores facets on a 3-level hierarchy (5 L1 dimensions / 23 L2 / 56 L3), each rated 0/1/2/N/A and aggregated L3→L2→L1→total (0-100), normalized to [0, 1]. Which L1 dimensions are scored is resolved **per prompt** from a ``dims_en`` checklist (faithful mode) when present, else a configurable fixed ``dimensions`` list. Deployment under **Example: Qwen-Image-Bench**.
 
 ### Example: Rational Rewards
 
@@ -86,6 +88,37 @@ Flow-Factory supports two paradigms for computing rewards:
 | ``examples/nft/lora/flux1_kontext/rational_rewards_edit.yaml`` | ``rational_rewards_edit`` | FLUX.1-Kontext |
 
 Rubric format and project background: [TIGER-AI-Lab/RationalRewards](https://github.com/TIGER-AI-Lab/RationalRewards). Tuning how parsed aspect scores map to the final scalar: adjust ``aggregate_aspect_scores`` in ``src/flow_factory/rewards/rational_rewards_t2i.py`` (shared with edit via ``supported_aspects``) or post-process in the edit module after parsing.
+
+### Example: Qwen-Image-Bench
+
+``qwen_image_bench`` calls the **remote** Qwen-Image-Bench judge ([Qwen/Qwen-Image-Bench](https://huggingface.co/Qwen/Qwen-Image-Bench), a fine-tuned ~27B Qwen3-VL) over an **OpenAI-compatible** API, the same deployment pattern as Rational Rewards.
+
+1. **Install** vLLM in the judge environment; training only needs ``pip install openai``.
+2. **Start the server** (wrapper script defaults ``MODEL_PATH=Qwen/Qwen-Image-Bench`` and ``SERVED_MODEL_NAME=Qwen-Image-Bench``). The judge emits a ``<think>…</think>`` section before the JSON scores, so keep ``--max-model-len`` well above (image tokens + ``max_tokens``):
+
+   ```bash
+   export CUDA_VISIBLE_DEVICES=0,1,2,3
+   ./scripts/start_vllm_qwen_image_bench.sh --max-model-len 32768
+   ```
+
+   Override ``PORT``, ``SERVED_MODEL_NAME``, ``TENSOR_PARALLEL_SIZE``, ``GPU_MEMORY_UTILIZATION``, or ``VLLM_BIN`` via environment variables documented in ``scripts/start_vllm_qwen_image_bench.sh``.
+
+3. **Point training YAML** at the API: set ``api_base_url`` to ``http://<host>:<port>/v1`` and ``vlm_model`` to the same string as ``--served-model-name`` (default ``Qwen-Image-Bench``).
+
+**Per-prompt checklists (``dims_en``).** The judge scores only the L1 dimensions a prompt declares. Build the dataset with ``python dataset/qwen_image_bench/prepare.py`` (downloads [Qwen/Qwen-Image-Bench](https://huggingface.co/datasets/Qwen/Qwen-Image-Bench) and writes ``train.jsonl``/``test.jsonl`` carrying ``dims_en``). The ``dims_en`` column flows to the reward via the per-sample ``metadata`` JSON, enabling faithful per-prompt scoring. For datasets **without** ``dims_en``, the reward falls back to the fixed ``dimensions`` config.
+
+**Key config keys** (in addition to ``api_base_url`` / ``api_key`` / ``vlm_model``):
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| ``call_strategy`` | ``per_dimension`` | ``per_dimension`` issues one judge call per L1 dim (faithful, matches the benchmark); ``single_call`` scores all dims in one call (cheaper, slight deviation). |
+| ``dimensions`` | all five L1 dims | Fallback L1 dimensions when a sample has no ``dims_en``. |
+| ``score_dimension`` | ``total`` | ``total`` (overall) or a single L1 dim name. |
+| ``max_tokens`` | ``4096`` | Generation cap (the judge uses thinking). |
+
+**Cost.** ``per_dimension`` means up to 5 judge calls per image (each with a thinking trace), which dominates RL wall-clock; use ``async_reward: true`` with a high ``num_workers``/``max_concurrent``, trim ``dimensions``, or switch to ``single_call``.
+
+**Example config**: [examples/grpo/lora/sd3_5/qwen_image_bench.yaml](../examples/grpo/lora/sd3_5/qwen_image_bench.yaml) (GRPO LoRA SD3.5 on the Qwen-Image-Bench prompts). Aggregation logic is vendored from upstream under ``src/flow_factory/rewards/qwen_image_bench/`` (``checklists.py``, ``score_utils.py``).
 
 ## Using Built-in Reward Models
 
