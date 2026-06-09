@@ -71,8 +71,14 @@ from ...scheduler import (
     FlowMatchEulerDiscreteSDEScheduler,
     SDESchedulerOutput,
 )
-from ...utils.base import filter_kwargs
-from ...utils.image import ImageBatch, ImageSingle, MultiImageBatch, standardize_image_batch
+from ...utils.base import move_tensors_to_device
+from ...utils.image import (
+    ImageBatch,
+    MultiImageBatch,
+    is_multi_image_batch,
+    standardize_image_batch,
+)
+from ...utils.imports import get_flash_attn_version, is_flash_attn_available
 from ...utils.logger_utils import setup_logger
 from ...utils.trajectory_collector import (
     CallbackCollector,
@@ -82,6 +88,26 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+
+# Bagel's LLM attention (qwen2_navit) hard-requires flash-attn's varlen kernel,
+# imported transitively by the `.modeling` imports below. Fail fast here with
+# install guidance instead of a deep ModuleNotFoundError from the vendored
+# modeling code when the adapter is loaded.
+_FLASH_ATTN_MIN_VERSION = "2.5.8"
+if not is_flash_attn_available(_FLASH_ATTN_MIN_VERSION):
+    _installed_flash_attn = get_flash_attn_version()
+    _flash_attn_detail = (
+        f"found flash-attn {_installed_flash_attn}, but >= {_FLASH_ATTN_MIN_VERSION} is required"
+        if _installed_flash_attn is not None
+        else "flash-attn is not installed"
+    )
+    raise ImportError(
+        f"The Bagel model adapter requires flash-attn >= {_FLASH_ATTN_MIN_VERSION} "
+        f'({_flash_attn_detail}). Install it with `pip install -e ".[bagel]"`, or a '
+        f"prebuilt wheel matching your torch/CUDA/Python from "
+        f"https://github.com/Dao-AILab/flash-attention/releases."
+    )
+
 from .data.data_utils import add_special_tokens, pil_img2rgb
 from .data.transforms import ImageTransform
 from .modeling.bagel import Bagel
@@ -393,6 +419,44 @@ class BagelAdapter(BaseAdapter):
         # Any non-list, non-None value (e.g. a single image / tensor) is a condition.
         return True
 
+    @staticmethod
+    def _normalize_condition_images(
+        condition_images: Optional[MultiImageBatch],
+    ) -> Optional[List[List[Image.Image]]]:
+        """Normalize condition images to a per-sample ``List[List[PIL]]`` (or None).
+
+        Reuses ``is_multi_image_batch`` + ``standardize_image_batch`` (mirroring the
+        multi-condition pattern in ``flux2.py``): a non-nested input is treated as a
+        single sample's images; each sample's images are standardized to PIL. Empty
+        per-sample entries become ``[]``. Accepts PIL (rollout) or tensor (training,
+        after ``BaseSample`` canonicalization) inputs uniformly.
+        """
+        if condition_images is None:
+            return None
+        per_sample = (
+            condition_images if is_multi_image_batch(condition_images) else [condition_images]
+        )
+        return [
+            (
+                standardize_image_batch(imgs, output_type="pil")
+                if imgs is not None and len(imgs) > 0
+                else []
+            )
+            for imgs in per_sample
+        ]
+
+    @staticmethod
+    def _uniform_condition_count(condition_images: List[List[Image.Image]]) -> bool:
+        """Return True if every sample carries the same (>=1) number of condition images.
+
+        Batched I2I requires a uniform per-sample count: the model's packed KV-cache
+        grows uniformly only when every per-image round processes all B samples
+        (the cache is monolithic, so subset rounds would corrupt non-participating
+        samples). Variable counts therefore use the per-sample fallback.
+        """
+        counts = {len(imgs) for imgs in condition_images}
+        return len(counts) == 1 and 0 not in counts
+
     # ======================== Decoding ========================
 
     def decode_latents(
@@ -443,35 +507,47 @@ class BagelAdapter(BaseAdapter):
     def _build_gen_context(
         self,
         prompt: Union[str, List[str]],
-        condition_images: Optional[ImageBatch] = None,
+        condition_images: Optional[List[List[Image.Image]]] = None,
         think: bool = False,
     ) -> Tuple[Dict, Dict, Dict]:
         """
-        Build KV-cache contexts for generation over one or B samples.
+        Build KV-cache contexts for generation over B samples (NaViT packing).
 
-        A single ``str`` prompt is treated as ``B == 1``; a ``List[str]`` of
-        length B is packed into one block-diagonal context (NaViT) by threading
-        per-sample ``kv_lens`` / ``ropes`` lists through the model's ``prepare_*``
-        / ``forward_cache_update_*`` methods (which already iterate them).
+        A single ``str`` prompt is treated as ``B == 1``; a ``List[str]`` of length
+        B is packed into one block-diagonal context by threading per-sample
+        ``kv_lens`` / ``ropes`` lists through the model's ``prepare_*`` /
+        ``forward_cache_update_*`` methods (which already iterate them).
+
+        ``condition_images`` (I2I) is per-sample: ``List[List[PIL]]`` of length B,
+        each a sample's reference images (already normalized to PIL). It must carry a
+        **uniform count** across samples (sizes may differ — the model pads VAE and
+        uses varlen ViT). Images are appended in per-image rounds: round ``r`` adds
+        the r-th image of every sample in one batched update. Variable counts are
+        not supported here (the monolithic cache requires every round to be full-B)
+        and must use the per-sample fallback.
 
         Constructs three contexts:
-          - gen_context: full context (text + images)
-          - cfg_text_context: context without text (for text-CFG)
-          - cfg_img_context: context without images (for image-CFG)
-
-        Condition images are only supported for ``B == 1`` (I2I always runs
-        per-sample, because reference-image sizes vary across samples).
+          - gen_context: full context (images + text)
+          - cfg_text_context: context without text (for text-CFG; images-only)
+          - cfg_img_context: context without images (for image-CFG; text-only)
 
         The model is temporarily switched to eval mode so that
         ``Qwen2Model.forward()`` dispatches to ``forward_inference()``.
         """
         prompts = [prompt] if isinstance(prompt, str) else prompt
         batch_size = len(prompts)
-        if condition_images is not None and batch_size != 1:
-            raise ValueError(
-                "BagelAdapter._build_gen_context only supports condition images for "
-                f"batch_size==1 (I2I runs per-sample); got batch_size={batch_size}."
-            )
+        if condition_images is not None:
+            if len(condition_images) != batch_size:
+                raise ValueError(
+                    f"condition_images length ({len(condition_images)}) must match the number "
+                    f"of prompts ({batch_size})."
+                )
+            if not self._uniform_condition_count(condition_images):
+                raise ValueError(
+                    "BagelAdapter._build_gen_context requires a uniform (>=1) condition-image "
+                    f"count across the batch; got counts {[len(c) for c in condition_images]}. "
+                    "Variable counts must use the per-sample path."
+                )
 
         bagel = self.pipeline.bagel
         num_layers = bagel.config.llm_config.num_hidden_layers
@@ -495,17 +571,22 @@ class BagelAdapter(BaseAdapter):
                 gen_context = self._update_context_text(system_prompts, gen_context)
                 cfg_img_context = self._update_context_text(system_prompts, cfg_img_context)
 
-            # --- Process interleaved inputs (I2I, B==1) ---
-            # For I2I: images go first, then text
+            # --- Interleaved condition images (I2I): images first, then text ---
+            # One per-image round per reference index; each round adds that image
+            # for all B samples in a single batched update (model pads sizes).
             if condition_images is not None:
-                condition_images = standardize_image_batch(condition_images, output_type="pil")
-                for img in condition_images:
-                    img_tensor = self.vae_transform.resize_transform(pil_img2rgb(img))
-                    gen_context = self._update_context_image(img_tensor, gen_context)
-                    cfg_text_context = deepcopy(gen_context)
+                num_rounds = len(condition_images[0])
+                for r in range(num_rounds):
+                    round_tensors = [
+                        self.vae_transform.resize_transform(pil_img2rgb(condition_images[b][r]))
+                        for b in range(batch_size)
+                    ]
+                    gen_context = self._update_context_image(round_tensors, gen_context)
 
-            # Text always comes last (before generation)
+            # cfg_text drops the text conditioning: capture state after images.
             cfg_text_context = deepcopy(gen_context)
+
+            # Text always comes last (before generation).
             gen_context = self._update_context_text(prompts, gen_context)
             cfg_img_context = self._update_context_text(prompts, cfg_img_context)
 
@@ -534,11 +615,7 @@ class BagelAdapter(BaseAdapter):
             tokenizer=self._tokenizer,
             new_token_ids=self.new_token_ids,
         )
-        # Move all tensors to model device before forward
-        generation_input = {
-            k: v.to(device) if isinstance(v, torch.Tensor) else v
-            for k, v in generation_input.items()
-        }
+        generation_input = move_tensors_to_device(generation_input, device, max_depth=1)
         past_key_values = bagel.forward_cache_update_text(
             gen_context["past_key_values"], **generation_input
         )
@@ -548,12 +625,19 @@ class BagelAdapter(BaseAdapter):
     @torch.no_grad()
     def _update_context_image(
         self,
-        image_tensor,
+        image_tensors: List[torch.Tensor],
         gen_context: Dict,
         vae: bool = True,
         vit: bool = True,
     ) -> Dict:
-        """Add image tokens (ViT + VAE) to the KV-cache context."""
+        """Add one image per sample (a single packed round) to the KV-cache context.
+
+        ``image_tensors`` is one pre-transformed image tensor per sample (length B),
+        aligned with the context's per-sample ``kv_lens`` / ``ropes``. The model's
+        ``prepare_vae_images`` pads varying sizes for a single batched ``vae.encode``
+        and ``prepare_vit_images`` uses varlen concat, so sizes may differ across
+        samples. B == 1 is the per-sample fallback case.
+        """
         bagel = self.pipeline.bagel
         vae_model = self.pipeline.vae
         device = self.device
@@ -565,13 +649,11 @@ class BagelAdapter(BaseAdapter):
             gen_input, kv_lens, ropes = bagel.prepare_vae_images(
                 curr_kvlens=kv_lens,
                 curr_rope=ropes,
-                images=[image_tensor],
+                images=image_tensors,
                 transforms=self.vae_transform,
                 new_token_ids=self.new_token_ids,
             )
-            gen_input = {
-                k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in gen_input.items()
-            }
+            gen_input = move_tensors_to_device(gen_input, device, max_depth=1)
             past_key_values = bagel.forward_cache_update_vae(
                 vae_model, past_key_values, **gen_input
             )
@@ -580,13 +662,11 @@ class BagelAdapter(BaseAdapter):
             gen_input, kv_lens, ropes = bagel.prepare_vit_images(
                 curr_kvlens=kv_lens,
                 curr_rope=ropes,
-                images=[image_tensor],
+                images=image_tensors,
                 transforms=self.vit_transform,
                 new_token_ids=self.new_token_ids,
             )
-            gen_input = {
-                k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in gen_input.items()
-            }
+            gen_input = move_tensors_to_device(gen_input, device, max_depth=1)
             past_key_values = bagel.forward_cache_update_vit(past_key_values, **gen_input)
 
         return {"kv_lens": kv_lens, "ropes": ropes, "past_key_values": past_key_values}
@@ -833,12 +913,13 @@ class BagelAdapter(BaseAdapter):
         """
         Full generation loop: build context -> denoise -> decode -> return samples.
 
-        Dispatches by task (see ``_is_i2i``):
-          - **T2I** (no condition images): all B prompts are packed into a single
-            block-diagonal denoising loop (NaViT) via one ``_inference`` call.
-          - **I2I** (condition images present): falls back to per-sample
-            (``batch_size=1``) generation via ``_inference`` per prompt because
-            reference-image sizes vary per sample. A one-time warning is emitted.
+        Dispatches by task:
+          - **T2I** (no condition images): all B prompts are packed into one
+            block-diagonal denoising loop (NaViT) via a single ``_inference`` call.
+          - **I2I, uniform condition count**: all B samples are packed together
+            (the model pads varying VAE image sizes / varlen ViT), one ``_inference``.
+          - **I2I, variable condition count**: per-sample fallback (one ``_inference``
+            per prompt), with a one-time warning.
 
         Returns:
             List of B ``BagelSample`` / ``BagelI2ISample`` (one per prompt).
@@ -861,23 +942,31 @@ class BagelAdapter(BaseAdapter):
             think=think,
         )
 
-        if self._is_i2i(condition_images):
-            # I2I: per-sample fallback (rank-uniform decision, see ``_is_i2i``).
+        # Per-sample List[List[PIL]] (or None for T2I).
+        cond = self._normalize_condition_images(condition_images)
+
+        if self._is_i2i(cond):
+            assert cond is not None  # _is_i2i(cond) is True only for a non-None batch
+            if self._uniform_condition_count(cond):
+                # Batched I2I: pack all B samples (varying sizes handled by the model).
+                return self._inference(
+                    prompts=prompt, condition_images=cond, generator=generator, **common_kwargs
+                )
+            # Variable condition count -> per-sample fallback.
             if not self._has_warned_inference_fallback:
                 logger.warning(
-                    "Bagel: batched I2I inference is not supported (reference images vary "
-                    "per sample); falling back to per-sample (batch_size=1) inference. "
-                    "This warning is shown once."
+                    "Bagel: batched I2I requires a uniform condition-image count per sample; "
+                    "this batch has a variable count, so falling back to per-sample "
+                    "(batch_size=1) inference. This warning is shown once."
                 )
                 self._has_warned_inference_fallback = True
             samples: List[BagelSample] = []
             for b in range(len(prompt)):
-                cur_cond_images = condition_images[b] if condition_images is not None else None
                 cur_generator = generator[b] if isinstance(generator, list) else generator
                 samples.extend(
                     self._inference(
                         prompts=[prompt[b]],
-                        condition_images=cur_cond_images,
+                        condition_images=[cond[b]],
                         generator=cur_generator,
                         **common_kwargs,
                     )
@@ -892,7 +981,7 @@ class BagelAdapter(BaseAdapter):
     def _inference(
         self,
         prompts: List[str],
-        condition_images: Optional[ImageBatch],
+        condition_images: Optional[List[List[Image.Image]]],
         num_inference_steps: int,
         height: int,
         width: int,
@@ -909,10 +998,9 @@ class BagelAdapter(BaseAdapter):
     ) -> List[BagelSample]:
         """Core generation: build context -> denoise once -> split per sample.
 
-        Handles both T2I (``prompts`` length B, ``condition_images=None`` -> NaViT
-        packing) and the per-sample I2I fallback (``prompts`` length 1 with that
-        sample's ``condition_images``). Condition images imply ``B == 1`` (enforced
-        by ``_build_gen_context``).
+        Handles T2I (``condition_images=None``) and batched/per-sample I2I, where
+        ``condition_images`` is per-sample ``List[List[PIL]]`` (length B, uniform
+        count). The B==1 case (per-sample fallback) is just a length-1 list.
         """
         device = self.device
         image_shape = (height, width)
@@ -946,13 +1034,11 @@ class BagelAdapter(BaseAdapter):
             extra_call_back_kwargs=extra_call_back_kwargs,
             device=device,
         )
-        # I2I (condition images) is per-sample, so attach the single sample's
-        # images; T2I has none.
-        condition_images_list = [condition_images] if condition_images is not None else None
+        # ``condition_images`` is already per-sample (or None for T2I).
         return self._assemble_samples(
             result,
             prompts=prompts,
-            condition_images_list=condition_images_list,
+            condition_images_list=condition_images,
             height=height,
             width=width,
         )
@@ -1085,10 +1171,7 @@ class BagelAdapter(BaseAdapter):
         timesteps = self.scheduler.timesteps  # (T,) in [0, 1000]
 
         # Move all packed tensors to device once.
-        generation_input = {
-            k: v.to(device) if isinstance(v, torch.Tensor) else v
-            for k, v in generation_input.items()
-        }
+        generation_input = move_tensors_to_device(generation_input, device, max_depth=1)
 
         # ── 2. Initial noise, reshaped to (B, num_tokens, dim) ──
         # ``packed_init_noises`` is (sum_vae_tokens, dim); with uniform target
@@ -1273,7 +1356,9 @@ class BagelAdapter(BaseAdapter):
         **Timestep convention**: ``t`` / ``t_next`` are in [0, 1000]; a per-token
         sigma in [0, 1] is built for the Bagel LLM via ``repeat_interleave`` (so
         samples may carry different ``t`` values, as decoupled trainers do), while
-        the scheduler receives the original ``t`` / ``t_next``.
+        the scheduler receives the original ``t`` / ``t_next``. When CFG is active,
+        all samples must fall on the same side of ``cfg_interval`` (batched CFG
+        gating is shared across the pack); this is enforced below.
         """
         device = latents.device
         latents, t, t_next, next_latents = self._normalize_batch(latents, t, t_next, next_latents)
@@ -1297,16 +1382,32 @@ class BagelAdapter(BaseAdapter):
         # sigma over exactly those tokens (supports per-sample-varying t).
         sigma = t / 1000.0  # (B,)
         vae_token_counts = (packed_seqlens.to(device) - 2).to(torch.long)
+        # The caller-provided context must describe exactly ``num_tokens`` VAE tokens
+        # per sample, or the ``v_t.reshape(B, n, d)`` below would silently misalign
+        # sample boundaries (corrupting per-sample log-probs) or fail opaquely.
+        if not bool((vae_token_counts == num_tokens).all()):
+            raise ValueError(
+                f"Packed forward requires uniform per-sample VAE token counts matching "
+                f"latents (n={num_tokens}); got {vae_token_counts.tolist()}."
+            )
         timestep_for_bagel = torch.repeat_interleave(sigma.to(device), vae_token_counts)
 
-        # ── CFG gating based on sigma (uniform t when CFG is active) ──
-        sigma_val = sigma.flatten()[0].item()
-        if sigma_val > cfg_interval[0] and sigma_val <= cfg_interval[1]:
-            cfg_text_s = cfg_text_scale
-            cfg_img_s = cfg_img_scale
-        else:
-            cfg_text_s = 1.0
-            cfg_img_s = 1.0
+        # ── CFG gating based on sigma ──
+        # Gating is shared across the pack, so all samples must be on the same side
+        # of cfg_interval. Fail loudly on straddling rather than silently applying
+        # the wrong CFG scale / renorm to some samples (a hidden train-inference
+        # inconsistency). Uniform-t schedules (GRPO) never straddle.
+        sigma_vals = sigma.flatten()
+        in_interval = (sigma_vals > cfg_interval[0]) & (sigma_vals <= cfg_interval[1])
+        if not (bool(in_interval.all()) or bool((~in_interval).all())):
+            raise ValueError(
+                "Per-sample timesteps straddle cfg_interval; batched CFG gating requires "
+                f"all samples on the same side. Got sigmas {sigma_vals.tolist()} vs "
+                f"interval {cfg_interval}."
+            )
+        use_cfg = bool(in_interval[0])
+        cfg_text_s = cfg_text_scale if use_cfg else 1.0
+        cfg_img_s = cfg_img_scale if use_cfg else 1.0
 
         # Helper: safely extract a CFG tensor onto the compute device.
         def _cfg(d: Optional[Dict], key: str) -> Optional[torch.Tensor]:
@@ -1396,14 +1497,7 @@ class BagelAdapter(BaseAdapter):
         next_latents: Optional[torch.Tensor] = None,
         noise_level: Optional[float] = None,
         compute_log_prob: bool = True,
-        return_kwargs: List[str] = [
-            "noise_pred",
-            "next_latents",
-            "next_latents_mean",
-            "std_dev_t",
-            "dt",
-            "log_prob",
-        ],
+        return_kwargs: Optional[List[str]] = None,
         # ── Context rebuild (training path) ──
         prompt: Optional[Union[str, List[str]]] = None,
         condition_images: Optional[List[List[Image.Image]]] = None,
@@ -1418,9 +1512,11 @@ class BagelAdapter(BaseAdapter):
             (pre-built, possibly packed for B samples). Computed directly.
           - **Training, T2I**: context rebuilt from ``prompt`` (``List[str]`` of
             length B) and packed into one block-diagonal forward (NaViT).
-          - **Training, I2I**: ``condition_images`` present -> warn-once and fall
-            back to per-sample processing (reference sizes vary per sample),
-            concatenating the per-sample outputs along the batch dim.
+          - **Training, I2I (uniform condition count)**: context rebuilt from
+            ``prompt`` + per-sample ``condition_images`` and packed (the model pads
+            varying sizes); one block-diagonal forward.
+          - **Training, I2I (variable count)**: per-sample fallback, concatenating
+            the per-sample outputs along the batch dim.
 
         **Timestep convention**: ``t`` / ``t_next`` are in [0, 1000]; converted to
         [0, 1] sigmas internally for the Bagel LLM, passed as-is to ``scheduler.step``.
@@ -1433,6 +1529,31 @@ class BagelAdapter(BaseAdapter):
             ``SDESchedulerOutput`` with ``next_latents``, ``log_prob``,
             ``noise_pred``, etc. depending on ``return_kwargs``.
         """
+        if return_kwargs is None:
+            return_kwargs = [
+                "noise_pred",
+                "next_latents",
+                "next_latents_mean",
+                "std_dev_t",
+                "dt",
+                "log_prob",
+            ]
+        # Invariant CFG + scheduler params threaded unchanged through the forward
+        # chain (forward -> _forward_rebuild / _forward_i2i_fallback -> _forward_packed).
+        # ``t`` / ``latents`` / ``t_next`` / ``next_latents`` stay explicit because the
+        # I2I fallback slices them per sample. ``_forward_packed`` keeps these as
+        # explicit params, so a malformed key surfaces as a TypeError at that boundary.
+        step_kwargs: Dict[str, Any] = dict(
+            cfg_text_scale=cfg_text_scale,
+            cfg_img_scale=cfg_img_scale,
+            cfg_interval=cfg_interval,
+            cfg_renorm_min=cfg_renorm_min,
+            cfg_renorm_type=cfg_renorm_type,
+            noise_level=noise_level,
+            compute_log_prob=compute_log_prob,
+            return_kwargs=return_kwargs,
+        )
+
         # ── Inference path: context already built (single or packed) ──
         if generation_input is not None and past_key_values is not None:
             return self._forward_packed(
@@ -1444,16 +1565,9 @@ class BagelAdapter(BaseAdapter):
                 past_key_values=past_key_values,
                 cfg_text_past_kv=cfg_text_past_kv,
                 cfg_img_past_kv=cfg_img_past_kv,
-                cfg_text_scale=cfg_text_scale,
-                cfg_img_scale=cfg_img_scale,
-                cfg_interval=cfg_interval,
-                cfg_renorm_min=cfg_renorm_min,
-                cfg_renorm_type=cfg_renorm_type,
                 t_next=t_next,
                 next_latents=next_latents,
-                noise_level=noise_level,
-                compute_log_prob=compute_log_prob,
-                return_kwargs=return_kwargs,
+                **step_kwargs,
             )
 
         # ── Training path: rebuild KV-cache context from prompt ──
@@ -1464,26 +1578,44 @@ class BagelAdapter(BaseAdapter):
             )
         if isinstance(prompt, str):
             prompt = [prompt]
-        _image_shape = image_shape or (kwargs.get("height", 1024), kwargs.get("width", 1024))
+        # Resolution must come from the batch (BagelSample stores ``image_shape`` /
+        # ``height`` / ``width`` as shared fields). Refuse to silently default to
+        # 1024x1024, which would mismatch the stored latents and surface as an
+        # opaque reshape failure downstream.
+        if image_shape is None and "height" not in kwargs:
+            raise ValueError(
+                "Bagel training forward requires `image_shape` (or `height`/`width`) "
+                "from the batch; refusing to default to 1024x1024."
+            )
+        _image_shape = image_shape or (kwargs["height"], kwargs["width"])
 
-        if self._is_i2i(condition_images):
-            # I2I: per-sample fallback (rank-uniform decision, see ``_is_i2i``).
+        # Per-sample List[List[PIL]] (or None for T2I).
+        cond = self._normalize_condition_images(condition_images)
+
+        if self._is_i2i(cond):
+            assert cond is not None  # _is_i2i(cond) is True only for a non-None batch
+            if self._uniform_condition_count(cond):
+                # Batched I2I: pack all B samples (varying sizes handled by the model).
+                return self._forward_rebuild(
+                    t=t,
+                    latents=latents,
+                    prompts=prompt,
+                    condition_images=cond,
+                    image_shape=_image_shape,
+                    t_next=t_next,
+                    next_latents=next_latents,
+                    **step_kwargs,
+                )
+            # Variable condition count -> per-sample fallback.
             return self._forward_i2i_fallback(
                 t=t,
                 latents=latents,
                 prompt=prompt,
-                condition_images=condition_images,
+                condition_images=cond,
                 image_shape=_image_shape,
-                cfg_text_scale=cfg_text_scale,
-                cfg_img_scale=cfg_img_scale,
-                cfg_interval=cfg_interval,
-                cfg_renorm_min=cfg_renorm_min,
-                cfg_renorm_type=cfg_renorm_type,
                 t_next=t_next,
                 next_latents=next_latents,
-                noise_level=noise_level,
-                compute_log_prob=compute_log_prob,
-                return_kwargs=return_kwargs,
+                **step_kwargs,
             )
 
         # T2I: pack all B prompts into one block-diagonal context, then compute.
@@ -1493,16 +1625,9 @@ class BagelAdapter(BaseAdapter):
             prompts=prompt,
             condition_images=None,
             image_shape=_image_shape,
-            cfg_text_scale=cfg_text_scale,
-            cfg_img_scale=cfg_img_scale,
-            cfg_interval=cfg_interval,
-            cfg_renorm_min=cfg_renorm_min,
-            cfg_renorm_type=cfg_renorm_type,
             t_next=t_next,
             next_latents=next_latents,
-            noise_level=noise_level,
-            compute_log_prob=compute_log_prob,
-            return_kwargs=return_kwargs,
+            **step_kwargs,
         )
 
     def _forward_rebuild(
@@ -1510,25 +1635,23 @@ class BagelAdapter(BaseAdapter):
         t: torch.Tensor,
         latents: torch.Tensor,
         prompts: List[str],
-        condition_images: Optional[ImageBatch],
+        condition_images: Optional[List[List[Image.Image]]],
         image_shape: Tuple[int, int],
-        cfg_text_scale: float,
-        cfg_img_scale: float,
-        cfg_interval: Tuple[float, float],
-        cfg_renorm_min: float,
-        cfg_renorm_type: str,
         t_next: Optional[torch.Tensor],
         next_latents: Optional[torch.Tensor],
-        noise_level: Optional[float],
-        compute_log_prob: bool,
-        return_kwargs: List[str],
+        **step_kwargs: Any,
     ) -> SDESchedulerOutput:
         """Rebuild a KV-cache context from prompts and run one ``_forward_packed``.
 
-        Used by the T2I training path (``prompts`` length B, ``condition_images=None``
-        -> NaViT packing) and by the per-sample I2I fallback (``prompts`` length 1
-        with that sample's ``condition_images``). Condition images imply ``B == 1``
-        (enforced by ``_build_gen_context``).
+        Used by T2I training (``condition_images=None``), batched I2I (per-sample
+        ``condition_images`` of length B, uniform count), and the per-sample I2I
+        fallback (length-1 per-sample list). ``condition_images`` is per-sample
+        ``List[List[PIL]]``.
+
+        ``step_kwargs`` carries the invariant CFG + scheduler params (``cfg_text_scale``,
+        ``cfg_img_scale``, ``cfg_interval``, ``cfg_renorm_min``, ``cfg_renorm_type``,
+        ``noise_level``, ``compute_log_prob``, ``return_kwargs``) forwarded as-is to
+        ``_forward_packed``.
         """
         device = latents.device
         with torch.no_grad():
@@ -1553,16 +1676,9 @@ class BagelAdapter(BaseAdapter):
             past_key_values=gen_ctx["past_key_values"],
             cfg_text_past_kv=cfg_text_ctx["past_key_values"],
             cfg_img_past_kv=cfg_img_ctx["past_key_values"],
-            cfg_text_scale=cfg_text_scale,
-            cfg_img_scale=cfg_img_scale,
-            cfg_interval=cfg_interval,
-            cfg_renorm_min=cfg_renorm_min,
-            cfg_renorm_type=cfg_renorm_type,
             t_next=t_next,
             next_latents=next_latents,
-            noise_level=noise_level,
-            compute_log_prob=compute_log_prob,
-            return_kwargs=return_kwargs,
+            **step_kwargs,
         )
 
     def _forward_i2i_fallback(
@@ -1570,28 +1686,32 @@ class BagelAdapter(BaseAdapter):
         t: torch.Tensor,
         latents: torch.Tensor,
         prompt: List[str],
-        condition_images: List[ImageBatch],
+        condition_images: List[List[Image.Image]],
         image_shape: Tuple[int, int],
-        cfg_text_scale: float,
-        cfg_img_scale: float,
-        cfg_interval: Tuple[float, float],
-        cfg_renorm_min: float,
-        cfg_renorm_type: str,
         t_next: Optional[torch.Tensor],
         next_latents: Optional[torch.Tensor],
-        noise_level: Optional[float],
-        compute_log_prob: bool,
-        return_kwargs: List[str],
+        **step_kwargs: Any,
     ) -> SDESchedulerOutput:
-        """Per-sample I2I training forward, concatenating outputs along the batch dim."""
+        """Per-sample I2I training forward (variable condition count), concatenating
+        outputs along the batch dim.
+
+        ``condition_images`` is per-sample ``List[List[PIL]]``. ``step_kwargs`` carries
+        the invariant CFG + scheduler params forwarded to each per-sample
+        ``_forward_rebuild`` (see ``forward``).
+        """
         if not self._has_warned_forward_fallback:
             logger.warning(
-                "Bagel: batched I2I training is not supported (reference images vary per "
-                "sample); falling back to per-sample (batch_size=1) forward. This warning "
-                "is shown once."
+                "Bagel: batched I2I training requires a uniform condition-image count per "
+                "sample; this batch has a variable count, so falling back to per-sample "
+                "(batch_size=1) forward. This warning is shown once."
             )
             self._has_warned_forward_fallback = True
 
+        # NOTE: this runs exactly B forwards on every rank. Under FSDP the per-rank
+        # forward count must match across ranks or the parameter all-gathers deadlock.
+        # Sampler constraint #9a (e.g. M=48, K=16, W=8) guarantees a uniform per-rank
+        # batch size today; a future "drop uneven last batch" change would surface as
+        # a hang here rather than an error.
         if latents.dim() == 2:
             latents = latents.unsqueeze(0)
         if next_latents is not None and next_latents.dim() == 2:
@@ -1614,18 +1734,11 @@ class BagelAdapter(BaseAdapter):
                 t=t_flat[b : b + 1],
                 latents=latents[b : b + 1],
                 prompts=[prompt[b]],
-                condition_images=condition_images[b],
+                condition_images=[condition_images[b]],
                 image_shape=image_shape,
-                cfg_text_scale=cfg_text_scale,
-                cfg_img_scale=cfg_img_scale,
-                cfg_interval=cfg_interval,
-                cfg_renorm_min=cfg_renorm_min,
-                cfg_renorm_type=cfg_renorm_type,
                 t_next=(t_next_flat[b : b + 1] if t_next_flat is not None else None),
                 next_latents=(next_latents[b : b + 1] if next_latents is not None else None),
-                noise_level=noise_level,
-                compute_log_prob=compute_log_prob,
-                return_kwargs=return_kwargs,
+                **step_kwargs,
             )
             outputs.append(out_b.to_dict())
 
@@ -1638,5 +1751,8 @@ class BagelAdapter(BaseAdapter):
             elif isinstance(values[0], torch.Tensor):
                 merged[key] = torch.cat(values, dim=0)
             else:
+                # Non-tensor outputs are assumed batch-invariant (scalars / None).
+                # All current SDESchedulerOutput fields are tensors or None, so this
+                # branch is unreached today; revisit if a list-valued field is added.
                 merged[key] = values[0]
         return SDESchedulerOutput.from_dict(merged)

@@ -64,6 +64,12 @@ quantization = [
     "bitsandbytes>=0.45.3",
 ]
 
+# Bagel adapter runtime (flash-attn varlen kernels + opencv transforms)
+bagel = [
+    "flash-attn>=2.5.8",
+    "opencv-python",
+]
+
 # Experiment tracking
 wandb = [ "wandb" ]
 swanlab = [ "swanlab" ]
