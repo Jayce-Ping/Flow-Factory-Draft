@@ -55,7 +55,6 @@ train:
 
   # Sampling settings
   resolution: 512  # Can be int or [height, width]
-  condition_image_size: 512
   num_inference_steps: 10  # Number of timesteps
   # Bagel-specific generation params (passed to inference/forward via **training_args)
   cfg_text_scale: 1.0
@@ -65,7 +64,7 @@ train:
   cfg_renorm_type: global
  
   # Batch and sampling
-  per_device_batch_size: 2  # Batch size per device (I2I falls back to per-sample; no throughput gain over 1)
+  per_device_batch_size: 2  # Batch size per device (I2I: batched for uniform condition count, else per-sample)
   group_size: 16  # Group size for GRPO sampling
   global_std: true  # Use global std for advantage normalization
   unique_sample_num_per_epoch: 48  # Unique samples per group
@@ -101,8 +100,7 @@ scheduler:
 # Evaluation settings
 eval:
   resolution: 1024  # Evaluation resolution
-  condition_image_size: 1024
-  per_device_batch_size: 1  # Eval batch size
+  per_device_batch_size: 2  # Eval batch size
   num_inference_steps: 50  # Number of eval timesteps
   eval_freq: 20  # Eval frequency in epochs (0 to disable)
   seed: 42  # Eval seed (defaults to training seed)

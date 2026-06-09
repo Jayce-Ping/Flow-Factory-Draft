@@ -94,7 +94,7 @@ scheduler:
 # Evaluation settings
 eval:
   resolution: 512  # Evaluation resolution
-  per_device_batch_size: 1  # Eval batch size
+  per_device_batch_size: 2  # Eval batch size
   guidance_scale: 1.0  # Guidance scale for sampling
   num_inference_steps: 28  # Number of eval timesteps
   eval_freq: 20  # Eval frequency in epochs (0 to disable)

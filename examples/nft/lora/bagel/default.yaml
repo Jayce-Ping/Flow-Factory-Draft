@@ -103,7 +103,7 @@ scheduler:
 # Evaluation settings
 eval:
   resolution: 1024  # Evaluation resolution
-  per_device_batch_size: 1  # Eval batch size
+  per_device_batch_size: 2  # Eval batch size
   num_inference_steps: 50  # Number of eval timesteps
   eval_freq: 20  # Eval frequency in epochs (0 to disable)
   seed: 42  # Eval seed (defaults to training seed)
