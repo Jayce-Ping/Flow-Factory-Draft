@@ -122,7 +122,7 @@ class BaseAdapter(ABC):
     # conversion would be lossy and break tensor consumers. The raw modality
     # column ``images`` is always handled as images by the dataset itself,
     # independent of this declaration.
-    preprocess_image_columns: ClassVar[frozenset[str]] = frozenset()
+    pil_image_columns: ClassVar[frozenset[str]] = frozenset()
 
     def __init__(self, config: Arguments, accelerator : Accelerator):
         super().__init__()

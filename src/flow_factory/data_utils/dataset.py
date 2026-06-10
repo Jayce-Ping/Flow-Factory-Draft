@@ -472,12 +472,12 @@ class GeneralDataset(Dataset):
         preprocess_res = self._preprocess_func(**filtered_args)
 
         # 6. Process results - move tensors to CPU for caching.
-        # Image-valued adapter outputs (declared via `preprocess_image_columns`)
+        # Image-valued adapter outputs (declared via `pil_image_columns`)
         # are stored as per-sample List[PIL] so HF serializes them via the Image
         # feature; ragged image tensors (variable size/count, e.g. multi-ref I2I)
         # are not Arrow-serializable.
         adapter = getattr(self._preprocess_func, "__self__", None)
-        adapter_image_cols = getattr(adapter, "preprocess_image_columns", frozenset())
+        adapter_image_cols = getattr(adapter, "pil_image_columns", frozenset())
         final_res = {}
         for k, v in preprocess_res.items():
             if k in adapter_image_cols:

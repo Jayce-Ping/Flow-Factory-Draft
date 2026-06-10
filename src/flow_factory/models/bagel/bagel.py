@@ -176,7 +176,7 @@ class BagelAdapter(BaseAdapter):
     # re-encodes them at rollout/training. Persist them via the HF Image feature
     # so ragged multi-reference batches serialize; they read back as PIL and are
     # re-normalized by ``_normalize_condition_images``.
-    preprocess_image_columns: ClassVar[frozenset[str]] = frozenset({"condition_images"})
+    pil_image_columns: ClassVar[frozenset[str]] = frozenset({"condition_images"})
 
     def __init__(self, config: Arguments, accelerator: Accelerator):
         # Load tokenizer and transforms before super().__init__
