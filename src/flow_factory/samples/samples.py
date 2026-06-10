@@ -415,19 +415,34 @@ class BaseSample:
 
 @dataclass
 class ImageConditionSample(BaseSample):
-    """Sample for tasks with image conditions."""
+    """Sample for tasks with image conditions.
+
+    ``condition_images`` is canonicalized in ``__post_init__`` to a deterministic
+    per-sample type so gather/stack dispatch stays consistent across samples/ranks:
+    ``List[torch.Tensor(C, H, W)]`` in [0, 1] by default, or ``List[PIL.Image]``
+    when the subclass sets ``condition_images_as_pil = True`` (see that field).
+    """
     _id_fields : ClassVar[frozenset[str]] = BaseSample._id_fields | frozenset({'condition_images'})
+    # When True, keep ``condition_images`` as ``List[PIL.Image]`` instead of
+    # canonicalizing to ``List[torch.Tensor(C, H, W)]`` in [0, 1]. Set True by
+    # adapters that persist condition_images via the HF Image feature (i.e. declare
+    # them in ``pil_image_columns``) so PIL is preserved end-to-end with no lossy /
+    # wasteful tensor round-trip. Keep in sync with the adapter's ``pil_image_columns``.
+    condition_images_as_pil : ClassVar[bool] = False
 
     condition_images : Optional[ImageBatch] = None # A list of (Image.Image | torch.Tensor | np.ndarray) or a batched tensor/array
-    # `condition_images` will be canonicalized to List[torch.Tensor] of shape (C, H, W).
+    # Canonicalized to List[torch.Tensor(C, H, W)] in [0, 1] (default), or to
+    # List[PIL.Image] when ``condition_images_as_pil`` is True.
 
     def __post_init__(self):
         super().__post_init__()
         if self.condition_images is not None:
-            # Standardize to List[torch.Tensor] of shape (C, H, W).
-            # Always unbind batched tensors so the type is deterministic
-            # across samples/ranks (needed by gather_samples type dispatch).
-            self.condition_images = standardize_image_batch(self.condition_images, 'pt')
+            # Canonicalize to a deterministic per-sample type so gather_samples type
+            # dispatch stays consistent across samples/ranks: List[PIL.Image] when
+            # ``condition_images_as_pil`` is set, else List[torch.Tensor(C, H, W)] in
+            # [0, 1] (batched tensors are unbound to a list).
+            output_type = 'pil' if self.condition_images_as_pil else 'pt'
+            self.condition_images = standardize_image_batch(self.condition_images, output_type)
             if isinstance(self.condition_images, torch.Tensor):
                 self.condition_images = list(self.condition_images.unbind(0))
 
@@ -442,19 +457,35 @@ class ImageConditionSample(BaseSample):
 
 @dataclass
 class VideoConditionSample(BaseSample):
-    """Sample for tasks with video conditions."""
+    """Sample for tasks with video conditions.
+
+    ``condition_videos`` is canonicalized in ``__post_init__`` to a deterministic
+    per-sample type so gather/stack dispatch stays consistent across samples/ranks:
+    ``List[torch.Tensor(T, C, H, W)]`` by default, or ``List[List[PIL.Image]]``
+    (per-video frame lists) when the subclass sets ``condition_videos_as_pil = True``
+    (see that field).
+    """
     _id_fields : ClassVar[frozenset[str]] = BaseSample._id_fields | frozenset({'condition_videos'})
+    # When True, keep ``condition_videos`` as ``List[List[PIL.Image]]`` (per-video
+    # frame lists) instead of canonicalizing to ``List[torch.Tensor(T, C, H, W)]``.
+    # Set True by adapters that persist condition_videos as PIL frames so PIL is
+    # preserved end-to-end with no lossy / wasteful tensor round-trip. Mirrors
+    # ``ImageConditionSample.condition_images_as_pil``.
+    condition_videos_as_pil : ClassVar[bool] = False
 
     condition_videos: Optional[VideoBatch] = None # A list of (List[Image.Image] | torch.Tensor | np.ndarray) or a batched tensor/array
-    # `condition_videos` will be canonicalized to List[torch.Tensor] of shape (T, C, H, W).
+    # Canonicalized to List[torch.Tensor(T, C, H, W)] (default), or to
+    # List[List[PIL.Image]] when ``condition_videos_as_pil`` is True.
 
     def __post_init__(self):
         super().__post_init__()
         if self.condition_videos is not None:
-            # Standardize to List[torch.Tensor] of shape (T, C, H, W).
-            # Always unbind batched tensors so the type is deterministic
-            # across samples/ranks (needed by gather_samples type dispatch).
-            self.condition_videos = standardize_video_batch(self.condition_videos, 'pt')
+            # Canonicalize to a deterministic per-sample type so gather_samples type
+            # dispatch stays consistent across samples/ranks: List[List[PIL.Image]]
+            # when ``condition_videos_as_pil`` is set, else List[torch.Tensor(T, C, H, W)]
+            # (batched tensors are unbound to a list).
+            output_type = 'pil' if self.condition_videos_as_pil else 'pt'
+            self.condition_videos = standardize_video_batch(self.condition_videos, output_type)
             if isinstance(self.condition_videos, torch.Tensor):
                 self.condition_videos = list(self.condition_videos.unbind(0))
 

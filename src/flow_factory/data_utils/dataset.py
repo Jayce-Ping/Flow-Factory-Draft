@@ -746,9 +746,11 @@ class GeneralDataset(Dataset):
         Collate function for DataLoader.
 
         Stacks tensors with same shape, keeps ragged tensors as lists. Image
-        columns (raw ``images`` and adapter ``condition_images``) are stored via
-        the HF Image feature and decode to per-sample ``List[PIL.Image]``, so they
+        columns stored via the HF Image feature -- the raw ``images`` column always,
+        plus any adapter output declared in ``pil_image_columns`` (e.g. Bagel's
+        ``condition_images``) -- decode to per-sample ``List[PIL.Image]``, so they
         land in Case 3 and are kept as a ``List[List[PIL.Image]]`` MultiImageBatch.
+        ``condition_images`` not declared in ``pil_image_columns`` stay tensors.
 
         Args:
             batch: List of samples

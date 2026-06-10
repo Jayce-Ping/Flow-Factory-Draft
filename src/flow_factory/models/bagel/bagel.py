@@ -152,6 +152,11 @@ class BagelI2ISample(I2ISample):
             "image_shape",
         }
     )
+    # Bagel declares condition_images in ``pil_image_columns`` (stored as PIL) and
+    # re-normalizes from PIL at forward time. Keep them PIL on the sample to avoid a
+    # redundant PIL -> [0,1] float tensor -> PIL round-trip (and ~4x memory) in the
+    # trajectory buffer. Must stay in sync with ``BagelAdapter.pil_image_columns``.
+    condition_images_as_pil: ClassVar[bool] = True
     image_shape: Optional[Tuple[int, int]] = None
 
 
