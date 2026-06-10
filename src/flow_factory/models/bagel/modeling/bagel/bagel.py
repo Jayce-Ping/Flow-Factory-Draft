@@ -306,6 +306,18 @@ class Bagel(PreTrainedModel):
         _curr = curr = 0
         newlens, new_rope = list(), list()
         for image, curr_kvlen, curr_position_id in zip(images, curr_kvlens, curr_rope):
+            if image is None:
+                # Inactive sample for this round (variable condition-image count):
+                # keep its cached KV on the key/value side (the cache merge requires
+                # every sample currently in the cache), add no query tokens, and leave
+                # its length/rope unchanged. Yields a zero-length query segment.
+                packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
+                curr += curr_kvlen
+                packed_seqlens.append(0)
+                newlens.append(curr_kvlen)
+                new_rope.append(curr_position_id)
+                continue
+
             packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
             curr += curr_kvlen
 
@@ -425,6 +437,18 @@ class Bagel(PreTrainedModel):
         vae_image_tensors = list()
         newlens, new_rope = list(), list()
         for image, curr_kvlen, curr_position_id in zip(images, curr_kvlens, curr_rope):
+            if image is None:
+                # Inactive sample for this round (variable condition-image count):
+                # keep its cached KV on the key/value side (the cache merge requires
+                # every sample currently in the cache), add no query tokens, and leave
+                # its length/rope unchanged. Yields a zero-length query segment.
+                packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
+                curr += curr_kvlen
+                packed_seqlens.append(0)
+                newlens.append(curr_kvlen)
+                new_rope.append(curr_position_id)
+                continue
+
             packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
             curr += curr_kvlen
 
