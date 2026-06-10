@@ -251,6 +251,19 @@ class TrainingArguments(ArgABC):
         )},
     )
 
+    # --- Optimize-loop sample ordering ---
+    shuffle_samples: bool = field(
+        default=True,
+        metadata={"help": (
+            "Shuffle samples before each inner optimize epoch. Keep True normally. "
+            "Set False for adapters whose batched forward is pack-composition-dependent "
+            "(e.g. Bagel/NaViT sequence packing): then each training micro-batch packs the "
+            "same samples as its rollout pack, so the bf16 forward is bit-identical between "
+            "rollout and training and the on-policy ratio stays 1. Requires matched sampling "
+            "and training `per_device_batch_size`."
+        )},
+    )
+
     def __post_init__(self):
         # --- Resolution standardization ---
         if not self.resolution:

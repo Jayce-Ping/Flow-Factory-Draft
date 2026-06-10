@@ -29,7 +29,7 @@ tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 from .abc import BaseTrainer
 from ..hparams import GRPOTrainingArguments
 from ..samples import BaseSample
-from ..utils.base import filter_kwargs, create_generator, create_generator_by_prompt
+from ..utils.base import filter_kwargs, create_generator_by_prompt
 from ..utils.logger_utils import setup_logger
 from ..utils.trajectory_collector import TrajectoryCollector, compute_trajectory_indices
 from ..utils.dist import reduce_loss_info
@@ -119,10 +119,9 @@ class GRPOTrainer(BaseTrainer):
         per_device_batch_size = self.training_args.per_device_batch_size
         num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
         for inner_epoch in range(self.training_args.num_inner_epochs):
-            # Shuffle samples at the beginning of each inner epoch
-            perm_gen = create_generator(self.training_args.seed, self.epoch, inner_epoch)
-            perm = torch.randperm(len(samples), generator=perm_gen)
-            shuffled_samples = [samples[i] for i in perm]
+            # Order samples for this inner epoch (shuffle unless disabled for
+            # pack-composition-dependent adapters; see _order_samples_for_optimize).
+            shuffled_samples = self._order_samples_for_optimize(samples, inner_epoch)
 
             self.adapter.train()
             loss_info = defaultdict(list)
@@ -351,10 +350,9 @@ class GRPOGuardTrainer(GRPOTrainer):
         per_device_batch_size = self.training_args.per_device_batch_size
         num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
         for inner_epoch in range(self.training_args.num_inner_epochs):
-            # Shuffle samples at the beginning of each inner epoch
-            perm_gen = create_generator(self.training_args.seed, self.epoch, inner_epoch)
-            perm = torch.randperm(len(samples), generator=perm_gen)
-            shuffled_samples = [samples[i] for i in perm]
+            # Order samples for this inner epoch (shuffle unless disabled for
+            # pack-composition-dependent adapters; see _order_samples_for_optimize).
+            shuffled_samples = self._order_samples_for_optimize(samples, inner_epoch)
 
             self.adapter.train()
             loss_info = defaultdict(list)

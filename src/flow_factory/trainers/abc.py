@@ -41,7 +41,7 @@ from ..advantage import AdvantageProcessor
 from ..logger import load_logger, LogFormatter
 from ..samples import BaseSample
 from ..utils.logger_utils import setup_logger
-from ..utils.base import filter_kwargs, create_generator_by_prompt
+from ..utils.base import create_generator, create_generator_by_prompt, filter_kwargs
 
 logger = setup_logger(__name__)
 
@@ -414,6 +414,23 @@ class BaseTrainer(ABC):
     def optimize(self, *args, **kwargs):
         """Update policy model"""
         pass
+
+    def _order_samples_for_optimize(
+        self, samples: List[BaseSample], inner_epoch: int
+    ) -> List[BaseSample]:
+        """Return the per-inner-epoch sample ordering for the optimize loop.
+
+        When ``training_args.shuffle_samples`` is False, the rollout-pack order is
+        preserved so each training micro-batch packs exactly the samples of its
+        corresponding rollout ``inference`` pack. For adapters whose batched forward
+        is pack-composition-dependent (e.g. Bagel/NaViT packing), this keeps the
+        bf16 forward bit-identical between rollout and training (on-policy ratio==1).
+        """
+        if not self.training_args.shuffle_samples:
+            return samples
+        perm_gen = create_generator(self.training_args.seed, self.epoch, inner_epoch)
+        perm = torch.randperm(len(samples), generator=perm_gen)
+        return [samples[i] for i in perm]
 
     def _maybe_offload_samples_to_cpu(self, samples: List[BaseSample]) -> None:
         """Move every sample's tensor fields to CPU when ``offload_samples_to_cpu`` is enabled.

@@ -60,7 +60,7 @@ tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 from ...hparams import DiffusionOPDTrainingArguments
 from ...hparams.training_args.opd import resolve_distill_step_band
 from ...samples import BaseSample
-from ...utils.base import create_generator, filter_kwargs
+from ...utils.base import filter_kwargs
 from ...utils.logger_utils import setup_logger
 from ...utils.trajectory_collector import compute_trajectory_indices
 from ..abc import BaseTrainer
@@ -281,9 +281,9 @@ class DiffusionOPDTrainer(BaseTrainer):
         num_batches = math.ceil(len(samples) / per_device_batch_size)
 
         for inner_epoch in range(self.training_args.num_inner_epochs):
-            perm_gen = create_generator(self.training_args.seed, self.epoch, inner_epoch)
-            perm = torch.randperm(len(samples), generator=perm_gen)
-            shuffled_samples = [samples[i] for i in perm]
+            # Order samples for this inner epoch (shuffle unless disabled for
+            # pack-composition-dependent adapters; see _order_samples_for_optimize).
+            shuffled_samples = self._order_samples_for_optimize(samples, inner_epoch)
 
             self.adapter.train()
             # Per-teacher KL accumulators over the current gradient-accumulation window.

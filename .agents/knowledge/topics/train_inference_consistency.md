@@ -36,6 +36,15 @@ If rollout and training `forward()` diverge, `ratio` deviates from 1.0 at epoch 
 4. **Model weight change**: EMA swap without restore between `inference()` and first `forward()` call.
 5. **Scheduler state mismatch**: `step_index` not matching (e.g., dual-scheduler models).
 6. **`num_inference_steps` changed**: invalidates sigma schedule, all trajectory timesteps are wrong.
+7. **Batch/pack composition mismatch (pack-dependent adapters)**: For adapters whose batched `forward()` is *pack-composition-dependent* (e.g. Bagel NaViT sequence packing, where a sample's linear-projection matmuls run over the concatenated `sum_seqlen` of the whole pack), bf16 rounding depends on *which* samples share the pack. If a training micro-batch packs a different sample set than the corresponding rollout pack, the on-policy `forward()` is no longer bit-identical -> `ratio != 1` (~1e-4) even though every stored argument matches. Per-sample (B=1) adapters are immune. The trigger is the optimize-time sample shuffle reordering `samples` before chunking into micro-batches.
+
+## Pack-composition-dependent adapters: `shuffle_samples`
+
+`samples` reaches `optimize()` in rollout-pack order (`generate_samples` appends each `inference` pack in order; `compute_advantages(store_to_samples=True)` attaches advantages in place without reordering), so `samples[i*B:(i+1)*B]` is exactly rollout pack `i`. Set `train.shuffle_samples: false` so the optimize loop keeps that order: each training micro-batch then packs the *same* samples as its rollout pack -> deterministic bf16 -> on-policy `ratio == 1`.
+
+- Requires matched sampling and training `per_device_batch_size` (so contiguous chunks reproduce the rollout packs).
+- Default is `True` (per-inner-epoch shuffle); only pack-dependent adapters (Bagel) need `false`. The off-policy decorrelation cost is minor because the rollout order is already sampler-randomized.
+- Wired via `BaseTrainer._order_samples_for_optimize(samples, inner_epoch)` (used by grpo/nft/awm/opd; dpo shuffles chosen/rejected pairs separately).
 
 ## Where in Code
 
