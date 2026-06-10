@@ -1197,7 +1197,12 @@ class BagelAdapter(BaseAdapter):
             )
         init_noises = generation_input["packed_init_noises"].to(device)
         patch_dim = init_noises.shape[-1]
-        x_t = init_noises.reshape(batch_size, num_tokens, patch_dim)
+        # Cast the init noise to the trajectory storage dtype up front (every later
+        # step does this via ``cast_latents``). Otherwise step 0 runs at the raw
+        # float32 noise dtype while its ``next_latents`` is stored/replayed at
+        # ``latent_storage_dtype`` -> the on-policy log_prob (and PPO ratio) would
+        # diverge between rollout and training at step 0.
+        x_t = self.cast_latents(init_noises.reshape(batch_size, num_tokens, patch_dim))
 
         # ── 3. Trajectory & callback collectors ──
         latent_collector = create_trajectory_collector(trajectory_indices, num_inference_steps)
