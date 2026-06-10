@@ -443,13 +443,32 @@ class BagelAdapter(BaseAdapter):
         ]
 
     def _assert_variable_count_supported(self, condition_images: List[List[Image.Image]]) -> None:
-        """Fail fast on a variable condition-image count under FSDP.
+        """Fail fast on a variable per-sample condition-image count under FSDP.
 
-        Variable counts make the number of per-rank prefill passes (and thus the
-        number of FSDP parameter all-gathers) differ across ranks, which deadlocks.
-        DDP and DeepSpeed ZeRO-1/2 (the Bagel I2I backends) all-reduce gradients
-        once at backward, so variable counts are safe there. A uniform count is
-        safe under every backend.
+        Why only FSDP: the prefill (``_build_gen_context``) issues a *data-dependent*
+        number of ``bagel.language_model.forward_inference`` calls -- ``2*num_rounds + 2``,
+        where ``num_rounds = max(per-sample count)`` in this rank's local batch (2 calls
+        per image round, for the VAE and ViT cache updates, plus the final gen/cfg_img
+        text passes). ``language_model`` is the *only* FSDP-sharded module; the frozen
+        ViT/VAE are not sharded, so their per-image encodes issue no collective and are
+        irrelevant here.
+
+        - FSDP FULL_SHARD/HYBRID (and DeepSpeed ZeRO-3) shard ``language_model``'s
+          params, so each ``forward_inference`` must ``AllGather`` its shard. With a
+          variable count, ranks issue different numbers of AllGathers, the collective
+          mismatches, and training hangs (NCCL deadlock). Running the prefill under
+          ``@torch.no_grad`` does not help: FSDP still all-gathers params to *compute*
+          the forward.
+        - DDP / DeepSpeed ZeRO-1/2 (the Bagel I2I backends) replicate params, so
+          forward is local (no collective) and gradients sync a fixed number of times
+          at backward -- variable counts are safe.
+
+        A per-sample (batch_size=1) fallback would not help: it issues
+        ``sum_b(2*count_b + 2)`` calls, still data-dependent. The FSDP-safe fix is to
+        gather ``language_model`` once for the whole generation
+        (``FSDP.summon_full_params`` / ``reshard_after_forward=False``) so the inner
+        forwards are collective-free; until then we fail fast (a clear error beats a
+        silent hang). A uniform count is safe under every backend.
         """
         counts = {len(imgs) for imgs in condition_images}
         if len(counts) <= 1:
@@ -457,9 +476,11 @@ class BagelAdapter(BaseAdapter):
         if self.accelerator.distributed_type == DistributedType.FSDP:
             raise RuntimeError(
                 "Bagel batched I2I with a variable per-sample condition-image count "
-                f"(counts={sorted(counts)}) is unsupported under FSDP: per-rank prefill "
-                "pass counts differ and the parameter all-gathers deadlock. Use DDP or "
-                "DeepSpeed ZeRO-1/2 for variable-count I2I, or pad to a uniform count."
+                f"(counts={sorted(counts)}) is unsupported under FSDP: the prefill makes a "
+                "data-dependent number of language_model all-gathers (2*max_count+2), which "
+                "mismatches across ranks and deadlocks. Use DDP or DeepSpeed ZeRO-1/2 for "
+                "variable-count I2I, pad to a uniform count, or gather language_model once "
+                "(summon_full_params / reshard_after_forward=False)."
             )
 
     # ======================== Decoding ========================
