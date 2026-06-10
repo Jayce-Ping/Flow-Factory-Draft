@@ -116,6 +116,8 @@ Optional dependencies, such as `deepspeed`, are also available. Install them wit
 pip install -e .[deepspeed]
 ```
 
+> **Note**: The Bagel adapter requires `flash-attn` (>= 2.5.8) and `opencv-python`. Install them with `pip install -e .[bagel]` (the `[bagel]` extra is intentionally not part of `[all]` because flash-attn is heavy to build).
+
 > **Note**: Some models (e.g., LTX-2) require pipeline code not yet released in the official `diffusers` package. For these models, install the bundled diffusers submodule:
 > ```bash
 > git submodule update --init

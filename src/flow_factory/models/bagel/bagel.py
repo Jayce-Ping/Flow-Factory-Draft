@@ -54,14 +54,14 @@ import os
 import random
 from collections import defaultdict
 from contextlib import contextmanager
-from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
-from accelerate import Accelerator, DistributedType
+from accelerate import Accelerator
 from PIL import Image
 from tqdm import tqdm
 
@@ -79,6 +79,7 @@ from ...utils.image import (
     standardize_image_batch,
 )
 from ...utils.imports import get_flash_attn_version, is_flash_attn_available
+from ...utils.logger_utils import setup_logger
 from ...utils.trajectory_collector import (
     CallbackCollector,
     TrajectoryCollector,
@@ -119,6 +120,8 @@ The reasoning process is enclosed within <think> </think> tags, i.e. <think> rea
 
 GEN_THINK_SYSTEM_PROMPT = """You should first think about the planning process in the mind and then generate the image. 
 The planning process is enclosed within <think> </think> tags, i.e. <think> planning process here </think> image here"""
+
+logger = setup_logger(__name__, rank_zero_only=True)
 
 # ============================================================================
 # Sample Dataclasses
@@ -191,6 +194,16 @@ class BagelAdapter(BaseAdapter):
         super().__init__(config, accelerator)
         self.pipeline: BagelPseudoPipeline
         self.scheduler: FlowMatchEulerDiscreteSDEScheduler
+
+        # Bagel's batched forward is pack-composition-dependent (NaViT packing), so the
+        # optimize-time sample shuffle must be off to keep the on-policy ratio == 1.
+        if getattr(self.training_args, "shuffle_samples", True):
+            logger.warning(
+                "Bagel is not batch-invariant (NaViT packing) but training_args.shuffle_samples "
+                "is True: this reorders optimize micro-batches vs rollout packs and breaks "
+                "train-inference consistency (on-policy ratio != 1). Set `train.shuffle_samples: "
+                "false` (see the Bagel example configs / train_inference_consistency.md)."
+            )
 
     # ─────────────────── Tokenizer & Transforms ───────────────────
 
@@ -468,45 +481,56 @@ class BagelAdapter(BaseAdapter):
         return cond
 
     def _assert_variable_count_supported(self, condition_images: List[List[Image.Image]]) -> None:
-        """Fail fast on a variable per-sample condition-image count under FSDP.
+        """Fail fast on condition-image counts that desync collectives under a
+        parameter-sharded ``language_model`` (FSDP FULL/HYBRID, FSDP2, ZeRO-3).
 
-        Why only FSDP: the prefill (``_build_gen_context``) issues a *data-dependent*
-        number of ``bagel.language_model.forward_inference`` calls -- ``2*num_rounds + 2``,
-        where ``num_rounds = max(per-sample count)`` in this rank's local batch (2 calls
-        per image round, for the VAE and ViT cache updates, plus the final gen/cfg_img
-        text passes). ``language_model`` is the *only* FSDP-sharded module; the frozen
-        ViT/VAE are not sharded, so their per-image encodes issue no collective and are
-        irrelevant here.
+        The prefill (``_build_gen_context``) issues a *data-dependent* number of
+        ``language_model.forward_inference`` calls -- ``2*num_rounds + 2`` where
+        ``num_rounds = max(per-sample count)`` (2 per image round for the VAE and ViT
+        cache updates, plus the final gen / cfg_img text passes). ``language_model`` is
+        the only sharded module (frozen ViT/VAE are not). When params are sharded each
+        call must ``AllGather`` its shard, so a per-forward call count that differs
+        ACROSS ranks mismatches the collective and deadlocks. Two ways this happens:
+          (a) variable counts WITHIN a rank's batch, and
+          (b) locally-uniform counts that differ ACROSS ranks (different ``num_rounds``).
+        DDP / DeepSpeed ZeRO-1/2 replicate params (forward is collective-free; gradients
+        sync a fixed number of times at backward), so any count is safe -- early-return.
 
-        - FSDP FULL_SHARD/HYBRID (and DeepSpeed ZeRO-3) shard ``language_model``'s
-          params, so each ``forward_inference`` must ``AllGather`` its shard. With a
-          variable count, ranks issue different numbers of AllGathers, the collective
-          mismatches, and training hangs (NCCL deadlock). Running the prefill under
-          ``@torch.no_grad`` does not help: FSDP still all-gathers params to *compute*
-          the forward.
-        - DDP / DeepSpeed ZeRO-1/2 (the Bagel I2I backends) replicate params, so
-          forward is local (no collective) and gradients sync a fixed number of times
-          at backward -- variable counts are safe.
-
-        A per-sample (batch_size=1) fallback would not help: it issues
-        ``sum_b(2*count_b + 2)`` calls, still data-dependent. The FSDP-safe fix is to
-        gather ``language_model`` once for the whole generation
-        (``FSDP.summon_full_params`` / ``reshard_after_forward=False``) so the inner
-        forwards are collective-free; until then we fail fast (a clear error beats a
-        silent hang). A uniform count is safe under every backend.
+        The cross-rank check (b) is itself a collective; all ranks reach it because I2I
+        vs T2I is fixed by the run's task/config (see ``_is_i2i``) and every sample in an
+        I2I run carries condition images. The robust fix to *support* variable counts
+        under sharding is to gather ``language_model`` once (``summon_full_params`` /
+        ``reshard_after_forward=False``); until then we fail fast (a clear error beats a
+        silent hang).
         """
-        counts = {len(imgs) for imgs in condition_images}
-        if len(counts) <= 1:
+        if not self._is_param_sharded():
             return
-        if self.accelerator.distributed_type == DistributedType.FSDP:
+        counts = {len(imgs) for imgs in condition_images}
+        if len(counts) > 1:
             raise RuntimeError(
                 "Bagel batched I2I with a variable per-sample condition-image count "
-                f"(counts={sorted(counts)}) is unsupported under FSDP: the prefill makes a "
-                "data-dependent number of language_model all-gathers (2*max_count+2), which "
-                "mismatches across ranks and deadlocks. Use DDP or DeepSpeed ZeRO-1/2 for "
-                "variable-count I2I, pad to a uniform count, or gather language_model once "
-                "(summon_full_params / reshard_after_forward=False)."
+                f"(counts={sorted(counts)}) is unsupported under a parameter-sharded "
+                "language_model (FSDP FULL/HYBRID, FSDP2, DeepSpeed ZeRO-3): the prefill "
+                "makes a data-dependent number of all-gathers (2*max_count+2) that "
+                "mismatches across ranks and deadlocks. Use DDP or ZeRO-1/2 for "
+                "variable-count I2I, pad to a uniform count, or gather language_model "
+                "once (summon_full_params / reshard_after_forward=False)."
             )
+        if self.accelerator.num_processes > 1:
+            local_rounds = max(counts) if counts else 0
+            global_max = torch.tensor([local_rounds], device=self.accelerator.device)
+            global_min = global_max.clone()
+            dist.all_reduce(global_max, op=dist.ReduceOp.MAX)
+            dist.all_reduce(global_min, op=dist.ReduceOp.MIN)
+            if int(global_max.item()) != int(global_min.item()):
+                raise RuntimeError(
+                    "Bagel batched I2I has a per-sample condition-image count that is "
+                    "uniform within each rank but differs ACROSS ranks (num_rounds in "
+                    f"[{int(global_min.item())}, {int(global_max.item())}]) under a "
+                    "parameter-sharded language_model: the prefill issues a different "
+                    "number of all-gathers per rank and deadlocks. Use DDP or ZeRO-1/2, "
+                    "or pad all ranks to a uniform reference-image count."
+                )
 
     # ======================== Decoding ========================
 
@@ -636,14 +660,39 @@ class BagelAdapter(BaseAdapter):
                             round_tensors.append(None)
                     gen_context = self._update_context_image(round_tensors, gen_context)
 
-            # cfg_text drops the text conditioning: capture state after images.
-            cfg_text_context = deepcopy(gen_context)
+            # cfg_text drops the text conditioning: snapshot state after images, before
+            # the text append below. A shallow snapshot (shared KV-tensor refs) suffices
+            # because cache updates reassign ``key_cache[layer]`` to a freshly-allocated
+            # tensor and never mutate cached tensors in place (see ``_snapshot_context``).
+            cfg_text_context = self._snapshot_context(gen_context)
 
             # Text always comes last (before generation).
             gen_context = self._update_context_text(prompts, gen_context)
             cfg_img_context = self._update_context_text(prompts, cfg_img_context)
 
         return gen_context, cfg_text_context, cfg_img_context
+
+    @staticmethod
+    def _snapshot_context(gen_context: Dict) -> Dict:
+        """Cheap, behavior-preserving snapshot of a KV-cache context.
+
+        Used for ``cfg_text_context``, which only *reads* its cache. The qwen2_navit
+        cache update reassigns ``past_key_values.key_cache[layer]`` to a newly
+        allocated (cat'd) tensor and never mutates cached tensors in place, so copying
+        only the per-layer dicts (with shared tensor references) isolates this snapshot
+        from later text appends to ``gen_context`` -- without the full ``deepcopy`` of
+        every KV tensor (material for I2I with long condition KV, rebuilt per training
+        forward).
+        """
+        src = gen_context["past_key_values"]
+        snap = NaiveCache(len(src.key_cache))
+        snap.key_cache = dict(src.key_cache)
+        snap.value_cache = dict(src.value_cache)
+        return {
+            "kv_lens": list(gen_context["kv_lens"]),
+            "ropes": list(gen_context["ropes"]),
+            "past_key_values": snap,
+        }
 
     # ─── _update_context_text ───
     @torch.no_grad()
@@ -693,6 +742,13 @@ class BagelAdapter(BaseAdapter):
         (variable condition-image count): its cached KV is kept and it contributes a
         zero-length query segment. At least one entry per call must be non-``None``.
         """
+        if not any(img is not None for img in image_tensors):
+            raise ValueError(
+                "Bagel _update_context_image received an all-None image round (no active "
+                "sample). Each packed round must have >=1 non-None image; an all-None round "
+                "indicates a packing bug (num_rounds must equal the max per-sample "
+                "condition-image count) and would crash opaquely in the vendored encoder."
+            )
         bagel = self.pipeline.bagel
         vae_model = self.pipeline.vae
         device = self.device
@@ -1414,19 +1470,23 @@ class BagelAdapter(BaseAdapter):
         timestep_for_bagel = torch.repeat_interleave(sigma.to(device), vae_token_counts)
 
         # ── CFG gating based on sigma ──
-        # Gating is shared across the pack, so all samples must be on the same side
-        # of cfg_interval. Fail loudly on straddling rather than silently applying
-        # the wrong CFG scale / renorm to some samples (a hidden train-inference
-        # inconsistency). Uniform-t schedules (GRPO) never straddle.
-        sigma_vals = sigma.flatten()
-        in_interval = (sigma_vals > cfg_interval[0]) & (sigma_vals <= cfg_interval[1])
-        if not (bool(in_interval.all()) or bool((~in_interval).all())):
-            raise ValueError(
-                "Per-sample timesteps straddle cfg_interval; batched CFG gating requires "
-                f"all samples on the same side. Got sigmas {sigma_vals.tolist()} vs "
-                f"interval {cfg_interval}."
-            )
-        use_cfg = bool(in_interval[0])
+        # Gating is shared across the pack, so when CFG is active all samples must be on
+        # the same side of cfg_interval. Fail loudly on straddling rather than silently
+        # applying the wrong CFG scale / renorm to some samples (a hidden train-inference
+        # inconsistency). Uniform-t schedules (GRPO) never straddle. When CFG is disabled
+        # (scales <= 1.0, e.g. NFT/AWM), gating is a no-op, so skip the check entirely.
+        if cfg_text_scale > 1.0 or cfg_img_scale > 1.0:
+            sigma_vals = sigma.flatten()
+            in_interval = (sigma_vals > cfg_interval[0]) & (sigma_vals <= cfg_interval[1])
+            if not (bool(in_interval.all()) or bool((~in_interval).all())):
+                raise ValueError(
+                    "Per-sample timesteps straddle cfg_interval; batched CFG gating requires "
+                    f"all samples on the same side. Got sigmas {sigma_vals.tolist()} vs "
+                    f"interval {cfg_interval}."
+                )
+            use_cfg = bool(in_interval[0])
+        else:
+            use_cfg = False
         cfg_text_s = cfg_text_scale if use_cfg else 1.0
         cfg_img_s = cfg_img_scale if use_cfg else 1.0
 

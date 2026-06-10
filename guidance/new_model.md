@@ -90,14 +90,14 @@ class MyModelSample(T2ISample):
 | `BaseSample` | Generic | `image`, `video`, `prompt`, `all_latents`, `log_probs`, ... |
 | `T2ISample` | Text-to-image | Alias of `BaseSample` |
 | `T2VSample` | Text-to-video | Alias of `BaseSample` |
-| `ImageConditionSample` | Image-conditioned generation | `condition_images: List[Tensor(C,H,W)]` — always `List`, never batched tensor |
-| `VideoConditionSample` | Video-conditioned generation | `condition_videos: List[Tensor(T,C,H,W)]` — always `List`, never batched tensor |
+| `ImageConditionSample` | Image-conditioned generation | `condition_images`: per-sample `List[Tensor(C,H,W)]` (or `List[PIL.Image]` when the subclass sets `condition_images_as_pil=True`); always `List`, never batched tensor |
+| `VideoConditionSample` | Video-conditioned generation | `condition_videos`: per-sample `List[Tensor(T,C,H,W)]` (or `List[List[PIL.Image]]` when `condition_videos_as_pil=True`); always `List`, never batched tensor |
 
 > See [`src/flow_factory/samples/samples.py`](src/flow_factory/samples/samples.py) for all available classes.
 
 > **Key**: The `_shared_fields` class variable declares fields that are identical across a batch (e.g., `height`, `width`, `latent_index_map`). During `BaseSample.stack()`, shared fields take the first element instead of stacking.
 
-> **Type determinism for `gather_samples`**: `ImageConditionSample.__post_init__` and `VideoConditionSample.__post_init__` always unbind batched tensors to `List[Tensor]`, ensuring `condition_images` / `condition_videos` have a deterministic type across all samples and ranks. When defining custom sample fields that will be gathered across ranks (via `gather_samples`), ensure each field has a **consistent type** on every sample — mixing `Tensor` on some samples and `List[Tensor]` on others will cause `gather_samples` to fall through to slow pickle-based `gather_object`. Prefer `List[Tensor]` for variable-length sequences.
+> **Type determinism for `gather_samples`**: `ImageConditionSample.__post_init__` and `VideoConditionSample.__post_init__` canonicalize to a deterministic per-sample type across all samples and ranks — `List[Tensor]` by default, or `List[PIL.Image]` / `List[List[PIL.Image]]` when the subclass sets `condition_images_as_pil` / `condition_videos_as_pil` (adapters that persist condition media as PIL via `pil_image_columns`, e.g. Bagel). When defining custom sample fields that will be gathered across ranks (via `gather_samples`), ensure each field has a **consistent type** on every sample — mixing `Tensor` on some samples and `List[Tensor]` on others will cause `gather_samples` to fall through to slow pickle-based `gather_object`. Prefer `List[Tensor]` for variable-length sequences.
 
 
 ### Step 2: Create Adapter Class
@@ -250,7 +250,7 @@ def encode_image(
     """
 ```
 
-> **Important**: The `images` input follows the **multi-image batch** convention: `List[List[Image.Image]]`. Each sample can have zero, one, or multiple condition images. See [Data Format Conventions](#data-format-conventions) for details.
+> **Important**: The `images` input follows the **multi-image batch** convention: `List[List[Image.Image]]`. Each sample can have zero, one, or multiple condition images. See [Data Format Conventions](#data-format-conventions) for details. Adapters that persist a returned image column as PIL (declare it in `pil_image_columns`, e.g. Bagel's `condition_images`) may keep it as PIL; the dataset stores those columns via the HF Image feature and reads them back as PIL.
 
 #### `encode_video`
 
