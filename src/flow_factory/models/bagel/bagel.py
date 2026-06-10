@@ -209,14 +209,6 @@ class BagelAdapter(BaseAdapter):
             low_cpu_mem_usage=False,
             **self.model_args.extra_kwargs,
         )
-        # Condition images (I2I) are VAE-encoded into the KV context. The VAE's
-        # DiagonalGaussian samples (mean + std * randn, unseeded) by default, so the
-        # context built once at rollout would differ from the context rebuilt on every
-        # training forward() -> train-inference inconsistency (PPO on-policy ratio != 1).
-        # Use the distribution mean for deterministic, replayable conditioning. Safe:
-        # encode is used only for conditioning (the generation target is pure noise) and
-        # decode uses the decoder only, so T2I and decoding are unaffected.
-        pipeline.vae.reg.sample = False
         return pipeline
 
     def load_scheduler(self) -> FlowMatchEulerDiscreteSDEScheduler:
