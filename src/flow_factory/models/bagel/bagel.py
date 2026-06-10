@@ -209,6 +209,13 @@ class BagelAdapter(BaseAdapter):
             low_cpu_mem_usage=False,
             **self.model_args.extra_kwargs,
         )
+        # Train-inference consistency (I2I): the condition-image VAE encode is rebuilt
+        # on every training forward() but only once during rollout. Stochastic sampling
+        # (mean + std*randn) would then differ between the two and break the on-policy
+        # ratio (== 1). Use the posterior mean so condition encoding is deterministic.
+        # vae.encode is only used for condition images here (generation uses init noise;
+        # vae.decode is unaffected), so this is safe.
+        pipeline.vae.reg.sample = False
         return pipeline
 
     def load_scheduler(self) -> FlowMatchEulerDiscreteSDEScheduler:
