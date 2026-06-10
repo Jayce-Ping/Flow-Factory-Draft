@@ -17,7 +17,7 @@ import os
 import re
 import json
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, Tuple, List, Union, Literal, Iterable, Set
+from typing import Dict, Any, ClassVar, Optional, Tuple, List, Union, Literal, Iterable, Set
 from dataclasses import dataclass, field, asdict, fields
 from contextlib import contextmanager, nullcontext, ExitStack
 import logging
@@ -109,6 +109,21 @@ class BaseAdapter(ABC):
             "lora_embedding_A", "lora_embedding_B",  # Embedding LoRA
             "modules_to_save",  # Additional modules marked for saving
         ]
+
+    # Names of ``preprocess_func`` output columns that hold RGB images and must
+    # be persisted via the HuggingFace ``Image`` feature (PNG bytes) instead of
+    # raw tensors. This lets the dataset store variable-size / variable-count
+    # images (e.g. multi-reference I2I) that Arrow cannot serialize as ragged
+    # tensors, and read them back as PIL.
+    #
+    # Empty by default and OPT-IN per adapter: only declare an output here when
+    # it is a genuine RGB image that survives a PIL round-trip. Do NOT declare
+    # preprocessed/non-RGB tensors (e.g. VAE-ready video tensors, latents) -- PIL
+    # conversion would be lossy and break tensor consumers. The raw modality
+    # column ``images`` is always handled as images by the dataset itself,
+    # independent of this declaration.
+    preprocess_image_columns: ClassVar[frozenset[str]] = frozenset()
+
     def __init__(self, config: Arguments, accelerator : Accelerator):
         super().__init__()
         self.config = config

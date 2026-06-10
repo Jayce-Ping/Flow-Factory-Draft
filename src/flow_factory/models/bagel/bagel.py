@@ -175,6 +175,12 @@ class BagelAdapter(BaseAdapter):
       4. CFG uses separate pre-computed KV caches for text-only and image-only conditions.
     """
 
+    # Bagel stores raw, variable-size condition images (no fixed resize) and
+    # re-encodes them at rollout/training. Persist them via the HF Image feature
+    # so ragged multi-reference batches serialize; they read back as PIL and are
+    # re-normalized by ``_normalize_condition_images``.
+    preprocess_image_columns: ClassVar[frozenset[str]] = frozenset({"condition_images"})
+
     def __init__(self, config: Arguments, accelerator: Accelerator):
         # Load tokenizer and transforms before super().__init__
         # because load_pipeline may need them, and base __init__ calls load_pipeline

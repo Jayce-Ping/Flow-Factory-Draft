@@ -25,16 +25,28 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Union
 import imageio.v3 as iio
 import torch
 from datasets import Dataset as HFDataset
+from datasets import Image as HFImage
+from datasets import Sequence as HFSequence
 from datasets import load_dataset, load_from_disk
 from datasets.utils.logging import disable_progress_bar
 from PIL import Image
 from torch.utils.data import Dataset
 
 from ..utils.audio import load_audio
-from ..utils.base import filter_kwargs, pil_image_to_tensor, tensor_to_pil_image
+from ..utils.base import (
+    filter_kwargs,
+    pil_image_to_tensor,
+    standardize_image_batch,
+    tensor_to_pil_image,
+)
 from ..utils.logger_utils import setup_logger
 
 logger = setup_logger(__name__, rank_zero_only=True)
+
+# Bump when the on-disk preprocessed format changes in a backward-incompatible
+# way (e.g. image columns switched from raw tensors to the HF Image feature), so
+# stale caches written by an older format are not silently reused.
+_PREPROCESS_FORMAT_VERSION = 2
 
 
 # ========================================================================================
@@ -286,10 +298,7 @@ class GeneralDataset(Dataset):
             load_from_cache_file=not force_reprocess,
         )
 
-        try:
-            processed_dataset.set_format(type="torch", columns=processed_dataset.column_names)
-        except Exception:
-            pass
+        _apply_torch_format(processed_dataset)
 
         return processed_dataset
 
@@ -393,9 +402,11 @@ class GeneralDataset(Dataset):
                         Image.open(_resolve_path(image_dir, img_path)).convert("RGB")
                         for img_path in img_paths
                     ]
-                    image_pts = [pil_image_to_tensor(img)[0] for img in images]
                     image_args['images'].append(images)
-                    batch['images'].append(image_pts)
+                    # Persist as PIL (not tensors) so HF stores this column via the
+                    # Image feature. Ragged image tensors (variable size/count, e.g.
+                    # multi-reference I2I) are not Arrow-serializable.
+                    batch['images'].append(images)
 
         # 3. Prepare video inputs (only when video_dir exists and batch has videos)
         if 'video' in batch:
@@ -460,10 +471,27 @@ class GeneralDataset(Dataset):
         filtered_args = filter_kwargs(self._preprocess_func, **input_args)
         preprocess_res = self._preprocess_func(**filtered_args)
 
-        # 6. Process results - move tensors to CPU for caching
+        # 6. Process results - move tensors to CPU for caching.
+        # Image-valued adapter outputs (declared via `preprocess_image_columns`)
+        # are stored as per-sample List[PIL] so HF serializes them via the Image
+        # feature; ragged image tensors (variable size/count, e.g. multi-ref I2I)
+        # are not Arrow-serializable.
+        adapter = getattr(self._preprocess_func, "__self__", None)
+        adapter_image_cols = getattr(adapter, "preprocess_image_columns", frozenset())
         final_res = {}
         for k, v in preprocess_res.items():
-            if isinstance(v, torch.Tensor):
+            if k in adapter_image_cols:
+                # Image column: canonicalize each per-sample value
+                # (Tensor(N,C,H,W) / List[Tensor] / List[PIL]) to List[PIL].
+                # Empty samples stay []. The per-batch value is a per-sample list
+                # by the column-homogeneity contract.
+                if not isinstance(v, list):
+                    raise TypeError(
+                        f"image column {k!r} must be a per-sample list for HF "
+                        f"Image serialization, got {type(v).__name__}"
+                    )
+                final_res[k] = [_to_pil_image_list(per_sample) for per_sample in v]
+            elif isinstance(v, torch.Tensor):
                 # Case A: Dense Batch Tensor
                 # Move entire batch to CPU first (faster than moving slices), then unbind
                 final_res[k] = list(torch.unbind(v.cpu(), dim=0))
@@ -503,11 +531,13 @@ class GeneralDataset(Dataset):
             GeneralDataset instance with loaded data
         """
         instance = cls.__new__(cls)
-        instance.processed_dataset = load_from_disk(merged_cache_path)
-        try:
-            instance.processed_dataset.set_format(type="torch", columns=instance.processed_dataset.column_names)
-        except Exception:
-            pass
+        loaded = load_from_disk(merged_cache_path)
+        if not isinstance(loaded, HFDataset):
+            raise TypeError(
+                f"expected a Dataset at {merged_cache_path!r}, got {type(loaded).__name__}"
+            )
+        instance.processed_dataset = loaded
+        _apply_torch_format(instance.processed_dataset)
         return instance
     
     @staticmethod
@@ -550,7 +580,10 @@ class GeneralDataset(Dataset):
         ).hexdigest()[:16]
         extra_hash = "|".join(extra_hash_strs) if extra_hash_strs else ""
 
-        combined = f"{dataset_name}|{split}|{cutoff_str}|{funcs_hash}|{kwargs_hash}|{extra_hash}"
+        combined = (
+            f"{dataset_name}|{split}|{cutoff_str}|{funcs_hash}|{kwargs_hash}"
+            f"|{extra_hash}|fmtv{_PREPROCESS_FORMAT_VERSION}"
+        )
         fingerprint = hashlib.md5(combined.encode()).hexdigest()[:min(digits, 32)]
 
         logger.debug(
@@ -711,12 +744,15 @@ class GeneralDataset(Dataset):
     def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         Collate function for DataLoader.
-        
-        Stacks tensors with same shape, keeps ragged tensors as lists.
-        
+
+        Stacks tensors with same shape, keeps ragged tensors as lists. Image
+        columns (raw ``images`` and adapter ``condition_images``) are stored via
+        the HF Image feature and decode to per-sample ``List[PIL.Image]``, so they
+        land in Case 3 and are kept as a ``List[List[PIL.Image]]`` MultiImageBatch.
+
         Args:
             batch: List of samples
-            
+
         Returns:
             Collated batch dictionary
         """
@@ -741,9 +777,11 @@ class GeneralDataset(Dataset):
                     collated_batch[key] = values
 
             elif any(is_tensor) and any(is_list):
-                # Case 2: Mixed tensor/list → normalize to List[List[Tensor]]
-                # Handles ragged data (e.g., multi-reference images): dataset auto-stacks same-shape cases,
-                # while some samples may have images of differetn shapes and are kept as List[Tensor], which is inconstent
+                # Case 2: Mixed tensor/list → normalize to List[List[Tensor]].
+                # Handles ragged tensor columns (e.g. image latents) where the
+                # dataset auto-stacks same-shape samples into a Tensor but keeps
+                # variable-shape samples as List[Tensor]; unbind the stacked ones
+                # so the whole column is a consistent List[List[Tensor]].
                 collated_batch[key] = [
                     list(torch.unbind(v, dim=0))
                     if isinstance(v, torch.Tensor) else v
@@ -751,7 +789,9 @@ class GeneralDataset(Dataset):
                 ]
             
             else:
-                # Case 3: Other types (all lists, ints, strs, etc.)
+                # Case 3: Other types (lists, ints, strs, and PIL image columns).
+                # Image columns arrive here as per-sample List[PIL.Image]; keeping
+                # `values` yields a List[List[PIL.Image]] MultiImageBatch.
                 collated_batch[key] = values
 
         return collated_batch
@@ -769,6 +809,52 @@ def _move_to_cpu(obj):
     if isinstance(obj, list):
         return [_move_to_cpu(x) for x in obj]
     return obj
+
+
+def _to_pil_image_list(per_sample: Any) -> List[Image.Image]:
+    """Convert one sample's image value to a ``List[PIL.Image]``.
+
+    Accepts ``Tensor(N,C,H,W)``, ``List[Tensor]``, or ``List[PIL]``; an empty
+    sample stays ``[]``. Used to store image columns via the HF Image feature.
+    """
+    if len(per_sample) == 0:
+        return []
+    return standardize_image_batch(per_sample, output_type="pil")
+
+
+def _is_image_feature(feature: Any) -> bool:
+    """Return True if a HuggingFace feature stores images (``Image`` or a
+    sequence/list of ``Image``).
+
+    Image columns decode to PIL and must be excluded from the ``torch`` format.
+    """
+    if isinstance(feature, HFImage):
+        return True
+    if isinstance(feature, HFSequence):
+        # ``Sequence.feature`` holds the inner feature; getattr avoids a stub gap.
+        return _is_image_feature(getattr(feature, "feature", None))
+    # Nested-list features (e.g. ``[Image()]``) also denote a sequence of images.
+    if isinstance(feature, list):
+        return len(feature) == 1 and _is_image_feature(feature[0])
+    return False
+
+
+def _image_column_names(dataset: HFDataset) -> List[str]:
+    """Names of columns whose feature stores images (decoded as PIL)."""
+    return [name for name, feat in dataset.features.items() if _is_image_feature(feat)]
+
+
+def _apply_torch_format(dataset: HFDataset) -> None:
+    """Set the ``torch`` format on non-image columns only.
+
+    Image columns decode to PIL images of varying sizes, which cannot be cast to
+    torch tensors. They are excluded from the formatted columns and surfaced via
+    ``output_all_columns`` so they are still returned (as PIL) by ``__getitem__``
+    and handled by ``collate_fn``.
+    """
+    image_cols = set(_image_column_names(dataset))
+    torch_cols = [c for c in dataset.column_names if c not in image_cols]
+    dataset.set_format(type="torch", columns=torch_cols, output_all_columns=True)
 
 
 def _resolve_path(base_dir: str, path: str) -> str:
