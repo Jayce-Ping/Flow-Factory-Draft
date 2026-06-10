@@ -346,8 +346,7 @@ class AWMTrainer(BaseTrainer):
         num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
 
         for inner_epoch in range(self.training_args.num_inner_epochs):
-            # Order samples for this inner epoch (shuffle unless disabled for
-            # pack-composition-dependent adapters; see _order_samples_for_optimize).
+            # Shuffle unless disabled for pack-composition-dependent adapters.
             shuffled_samples = self._order_samples_for_optimize(samples, inner_epoch)
 
             loss_info = defaultdict(list)

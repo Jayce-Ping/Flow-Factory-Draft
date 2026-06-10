@@ -152,10 +152,9 @@ class BagelI2ISample(I2ISample):
             "image_shape",
         }
     )
-    # Bagel declares condition_images in ``pil_image_columns`` (stored as PIL) and
-    # re-normalizes from PIL at forward time. Keep them PIL on the sample to avoid a
-    # redundant PIL -> [0,1] float tensor -> PIL round-trip (and ~4x memory) in the
-    # trajectory buffer. Must stay in sync with ``BagelAdapter.pil_image_columns``.
+    # Keep condition_images as PIL on the sample (Bagel persists them via
+    # ``pil_image_columns`` and re-normalizes from PIL at forward time), avoiding a
+    # PIL -> float tensor -> PIL round-trip and ~4x buffer memory. Sync with that ClassVar.
     condition_images_as_pil: ClassVar[bool] = True
     image_shape: Optional[Tuple[int, int]] = None
 
@@ -403,11 +402,11 @@ class BagelAdapter(BaseAdapter):
     def _is_i2i(condition_images: Optional[Any]) -> bool:
         """Return whether the batch carries condition image(s) (Image-to-Image).
 
-        This is the dispatch flag for batch handling: T2I (no condition images)
-        runs the NaViT-packed batched path, while I2I falls back to per-sample
-        (``batch_size=1``) processing. The decision depends only on the presence
-        of condition images, which is fixed by the run's task/config and is
-        therefore identical across distributed ranks (avoiding collective/RNG
+        This is the dispatch flag for batch handling: both T2I (no condition
+        images) and I2I run the same NaViT-packed batched path (I2I adds the
+        condition images in per-image subset-rounds). The decision depends only on
+        the presence of condition images, which is fixed by the run's task/config
+        and is therefore identical across distributed ranks (avoiding collective/RNG
         desync — see ``adapter_conventions.md``).
 
         Args:
@@ -453,6 +452,20 @@ class BagelAdapter(BaseAdapter):
             )
             for imgs in per_sample
         ]
+
+    def _resolve_condition_images_for_packing(
+        self, condition_images: Optional[MultiImageBatch]
+    ) -> Optional[List[List[Image.Image]]]:
+        """Resolve condition images for the packed dispatch shared by ``inference()``
+        and ``forward()``: returns per-sample ``List[List[PIL]]`` for I2I (after the
+        FSDP variable-count guard), or ``None`` for T2I (no / all-empty conditions).
+        Both T2I and I2I then take the same NaViT-packed path.
+        """
+        cond = self._normalize_condition_images(condition_images)
+        if cond is None or not self._is_i2i(cond):
+            return None
+        self._assert_variable_count_supported(cond)
+        return cond
 
     def _assert_variable_count_supported(self, condition_images: List[List[Image.Image]]) -> None:
         """Fail fast on a variable per-sample condition-image count under FSDP.
@@ -592,8 +605,9 @@ class BagelAdapter(BaseAdapter):
             }
 
         gen_context = _init_ctx()
-        cfg_text_context = _init_ctx()
         cfg_img_context = _init_ctx()
+        # cfg_text_context is captured below as a snapshot of gen_context after the
+        # condition images are added, so it needs no separate init here.
 
         # ── Must use eval mode for Qwen2 dispatch (forward_inference) ──
         with self._eval_mode(bagel):
@@ -724,19 +738,10 @@ class BagelAdapter(BaseAdapter):
         """Build packed VAE-latent generation inputs (+ CFG inputs) for B samples.
 
         ``image_sizes`` carries one ``(H, W)`` per sample. The model's
-        ``prepare_vae_latent`` / ``prepare_vae_latent_cfg`` already iterate over
-        the per-sample ``kv_lens`` / ``ropes`` lists, so this works for B >= 1.
-
-        Args:
-            gen_context: Full generation context.
-            cfg_text_context: Text-CFG context (no prompt).
-            cfg_img_context: Image-CFG context (no condition images).
-            image_sizes: List of B ``(H, W)`` target sizes.
-            device: Device for the packed tensors.
-            generator: Optional RNG (single or per-sample list) for init noise.
-
-        Returns:
-            ``(generation_input, cfg_text_generation_input, cfg_img_generation_input)``.
+        ``prepare_vae_latent`` / ``prepare_vae_latent_cfg`` already iterate the
+        per-sample ``kv_lens`` / ``ropes`` lists, so this works for B >= 1;
+        ``generator`` seeds the per-sample init noise. Returns
+        ``(generation_input, cfg_text_generation_input, cfg_img_generation_input)``.
         """
         bagel = self.pipeline.bagel
         generation_input = bagel.prepare_vae_latent(
@@ -982,22 +987,11 @@ class BagelAdapter(BaseAdapter):
             think=think,
         )
 
-        # Per-sample List[List[PIL]] (or None for T2I).
-        cond = self._normalize_condition_images(condition_images)
-
-        if self._is_i2i(cond):
-            assert cond is not None  # _is_i2i(cond) is True only for a non-None batch
-            # Batched I2I: pack all B samples together. Reference-image count may
-            # vary per sample (subset-round packing); sizes may vary too (the model
-            # pads VAE / varlen ViT).
-            self._assert_variable_count_supported(cond)
-            return self._inference(
-                prompts=prompt, condition_images=cond, generator=generator, **common_kwargs
-            )
-
-        # T2I: NaViT-packed batched generation over all B prompts.
+        # Per-sample List[List[PIL]] for I2I (after the FSDP guard), or None for T2I.
+        # Both paths run the same NaViT-packed batched generation over all B prompts.
+        cond = self._resolve_condition_images_for_packing(condition_images)
         return self._inference(
-            prompts=prompt, condition_images=None, generator=generator, **common_kwargs
+            prompts=prompt, condition_images=cond, generator=generator, **common_kwargs
         )
 
     def _inference(
@@ -1207,7 +1201,7 @@ class BagelAdapter(BaseAdapter):
                 "Bagel batched denoising requires a uniform target resolution across the "
                 f"batch; got per-sample VAE token counts {vae_token_counts.tolist()}."
             )
-        init_noises = generation_input["packed_init_noises"].to(device)
+        init_noises = generation_input["packed_init_noises"]  # already on device (moved above)
         patch_dim = init_noises.shape[-1]
         # Cast the init noise to the trajectory storage dtype up front (every later
         # step does this via ``cast_latents``). Otherwise step 0 runs at the raw
@@ -1613,31 +1607,14 @@ class BagelAdapter(BaseAdapter):
             )
         _image_shape = image_shape or (kwargs["height"], kwargs["width"])
 
-        # Per-sample List[List[PIL]] (or None for T2I).
-        cond = self._normalize_condition_images(condition_images)
-
-        if self._is_i2i(cond):
-            assert cond is not None  # _is_i2i(cond) is True only for a non-None batch
-            # Batched I2I: pack all B samples together; condition-image count may
-            # vary per sample (subset-round packing) as may sizes.
-            self._assert_variable_count_supported(cond)
-            return self._forward_rebuild(
-                t=t,
-                latents=latents,
-                prompts=prompt,
-                condition_images=cond,
-                image_shape=_image_shape,
-                t_next=t_next,
-                next_latents=next_latents,
-                **step_kwargs,
-            )
-
-        # T2I: pack all B prompts into one block-diagonal context, then compute.
+        # Per-sample List[List[PIL]] for I2I (after the FSDP guard), or None for T2I.
+        # Both paths run the same NaViT-packed rebuild + forward.
+        cond = self._resolve_condition_images_for_packing(condition_images)
         return self._forward_rebuild(
             t=t,
             latents=latents,
             prompts=prompt,
-            condition_images=None,
+            condition_images=cond,
             image_shape=_image_shape,
             t_next=t_next,
             next_latents=next_latents,

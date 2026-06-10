@@ -62,7 +62,7 @@ train:
   cfg_renorm_type: global
 
   # Batch and sampling
-  per_device_batch_size: 2  # Batch size per device (T2I uses NaViT-packed batching; I2I falls back to per-sample)
+  per_device_batch_size: 2  # Batch size per device (T2I and I2I both use NaViT-packed batching)
   # Bagel is NOT batch-invariant: it uses NaViT-style sequence packing (all samples in a
   # batch are concatenated into one block-diagonal-attention sequence), so a sample's
   # linear-projection matmuls run over the whole pack's token length and its bf16 rounding

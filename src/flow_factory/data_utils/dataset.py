@@ -37,7 +37,6 @@ from ..utils.base import (
     filter_kwargs,
     pil_image_to_tensor,
     standardize_image_batch,
-    tensor_to_pil_image,
 )
 from ..utils.logger_utils import setup_logger
 
