@@ -22,9 +22,10 @@ facet checklist) and ``ID``; non-prompt columns are packed into the reward's
 per-prompt scoring.
 
 Usage:
-    python dataset/qwen_image_bench/prepare.py                 # English prompts
-    python dataset/qwen_image_bench/prepare.py --lang cn       # Chinese prompts
-    python dataset/qwen_image_bench/prepare.py --test-size 64  # eval slice size
+    python dataset/qwen_image_bench/prepare.py                  # English prompts
+    python dataset/qwen_image_bench/prepare.py --lang cn        # Chinese prompts
+    python dataset/qwen_image_bench/prepare.py --test-size 64   # eval slice size
+    python dataset/qwen_image_bench/prepare.py --seed 0         # change eval sampling
 
 Note: these are the benchmark's own 1000 prompts. Training on them and then
 evaluating on Qwen-Image-Bench is train/test contamination -- fine for a demo,
@@ -34,6 +35,7 @@ but do not report it as a held-out benchmark result.
 import argparse
 import json
 import os
+import random
 
 from datasets import load_dataset
 
@@ -53,7 +55,13 @@ def main() -> None:
         "--test-size",
         type=int,
         default=128,
-        help="Number of leading rows written to test.jsonl for eval. Default: 128.",
+        help="Number of rows randomly sampled into test.jsonl for eval. Default: 128.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducible test-set sampling. Default: 42.",
     )
     args = parser.parse_args()
 
@@ -86,7 +94,13 @@ def main() -> None:
     if args.test_size < 0:
         raise ValueError(f"expected --test-size >= 0, got {args.test_size}")
 
-    splits = {"train": rows, "test": rows[: args.test_size]}
+    # Reproducible random eval slice (seed-controlled) instead of a sequential head.
+    rng = random.Random(args.seed)
+    test_count = min(args.test_size, len(rows))
+    test_indices = sorted(rng.sample(range(len(rows)), test_count))
+    test_rows = [rows[i] for i in test_indices]
+
+    splits = {"train": rows, "test": test_rows}
     for name, data in splits.items():
         out_path = os.path.join(SCRIPT_DIR, f"{name}.jsonl")
         with open(out_path, "w", encoding="utf-8") as f:
