@@ -86,6 +86,17 @@ geneval = [
     "open_clip_torch",
 ]
 
+# GenEval2 Soft-TIFA reward. Qwen3-VL comes with core `transformers`; scipy only adds
+# exact geometric-mean parity with the official GenEval2 script (falls back to a pure-Python
+# gmean when absent).
+geneval2 = [
+    "scipy>=1.11.0",
+]
+
+# HPS v2 reward is NOT an optional extra: the PyPI `hpsv2` package pins protobuf<4, which
+# conflicts with flow-factory's protobuf>=6. Install it without its dependencies after
+# flow-factory:  uv pip install hpsv2 --no-deps  (runtime works with protobuf 6+).
+
 all = [
     "flow-factory[deepspeed,quantization]",
 ]

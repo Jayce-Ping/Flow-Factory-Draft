@@ -131,6 +131,8 @@ All three registries map string keys → lazy import paths. Resolution: registry
 | `pickscore_rank` | `PickScoreRankRewardModel` | Groupwise |
 | `clip` | `CLIPRewardModel` | Pointwise |
 | `ocr` | `OCRRewardModel` | Pointwise |
+| `geneval2_soft_tifa` | `GenEval2SoftTIFARewardModel` | Pointwise |
+| `hpsv2` | `HPSv2RewardModel` | Pointwise |
 | `vllm_evaluate` | `VLMEvaluateRewardModel` | Pointwise |
 | `rational_rewards_t2i` | `RationalRewardsT2I` | Pointwise |
 | `rational_rewards_edit` | `RationalRewardsEdit` | Pointwise |
