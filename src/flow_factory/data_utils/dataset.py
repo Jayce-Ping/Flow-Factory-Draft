@@ -47,6 +47,16 @@ logger = setup_logger(__name__, rank_zero_only=True)
 # stale caches written by an older format are not silently reused.
 _PREPROCESS_FORMAT_VERSION = 2
 
+# Column that carries raw per-sample JSONL fields (packed by ``_preprocess_batch``,
+# consumed by ``BaseTrainer._inject_batch_metadata`` via ``json.dumps``).
+METADATA_COLUMN = "metadata"
+
+# Columns kept in HF "python objects" format by name (in addition to image
+# columns, which are detected by feature type via ``_is_image_feature``).
+# The torch formatter would recursively tensorize ``METADATA_COLUMN``'s numeric
+# values (e.g. an int becomes a 0-dim Tensor), breaking JSON serialization.
+PYTHON_FORMAT_COLUMNS = frozenset({METADATA_COLUMN})
+
 
 # ========================================================================================
 # Protocol Definitions
@@ -368,8 +378,8 @@ class GeneralDataset(Dataset):
             forces every downstream consumer to handle three input shapes.
         """
         assert self._preprocess_func is not None, "Preprocess function must be provided."
-        # The keys that are used in preprocess and maintained in the final results.
-        PREPROCESS_KEYS = ('prompt', 'negative_prompt', 'images', 'videos', 'audios')
+        # The columns that are used in preprocess and maintained in the final results.
+        PREPROCESS_COLUMNS = ('prompt', 'negative_prompt', 'images', 'videos', 'audios')
         
         # 1. Prepare prompt inputs (text)
         prompt = batch["prompt"]
@@ -476,10 +486,10 @@ class GeneralDataset(Dataset):
         # feature; ragged image tensors (variable size/count, e.g. multi-ref I2I)
         # are not Arrow-serializable.
         adapter = getattr(self._preprocess_func, "__self__", None)
-        adapter_image_cols = getattr(adapter, "pil_image_columns", frozenset())
+        adapter_pil_image_cols = getattr(adapter, "pil_image_columns", frozenset())
         final_res = {}
         for k, v in preprocess_res.items():
-            if k in adapter_image_cols:
+            if k in adapter_pil_image_cols:
                 # Image column: canonicalize each per-sample value
                 # (Tensor(N,C,H,W) / List[Tensor] / List[PIL]) to List[PIL].
                 # Empty samples stay []. The per-batch value is a per-sample list
@@ -504,15 +514,15 @@ class GeneralDataset(Dataset):
 
         # 7. Prepare final results
         batch_dict = {**batch, **final_res}
-        # Pack non-preprocess fields into `metadata` column (dict[list] -> list[dict]).
+        # Pack non-preprocess fields into the METADATA_COLUMN (dict[list] -> list[dict]).
         # At sample time, BaseTrainer._inject_batch_metadata stores each per-sample
         # dict as a single JSON string under `sample.extra_kwargs['metadata']`.
         # Reward models that need metadata fields call `json.loads(sample.metadata)`
         # to access them (see GenEvalRewardModel for a full example).
         # Complex values (nested lists/dicts) in the source JSONL must already be
         # stored as JSON strings for Arrow compatibility.
-        batch_dict['metadata'] = [
-            {k: v[idx] for k,v in batch.items() if k not in PREPROCESS_KEYS}
+        batch_dict[METADATA_COLUMN] = [
+            {k: v[idx] for k,v in batch.items() if k not in PREPROCESS_COLUMNS}
             for idx in range(len(batch['prompt']))
         ]
 
@@ -790,7 +800,8 @@ class GeneralDataset(Dataset):
                 ]
             
             else:
-                # Case 3: Other types (lists, ints, strs, and PIL image columns).
+                # Case 3: Other types (lists, ints, strs, and python-format
+                # columns: metadata dicts and PIL image columns).
                 # Image columns arrive here as per-sample List[PIL.Image]; keeping
                 # `values` yields a List[List[PIL.Image]] MultiImageBatch.
                 collated_batch[key] = values
@@ -823,14 +834,6 @@ def _to_pil_image_list(per_sample: Any) -> List[Image.Image]:
     return standardize_image_batch(per_sample, output_type="pil")
 
 
-# Columns excluded from the ``torch`` format by name (in addition to image
-# columns, which are detected by feature type via ``_is_image_feature``).
-# ``metadata`` holds raw per-sample JSONL fields destined for ``json.dumps()``;
-# the torch formatter would recursively tensorize its numeric values
-# (e.g. an int becomes a 0-dim Tensor), breaking JSON serialization.
-NON_TENSORIZE_COLUMNS = frozenset({"metadata"})
-
-
 def _is_image_feature(feature: Any) -> bool:
     """Return True if a HuggingFace feature stores images (``Image`` or a
     sequence/list of ``Image``).
@@ -848,29 +851,30 @@ def _is_image_feature(feature: Any) -> bool:
     return False
 
 
-def _non_tensorize_column_names(dataset: HFDataset) -> set:
-    """Names of columns that must NOT be cast to torch tensors.
+def _python_format_column_names(dataset: HFDataset) -> set:
+    """Names of columns surfaced as plain Python objects (HF "python" format)
+    instead of torch tensors.
 
     Two sources:
         1. Image columns (detected by feature type): decode to PIL images of
-           varying sizes, which cannot be tensorized.
-        2. ``NON_TENSORIZE_COLUMNS`` (by name): plain-Python columns such as
-           ``metadata`` that must survive untouched for JSON serialization.
+           varying sizes, which cannot be cast to tensors.
+        2. ``PYTHON_FORMAT_COLUMNS`` (by name): columns such as ``metadata``
+           that must survive untouched for JSON serialization.
     """
     image_cols = {name for name, feat in dataset.features.items() if _is_image_feature(feat)}
-    return image_cols | NON_TENSORIZE_COLUMNS
+    return image_cols | PYTHON_FORMAT_COLUMNS
 
 
 def _apply_torch_format(dataset: HFDataset) -> None:
-    """Set the ``torch`` format on tensorizable columns only.
+    """Split columns between the ``torch`` and ``python`` formats.
 
-    Columns from ``_non_tensorize_column_names`` (image columns + ``metadata``)
-    are excluded from the formatted columns and surfaced via
-    ``output_all_columns`` so they are still returned (as PIL / plain Python)
-    by ``__getitem__`` and handled by ``collate_fn``.
+    Tensorizable columns get the ``torch`` format; columns from
+    ``_python_format_column_names`` (image columns + ``metadata``) are excluded
+    and surfaced via ``output_all_columns``, so ``__getitem__`` returns them as
+    plain Python objects (PIL images / dicts) for ``collate_fn`` to handle.
     """
-    non_tensorize_cols = _non_tensorize_column_names(dataset)
-    torch_cols = [c for c in dataset.column_names if c not in non_tensorize_cols]
+    python_cols = _python_format_column_names(dataset)
+    torch_cols = [c for c in dataset.column_names if c not in python_cols]
     dataset.set_format(type="torch", columns=torch_cols, output_all_columns=True)
 
 

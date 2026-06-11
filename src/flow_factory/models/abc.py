@@ -122,6 +122,8 @@ class BaseAdapter(ABC):
     # conversion would be lossy and break tensor consumers. The raw modality
     # column ``images`` is always handled as images by the dataset itself,
     # independent of this declaration.
+    # Declared columns consequently stay in the HF "python" format (returned
+    # as PIL, never tensorized) -- see ``data_utils.dataset._apply_torch_format``.
     pil_image_columns: ClassVar[frozenset[str]] = frozenset()
 
     def __init__(self, config: Arguments, accelerator : Accelerator):
