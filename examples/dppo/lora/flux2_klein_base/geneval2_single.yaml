@@ -51,11 +51,11 @@ train:
   # Trainer settings
   trainer_type: 'dppo'  # Options: 'grpo', 'grpo-guard', 'dppo', 'nft', 'awm'
   advantage_aggregation: 'sum'  # Options: 'sum', 'gdpo'
-  # Clipping
-  clip_range: 1.0e-4  # PPO/GRPO ratio clip range (logged; DPPO uses the KL mask below)
+  # Advantage clipping
   adv_clip_range: 5.0  # Advantage clipping range
   # KL
-  kl_type: 'x-based'  # Options: 'x-based', 'v-based'
+  kl_type: 'x-based'  # KL-vs-reference penalty space. Options: 'x-based', 'v-based'
+  kl_mask_type: 'x-based'  # DPPO trust-region mask space. Options: 'x-based', 'v-based'
   kl_beta: 1.0e-3  # KL(current || reference) penalty. 0 disables the ref term. Typical ~1e-2 (x) / ~1e-3 (v).
   kl_guidance_scale: 4.0  # CFG for the KL-vs-reference forward. Null uses training guidance_scale.
   kl_mask_threshold: 1.0e-6  # DPPO: zero-gradient samples whose per-step KL(current||old) >= this and push the wrong way.

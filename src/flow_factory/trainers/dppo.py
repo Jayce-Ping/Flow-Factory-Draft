@@ -108,7 +108,8 @@ class DPPOTrainer(GRPOTrainer):
         device = self.accelerator.device
         per_device_batch_size = self.training_args.per_device_batch_size
         num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
-        kl_type = self.training_args.kl_type
+        kl_type = self.training_args.kl_type  # KL-vs-reference penalty space
+        kl_mask_type = self.training_args.kl_mask_type  # trust-region mask space
         for inner_epoch in range(self.training_args.num_inner_epochs):
             shuffled_samples = self._order_samples_for_optimize(samples, inner_epoch)
 
@@ -174,12 +175,17 @@ class DPPOTrainer(GRPOTrainer):
                                 **batch,
                             }
                             forward_inputs = filter_kwargs(self.adapter.forward, **forward_inputs)
-                            # 2. Forward pass — request what the mask (and KL) need
+                            # 2. Forward pass — request what the mask (and optional ref KL) need.
+                            # The mask uses kl_mask_type; the ref penalty uses kl_type. When they
+                            # differ, both noise_pred and next_latents_mean are requested.
                             return_kwargs = {"log_prob", "dt", "std_dev_t"}
-                            if kl_type == "v-based":
-                                return_kwargs.add("noise_pred")
-                            else:
-                                return_kwargs.add("next_latents_mean")
+                            return_kwargs.add(
+                                "noise_pred" if kl_mask_type == "v-based" else "next_latents_mean"
+                            )
+                            if self.enable_kl_loss:
+                                return_kwargs.add(
+                                    "noise_pred" if kl_type == "v-based" else "next_latents_mean"
+                                )
                             forward_inputs["return_kwargs"] = list(return_kwargs)
                             output = self.adapter.forward(**forward_inputs)
 
@@ -190,7 +196,7 @@ class DPPOTrainer(GRPOTrainer):
                             ratio = torch.exp(output.log_prob - old_log_prob)
 
                             # Per-step KL(current || old) for the trust-region mask.
-                            if kl_type == "v-based":
+                            if kl_mask_type == "v-based":
                                 sq = (output.noise_pred - old_noise_pred) ** 2
                                 kl_new_old = sq.mean(dim=tuple(range(1, sq.ndim)))
                             else:

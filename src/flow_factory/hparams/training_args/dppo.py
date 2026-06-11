@@ -17,28 +17,51 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Literal, Optional
 
-from .grpo import GRPOTrainingArguments
+from ._base import TrainingArguments, _standardize_clip_range
 
 
 @dataclass
-class DPPOTrainingArguments(GRPOTrainingArguments):
+class DPPOTrainingArguments(TrainingArguments):
     r"""Training arguments for Flow-DPPO.
 
-    DPPO is a strict Flow-GRPO variant: it keeps GRPO's group advantages and the
-    optional KL-vs-reference penalty, but replaces the PPO ratio-clip with a KL
-    trust-region mask. A sample's gradient is zeroed when its per-step
-    KL(current || rollout-old) exceeds ``kl_mask_threshold`` and the update would
-    push further in the wrong direction.
+    DPPO keeps GRPO's group advantages and the optional KL-vs-reference penalty,
+    but replaces the PPO ratio-clip with a KL trust-region mask. It therefore does
+    NOT inherit ``GRPOTrainingArguments`` (no ``clip_range``); the field set is
+    kept minimal. The two KL computations are decoupled:
+
+    - ``kl_type`` selects the space of the KL-vs-reference penalty (``kl_beta``).
+    - ``kl_mask_type`` selects the space of the per-step KL(current || old) used by
+      the trust-region mask (``kl_mask_threshold``).
     """
 
-    kl_mask_threshold: float = field(
-        default=1.0e-6,
+    # Group-wise advantage normalization / aggregation (same semantics as GRPO).
+    global_std: bool = field(
+        default=True,
+        metadata={"help": "Whether to use global std for advantage normalization."},
+    )
+    advantage_aggregation: Literal["sum", "gdpo"] = field(
+        default="gdpo",
         metadata={
-            "help": "Mask (zero-gradient) samples whose per-step KL(current || old) "
-            "exceeds this threshold and push the wrong way."
+            "help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo']."
         },
+    )
+    adv_clip_range: tuple[float, float] = field(
+        default=(-5.0, 5.0),
+        metadata={"help": "Clipping range for advantages."},
+    )
+
+    # KL-vs-reference penalty (optional).
+    kl_type: Literal["v-based", "x-based"] = field(
+        default="x-based",
+        metadata={
+            "help": "Space of the KL-vs-reference penalty. 'v-based': velocity, 'x-based': latent."
+        },
+    )
+    kl_beta: float = field(
+        default=0,
+        metadata={"help": "KL(current || reference) penalty beta. 0 to disable the ref term."},
     )
     kl_guidance_scale: Optional[float] = field(
         default=None,
@@ -47,13 +70,41 @@ class DPPOTrainingArguments(GRPOTrainingArguments):
             "guidance_scale; >1.0 enables CFG on the frozen reference model."
         },
     )
+    ref_param_device: Literal["cpu", "cuda"] = field(
+        default="cuda",
+        metadata={"help": "Device to store reference model parameters."},
+    )
+
+    # DPPO trust-region mask.
+    kl_mask_type: Literal["v-based", "x-based"] = field(
+        default="x-based",
+        metadata={"help": "Space of the KL(current || old) used by the trust-region mask."},
+    )
+    kl_mask_threshold: float = field(
+        default=1.0e-6,
+        metadata={
+            "help": "Mask (zero-gradient) samples whose per-step KL(current || old) "
+            "exceeds this threshold and push the wrong way."
+        },
+    )
 
     def __post_init__(self):
         super().__post_init__()
         # Guard against scientific-notation strings from CLI/YAML overrides.
+        self.kl_beta = float(self.kl_beta)
         self.kl_mask_threshold = float(self.kl_mask_threshold)
         if self.kl_guidance_scale is not None:
             self.kl_guidance_scale = float(self.kl_guidance_scale)
+        self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, "adv_clip_range")
+        if self.kl_type not in ("v-based", "x-based"):
+            raise ValueError(f"expected kl_type in ('v-based', 'x-based'), got {self.kl_type!r}")
+        if self.kl_mask_type not in ("v-based", "x-based"):
+            raise ValueError(
+                f"expected kl_mask_type in ('v-based', 'x-based'), got {self.kl_mask_type!r}"
+            )
+
+    def get_num_train_timesteps(self, args: Any) -> int:
+        return args.scheduler_args.num_sde_steps
 
     def get_preprocess_guidance_scale(self) -> float:
         """Ensure negative prompts are encoded when the KL-ref branch needs CFG."""
