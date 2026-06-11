@@ -120,7 +120,7 @@ Rubric format and project background: [TIGER-AI-Lab/RationalRewards](https://git
 
 **Cost.** ``per_dimension`` means up to 5 judge calls per image (each with a thinking trace), which dominates RL wall-clock; use ``async_reward: true`` with a high ``num_workers``/``max_concurrent``, trim ``dimensions``, or switch to ``single_call``.
 
-**Example config**: [examples/grpo/lora/sd3_5/qwen_image_bench.yaml](../examples/grpo/lora/sd3_5/qwen_image_bench.yaml) (GRPO LoRA SD3.5 on the Qwen-Image-Bench prompts). Aggregation logic is vendored from upstream under ``src/flow_factory/rewards/qwen_image_bench/`` (``checklists.py``, ``score_utils.py``).
+**Implementation note**: Aggregation logic is vendored from upstream under ``src/flow_factory/rewards/qwen_image_bench/`` (``checklists.py``, ``score_utils.py``).
 
 ## Using Built-in Reward Models
 
