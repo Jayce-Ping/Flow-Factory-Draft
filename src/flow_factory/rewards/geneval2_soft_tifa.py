@@ -69,9 +69,11 @@ def _load_prompt_vqa_map_from_jsonl_paths(paths: List[Path]) -> Dict[str, List[A
 
     Args:
         paths: GenEval2 JSONL files; each line must have ``prompt`` and ``vqa_list``.
+            ``vqa_list`` may be a native list or a JSON string (GenEval-style
+            stringified metadata); both are normalized to a list.
 
     Returns:
-        Mapping from prompt to its ``vqa_list``.
+        Mapping from prompt to its ``vqa_list`` (always a list).
 
     Raises:
         ValueError: If a prompt appears twice with different ``vqa_list`` payloads.
@@ -92,6 +94,8 @@ def _load_prompt_vqa_map_from_jsonl_paths(paths: List[Path]) -> Dict[str, List[A
                 vqa = obj.get("vqa_list")
                 if vqa is None:
                     raise ValueError(f"{path}:{lineno}: missing 'vqa_list'")
+                if isinstance(vqa, str):
+                    vqa = json.loads(vqa)
                 if prompt in out and out[prompt] != vqa:
                     raise ValueError(
                         f"Duplicate prompt with different vqa_list: {prompt!r} "
