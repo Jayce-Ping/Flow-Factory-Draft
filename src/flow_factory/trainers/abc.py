@@ -41,7 +41,7 @@ from ..advantage import AdvantageProcessor
 from ..logger import load_logger, LogFormatter
 from ..samples import BaseSample
 from ..utils.logger_utils import setup_logger
-from ..utils.base import create_generator, create_generator_by_prompt, filter_kwargs
+from ..utils.base import create_generator, create_generator_by_prompt, filter_kwargs, json_default
 
 logger = setup_logger(__name__)
 
@@ -597,7 +597,7 @@ class BaseTrainer(ABC):
             if metadata_list:
                 meta = metadata_list[batch_idx]
                 if isinstance(meta, dict):
-                    sample.extra_kwargs['metadata'] = json.dumps(meta)
+                    sample.extra_kwargs['metadata'] = json.dumps(meta, default=json_default)
             if sources:
                 # Homogeneous within a batch in this PR; per-sample shape
                 # leaves room for future PRs that may interleave within a

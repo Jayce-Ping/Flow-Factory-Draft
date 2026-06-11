@@ -92,6 +92,28 @@ def split_kwargs(funcs: list[Callable], **kwargs: Any) -> list[dict[str, Any]]:
     
     return results
 
+def json_default(o: Any) -> Any:
+    """
+    ``json.dumps(obj, default=json_default)`` fallback for non-serializable values.
+
+    Converts torch Tensors and numpy scalars to native Python values
+    (e.g. 0-dim Tensors produced by HF datasets' torch formatter).
+
+    Args:
+        o: Object that the default JSON encoder cannot serialize
+
+    Returns:
+        A JSON-serializable equivalent of ``o``
+
+    Raises:
+        TypeError: If ``o`` is not a supported type
+    """
+    if isinstance(o, torch.Tensor):
+        return o.item() if o.dim() == 0 else o.tolist()
+    if isinstance(o, np.generic):
+        return o.item()
+    raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+
 # ------------------------------------Random Utils---------------------------------------
 def create_generator(
     *args: int,

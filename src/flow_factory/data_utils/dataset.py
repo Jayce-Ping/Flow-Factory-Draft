@@ -846,15 +846,18 @@ def _image_column_names(dataset: HFDataset) -> List[str]:
 
 
 def _apply_torch_format(dataset: HFDataset) -> None:
-    """Set the ``torch`` format on non-image columns only.
+    """Set the ``torch`` format on non-image, non-metadata columns only.
 
     Image columns decode to PIL images of varying sizes, which cannot be cast to
-    torch tensors. They are excluded from the formatted columns and surfaced via
-    ``output_all_columns`` so they are still returned (as PIL) by ``__getitem__``
-    and handled by ``collate_fn``.
+    torch tensors. The ``metadata`` column holds raw per-sample JSONL fields
+    destined for ``json.dumps()``; the torch formatter would recursively
+    tensorize its numeric values (e.g. an int becomes a 0-dim Tensor). Both are
+    excluded from the formatted columns and surfaced via ``output_all_columns``
+    so they are still returned (as PIL / plain Python) by ``__getitem__`` and
+    handled by ``collate_fn``.
     """
-    image_cols = set(_image_column_names(dataset))
-    torch_cols = [c for c in dataset.column_names if c not in image_cols]
+    non_tensorize_cols = set(_image_column_names(dataset)) | {"metadata"}
+    torch_cols = [c for c in dataset.column_names if c not in non_tensorize_cols]
     dataset.set_format(type="torch", columns=torch_cols, output_all_columns=True)
 
 
