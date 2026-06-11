@@ -52,8 +52,8 @@ def main() -> None:
     parser.add_argument(
         "--test-size",
         type=int,
-        default=64,
-        help="Number of leading rows written to test.jsonl for eval. Default: 64.",
+        default=128,
+        help="Number of leading rows written to test.jsonl for eval. Default: 128.",
     )
     args = parser.parse_args()
 
