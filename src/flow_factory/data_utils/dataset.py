@@ -823,6 +823,14 @@ def _to_pil_image_list(per_sample: Any) -> List[Image.Image]:
     return standardize_image_batch(per_sample, output_type="pil")
 
 
+# Columns excluded from the ``torch`` format by name (in addition to image
+# columns, which are detected by feature type via ``_is_image_feature``).
+# ``metadata`` holds raw per-sample JSONL fields destined for ``json.dumps()``;
+# the torch formatter would recursively tensorize its numeric values
+# (e.g. an int becomes a 0-dim Tensor), breaking JSON serialization.
+NON_TENSORIZE_COLUMNS = frozenset({"metadata"})
+
+
 def _is_image_feature(feature: Any) -> bool:
     """Return True if a HuggingFace feature stores images (``Image`` or a
     sequence/list of ``Image``).
@@ -840,23 +848,28 @@ def _is_image_feature(feature: Any) -> bool:
     return False
 
 
-def _image_column_names(dataset: HFDataset) -> List[str]:
-    """Names of columns whose feature stores images (decoded as PIL)."""
-    return [name for name, feat in dataset.features.items() if _is_image_feature(feat)]
+def _non_tensorize_column_names(dataset: HFDataset) -> set:
+    """Names of columns that must NOT be cast to torch tensors.
+
+    Two sources:
+        1. Image columns (detected by feature type): decode to PIL images of
+           varying sizes, which cannot be tensorized.
+        2. ``NON_TENSORIZE_COLUMNS`` (by name): plain-Python columns such as
+           ``metadata`` that must survive untouched for JSON serialization.
+    """
+    image_cols = {name for name, feat in dataset.features.items() if _is_image_feature(feat)}
+    return image_cols | NON_TENSORIZE_COLUMNS
 
 
 def _apply_torch_format(dataset: HFDataset) -> None:
-    """Set the ``torch`` format on non-image, non-metadata columns only.
+    """Set the ``torch`` format on tensorizable columns only.
 
-    Image columns decode to PIL images of varying sizes, which cannot be cast to
-    torch tensors. The ``metadata`` column holds raw per-sample JSONL fields
-    destined for ``json.dumps()``; the torch formatter would recursively
-    tensorize its numeric values (e.g. an int becomes a 0-dim Tensor). Both are
-    excluded from the formatted columns and surfaced via ``output_all_columns``
-    so they are still returned (as PIL / plain Python) by ``__getitem__`` and
-    handled by ``collate_fn``.
+    Columns from ``_non_tensorize_column_names`` (image columns + ``metadata``)
+    are excluded from the formatted columns and surfaced via
+    ``output_all_columns`` so they are still returned (as PIL / plain Python)
+    by ``__getitem__`` and handled by ``collate_fn``.
     """
-    non_tensorize_cols = set(_image_column_names(dataset)) | {"metadata"}
+    non_tensorize_cols = _non_tensorize_column_names(dataset)
     torch_cols = [c for c in dataset.column_names if c not in non_tensorize_cols]
     dataset.set_format(type="torch", columns=torch_cols, output_all_columns=True)
 
