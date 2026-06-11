@@ -249,33 +249,20 @@ class GenEval2SoftTIFARewardModel(PointwiseRewardModel):
         self._answer_token_id: Dict[str, int] = {}
 
         resolved_device_map = _resolve_geneval2_device_map(self._device_map, self.device)
-        is_local_main = accelerator is None or accelerator.is_local_main_process
 
-        # Rank-0 downloads first so other ranks load from the warm HF cache.
-        if is_local_main:
-            self._processor = AutoProcessor.from_pretrained(
-                self._model_name,
-                torch_dtype="auto",
-            )
-            self.qwen_model = Qwen3VLForConditionalGeneration.from_pretrained(
-                self._model_name,
-                dtype="auto",
-                device_map=resolved_device_map,
-            )
+        # Un-gated load on every rank: Hugging Face Hub's per-blob file lock
+        # serializes concurrent downloads, so only one rank transfers bytes while
+        # the rest block then read the warm cache. This avoids the
+        # is_local_main_process gate + barrier whose failure mode deadlocks the
+        # siblings (mirrors models/abc.py `_resolve_checkpoint_path`).
+        self._processor = AutoProcessor.from_pretrained(self._model_name, torch_dtype="auto")
+        self.qwen_model = Qwen3VLForConditionalGeneration.from_pretrained(
+            self._model_name,
+            dtype="auto",
+            device_map=resolved_device_map,
+        )
         if accelerator is not None:
             accelerator.wait_for_everyone()
-        if not is_local_main:
-            self._processor = AutoProcessor.from_pretrained(
-                self._model_name,
-                torch_dtype="auto",
-                local_files_only=True,
-            )
-            self.qwen_model = Qwen3VLForConditionalGeneration.from_pretrained(
-                self._model_name,
-                dtype="auto",
-                device_map=resolved_device_map,
-                local_files_only=True,
-            )
 
         self.qwen_model.eval()
         self.model = self.qwen_model

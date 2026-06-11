@@ -125,9 +125,16 @@ class HPSv2RewardModel(PointwiseRewardModel):
         open_clip_pretrained = extras.get("open_clip_pretrained", "laion2B-s32B-b79K")
         ckpt = extras.get("checkpoint_path")
 
-        is_local_main = accelerator is None or accelerator.is_local_main_process
-
-        create_kwargs = dict(
+        # Un-gated download on every rank: Hugging Face Hub's per-blob file lock
+        # serializes concurrent fetches, so exactly one rank transfers bytes while
+        # the rest block on the lock and then read the warm cache. This avoids the
+        # is_local_main_process gate + barrier, whose failure mode deadlocks the
+        # siblings (mirrors models/abc.py `_resolve_checkpoint_path`).
+        if ckpt is None:
+            ckpt = huggingface_hub.hf_hub_download("xswu/HPSv2", hps_version_map[hps_ver])
+        model, _preprocess_train, preprocess_val = create_model_and_transforms(
+            "ViT-H-14",
+            open_clip_pretrained,
             precision="amp",
             device=self.device,
             jit=False,
@@ -144,30 +151,8 @@ class HPSv2RewardModel(PointwiseRewardModel):
             with_score_predictor=False,
             with_region_predictor=False,
         )
-
-        # Rank-0 downloads first so other ranks hit the warm HF cache.
-        if is_local_main:
-            if ckpt is None:
-                ckpt = huggingface_hub.hf_hub_download("xswu/HPSv2", hps_version_map[hps_ver])
-            model, _preprocess_train, preprocess_val = create_model_and_transforms(
-                "ViT-H-14",
-                open_clip_pretrained,
-                **create_kwargs,
-            )
         if accelerator is not None:
             accelerator.wait_for_everyone()
-        if not is_local_main:
-            if ckpt is None:
-                ckpt = huggingface_hub.hf_hub_download(
-                    "xswu/HPSv2",
-                    hps_version_map[hps_ver],
-                    local_files_only=True,
-                )
-            model, _preprocess_train, preprocess_val = create_model_and_transforms(
-                "ViT-H-14",
-                open_clip_pretrained,
-                **create_kwargs,
-            )
 
         try:
             checkpoint = torch.load(ckpt, map_location=self.device, weights_only=False)
