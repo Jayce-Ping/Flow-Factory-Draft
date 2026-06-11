@@ -117,7 +117,9 @@ class HPSv2RewardModel(PointwiseRewardModel):
         extras = config.extra_kwargs or {}
         hps_ver = extras.get("hps_version", "v2.1")
         if hps_ver not in hps_version_map:
-            hps_ver = "v2.1"
+            raise ValueError(
+                f"unknown hps_version {hps_ver!r}; expected one of {sorted(hps_version_map)}"
+            )
         self._hps_version = hps_ver
 
         open_clip_pretrained = extras.get("open_clip_pretrained", "laion2B-s32B-b79K")
@@ -222,16 +224,36 @@ class HPSv2RewardModel(PointwiseRewardModel):
         image: Optional[List[Image.Image]] = None,
         video: Optional[List[List[Image.Image]]] = None,
     ) -> RewardModelOutput:
+        """Compute per-sample HPS v2 scores.
+
+        Args:
+            prompt: Text prompts (batch_size,).
+            image: Generated PIL images (batch_size,); mutually exclusive with ``video``.
+            video: Generated clips as frame lists (batch_size,); scored frame-wise then mean-pooled.
+
+        Returns:
+            RewardModelOutput with per-sample HPS v2 scores.
+        """
         if not isinstance(prompt, list):
             prompt = [prompt]
         if image is not None and video is not None:
             raise ValueError("Only one of image or video can be provided.")
+        if image is None and video is None:
+            raise ValueError("HPSv2 reward requires either image or video input.")
 
         batch_size = getattr(self.config, "batch_size", len(prompt))
 
         if video is not None:
+            if len(video) != len(prompt):
+                raise ValueError(
+                    f"video/prompt length mismatch: {len(video)} clips vs {len(prompt)} prompts."
+                )
             scores = self._compute_video_scores(prompt, video, batch_size)
         else:
+            if len(image) != len(prompt):
+                raise ValueError(
+                    f"image/prompt length mismatch: {len(image)} images vs {len(prompt)} prompts."
+                )
             chunks: List[torch.Tensor] = []
             for i in range(0, len(prompt), batch_size):
                 chunks.append(

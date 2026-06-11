@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
-import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -21,9 +19,7 @@ from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
 try:
     from scipy.stats import gmean as _gmean_scores
-except (
-    ImportError
-):  # optional; install scipy (`pip install -e ".[geneval2]"`) for identical GM behavior
+except ImportError:  # optional; `pip install -e ".[geneval2]"` for exact GM parity
 
     def _gmean_scores(xs: List[float]) -> float:
         xs = [max(x, 1e-300) for x in xs]
@@ -31,7 +27,12 @@ except (
 
 
 from ..hparams import RewardArguments
+from ..utils.logger_utils import setup_logger
 from .abc import PointwiseRewardModel, RewardModelOutput
+
+logger = setup_logger(__name__, rank_zero_only=True)
+
+VqaAtom = Tuple[str, str]
 
 
 def _hf_single_gpu_device_map(device: torch.device) -> Dict[str, Any]:
@@ -237,6 +238,15 @@ class GenEval2SoftTIFARewardModel(PointwiseRewardModel):
         self._prompt_to_vqa: Optional[Dict[str, List[Any]]] = None
         if jsonl_paths:
             self._prompt_to_vqa = _load_prompt_vqa_map_from_jsonl_paths(jsonl_paths)
+            logger.info(
+                "GenEval2 Soft-TIFA: loaded %d prompt->vqa_list entries from %s",
+                len(self._prompt_to_vqa),
+                [str(p) for p in jsonl_paths],
+            )
+
+        # Cache the first token id of each fixed answer variant; encoding is pure
+        # function of the string, so this avoids re-tokenizing per VQA atom.
+        self._answer_token_id: Dict[str, int] = {}
 
         resolved_device_map = _resolve_geneval2_device_map(self._device_map, self.device)
         is_local_main = accelerator is None or accelerator.is_local_main_process
@@ -275,12 +285,31 @@ class GenEval2SoftTIFARewardModel(PointwiseRewardModel):
             return self.qwen_model.device
         return next(self.qwen_model.parameters()).device
 
-    def _send_message_with_image(
+    def _first_token_id(self, answer: str) -> int:
+        """Return (and cache) the first token id of a fixed answer variant."""
+        token_id = self._answer_token_id.get(answer)
+        if token_id is None:
+            token_id = self._processor.tokenizer.encode(answer)[0]
+            self._answer_token_id[answer] = token_id
+        return token_id
+
+    def _answer_probability(
         self,
         text: str,
         image_ref: Union[str, Image.Image],
-        answer_list: Optional[Sequence[str]] = None,
-    ) -> Tuple[str, Optional[float]]:
+        answer_list: Sequence[str],
+    ) -> float:
+        """Total next-token probability mass over the accepted answer variants.
+
+        Args:
+            text: The VQA question (already suffixed with the one-word instruction).
+            image_ref: The image to condition on (PIL image or path).
+            answer_list: Accepted answer surface forms; duplicates are summed with
+                multiplicity to match the official Soft-TIFA scoring.
+
+        Returns:
+            Summed softmax probability of the first generated token over ``answer_list``.
+        """
         messages = _construct_message_with_image(text, image_ref)
         inputs = self._processor.apply_chat_template(
             messages,
@@ -298,28 +327,19 @@ class GenEval2SoftTIFARewardModel(PointwiseRewardModel):
                 output_scores=True,
                 return_dict_in_generate=True,
             )
-        scores = outputs.scores[0]
-        probs = torch.nn.functional.softmax(scores, dim=-1)
-
-        if answer_list:
-            lm_prob = 0.0
-            for answer in answer_list:
-                ans_token_id = self._processor.tokenizer.encode(answer)[0]
-                lm_prob += probs[0, ans_token_id].item()
-        else:
-            lm_prob = None
-
-        argmax_token = self._processor.batch_decode([torch.argmax(probs, dim=-1)])[0]
-        return argmax_token, lm_prob
+        probs = torch.nn.functional.softmax(outputs.scores[0], dim=-1)
+        token_ids = torch.as_tensor(
+            [self._first_token_id(a) for a in answer_list], device=probs.device
+        )
+        return probs[0, token_ids].sum().item()
 
     def _soft_tifa(
         self,
-        vqa_list: List[Tuple[str, str]],
+        vqa_list: List[VqaAtom],
         image_ref: Union[str, Image.Image],
-    ) -> Tuple[float, List[float]]:
+    ) -> List[float]:
         score_list: List[float] = []
-        for vqa in vqa_list:
-            question, answer = vqa
+        for question, answer in vqa_list:
             if question.startswith("How many"):
                 answer_list = [
                     answer,
@@ -331,31 +351,19 @@ class GenEval2SoftTIFARewardModel(PointwiseRewardModel):
                 ]
             else:
                 answer_list = ["Yes", "yes", " yes", " Yes"]
-            _, ans_prob = self._send_message_with_image(
-                "{} Answer in one word.".format(question),
-                image_ref,
-                answer_list=answer_list,
-            )
-            if ans_prob is None:
-                raise ValueError(
-                    f"Soft-TIFA could not score answer for question {question!r}: "
-                    "answer probability is None (empty answer_list)."
+            score_list.append(
+                self._answer_probability(
+                    "{} Answer in one word.".format(question),
+                    image_ref,
+                    answer_list,
                 )
-            score_list.append(ans_prob)
-        mean_score = sum(score_list) / len(score_list)
-        return mean_score, score_list
+            )
+        return score_list
 
     def _aggregate(self, score_list: List[float]) -> float:
         if self._aggregation == "gm":
             return float(_gmean_scores(score_list))
         return float(sum(score_list) / len(score_list))
-
-    @staticmethod
-    def _pil_to_temp_png(img: Image.Image) -> str:
-        fd, path = tempfile.mkstemp(suffix=".png")
-        os.close(fd)
-        img.save(path, format="PNG")
-        return path
 
     @torch.no_grad()
     def __call__(
@@ -365,14 +373,29 @@ class GenEval2SoftTIFARewardModel(PointwiseRewardModel):
         video: Optional[List[List[Image.Image]]] = None,
         condition_images: Optional[List[List[Image.Image]]] = None,
         condition_videos: Optional[List[List[List[Image.Image]]]] = None,
-        metadata: Optional[List[Any]] = None,
+        metadata: Optional[List[str]] = None,
         vqa_list: Optional[List[Any]] = None,
         **kwargs: Any,
     ) -> RewardModelOutput:
+        """Compute Soft-TIFA rewards for a batch of generated images.
+
+        Args:
+            prompt: Text prompts (batch_size,).
+            image: Generated PIL images (batch_size,); video is not supported.
+            metadata: Per-sample metadata JSON strings (batch_size,); may carry ``vqa_list``.
+            vqa_list: Optional explicit per-sample VQA atom lists (batch_size,).
+
+        Returns:
+            RewardModelOutput with per-sample Soft-TIFA scores in [0, 1].
+        """
         if video is not None:
             raise ValueError("GenEval2SoftTIFARewardModel supports image only.")
         if image is None:
             raise ValueError("image is required.")
+        if len(image) != len(prompt):
+            raise ValueError(
+                f"image/prompt length mismatch: {len(image)} images vs {len(prompt)} prompts."
+            )
 
         rewards: List[float] = []
         for i in range(len(prompt)):
@@ -383,22 +406,15 @@ class GenEval2SoftTIFARewardModel(PointwiseRewardModel):
                 vqa = _vqa_from_metadata(metadata[i])
             if (vqa is None or not isinstance(vqa, list)) and self._prompt_to_vqa is not None:
                 vqa = self._prompt_to_vqa.get(prompt[i])
-            if vqa is None or not isinstance(vqa, list):
+            if not isinstance(vqa, list) or len(vqa) == 0:
                 raise ValueError(
-                    "Could not resolve vqa_list for Soft-TIFA: provide per-sample vqa_list, ensure the "
-                    "dataset JSONL has a 'vqa_list' column (delivered via 'metadata'), or set extra_kwargs "
-                    "benchmark_jsonl / data_path to a GenEval2 JSONL (or dataset directory with "
-                    f"train.jsonl/test.jsonl). Missing lookup for prompt[{i}]={prompt[i]!r}."
+                    "Could not resolve a non-empty vqa_list for Soft-TIFA: provide per-sample "
+                    "vqa_list, ensure the dataset JSONL has a 'vqa_list' column (delivered via "
+                    "'metadata'), or set extra_kwargs benchmark_jsonl / data_path to a GenEval2 "
+                    "JSONL (or dataset directory with train.jsonl/test.jsonl). "
+                    f"Got {vqa!r} for prompt[{i}]={prompt[i]!r}."
                 )
-            img = image[i]
-            path = self._pil_to_temp_png(img)
-            try:
-                _, score_list = self._soft_tifa(vqa, path)
-                rewards.append(self._aggregate(score_list))
-            finally:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+            score_list = self._soft_tifa(vqa, image[i])
+            rewards.append(self._aggregate(score_list))
 
         return RewardModelOutput(rewards=torch.tensor(rewards, dtype=torch.float32))
