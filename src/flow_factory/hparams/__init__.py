@@ -22,6 +22,7 @@ from .scheduler_args import SchedulerArguments
 from .training_args import (
     TrainingArguments,
     GRPOTrainingArguments,
+    DPPOTrainingArguments,
     NFTTrainingArguments,
     AWMTrainingArguments,
     DGPOTrainingArguments,
@@ -43,6 +44,7 @@ __all__ = [
     "SchedulerArguments",
     "TrainingArguments",
     "GRPOTrainingArguments",
+    "DPPOTrainingArguments",
     "NFTTrainingArguments",
     "AWMTrainingArguments",
     "DGPOTrainingArguments",

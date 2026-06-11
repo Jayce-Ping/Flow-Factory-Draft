@@ -23,6 +23,7 @@ against the monolithic ``training_args.py`` continue to work unchanged:
 from ._base import EvaluationArguments, TrainingArguments
 from ._registry import get_training_args_class, list_registered_training_args
 from .grpo import GRPOTrainingArguments
+from .dppo import DPPOTrainingArguments
 from .nft import NFTTrainingArguments
 from .awm import AWMTrainingArguments
 from .dpo import DPOTrainingArguments
@@ -34,6 +35,7 @@ __all__ = [
     "EvaluationArguments",
     "TrainingArguments",
     "GRPOTrainingArguments",
+    "DPPOTrainingArguments",
     "NFTTrainingArguments",
     "AWMTrainingArguments",
     "DPOTrainingArguments",

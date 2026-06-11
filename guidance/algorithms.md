@@ -13,6 +13,8 @@
      - [KL-loss](#kl-loss)
      - [GRPO-Guard](#grpo-guard)
 
+- [DPPO](#dppo)
+
 - [DPO](#dpo)
 
 - [DGPO](#dgpo)
@@ -158,6 +160,21 @@ train:
     dynamics_type: 'Flow-SDE'
 ```
 > ‼️ **Note**: Currently, `grpo-guard` reweighting is only compatible with `Flow-GRPO` dynamics. Therefore, dynamics_type must be explicitly set to `Flow-SDE`.
+
+## DPPO
+
+Flow-DPPO is a strict Flow-GRPO variant that keeps GRPO's group advantages and the optional KL-vs-reference penalty, but **replaces the PPO ratio-clip with a KL trust-region mask**. Instead of clipping the importance ratio, DPPO zeroes the gradient for any sample whose per-step KL(current ‖ rollout-old) exceeds `kl_mask_threshold` *and* whose update would push the action further in the wrong direction (`ratio > 1 & adv > 0`, or `ratio < 1 & adv < 0`).
+
+```yaml
+train:
+    trainer_type: 'dppo'
+    kl_type: 'x-based'         # KL(current||old) space: 'x-based' (next_latents_mean) or 'v-based' (noise_pred)
+    kl_mask_threshold: 1.0e-6  # Per-step KL trust-region; larger keeps more samples
+    kl_beta: 1.0e-3            # Optional KL(current||reference) penalty (0 disables)
+    kl_guidance_scale: 4.5     # CFG for the KL-vs-reference forward (Null = training guidance_scale)
+```
+
+Like GRPO, DPPO is **coupled** and must use SDE dynamics (`Flow-SDE`, `Dance-SDE`, `CPS`). When `kl_beta > 0`, the KL-vs-reference term is evaluated at `kl_guidance_scale`; this is reflected in `DPPOTrainingArguments.get_preprocess_guidance_scale()` so negative prompts are encoded at preprocessing whenever `kl_guidance_scale > 1.0`. Example configs: `examples/dppo/lora/{flux2_klein_base,sd3_5}/{single,multi}.yaml`.
 
 ## DPO
 

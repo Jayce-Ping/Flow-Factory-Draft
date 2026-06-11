@@ -98,13 +98,14 @@ All three registries map string keys → lazy import paths. Resolution: registry
 |-----|-------|----------|------------|
 | `grpo` | `GRPOTrainer` | Coupled | `BaseTrainer` |
 | `grpo-guard` | `GRPOGuardTrainer` | Coupled | `GRPOTrainer` |
+| `dppo` | `DPPOTrainer` | Coupled | `GRPOTrainer` |
 | `dpo` | `DPOTrainer` | Decoupled | `BaseTrainer` |
 | `dgpo` | `DGPOTrainer` | Decoupled | `BaseTrainer` |
 | `nft` | `DiffusionNFTTrainer` | Decoupled | `BaseTrainer` |
 | `awm` | `AWMTrainer` | Decoupled | `BaseTrainer` |
 | `crd` | `CRDTrainer` | Decoupled | `BaseTrainer` |
 
-**Flat hierarchy**: New trainers inherit from `BaseTrainer` directly. `GRPOGuardTrainer → GRPOTrainer` is the only sanctioned exception (see constraint #11).
+**Flat hierarchy**: New trainers inherit from `BaseTrainer` directly. The sanctioned exceptions are `GRPOGuardTrainer → GRPOTrainer` and `DPPOTrainer → GRPOTrainer` (strict GRPO loss variants; see constraint #11).
 
 **Model Adapters** (`models/registry.py`):
 | Key | Class | Task |

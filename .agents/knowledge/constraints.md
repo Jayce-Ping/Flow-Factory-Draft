@@ -57,7 +57,7 @@ Reward model sharding under ZeRO-3 is broken even with `GatherParameter` context
 
 **Per-epoch hook order**: `sample()` (Stages 2–3) → `prepare_feedback()` (Stages 4–5) → `optimize()` (Stage 6). `DPOTrainer` forms chosen/rejected pairs at the **start** of `optimize()` (not in `prepare_feedback()`).
 
-**Trainer hierarchy**: New trainers MUST inherit directly from `BaseTrainer`. The only sanctioned exception is `GRPOGuardTrainer → GRPOTrainer` (a strict behavioral variant that adds ratio-normalization logic without changing the core algorithm). Trainer-to-trainer inheritance creates fragile coupling; when in doubt, inherit from `BaseTrainer` and extract shared logic into helper methods. All trainers delegate advantage computation to `self.advantage_processor.compute_advantages()`.
+**Trainer hierarchy**: New trainers MUST inherit directly from `BaseTrainer`. The only sanctioned exceptions are strict behavioral variants of GRPO that change only the per-step loss while reusing GRPO's sampling/advantage/eval machinery: `GRPOGuardTrainer → GRPOTrainer` (adds ratio-normalization) and `DPPOTrainer → GRPOTrainer` (replaces the PPO ratio-clip with a KL trust-region mask). Trainer-to-trainer inheritance creates fragile coupling; when in doubt, inherit from `BaseTrainer` and extract shared logic into helper methods. All trainers delegate advantage computation to `self.advantage_processor.compute_advantages()`.
 
 ### 12. BaseAdapter Abstract Methods
 Subclasses of `BaseAdapter` MUST implement these **4 abstract methods**:
