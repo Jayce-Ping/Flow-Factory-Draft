@@ -44,6 +44,7 @@ log:
   save_dir: "saves/"  # Directory to save model checkpoints and logs
   save_freq: 40  # Save frequency in epochs (0 to disable)
   save_model_only: true  # Save only the model weights (not optimizer, scheduler, etc.)
+  verbose: false  # Print detailed progress during training
 
 # Training Configuration
 train:

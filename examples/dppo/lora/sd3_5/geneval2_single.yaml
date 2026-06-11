@@ -5,7 +5,7 @@
 
 # Environment Configuration
 launcher: "accelerate"  # Options: accelerate
-config_file: config/deepspeed/deepspeed_zero2.yaml  # Path to distributed config file (optional)
+config_file: config/accelerate_configs/multi_gpu.yaml  # Path to distributed config file (optional)
 num_processes: 8  # Number of processes to launch (overrides config file)
 main_process_port: 29500
 mixed_precision: "bf16"  # Options: no, fp16, bf16
@@ -44,6 +44,7 @@ log:
   save_dir: "saves/"  # Directory to save model checkpoints and logs
   save_freq: 40  # Save frequency in epochs (0 to disable)
   save_model_only: true  # Save only the model weights (not optimizer, scheduler, etc.)
+  verbose: false  # Print detailed progress during training
 
 # Training Configuration
 train:
