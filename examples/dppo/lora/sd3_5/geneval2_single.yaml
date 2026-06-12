@@ -95,7 +95,7 @@ train:
 
 # Scheduler Configuration
 scheduler:
-  dynamics_type: "Flow-SDE"  # Options: Flow-SDE, Dance-SDE, CPS, ODE
+  dynamics_type: "CPS"  # Options: Flow-SDE, Dance-SDE, CPS, ODE
   noise_level: 0.7  # Noise level for sampling
   num_sde_steps: 3  # Number of noise steps
   sde_steps: [0, 1, 2, 3, 4, 5]  # Custom noise window; noise steps randomly selected from this list
