@@ -234,16 +234,18 @@ class VLMEvaluateRewardModel(PointwiseRewardModel):
     ) -> List[float]:
         """Create a loop-local client + semaphore, then score the batch.
 
-        ``AsyncOpenAI`` and ``asyncio.Semaphore`` are event-loop-bound; each batch
-        runs in a fresh ``asyncio.run`` loop (and the async-reward path runs from a
-        thread pool), so they must be created inside the running loop and passed
-        down -- never cached on ``self`` -- to avoid
-        ``RuntimeError: ... bound to a different event loop``.
+        ``AsyncOpenAI`` and ``asyncio.Semaphore`` are event-loop-bound, so they
+        must be created inside this per-call ``asyncio.run`` loop and threaded
+        through the call chain -- never cached on ``self`` (caching reuses them
+        across loops and raises "bound to a different event loop"). The semaphore
+        is per call: ``max_concurrent`` caps in-flight judge requests per batch,
+        so with ``async_reward`` and ``num_workers`` > 1 the effective server
+        concurrency is ``num_workers * max_concurrent``.
         """
         async with self._async_openai_cls(
             base_url=self.api_base_url, api_key=self.api_key
         ) as client:
-            semaphore = asyncio.Semaphore(self.max_concurrent)
+            semaphore = asyncio.Semaphore(max(1, self.max_concurrent))
             return await self._async_score_batch(client, semaphore, images)
 
     async def _async_score_batch(

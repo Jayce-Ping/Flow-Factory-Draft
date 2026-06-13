@@ -281,12 +281,13 @@ class QwenImageBenchRewardModel(PointwiseRewardModel):
     ) -> List[float]:
         """Create a loop-local client + semaphore, then score the batch.
 
-        ``AsyncOpenAI`` and ``asyncio.Semaphore`` are event-loop-bound. ``__call__``
-        scores each batch inside a fresh ``asyncio.run`` loop (and the async-reward
-        path runs ``__call__`` from a thread pool), so these objects must be created
-        inside the running loop and threaded through the call chain -- never cached
-        on ``self`` -- otherwise reuse across loops raises
-        ``RuntimeError: ... bound to a different event loop``.
+        ``AsyncOpenAI`` and ``asyncio.Semaphore`` are event-loop-bound, so they
+        must be created inside this per-call ``asyncio.run`` loop and threaded
+        through the call chain -- never cached on ``self`` (caching reuses them
+        across loops and raises "bound to a different event loop"). The semaphore
+        is per call: ``max_concurrent`` caps in-flight judge requests per batch,
+        so with ``async_reward`` and ``num_workers`` > 1 the effective server
+        concurrency is ``num_workers * max_concurrent``.
         """
         async with self._async_openai_cls(
             base_url=self.api_base_url, api_key=self.api_key
