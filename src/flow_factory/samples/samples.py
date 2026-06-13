@@ -424,7 +424,7 @@ class ImageConditionSample(BaseSample):
     """
     _id_fields : ClassVar[frozenset[str]] = BaseSample._id_fields | frozenset({'condition_images'})
     # Opt-in for adapters that persist condition_images via the HF Image feature
-    # (``pil_image_columns``); keep in sync with that ClassVar.
+    # (``python_format_columns``); keep in sync with that ClassVar.
     condition_images_as_pil : ClassVar[bool] = False
 
     condition_images : Optional[ImageBatch] = None  # Image.Image | torch.Tensor | np.ndarray, per-sample list or batched

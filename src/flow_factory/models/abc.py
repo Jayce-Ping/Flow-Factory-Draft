@@ -110,21 +110,24 @@ class BaseAdapter(ABC):
             "modules_to_save",  # Additional modules marked for saving
         ]
 
-    # Names of ``preprocess_func`` output columns that hold RGB images and must
-    # be persisted via the HuggingFace ``Image`` feature (PNG bytes) instead of
-    # raw tensors. This lets the dataset store variable-size / variable-count
-    # images (e.g. multi-reference I2I) that Arrow cannot serialize as ragged
-    # tensors, and read them back as PIL.
+    # Names of ``preprocess_func`` output columns that must be surfaced in the HF
+    # "python" format (returned as PIL, never tensorized) instead of the torch
+    # format. They are persisted via the HuggingFace ``Image`` feature (PNG bytes)
+    # rather than raw tensors, which lets the dataset store variable-size /
+    # variable-count images (e.g. multi-reference I2I) that Arrow cannot serialize
+    # as ragged tensors, and read them back as PIL -- see
+    # ``data_utils.dataset._apply_torch_format``.
     #
-    # Empty by default and OPT-IN per adapter: only declare an output here when
-    # it is a genuine RGB image that survives a PIL round-trip. Do NOT declare
+    # MUST contain only genuine RGB image columns: each entry is run through PIL
+    # canonicalization (``_to_pil_image_list``), so non-image data would break.
+    # Empty by default and OPT-IN per adapter: only declare an output here when it
+    # is a genuine RGB image that survives a PIL round-trip. Do NOT declare
     # preprocessed/non-RGB tensors (e.g. VAE-ready video tensors, latents) -- PIL
-    # conversion would be lossy and break tensor consumers. The raw modality
-    # column ``images`` is always handled as images by the dataset itself,
-    # independent of this declaration.
-    # Declared columns consequently stay in the HF "python" format (returned
-    # as PIL, never tensorized) -- see ``data_utils.dataset._apply_torch_format``.
-    pil_image_columns: ClassVar[frozenset[str]] = frozenset()
+    # conversion would be lossy and break tensor consumers; non-image columns that
+    # must stay python belong in ``dataset.EXTRA_PYTHON_FORMAT_COLUMNS``, not here.
+    # The raw modality column ``images`` is always handled as images by the dataset
+    # itself, independent of this declaration.
+    python_format_columns: ClassVar[frozenset[str]] = frozenset()
 
     def __init__(self, config: Arguments, accelerator : Accelerator):
         super().__init__()

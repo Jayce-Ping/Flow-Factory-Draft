@@ -51,11 +51,11 @@ _PREPROCESS_FORMAT_VERSION = 2
 # consumed by ``BaseTrainer._inject_batch_metadata`` via ``json.dumps``).
 METADATA_COLUMN = "metadata"
 
-# Columns kept in HF "python objects" format by name (in addition to image
-# columns, which are detected by feature type via ``_is_image_feature``).
+# Non-image columns kept in the HF "python" format by name (in addition to image
+# columns, which are auto-detected by feature type via ``_is_image_feature``).
 # The torch formatter would recursively tensorize ``METADATA_COLUMN``'s numeric
 # values (e.g. an int becomes a 0-dim Tensor), breaking JSON serialization.
-PYTHON_FORMAT_COLUMNS = frozenset({METADATA_COLUMN})
+EXTRA_PYTHON_FORMAT_COLUMNS = frozenset({METADATA_COLUMN})
 
 
 # ========================================================================================
@@ -481,15 +481,15 @@ class GeneralDataset(Dataset):
         preprocess_res = self._preprocess_func(**filtered_args)
 
         # 6. Process results - move tensors to CPU for caching.
-        # Image-valued adapter outputs (declared via `pil_image_columns`)
+        # Image-valued adapter outputs (declared via `python_format_columns`)
         # are stored as per-sample List[PIL] so HF serializes them via the Image
         # feature; ragged image tensors (variable size/count, e.g. multi-ref I2I)
         # are not Arrow-serializable.
         adapter = getattr(self._preprocess_func, "__self__", None)
-        adapter_pil_image_cols = getattr(adapter, "pil_image_columns", frozenset())
+        adapter_python_format_cols = getattr(adapter, "python_format_columns", frozenset())
         final_res = {}
         for k, v in preprocess_res.items():
-            if k in adapter_pil_image_cols:
+            if k in adapter_python_format_cols:
                 # Image column: canonicalize each per-sample value
                 # (Tensor(N,C,H,W) / List[Tensor] / List[PIL]) to List[PIL].
                 # Empty samples stay []. The per-batch value is a per-sample list
@@ -756,10 +756,10 @@ class GeneralDataset(Dataset):
 
         Stacks tensors with same shape, keeps ragged tensors as lists. Image
         columns stored via the HF Image feature -- the raw ``images`` column always,
-        plus any adapter output declared in ``pil_image_columns`` (e.g. Bagel's
+        plus any adapter output declared in ``python_format_columns`` (e.g. Bagel's
         ``condition_images``) -- decode to per-sample ``List[PIL.Image]``, so they
         land in Case 3 and are kept as a ``List[List[PIL.Image]]`` MultiImageBatch.
-        ``condition_images`` not declared in ``pil_image_columns`` stay tensors.
+        ``condition_images`` not declared in ``python_format_columns`` stay tensors.
 
         Args:
             batch: List of samples
@@ -858,11 +858,11 @@ def _python_format_column_names(dataset: HFDataset) -> set:
     Two sources:
         1. Image columns (detected by feature type): decode to PIL images of
            varying sizes, which cannot be cast to tensors.
-        2. ``PYTHON_FORMAT_COLUMNS`` (by name): columns such as ``metadata``
-           that must survive untouched for JSON serialization.
+        2. ``EXTRA_PYTHON_FORMAT_COLUMNS`` (by name): non-image columns such as
+           ``metadata`` that must survive untouched for JSON serialization.
     """
     image_cols = {name for name, feat in dataset.features.items() if _is_image_feature(feat)}
-    return image_cols | PYTHON_FORMAT_COLUMNS
+    return image_cols | EXTRA_PYTHON_FORMAT_COLUMNS
 
 
 def _apply_torch_format(dataset: HFDataset) -> None:

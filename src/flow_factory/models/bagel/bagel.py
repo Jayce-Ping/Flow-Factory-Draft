@@ -156,8 +156,8 @@ class BagelI2ISample(I2ISample):
         }
     )
     # Keep condition_images as PIL on the sample (Bagel persists them via
-    # ``pil_image_columns`` and re-normalizes from PIL at forward time), avoiding a
-    # PIL -> float tensor -> PIL round-trip and ~4x buffer memory. Sync with that ClassVar.
+    # ``python_format_columns`` and re-normalizes from PIL at forward time), avoiding
+    # a PIL -> float tensor -> PIL round-trip and ~4x buffer memory. Sync with that ClassVar.
     condition_images_as_pil: ClassVar[bool] = True
     image_shape: Optional[Tuple[int, int]] = None
 
@@ -183,7 +183,7 @@ class BagelAdapter(BaseAdapter):
     # re-encodes them at rollout/training. Persist them via the HF Image feature
     # so ragged multi-reference batches serialize; they read back as PIL and are
     # re-normalized by ``_normalize_condition_images``.
-    pil_image_columns: ClassVar[frozenset[str]] = frozenset({"condition_images"})
+    python_format_columns: ClassVar[frozenset[str]] = frozenset({"condition_images"})
 
     def __init__(self, config: Arguments, accelerator: Accelerator):
         # Load tokenizer and transforms before super().__init__
