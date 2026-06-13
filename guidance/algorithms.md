@@ -163,7 +163,7 @@ train:
 
 ## DPPO
 
-Flow-DPPO is a strict Flow-GRPO variant that keeps GRPO's group advantages and the optional KL-vs-reference penalty, but **replaces the PPO ratio-clip with a KL trust-region mask**. Instead of clipping the importance ratio, DPPO zeroes the gradient for any sample whose per-step KL(current ‖ rollout-old) exceeds `kl_mask_threshold` *and* whose update would push the action further in the wrong direction (`ratio > 1 & adv > 0`, or `ratio < 1 & adv < 0`).
+Flow-DPPO (Divergence Proximal Policy Optimization) [[15]](#ref15) is a strict Flow-GRPO variant that keeps GRPO's group advantages and the optional KL-vs-reference penalty, but **replaces the PPO ratio-clip with a divergence proximal constraint**. The argument is that the single-sample probability ratio is a noisy estimate of the true policy divergence, so ratio clipping over-constrains some steps and under-constrains others. Because the per-step policy in a flow model is Gaussian, the KL between the old and new policies is exact and cheap to compute. DPPO uses this in an **asymmetric divergence mask**: it zeroes the gradient for any sample whose per-step KL(current ‖ rollout-old) exceeds `kl_mask_threshold` *and* whose update would push the action further in the wrong direction (`ratio > 1 & adv > 0`, or `ratio < 1 & adv < 0`).
 
 The two KL computations are **decoupled**: `kl_mask_type` selects the space of the trust-region mask's KL(current ‖ old), while `kl_type` selects the space of the optional KL(current ‖ reference) penalty.
 
@@ -583,3 +583,4 @@ Each teacher's `applicable_datasets` must reference declared `data.datasets[*].n
 * <a name="ref12"></a>[12] [**TDM-R1**: Reinforcing Few-Step Diffusion Models with Non-Differentiable Reward](https://arxiv.org/abs/2510.08425)
 * <a name="ref13"></a>[13] [**CRD**: Diffusion Reinforcement Learning via Centered Reward Distillation](https://arxiv.org/abs/2603.14128)
 * <a name="ref14"></a>[14] [**DiffusionOPD**: A Unified Perspective of On-Policy Distillation in Diffusion Models](https://arxiv.org/abs/2605.15055)
+* <a name="ref15"></a>[15] [**Flow-DPPO**: Divergence Proximal Policy Optimization for Flow Matching Models](https://arxiv.org/abs/2606.11025) ([Code](https://github.com/Tencent-Hunyuan/UniRL/tree/main/FlowDPPO#readme))
