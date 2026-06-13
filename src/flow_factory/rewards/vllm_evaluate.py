@@ -34,21 +34,22 @@ Usage in YAML config:
         timeout: 60
         top_logprobs: 20
 """
+
 from __future__ import annotations
 
-import hashlib
 import asyncio
+import hashlib
 import logging
-from typing import Optional, List
+from typing import Any, List, Optional
 
-import torch
 import numpy as np
-from PIL import Image
+import torch
 from accelerate import Accelerator
+from PIL import Image
 
-from .abc import PointwiseRewardModel, RewardModelOutput
 from ..hparams import RewardArguments
 from ..utils.image import pil_image_to_base64
+from .abc import PointwiseRewardModel, RewardModelOutput
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,7 @@ logging.getLogger("openai").setLevel(logging.WARNING)
 # =====================================================================
 # Helper functions
 # =====================================================================
+
 
 def _get_yes_cond_prob(completion, canonicalize: bool = False) -> float:
     """
@@ -80,22 +82,18 @@ def _get_yes_cond_prob(completion, canonicalize: bool = False) -> float:
         return 0.0
 
     if not canonicalize:
-        token_logprobs = {
-            t.token: t.logprob for t in logprobs.content[0].top_logprobs
-        }
-        yes_logprob = token_logprobs.get('Yes', float('-inf'))
-        no_logprob = token_logprobs.get('No', float('-inf'))
+        token_logprobs = {t.token: t.logprob for t in logprobs.content[0].top_logprobs}
+        yes_logprob = token_logprobs.get("Yes", float("-inf"))
+        no_logprob = token_logprobs.get("No", float("-inf"))
 
-        if yes_logprob == float('-inf') and no_logprob == float('-inf'):
+        if yes_logprob == float("-inf") and no_logprob == float("-inf"):
             return 0.0
 
         diff = torch.tensor(yes_logprob - no_logprob, dtype=torch.float64)
         return torch.sigmoid(diff).item()
     else:
         # Aggregate all case variations
-        token_probs = {
-            t.token: np.exp(t.logprob) for t in logprobs.content[0].top_logprobs
-        }
+        token_probs = {t.token: np.exp(t.logprob) for t in logprobs.content[0].top_logprobs}
         tokens = np.array(list(token_probs.keys()))
         probs = np.array(list(token_probs.values()), dtype=np.float64)
         tokens_stripped = np.array([token.strip().lower() for token in tokens])
@@ -112,6 +110,7 @@ def _get_yes_cond_prob(completion, canonicalize: bool = False) -> float:
 # =====================================================================
 # VLMEvaluateRewardModel
 # =====================================================================
+
 
 class VLMEvaluateRewardModel(PointwiseRewardModel):
     """
@@ -179,12 +178,7 @@ class VLMEvaluateRewardModel(PointwiseRewardModel):
         self.canonicalize = config.extra_kwargs.get("canonicalize", False)
         self.max_cache_size = config.extra_kwargs.get("max_cache_size", 1024)
 
-        # Initialize async OpenAI client
-        self.client = AsyncOpenAI(
-            base_url=self.api_base_url,
-            api_key=self.api_key,
-        )
-        self.semaphore = asyncio.Semaphore(self.max_concurrent)
+        self._async_openai_cls = AsyncOpenAI
 
         # Simple FIFO cache: img_hash -> score
         self._cache: dict[str, float] = {}
@@ -224,28 +218,48 @@ class VLMEvaluateRewardModel(PointwiseRewardModel):
         if image is None:
             raise ValueError("Either 'image' or 'video' must be provided")
 
-        assert len(prompt) == len(image), (
-            f"Mismatch: {len(prompt)} prompts vs {len(image)} images"
-        )
+        assert len(prompt) == len(image), f"Mismatch: {len(prompt)} prompts vs {len(image)} images"
 
         # Run async scoring
-        rewards = asyncio.run(self._async_score_batch(image))
+        rewards = asyncio.run(self._run_batch(image))
 
         return RewardModelOutput(
             rewards=torch.tensor(rewards, dtype=torch.float32),
             extra_info={},
         )
 
-    async def _async_score_batch(
+    async def _run_batch(
         self,
         images: List[Image.Image],
     ) -> List[float]:
+        """Create a loop-local client + semaphore, then score the batch.
+
+        ``AsyncOpenAI`` and ``asyncio.Semaphore`` are event-loop-bound; each batch
+        runs in a fresh ``asyncio.run`` loop (and the async-reward path runs from a
+        thread pool), so they must be created inside the running loop and passed
+        down -- never cached on ``self`` -- to avoid
+        ``RuntimeError: ... bound to a different event loop``.
+        """
+        async with self._async_openai_cls(
+            base_url=self.api_base_url, api_key=self.api_key
+        ) as client:
+            semaphore = asyncio.Semaphore(self.max_concurrent)
+            return await self._async_score_batch(client, semaphore, images)
+
+    async def _async_score_batch(
+        self,
+        client: Any,
+        semaphore: asyncio.Semaphore,
+        images: List[Image.Image],
+    ) -> List[float]:
         """Score all images in the batch concurrently."""
-        tasks = [self._score_single(img) for img in images]
+        tasks = [self._score_single(client, semaphore, img) for img in images]
         return list(await asyncio.gather(*tasks))
 
     async def _score_single(
         self,
+        client: Any,
+        semaphore: asyncio.Semaphore,
         image: Image.Image,
     ) -> float:
         """
@@ -269,8 +283,8 @@ class VLMEvaluateRewardModel(PointwiseRewardModel):
 
         for attempt in range(self.max_retries):
             try:
-                async with self.semaphore:
-                    completion = await self.client.chat.completions.create(
+                async with semaphore:
+                    completion = await client.chat.completions.create(
                         model=self.vlm_model,
                         messages=messages,
                         temperature=0.0,
@@ -285,11 +299,9 @@ class VLMEvaluateRewardModel(PointwiseRewardModel):
                 return score
 
             except Exception as e:
-                logger.warning(
-                    f"VLM API error on attempt {attempt + 1}/{self.max_retries}: {e}"
-                )
+                logger.warning(f"VLM API error on attempt {attempt + 1}/{self.max_retries}: {e}")
                 if attempt < self.max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)
+                    await asyncio.sleep(2**attempt)
 
         # All retries exhausted, return default score (do not cache failures)
         return 0.0

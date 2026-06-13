@@ -56,7 +56,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from accelerate import Accelerator
@@ -155,6 +155,7 @@ class QwenImageBenchRewardModel(PointwiseRewardModel):
                 "QwenImageBenchRewardModel requires the `openai` package. "
                 "Install with: pip install openai"
             )
+        self._async_openai_cls = AsyncOpenAI
 
         extra = config.extra_kwargs
         self.api_base_url: str = extra.get("api_base_url", "http://localhost:8000/v1")
@@ -195,9 +196,6 @@ class QwenImageBenchRewardModel(PointwiseRewardModel):
                 f"expected score_dimension == 'total' or one of {list(DIM_TO_CHECKLIST)}, "
                 f"got {self.score_dimension!r}"
             )
-
-        self.client = AsyncOpenAI(base_url=self.api_base_url, api_key=self.api_key)
-        self.semaphore = asyncio.Semaphore(max(1, self.max_concurrent))
 
     # ============================== Public API ==============================
 
@@ -247,7 +245,7 @@ class QwenImageBenchRewardModel(PointwiseRewardModel):
             pil_image_to_base64(self._prepare_image(img), format="PNG") for img in image
         ]
 
-        scores = asyncio.run(self._async_score_batch(prompt, image_data_urls, l1_dims_per_sample))
+        scores = asyncio.run(self._run_batch(prompt, image_data_urls, l1_dims_per_sample))
         rewards = torch.tensor(scores, dtype=torch.float32, device=self.device)
         return RewardModelOutput(rewards=rewards, extra_info={})
 
@@ -275,21 +273,48 @@ class QwenImageBenchRewardModel(PointwiseRewardModel):
 
     # ============================== Async scoring ==============================
 
+    async def _run_batch(
+        self,
+        prompts: List[str],
+        image_data_urls: List[str],
+        l1_dims_per_sample: List[List[str]],
+    ) -> List[float]:
+        """Create a loop-local client + semaphore, then score the batch.
+
+        ``AsyncOpenAI`` and ``asyncio.Semaphore`` are event-loop-bound. ``__call__``
+        scores each batch inside a fresh ``asyncio.run`` loop (and the async-reward
+        path runs ``__call__`` from a thread pool), so these objects must be created
+        inside the running loop and threaded through the call chain -- never cached
+        on ``self`` -- otherwise reuse across loops raises
+        ``RuntimeError: ... bound to a different event loop``.
+        """
+        async with self._async_openai_cls(
+            base_url=self.api_base_url, api_key=self.api_key
+        ) as client:
+            semaphore = asyncio.Semaphore(max(1, self.max_concurrent))
+            return await self._async_score_batch(
+                client, semaphore, prompts, image_data_urls, l1_dims_per_sample
+            )
+
     async def _async_score_batch(
         self,
+        client: Any,
+        semaphore: asyncio.Semaphore,
         prompts: List[str],
         image_data_urls: List[str],
         l1_dims_per_sample: List[List[str]],
     ) -> List[float]:
         """Score every image concurrently; returns per-image rewards in [0, 1]."""
         tasks = [
-            self._score_single_image(p, url, dims)
+            self._score_single_image(client, semaphore, p, url, dims)
             for p, url, dims in zip(prompts, image_data_urls, l1_dims_per_sample)
         ]
         return list(await asyncio.gather(*tasks))
 
     async def _score_single_image(
         self,
+        client: Any,
+        semaphore: asyncio.Semaphore,
         prompt: str,
         image_data_url: str,
         l1_dims: List[str],
@@ -300,6 +325,8 @@ class QwenImageBenchRewardModel(PointwiseRewardModel):
             outputs = await asyncio.gather(
                 *[
                     self._call_judge(
+                        client,
+                        semaphore,
                         USER_PROMPT_TEMPLATE.format(
                             prompt=prompt,
                             level1_dim=l1,
@@ -320,12 +347,20 @@ class QwenImageBenchRewardModel(PointwiseRewardModel):
         # single_call
         all_checklists = "\n\n".join(f"## {l1}\n{DIM_TO_CHECKLIST[l1]}" for l1 in l1_dims)
         output = await self._call_judge(
+            client,
+            semaphore,
             _SINGLE_CALL_TEMPLATE.format(prompt=prompt, all_checklists=all_checklists),
             image_data_url,
         )
         return self._aggregate(self._parse_single_call(output, l1_dims))
 
-    async def _call_judge(self, user_text: str, image_data_url: str) -> Optional[str]:
+    async def _call_judge(
+        self,
+        client: Any,
+        semaphore: asyncio.Semaphore,
+        user_text: str,
+        image_data_url: str,
+    ) -> Optional[str]:
         """Issue one judge request with retries; returns raw text or None on failure."""
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -340,8 +375,8 @@ class QwenImageBenchRewardModel(PointwiseRewardModel):
         last_err: Optional[BaseException] = None
         for attempt in range(self.max_retries):
             try:
-                async with self.semaphore:
-                    completion = await self.client.chat.completions.create(
+                async with semaphore:
+                    completion = await client.chat.completions.create(
                         model=self.vlm_model,
                         messages=messages,
                         temperature=self.temperature,

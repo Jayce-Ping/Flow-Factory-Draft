@@ -25,20 +25,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 from accelerate import Accelerator
 from PIL import Image
 
+from ..hparams import RewardArguments
+from ..utils.image import pil_image_to_base64
 from .abc import PointwiseRewardModel, RewardModelOutput
 from .rational_rewards_t2i import (
     _clip_vlm_text_for_log,
     aggregate_aspect_scores,
     extract_numeric_score,
 )
-from ..hparams import RewardArguments
-from ..utils.image import pil_image_to_base64
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
@@ -251,7 +251,9 @@ def build_scoring_messages_edit(
 def _first_condition_image(cond: Union[Image.Image, List[Image.Image]]) -> Image.Image:
     if isinstance(cond, list):
         if not cond:
-            raise ValueError("condition_images entry is an empty list; need at least one source image")
+            raise ValueError(
+                "condition_images entry is an empty list; need at least one source image"
+            )
         first = cond[0]
         if not isinstance(first, Image.Image):
             raise TypeError(
@@ -315,8 +317,7 @@ class RationalRewardsEditRewardModel(PointwiseRewardModel):
                 f"unsupported aspect(s) {unknown!r}; allowed: {list(SUPPORTED_ASPECTS)}"
             )
 
-        self.client = AsyncOpenAI(base_url=self.api_base_url, api_key=self.api_key)
-        self.semaphore = asyncio.Semaphore(max(1, self.max_concurrent))
+        self._async_openai_cls = AsyncOpenAI
 
     @torch.no_grad()
     def __call__(
@@ -341,20 +342,52 @@ class RationalRewardsEditRewardModel(PointwiseRewardModel):
             )
 
         source_images = [_first_condition_image(c) for c in condition_images]
-        scores = asyncio.run(self._async_score_batch(prompt, source_images, image))
+        scores = asyncio.run(self._run_batch(prompt, source_images, image))
         rewards = torch.tensor(scores, dtype=torch.float32, device=self.device)
         return RewardModelOutput(rewards=rewards, extra_info={})
 
-    async def _async_score_batch(
+    async def _run_batch(
         self,
         prompts: List[str],
         sources: List[Image.Image],
         edited: List[Image.Image],
     ) -> List[float]:
-        tasks = [self._score_single(p, s, e) for p, s, e in zip(prompts, sources, edited)]
+        """Create a loop-local client + semaphore, then score the batch.
+
+        ``AsyncOpenAI`` and ``asyncio.Semaphore`` are event-loop-bound; each batch
+        runs in a fresh ``asyncio.run`` loop (and the async-reward path runs from a
+        thread pool), so they must be created inside the running loop and passed
+        down -- never cached on ``self`` -- to avoid
+        ``RuntimeError: ... bound to a different event loop``.
+        """
+        async with self._async_openai_cls(
+            base_url=self.api_base_url, api_key=self.api_key
+        ) as client:
+            semaphore = asyncio.Semaphore(max(1, self.max_concurrent))
+            return await self._async_score_batch(client, semaphore, prompts, sources, edited)
+
+    async def _async_score_batch(
+        self,
+        client: Any,
+        semaphore: asyncio.Semaphore,
+        prompts: List[str],
+        sources: List[Image.Image],
+        edited: List[Image.Image],
+    ) -> List[float]:
+        tasks = [
+            self._score_single(client, semaphore, p, s, e)
+            for p, s, e in zip(prompts, sources, edited)
+        ]
         return list(await asyncio.gather(*tasks))
 
-    async def _score_single(self, prompt: str, source: Image.Image, edited: Image.Image) -> float:
+    async def _score_single(
+        self,
+        client: Any,
+        semaphore: asyncio.Semaphore,
+        prompt: str,
+        source: Image.Image,
+        edited: Image.Image,
+    ) -> float:
         from openai import APIConnectionError, APITimeoutError, RateLimitError
 
         source_url = pil_image_to_base64(source, format="PNG")
@@ -364,8 +397,8 @@ class RationalRewardsEditRewardModel(PointwiseRewardModel):
         last_err: Optional[BaseException] = None
         for attempt in range(self.max_retries):
             try:
-                async with self.semaphore:
-                    completion = await self.client.chat.completions.create(
+                async with semaphore:
+                    completion = await client.chat.completions.create(
                         model=self.vlm_model,
                         messages=messages,
                         temperature=self.temperature,

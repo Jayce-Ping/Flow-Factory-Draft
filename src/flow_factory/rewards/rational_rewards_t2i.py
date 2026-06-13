@@ -33,9 +33,9 @@ import torch
 from accelerate import Accelerator
 from PIL import Image
 
-from .abc import PointwiseRewardModel, RewardModelOutput
 from ..hparams import RewardArguments
 from ..utils.image import pil_image_to_base64
+from .abc import PointwiseRewardModel, RewardModelOutput
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
@@ -88,7 +88,9 @@ def _extract_score_from_block(block_text: str) -> Optional[Union[float, str]]:
     return None
 
 
-def parse_scores_from_detailed_judgement(detailed_judgement: str) -> Dict[str, Optional[Union[float, str]]]:
+def parse_scores_from_detailed_judgement(
+    detailed_judgement: str,
+) -> Dict[str, Optional[Union[float, str]]]:
     """
     Parse aspect scores from the ``# Detailed Judgement`` section.
 
@@ -341,8 +343,7 @@ class RationalRewardsT2IRewardModel(PointwiseRewardModel):
                 f"unsupported aspect(s) {unknown!r}; allowed: {list(SUPPORTED_ASPECTS)}"
             )
 
-        self.client = AsyncOpenAI(base_url=self.api_base_url, api_key=self.api_key)
-        self.semaphore = asyncio.Semaphore(max(1, self.max_concurrent))
+        self._async_openai_cls = AsyncOpenAI
 
     @torch.no_grad()
     def __call__(
@@ -363,19 +364,46 @@ class RationalRewardsT2IRewardModel(PointwiseRewardModel):
                 f"expected len(prompt)==len(image), got {len(prompt)} prompts and {len(image)} images"
             )
 
-        scores = asyncio.run(self._async_score_batch(prompt, image))
+        scores = asyncio.run(self._run_batch(prompt, image))
         rewards = torch.tensor(scores, dtype=torch.float32, device=self.device)
         return RewardModelOutput(rewards=rewards, extra_info={})
 
-    async def _async_score_batch(
+    async def _run_batch(
         self,
         prompts: List[str],
         images: List[Image.Image],
     ) -> List[float]:
-        tasks = [self._score_single(p, img) for p, img in zip(prompts, images)]
+        """Create a loop-local client + semaphore, then score the batch.
+
+        ``AsyncOpenAI`` and ``asyncio.Semaphore`` are event-loop-bound; each batch
+        runs in a fresh ``asyncio.run`` loop (and the async-reward path runs from a
+        thread pool), so they must be created inside the running loop and passed
+        down -- never cached on ``self`` -- to avoid
+        ``RuntimeError: ... bound to a different event loop``.
+        """
+        async with self._async_openai_cls(
+            base_url=self.api_base_url, api_key=self.api_key
+        ) as client:
+            semaphore = asyncio.Semaphore(max(1, self.max_concurrent))
+            return await self._async_score_batch(client, semaphore, prompts, images)
+
+    async def _async_score_batch(
+        self,
+        client: Any,
+        semaphore: asyncio.Semaphore,
+        prompts: List[str],
+        images: List[Image.Image],
+    ) -> List[float]:
+        tasks = [self._score_single(client, semaphore, p, img) for p, img in zip(prompts, images)]
         return list(await asyncio.gather(*tasks))
 
-    async def _score_single(self, prompt: str, image: Image.Image) -> float:
+    async def _score_single(
+        self,
+        client: Any,
+        semaphore: asyncio.Semaphore,
+        prompt: str,
+        image: Image.Image,
+    ) -> float:
         from openai import APIConnectionError, APITimeoutError, RateLimitError
 
         data_url = pil_image_to_base64(image, format="PNG")
@@ -384,8 +412,8 @@ class RationalRewardsT2IRewardModel(PointwiseRewardModel):
         last_err: Optional[BaseException] = None
         for attempt in range(self.max_retries):
             try:
-                async with self.semaphore:
-                    completion = await self.client.chat.completions.create(
+                async with semaphore:
+                    completion = await client.chat.completions.create(
                         model=self.vlm_model,
                         messages=messages,
                         temperature=self.temperature,
