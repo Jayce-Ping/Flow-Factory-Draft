@@ -28,7 +28,7 @@ Before starting, ensure you understand:
    - Text encoders → `encode_prompt()`, `preprocessing_modules`
    - VAE → `encode_image()` / `decode_latents()`, `preprocessing_modules`
    - Audio encoder/VAE (if any) → `encode_audio()`, `preprocessing_modules`
-   - Transformer/UNet → `forward()`, `target_module_map`, `inference_modules`
+   - Transformer/UNet → `forward()`, `default_target_modules` (LoRA target layer names), `inference_modules`
 4. **Also read**: `topics/adapter_conventions.md` for upstream alignment rules; `topics/dtype_precision.md` for precision handling in `cast_latents()`.
 
 ## Phase 2: Implementation
@@ -57,9 +57,13 @@ class MyModelAdapter(BaseAdapter):
         return ["vae"]  # Components needed at inference time
 
     @property
-    def target_module_map(self) -> Dict[str, str]:
-        return {"transformer": "transformer"}  # Trainable components
+    def default_target_modules(self) -> List[str]:
+        # LoRA target module names used when YAML sets `target_modules: default`.
+        # Override only if your transformer uses non-standard attention layer names.
+        return ["to_q", "to_k", "to_v", "to_out.0"]
 ```
+
+> Which components are trainable is **config-driven**: the YAML `target_components` / `target_modules` fields are resolved by `BaseAdapter._parse_target_modules()` into `self.target_module_map` (set in `__init__`). Adapters do **not** override `target_module_map`.
 
 ### Step 3 — Implement Required Methods
 
@@ -88,7 +92,7 @@ Create example YAML config in `examples/grpo/lora/<model>/default.yaml`:
 ```yaml
 model:
   model_type: "my-model"
-  model_path: "org/model-name"
+  model_name_or_path: "org/model-name"
   finetune_type: "lora"
   target_components: ["transformer"]
 ```
@@ -109,7 +113,7 @@ Also read: `topics/parity_testing.md` for the 4-layer verification protocol.
 ## Common Pitfalls
 
 1. **Forgetting to set `preprocessing_modules`** — causes text encoder to stay on GPU, OOM during training
-2. **Wrong `target_module_map`** — LoRA applied to wrong components, no training effect
+2. **Wrong `target_components` / `target_modules` (or `default_target_modules`)** — LoRA applied to wrong components/layers, no training effect
 3. **Mismatched `_shared_fields`** — data corruption during batch collation
 4. **Not handling `enable_preprocess=False`** — encoding components not loaded at inference time
 5. **Inconsistent custom field types across samples** — if a custom sample field is `Tensor` on some samples and `List[Tensor]` on others, `gather_samples` will fall back to slow pickle-based `gather_object`. Always canonicalize to a single type in `__post_init__`; prefer `List[Tensor]` for variable-length data.

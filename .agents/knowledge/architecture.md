@@ -35,7 +35,10 @@
 | `rewards/abc.py` | `hparams` | All reward models, `trainers/abc.py` |
 | `data_utils/` | `hparams` | `trainers/abc.py` |
 | `scheduler/` | (standalone) | `models/abc.py` |
-| `samples/` | (standalone) | `models/`, `rewards/` |
+| `samples/` | `utils/` | `models/`, `rewards/`, `advantage/`, `trainers/` |
+| `ema/` | `utils/` | `models/abc.py` |
+| `logger/` | `hparams` | `trainers/abc.py` |
+| `utils/` | (standalone) | Most modules |
 
 ---
 
@@ -50,9 +53,10 @@ Stage 1: Data Preprocessing (offline, cached)
   │  Result cached with hash fingerprint
   ▼
 Stage 2: K-Repeat Sampling
-  │  Two sampler strategies (see `topics/samplers.md`):
+  │  Three sampler strategies (see `topics/samplers.md`):
   │  - GroupContiguousSampler (preferred, auto-selected): keeps K copies on same rank
   │  - DistributedKRepeatSampler (fallback): shuffles K copies across ranks
+  │  - GroupDistributedSampler (DGPO): rank-identical prompt sequence, K/W copies per rank
   │  K = training_args.group_size
   ▼
 Stage 3: Trajectory Generation
@@ -66,7 +70,7 @@ Stage 4: Reward Computation
 Stage 5: Advantage Computation
   │  AdvantageProcessor (advantage/advantage_processor.py)
   │  Communication-aware: auto-selects gather vs local path
-  │  Strategies: weighted-sum (GRPO) or GDPO
+  │  Strategies: "sum" (weighted-sum, GRPO) or "gdpo"
   ▼
 Stage 6: Policy Optimization
   │  adapter.forward() — single-step denoising for loss computation
@@ -104,6 +108,7 @@ All three registries map string keys → lazy import paths. Resolution: registry
 | `nft` | `DiffusionNFTTrainer` | Decoupled | `BaseTrainer` |
 | `awm` | `AWMTrainer` | Decoupled | `BaseTrainer` |
 | `crd` | `CRDTrainer` | Decoupled | `BaseTrainer` |
+| `diffusion-opd` | `DiffusionOPDTrainer` | Distillation (on-policy) | `BaseTrainer` |
 
 **Flat hierarchy**: New trainers inherit from `BaseTrainer` directly. The sanctioned exceptions are `GRPOGuardTrainer → GRPOTrainer` and `DPPOTrainer → GRPOTrainer` (strict GRPO loss variants; see constraint #11).
 
@@ -131,12 +136,15 @@ All three registries map string keys → lazy import paths. Resolution: registry
 | `pickscore` | `PickScoreRewardModel` | Pointwise |
 | `pickscore_rank` | `PickScoreRankRewardModel` | Groupwise |
 | `clip` | `CLIPRewardModel` | Pointwise |
+| `clap` | `CLAPRewardModel` | Pointwise |
+| `imagebind` | `ImageBindRewardModel` | Pointwise |
 | `ocr` | `OCRRewardModel` | Pointwise |
+| `vllm_evaluate` | `VLMEvaluateRewardModel` | Pointwise |
+| `rational_rewards_t2i` | `RationalRewardsT2IRewardModel` | Pointwise |
+| `rational_rewards_edit` | `RationalRewardsEditRewardModel` | Pointwise |
+| `geneval` | `GenEvalRewardModel` | Pointwise |
 | `geneval2_soft_tifa` | `GenEval2SoftTIFARewardModel` | Pointwise |
 | `hpsv2` | `HPSv2RewardModel` | Pointwise |
-| `vllm_evaluate` | `VLMEvaluateRewardModel` | Pointwise |
-| `rational_rewards_t2i` | `RationalRewardsT2I` | Pointwise |
-| `rational_rewards_edit` | `RationalRewardsEdit` | Pointwise |
 | `qwen_image_bench` | `QwenImageBenchRewardModel` | Pointwise |
 
 ---
@@ -181,7 +189,7 @@ Two-layer structure (constraint #14): task-level samples (`T2ISample`, `I2VSampl
 - **Async**: optional non-blocking computation
 
 ### Advantage Computation
-`AdvantageProcessor` (`advantage/advantage_processor.py`): communication-aware, auto-selects gather vs local path. Strategies: `"sum"` (GRPO) and `"gdpo"`. All trainers delegate to `self.advantage_processor.compute_advantages()`.
+`AdvantageProcessor` (`advantage/advantage_processor.py`): communication-aware, auto-selects gather vs local path. Strategies: `"sum"` (GRPO) and `"gdpo"`. All reward-based trainers delegate to `self.advantage_processor.compute_advantages()`; the distillation trainer `diffusion-opd` is the exception (its `prepare_feedback()` is a no-op — no reward/advantage stage).
 
 ### Configuration Hierarchy
 ```

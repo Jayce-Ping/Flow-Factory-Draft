@@ -24,7 +24,7 @@ All adapters that support CFG must follow a consistent two-stage pattern. Guidan
 
 ### Reference implementation
 
-`flux/flux2_klein.py` — `encode_prompt()` (line ~165) and `_forward()` (line ~769).
+`flux/flux2_klein.py` — `encode_prompt()` and `_forward()`.
 
 ### Models with model-specific CFG extensions
 
@@ -55,7 +55,7 @@ All adapters that support CFG must follow a consistent two-stage pattern. Guidan
 | Preprocessing | `preprocessing_modules` | yes | yes | `text_encoders`, `vae` |
 | Inference/Training | `inference_modules` | transformer: trainable; VAE: frozen | VAE: yes | `transformer`, `vae` |
 
-Defined in `models/abc.py` L380-387. Override in subclasses to add model-specific components (e.g., `connectors`, `image_encoder`).
+Defined in `models/abc.py` (`preprocessing_modules` / `inference_modules` properties). Override in subclasses to add model-specific components (e.g., `connectors`, `image_encoder`).
 
 ## Batch Dimension Convention
 

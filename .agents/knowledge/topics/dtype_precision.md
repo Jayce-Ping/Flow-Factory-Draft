@@ -14,11 +14,11 @@
 | Latent storage (trajectory) | `latent_storage_dtype` (configurable) | Memory vs. precision tradeoff |
 | Advantage computation | `float64` (numpy) | Normalization stability |
 
-Boundaries are set in `BaseAdapter._mix_precision()` (`models/abc.py` L818) and `BaseTrainer.__init__` (autocast context).
+Boundaries are set in `BaseAdapter._mix_precision()` (`models/abc.py`) and `BaseTrainer.__init__` (autocast context).
 
 ## `cast_latents()` Contract
 
-`BaseAdapter.cast_latents()` (`models/abc.py` L165) casts latents to `latent_storage_dtype` for trajectory storage.
+`BaseAdapter.cast_latents()` (`models/abc.py`) casts latents to `latent_storage_dtype` for trajectory storage.
 
 - **float16 overflow protection**: clamps values exceeding 65504.0 with a warning.
 - **Identity when no target**: returns latents unchanged if `latent_storage_dtype` is unset and no default provided.

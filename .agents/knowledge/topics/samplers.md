@@ -63,7 +63,7 @@ Define the following variables:
 | `B` | Per-device batch size | `training_args.per_device_batch_size` |
 | `G` | Gradient steps per epoch | `training_args.gradient_step_per_epoch` |
 
-### Base Constraint (Both Samplers)
+### Base Constraint (All Samplers)
 
 The constraint depends on whether `gradient_accumulation_steps` is set manually or derived automatically.
 
@@ -148,7 +148,7 @@ gradient_accumulation_steps = max(1, num_batches_per_epoch // G)
 Then `Arguments.__post_init__` applies the per-timestep multiplier, also in **auto mode** only:
 
 ```python
-gradient_accumulation_steps *= num_train_timesteps  # GRPO, NFT, AWM, DPO
+gradient_accumulation_steps *= num_train_timesteps  # all trainers (via get_num_train_timesteps())
 ```
 
 #### Manual ``gradient_accumulation_steps``
@@ -182,31 +182,40 @@ The `sampler_type` field in `DataArguments` (`hparams/data_args.py`) allows user
 The `_resolve_sampler_type()` method in `hparams/args.py` resolves the final sampler type and writes it back to `data_args.sampler_type`:
 
 ```python
-# 1. Detect async rewards
+# 1. Detect async rewards (any reward config with async_reward=True)
 self._has_async_rewards = any(
     getattr(cfg, 'async_reward', False)
     for cfg in all_reward_configs
 )
-
-# 2. Resolve sampler type
 user_choice = self.data_args.sampler_type
-if user_choice != "auto":
-    # Only override if distributed_k_repeat + async rewards (hard conflict)
-    if user_choice == "distributed_k_repeat" and self._has_async_rewards:
-        self.data_args.sampler_type = "group_contiguous"
-else:
-    # Prefer group_contiguous; fall back if geometric constraints fail
-    if m % world_size == 0 and (m // world_size * K) % B == 0:
-        self.data_args.sampler_type = "group_contiguous"
-    else:
+trainer_type = str(training_args.trainer_type).lower()
+
+# 2. Async override: a user-requested distributed_k_repeat OR group_distributed
+#    is forced to group_contiguous when async rewards are on (DGPO is exempt).
+if (user_choice in {"distributed_k_repeat", "group_distributed"}
+        and self._has_async_rewards and trainer_type != "dgpo"):
+    self.data_args.sampler_type = "group_contiguous"
+
+# 3. "auto" (non-DGPO): default to group_contiguous; only pick distributed_k_repeat
+#    when groups-per-rank FAILS but local batch tiling holds. Otherwise stay on
+#    group_contiguous and let _align_batch_geometry() pad M to satisfy constraints.
+if user_choice == "auto" and trainer_type != "dgpo":
+    groups_per_rank_ok = (m % world_size == 0)
+    local_batch_tiling_ok = (m // world_size * K % B == 0)
+    if not groups_per_rank_ok and local_batch_tiling_ok:
         self.data_args.sampler_type = "distributed_k_repeat"
+    else:
+        self.data_args.sampler_type = "group_contiguous"
+
+# 4. DGPO always forces group_distributed.
+if trainer_type == "dgpo" and self.data_args.sampler_type != "group_distributed":
+    self.data_args.sampler_type = "group_distributed"
 ```
 
 **Key behaviors**:
 - DGPO trainer forces `group_distributed` regardless of user setting (via `_resolve_sampler_type`)
-- `"auto"` defaults to `group_contiguous` when constraints are met — minimises communication
-- Falls back to `distributed_k_repeat` only when `M % W != 0` or `(M/W)*K % B != 0`
-- Async rewards **always force** `group_contiguous`, even if user explicitly requests `distributed_k_repeat` (with a warning)
+- `"auto"` defaults to `group_contiguous`; it picks `distributed_k_repeat` **only** when groups-per-rank fails (`M % W != 0`) **but** local batch tiling holds (`(M/W)*K % B == 0`). When both fail it stays on `group_contiguous` and `_align_batch_geometry()` pads `M`.
+- Async rewards force `group_contiguous` when the user requested `distributed_k_repeat` **or** `group_distributed` (DGPO exempt), emitting a warning
 - User can manually select `group_contiguous` without async rewards (e.g., to reduce cross-rank communication)
 
 ### Sampler Factory (`data_utils/sampler_loader.py`)
@@ -265,13 +274,14 @@ Both samplers are **fully compatible** with existing gather/reduce/advantage log
 
 | Operation | `distributed_k_repeat` | `group_contiguous` | `group_distributed` |
 |-----------|----------------------|-------------------|---------------------|
-| Gather rewards | Single `accelerator.gather()` (packed tensor) | **Skipped** — local data used directly | Single `accelerator.gather()` |
-| Gather unique_ids | Packed into same gather call | **Skipped** — local `np.unique()` | **Skipped** — local `torch.unique()` (rank contract) |
-| Group construction | `np.unique()` over W×B items | `np.unique()` over B items only | `torch.unique()` over B items (identical across ranks) |
+| Gather rewards | Single `accelerator.gather()` (packed tensor) | **Skipped** — local data used directly | Single `accelerator.gather()` (same as `distributed_k_repeat`) |
+| Gather unique_ids | Packed into same gather call | **Skipped** — local `np.unique()` | Packed into same gather call |
+| Group construction | `np.unique()` over W×B items | `np.unique()` over B items only | `np.unique()` over W×B items |
 | Scatter advantages | `reshape(W, B)[rank]` | **Direct return** — already local | `reshape(W, B)[rank]` |
-| Group loss | N/A | N/A | `scatter_add` + `accelerator.reduce(SUM)` + `sigmoid` |
 
-The `AdvantageProcessor` is instantiated in `BaseTrainer._init_reward_model()` with `sampler_type=self.config.data_args.sampler_type`. All trainers (GRPO, GRPOGuard, NFT, AWM, DPO, DGPO) delegate advantage computation to `self.advantage_processor.compute_advantages()` via their own `compute_advantages()` method, invoked from `prepare_feedback()` after each `sample()` epoch (see `guidance/workflow.md` for `sample` → `prepare_feedback` → `optimize`). DPO forms chosen/rejected pairs at the start of `optimize()`, not in `prepare_feedback()`. DGPO handles group loss in its own `_compute_group_dgpo_loss()` via `scatter_add + reduce`.
+> `group_on_same_rank` is `True` **only** for `group_contiguous` (`advantage/advantage_processor.py`); `group_distributed` takes the **same gather path** as `distributed_k_repeat`. DGPO's rank-identical contract (local `torch.unique`, `scatter_add` + `accelerator.reduce(SUM)` + `sigmoid`) lives in the **DGPO loss** (`trainers/dgpo.py`), not in `AdvantageProcessor`.
+
+The `AdvantageProcessor` is instantiated in `BaseTrainer._init_reward_model()` with `sampler_type=self.config.data_args.sampler_type`. Reward-based trainers (GRPO, GRPOGuard, NFT, AWM, DPO, DGPO, CRD) delegate advantage computation to `self.advantage_processor.compute_advantages()` via their own `compute_advantages()` method, invoked from `prepare_feedback()` after each `sample()` epoch (see `guidance/workflow.md` for `sample` → `prepare_feedback` → `optimize`). The distillation trainer `diffusion-opd` is the exception: its `prepare_feedback()` is a no-op and it does not use `AdvantageProcessor`. DPO forms chosen/rejected pairs at the start of `optimize()`, not in `prepare_feedback()`. DGPO handles group loss in its own `_compute_group_dgpo_loss()` via `scatter_add + reduce`.
 
 When `GroupContiguousSampler` is used:
 1. **Groupwise Reward Computation** (`reward_processor.py`): `gather_samples()` → `group_samples()` → stride → compute → `all_reduce` → scatter — works correctly (gather collects redundant data but logic is sound)

@@ -38,6 +38,9 @@ Flow-Factory supports two paradigms for computing rewards:
 | `PickScore` | Pointwise | CLIP-based aesthetic scoring | [PickScore](https://huggingface.co/yuvalkirstain/PickScore_v1) |
 | `CLIP` | Pointwise | Image-text cosine similarity | [CLIP](https://huggingface.co/openai/clip-vit-large-patch14) |
 | `PickScore_Rank` | Groupwise | Ranking-based reward using PickScore | [PickScore](https://huggingface.co/yuvalkirstain/PickScore_v1) |
+| `ocr` | Pointwise | Text-rendering accuracy via PP-OCRv5 (rewards correctly rendered text) | [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) |
+| `clap` | Pointwise | Audio-text cosine similarity via LAION CLAP (`transformers.ClapModel`); for audio / audio-video models | [CLAP](https://github.com/LAION-AI/CLAP) |
+| `imagebind` | Pointwise | Audio-video / text-audio / text-video alignment via Meta ImageBind (CC-BY-NC-SA, NonCommercial) | [ImageBind](https://github.com/facebookresearch/ImageBind) |
 | `GenEval` | Pointwise | Compositional T2I evaluation (object count, color, position) via Mask2Former + CLIP | [GenEval](https://github.com/djghosh13/geneval) |
 | `geneval2_soft_tifa` | Pointwise | GenEval2 Soft-TIFA: per-atom VQA soft-match via local Qwen3-VL, AM/GM aggregation; `vqa_list` from dataset `metadata` or a `data_path` JSONL. Needs `pip install -e ".[geneval2]"` for exact GM parity | [GenEval2](https://github.com/facebookresearch/GenEval2) |
 | `hpsv2` | Pointwise | Human Preference Score v2 (OpenCLIP ViT-H-14 + HPS checkpoint). Install with `uv pip install hpsv2 --no-deps` | [HPSv2](https://github.com/tgxs002/HPSv2) |
@@ -176,8 +179,10 @@ class MyPointwiseReward(PointwiseRewardModel):
         prompt: List[str],
         image: Optional[List[Image.Image]] = None,
         video: Optional[List[List[Image.Image]]] = None,
+        audio: Optional[List[torch.Tensor]] = None,
         condition_images: Optional[List[List[Image.Image]]] = None,
         condition_videos: Optional[List[List[List[Image.Image]]]] = None,
+        **kwargs,
     ) -> RewardModelOutput:
         # Input length equals self.config.batch_size
         rewards = torch.zeros(len(prompt), device=self.device)
@@ -211,8 +216,10 @@ class MyGroupwiseReward(GroupwiseRewardModel):
         prompt: List[str],
         image: Optional[List[Image.Image]] = None,
         video: Optional[List[List[Image.Image]]] = None,
+        audio: Optional[List[torch.Tensor]] = None,
         condition_images: Optional[List[List[Image.Image]]] = None,
         condition_videos: Optional[List[List[List[Image.Image]]]] = None,
+        **kwargs,
     ) -> RewardModelOutput:
         # Input length equals group_size (NOT batch_size)
         # Handle batching internally using self.config.batch_size
@@ -275,11 +282,13 @@ class TensorBasedReward(PointwiseRewardModel):
         prompt: List[str],
         image: Optional[List[torch.Tensor]] = None,  # List of (C, H, W) tensors, range in [0, 1]
         video: Optional[List[torch.Tensor]] = None, # List of (T, C, H, W) tensors, range in [0, 1]
+        audio: Optional[List[torch.Tensor]] = None, # List of (C, T) waveforms
         condition_images: Optional[List[Union[torch.Tensor, List[torch.Tensor]]]] = None, # A batch of condition image list
         condition_videos: Optional[List[Union[torch.Tensor, List[torch.Tensor]]]] = None, # A batch of condition video list
+        **kwargs,
     ) -> RewardModelOutput:
         # Stack and process directly on GPU
-        rewards = torch.zeros_like(prompt, dtype=torch.float32)
+        rewards = torch.zeros(len(prompt), dtype=torch.float32, device=self.device)
         return RewardModelOutput(rewards=rewards)
 ```
 
@@ -313,24 +322,25 @@ JSONL field → Dataset "metadata" column → sample.extra_kwargs → reward __c
 {"prompt": "a red car", "include": "[{\"class\":\"car\",\"count\":1,\"color\":\"red\"}]", "tag": "colors"}
 ```
 
-The reward model parses these strings internally:
+All non-preprocess JSONL columns (here `include`, `tag`) are packed into a **single** per-sample `metadata` JSON string and delivered to the reward as `metadata: List[str]` (see `data_utils/dataset.py` `_preprocess_batch` and `BaseTrainer._inject_batch_metadata`). Declare `metadata` in `required_fields` and parse it internally:
 
 ```python
 class MyMetadataReward(PointwiseRewardModel):
-    required_fields = ("image", "prompt", "include")  # Declare metadata fields
+    required_fields = ("image", "prompt", "metadata")  # Receive the packed metadata JSON
 
-    def __call__(self, prompt, image=None, include=None, **kwargs):
+    def __call__(self, prompt, image=None, metadata=None, **kwargs):
         for i in range(len(prompt)):
-            spec = json.loads(include[i]) if isinstance(include[i], str) else include[i]
+            meta = json.loads(metadata[i]) if isinstance(metadata[i], str) else metadata[i]
+            spec = meta.get("include", [])  # original JSONL fields live inside `metadata`
             # ... use spec for evaluation
 ```
 
 **Rules:**
 1. Flat scalars (`str`, `int`, `float`) can be stored directly in JSONL.
-2. Complex values (lists, nested dicts) → `json.dumps()` in JSONL, `json.loads()` in reward model.
-3. Fields listed in `required_fields` are checked during reward computation; missing fields raise errors.
+2. Complex values (lists, nested dicts) → `json.dumps()` in JSONL; the packed `metadata` string is `json.loads()`-ed in the reward model.
+3. Request `metadata` (not individual JSONL columns) in `required_fields`; missing fields raise errors during reward computation.
 
-See `src/flow_factory/rewards/geneval.py` for a complete example (GenEval uses `include`/`exclude`/`tag`).
+See `src/flow_factory/rewards/geneval.py` for a complete example (GenEval reads `include`/`exclude`/`tag` from the parsed `metadata`).
 
 ## Multi-Reward Training
 
@@ -357,7 +367,7 @@ When using multiple rewards, Flow-Factory supports the following aggregation str
 | `sum` | Advantage of the weighted sum of rewards |
 | `gdpo` | Weighted sum of advantages from each reward |
 
-> To use a customized aggregation algorithm, refer to and modify `src/flow_factory/trainer/grpo:GRPOTrainer.compute_advantages`.
+> To use a customized aggregation algorithm, refer to and modify `src/flow_factory/trainers/grpo.py` (`GRPOTrainer.compute_advantages`).
 
 **Weighted Sum (`sum`):**
 

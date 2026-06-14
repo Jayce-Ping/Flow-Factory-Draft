@@ -19,7 +19,7 @@ Test stages in dependency order. When a stage fails, fix it before testing downs
 
 1. **Prompt encoding** — `encode_prompt()` vs `pipeline._encode_prompt()`
 2. **Latent preparation** — `prepare_latents()` vs pipeline equivalent
-3. **Scheduler setup** — `set_timesteps()` output comparison
+3. **Scheduler setup** — `set_scheduler_timesteps()` output comparison
 4. **Single denoise step** — `forward()` with same input vs pipeline's inner loop body
 5. **Full denoising loop** — `inference()` vs `pipeline.__call__()` (seed-matched)
 6. **VAE decode** — `decode_latents()` vs `pipeline.vae.decode()`
@@ -27,7 +27,7 @@ Test stages in dependency order. When a stage fails, fix it before testing downs
 ## Flow-Factory Specific Pitfalls (append-only)
 
 1. **`cast_latents()` not applied**: Pipeline doesn't cast; adapter does. If `latent_storage_dtype` is set, parity requires applying `cast_latents()` to pipeline output too before comparison.
-2. **Scheduler state not reset**: `scheduler.set_timesteps()` must be called before each comparison run. Leftover `step_index` from a previous run causes different sigma lookups.
+2. **Scheduler state not reset**: `scheduler.set_scheduler_timesteps()` must be called before each comparison run. Leftover `step_index` from a previous run causes different sigma lookups.
 3. **`guidance_scale` embedding**: Some models (FLUX, SD3.5) embed `guidance_scale` as a conditioning input, not just a classifier-free guidance weight. Verify the adapter passes it to `forward()`.
 4. **Tokenizer padding mismatch**: Pipeline may use `max_length` padding while adapter uses `longest`. Compare `attention_mask` shape and values.
 5. **VAE scaling factor**: Pipeline applies `vae.config.scaling_factor` during encode/decode. Adapter must apply the same factor at the same point.
@@ -35,7 +35,9 @@ Test stages in dependency order. When a stage fails, fix it before testing downs
 7. **Timestep offset**: Some schedulers use `timestep_spacing="trailing"` — adapter must match the pipeline's scheduler config exactly.
 8. **Dual-modality scheduling**: Models with video+audio (e.g., LTX2-T2AV) need separate scheduler instances. Sharing one scheduler corrupts `step_index` for the second modality.
 
-## `compare_tensors()` Utility
+## Parity Helper: `compare_tensors()`
+
+> Self-contained helper to drop into a throwaway `.scratch/` parity script — it is **not** part of `flow_factory`; copy it where you need it.
 
 ```python
 def compare_tensors(name: str, a: torch.Tensor, b: torch.Tensor, atol: float = 1e-5):

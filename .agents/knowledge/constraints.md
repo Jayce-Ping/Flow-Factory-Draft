@@ -1,6 +1,6 @@
 # Hard Constraints
 
-Quick index: **#1-5** Registry | **#6-10** Training Pipeline | **#11-14** Base Classes | **#15-17** Config | **#18-20** Distributed | **#21-27** Code Quality
+Quick index: **#1-5** Registry | **#6-10** Training Pipeline | **#11-14** Base Classes | **#15-17** Config | **#18-20** Distributed | **#21-27** Code Quality | **#28-29** Agent Workflow
 
 These constraints MUST NOT be violated. Consult this file before making any code changes.
 
@@ -31,8 +31,9 @@ Every `BaseAdapter` subclass's `load_pipeline()` must return a `diffusers.Diffus
 The training loop executes: Data Preprocessing → K-Repeat Sampling → Trajectory Generation → Reward Computation → Advantage Computation → Policy Optimization. This order is invariant. Do not reorder or skip stages.
 
 ### 7. Coupled vs Decoupled Paradigm
-- **Coupled** (GRPO, GRPO-Guard): Training timesteps are coupled with SDE-based sampling. Requires log-probability computation. Must use SDE dynamics (`Flow-SDE`, `Dance-SDE`, `CPS`).
-- **Decoupled** (DPO, NFT, AWM): Training timesteps are decoupled from sampling. Can use any dynamics including `ODE`.
+- **Coupled** (GRPO, GRPO-Guard, DPPO): Training timesteps are coupled with SDE-based sampling. Requires log-probability computation. Must use SDE dynamics (`Flow-SDE`, `Dance-SDE`, `CPS`).
+- **Decoupled** (DPO, NFT, AWM, DGPO, CRD): Training timesteps are decoupled from sampling. Can use any dynamics including `ODE`.
+- **Distillation** (`diffusion-opd`): On-policy multi-teacher distillation; dynamics-agnostic (ODE or SDE) and has no reward/advantage stage.
 
 Mixing paradigms (e.g., using `ODE` dynamics with `GRPO`) will produce incorrect gradients silently.
 
@@ -46,18 +47,18 @@ Only **trainable modules** and the **optimizer** go through `accelerator.prepare
 `DistributedKRepeatSampler` and `GroupContiguousSampler` require `M * K ≡ 0 (mod W * B * G)` where M=unique_sample_num, K=group_size, W=world_size, B=per_device_batch_size, G=gradient_step_per_epoch — **unless** `gradient_accumulation_steps` is set manually, in which case the constraint reduces to `M * K ≡ 0 (mod W * B)`. **GroupContiguousSampler** adds: `M ≡ 0 (mod W)`. **GroupDistributedSampler** (DGPO) requires: `K % W == 0` and `(W * B) % K == 0`; auto-aligned by `_align_for_group_distributed`. See `topics/samplers.md` for full details.
 
 ### 10. DeepSpeed ZeRO-3 Is Unsupported
-Reward model sharding under ZeRO-3 is broken even with `GatherParameter` context manager (see `trainers/abc.py` line 119–123). Only ZeRO-1 and ZeRO-2 are safe. Document this if users ask.
+Reward model sharding under ZeRO-3 is broken even with `GatherParameter` context manager (see the ZeRO-3 guard comment in `trainers/abc.py`). Only ZeRO-1 and ZeRO-2 are safe. Document this if users ask.
 
 ---
 
 ## Base Class Interfaces (11–14)
 
 ### 11. BaseTrainer Abstract Contract
-`BaseTrainer.__init__` expects `(accelerator, config, adapter)`. Subclasses must implement `start()`, `prepare_feedback()`, `optimize()`, and `evaluate()`. The `_initialization()` method handles dataloader, optimizer, accelerator preparation, reward model loading, and `AdvantageProcessor` instantiation — do not duplicate this logic.
+`BaseTrainer.__init__` expects `(accelerator, config, adapter)`. Subclasses must implement the three abstract methods `start()`, `prepare_feedback()`, and `optimize()`. `evaluate()` is a **concrete** base method — override only to customize evaluation. The `_initialization()` method handles dataloader, optimizer, accelerator preparation, reward model loading, and `AdvantageProcessor` instantiation — do not duplicate this logic.
 
 **Per-epoch hook order**: `sample()` (Stages 2–3) → `prepare_feedback()` (Stages 4–5) → `optimize()` (Stage 6). `DPOTrainer` forms chosen/rejected pairs at the **start** of `optimize()` (not in `prepare_feedback()`).
 
-**Trainer hierarchy**: New trainers MUST inherit directly from `BaseTrainer`. The only sanctioned exceptions are strict behavioral variants of GRPO that change only the per-step loss while reusing GRPO's sampling/advantage/eval machinery: `GRPOGuardTrainer → GRPOTrainer` (adds ratio-normalization) and `DPPOTrainer → GRPOTrainer` (replaces the PPO ratio-clip with a KL trust-region mask). Trainer-to-trainer inheritance creates fragile coupling; when in doubt, inherit from `BaseTrainer` and extract shared logic into helper methods. All trainers delegate advantage computation to `self.advantage_processor.compute_advantages()`.
+**Trainer hierarchy**: New trainers MUST inherit directly from `BaseTrainer`. The only sanctioned exceptions are strict behavioral variants of GRPO that change only the per-step loss while reusing GRPO's sampling/advantage/eval machinery: `GRPOGuardTrainer → GRPOTrainer` (adds ratio-normalization) and `DPPOTrainer → GRPOTrainer` (replaces the PPO ratio-clip with a KL trust-region mask). Trainer-to-trainer inheritance creates fragile coupling; when in doubt, inherit from `BaseTrainer` and extract shared logic into helper methods. All reward-based trainers delegate advantage computation to `self.advantage_processor.compute_advantages()`; the distillation trainer `diffusion-opd` is the exception (its `prepare_feedback()` is a no-op with no reward/advantage stage).
 
 ### 12. BaseAdapter Abstract Methods
 Subclasses of `BaseAdapter` MUST implement these **4 abstract methods**:
@@ -100,7 +101,7 @@ All config dataclasses live in `hparams/`. The top-level `Arguments` aggregates 
 3. Any code that accesses `config.<field_name>`
 
 ### 16. Algorithm-Specific Training Args
-`TrainingArguments` has algorithm-specific subclasses (`GRPOTrainingArguments`, `DPOTrainingArguments`, `NFTTrainingArguments`, `AWMTrainingArguments`). The correct subclass is resolved by `get_training_args_class()`. Adding a new algorithm requires adding a corresponding subclass and updating the resolver.
+`TrainingArguments` has algorithm-specific subclasses (`GRPOTrainingArguments`, `DPPOTrainingArguments`, `DPOTrainingArguments`, `DGPOTrainingArguments`, `NFTTrainingArguments`, `AWMTrainingArguments`, `CRDTrainingArguments`, `DiffusionOPDTrainingArguments`). The correct subclass is resolved by `get_training_args_class()` (registry in `hparams/training_args/_registry.py`). Adding a new algorithm requires adding a corresponding subclass and updating the resolver.
 
 ### 17. YAML Config Structure
 Config keys must exactly match Pydantic field names. Typos fail silently with default values. See `examples/` for canonical config templates; structure defined in `hparams/args.py`.

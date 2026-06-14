@@ -2,8 +2,8 @@
 
 Flow-Factory is a simple, extensible RL fine-tuning framework for diffusion/flow-matching models.
 Models, algorithms, and rewards are decoupled via registries and base-class contracts.
-Both rollout and training use FSDP as backend. The single most important invariant is
-**train-inference consistency**.
+Both rollout and training run under Hugging Face Accelerate (DDP / DeepSpeed ZeRO-1-2 / FSDP
+backends). The single most important invariant is **train-inference consistency**.
 
 ## Principles
 
@@ -12,7 +12,7 @@ Both rollout and training use FSDP as backend. The single most important invaria
 | 1 | Train-inference consistency | Same inputs → same outputs across rollout and training | `topics/train_inference_consistency.md` |
 | 2 | Decoupled extensibility | Models, trainers, rewards independently pluggable via registries | `architecture.md` "Registry System" |
 | 3 | Fail-fast, no speculative code | Raise with context on invalid state; never silently correct | `constraints.md` #26 |
-| 4 | Top-down readability | `forward()` and `inference()` read linearly without utility tracing | `constraints.md` #27 |
+| 4 | Top-down readability | `forward()` and `inference()` read linearly without utility tracing | `.cursor/rules/no-section-divider-comments.mdc` |
 | 5 | Structural vs behavioral separation | Numerical correctness first, style cleanup second | `topics/adapter_conventions.md` |
 
 ## Coding Style Index

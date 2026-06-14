@@ -90,8 +90,13 @@ class MyModelSample(T2ISample):
 | `BaseSample` | Generic | `image`, `video`, `prompt`, `all_latents`, `log_probs`, ... |
 | `T2ISample` | Text-to-image | Alias of `BaseSample` |
 | `T2VSample` | Text-to-video | Alias of `BaseSample` |
+| `T2AVSample` | Text-to-audio-video | Alias of `BaseSample` |
 | `ImageConditionSample` | Image-conditioned generation | `condition_images`: per-sample `List[Tensor(C,H,W)]` (or `List[PIL.Image]` when the subclass sets `condition_images_as_pil=True`); always `List`, never batched tensor |
 | `VideoConditionSample` | Video-conditioned generation | `condition_videos`: per-sample `List[Tensor(T,C,H,W)]` (or `List[List[PIL.Image]]` when `condition_videos_as_pil=True`); always `List`, never batched tensor |
+| `I2ISample` | Image-to-image | `ImageConditionSample` subclass |
+| `I2VSample` | Image-to-video | `ImageConditionSample` subclass |
+| `I2AVSample` | Image-to-audio-video | `ImageConditionSample` subclass |
+| `V2VSample` | Video-to-video | `VideoConditionSample` subclass |
 
 > See [`src/flow_factory/samples/samples.py`](src/flow_factory/samples/samples.py) for all available classes.
 
@@ -575,7 +580,7 @@ def preprocess_func(
 
 Not all models have a diffusers pipeline. For models like [Bagel](https://github.com/ByteDance-Seed/Bagel) — a unified multimodal foundation model that combines LLM, ViT, and VAE in a single architecture — you can create a **pseudo-pipeline** that mimics the diffusers `Pipeline` interface just enough for `BaseAdapter` to work.
 
-> **Reference implementation**: See the [`bagel` branch](https://github.com/X-GenGroup/Flow-Factory/tree/bagel/src/flow_factory/models/bagel) for the complete working example.
+> **Reference implementation**: See [`src/flow_factory/models/bagel/`](../src/flow_factory/models/bagel) (registered as `bagel`) for the complete working example of a non-diffusers pseudo-pipeline adapter.
 
 ### Why a Pseudo-Pipeline?
 

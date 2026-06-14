@@ -51,6 +51,7 @@ class MyRewardModel(PointwiseRewardModel):
         prompt: List[str],
         image: Optional[List[Image.Image]] = None,
         video: Optional[List[List[Image.Image]]] = None,
+        audio: Optional[List[torch.Tensor]] = None,
         condition_images=None,
         condition_videos=None,
         **kwargs,

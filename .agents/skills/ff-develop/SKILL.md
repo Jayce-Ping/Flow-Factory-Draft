@@ -16,8 +16,8 @@ description: "Feature development with cross-module impact analysis. Covers trai
 Before implementing features or refactoring, analyze impacts across these areas:
 
 ### 1. Trainer Hierarchy (`constraints.md` #11)
-- Changes to `BaseTrainer` affect all 6 concrete trainers; changed abstract methods must be implemented on every one
-- Changes to `AdvantageProcessor` affect all trainers (`architecture.md` "Advantage Computation")
+- Changes to `BaseTrainer` affect all 9 concrete trainers (grpo, grpo-guard, dppo, nft, awm, dgpo, dpo, crd, diffusion-opd); changed abstract methods must be implemented on every one
+- Changes to `AdvantageProcessor` affect all reward-based trainers (`architecture.md` "Advantage Computation"; `diffusion-opd` skips it)
 - Check: Does your change alter `_initialization()`, `_init_reward_model()`, or `_init_dataloader()`?
 
 ### 2. Model Adapter Hierarchy (`constraints.md` #12)
@@ -64,8 +64,9 @@ Before implementing features or refactoring, analyze impacts across these areas:
    - Run tests after each change
 
 4. **Cross-algorithm verification**
-   - Test with GRPO (coupled paradigm)
-   - Test with NFT or AWM (decoupled paradigm)
+   - Test with GRPO (coupled paradigm; also covers GRPO-Guard / DPPO variants)
+   - Test with NFT or AWM (decoupled paradigm; also DGPO / CRD / DPO)
+   - If the change touches the sample/optimize path, also test `diffusion-opd` (distillation; no reward/advantage stage)
    - Verify with at least two different model adapters
 
 ## Documentation

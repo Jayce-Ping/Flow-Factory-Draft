@@ -36,7 +36,7 @@ Flow-Factory provides unified implementations of state-of-the-art RL algorithms 
 At a high level, the supported algorithms fall into two paradigms:
 
 - **Coupled paradigm (GRPO and variants)**: Training timesteps are coupled with the SDE-based sampling dynamics, requiring tractable log-probability computation for policy gradient optimization.
-- **Decoupled paradigm (DPO, DiffusionNFT, AWM, DGPO)**: Training timesteps are decoupled from the actual sampling dynamics, making them inherently solver-agnostic — any ODE solver can be used for trajectory generation without modifying the training procedure.
+- **Decoupled paradigm (DPO, DiffusionNFT, AWM, DGPO, CRD, DiffusionOPD)**: Training timesteps are decoupled from the actual sampling dynamics, making them inherently solver-agnostic — any ODE solver can be used for trajectory generation without modifying the training procedure.
 
 ## GRPO
 
@@ -79,7 +79,7 @@ Flow-Factory implements multiple SDE dynamics through a unified `SDESchedulerMix
 To switch between these formulations, set:
 
 ```yaml
-train:
+scheduler:
     dynamics_type: 'Flow-SDE' # Options are ['Flow-SDE', 'Dance-SDE', 'CPS', 'ODE'].
 ```
 
@@ -95,16 +95,16 @@ Training with the original Flow-GRPO and DanceGRPO methods is computationally ex
 
 Subsequent works, such as MixGRPO [[3]](#ref3) and TempFlow-GRPO [[4]](#ref4), investigated the effects of mixing ODE and SDE denoising rules. They found that applying SDE updates for only $1\sim 2$ steps—and optimizing only those corresponding steps—is sufficient. This approach significantly reduces the cost of the optimization stage and results in faster performance improvements.
 
-To control this behavior, you can configure `train_steps` and `num_train_steps` as follows:
+To control this behavior, you can configure `sde_steps` and `num_sde_steps` as follows:
 
 ```yaml
-train:
+scheduler:
     # Candidate steps for SDE noise (early steps typically provide more sample diversity)
-    train_steps: [1, 2, 3] 
+    sde_steps: [1, 2, 3] 
     
-    # Randomly select `1` step from the specified `train_steps` list (e.g., step 2) 
+    # Randomly select `1` step from the specified `sde_steps` list (e.g., step 2) 
     # to use SDE denoising. All other steps will use the standard ODE solver.
-    num_train_steps: 1
+    num_sde_steps: 1
 ```
 
 #### Decoupled Training and Inference Resolution
@@ -157,6 +157,7 @@ To enable this reweighting strategy, switch the `trainer_type` to `grpo-guard`:
 ```yaml
 train:
     trainer_type: 'grpo-guard'
+scheduler:
     dynamics_type: 'Flow-SDE'
 ```
 > ‼️ **Note**: Currently, `grpo-guard` reweighting is only compatible with `Flow-GRPO` dynamics. Therefore, dynamics_type must be explicitly set to `Flow-SDE`.

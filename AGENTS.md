@@ -4,9 +4,9 @@
 
 Flow-Factory is a unified **online RL fine-tuning framework** for diffusion/flow-matching models. It provides a modular architecture where trainers, model adapters, and reward models are independently extensible via a registry-based plugin system.
 
-- **Algorithms**: GRPO, GRPO-Guard, DPPO, DPO, DGPO, DiffusionNFT, AWM
-- **Models**: FLUX.1/2, SD3.5, Wan2.1/2.2, Qwen-Image, Z-Image
-- **Rewards**: PickScore, CLIP, OCR, GenEval, VLM-Evaluate, and custom rewards
+- **Algorithms**: GRPO, GRPO-Guard, DPPO, DPO, DGPO, DiffusionNFT, AWM, CRD, DiffusionOPD
+- **Models**: FLUX.1 (+Kontext), FLUX.2 (+Klein), SD3.5, Qwen-Image (+Edit-Plus), Z-Image, Wan2 (T2V/I2V/V2V), LTX2 (T2AV/I2AV), Bagel
+- **Rewards**: PickScore (+Rank), CLIP, CLAP, ImageBind, OCR, GenEval/GenEval2, HPSv2, VLM-Evaluate, rational-rewards, and custom rewards
 - **Python**: >=3.10 | **PyTorch**: >=2.6.0 | **License**: Apache-2.0
 
 **Language**: Match user's language.
@@ -18,7 +18,7 @@ On session start, read **Tier 1** (see `.agents/knowledge/README.md`):
 - `.agents/knowledge/constraints.md` — hard rules, indexed by category
 - `.agents/knowledge/architecture.md` — module graph, pipeline stages, registries
 
-**Tier 2**: Topic docs triggered by change area. See `knowledge/README.md` for triggers.
+**Tier 2**: Topic docs triggered by change area. See `.agents/knowledge/README.md` for triggers.
 
 ## Core Operating Principles
 
@@ -27,7 +27,7 @@ On session start, read **Tier 1** (see `.agents/knowledge/README.md`):
 3. **Plan before implement** — Multi-file tasks -> TodoWrite. Plan must state which skills apply.
 4. **Challenge first, execute second** — Spot logic flaws or simpler alternatives? Raise before executing.
 5. **Escalation** — After three failed approaches, document findings and request review.
-6. **Fix capture** — After every bug fix, generate summary per `topics/fix_patterns.md` template.
+6. **Fix capture** — After every bug fix, generate summary per `.agents/knowledge/topics/fix_patterns.md` template.
 7. **English-only docs** — All code comments, docstrings, commit messages, and agent docs must be English.
 8. **Scratch files only** — All temporary/intermediate files (analysis reports, investigation notes, checklists) MUST go under `.scratch/` (git-ignored). Never pollute the project root or tracked directories.
 
@@ -53,14 +53,14 @@ pytest                          # Run tests
 
 ## Project Structure
 
-See `architecture.md` "Module Dependency Graph" for full details.
+See `.agents/knowledge/architecture.md` "Module Dependency Graph" for full details.
 
 ## Documentation Reference
 
 | Document | Purpose |
 |----------|---------|
 | `guidance/workflow.md` | 6-stage training pipeline with code examples |
-| `guidance/algorithms.md` | GRPO, DiffusionNFT, DGPO, AWM deep dive |
+| `guidance/algorithms.md` | All 9 algorithms (GRPO, GRPO-Guard, DPPO, DPO, DGPO, DiffusionNFT, AWM, CRD, DiffusionOPD) deep dive |
 | `guidance/rewards.md` | Reward system design, custom model creation |
 | `guidance/new_model.md` | Step-by-step model adapter integration |
 

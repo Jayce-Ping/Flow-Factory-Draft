@@ -168,7 +168,7 @@ train:
 
 | | Description |
 |---|---|
-| **Input** | Batched **raw input** (`prompt`, `images`) or **encoded tensors** (`prompt_embedds`, `image_latents`) from the dataloader. |
+| **Input** | Batched **raw input** (`prompt`, `images`) or **encoded tensors** (`prompt_embeds`, `image_latents`) from the dataloader. |
 | **Output** | `List[BaseSample]` — each sample contains: generated image/video, denoising trajectory (`all_latents`), log-probabilities (`log_probs`), timestep schedule, and prompt info |
 
 ### How It Works
@@ -177,22 +177,19 @@ The trainer's `sample()` method switches the adapter to rollout mode and runs in
 
 ```python
 # src/flow_factory/trainers/grpo.py — GRPOTrainer.sample()
-def sample(self):
-    self.adapter.rollout()  # Disable grad, set eval mode
-    samples = []
+def sample(self) -> List[BaseSample]:
     trajectory_indices = compute_trajectory_indices(
         train_timestep_indices=self.adapter.scheduler.train_timesteps,
         num_inference_steps=self.training_args.num_inference_steps,
     )
-    with torch.no_grad(), self.autocast():
-        for batch in dataloader:
-            sample_batch = self.adapter.inference(
-                compute_log_prob=True,
-                trajectory_indices=trajectory_indices,
-                **batch,
-            )
-            samples.extend(sample_batch)
-    return samples
+    # generate_samples() (BaseTrainer) switches the adapter to rollout mode,
+    # loops the dataloader, runs adapter.inference() under no_grad + autocast,
+    # buffers rewards (reward_buffer), and returns the collected samples.
+    return self.generate_samples(
+        reward_buffer=self.reward_buffer,
+        compute_log_prob=True,
+        trajectory_indices=trajectory_indices,
+    )
 ```
 
 Inside `adapter.inference()`, the model runs a multi-step denoising loop (SDE or ODE), collecting latents and computing log-probabilities at each step. The result is packaged into `BaseSample` dataclass instances:
@@ -299,22 +296,20 @@ rewards:
 ### How It Works
 
 ```python
-# src/flow_factory/trainers/grpo.py — GRPOTrainer.compute_advantage_weighted_sum()
-def compute_advantage_weighted_sum(self, samples, rewards, store_to_samples=True):
-    # 1. Gather rewards from all ranks
-    gathered_rewards = {k: accelerator.gather(v).cpu().numpy() for k, v in rewards.items()}
-    # 2. Weighted sum of multiple rewards
-    aggregated = sum(arr * weight for arr, weight in ...)
-    # 3. Group by unique_id
-    unique_ids = [s.unique_id for s in samples]
-    gathered_ids = accelerator.gather(unique_ids)
-    _, group_indices = np.unique(gathered_ids, return_inverse=True)
-    # 4. Normalize within each group: (r - mean) / std
-    for group_id in np.unique(group_indices):
-        mask = (group_indices == group_id)
-        advantages[mask] = (aggregated[mask] - mean) / std
-    # 5. Scatter back to local rank
-    advantages = advantages.reshape(num_processes, -1)[process_index]
+# src/flow_factory/trainers/grpo.py — GRPOTrainer.compute_advantages()
+def compute_advantages(self, samples, rewards, store_to_samples=True, aggregation_func=None):
+    # Thin wrapper: resolve the aggregation strategy, then delegate to
+    # AdvantageProcessor (advantage/advantage_processor.py). The processor is
+    # communication-aware and auto-selects the gather-vs-local path; it performs
+    # the gather -> weighted-aggregate -> group-by-unique_id -> normalize ->
+    # scatter sequence summarized below.
+    aggregation_func = aggregation_func or self.training_args.advantage_aggregation
+    return self.advantage_processor.compute_advantages(
+        samples=samples,
+        rewards=rewards,
+        store_to_samples=store_to_samples,
+        aggregation_func=aggregation_func,
+    )
 ```
 
 ### Aggregation Strategies

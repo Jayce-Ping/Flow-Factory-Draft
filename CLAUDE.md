@@ -1,4 +1,4 @@
-AGENTS.md
+@AGENTS.md
 
 # Hard Rules (always enforced, including sub-agents)
 

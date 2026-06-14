@@ -63,9 +63,14 @@ class ModelArguments(ArgABC):
         metadata={"help": "Which layers to fine-tune. Options are like ['all',  'default', 'to_q', ['to_q', 'to_k', 'to_v']]"}
     )
 
-    model_type: Literal["sd3", "flux1", "flux1-kontext", 'flux2', 'qwenimage', 'qwenimage-edit', 'z-image'] = field(
+    model_type: Literal[
+        "sd3-5", "flux1", "flux1-kontext", "flux2", "flux2-klein",
+        "qwen-image", "qwen-image-edit-plus", "z-image",
+        "wan2_t2v", "wan2_i2v", "wan2_v2v", "bagel",
+        "ltx2_t2av", "ltx2_i2av",
+    ] = field(
         default="flux1",
-        metadata={"help": "Type of model to use."},
+        metadata={"help": "Registered model adapter key (see models/registry.py), or a custom 'pkg.module.Adapter' python path."},
     )
 
     lora_rank : int = field(

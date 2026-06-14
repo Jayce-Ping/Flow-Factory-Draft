@@ -26,21 +26,28 @@ pyproject.toml
 │   ├── swanlab         SwanLab tracking
 │   ├── nvidia          xformers, nvidia-ml-py
 │   ├── bagel           flash-attn, opencv-python
+│   ├── geneval         mmcv, mmengine, mmdet, open_clip_torch
+│   ├── geneval2        scipy (exact GenEval2 GM parity)
 │   └── all             deepspeed + quantization
 └── [tool.*]            black, isort config
 ```
 
 ## Core Dependencies
 
+The authoritative list is `pyproject.toml` `[project.dependencies]` (20+ packages). Key ones:
+
 | Package | Min Version | Purpose |
 |---------|-------------|---------|
 | `torch` | >= 2.6.0 | PyTorch core |
 | `torchvision` | >= 0.19.0 | Vision utilities |
+| `torchaudio` | >= 2.4.0 | Audio I/O (audio / audio-video models, CLAP) |
 | `transformers` | >= 4.57.1 | Text encoders, tokenizers |
 | `diffusers` | >= 0.36.0 | Diffusion pipelines, schedulers |
 | `accelerate` | >= 1.11.0 | Distributed training, mixed precision |
 | `peft` | >= 0.17.0 | LoRA, parameter-efficient fine-tuning |
 | `datasets` | >= 3.3.2 | Dataset loading |
+| `huggingface-hub` | >= 0.35.3 | Model/dataset downloads |
+| `protobuf` / `sentencepiece` | >= 6.33.2 / >= 0.2.1 | T5 tokenizer (Flux, SD3.5) |
 | `pydantic` | >= 2.8.0 | Config dataclass validation |
 
 ## Key Compatibility Notes
@@ -58,6 +65,13 @@ pyproject.toml
 
 ### bagel extra
 - Bagel remains a registered model adapter, but its heavyweight runtime packages are optional. Install with `pip install -e ".[bagel]"` before using `model_type: "bagel"`.
+
+### geneval / geneval2 rewards
+- `geneval` needs `pip install -e ".[geneval]"` (mmcv / mmengine / mmdet + open_clip_torch) for Mask2Former detection.
+- `geneval2` (`geneval2_soft_tifa`) needs `pip install -e ".[geneval2]"` (scipy) for exact GenEval2 geometric-mean parity; Qwen3-VL ships with core `transformers`, and a pure-Python gmean is used when scipy is absent.
+
+### HPSv2 reward
+- The PyPI `hpsv2` package pins `protobuf<4`, conflicting with Flow-Factory's `protobuf>=6`. It is **not** an optional extra. Install it without dependencies after Flow-Factory: `uv pip install hpsv2 --no-deps` (runtime works with protobuf 6+).
 
 ### accelerate
 - Primary distributed backend. `accelerator.prepare()` is used for trainable modules and optimizer only (constraint #9).

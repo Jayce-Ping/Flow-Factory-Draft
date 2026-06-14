@@ -41,7 +41,7 @@ git status             # Modified files
 - [ ] Config fields synchronized with YAML examples (#15–17)
 
 ### Cross-Module Consistency
-- [ ] Changes to `abc.py` base classes reflected in ALL subclasses (GRPO, GRPOGuard, DPO, NFT, AWM)
+- [ ] Changes to `abc.py` base classes reflected in ALL subclasses (grpo, grpo-guard, dppo, nft, awm, dgpo, dpo, crd, diffusion-opd)
 - [ ] Changes to `hparams/` reflected in ALL example configs
 - [ ] Changes to `AdvantageProcessor` compatible with all trainers
 - [ ] Registry keys match actual import paths

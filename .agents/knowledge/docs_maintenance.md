@@ -40,7 +40,7 @@ When modifying the knowledge system, verify these steps:
 |--------|-----------------|
 | New topic doc | Add row to `README.md` routing table with trigger condition |
 | New topic doc | Add cross-refs in relevant skills (`ff-develop`, `ff-debug`, `ff-review`, `ff-new-model`) |
-| New constraint | Update quick index range in `constraints.md` header + section header (e.g., `21-27` -> `21-28`) |
+| New constraint | Update quick index range in `constraints.md` header + section header (e.g., extend `#21-27` Code Quality or add a new category such as `#28-29` Agent Workflow) |
 | Append-only list | `Numbered Gotchas`, `FF-Specific Pitfalls` — only append, never reorder or remove |
 | Any doc change | All text in English (`constraints.md` #21) |
 | Moved detail | Replace inline content with pointer to the leaf that now holds it |

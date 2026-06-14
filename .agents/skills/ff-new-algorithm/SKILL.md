@@ -125,9 +125,8 @@ class MyAlgoTrainer(BaseTrainer):
             self.adapter.ema_step(step=self.epoch)
             self.epoch += 1
 
-    def evaluate(self):
-        """Evaluation loop — reuse pattern from GRPO/NFT."""
-        pass
+    # NOTE: evaluate() is a CONCRETE BaseTrainer method (called by the loop above).
+    # Override it only to customize evaluation — it is NOT an abstract method.
 
     def sample(self):
         """Stages 2-3: K-repeat sampling + trajectory generation."""
@@ -150,7 +149,7 @@ class MyAlgoTrainer(BaseTrainer):
 ```
 
 > **Note**: `AdvantageProcessor` is auto-instantiated in `BaseTrainer._init_reward_model()`.
-> All trainers delegate via `self.advantage_processor.compute_advantages()` — see `architecture.md` "Advantage Computation".
+> Reward-based trainers delegate via `self.advantage_processor.compute_advantages()` — see `architecture.md` "Advantage Computation". (Pure-distillation trainers like `diffusion-opd` skip rewards/advantages with a no-op `prepare_feedback()`.)
 
 ### Step 4 — Register in Trainer Registry
 
@@ -167,7 +166,7 @@ Create example config `examples/my_algo/lora/flux1/default.yaml`:
 ```yaml
 model:
   model_type: "flux1"
-  model_path: "black-forest-labs/FLUX.1-dev"
+  model_name_or_path: "black-forest-labs/FLUX.1-dev"
   finetune_type: "lora"
   target_components: ["transformer"]
 
@@ -183,11 +182,19 @@ scheduler:
   dynamics_type: "ODE"          # Or appropriate dynamics
 
 data:
-  dataset: "path/to/dataset"
+  datasets:
+    - name: default
+      dataset_dir: "path/to/dataset"   # Folder with train.jsonl / test.jsonl
+      train:
+        weight: 1
+        max_dataset_size: 1024
+      eval: {}
 
 rewards:
-  reward_model: "PickScore"
-  batch_size: 16
+  - name: "pickscore"
+    reward_model: "pickscore"
+    weight: 1.0
+    batch_size: 16
 ```
 
 ## Phase 5: Verification
