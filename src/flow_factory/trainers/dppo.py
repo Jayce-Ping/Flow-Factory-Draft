@@ -61,8 +61,6 @@ class DPPOTrainer(GRPOTrainer):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.training_args: DPPOTrainingArguments
-        self.kl_mask_threshold = float(self.training_args.kl_mask_threshold)
-        self.kl_guidance_scale = self.training_args.kl_guidance_scale
 
     def _effective_sigma(self, std_dev_t: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
         """Per-step Gaussian std for the x-space KL, by sampling dynamics.
@@ -87,19 +85,22 @@ class DPPOTrainer(GRPOTrainer):
 
     # =========================== Sampling Loop ============================
     def sample(self) -> List[BaseSample]:
-        """Generate rollouts and store the old per-step quantities for the KL mask."""
+        """Generate rollouts and store the rollout-old quantity the KL mask needs."""
         trajectory_indices = compute_trajectory_indices(
             train_timestep_indices=self.adapter.scheduler.train_timesteps,
             num_inference_steps=self.training_args.num_inference_steps,
         )
-        # Store the rollout-old velocity / mean so optimize() can compute
-        # KL(current || old) per training timestep.
-        extra_call_back_kwargs = ["noise_pred", "next_latents_mean"]
+        # The trust-region mask compares the current policy against the rollout-old
+        # policy in `kl_mask_type` space, so only that per-step quantity is stored
+        # (the ref-KL penalty compares current vs reference, never the old policy).
+        mask_field = (
+            "noise_pred" if self.training_args.kl_mask_type == "v-based" else "next_latents_mean"
+        )
         return self.generate_samples(
             reward_buffer=self.reward_buffer,
             compute_log_prob=True,
             trajectory_indices=trajectory_indices,
-            extra_call_back_kwargs=extra_call_back_kwargs,
+            extra_call_back_kwargs=[mask_field],
         )
 
     # =========================== Optimization Loop ============================
@@ -108,8 +109,12 @@ class DPPOTrainer(GRPOTrainer):
         device = self.accelerator.device
         per_device_batch_size = self.training_args.per_device_batch_size
         num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
-        kl_type = self.training_args.kl_type  # KL-vs-reference penalty space
-        kl_mask_type = self.training_args.kl_mask_type  # trust-region mask space
+        kl_type = self.training_args.kl_type
+        kl_mask_type = self.training_args.kl_mask_type
+        kl_guidance_scale = self.training_args.kl_guidance_scale
+        kl_mask_threshold = self.training_args.kl_mask_threshold
+        # Mask space picks the single rollout-old tensor stored by sample().
+        mask_field = "noise_pred" if kl_mask_type == "v-based" else "next_latents_mean"
         for inner_epoch in range(self.training_args.num_inner_epochs):
             shuffled_samples = self._order_samples_for_optimize(samples, inner_epoch)
 
@@ -133,24 +138,20 @@ class DPPOTrainer(GRPOTrainer):
                     latents_index_map = batch["latent_index_map"]  # (T+1,) LongTensor
                     log_probs_index_map = batch["log_prob_index_map"]  # (T,) LongTensor
                     callback_index_map = batch["callback_index_map"][0]  # (T,) LongTensor, shared
-                    for idx, timestep_index in enumerate(
-                        tqdm(
-                            self.adapter.scheduler.train_timesteps,
-                            desc=f"Epoch {self.epoch} Timestep",
-                            position=1,
-                            leave=False,
-                            disable=not self.show_progress_bar,
-                        )
+                    for timestep_index in tqdm(
+                        self.adapter.scheduler.train_timesteps,
+                        desc=f"Epoch {self.epoch} Timestep",
+                        position=1,
+                        leave=False,
+                        disable=not self.show_progress_bar,
                     ):
                         with self.accelerator.accumulate(*self.adapter.trainable_components):
                             # 1. Prepare inputs
                             old_log_prob = batch["log_probs"][
                                 :, log_probs_index_map[timestep_index]
                             ]
-                            old_noise_pred = batch["noise_pred"][
-                                :, callback_index_map[timestep_index]
-                            ]
-                            old_next_latents_mean = batch["next_latents_mean"][
+                            # Rollout-old policy in mask space (the only stored callback tensor).
+                            old_mask_tensor = batch[mask_field][
                                 :, callback_index_map[timestep_index]
                             ]
                             num_timesteps = batch["timesteps"].shape[1]
@@ -175,13 +176,14 @@ class DPPOTrainer(GRPOTrainer):
                                 **batch,
                             }
                             forward_inputs = filter_kwargs(self.adapter.forward, **forward_inputs)
-                            # 2. Forward pass — request what the mask (and optional ref KL) need.
-                            # The mask uses kl_mask_type; the ref penalty uses kl_type. When they
-                            # differ, both noise_pred and next_latents_mean are requested.
-                            return_kwargs = {"log_prob", "dt", "std_dev_t"}
-                            return_kwargs.add(
-                                "noise_pred" if kl_mask_type == "v-based" else "next_latents_mean"
-                            )
+                            # 2. Forward pass — request only what the mask (and optional ref KL) need.
+                            # The mask uses kl_mask_type; the ref penalty uses kl_type. std_dev_t/dt
+                            # feed the x-based mask's variance scaling only.
+                            return_kwargs = {"log_prob"}
+                            if kl_mask_type == "v-based":
+                                return_kwargs.add("noise_pred")
+                            else:
+                                return_kwargs.update(("next_latents_mean", "std_dev_t", "dt"))
                             if self.enable_kl_loss:
                                 return_kwargs.add(
                                     "noise_pred" if kl_type == "v-based" else "next_latents_mean"
@@ -195,21 +197,23 @@ class DPPOTrainer(GRPOTrainer):
                             adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
                             ratio = torch.exp(output.log_prob - old_log_prob)
 
-                            # Per-step KL(current || old) for the trust-region mask.
+                            # Per-step KL(current || old) for the trust-region mask. The x-based mask
+                            # uses the exact variance-scaled Gaussian KL; the v-based mask and the
+                            # ref-KL penalty below use unscaled squared error (GRPO convention).
                             if kl_mask_type == "v-based":
-                                sq = (output.noise_pred - old_noise_pred) ** 2
+                                sq = (output.noise_pred - old_mask_tensor) ** 2
                                 kl_new_old = sq.mean(dim=tuple(range(1, sq.ndim)))
                             else:
                                 sigma_t = self._effective_sigma(output.std_dev_t, output.dt)
                                 kl_elem = gaussian_kl_div(
-                                    output.next_latents_mean, old_next_latents_mean, sigma_t
+                                    output.next_latents_mean, old_mask_tensor, sigma_t
                                 )
                                 kl_new_old = kl_elem.mean(dim=tuple(range(1, kl_elem.ndim)))
 
                             # DPPO mask: zero gradient for trust-region violators that
                             # push the wrong way (ratio>1 & adv>0, or ratio<1 & adv<0).
                             unclipped_loss = -adv * ratio
-                            violate = kl_new_old >= self.kl_mask_threshold
+                            violate = kl_new_old >= kl_mask_threshold
                             pos_rm = violate & (ratio > 1.0) & (adv > 0)
                             neg_rm = violate & (ratio < 1.0) & (adv < 0)
                             keep_mask = (
@@ -221,21 +225,15 @@ class DPPOTrainer(GRPOTrainer):
 
                             loss = policy_loss
 
-                            # 4. Optional KL-vs-reference penalty (run at kl_guidance_scale CFG)
+                            # 4. Optional KL-vs-reference penalty (run at kl_guidance_scale CFG).
+                            # negative_* embeds already rode `sample.to(device)` into `batch`, so the
+                            # ref forward reuses them on-device without an extra move.
                             if self.enable_kl_loss:
                                 with torch.no_grad(), self.adapter.use_ref_parameters():
                                     ref_forward_inputs = forward_inputs.copy()
                                     ref_forward_inputs["compute_log_prob"] = False
-                                    if self.kl_guidance_scale is not None:
-                                        ref_forward_inputs["guidance_scale"] = (
-                                            self.kl_guidance_scale
-                                        )
-                                        if self.kl_guidance_scale > 1.0:
-                                            for k, v in ref_forward_inputs.items():
-                                                if k.startswith("negative_") and isinstance(
-                                                    v, torch.Tensor
-                                                ):
-                                                    ref_forward_inputs[k] = v.to(device)
+                                    if kl_guidance_scale is not None:
+                                        ref_forward_inputs["guidance_scale"] = kl_guidance_scale
                                     if kl_type == "v-based":
                                         ref_forward_inputs["return_kwargs"] = ["noise_pred"]
                                     else:
@@ -268,13 +266,14 @@ class DPPOTrainer(GRPOTrainer):
                                 loss_info["kl_loss"].append(kl_loss.detach())
 
                             # 5. Log per-timestep info
+                            keep_frac = keep_mask.mean().detach()
                             loss_info["ratio"].append(ratio.detach())
                             loss_info["kl_new_old"].append(kl_new_old.detach())
                             loss_info["unclipped_loss"].append(unclipped_loss.detach())
                             loss_info["policy_loss"].append(policy_loss.detach())
                             loss_info["loss"].append(loss.detach())
-                            loss_info["keep_ratio"].append(keep_mask.mean())
-                            loss_info["masked_ratio"].append(1.0 - keep_mask.mean())
+                            loss_info["keep_ratio"].append(keep_frac)
+                            loss_info["masked_ratio"].append(1.0 - keep_frac)
 
                             # 6. Backward and optimizer step
                             self.accelerator.backward(loss)
