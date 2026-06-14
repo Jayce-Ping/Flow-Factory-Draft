@@ -48,4 +48,5 @@ exec "${VLLM_BIN}" serve "${MODEL_PATH}" \
   --port "${PORT}" \
   --served-model-name "${SERVED_MODEL_NAME}" \
   --limit-mm-per-prompt '{"image": 1}' \
+  --trust-remote-code \
   "$@"
