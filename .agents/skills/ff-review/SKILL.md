@@ -99,10 +99,10 @@ Additionally, read based on diff scope:
 | Diff touches... | Also read |
 |----------------|-----------|
 | `models/` | `topics/adapter_conventions.md`, `topics/parity_testing.md` |
-| `trainers/` | `topics/train_inference_consistency.md` |
+| `trainers/` | `topics/train_inference_consistency.md`, `topics/autocast_param_swap.md` |
 | `scheduler/` | `topics/train_inference_consistency.md`, `topics/dtype_precision.md` |
 | New adapter | `topics/adapter_conventions.md`, `topics/parity_testing.md` |
-| dtype/precision | `topics/dtype_precision.md` |
+| dtype/precision | `topics/dtype_precision.md`, `topics/autocast_param_swap.md` |
 
 ## Common Issues Found in Review
 
@@ -113,3 +113,4 @@ Additionally, read based on diff scope:
 5. **Missing `wait_for_everyone()`** — Distributed deadlock risk
 6. **Reward shape mismatch** — Pointwise returning wrong batch dim
 7. **License header missing** — New files without Apache 2.0 header
+8. **Autocast spans a forward** — flat loss / KL ≈ 0 (fp32 master); see #20a / `topics/autocast_param_swap.md`

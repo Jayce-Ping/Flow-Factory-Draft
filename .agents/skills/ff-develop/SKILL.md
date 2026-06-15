@@ -9,6 +9,7 @@ description: "Feature development with cross-module impact analysis. Covers trai
 
 - Adapter changes -> `topics/adapter_conventions.md`
 - Trainer/scheduler changes -> `topics/train_inference_consistency.md`
+- Trainer `optimize()` loop, autocast scope, ref/EMA/named param swaps -> `topics/autocast_param_swap.md`
 - Precision changes -> `topics/dtype_precision.md`
 
 ## Impact Analysis Checklist

@@ -79,8 +79,8 @@ for each micro-batch:
                   _old_v_pred_list / _old_log_probs) for THIS batch only
   3. train under current policy:
        adapter.train()
-       with self.autocast():
-         per-timestep forward / backward / optimizer step
+       per-timestep: each forward (and KL) in its OWN `with self.autocast():`
+                     (constraint #20a); backward / optimizer step outside autocast
 ```
 
 Compared with the previous "eager precompute over ALL batches, then train all batches" design, this caps the precompute footprint to a single batch (`_old_v_pred_list` was 5+ GB on FLUX1 1024² 32-batch in the eager design; tens of GB on Wan).
@@ -109,3 +109,4 @@ If a future custom adapter stores large GPU tensors in `extra_kwargs`, either ha
 - `constraints.md` #15 + `.cursor/rules/examples-yaml-sync.mdc` (the three-tier strategy is an intentional deviation)
 - `topics/train_inference_consistency.md` item #4 (EMA swap without restore — preserved by per-batch interleave)
 - `topics/dtype_precision.md` (device-move never changes dtype; orthogonal to autocast)
+- `topics/autocast_param_swap.md` (#20a)

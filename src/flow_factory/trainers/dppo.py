@@ -121,114 +121,111 @@ class DPPOTrainer(GRPOTrainer):
             self.adapter.train()
             loss_info = defaultdict(list)
 
-            with self.autocast():
-                for batch_idx in tqdm(
-                    range(num_batches),
-                    total=num_batches,
-                    desc=f"Epoch {self.epoch} Training",
-                    position=0,
+            for batch_idx in tqdm(
+                range(num_batches),
+                total=num_batches,
+                desc=f"Epoch {self.epoch} Training",
+                position=0,
+                disable=not self.show_progress_bar,
+            ):
+                start = batch_idx * per_device_batch_size
+                batch_samples = [
+                    sample.to(device)
+                    for sample in shuffled_samples[start : start + per_device_batch_size]
+                ]
+                batch = BaseSample.stack(batch_samples)
+                latents_index_map = batch["latent_index_map"]  # (T+1,) LongTensor
+                log_probs_index_map = batch["log_prob_index_map"]  # (T,) LongTensor
+                callback_index_map = batch["callback_index_map"][0]  # (T,) LongTensor, shared
+                for timestep_index in tqdm(
+                    self.adapter.scheduler.train_timesteps,
+                    desc=f"Epoch {self.epoch} Timestep",
+                    position=1,
+                    leave=False,
                     disable=not self.show_progress_bar,
                 ):
-                    start = batch_idx * per_device_batch_size
-                    batch_samples = [
-                        sample.to(device)
-                        for sample in shuffled_samples[start : start + per_device_batch_size]
-                    ]
-                    batch = BaseSample.stack(batch_samples)
-                    latents_index_map = batch["latent_index_map"]  # (T+1,) LongTensor
-                    log_probs_index_map = batch["log_prob_index_map"]  # (T,) LongTensor
-                    callback_index_map = batch["callback_index_map"][0]  # (T,) LongTensor, shared
-                    for timestep_index in tqdm(
-                        self.adapter.scheduler.train_timesteps,
-                        desc=f"Epoch {self.epoch} Timestep",
-                        position=1,
-                        leave=False,
-                        disable=not self.show_progress_bar,
-                    ):
-                        with self.accelerator.accumulate(*self.adapter.trainable_components):
-                            # 1. Prepare inputs
-                            old_log_prob = batch["log_probs"][
-                                :, log_probs_index_map[timestep_index]
-                            ]
-                            # Rollout-old policy in mask space (the only stored callback tensor).
-                            old_mask_tensor = batch[mask_field][
-                                :, callback_index_map[timestep_index]
-                            ]
-                            num_timesteps = batch["timesteps"].shape[1]
-                            t = batch["timesteps"][:, timestep_index]
-                            t_next = (
-                                batch["timesteps"][:, timestep_index + 1]
-                                if timestep_index + 1 < num_timesteps
-                                else torch.tensor(0, device=self.accelerator.device)
+                    with self.accelerator.accumulate(*self.adapter.trainable_components):
+                        # 1. Prepare inputs
+                        old_log_prob = batch["log_probs"][:, log_probs_index_map[timestep_index]]
+                        # Rollout-old policy in mask space (the only stored callback tensor).
+                        old_mask_tensor = batch[mask_field][:, callback_index_map[timestep_index]]
+                        num_timesteps = batch["timesteps"].shape[1]
+                        t = batch["timesteps"][:, timestep_index]
+                        t_next = (
+                            batch["timesteps"][:, timestep_index + 1]
+                            if timestep_index + 1 < num_timesteps
+                            else torch.tensor(0, device=self.accelerator.device)
+                        )
+                        latents = batch["all_latents"][:, latents_index_map[timestep_index]]
+                        next_latents = batch["all_latents"][
+                            :, latents_index_map[timestep_index + 1]
+                        ]
+                        forward_inputs = {
+                            **self.training_args,
+                            "t": t,
+                            "t_next": t_next,
+                            "latents": latents,
+                            "next_latents": next_latents,
+                            "compute_log_prob": True,
+                            "noise_level": self.adapter.scheduler.noise_level,
+                            **batch,
+                        }
+                        forward_inputs = filter_kwargs(self.adapter.forward, **forward_inputs)
+                        # 2. Forward pass — request only what the mask (and optional ref KL) need.
+                        # The mask uses kl_mask_type; the ref penalty uses kl_type. std_dev_t/dt
+                        # feed the x-based mask's variance scaling only.
+                        return_kwargs = {"log_prob"}
+                        if kl_mask_type == "v-based":
+                            return_kwargs.add("noise_pred")
+                        else:
+                            return_kwargs.update(("next_latents_mean", "std_dev_t", "dt"))
+                        if self.enable_kl_loss:
+                            return_kwargs.add(
+                                "noise_pred" if kl_type == "v-based" else "next_latents_mean"
                             )
-                            latents = batch["all_latents"][:, latents_index_map[timestep_index]]
-                            next_latents = batch["all_latents"][
-                                :, latents_index_map[timestep_index + 1]
-                            ]
-                            forward_inputs = {
-                                **self.training_args,
-                                "t": t,
-                                "t_next": t_next,
-                                "latents": latents,
-                                "next_latents": next_latents,
-                                "compute_log_prob": True,
-                                "noise_level": self.adapter.scheduler.noise_level,
-                                **batch,
-                            }
-                            forward_inputs = filter_kwargs(self.adapter.forward, **forward_inputs)
-                            # 2. Forward pass — request only what the mask (and optional ref KL) need.
-                            # The mask uses kl_mask_type; the ref penalty uses kl_type. std_dev_t/dt
-                            # feed the x-based mask's variance scaling only.
-                            return_kwargs = {"log_prob"}
-                            if kl_mask_type == "v-based":
-                                return_kwargs.add("noise_pred")
-                            else:
-                                return_kwargs.update(("next_latents_mean", "std_dev_t", "dt"))
-                            if self.enable_kl_loss:
-                                return_kwargs.add(
-                                    "noise_pred" if kl_type == "v-based" else "next_latents_mean"
-                                )
-                            forward_inputs["return_kwargs"] = list(return_kwargs)
+                        forward_inputs["return_kwargs"] = list(return_kwargs)
+                        with self.autocast():
                             output = self.adapter.forward(**forward_inputs)
 
-                            # 3. Compute loss
-                            adv = batch["advantage"]
-                            adv_clip_range = self.training_args.adv_clip_range
-                            adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
-                            ratio = torch.exp(output.log_prob - old_log_prob)
+                        # 3. Compute loss
+                        adv = batch["advantage"]
+                        adv_clip_range = self.training_args.adv_clip_range
+                        adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
+                        ratio = torch.exp(output.log_prob - old_log_prob)
 
-                            # Per-step KL(current || old) for the trust-region mask. The x-based mask
-                            # uses the exact variance-scaled Gaussian KL; the v-based mask and the
-                            # ref-KL penalty below use unscaled squared error (GRPO convention).
-                            if kl_mask_type == "v-based":
-                                sq = (output.noise_pred - old_mask_tensor) ** 2
-                                kl_new_old = sq.mean(dim=tuple(range(1, sq.ndim)))
-                            else:
-                                sigma_t = self._effective_sigma(output.std_dev_t, output.dt)
-                                kl_elem = gaussian_kl_div(
-                                    output.next_latents_mean, old_mask_tensor, sigma_t
-                                )
-                                kl_new_old = kl_elem.mean(dim=tuple(range(1, kl_elem.ndim)))
-
-                            # DPPO mask: zero gradient for trust-region violators that
-                            # push the wrong way (ratio>1 & adv>0, or ratio<1 & adv<0).
-                            unclipped_loss = -adv * ratio
-                            violate = kl_new_old >= kl_mask_threshold
-                            pos_rm = violate & (ratio > 1.0) & (adv > 0)
-                            neg_rm = violate & (ratio < 1.0) & (adv < 0)
-                            keep_mask = (
-                                torch.logical_not(pos_rm | neg_rm)
-                                .to(dtype=unclipped_loss.dtype)
-                                .detach()
+                        # Per-step KL(current || old) for the trust-region mask. The x-based mask
+                        # uses the exact variance-scaled Gaussian KL; the v-based mask and the
+                        # ref-KL penalty below use unscaled squared error (GRPO convention).
+                        if kl_mask_type == "v-based":
+                            sq = (output.noise_pred - old_mask_tensor) ** 2
+                            kl_new_old = sq.mean(dim=tuple(range(1, sq.ndim)))
+                        else:
+                            sigma_t = self._effective_sigma(output.std_dev_t, output.dt)
+                            kl_elem = gaussian_kl_div(
+                                output.next_latents_mean, old_mask_tensor, sigma_t
                             )
-                            policy_loss = torch.mean(unclipped_loss * keep_mask)
+                            kl_new_old = kl_elem.mean(dim=tuple(range(1, kl_elem.ndim)))
 
-                            loss = policy_loss
+                        # DPPO mask: zero gradient for trust-region violators that
+                        # push the wrong way (ratio>1 & adv>0, or ratio<1 & adv<0).
+                        unclipped_loss = -adv * ratio
+                        violate = kl_new_old >= kl_mask_threshold
+                        pos_rm = violate & (ratio > 1.0) & (adv > 0)
+                        neg_rm = violate & (ratio < 1.0) & (adv < 0)
+                        keep_mask = (
+                            torch.logical_not(pos_rm | neg_rm)
+                            .to(dtype=unclipped_loss.dtype)
+                            .detach()
+                        )
+                        policy_loss = torch.mean(unclipped_loss * keep_mask)
 
-                            # 4. Optional KL-vs-reference penalty (run at kl_guidance_scale CFG).
-                            # negative_* embeds already rode `sample.to(device)` into `batch`, so the
-                            # ref forward reuses them on-device without an extra move.
-                            if self.enable_kl_loss:
+                        loss = policy_loss
+
+                        # 4. Optional KL-vs-reference penalty (run at kl_guidance_scale CFG).
+                        # negative_* embeds already rode `sample.to(device)` into `batch`, so the
+                        # ref forward reuses them on-device without an extra move.
+                        if self.enable_kl_loss:
+                            with self.autocast():
                                 with torch.no_grad(), self.adapter.use_ref_parameters():
                                     ref_forward_inputs = forward_inputs.copy()
                                     ref_forward_inputs["compute_log_prob"] = False
@@ -265,30 +262,30 @@ class DPPOTrainer(GRPOTrainer):
                                 loss_info["kl_div"].append(kl_div.detach())
                                 loss_info["kl_loss"].append(kl_loss.detach())
 
-                            # 5. Log per-timestep info
-                            keep_frac = keep_mask.mean().detach()
-                            loss_info["ratio"].append(ratio.detach())
-                            loss_info["kl_new_old"].append(kl_new_old.detach())
-                            loss_info["unclipped_loss"].append(unclipped_loss.detach())
-                            loss_info["policy_loss"].append(policy_loss.detach())
-                            loss_info["loss"].append(loss.detach())
-                            loss_info["keep_ratio"].append(keep_frac)
-                            loss_info["masked_ratio"].append(1.0 - keep_frac)
+                        # 5. Log per-timestep info
+                        keep_frac = keep_mask.mean().detach()
+                        loss_info["ratio"].append(ratio.detach())
+                        loss_info["kl_new_old"].append(kl_new_old.detach())
+                        loss_info["unclipped_loss"].append(unclipped_loss.detach())
+                        loss_info["policy_loss"].append(policy_loss.detach())
+                        loss_info["loss"].append(loss.detach())
+                        loss_info["keep_ratio"].append(keep_frac)
+                        loss_info["masked_ratio"].append(1.0 - keep_frac)
 
-                            # 6. Backward and optimizer step
-                            self.accelerator.backward(loss)
-                            if self.accelerator.sync_gradients:
-                                grad_norm = self.accelerator.clip_grad_norm_(
-                                    self.adapter.get_trainable_parameters(),
-                                    self.training_args.max_grad_norm,
-                                )
-                                self.optimizer.step()
-                                self.optimizer.zero_grad()
-                                loss_info = reduce_loss_info(self.accelerator, loss_info)
-                                loss_info["grad_norm"] = grad_norm
-                                self.log_data(
-                                    {f"train/{k}": v for k, v in loss_info.items()},
-                                    step=self.step,
-                                )
-                                self.step += 1
-                                loss_info = defaultdict(list)
+                        # 6. Backward and optimizer step
+                        self.accelerator.backward(loss)
+                        if self.accelerator.sync_gradients:
+                            grad_norm = self.accelerator.clip_grad_norm_(
+                                self.adapter.get_trainable_parameters(),
+                                self.training_args.max_grad_norm,
+                            )
+                            self.optimizer.step()
+                            self.optimizer.zero_grad()
+                            loss_info = reduce_loss_info(self.accelerator, loss_info)
+                            loss_info["grad_norm"] = grad_norm
+                            self.log_data(
+                                {f"train/{k}": v for k, v in loss_info.items()},
+                                step=self.step,
+                            )
+                            self.step += 1
+                            loss_info = defaultdict(list)

@@ -14,7 +14,7 @@
 | Latent storage (trajectory) | `latent_storage_dtype` (configurable) | Memory vs. precision tradeoff |
 | Advantage computation | `float64` (numpy) | Normalization stability |
 
-Boundaries are set in `BaseAdapter._mix_precision()` (`models/abc.py`) and `BaseTrainer.__init__` (autocast context).
+Boundaries are set in `BaseAdapter._mix_precision()` (`models/abc.py`) and `BaseTrainer.__init__` (autocast context). Autocast weight-cache invariant + in-place ref/EMA/named swaps: `topics/autocast_param_swap.md` (#20a).
 
 ## `cast_latents()` Contract
 
@@ -68,5 +68,6 @@ The round-trip ensures that the precision of stored latents matches what trainin
 
 - `constraints.md` #18 (all-rank synchronization — precision errors may manifest differently per rank)
 - `constraints.md` #20 (mixed precision consistency)
+- `topics/autocast_param_swap.md` (#20a)
 - `train_inference_consistency.md` (log_prob mismatch from precision)
 - `topics/timestep_sigma.md` (scheduler math always float32)

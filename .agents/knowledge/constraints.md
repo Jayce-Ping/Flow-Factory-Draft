@@ -119,6 +119,9 @@ When using FSDP with CPU offloading, frozen components (text encoder, VAE) may b
 ### 20. Mixed Precision Consistency
 The adapter sets inference dtype for frozen components and training dtype for trainable parameters in `_mix_precision()`. Autocast context is configured in `BaseTrainer.__init__`. Do not manually cast tensors unless you understand the precision boundary. Details: `topics/dtype_precision.md`.
 
+### 20a. Autocast Weight Cache Must Not Span a Forward
+`torch.autocast`'s weight cache (keyed by tensor `data_ptr`) serves **stale** casts after any in-place weight change — `optimizer.step()` or a `use_ref/ema/named_parameters` swap (`param.data.copy_`). So wrap **each** forward (and its KL) in its own `with self.autocast():`; never one autocast around the optimize loop. Active for fp32 trainable weights (`master_weight_dtype: fp32`), dormant for the bf16 default, LoRA `disable_adapter()` safe. Details + DDP/DeepSpeed caveat: `topics/autocast_param_swap.md`.
+
 ---
 
 ## Code Quality (21–27)

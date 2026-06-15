@@ -143,7 +143,8 @@ class MyAlgoTrainer(BaseTrainer):
 
     def optimize(self, samples):
         """Stage 6: Policy update."""
-        # Use self.adapter.forward() for single-step denoising
+        # Use self.adapter.forward() for single-step denoising.
+        # Per-forward autocast — never one outer autocast around the loop (#20a).
         # Compute loss, backprop, step
         pass
 ```

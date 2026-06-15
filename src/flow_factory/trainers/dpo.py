@@ -449,128 +449,128 @@ class DPOTrainer(BaseTrainer):
             self.adapter.train()
             loss_info = defaultdict(list)
 
-            with self.autocast():
-                for pair_batch in tqdm(
-                    pair_batches,
-                    total=len(pair_batches),
-                    desc=f'Epoch {self.epoch} DPO Training',
-                    position=0,
-                    disable=not self.show_progress_bar,
-                ):
-                    # Stack chosen and rejected latents (shared across timesteps).
-                    # Lazy reload: when samples are GPU-resident `sample.to(device)` is
-                    # a no-op; when they are CPU-resident (offload pipeline) this is
-                    # the H2D point.
-                    device = self.accelerator.device
-                    chosen_samples = [p[0].to(device) for p in pair_batch]
-                    rejected_samples = [p[1].to(device) for p in pair_batch]
+            for pair_batch in tqdm(
+                pair_batches,
+                total=len(pair_batches),
+                desc=f'Epoch {self.epoch} DPO Training',
+                position=0,
+                disable=not self.show_progress_bar,
+            ):
+                # Stack chosen and rejected latents (shared across timesteps).
+                # Lazy reload: when samples are GPU-resident `sample.to(device)` is
+                # a no-op; when they are CPU-resident (offload pipeline) this is
+                # the H2D point.
+                device = self.accelerator.device
+                chosen_samples = [p[0].to(device) for p in pair_batch]
+                rejected_samples = [p[1].to(device) for p in pair_batch]
 
-                    chosen_batch = BaseSample.stack(chosen_samples)
-                    rejected_batch = BaseSample.stack(rejected_samples)
+                chosen_batch = BaseSample.stack(chosen_samples)
+                rejected_batch = BaseSample.stack(rejected_samples)
 
-                    # Get clean latents (final step from trajectory, index -1)
-                    chosen_latents = chosen_batch['all_latents'][:, -1]
-                    rejected_latents = rejected_batch['all_latents'][:, -1]
+                # Get clean latents (final step from trajectory, index -1)
+                chosen_latents = chosen_batch['all_latents'][:, -1]
+                rejected_latents = rejected_batch['all_latents'][:, -1]
 
-                    current_batch_size = chosen_latents.shape[0]
+                current_batch_size = chosen_latents.shape[0]
 
-                    # Pre-sample T×B timesteps for this pair batch
-                    all_timesteps = self._sample_timesteps(
-                        batch_size=current_batch_size,
-                        num_timesteps=self.num_train_timesteps,
-                        timestep_range=self.training_args.timestep_range,
-                    )  # (T, B)
+                # Pre-sample T×B timesteps for this pair batch
+                all_timesteps = self._sample_timesteps(
+                    batch_size=current_batch_size,
+                    num_timesteps=self.num_train_timesteps,
+                    timestep_range=self.training_args.timestep_range,
+                )  # (T, B)
 
-                    # Build static forward kwargs (shared across timesteps)
-                    _excluded_batch_keys = {'all_latents', 'timesteps', 'advantage'}
-                    static_kwargs = {
-                        **self.training_args,
-                        'compute_log_prob': False,
-                        'return_kwargs': ['noise_pred'],
-                        'noise_level': 0.0,
-                        **{k: v for k, v in chosen_batch.items()
-                           if k not in _excluded_batch_keys},
-                    }
+                # Build static forward kwargs (shared across timesteps)
+                _excluded_batch_keys = {'all_latents', 'timesteps', 'advantage'}
+                static_kwargs = {
+                    **self.training_args,
+                    'compute_log_prob': False,
+                    'return_kwargs': ['noise_pred'],
+                    'noise_level': 0.0,
+                    **{k: v for k, v in chosen_batch.items()
+                       if k not in _excluded_batch_keys},
+                }
 
-                    for t_idx in range(self.num_train_timesteps):
-                        with self.accelerator.accumulate(*self.adapter.trainable_components):
-                            t = all_timesteps[t_idx]  # (B,), scheduler scale [0, 1000]
-                            sigma = flow_match_sigma(t)  # σ ∈ [0, 1]
-                            noise = randn_tensor(
-                                chosen_latents.shape,
-                                device=chosen_latents.device,
-                                dtype=chosen_latents.dtype,
-                            )
+                for t_idx in range(self.num_train_timesteps):
+                    with self.accelerator.accumulate(*self.adapter.trainable_components):
+                        t = all_timesteps[t_idx]  # (B,), scheduler scale [0, 1000]
+                        sigma = flow_match_sigma(t)  # σ ∈ [0, 1]
+                        noise = randn_tensor(
+                            chosen_latents.shape,
+                            device=chosen_latents.device,
+                            dtype=chosen_latents.dtype,
+                        )
 
-                            sigma_broadcast = to_broadcast_tensor(sigma, chosen_latents)
+                        sigma_broadcast = to_broadcast_tensor(sigma, chosen_latents)
 
-                            # Noise both at same σ: x_t = (1 - σ) * x_0 + σ * noise
-                            noised_chosen = (1 - sigma_broadcast) * chosen_latents + sigma_broadcast * noise
-                            noised_rejected = (1 - sigma_broadcast) * rejected_latents + sigma_broadcast * noise
+                        # Noise both at same σ: x_t = (1 - σ) * x_0 + σ * noise
+                        noised_chosen = (1 - sigma_broadcast) * chosen_latents + sigma_broadcast * noise
+                        noised_rejected = (1 - sigma_broadcast) * rejected_latents + sigma_broadcast * noise
 
-                            # Per-timestep forward kwargs (adapter expects scheduler scale)
-                            base_kwargs = {
-                                **static_kwargs,
-                                't': t,
-                                't_next': torch.zeros_like(t),
-                            }
+                        # Per-timestep forward kwargs (adapter expects scheduler scale)
+                        base_kwargs = {
+                            **static_kwargs,
+                            't': t,
+                            't_next': torch.zeros_like(t),
+                        }
 
-                            # Policy forward
+                        # Policy forward
+                        with self.autocast():
                             theta_w_pred = self._forward_noise_pred(noised_chosen, base_kwargs)
                             theta_l_pred = self._forward_noise_pred(noised_rejected, base_kwargs)
 
-                            # Reference forward (frozen)
-                            with torch.no_grad(), self.adapter.use_ref_parameters():
-                                ref_w_pred = self._forward_noise_pred(noised_chosen, base_kwargs)
-                                ref_l_pred = self._forward_noise_pred(noised_rejected, base_kwargs)
+                        # Reference forward (frozen)
+                        with torch.no_grad(), self.adapter.use_ref_parameters(), self.autocast():
+                            ref_w_pred = self._forward_noise_pred(noised_chosen, base_kwargs)
+                            ref_l_pred = self._forward_noise_pred(noised_rejected, base_kwargs)
 
-                            # MSE errors per sample — target is flow-matching velocity (noise - x_0), same as
-                            # flow_grpo train_sd3_dpo.py: target = noise - model_input
-                            target_w = noise - chosen_latents
-                            target_l = noise - rejected_latents
-                            spatial_dims = tuple(range(1, theta_w_pred.ndim))
-                            theta_w_err = ((theta_w_pred.float() - target_w.float()) ** 2).mean(dim=spatial_dims)
-                            theta_l_err = ((theta_l_pred.float() - target_l.float()) ** 2).mean(dim=spatial_dims)
-                            ref_w_err = ((ref_w_pred.float() - target_w.float()) ** 2).mean(dim=spatial_dims)
-                            ref_l_err = ((ref_l_pred.float() - target_l.float()) ** 2).mean(dim=spatial_dims)
+                        # MSE errors per sample — target is flow-matching velocity (noise - x_0), same as
+                        # flow_grpo train_sd3_dpo.py: target = noise - model_input
+                        target_w = noise - chosen_latents
+                        target_l = noise - rejected_latents
+                        spatial_dims = tuple(range(1, theta_w_pred.ndim))
+                        theta_w_err = ((theta_w_pred.float() - target_w.float()) ** 2).mean(dim=spatial_dims)
+                        theta_l_err = ((theta_l_pred.float() - target_l.float()) ** 2).mean(dim=spatial_dims)
+                        ref_w_err = ((ref_w_pred.float() - target_w.float()) ** 2).mean(dim=spatial_dims)
+                        ref_l_err = ((ref_l_pred.float() - target_l.float()) ** 2).mean(dim=spatial_dims)
 
-                            # DPO loss
-                            beta = self.training_args.beta
-                            w_diff = theta_w_err - ref_w_err
-                            l_diff = theta_l_err - ref_l_err
-                            w_l_diff = w_diff - l_diff
-                            inside_term = -0.5 * beta * w_l_diff
-                            loss = -F.logsigmoid(inside_term).mean()
+                        # DPO loss
+                        beta = self.training_args.beta
+                        w_diff = theta_w_err - ref_w_err
+                        l_diff = theta_l_err - ref_l_err
+                        w_l_diff = w_diff - l_diff
+                        inside_term = -0.5 * beta * w_l_diff
+                        loss = -F.logsigmoid(inside_term).mean()
 
-                            # Logging metrics
-                            with torch.no_grad():
-                                implicit_reward_chosen = -0.5 * beta * w_diff
-                                implicit_reward_rejected = -0.5 * beta * l_diff
-                                implicit_accuracy = (implicit_reward_chosen > implicit_reward_rejected).float().mean()
+                        # Logging metrics
+                        with torch.no_grad():
+                            implicit_reward_chosen = -0.5 * beta * w_diff
+                            implicit_reward_rejected = -0.5 * beta * l_diff
+                            implicit_accuracy = (implicit_reward_chosen > implicit_reward_rejected).float().mean()
 
-                            loss_info['loss'].append(loss.detach())
-                            loss_info['theta_w_err'].append(theta_w_err.mean().detach())
-                            loss_info['theta_l_err'].append(theta_l_err.mean().detach())
-                            loss_info['ref_w_err'].append(ref_w_err.mean().detach())
-                            loss_info['ref_l_err'].append(ref_l_err.mean().detach())
-                            loss_info['implicit_accuracy'].append(implicit_accuracy.detach())
-                            loss_info['implicit_reward_chosen'].append(implicit_reward_chosen.mean().detach())
-                            loss_info['implicit_reward_rejected'].append(implicit_reward_rejected.mean().detach())
+                        loss_info['loss'].append(loss.detach())
+                        loss_info['theta_w_err'].append(theta_w_err.mean().detach())
+                        loss_info['theta_l_err'].append(theta_l_err.mean().detach())
+                        loss_info['ref_w_err'].append(ref_w_err.mean().detach())
+                        loss_info['ref_l_err'].append(ref_l_err.mean().detach())
+                        loss_info['implicit_accuracy'].append(implicit_accuracy.detach())
+                        loss_info['implicit_reward_chosen'].append(implicit_reward_chosen.mean().detach())
+                        loss_info['implicit_reward_rejected'].append(implicit_reward_rejected.mean().detach())
 
-                            # Backward + optimizer step
-                            self.accelerator.backward(loss)
-                            if self.accelerator.sync_gradients:
-                                grad_norm = self.accelerator.clip_grad_norm_(
-                                    self.adapter.get_trainable_parameters(),
-                                    self.training_args.max_grad_norm,
-                                )
-                                self.optimizer.step()
-                                self.optimizer.zero_grad()
-                                loss_info = reduce_loss_info(self.accelerator, loss_info)
-                                loss_info['grad_norm'] = grad_norm
-                                self.log_data(
-                                    {f'train/{k}': v for k, v in loss_info.items()},
-                                    step=self.step,
-                                )
-                                self.step += 1
-                                loss_info = defaultdict(list)
+                        # Backward + optimizer step
+                        self.accelerator.backward(loss)
+                        if self.accelerator.sync_gradients:
+                            grad_norm = self.accelerator.clip_grad_norm_(
+                                self.adapter.get_trainable_parameters(),
+                                self.training_args.max_grad_norm,
+                            )
+                            self.optimizer.step()
+                            self.optimizer.zero_grad()
+                            loss_info = reduce_loss_info(self.accelerator, loss_info)
+                            loss_info['grad_norm'] = grad_norm
+                            self.log_data(
+                                {f'train/{k}': v for k, v in loss_info.items()},
+                                step=self.step,
+                            )
+                            self.step += 1
+                            loss_info = defaultdict(list)

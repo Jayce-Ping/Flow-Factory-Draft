@@ -601,17 +601,18 @@ class DGPOTrainer(BaseTrainer):
 
         old_v: Optional[torch.Tensor] = None
         if compute_old_v:
-            with torch.no_grad(), self._ema_ref_forward_context():
+            with torch.no_grad(), self._ema_ref_forward_context(), self.autocast():
                 old_v = self._compute_dgpo_output(
                     batch, t_flat, noised, guidance_scale=1.0
                 ).detach()
 
-        model_v = self._compute_dgpo_output(batch, t_flat, noised, guidance_scale=1.0)
+        with self.autocast():
+            model_v = self._compute_dgpo_output(batch, t_flat, noised, guidance_scale=1.0)
 
         ref_v: Optional[torch.Tensor] = None
         if self.enable_kl_loss or (not self.use_ema_ref):
             ref_cfg = self.kl_cfg if self.kl_cfg > 1.0 else 1.0
-            with torch.no_grad(), self.adapter.use_ref_parameters():
+            with torch.no_grad(), self.adapter.use_ref_parameters(), self.autocast():
                 ref_v = self._compute_dgpo_output(batch, t_flat, noised, guidance_scale=ref_cfg)
 
         if self.use_ema_ref:
@@ -693,11 +694,12 @@ class DGPOTrainer(BaseTrainer):
                     "enabled, but got None."
                 )
             batch_size = model_v.shape[0]
-            kl_div = (model_v - ref_v).square().reshape(batch_size, -1).mean(dim=1)
-            if self.clip_kl and should_clip is not None:
-                kl_div = torch.where(should_clip, kl_div.detach(), kl_div)
-            kl_loss = self.kl_beta * kl_div.mean()
-            loss = loss + kl_loss
+            with self.autocast():
+                kl_div = (model_v - ref_v).square().reshape(batch_size, -1).mean(dim=1)
+                if self.clip_kl and should_clip is not None:
+                    kl_div = torch.where(should_clip, kl_div.detach(), kl_div)
+                kl_loss = self.kl_beta * kl_div.mean()
+                loss = loss + kl_loss
             loss_info["kl_div"].append(kl_div.mean().detach())
             loss_info["kl_loss"].append(kl_loss.detach())
 
@@ -873,54 +875,54 @@ class DGPOTrainer(BaseTrainer):
         """
         loss_info: Dict[str, List[torch.Tensor]] = defaultdict(list)
 
-        with self.autocast():
-            for tb in tqdm(
-                training_batches,
-                desc=f"Epoch {self.epoch} Training",
-                position=0,
+        # No loop-level autocast: forwards are wrapped in `_forward_velocities` (#20a).
+        for tb in tqdm(
+            training_batches,
+            desc=f"Epoch {self.epoch} Training",
+            position=0,
+            disable=not self.show_progress_bar,
+        ):
+            p = self._prep_training_batch(tb)
+            batch = p["batch"]
+            adv = p["adv"]
+            group_info = p["group_info"]
+
+            for t_idx in tqdm(
+                range(self.num_train_timesteps),
+                desc=f"Epoch {self.epoch} Timestep",
+                position=1,
+                leave=False,
                 disable=not self.show_progress_bar,
             ):
-                p = self._prep_training_batch(tb)
-                batch = p["batch"]
-                adv = p["adv"]
-                group_info = p["group_info"]
-
-                for t_idx in tqdm(
-                    range(self.num_train_timesteps),
-                    desc=f"Epoch {self.epoch} Timestep",
-                    position=1,
-                    leave=False,
-                    disable=not self.show_progress_bar,
-                ):
-                    with self.accelerator.accumulate(*self.adapter.trainable_components):
-                        noised = self._build_noised_inputs(p, t_idx)
-                        vels = self._forward_velocities(
-                            batch, noised["t_flat"], noised["noised"]
-                        )
-                        dsm_loss = self._compute_dsm_loss(noised["target_v"], vels["model_v"])
-                        should_clip, dsm_loss = self._maybe_clip_dsm(
-                            dsm_loss=dsm_loss,
-                            old_v=vels["old_v"],
-                            target_v=noised["target_v"],
-                            adv=adv,
-                            loss_info=loss_info,
-                        )
-                        ref_dgpo_v = vels["ref_dgpo_v"]
-                        dgpo_loss = self._compute_group_dgpo_loss(
-                            ref_v=ref_dgpo_v,
-                            target_v=noised["target_v"],
-                            advantages=adv,
-                            group_info=group_info,
-                            dsm_loss=dsm_loss,
-                        )
-                        loss_info["dsm_loss"].append(dsm_loss.mean().detach())
-                        loss_info = self._apply_total_loss_and_backward(
-                            dgpo_loss=dgpo_loss,
-                            model_v=vels["model_v"],
-                            ref_v=vels["ref_v"],
-                            should_clip=should_clip,
-                            loss_info=loss_info,
-                        )
+                with self.accelerator.accumulate(*self.adapter.trainable_components):
+                    noised = self._build_noised_inputs(p, t_idx)
+                    vels = self._forward_velocities(
+                        batch, noised["t_flat"], noised["noised"]
+                    )
+                    dsm_loss = self._compute_dsm_loss(noised["target_v"], vels["model_v"])
+                    should_clip, dsm_loss = self._maybe_clip_dsm(
+                        dsm_loss=dsm_loss,
+                        old_v=vels["old_v"],
+                        target_v=noised["target_v"],
+                        adv=adv,
+                        loss_info=loss_info,
+                    )
+                    ref_dgpo_v = vels["ref_dgpo_v"]
+                    dgpo_loss = self._compute_group_dgpo_loss(
+                        ref_v=ref_dgpo_v,
+                        target_v=noised["target_v"],
+                        advantages=adv,
+                        group_info=group_info,
+                        dsm_loss=dsm_loss,
+                    )
+                    loss_info["dsm_loss"].append(dsm_loss.mean().detach())
+                    loss_info = self._apply_total_loss_and_backward(
+                        dgpo_loss=dgpo_loss,
+                        model_v=vels["model_v"],
+                        ref_v=vels["ref_v"],
+                        should_clip=should_clip,
+                        loss_info=loss_info,
+                    )
 
     # =========================== Optimizer Step Finalization ============================
     def _finalize_step(

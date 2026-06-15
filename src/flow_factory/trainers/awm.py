@@ -398,42 +398,43 @@ class AWMTrainer(BaseTrainer):
                 adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
                 ratio_clip_range = self.training_args.clip_range
 
-                with self.autocast():
-                    for t_idx in tqdm(
-                        range(self.num_train_timesteps),
-                        desc=f'Epoch {self.epoch} Timestep',
-                        position=1,
-                        leave=False,
-                        disable=not self.show_progress_bar,
-                    ):
-                        with self.accelerator.accumulate(*self.adapter.trainable_components):
-                            # 1. Prepare inputs for current timestep
-                            t_flat = all_timesteps[t_idx]  # (B,) [0, 1000]
-                            sigma_broadcast = to_broadcast_tensor(flow_match_sigma(t_flat), clean_latents)
-                            
-                            noise = all_random_noise[t_idx]
-                            noised_latents = (1 - sigma_broadcast) * clean_latents + sigma_broadcast * noise
-                            old_log_prob = old_log_probs_list[t_idx]  # (B,)
-                            
-                            # 2. Forward pass for current policy
+                for t_idx in tqdm(
+                    range(self.num_train_timesteps),
+                    desc=f'Epoch {self.epoch} Timestep',
+                    position=1,
+                    leave=False,
+                    disable=not self.show_progress_bar,
+                ):
+                    with self.accelerator.accumulate(*self.adapter.trainable_components):
+                        # 1. Prepare inputs for current timestep
+                        t_flat = all_timesteps[t_idx]  # (B,) [0, 1000]
+                        sigma_broadcast = to_broadcast_tensor(flow_match_sigma(t_flat), clean_latents)
+
+                        noise = all_random_noise[t_idx]
+                        noised_latents = (1 - sigma_broadcast) * clean_latents + sigma_broadcast * noise
+                        old_log_prob = old_log_probs_list[t_idx]  # (B,)
+
+                        # 2. Forward pass for current policy
+                        with self.autocast():
                             current_output = self._compute_awm_output(
                                 batch, t_flat, noised_latents, clean_latents, noise
                             )
-                            
-                            log_prob = current_output['log_prob']  # (B,)
-                            
-                            # 3. Compute PPO-style clipped loss
-                            ratio = torch.exp(log_prob - old_log_prob)
-                            unclipped_loss = -adv * ratio
-                            clipped_loss = -adv * torch.clamp(
-                                ratio, 1.0 + ratio_clip_range[0], 1.0 + ratio_clip_range[1]
-                            )
-                            policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
-                            
-                            loss = policy_loss
-                            
-                            # 4. KL regularization with reference model
-                            if self.enable_kl_loss:
+
+                        log_prob = current_output['log_prob']  # (B,)
+
+                        # 3. Compute PPO-style clipped loss
+                        ratio = torch.exp(log_prob - old_log_prob)
+                        unclipped_loss = -adv * ratio
+                        clipped_loss = -adv * torch.clamp(
+                            ratio, 1.0 + ratio_clip_range[0], 1.0 + ratio_clip_range[1]
+                        )
+                        policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+
+                        loss = policy_loss
+
+                        # 4. KL regularization with reference model
+                        if self.enable_kl_loss:
+                            with self.autocast():
                                 with torch.no_grad(), self.adapter.use_ref_parameters():
                                     ref_output = self._compute_awm_output(
                                         batch, t_flat, noised_latents, clean_latents, noise
@@ -448,9 +449,10 @@ class AWMTrainer(BaseTrainer):
                                 loss = loss + kl_loss
                                 loss_info['kl_div'].append(kl_div.detach())
                                 loss_info['kl_loss'].append(kl_loss.detach())
-                            
-                            # 5. EMA-based KL regularization
-                            if self.enable_ema_kl_loss:
+
+                        # 5. EMA-based KL regularization
+                        if self.enable_ema_kl_loss:
+                            with self.autocast():
                                 with torch.no_grad(), self.adapter.use_ema_parameters():
                                     ema_output = self._compute_awm_output(
                                         batch, t_flat, noised_latents, clean_latents, noise
@@ -458,37 +460,37 @@ class AWMTrainer(BaseTrainer):
                                 # KL-div in velocity space
                                 noise_pred = current_output['noise_pred']
                                 ema_noise_pred = ema_output['noise_pred']
-                                
+
                                 ema_kl = ((noise_pred - ema_noise_pred) ** 2).mean(dim=tuple(range(1, noise_pred.ndim)))
                                 ema_kl_loss = self.ema_kl_beta * ema_kl.mean()
                                 loss = loss + ema_kl_loss
                                 loss_info['ema_kl_div'].append(ema_kl.detach())
                                 loss_info['ema_kl_loss'].append(ema_kl_loss.detach())
 
-                            # 6. Log per-timestep info
-                            loss_info['ratio'].append(ratio.detach())
-                            loss_info['unclipped_loss'].append(unclipped_loss.detach())
-                            loss_info['clipped_loss'].append(clipped_loss.detach())
-                            loss_info['policy_loss'].append(policy_loss.detach())
-                            loss_info['loss'].append(loss.detach())
-                            clip_frac_high = torch.mean((ratio > 1.0 + ratio_clip_range[1]).float())
-                            clip_frac_low = torch.mean((ratio < 1.0 + ratio_clip_range[0]).float())
-                            loss_info["clip_frac_high"].append(clip_frac_high.detach())
-                            loss_info["clip_frac_low"].append(clip_frac_low.detach())
-                            loss_info['clip_frac_total'].append((clip_frac_high + clip_frac_low).detach())
+                        # 6. Log per-timestep info
+                        loss_info['ratio'].append(ratio.detach())
+                        loss_info['unclipped_loss'].append(unclipped_loss.detach())
+                        loss_info['clipped_loss'].append(clipped_loss.detach())
+                        loss_info['policy_loss'].append(policy_loss.detach())
+                        loss_info['loss'].append(loss.detach())
+                        clip_frac_high = torch.mean((ratio > 1.0 + ratio_clip_range[1]).float())
+                        clip_frac_low = torch.mean((ratio < 1.0 + ratio_clip_range[0]).float())
+                        loss_info["clip_frac_high"].append(clip_frac_high.detach())
+                        loss_info["clip_frac_low"].append(clip_frac_low.detach())
+                        loss_info['clip_frac_total'].append((clip_frac_high + clip_frac_low).detach())
 
-                            # 6. Backward pass and optimizer step
-                            self.accelerator.backward(loss)
-                            if self.accelerator.sync_gradients:
-                                grad_norm = self.accelerator.clip_grad_norm_(
-                                    self.adapter.get_trainable_parameters(),
-                                    self.training_args.max_grad_norm,
-                                )
-                                self.optimizer.step()
-                                self.optimizer.zero_grad()
-                                # Log loss info
-                                loss_info = reduce_loss_info(self.accelerator, loss_info)
-                                loss_info['grad_norm'] = grad_norm
-                                self.log_data({f'train/{k}': v for k, v in loss_info.items()}, step=self.step)
-                                self.step += 1
-                                loss_info = defaultdict(list)
+                        # 6. Backward pass and optimizer step
+                        self.accelerator.backward(loss)
+                        if self.accelerator.sync_gradients:
+                            grad_norm = self.accelerator.clip_grad_norm_(
+                                self.adapter.get_trainable_parameters(),
+                                self.training_args.max_grad_norm,
+                            )
+                            self.optimizer.step()
+                            self.optimizer.zero_grad()
+                            # Log loss info
+                            loss_info = reduce_loss_info(self.accelerator, loss_info)
+                            loss_info['grad_norm'] = grad_norm
+                            self.log_data({f'train/{k}': v for k, v in loss_info.items()}, step=self.step)
+                            self.step += 1
+                            loss_info = defaultdict(list)

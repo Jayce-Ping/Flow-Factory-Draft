@@ -9,6 +9,7 @@ description: "Bug fixing and debugging for ANY error, crash, loss divergence, gr
 
 - NaN, loss divergence, wrong gradients -> `topics/train_inference_consistency.md`
 - Dtype mismatch, overflow, precision -> `topics/dtype_precision.md`
+- Frozen/flat loss or KL ≈ 0 -> `topics/autocast_param_swap.md` (#20a)
 
 ## Two Pathways
 

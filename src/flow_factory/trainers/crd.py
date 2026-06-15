@@ -634,110 +634,111 @@ class CRDTrainer(BaseTrainer):
             self.adapter.train()
             loss_info = defaultdict(list)
 
-            with self.autocast():
-                for batch in tqdm(
-                    sample_batches,
-                    total=len(sample_batches),
-                    desc=f'Epoch {self.epoch} Training',
-                    position=0,
+            for batch in tqdm(
+                sample_batches,
+                total=len(sample_batches),
+                desc=f'Epoch {self.epoch} Training',
+                position=0,
+                disable=not self.show_progress_bar,
+            ):
+                # Retrieve pre-computed data
+                batch_size = batch['all_latents'].shape[0]
+                clean_latents = batch['all_latents'][:, -1]
+                all_timesteps = batch['_all_timesteps']
+                all_random_noise = batch['_all_random_noise']
+                old_v_pred_list = batch['_old_v_pred_list']
+                # Iterate through timesteps
+                for t_idx in tqdm(
+                    range(self.num_train_timesteps),
+                    desc=f'Epoch {self.epoch} Timestep',
+                    position=1,
+                    leave=False,
                     disable=not self.show_progress_bar,
                 ):
-                    # Retrieve pre-computed data
-                    batch_size = batch['all_latents'].shape[0]
-                    clean_latents = batch['all_latents'][:, -1]
-                    all_timesteps = batch['_all_timesteps']
-                    all_random_noise = batch['_all_random_noise']
-                    old_v_pred_list = batch['_old_v_pred_list']
-                    # Iterate through timesteps
-                    for t_idx in tqdm(
-                        range(self.num_train_timesteps),
-                        desc=f'Epoch {self.epoch} Timestep',
-                        position=1,
-                        leave=False,
-                        disable=not self.show_progress_bar,
-                    ):
-                        with self.accelerator.accumulate(*self.adapter.trainable_components):
-                            # 1. Prepare inputs
-                            t_flat = all_timesteps[t_idx]  # (B,) scheduler scale [0, 1000]
-                            sigma_broadcast = to_broadcast_tensor(flow_match_sigma(t_flat), clean_latents)
-                            noise = all_random_noise[t_idx]
-                            noised_latents = (1 - sigma_broadcast) * clean_latents + sigma_broadcast * noise
-                            old_v_pred = old_v_pred_list[t_idx]
-                            v_target = noise - clean_latents
+                    with self.accelerator.accumulate(*self.adapter.trainable_components):
+                        # 1. Prepare inputs
+                        t_flat = all_timesteps[t_idx]  # (B,) scheduler scale [0, 1000]
+                        sigma_broadcast = to_broadcast_tensor(flow_match_sigma(t_flat), clean_latents)
+                        noise = all_random_noise[t_idx]
+                        noised_latents = (1 - sigma_broadcast) * clean_latents + sigma_broadcast * noise
+                        old_v_pred = old_v_pred_list[t_idx]
+                        v_target = noise - clean_latents
 
-                            # 2. Current model forward pass
+                        # 2. Current model forward pass
+                        with self.autocast():
                             output = self._compute_crd_output(batch, t_flat, noised_latents)
-                            forward_pred = output['noise_pred']
+                        forward_pred = output['noise_pred']
 
-                            # 3. Reference model forward pass (for KL)
-                            # If kl_cfg > 1.0, the adapter's forward() will do CFG automatically:
-                            # it concatenates [neg_embeds, pos_embeds] and computes:
-                            #   noise_pred = uncond + kl_cfg * (cond - uncond)
-                            # The negative embeddings come from the batch (negative_prompt_embeds,
-                            # negative_pooled_prompt_embeds stored by SD3_5Sample during rollout).
-                            with torch.no_grad(), self.adapter.use_ref_parameters():
-                                cfg = self.kl_cfg if self.kl_cfg > 1.0 else None
-                                ref_output = self._compute_crd_output(batch, t_flat, noised_latents, guidance_scale=cfg)
-                                ref_pred = ref_output['noise_pred']
+                        # 3. Reference model forward pass (for KL)
+                        # If kl_cfg > 1.0, the adapter's forward() will do CFG automatically:
+                        # it concatenates [neg_embeds, pos_embeds] and computes:
+                        #   noise_pred = uncond + kl_cfg * (cond - uncond)
+                        # The negative embeddings come from the batch (negative_prompt_embeds,
+                        # negative_pooled_prompt_embeds stored by SD3_5Sample during rollout).
+                        with torch.no_grad(), self.adapter.use_ref_parameters(), self.autocast():
+                            cfg = self.kl_cfg if self.kl_cfg > 1.0 else None
+                            ref_output = self._compute_crd_output(batch, t_flat, noised_latents, guidance_scale=cfg)
+                            ref_pred = ref_output['noise_pred']
 
-                            # 4. Compute implicit reward: r_theta = -(||pred_theta - v_target||^2 - ||pred_old - v_target||^2)
-                            if self.adaptive_logp:
-                                with torch.no_grad():
-                                    weight_theta = (
-                                        torch.abs(forward_pred.double() - v_target.double())
-                                        .mean(dim=tuple(range(1, forward_pred.ndim)), keepdim=True)
-                                        .clip(min=1e-5)
-                                    )
-                                    weight_old = (
-                                        torch.abs(old_v_pred.double() - v_target.double())
-                                        .mean(dim=tuple(range(1, old_v_pred.ndim)), keepdim=True)
-                                        .clip(min=1e-5)
-                                    )
-                                r_theta = -(
-                                    (forward_pred - v_target) ** 2 / weight_theta
-                                    - (old_v_pred - v_target) ** 2 / weight_old
+                        # 4. Compute implicit reward: r_theta = -(||pred_theta - v_target||^2 - ||pred_old - v_target||^2)
+                        if self.adaptive_logp:
+                            with torch.no_grad():
+                                weight_theta = (
+                                    torch.abs(forward_pred.double() - v_target.double())
+                                    .mean(dim=tuple(range(1, forward_pred.ndim)), keepdim=True)
+                                    .clip(min=1e-5)
                                 )
-                            else:
-                                r_theta = -(
-                                    (forward_pred - v_target) ** 2
-                                    - (old_v_pred - v_target) ** 2
+                                weight_old = (
+                                    torch.abs(old_v_pred.double() - v_target.double())
+                                    .mean(dim=tuple(range(1, old_v_pred.ndim)), keepdim=True)
+                                    .clip(min=1e-5)
                                 )
-
-                            # Reduce spatial dims to per-sample scalar
-                            r_theta_local = r_theta.mean(dim=tuple(range(1, r_theta.ndim)))
-
-                            # Gather r_theta across all GPUs for centering
-                            r_theta_gathered = self.accelerator.gather(r_theta_local.detach()).to(
-                                self.accelerator.device
+                            r_theta = -(
+                                (forward_pred - v_target) ** 2 / weight_theta
+                                - (old_v_pred - v_target) ** 2 / weight_old
+                            )
+                        else:
+                            r_theta = -(
+                                (forward_pred - v_target) ** 2
+                                - (old_v_pred - v_target) ** 2
                             )
 
-                            # 5. Compute advantages for CRD centering
-                            adv = batch['advantage']
-                            adv_clip_range = self.training_args.adv_clip_range
-                            adv_clipped = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
+                        # Reduce spatial dims to per-sample scalar
+                        r_theta_local = r_theta.mean(dim=tuple(range(1, r_theta.ndim)))
 
-                            # Normalize to [0, 1]
-                            normalized_adv = (adv_clipped / max(adv_clip_range)) / 2.0 + 0.5
-                            adv_cur_rank = torch.clamp(normalized_adv, 0, 1)
+                        # Gather r_theta across all GPUs for centering
+                        r_theta_gathered = self.accelerator.gather(r_theta_local.detach()).to(
+                            self.accelerator.device
+                        )
 
-                            # Gather advantages across all GPUs
-                            adv_cur = self.accelerator.gather(adv_cur_rank.detach()).to(
-                                self.accelerator.device
-                            )
+                        # 5. Compute advantages for CRD centering
+                        adv = batch['advantage']
+                        adv_clip_range = self.training_args.adv_clip_range
+                        adv_clipped = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
 
-                            # 6. Centered Reward Distillation loss (supports dual-direction centering)
-                            ori_policy_loss = self._compute_crd_loss(
-                                adv_cur=adv_cur,
-                                adv_cur_rank=adv_cur_rank,
-                                r_theta_gathered=r_theta_gathered,
-                                r_theta_local=r_theta_local,
-                            )
+                        # Normalize to [0, 1]
+                        normalized_adv = (adv_clipped / max(adv_clip_range)) / 2.0 + 0.5
+                        adv_cur_rank = torch.clamp(normalized_adv, 0, 1)
 
-                            # Scale by adv_clip_max / beta for gradient magnitude normalization
-                            policy_loss = (ori_policy_loss * adv_clip_range[1] / max(self.crd_beta, 1e-8)).mean()
-                            loss = policy_loss
+                        # Gather advantages across all GPUs
+                        adv_cur = self.accelerator.gather(adv_cur_rank.detach()).to(
+                            self.accelerator.device
+                        )
 
-                            # 7. KL regularization against reference model
+                        # 6. Centered Reward Distillation loss (supports dual-direction centering)
+                        ori_policy_loss = self._compute_crd_loss(
+                            adv_cur=adv_cur,
+                            adv_cur_rank=adv_cur_rank,
+                            r_theta_gathered=r_theta_gathered,
+                            r_theta_local=r_theta_local,
+                        )
+
+                        # Scale by adv_clip_max / beta for gradient magnitude normalization
+                        policy_loss = (ori_policy_loss * adv_clip_range[1] / max(self.crd_beta, 1e-8)).mean()
+                        loss = policy_loss
+
+                        # 7. KL regularization against reference model
+                        with self.autocast():
                             kl_div = ((forward_pred - ref_pred) ** 2).mean(
                                 dim=tuple(range(1, forward_pred.ndim))
                             )
@@ -753,37 +754,37 @@ class CRDTrainer(BaseTrainer):
 
                             loss = loss + kl_loss
 
-                            # 8. Logging
-                            loss_info['policy_loss'].append(policy_loss.detach())
-                            loss_info['unweighted_policy_loss'].append(ori_policy_loss.mean().detach())
-                            loss_info['kl_div'].append(kl_div.mean().detach())
-                            loss_info['kl_loss'].append(kl_loss.detach())
-                            loss_info['r_theta_mean'].append(r_theta_local.mean().detach())
-                            loss_info['loss'].append(loss.detach())
+                        # 8. Logging
+                        loss_info['policy_loss'].append(policy_loss.detach())
+                        loss_info['unweighted_policy_loss'].append(ori_policy_loss.mean().detach())
+                        loss_info['kl_div'].append(kl_div.mean().detach())
+                        loss_info['kl_loss'].append(kl_loss.detach())
+                        loss_info['r_theta_mean'].append(r_theta_local.mean().detach())
+                        loss_info['loss'].append(loss.detach())
 
-                            if self.use_old_for_loss:
-                                old_kl = ((old_v_pred - ref_pred) ** 2).mean(
-                                    dim=tuple(range(1, old_v_pred.ndim))
-                                ).mean()
-                                loss_info['old_kl_div'].append(old_kl.detach())
-                                old_deviate = ((forward_pred - old_v_pred) ** 2).mean()
-                                loss_info['old_deviate'].append(old_deviate.detach())
+                        if self.use_old_for_loss:
+                            old_kl = ((old_v_pred - ref_pred) ** 2).mean(
+                                dim=tuple(range(1, old_v_pred.ndim))
+                            ).mean()
+                            loss_info['old_kl_div'].append(old_kl.detach())
+                            old_deviate = ((forward_pred - old_v_pred) ** 2).mean()
+                            loss_info['old_deviate'].append(old_deviate.detach())
 
-                            # 9. Backward and optimizer step
-                            self.accelerator.backward(loss)
-                            if self.accelerator.sync_gradients:
-                                grad_norm = self.accelerator.clip_grad_norm_(
-                                    self.adapter.get_trainable_parameters(),
-                                    self.training_args.max_grad_norm,
-                                )
-                                self.optimizer.step()
-                                self.optimizer.zero_grad()
-                                # Log accumulated loss info
-                                loss_info = reduce_loss_info(self.accelerator, loss_info)
-                                loss_info['grad_norm'] = grad_norm
-                                self.log_data(
-                                    {f'train/{k}': v for k, v in loss_info.items()},
-                                    step=self.step,
-                                )
-                                self.step += 1
-                                loss_info = defaultdict(list)
+                        # 9. Backward and optimizer step
+                        self.accelerator.backward(loss)
+                        if self.accelerator.sync_gradients:
+                            grad_norm = self.accelerator.clip_grad_norm_(
+                                self.adapter.get_trainable_parameters(),
+                                self.training_args.max_grad_norm,
+                            )
+                            self.optimizer.step()
+                            self.optimizer.zero_grad()
+                            # Log accumulated loss info
+                            loss_info = reduce_loss_info(self.accelerator, loss_info)
+                            loss_info['grad_norm'] = grad_norm
+                            self.log_data(
+                                {f'train/{k}': v for k, v in loss_info.items()},
+                                step=self.step,
+                            )
+                            self.step += 1
+                            loss_info = defaultdict(list)

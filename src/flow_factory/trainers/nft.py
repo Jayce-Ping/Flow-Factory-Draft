@@ -304,62 +304,63 @@ class DiffusionNFTTrainer(BaseTrainer):
 
                 # ---------- Train this batch under current policy ----------
                 self.adapter.train()
-                with self.autocast():
-                    for t_idx in tqdm(
-                        range(self.num_train_timesteps),
-                        desc=f'Epoch {self.epoch} Timestep',
-                        position=1,
-                        leave=False,
-                        disable=not self.show_progress_bar,
-                    ):
-                        with self.accelerator.accumulate(*self.adapter.trainable_components):
-                            # 1. Prepare inputs
-                            t_flat = all_timesteps[t_idx]  # (B,) [0, 1000]
-                            sigma_broadcast = to_broadcast_tensor(flow_match_sigma(t_flat), clean_latents)
-                            noise = all_random_noise[t_idx]
-                            noised_latents = (1 - sigma_broadcast) * clean_latents + sigma_broadcast * noise
-                            old_v_pred = old_v_pred_list[t_idx]
+                for t_idx in tqdm(
+                    range(self.num_train_timesteps),
+                    desc=f'Epoch {self.epoch} Timestep',
+                    position=1,
+                    leave=False,
+                    disable=not self.show_progress_bar,
+                ):
+                    with self.accelerator.accumulate(*self.adapter.trainable_components):
+                        # 1. Prepare inputs
+                        t_flat = all_timesteps[t_idx]  # (B,) [0, 1000]
+                        sigma_broadcast = to_broadcast_tensor(flow_match_sigma(t_flat), clean_latents)
+                        noise = all_random_noise[t_idx]
+                        noised_latents = (1 - sigma_broadcast) * clean_latents + sigma_broadcast * noise
+                        old_v_pred = old_v_pred_list[t_idx]
 
-                            # 2. Forward pass for current policy
+                        # 2. Forward pass for current policy
+                        with self.autocast():
                             output = self._compute_nft_output(batch, t_flat, noised_latents)
-                            new_v_pred = output['noise_pred']
-                            
-                            # 3. Compute NFT loss
-                            adv = batch['advantage']
-                            adv_clip_range = self.training_args.adv_clip_range
-                            adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
-                            
-                            # Normalize advantage to [0, 1]
-                            normalized_adv = (adv / max(adv_clip_range)) / 2.0 + 0.5
-                            r = torch.clamp(normalized_adv, 0, 1).view(-1, *([1] * (new_v_pred.dim() - 1)))
-                            
-                            # Positive/negative predictions
-                            positive_pred = self.nft_beta * new_v_pred + (1 - self.nft_beta) * old_v_pred
-                            negative_pred = (1.0 + self.nft_beta) * old_v_pred - self.nft_beta * new_v_pred
-                            
-                            # Positive loss
-                            x0_pred = noised_latents - sigma_broadcast * positive_pred
-                            with torch.no_grad():
-                                weight = torch.abs(x0_pred.double() - clean_latents.double()).mean(
-                                    dim=tuple(range(1, clean_latents.ndim)), keepdim=True
-                                ).clip(min=1e-5)
-                            positive_loss = ((x0_pred - clean_latents) ** 2 / weight).mean(dim=tuple(range(1, clean_latents.ndim)))
-                            
-                            # Negative loss
-                            neg_x0_pred = noised_latents - sigma_broadcast * negative_pred
-                            with torch.no_grad():
-                                neg_weight = torch.abs(neg_x0_pred.double() - clean_latents.double()).mean(
-                                    dim=tuple(range(1, clean_latents.ndim)), keepdim=True
-                                ).clip(min=1e-5)
-                            negative_loss = ((neg_x0_pred - clean_latents) ** 2 / neg_weight).mean(dim=tuple(range(1, clean_latents.ndim)))
-                            
-                            # Combined loss
-                            ori_policy_loss = (r.squeeze() * positive_loss + (1.0 - r.squeeze()) * negative_loss) / self.nft_beta
-                            policy_loss = (ori_policy_loss * adv_clip_range[1]).mean()
-                            loss = policy_loss
-                            
-                            # 4. KL penalty
-                            if self.enable_kl_loss:
+                        new_v_pred = output['noise_pred']
+
+                        # 3. Compute NFT loss
+                        adv = batch['advantage']
+                        adv_clip_range = self.training_args.adv_clip_range
+                        adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
+
+                        # Normalize advantage to [0, 1]
+                        normalized_adv = (adv / max(adv_clip_range)) / 2.0 + 0.5
+                        r = torch.clamp(normalized_adv, 0, 1).view(-1, *([1] * (new_v_pred.dim() - 1)))
+
+                        # Positive/negative predictions
+                        positive_pred = self.nft_beta * new_v_pred + (1 - self.nft_beta) * old_v_pred
+                        negative_pred = (1.0 + self.nft_beta) * old_v_pred - self.nft_beta * new_v_pred
+
+                        # Positive loss
+                        x0_pred = noised_latents - sigma_broadcast * positive_pred
+                        with torch.no_grad():
+                            weight = torch.abs(x0_pred.double() - clean_latents.double()).mean(
+                                dim=tuple(range(1, clean_latents.ndim)), keepdim=True
+                            ).clip(min=1e-5)
+                        positive_loss = ((x0_pred - clean_latents) ** 2 / weight).mean(dim=tuple(range(1, clean_latents.ndim)))
+
+                        # Negative loss
+                        neg_x0_pred = noised_latents - sigma_broadcast * negative_pred
+                        with torch.no_grad():
+                            neg_weight = torch.abs(neg_x0_pred.double() - clean_latents.double()).mean(
+                                dim=tuple(range(1, clean_latents.ndim)), keepdim=True
+                            ).clip(min=1e-5)
+                        negative_loss = ((neg_x0_pred - clean_latents) ** 2 / neg_weight).mean(dim=tuple(range(1, clean_latents.ndim)))
+
+                        # Combined loss
+                        ori_policy_loss = (r.squeeze() * positive_loss + (1.0 - r.squeeze()) * negative_loss) / self.nft_beta
+                        policy_loss = (ori_policy_loss * adv_clip_range[1]).mean()
+                        loss = policy_loss
+
+                        # 4. KL penalty
+                        if self.enable_kl_loss:
+                            with self.autocast():
                                 with torch.no_grad(), self.adapter.use_ref_parameters():
                                     ref_output = self._compute_nft_output(batch, t_flat, noised_latents)
                                 # KL-loss in v-space
@@ -372,23 +373,23 @@ class DiffusionNFTTrainer(BaseTrainer):
                                 loss_info['kl_div'].append(kl_div.detach())
                                 loss_info['kl_loss'].append(kl_loss.detach())
 
-                            # 5. Log per-timestep info
-                            loss_info['policy_loss'].append(policy_loss.detach())
-                            loss_info['unweighted_policy_loss'].append(ori_policy_loss.mean().detach())
-                            loss_info['loss'].append(loss.detach())
-                                
-                            # 6. Backward and optimizer step
-                            self.accelerator.backward(loss)
-                            if self.accelerator.sync_gradients:
-                                grad_norm = self.accelerator.clip_grad_norm_(
-                                    self.adapter.get_trainable_parameters(),
-                                    self.training_args.max_grad_norm,
-                                )
-                                self.optimizer.step()
-                                self.optimizer.zero_grad()
-                                # Log loss info
-                                loss_info = reduce_loss_info(self.accelerator, loss_info)
-                                loss_info['grad_norm'] = grad_norm
-                                self.log_data({f'train/{k}': v for k, v in loss_info.items()}, step=self.step)
-                                self.step += 1
-                                loss_info = defaultdict(list)
+                        # 5. Log per-timestep info
+                        loss_info['policy_loss'].append(policy_loss.detach())
+                        loss_info['unweighted_policy_loss'].append(ori_policy_loss.mean().detach())
+                        loss_info['loss'].append(loss.detach())
+
+                        # 6. Backward and optimizer step
+                        self.accelerator.backward(loss)
+                        if self.accelerator.sync_gradients:
+                            grad_norm = self.accelerator.clip_grad_norm_(
+                                self.adapter.get_trainable_parameters(),
+                                self.training_args.max_grad_norm,
+                            )
+                            self.optimizer.step()
+                            self.optimizer.zero_grad()
+                            # Log loss info
+                            loss_info = reduce_loss_info(self.accelerator, loss_info)
+                            loss_info['grad_norm'] = grad_norm
+                            self.log_data({f'train/{k}': v for k, v in loss_info.items()}, step=self.step)
+                            self.step += 1
+                            loss_info = defaultdict(list)

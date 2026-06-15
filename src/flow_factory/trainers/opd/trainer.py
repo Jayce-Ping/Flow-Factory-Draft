@@ -293,46 +293,46 @@ class DiffusionOPDTrainer(BaseTrainer):
             teacher_kl_count = torch.zeros(num_teachers, device=device)
             grad_norm = None
 
-            with self.autocast():
-                for batch_idx in tqdm(
-                    range(num_batches),
-                    total=num_batches,
-                    desc=f"Epoch {self.epoch} Distill",
-                    position=0,
-                    disable=not self.show_progress_bar,
-                ):
-                    start = batch_idx * per_device_batch_size
-                    batch_samples = [
-                        s.to(device)
-                        for s in shuffled_samples[start : start + per_device_batch_size]
-                    ]
-                    # Teacher index per sample in this (possibly source-mixed) micro-batch.
-                    teacher_idx = torch.tensor(
-                        [self._teacher_index_for_sample(s) for s in batch_samples],
-                        device=device,
-                        dtype=torch.long,
-                    )  # (B,)
-                    batch = BaseSample.stack(batch_samples)
-                    # extra_kwargs tensors are not moved by BaseSample.to(); move explicitly.
-                    mu_teacher_all = batch["mu_teacher"]
-                    if not isinstance(mu_teacher_all, torch.Tensor):
-                        raise RuntimeError(
-                            "Expected cached teacher means `mu_teacher` (a tensor) on every "
-                            f"sample, got {type(mu_teacher_all).__name__}. PASS 1 "
-                            "(_precompute_teacher_targets) must run before PASS 2."
-                        )
-                    mu_teacher_all = mu_teacher_all.to(device)
+            for batch_idx in tqdm(
+                range(num_batches),
+                total=num_batches,
+                desc=f"Epoch {self.epoch} Distill",
+                position=0,
+                disable=not self.show_progress_bar,
+            ):
+                start = batch_idx * per_device_batch_size
+                batch_samples = [
+                    s.to(device)
+                    for s in shuffled_samples[start : start + per_device_batch_size]
+                ]
+                # Teacher index per sample in this (possibly source-mixed) micro-batch.
+                teacher_idx = torch.tensor(
+                    [self._teacher_index_for_sample(s) for s in batch_samples],
+                    device=device,
+                    dtype=torch.long,
+                )  # (B,)
+                batch = BaseSample.stack(batch_samples)
+                # extra_kwargs tensors are not moved by BaseSample.to(); move explicitly.
+                mu_teacher_all = batch["mu_teacher"]
+                if not isinstance(mu_teacher_all, torch.Tensor):
+                    raise RuntimeError(
+                        "Expected cached teacher means `mu_teacher` (a tensor) on every "
+                        f"sample, got {type(mu_teacher_all).__name__}. PASS 1 "
+                        "(_precompute_teacher_targets) must run before PASS 2."
+                    )
+                mu_teacher_all = mu_teacher_all.to(device)
 
-                    for idx, timestep_index in enumerate(
-                        tqdm(
-                            train_timesteps,
-                            desc=f"Epoch {self.epoch} Timestep",
-                            position=1,
-                            leave=False,
-                            disable=not self.show_progress_bar,
-                        )
-                    ):
-                        with self.accelerator.accumulate(*self.adapter.trainable_components):
+                for idx, timestep_index in enumerate(
+                    tqdm(
+                        train_timesteps,
+                        desc=f"Epoch {self.epoch} Timestep",
+                        position=1,
+                        leave=False,
+                        disable=not self.show_progress_bar,
+                    )
+                ):
+                    with self.accelerator.accumulate(*self.adapter.trainable_components):
+                        with self.autocast():
                             # mu_S: (B, *latent) student transition mean at this step.
                             mu_S, std_dev_t, dt = self._forward_step(
                                 batch,
@@ -359,28 +359,28 @@ class DiffusionOPDTrainer(BaseTrainer):
                             per_sample_kl = 0.5 * (per_sample_mse / denom)  # (B,)
                             loss = per_sample_kl.mean()  # scalar (mean over batch)
 
-                            self.accelerator.backward(loss)
+                        self.accelerator.backward(loss)
 
-                            # Accumulate per-teacher KL sums/counts for logging (detached).
-                            with torch.no_grad():
-                                teacher_kl_sum.index_add_(0, teacher_idx, per_sample_kl.detach())
-                                teacher_kl_count.index_add_(
-                                    0, teacher_idx, torch.ones_like(per_sample_kl)
-                                )
+                        # Accumulate per-teacher KL sums/counts for logging (detached).
+                        with torch.no_grad():
+                            teacher_kl_sum.index_add_(0, teacher_idx, per_sample_kl.detach())
+                            teacher_kl_count.index_add_(
+                                0, teacher_idx, torch.ones_like(per_sample_kl)
+                            )
 
-                            if self.accelerator.sync_gradients:
-                                grad_norm = self.accelerator.clip_grad_norm_(
-                                    self.adapter.get_trainable_parameters(),
-                                    self.training_args.max_grad_norm,
-                                )
-                                self.optimizer.step()
-                                self.optimizer.zero_grad()
-                                self._log_distill_metrics(
-                                    teacher_kl_sum, teacher_kl_count, grad_norm
-                                )
-                                self.step += 1
-                                teacher_kl_sum.zero_()
-                                teacher_kl_count.zero_()
+                        if self.accelerator.sync_gradients:
+                            grad_norm = self.accelerator.clip_grad_norm_(
+                                self.adapter.get_trainable_parameters(),
+                                self.training_args.max_grad_norm,
+                            )
+                            self.optimizer.step()
+                            self.optimizer.zero_grad()
+                            self._log_distill_metrics(
+                                teacher_kl_sum, teacher_kl_count, grad_norm
+                            )
+                            self.step += 1
+                            teacher_kl_sum.zero_()
+                            teacher_kl_count.zero_()
 
     # =============================== Helpers ===============================
     def _log_distill_metrics(

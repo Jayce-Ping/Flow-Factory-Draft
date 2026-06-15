@@ -4,7 +4,8 @@
 |---------|------|
 | Session start | `philosophy.md`, `constraints.md`, `architecture.md` |
 | Touching `trainers/*.optimize`, `adapter.forward`/`inference`, `scheduler.step` | `topics/train_inference_consistency.md` |
-| Touching dtype/precision, debugging NaN/overflow | `topics/dtype_precision.md` |
+| Touching dtype/precision, mixed precision config, debugging NaN/overflow | `topics/dtype_precision.md` |
+| Editing a trainer `optimize()` loop / autocast scope, ref/EMA/named param swaps | `topics/autocast_param_swap.md` |
 | Adding or modifying a model adapter | `topics/adapter_conventions.md` |
 | Adding adapter, upgrading diffusers, debugging output quality | `topics/parity_testing.md` |
 | Touching `TimeSampler`, `adapter.forward(t=...)`, `timestep_range`, `flow_match_sigma` | `topics/timestep_sigma.md` |
