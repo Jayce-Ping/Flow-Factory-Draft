@@ -33,7 +33,7 @@ Test stages in dependency order. When a stage fails, fix it before testing downs
 5. **VAE scaling factor**: Pipeline applies `vae.config.scaling_factor` during encode/decode. Adapter must apply the same factor at the same point.
 6. **`do_classifier_free_guidance` batching**: Pipeline concatenates conditional + unconditional embeddings along batch dim. Adapter must replicate this exactly if the model expects it.
 7. **Timestep offset**: Some schedulers use `timestep_spacing="trailing"` — adapter must match the pipeline's scheduler config exactly.
-8. **Dual-modality scheduling**: Models with video+audio (e.g., LTX2-T2AV) need separate scheduler instances. Sharing one scheduler corrupts `step_index` for the second modality.
+8. **Dual-modality scheduling**: Models with video+audio (e.g., LTX2-T2AV) need separate scheduler instances. Sharing one scheduler corrupts `step_index` for the second modality. The audio scheduler is a config twin of the video scheduler (built via `self.load_scheduler()`), so both modalities run the **same** SDE dynamics and form a single joint policy; their per-step log-probs are merged with an element-weighted mean (`models/ltx2/_common.py::combine_modality_log_prob`). The two instances differ only in their independent `step_index`.
 
 ## Parity Helper: `compare_tensors()`
 

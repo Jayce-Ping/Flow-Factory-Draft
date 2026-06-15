@@ -39,6 +39,7 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ._common import combine_modality_log_prob
 
 logger = setup_logger(__name__)
 
@@ -154,21 +155,18 @@ class LTX2_T2AV_Adapter(BaseAdapter):
         )
 
     def _create_audio_scheduler(self) -> FlowMatchEulerDiscreteSDEScheduler:
-        """Create a separate ODE-only scheduler for audio.
+        """Create a twin of the video scheduler for the audio modality.
 
-        A dedicated instance is needed because scheduler.step() mutates internal
-        state (step_index), which would conflict if shared with the video scheduler.
+        Audio is sampled with the same SDE dynamics as video so that both
+        modalities form a single joint policy whose per-step log_prob feeds the
+        GRPO objective. A dedicated instance is still required because
+        scheduler.step() mutates internal state (step_index), which would
+        conflict if shared with the video scheduler. ``load_scheduler`` rebuilds
+        an independent scheduler from the same pipeline scheduler + scheduler
+        args used for ``self.scheduler`` (which ``super().__init__`` has already
+        built at this point).
         """
-        base_config = {
-            k: v
-            for k, v in dict(self.pipeline.scheduler.config).items()
-            if k not in ("_class_name", "_diffusers_version")
-        }
-        return FlowMatchEulerDiscreteSDEScheduler(
-            dynamics_type="ODE",
-            noise_level=0.0,
-            **base_config,
-        )
+        return self.load_scheduler()
 
     # ============================== Module Properties ==============================
 
@@ -680,9 +678,10 @@ class LTX2_T2AV_Adapter(BaseAdapter):
 
         Accepts concatenated latents (B, video_seq + audio_seq, C) on the sequence dim.
         Internally splits into video/audio, runs the joint transformer, applies multi-level
-        guidance (CFG + STG + Modality Isolation) in x0-space, then steps video (SDE) and
-        audio (ODE) schedulers separately. The outputs are concatenated back so the caller
-        sees a single unified SDESchedulerOutput.
+        guidance (CFG + STG + Modality Isolation) in x0-space, then steps the video and audio
+        SDE schedulers separately (the audio scheduler is a twin of the video one, so both
+        modalities form a single joint policy). The outputs are concatenated back so the
+        caller sees a single unified SDESchedulerOutput.
 
         Guidance pipeline (matching official diffusers pipeline_ltx2.py):
             1. Main transformer forward (CFG: [uncond, cond] batch)
@@ -928,17 +927,17 @@ class LTX2_T2AV_Adapter(BaseAdapter):
             noise_level=noise_level,
         )
 
-        # --- 9. Audio: ODE scheduler step (deterministic, no log_prob) ---
+        # --- 9. Audio: SDE scheduler step (twin of video, with log_prob) ---
         audio_output = self.audio_scheduler.step(
             noise_pred=audio_pred,
             timestep=t,
             latents=audio_latents,
             timestep_next=t_next,
             next_latents=audio_next,
-            compute_log_prob=False,
+            compute_log_prob=compute_log_prob,
             return_dict=True,
-            return_kwargs=["next_latents"],
-            dynamics_type="ODE",
+            return_kwargs=return_kwargs,
+            noise_level=noise_level,
         )
 
         # --- 10. Concatenate back into unified latents ---
@@ -959,6 +958,22 @@ class LTX2_T2AV_Adapter(BaseAdapter):
             video_output.noise_pred = torch.cat(
                 [video_output.noise_pred, audio_pred],
                 dim=1,
+            )
+
+        # --- 11. Combine per-step log_prob across modalities ---
+        # Joint transition p(v,a|z_t) = p(v|z_t) p(a|z_t); the element-weighted mean
+        # reproduces what a single scheduler over the concatenated [video|audio] latent
+        # would return, keeping the log_prob scale consistent with the video-only path.
+        if (
+            compute_log_prob
+            and video_output.log_prob is not None
+            and audio_output.log_prob is not None
+        ):
+            video_output.log_prob = combine_modality_log_prob(
+                video_output.log_prob,
+                audio_output.log_prob,
+                n_video=video_latents[0].numel(),
+                n_audio=audio_latents[0].numel(),
             )
 
         return video_output

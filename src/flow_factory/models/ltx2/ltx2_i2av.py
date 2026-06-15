@@ -51,6 +51,7 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ._common import combine_modality_log_prob
 
 logger = setup_logger(__name__)
 
@@ -166,21 +167,18 @@ class LTX2_I2AV_Adapter(BaseAdapter):
         )
 
     def _create_audio_scheduler(self) -> FlowMatchEulerDiscreteSDEScheduler:
-        """Create a separate ODE-only scheduler for audio.
+        """Create a twin of the video scheduler for the audio modality.
 
-        A dedicated instance is needed because scheduler.step() mutates internal
-        state (step_index), which would conflict if shared with the video scheduler.
+        Audio is sampled with the same SDE dynamics as video so that both
+        modalities form a single joint policy whose per-step log_prob feeds the
+        GRPO objective. A dedicated instance is still required because
+        scheduler.step() mutates internal state (step_index), which would
+        conflict if shared with the video scheduler. ``load_scheduler`` rebuilds
+        an independent scheduler from the same pipeline scheduler + scheduler
+        args used for ``self.scheduler`` (which ``super().__init__`` has already
+        built at this point).
         """
-        base_config = {
-            k: v
-            for k, v in dict(self.pipeline.scheduler.config).items()
-            if k not in ("_class_name", "_diffusers_version")
-        }
-        return FlowMatchEulerDiscreteSDEScheduler(
-            dynamics_type="ODE",
-            noise_level=0.0,
-            **base_config,
-        )
+        return self.load_scheduler()
 
     @property
     def default_target_modules(self) -> List[str]:
@@ -988,6 +986,9 @@ class LTX2_I2AV_Adapter(BaseAdapter):
 
             gen_pred = video_pred_5d[:, :, 1:]
             gen_lats = video_latents_5d[:, :, 1:]
+            # Only the generated frames (1:) are stepped, so they are the video
+            # contribution to the joint log_prob (the conditioning frame is fixed).
+            n_video_stepped = gen_lats[0].numel()
 
             video_next_gen = None
             if video_next is not None:
@@ -1039,18 +1040,19 @@ class LTX2_I2AV_Adapter(BaseAdapter):
                 return_kwargs=return_kwargs,
                 noise_level=noise_level,
             )
+            n_video_stepped = video_latents[0].numel()
 
-        # --- 8. Audio: ODE scheduler step (deterministic, no log_prob) ---
+        # --- 8. Audio: SDE scheduler step (twin of video, with log_prob) ---
         audio_output = self.audio_scheduler.step(
             noise_pred=audio_pred,
             timestep=t,
             latents=audio_latents,
             timestep_next=t_next,
             next_latents=audio_next,
-            compute_log_prob=False,
+            compute_log_prob=compute_log_prob,
             return_dict=True,
-            return_kwargs=["next_latents"],
-            dynamics_type="ODE",
+            return_kwargs=return_kwargs,
+            noise_level=noise_level,
         )
 
         # --- 9. Concatenate back into unified latents ---
@@ -1071,6 +1073,23 @@ class LTX2_I2AV_Adapter(BaseAdapter):
             video_output.noise_pred = torch.cat(
                 [video_output.noise_pred, audio_pred],
                 dim=1,
+            )
+
+        # --- 10. Combine per-step log_prob across modalities ---
+        # Joint transition p(v,a|z_t) = p(v|z_t) p(a|z_t); the element-weighted mean
+        # reproduces what a single scheduler over the concatenated [video|audio] latent
+        # would return. `n_video_stepped` counts only the generated video frames (the
+        # conditioning frame is fixed and not stepped).
+        if (
+            compute_log_prob
+            and video_output.log_prob is not None
+            and audio_output.log_prob is not None
+        ):
+            video_output.log_prob = combine_modality_log_prob(
+                video_output.log_prob,
+                audio_output.log_prob,
+                n_video=n_video_stepped,
+                n_audio=audio_latents[0].numel(),
             )
 
         return video_output
