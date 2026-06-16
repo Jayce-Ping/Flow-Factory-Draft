@@ -20,6 +20,7 @@ Maps diffusers scheduler classes to custom SDE scheduler implementations.
 from typing import Type, Dict, Optional
 import importlib
 
+from .abc import SDESchedulerMixin
 from ..utils.logger_utils import setup_logger
 
 logger = setup_logger(__name__)
@@ -50,8 +51,14 @@ def get_sde_scheduler_class(scheduler) -> Type:
     Raises:
         ImportError: If no matching SDE scheduler is found
     """
-    class_name = scheduler.__class__.__name__ if not isinstance(scheduler, type) else scheduler.__name__
-    
+    cls = scheduler if isinstance(scheduler, type) else scheduler.__class__
+
+    # Idempotent: an already-wrapped SDE scheduler maps to itself, so callers
+    # building an independent twin via load_scheduler() can safely re-wrap.
+    if issubclass(cls, SDESchedulerMixin):
+        return cls
+
+    class_name = cls.__name__
     if class_name not in _SCHEDULER_REGISTRY:
         raise ImportError(
             f"No SDE scheduler registered for '{class_name}'. "
