@@ -32,7 +32,7 @@ from accelerate.utils import set_seed, ProjectConfiguration
 
 from ..hparams import *
 from ..models.abc import BaseAdapter
-from ..models.model_bundle import ModelBundle, RoutedComponent
+from ..models.model_bundle import ModelBundle, RoutedComponentProxy
 from ..data_utils.dataset import METADATA_COLUMN
 from ..data_utils.loader import (
     get_train_dataloader,
@@ -351,7 +351,7 @@ class BaseTrainer(ABC):
         inner_bundle = self.accelerator.unwrap_model(self.model_bundle)
         for name in bundle_names:
             self.adapter.set_component(
-                name, RoutedComponent(self.model_bundle, name, inner_bundle.members[name])
+                name, RoutedComponentProxy(self.model_bundle, name, inner_bundle.members[name])
             )
 
         # Load inference modules, excluding all bundle members (already prepared).

@@ -23,7 +23,7 @@ with a registry-based loading system for easy extensibility.
 from .abc import BaseAdapter
 from .latent_geometry import LatentAxes, LatentLayout, infer_latent_axes
 from .loader import load_model
-from .model_bundle import ModelBundle, RoutedComponent
+from .model_bundle import ModelBundle, RoutedComponentProxy
 from .registry import (
     get_model_adapter_class,
     list_registered_models,
@@ -38,7 +38,7 @@ __all__ = [
     "infer_latent_axes",
     # Single-root distributed wrapping
     "ModelBundle",
-    "RoutedComponent",
+    "RoutedComponentProxy",
     # Registry functions
     "get_model_adapter_class",
     "list_registered_models",

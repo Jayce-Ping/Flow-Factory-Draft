@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the single-root ModelBundle and its RoutedComponent proxy.
+"""Unit tests for the single-root ModelBundle and its RoutedComponentProxy.
 
 Covers name-dispatch + error paths on `ModelBundle`, parameter registration and
 frozen-member behavior (the Wan2.2 "shard both, train one" case), and the
-`RoutedComponent` proxy's call-routing + transparent attribute delegation +
+`RoutedComponentProxy`'s call-routing + transparent attribute delegation +
 peel-to-inner contract (mirroring `BaseAdapter._unwrap`).
 """
 
@@ -26,7 +26,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from flow_factory.models.model_bundle import ModelBundle, RoutedComponent
+from flow_factory.models.model_bundle import ModelBundle, RoutedComponentProxy
 
 # ============================== ModelBundle ==============================
 
@@ -84,36 +84,36 @@ def test_frozen_member_contributes_no_trainable_params():
     assert "transformer_2" in bundle.members
 
 
-# ============================== RoutedComponent ==============================
+# ============================== RoutedComponentProxy ==============================
 
 
-def test_routed_component_call_routes_through_bundle():
+def test_routed_component_proxy_call_routes_through_bundle():
     lin = nn.Linear(4, 2)
     bundle = ModelBundle({"transformer": lin})
-    proxy = RoutedComponent(bundle, "transformer", lin)
+    proxy = RoutedComponentProxy(bundle, "transformer", lin)
 
     x = torch.randn(3, 4)
     assert torch.allclose(proxy(x), lin(x))
 
 
-def test_routed_component_forwards_positional_and_kwargs():
+def test_routed_component_proxy_forwards_positional_and_kwargs():
     class TwoArg(nn.Module):
         def forward(self, a, b, scale=1.0):
             return (a + b) * scale
 
     m = TwoArg()
     bundle = ModelBundle({"m": m})
-    proxy = RoutedComponent(bundle, "m", m)
+    proxy = RoutedComponentProxy(bundle, "m", m)
 
     out = proxy(torch.ones(2), torch.ones(2), scale=3.0)
     assert torch.allclose(out, torch.full((2,), 6.0))
 
 
-def test_routed_component_delegates_attributes():
+def test_routed_component_proxy_delegates_attributes():
     lin = nn.Linear(4, 2)
     lin.custom_marker = 123
     bundle = ModelBundle({"transformer": lin})
-    proxy = RoutedComponent(bundle, "transformer", lin)
+    proxy = RoutedComponentProxy(bundle, "transformer", lin)
 
     assert proxy.custom_marker == 123  # arbitrary attribute
     assert proxy.in_features == 4  # module attribute
@@ -121,10 +121,10 @@ def test_routed_component_delegates_attributes():
     assert proxy.inner is lin  # explicit inner handle
 
 
-def test_routed_component_exposes_inner():
+def test_routed_component_proxy_exposes_inner():
     # `inner` is the handle BaseAdapter._unwrap peels the proxy down to.
     lin = nn.Linear(2, 2)
     bundle = ModelBundle({"transformer": lin})
-    proxy = RoutedComponent(bundle, "transformer", lin)
+    proxy = RoutedComponentProxy(bundle, "transformer", lin)
 
     assert proxy.inner is lin

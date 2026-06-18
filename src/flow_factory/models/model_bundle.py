@@ -22,7 +22,7 @@ engine per ``prepare``) and FSDP2 (one root) — they cannot wrap multiple model
 It also lets a frozen member (e.g. Wan2.2's inactive transformer) be FSDP-sharded
 for memory while only the ``requires_grad`` subset is trained.
 
-`RoutedComponent` is the transparent proxy installed as an adapter component
+`RoutedComponentProxy` is the transparent proxy installed as an adapter component
 after ``prepare``: calling it routes the forward through the (wrapped) bundle
 root — which is what drives DDP's gradient reducer / FSDP's param all-gather /
 the DeepSpeed engine — while attribute access (``.config``, ``.dtype``,
@@ -90,7 +90,7 @@ class ModelBundle(nn.Module):
         return self.members[component_name](*args, **kwargs)
 
 
-class RoutedComponent:
+class RoutedComponentProxy:
     """Callable proxy that routes a component's forward through a `ModelBundle`.
 
     Installed as an adapter component (in ``adapter._components``) after
@@ -123,4 +123,4 @@ class RoutedComponent:
     def __repr__(self) -> str:
         name = object.__getattribute__(self, "_name")
         inner = object.__getattribute__(self, "inner")
-        return f"RoutedComponent(name={name!r}, inner={type(inner).__name__})"
+        return f"RoutedComponentProxy(name={name!r}, inner={type(inner).__name__})"

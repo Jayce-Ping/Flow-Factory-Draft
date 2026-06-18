@@ -65,7 +65,7 @@ from ..utils.checkpoint import (
 )
 from ..samples import BaseSample
 from .latent_geometry import LatentAxes, infer_latent_axes
-from .model_bundle import RoutedComponent
+from .model_bundle import RoutedComponentProxy
 from ..ema import EMAModuleWrapper
 from ..scheduler import (
     load_scheduler as _load_scheduler,
@@ -237,22 +237,22 @@ class BaseAdapter(ABC):
 
     # ============================== Component Accessors ==============================
     # ---------------------------------- Wrappers ----------------------------------
-    def _unwrap(self, model: Union[torch.nn.Module, RoutedComponent]) -> torch.nn.Module:
+    def _unwrap(self, model: Union[torch.nn.Module, RoutedComponentProxy]) -> torch.nn.Module:
         """Get the unwrapped model.
 
-        Peels a `RoutedComponent` proxy to its inner module first (the proxy is
+        Peels a `RoutedComponentProxy` to its inner module first (the proxy is
         installed as a component after `accelerator.prepare`), then strips the
         accelerator wrapper (DDP/FSDP/DeepSpeed).
         """
-        if isinstance(model, RoutedComponent):
+        if isinstance(model, RoutedComponentProxy):
             model = model.inner
         return self.accelerator.unwrap_model(model)
 
-    def set_component(self, name: str, module: Union[torch.nn.Module, RoutedComponent]):
+    def set_component(self, name: str, module: Union[torch.nn.Module, RoutedComponentProxy]):
         """Cache a component for this name.
 
         Accepts either a real ``nn.Module`` (a prepared module, a freshly loaded
-        checkpoint module, etc.) or a transparent ``RoutedComponent`` proxy
+        checkpoint module, etc.) or a transparent ``RoutedComponentProxy``
         installed after ``accelerator.prepare``. The proxy is stored as an
         ``nn.Module`` stand-in (it duck-types one), so the cast is the single,
         encapsulated acknowledgement of that contract; readers via
@@ -264,7 +264,7 @@ class BaseAdapter(ABC):
         """Get a component, preferring the prepared version if available.
 
         After `accelerator.prepare`, trainable/bundled components resolve to a
-        transparent `RoutedComponent` proxy (a duck-typed nn.Module stand-in)
+        transparent `RoutedComponentProxy` (a duck-typed nn.Module stand-in)
         that routes forwards through the prepared root; use ``_unwrap`` to recover
         the real module.
         """
@@ -1482,7 +1482,7 @@ class BaseAdapter(ABC):
                     logger.info(f"No target modules applied to {comp_name}, skip saving")
                     continue
 
-                # Peel the RoutedComponent proxy to the inner module so the save
+                # Peel the RoutedComponentProxy to the inner module so the save
                 # path operates on the real diffusers/PeftModel (the prepared root
                 # is the ModelBundle; FSDP/DeepSpeed gathering happens inside
                 # get_state_dict on this member's params).
