@@ -43,6 +43,9 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 
+# Local-only tests (kept out of the public repo)
+tests/
+
 # ====================
 # Experiment tracking
 # ====================
