@@ -11,10 +11,6 @@
 # architecture (same target modules, compatible rank/alpha) since it is loaded
 # into the student's active adapter slot.
 #
-# Aligns to the Flow-Factory-Private MoF online config, minus all MoF-specific
-# machinery (mof_checkpoint / mof_module_type / source_ratio / normalize_d_k /
-# eval_baselines_at_start) which belong to the out-of-scope MoF extension.
-#
 # To distill under SDE instead of ODE, set `scheduler.dynamics_type` to an SDE
 # variant (e.g. Flow-SDE) and `scheduler.noise_level > 0`; the loss picks up the
 # transition-variance denominator automatically (no other change needed).
