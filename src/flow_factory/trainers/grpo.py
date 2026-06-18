@@ -151,7 +151,7 @@ class GRPOTrainer(BaseTrainer):
                     leave=False,
                     disable=not self.show_progress_bar,
                 )):
-                    with self.accelerator.accumulate(*self.adapter.trainable_components):
+                    with self.accumulate_gradients():
                         # 1. Prepare inputs
                         # Get old log prob
                         old_log_prob = batch['log_probs'][:, log_probs_index_map[timestep_index]]
@@ -381,7 +381,7 @@ class GRPOGuardTrainer(GRPOTrainer):
                     leave=False,
                     disable=not self.show_progress_bar,
                 )):
-                    with self.accelerator.accumulate(*self.adapter.trainable_components):
+                    with self.accumulate_gradients():
                         # 1. Prepare inputs
                         # Get old log prob
                         old_log_prob = batch['log_probs'][:, log_probs_index_map[timestep_index]]

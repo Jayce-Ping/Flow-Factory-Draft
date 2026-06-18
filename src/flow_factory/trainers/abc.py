@@ -32,6 +32,7 @@ from accelerate.utils import set_seed, ProjectConfiguration
 
 from ..hparams import *
 from ..models.abc import BaseAdapter
+from ..models.model_bundle import ModelBundle, RoutedComponent
 from ..data_utils.dataset import METADATA_COLUMN
 from ..data_utils.loader import (
     get_train_dataloader,
@@ -96,6 +97,20 @@ class BaseTrainer(ABC):
         if m is None or m < 0:
             return True
         return self.epoch < m
+
+    def accumulate_gradients(self):
+        """Context manager for gradient accumulation over the single prepared root.
+
+        Centralizes ``accelerator.accumulate(self.model_bundle)`` so trainers do
+        not couple to the prepared-root identity: ``self.model_bundle`` is the one
+        object DDP/FSDP/DeepSpeed wraps, and accumulation must always target it.
+
+        Usage::
+
+            with self.accumulate_gradients():
+                ...  # forward / loss / backward / step
+        """
+        return self.accelerator.accumulate(self.model_bundle)
 
     def log_data(self, data: Dict[str, Any], step: int):
         """Log data using the initialized logger."""
@@ -303,30 +318,44 @@ class BaseTrainer(ABC):
         self.dataloader, eval_dataloaders = self._init_dataloader()
         self.optimizer = self._init_optimizer()
 
-        # Prepare trainable modules + optimizer + eval dataloaders in one call.
-        # Train dataloader is NOT prepared (handled by custom distributed sampler).
-        # Use the adapter's canonical accessors so names and modules align by
-        # construction (both iterate `target_module_map` in the same order) and
-        # property-less components (e.g. `transformer_2`) resolve via get_component.
-        trainable_names = self.adapter.trainable_component_names
-        trainable_modules = self.adapter.trainable_components
+        # Bundle ALL target components (trainable + frozen-but-shardable, e.g.
+        # Wan2.2's inactive transformer) into ONE nn.Module so accelerate wraps a
+        # single root. DeepSpeed (one engine) and FSDP2 (one root) cannot wrap
+        # multiple models, so PPO (policy + critic) and Wan2.2 (shard both, train
+        # one) require this. The optimizer/EMA/ref still operate on the
+        # requires_grad subset via `get_trainable_parameters()`; frozen members
+        # are sharded for memory but never receive gradient.
+        bundle_names = list(self.adapter.target_module_map.keys())
+        # Bundle the resolved trainable/frozen components. get_component returns the
+        # LoRA PeftModel for LoRA training (apply_lora stores it via set_component,
+        # NOT in-place on the pipeline), matching the pre-refactor membership.
+        bundle_members = {name: self.adapter.get_component(name) for name in bundle_names}
+        model_bundle = ModelBundle(bundle_members)
+
         eval_dataloader_names = list(eval_dataloaders.keys())
         eval_dataloader_list = [eval_dataloaders[n] for n in eval_dataloader_names]
-        to_prepare = trainable_modules + [self.optimizer] + eval_dataloader_list
 
-        prepared = self.accelerator.prepare(*to_prepare)
+        # One prepare call -> one DDP/FSDP/DeepSpeed root for the whole bundle.
+        prepared = self.accelerator.prepare(model_bundle, self.optimizer, *eval_dataloader_list)
+        self.model_bundle = prepared[0]
+        self.optimizer = prepared[1]
+        prepared_eval_dataloaders = prepared[2:]
+        self.eval_dataloaders: Dict[str, DataLoader] = dict(
+            zip(eval_dataloader_names, prepared_eval_dataloaders)
+        )
 
-        # Explicit slice (not implicit zip truncation): prepared also holds the
-        # optimizer + eval dataloaders after the trainable-module prefix.
-        for name, module in zip(trainable_names, prepared[:len(trainable_modules)]):
-            self.adapter.set_component(name, module)
+        # Install routing proxies so adapter forwards (`self.transformer(...)`,
+        # `self.transformer_2(...)`, ...) dispatch through the prepared root --
+        # required for DDP's reducer / FSDP's gather / the DeepSpeed engine --
+        # while attribute access delegates to the inner member.
+        inner_bundle = self.accelerator.unwrap_model(self.model_bundle)
+        for name in bundle_names:
+            self.adapter.set_component(
+                name, RoutedComponent(self.model_bundle, name, inner_bundle.members[name])
+            )
 
-        self.optimizer = prepared[len(trainable_modules)]
-        prepared_eval_dataloaders = prepared[len(trainable_modules) + 1:]
-        self.eval_dataloaders: Dict[str, DataLoader] = dict(zip(eval_dataloader_names, prepared_eval_dataloaders))
-
-        # Load inference modules, excluding already-prepared ones
-        self._load_inference_components(trainable_names)
+        # Load inference modules, excluding all bundle members (already prepared).
+        self._load_inference_components(bundle_names)
 
         # Initialize reward model
         self._init_reward_model()

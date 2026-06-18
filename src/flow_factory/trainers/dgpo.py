@@ -894,7 +894,7 @@ class DGPOTrainer(BaseTrainer):
                 leave=False,
                 disable=not self.show_progress_bar,
             ):
-                with self.accelerator.accumulate(*self.adapter.trainable_components):
+                with self.accumulate_gradients():
                     noised = self._build_noised_inputs(p, t_idx)
                     vels = self._forward_velocities(
                         batch, noised["t_flat"], noised["noised"]

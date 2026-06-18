@@ -492,7 +492,7 @@ class DPOTrainer(BaseTrainer):
                 }
 
                 for t_idx in range(self.num_train_timesteps):
-                    with self.accelerator.accumulate(*self.adapter.trainable_components):
+                    with self.accumulate_gradients():
                         t = all_timesteps[t_idx]  # (B,), scheduler scale [0, 1000]
                         sigma = flow_match_sigma(t)  # σ ∈ [0, 1]
                         noise = randn_tensor(

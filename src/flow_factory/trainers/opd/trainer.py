@@ -331,7 +331,7 @@ class DiffusionOPDTrainer(BaseTrainer):
                         disable=not self.show_progress_bar,
                     )
                 ):
-                    with self.accelerator.accumulate(*self.adapter.trainable_components):
+                    with self.accumulate_gradients():
                         with self.autocast():
                             # mu_S: (B, *latent) student transition mean at this step.
                             mu_S, std_dev_t, dt = self._forward_step(

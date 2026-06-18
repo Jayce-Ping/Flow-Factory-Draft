@@ -311,7 +311,7 @@ class DiffusionNFTTrainer(BaseTrainer):
                     leave=False,
                     disable=not self.show_progress_bar,
                 ):
-                    with self.accelerator.accumulate(*self.adapter.trainable_components):
+                    with self.accumulate_gradients():
                         # 1. Prepare inputs
                         t_flat = all_timesteps[t_idx]  # (B,) [0, 1000]
                         sigma_broadcast = to_broadcast_tensor(flow_match_sigma(t_flat), clean_latents)
