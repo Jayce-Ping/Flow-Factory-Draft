@@ -64,6 +64,7 @@ from ..utils.checkpoint import (
     HF_PATH_PREFIX,
 )
 from ..samples import BaseSample
+from .latent_geometry import LatentAxes, infer_latent_axes
 from ..ema import EMAModuleWrapper
 from ..scheduler import (
     load_scheduler as _load_scheduler,
@@ -128,6 +129,12 @@ class BaseAdapter(ABC):
     # The raw modality column ``images`` is always handled as images by the dataset
     # itself, independent of this declaration.
     python_format_columns: ClassVar[frozenset[str]] = frozenset()
+
+    # Resolution-invariant latent axis roles for the model-agnostic latent state
+    # API (see `latent_geometry.py`). ``None`` means "infer from latent ndim" via
+    # `resolve_latent_axes`, which covers every standard 3D/4D/5D layout. Adapters
+    # with a non-standard layout may override this with an explicit `LatentAxes`.
+    LATENT_AXES: ClassVar[Optional[LatentAxes]] = None
 
     def __init__(self, config: Arguments, accelerator : Accelerator):
         super().__init__()
@@ -2229,6 +2236,23 @@ class BaseAdapter(ABC):
         Decodes latent representations back into images/videos if applicable.
         """
         pass
+
+    # ======================================= Latent Geometry =======================================
+    def resolve_latent_axes(self, latents: torch.Tensor) -> LatentAxes:
+        """Resolve the :class:`LatentAxes` (axis roles) for ``latents``.
+
+        Returns the adapter's static ``LATENT_AXES`` override when set, otherwise
+        infers from the latent ndim (3=packed, 4=conv, 5=video). Resolution-invariant.
+
+        Args:
+            latents: A batched latent tensor.
+
+        Returns:
+            The :class:`LatentAxes` describing ``latents``.
+        """
+        if self.LATENT_AXES is not None:
+            return self.LATENT_AXES
+        return infer_latent_axes(latents.ndim)
 
     # ======================================= Sampling & Training =======================================
     @abstractmethod

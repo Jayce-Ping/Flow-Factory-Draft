@@ -21,20 +21,23 @@ with a registry-based loading system for easy extensibility.
 """
 
 from .abc import BaseAdapter
+from .latent_geometry import LatentAxes, LatentLayout, infer_latent_axes
+from .loader import load_model
 from .registry import (
     get_model_adapter_class,
     list_registered_models,
 )
-from .loader import load_model
 
 __all__ = [
     # Core classes
     "BaseAdapter",
-
+    # Latent geometry
+    "LatentAxes",
+    "LatentLayout",
+    "infer_latent_axes",
     # Registry functions
     "get_model_adapter_class",
     "list_registered_models",
-    
     # Factory function
     "load_model",
 ]

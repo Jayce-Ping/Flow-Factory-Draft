@@ -67,6 +67,40 @@ Defined in `models/abc.py` (`preprocessing_modules` / `inference_modules` proper
 - **Image-column persistence (HF Image feature)**: the raw `images` column and any `encode_image` output listed in `python_format_columns` (ClassVar on `BaseAdapter`, empty by default) are stored via the HuggingFace `Image` feature (PNG bytes) instead of raw tensors, and **read back as PIL** (`List[List[PIL.Image]]`). This is what lets ragged multi-reference batches (variable size/count) serialize — raw tensors are only Arrow-serializable when uniform. Opt in per adapter only for genuine RGB images (e.g. Bagel `condition_images`); never declare preprocessed/non-RGB tensors (VAE-ready video tensors, latents) — PIL conversion is lossy and breaks tensor consumers (e.g. LTX2-I2AV `condition_images` stays a tensor). Consumers must normalize via `_standardize_image_input` / `standardize_image_batch` before any tensor op. To keep PIL on the **sample** too (not just the dataset cache), the adapter's `ImageConditionSample` subclass must set `condition_images_as_pil = True` (else `__post_init__` re-canonicalizes to `List[Tensor(C,H,W)]` [0,1]); e.g. `BagelI2ISample`.
 - Single-condition adapters must flatten internally via `_standardize_image_input` / `_standardize_video_input` using `is_multi_image_batch` / `is_multi_video_batch` to extract the first element per sample (e.g. `Wan2_I2V._standardize_image_input`, `Wan2_V2V._standardize_video_input`, `LTX2_I2AV._standardize_image_input`). Multi-condition adapters (e.g. `Flux2`) consume the nested structure directly.
 
+## Latent Geometry
+
+Model-agnostic description of latent tensor **axis roles** on `BaseAdapter`. Defined in `models/latent_geometry.py` + `models/abc.py`. Additive and information-preserving — it only locates axes; it does not summarize or pool latents (a future consumer, e.g. a critic/value head, will add task-specific encoders on top).
+
+### API
+
+| Member | Role |
+|---|---|
+| `LATENT_AXES` (ClassVar) | Optional static `LatentAxes` override; `None` -> infer from ndim |
+| `resolve_latent_axes(latents)` | Returns `LatentAxes` (override, else ndim-inferred) |
+| `infer_latent_axes(ndim)` (module fn) | Maps rank 3/4/5 to canonical `LatentAxes`; fail-fasts on unsupported ranks |
+
+### Layouts (axis roles, resolution-invariant)
+
+| Layout | ndim | shape | channel | sequence | temporal | spatial |
+|---|---|---|---|---|---|---|
+| PACKED | 3 | `(B, Seq, C)` | -1 | 1 | - | () |
+| CONV | 4 | `(B, C, H, W)` | 1 | - | - | (2,3) |
+| VIDEO | 5 | `(B, C, T, H, W)` | 1 | - | 2 | (3,4) |
+
+Only axis roles are stored, never dynamic sizes (Seq/H/W/T). Packed models fold H/W(/T) into `Seq` via patchify, so their spatial/temporal are empty by design.
+
+### Per-adapter
+
+All 14 adapters resolve correctly via default ndim inference — none override `LATENT_AXES`:
+
+| Adapter(s) | Layout |
+|---|---|
+| FLUX.1/Kontext/2/Klein, Qwen-Image/Edit-Plus, Bagel, LTX2 T2AV/I2AV | PACKED |
+| SD3.5, Z-Image | CONV |
+| Wan2 T2V/I2V/V2V | VIDEO |
+
+LTX2 packs `[video|audio]` into one `(B, Seq, C)` sequence, so it resolves as PACKED (the split point lives in the adapter's own `forward` via `video_seq_len`, not in the geometry layer). I2I/I2V/Edit store only the generated latent in `all_latents` (condition is concatenated inside `forward()` / kept in separate fields), so the standard layout applies and reference-image count is irrelevant. Override `LATENT_AXES` only for a genuinely non-standard rank/channel layout.
+
 ## Numbered Gotchas (append-only)
 
 1. Never call `pipeline.__call__()` from `inference()` — decompose it into individual pipeline steps.
@@ -78,6 +112,7 @@ Defined in `models/abc.py` (`preprocessing_modules` / `inference_modules` proper
 7. **CFG two-stage consistency** — `encode_prompt()` and `forward()` must use the same threshold for CFG activation (`guidance_scale > 1.0`, or `> 0.0` for Z-Image). `forward()` must gracefully handle the case where `guidance_scale > threshold` but negative embeds are `None` (warn + fallback, never error). See "Classifier-Free Guidance (CFG) Convention" section above.
 8. **Bagel batch handling (NaViT subset-round packing)** — Bagel uses sequence packing, not a leading batch dim. **Both T2I and I2I** pack all B samples into one block-diagonal forward (`_build_gen_context` + `_forward_packed`; the framework's `(B, num_tokens, dim)` latents reshape to packed `(B*num_tokens, dim)` and back). For I2I, reference images are added in per-image rounds (`num_rounds = max per-sample count`); a sample without an r-th image is passed as `None` to `prepare_vae_images` / `prepare_vit_images`, which keep its cached KV and add a **zero-length query segment**. So a **variable per-sample reference-image count** (and varying sizes) is handled by packing directly — there is no per-sample (`batch_size=1`) fallback. The cache merge requires every sample to remain on the key/value side, so only the query may be a subset. The prefill is `@torch.no_grad` and every round has >=1 active image (`max_seqlen_q > 1`), avoiding flash-attn zero-length pitfalls (no backward, no `max_seqlen_q==1`). `_is_i2i(condition_images)` depends only on condition-image presence (distributed-safe). CFG global renorm is computed **per sample** over `packed_seqlens - 2`, and `forward()` returns per-sample `(B,)` log-prob (not per-token). **Distributed**: the prefill makes a data-dependent number of `language_model` forward calls (`2*num_rounds + 2`); `language_model` is the only FSDP-sharded module (frozen ViT/VAE are unsharded, so they don't count). Under FSDP FULL_SHARD/HYBRID (and ZeRO-3) each call AllGathers `language_model`'s shard, so per-rank counts mismatch and deadlock — `_assert_variable_count_supported` fails fast there (`@torch.no_grad` does not help; FSDP still all-gathers to compute). DDP / DeepSpeed ZeRO-1/2 (the Bagel I2I backends) replicate params (local forward, fixed grad sync at backward), so variable counts are safe. The FSDP-safe alternative is to gather `language_model` once for the generation (`summon_full_params` / `reshard_after_forward=False`).
 9. **Image columns persist via HF Image feature (variable-size/count I2I)** — preprocessing stores image data as PIL via the HF `Image` feature, not raw tensors; ragged tensor columns (multi-reference images of varying size/count) are NOT Arrow-serializable and otherwise crash in `Dataset.map` with `TypeError: a bytes-like object is required, not 'Tensor'` / `OverflowError`. The raw `images` column is always stored this way; an `encode_image` output is stored this way only when its name is listed in the adapter's `python_format_columns` ClassVar (default empty — opt in for RGB images only, e.g. Bagel `condition_images`). These columns **read back as PIL** (`List[List[PIL.Image]]`); the `torch` format excludes them (`_apply_torch_format` in `dataset.py`), and `collate_fn` keeps them as a `MultiImageBatch`. To keep PIL end-to-end on the **sample** (not just the cache), the adapter's `ImageConditionSample` subclass must also set `condition_images_as_pil=True` (else `ImageConditionSample.__post_init__` re-canonicalizes to `List[Tensor(C,H,W)]` [0,1]); e.g. `BagelI2ISample`. Bump `_PREPROCESS_FORMAT_VERSION` if the on-disk image format changes again.
+10. **Latent geometry override is rarely needed** — `resolve_latent_axes` infers axis roles from latent ndim (3=packed, 4=conv, 5=video), correct for all 14 adapters. Set the `LATENT_AXES` ClassVar only for a genuinely non-standard rank/channel layout. LTX2's packed `[video|audio]` resolves as PACKED; its modality split lives in the adapter `forward` (`video_seq_len`), not the geometry layer. See "Latent Geometry".
 
 ## Cross-refs
 
