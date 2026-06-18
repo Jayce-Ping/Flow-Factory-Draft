@@ -74,7 +74,7 @@ The authoritative list is `pyproject.toml` `[project.dependencies]` (20+ package
 - The PyPI `hpsv2` package pins `protobuf<4`, conflicting with Flow-Factory's `protobuf>=6`. It is **not** an optional extra. Install it without dependencies after Flow-Factory: `uv pip install hpsv2 --no-deps` (runtime works with protobuf 6+).
 
 ### accelerate
-- Primary distributed backend. `accelerator.prepare()` is used for trainable modules and optimizer only (constraint #9).
+- Primary distributed backend. `accelerator.prepare()` wraps a single `ModelBundle` (all target components) plus the optimizer as one root (constraint #9).
 - The dataloader uses custom samplers and is NOT prepared via accelerate.
 
 ### peft
