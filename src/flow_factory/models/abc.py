@@ -1170,7 +1170,7 @@ class BaseAdapter(ABC):
             else:
                 from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
 
-                state_dict = clone_tensors_for_torch_save(self.accelerator.unwrap_model(model).state_dict())
+                state_dict = clone_tensors_for_torch_save(self._unwrap(model).state_dict())
         elif self.accelerator.is_fsdp2:
             # FSDP/FSDP2
             from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
@@ -1216,7 +1216,7 @@ class BaseAdapter(ABC):
                 state_dict = model.state_dict()
         else:
             if unwrap:
-                model = self.accelerator.unwrap_model(model)
+                model = self._unwrap(model)
             state_dict = model.state_dict()
 
         # Filter by keys.
@@ -1255,7 +1255,7 @@ class BaseAdapter(ABC):
         save_directory: str,
     ) -> None:
         """Save LoRA adapter with distributed training support."""        
-        unwrapped = self.accelerator.unwrap_model(model)
+        unwrapped = self._unwrap(model)
         
         if not isinstance(unwrapped, PeftModel):
             logger.warning(f"Model is not a PeftModel, falling back to full save.")
@@ -1311,7 +1311,7 @@ class BaseAdapter(ABC):
                 'float32': torch.float32,
             }.get(dtype.lower(), torch.bfloat16)
 
-        unwrapped = self.accelerator.unwrap_model(model)
+        unwrapped = self._unwrap(model)
 
         # Check if casting is needed
         cast_needed = False
@@ -1620,7 +1620,7 @@ class BaseAdapter(ABC):
                 else path
             )
             
-            unwrapped = self.accelerator.unwrap_model(component)
+            unwrapped = self._unwrap(component)
             
             # Auto-detect checkpoint format
             adapter_config_path = os.path.join(comp_path, LORA_ADAPTER_CONFIG_NAME)
@@ -1719,7 +1719,7 @@ class BaseAdapter(ABC):
                 else path
             )
             
-            unwrapped = self.accelerator.unwrap_model(component)
+            unwrapped = self._unwrap(component)
             component_class = unwrapped.__class__
         
             # Try from_pretrained first
@@ -1837,7 +1837,7 @@ class BaseAdapter(ABC):
         """
         for comp_name in self.model_args.target_components:
             component = self.get_component(comp_name)
-            unwrapped = self.accelerator.unwrap_model(component)
+            unwrapped = self._unwrap(component)
 
             if isinstance(unwrapped, PeftModel):
                 merged = unwrapped.merge_and_unload()
