@@ -34,6 +34,7 @@ from ..utils.base import (
 
 from diffusers.utils.import_utils import is_torch_available, is_torch_version
 
+from ..utils.base import map_tensor_leaves
 from ..utils.base import (
     ImageSingle,
     ImageBatch,
@@ -294,19 +295,6 @@ class BaseSample:
             moved = t.to(device, non_blocking=non_blocking)
             return moved.pin_memory() if pin else moved
 
-        def _move_container(v: Any) -> Any:
-            # Recursively move tensor leaves inside list/tuple/dict fields (e.g.
-            # extra_kwargs), leaving non-tensor leaves untouched.
-            if isinstance(v, torch.Tensor):
-                return _move(v)
-            if isinstance(v, list):
-                return [_move_container(x) for x in v]
-            if isinstance(v, tuple):
-                return tuple(_move_container(x) for x in v)
-            if isinstance(v, dict):
-                return {k: _move_container(x) for k, x in v.items()}
-            return v
-
         for field in fields(self):
             value = getattr(self, field.name)
             if isinstance(value, torch.Tensor):
@@ -320,7 +308,7 @@ class BaseSample:
             elif depth == 1 and isinstance(value, dict):
                 # Dict fields (notably extra_kwargs: advantage, mu_teacher, ...)
                 # hold tensors that must follow the sample across offload/prefetch.
-                setattr(self, field.name, _move_container(value))
+                setattr(self, field.name, map_tensor_leaves(value, _move))
 
         return self
 

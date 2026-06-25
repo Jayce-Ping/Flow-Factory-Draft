@@ -43,26 +43,18 @@ from ..advantage import AdvantageProcessor
 from ..logger import load_logger, LogFormatter
 from ..samples import BaseSample
 from ..utils.logger_utils import setup_logger
-from ..utils.base import create_generator, create_generator_by_prompt, filter_kwargs, json_default
+from ..utils.base import create_generator, create_generator_by_prompt, filter_kwargs, json_default, visit_tensor_leaves
 
 logger = setup_logger(__name__)
 
 
 def _record_stream_on_batch(value: Any, stream: "torch.cuda.Stream") -> None:
-    """Record ``stream`` on every CUDA tensor in a stacked batch (dict/list/tensor).
+    """Record ``stream`` on every CUDA tensor in a stacked batch.
 
     Required for the copy-stream prefetch: it stops the caching allocator from
     reusing copy-stream-produced tensors until the consuming stream is done.
     """
-    if isinstance(value, torch.Tensor):
-        if value.is_cuda:
-            value.record_stream(stream)
-    elif isinstance(value, dict):
-        for v in value.values():
-            _record_stream_on_batch(v, stream)
-    elif isinstance(value, (list, tuple)):
-        for v in value:
-            _record_stream_on_batch(v, stream)
+    visit_tensor_leaves(value, lambda t: t.record_stream(stream) if t.is_cuda else None)
 
 
 class BaseTrainer(ABC):

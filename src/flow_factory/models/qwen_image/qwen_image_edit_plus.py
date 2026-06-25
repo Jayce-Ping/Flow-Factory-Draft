@@ -32,6 +32,7 @@ from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import QwenImage
 from diffusers.utils.torch_utils import randn_tensor
 
 from ..abc import BaseAdapter
+from ._utils import _pad_seq_dim
 from ...samples import I2ISample
 from ...hparams import *
 from ...scheduler import (
@@ -63,22 +64,6 @@ logger = setup_logger(__name__)
 
 CONDITION_IMAGE_SIZE = (1024, 1024)
 CONDITION_IMAGE_SIZE_FOR_ENCODE = (384, 384)
-
-
-def _pad_seq_dim(x: torch.Tensor, target_len: int, value: float) -> torch.Tensor:
-    """Right-pad a tensor along its sequence dim (dim=1) up to ``target_len``.
-
-    Handles 2-D masks ``(B, L)`` and 3-D embeddings ``(B, L, D)``. Returns the
-    input unchanged when it is already at least ``target_len`` long. Used to
-    align cond/uncond text streams so they can be concatenated along the batch
-    dim for a single CFG forward.
-    """
-    pad = target_len - x.shape[1]
-    if pad <= 0:
-        return x
-    if x.dim() == 2:
-        return torch.nn.functional.pad(x, (0, pad), value=value)
-    return torch.nn.functional.pad(x, (0, 0, 0, pad), value=value)
 
 @dataclass
 class QwenImageEditPlusSample(I2ISample):
@@ -595,15 +580,14 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         prompt_embeds: Optional[Union[List[torch.Tensor], torch.Tensor]] = None,
         prompt_ids: Optional[Union[List[torch.Tensor], torch.Tensor]] = None,
         device : Optional[torch.device] = None,
-    ) -> Tuple[List[int], torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         if isinstance(prompt_embeds_mask, list):
             device = device or prompt_embeds_mask[0].device
-            txt_seq_lens = [mask.sum() for mask in prompt_embeds_mask]
+            max_pos_len = int(max(mask.sum() for mask in prompt_embeds_mask))
         else:
             device = device or prompt_embeds_mask.device
-            txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist()
+            max_pos_len = int(prompt_embeds_mask.sum(dim=1).max())
 
-        max_pos_len = max(txt_seq_lens)
         if prompt_ids is not None:
             pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
             padded_prompt_ids = self._standardize_data(
@@ -631,13 +615,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
             device=device,
             max_len=max_pos_len,
         )
-        # Make the output order the args order
-        return (
-            txt_seq_lens,
-            padded_prompt_embeds_mask,
-            padded_prompt_embeds,
-            padded_prompt_ids,
-        )
+        return padded_prompt_embeds_mask, padded_prompt_embeds, padded_prompt_ids
     
     # ======================== Sampling / Inference ========================
     # Handle one sample
@@ -1054,14 +1032,14 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         # Truncate prompt embeddings and masks to the max valid length in the
         # batch. diffusers (>=0.38) derives the per-sample text length from
         # encoder_hidden_states_mask, so the deprecated txt_seq_lens is not passed.
-        _, prompt_embeds_mask, prompt_embeds, _ = self._pad_batch_prompt(
+        prompt_embeds_mask, prompt_embeds, _ = self._pad_batch_prompt(
             prompt_embeds_mask=prompt_embeds_mask,
             prompt_embeds=prompt_embeds,
             device=device
         )
 
         if do_classifier_free_guidance:
-            _, negative_prompt_embeds_mask, negative_prompt_embeds, _ = self._pad_batch_prompt(
+            negative_prompt_embeds_mask, negative_prompt_embeds, _ = self._pad_batch_prompt(
                 prompt_embeds_mask=negative_prompt_embeds_mask,
                 prompt_embeds=negative_prompt_embeds,
                 device=device
