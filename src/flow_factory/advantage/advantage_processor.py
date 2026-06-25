@@ -340,7 +340,7 @@ class AdvantageProcessor:
         """Compute global ``{min, max, mean, std}`` for each named array.
 
         When ``group_on_same_rank`` the arrays are local shards and require
-        cross-rank reduction via :func:`dm.global_tensor_stats_batch` (3
+        cross-rank reduction via :func:`dm.global_tensor_stats_batch` (2
         all-reduce calls total, regardless of the number of arrays).
 
         Otherwise the arrays already span all ranks (post-gather) and stats

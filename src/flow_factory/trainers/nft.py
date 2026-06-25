@@ -257,7 +257,6 @@ class DiffusionNFTTrainer(BaseTrainer):
         See ``.agents/knowledge/topics/sample_lifecycle.md`` for the memory,
         train-inference consistency, and RNG-order trade-offs.
         """
-        device = self.accelerator.device
         per_device_batch_size = self.training_args.per_device_batch_size
         num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
 

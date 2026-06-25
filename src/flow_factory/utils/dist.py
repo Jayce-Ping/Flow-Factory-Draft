@@ -863,7 +863,7 @@ def reduce_loss_info(
 
     flat: Dict[str, Any] = {}
 
-    # Per-sample tensors: batched global stats (3 all-reduce calls)
+    # Per-sample tensors: batched global stats (2 all-reduce calls)
     if per_sample:
         stats = global_tensor_stats_batch(accelerator, per_sample)
         for k, s in stats.items():
