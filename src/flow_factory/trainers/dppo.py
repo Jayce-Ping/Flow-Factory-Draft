@@ -106,7 +106,6 @@ class DPPOTrainer(GRPOTrainer):
     # =========================== Optimization Loop ============================
     def optimize(self, samples: List[BaseSample]) -> None:
         """Policy optimization (Stage 6): KL trust-region masked loss and optional KL-vs-ref."""
-        device = self.accelerator.device
         per_device_batch_size = self.training_args.per_device_batch_size
         num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
         kl_type = self.training_args.kl_type
@@ -121,19 +120,13 @@ class DPPOTrainer(GRPOTrainer):
             self.adapter.train()
             loss_info = defaultdict(list)
 
-            for batch_idx in tqdm(
-                range(num_batches),
+            for batch in tqdm(
+                self._iter_prefetched_batches(shuffled_samples, per_device_batch_size),
                 total=num_batches,
                 desc=f"Epoch {self.epoch} Training",
                 position=0,
                 disable=not self.show_progress_bar,
             ):
-                start = batch_idx * per_device_batch_size
-                batch_samples = [
-                    sample.to(device)
-                    for sample in shuffled_samples[start : start + per_device_batch_size]
-                ]
-                batch = BaseSample.stack(batch_samples)
                 latents_index_map = batch["latent_index_map"]  # (T+1,) LongTensor
                 log_probs_index_map = batch["log_prob_index_map"]  # (T,) LongTensor
                 callback_index_map = batch["callback_index_map"][0]  # (T,) LongTensor, shared

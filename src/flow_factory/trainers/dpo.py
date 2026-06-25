@@ -439,33 +439,27 @@ class DPOTrainer(BaseTrainer):
             perm = torch.randperm(len(pairs), generator=perm_gen)
             shuffled_pairs = [pairs[i] for i in perm]
 
-            # Batch pairs
+            # Batch pairs. Prefetch chosen and rejected micro-batches in lockstep
+            # via two copy-stream iterators so their H2D overlaps compute under
+            # offload (a plain blocking stack when offload is off).
             batch_size = self.training_args.per_device_batch_size
-            pair_batches = [
-                shuffled_pairs[i:i + batch_size]
-                for i in range(0, len(shuffled_pairs), batch_size)
-            ]
+            chosen_list = [p[0] for p in shuffled_pairs]
+            rejected_list = [p[1] for p in shuffled_pairs]
+            num_pair_batches = (len(shuffled_pairs) + batch_size - 1) // batch_size
 
             self.adapter.train()
             loss_info = defaultdict(list)
 
-            for pair_batch in tqdm(
-                pair_batches,
-                total=len(pair_batches),
+            for chosen_batch, rejected_batch in tqdm(
+                zip(
+                    self._iter_prefetched_batches(chosen_list, batch_size),
+                    self._iter_prefetched_batches(rejected_list, batch_size),
+                ),
+                total=num_pair_batches,
                 desc=f'Epoch {self.epoch} DPO Training',
                 position=0,
                 disable=not self.show_progress_bar,
             ):
-                # Stack chosen and rejected latents (shared across timesteps).
-                # Lazy reload: when samples are GPU-resident `sample.to(device)` is
-                # a no-op; when they are CPU-resident (offload pipeline) this is
-                # the H2D point.
-                device = self.accelerator.device
-                chosen_samples = [p[0].to(device) for p in pair_batch]
-                rejected_samples = [p[1].to(device) for p in pair_batch]
-
-                chosen_batch = BaseSample.stack(chosen_samples)
-                rejected_batch = BaseSample.stack(rejected_samples)
 
                 # Get clean latents (final step from trajectory, index -1)
                 chosen_latents = chosen_batch['all_latents'][:, -1]
