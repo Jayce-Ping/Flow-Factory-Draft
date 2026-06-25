@@ -292,8 +292,12 @@ class BaseSample:
         pin = pin_memory and device.type == "cpu"
 
         def _move(t: torch.Tensor) -> torch.Tensor:
-            moved = t.to(device, non_blocking=non_blocking)
-            return moved.pin_memory() if pin else moved
+            if pin:
+                # One D2H straight into pinned memory, avoiding the
+                # pageable->pinned double copy of t.to("cpu").pin_memory().
+                out = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+                return out.copy_(t, non_blocking=non_blocking)
+            return t.to(device, non_blocking=non_blocking)
 
         for field in fields(self):
             value = getattr(self, field.name)
@@ -306,8 +310,9 @@ class BaseSample:
                     [_move(t) if isinstance(t, torch.Tensor) else t for t in value]
                 )
             elif depth == 1 and isinstance(value, dict):
-                # Dict fields (notably extra_kwargs: advantage, mu_teacher, ...)
-                # hold tensors that must follow the sample across offload/prefetch.
+                # Move tensors nested in ANY dict field (in practice only
+                # extra_kwargs: advantage, mu_teacher, ...) so they follow the
+                # sample across offload/prefetch. Non-tensor leaves pass through.
                 setattr(self, field.name, map_tensor_leaves(value, _move))
 
         return self
