@@ -587,6 +587,9 @@ class QwenImageAdapter(BaseAdapter):
             # match two separate forwards (bf16 differs only at the ULP level).
             # Qwen-Image RL does not enable cross-step feature caching, so
             # collapsing the per-branch cache_context buckets is a no-op.
+            # Memory tradeoff: batching cond+uncond doubles peak activation memory
+            # vs two serial forwards; lower per_device_batch_size or resolution if
+            # this OOMs.
             seq_len = max(prompt_embeds.shape[1], negative_prompt_embeds.shape[1])
             prompt_embeds = _pad_seq_dim(prompt_embeds, seq_len, 0.0)
             prompt_embeds_mask = _pad_seq_dim(prompt_embeds_mask, seq_len, 0)
