@@ -116,10 +116,3 @@ ff-train multinode_examples/train.yaml \
   and other accelerate-specific settings. The multi-node launch parameters (`num_machines`,
   `machine_rank`, `main_process_ip`, etc.) are injected as CLI args to `accelerate launch`,
   which override whatever is written in the accelerate config file.
-- **FSDP forward prefetch (FSDP1 only).** The FSDP1 configs
-  (`config/accelerate_configs/fsdp_full_shard.yaml`, `fsdp_grad_op_shard.yaml`) enable
-  `fsdp_forward_prefetch: true`, which overlaps the next layer's parameter all-gather with the
-  current forward compute. This helps the most for multi-step rollout/forward, at the cost of one
-  extra layer's parameters being in flight (slightly higher peak memory) — set it back to `false`
-  if your heaviest config OOMs. FSDP2 (`fsdp2.yaml`) prefetches implicitly and does **not** support
-  this knob (accelerate raises if it is set), so it is left unset there.

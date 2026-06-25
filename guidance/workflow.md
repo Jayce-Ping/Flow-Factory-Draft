@@ -407,16 +407,6 @@ def optimize(self, samples):
 - **KL regularization**: Optional penalty keeping the policy close to a reference model (or EMA model for AWM), preventing reward hacking.
 - **Per-timestep iteration**: GRPO iterates over each stored trajectory timestep, computing loss at each. NFT, AWM, DGPO, and CRD sample fresh timesteps independently of the sampling trajectory.
 
-### Compute-Efficiency Knobs and Memory Tradeoffs
-
-These are numerically-equivalent optimizations; the only tradeoffs are peak memory and applicability.
-
-- **Qwen CFG single batched forward** (Qwen-Image / -Edit-Plus): cond and uncond are run in one batch-doubled transformer forward instead of two, halving transformer calls in rollout and training (largest win at `per_device_batch_size=1`). Tradeoff: peak activation memory roughly doubles vs two serial forwards; lower `per_device_batch_size` or `resolution` if it OOMs.
-- **Sample CPU offload + H2D prefetch** (`train.offload_samples_to_cpu: true`): samples are offloaded to pinned CPU between `sample()` and `optimize()`, and the next micro-batch's H2D copy is overlapped with compute via a copy stream. Recommended for video / large-tensor configs; the prefetch only helps when `optimize()` is H2D-bound (heavy compute-bound jobs already saturate the GPU). No correctness or convergence impact.
-- **DDP `find_unused_parameters`**: opt-in per adapter (`BaseAdapter.ddp_find_unused_parameters`, default `False`). `True` for Qwen (guidance embedder unused), Wan (transformer/transformer_2 routed by `boundary_ratio`), and Bagel (MoT gen experts + NaViT packing). Only affects the DDP backend; ignored under DeepSpeed/FSDP.
-- **FSDP1 `fsdp_forward_prefetch: true`** (`config/accelerate_configs/fsdp_full_shard.yaml`, `fsdp_grad_op_shard.yaml`): overlaps the next layer's parameter all-gather with the current forward; benefit grows with model depth, step count, and interconnect latency (multi-node). Tradeoff: one extra layer's parameters in flight (slightly higher peak memory) — set `false` if the heaviest config OOMs. FSDP2 prefetches implicitly and does not expose this knob.
-
-
 ## Putting It All Together
 
 A complete epoch with GRPO on a 8×GPU cluster:
