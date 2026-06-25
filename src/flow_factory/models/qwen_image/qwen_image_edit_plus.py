@@ -107,13 +107,13 @@ class QwenImageEditPlusAdapter(BaseAdapter):
     ddp_find_unused_parameters = True
 
     def __init__(self, config: Arguments, accelerator : Accelerator):
-        if not is_version_at_least("diffusers", "0.38.0"):
+        if not is_version_at_least("diffusers", "0.37.0"):
             raise ImportError(
-                "QwenImageEditPlusAdapter requires diffusers>=0.38.0 (the "
+                "QwenImageEditPlusAdapter requires diffusers>=0.37.0 (the "
                 "transformer derives the text sequence length from "
                 "encoder_hidden_states_mask; txt_seq_lens is no longer passed). "
                 f"Found diffusers {diffusers.__version__}. "
-                "Upgrade with `pip install -U 'diffusers>=0.38.0'`."
+                "Upgrade with `pip install -U 'diffusers>=0.37.0'`."
             )
         super().__init__(config, accelerator)
         self.pipeline: QwenImageEditPlusPipeline
@@ -583,10 +583,10 @@ class QwenImageEditPlusAdapter(BaseAdapter):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         if isinstance(prompt_embeds_mask, list):
             device = device or prompt_embeds_mask[0].device
-            max_pos_len = int(max(mask.sum() for mask in prompt_embeds_mask))
+            max_pos_len = max(1, int(max(mask.sum() for mask in prompt_embeds_mask)))
         else:
             device = device or prompt_embeds_mask.device
-            max_pos_len = int(prompt_embeds_mask.sum(dim=1).max())
+            max_pos_len = max(1, int(prompt_embeds_mask.sum(dim=1).max()))
 
         if prompt_ids is not None:
             pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
