@@ -20,7 +20,8 @@ Reference:
     - https://arxiv.org/abs/2603.14128
 """
 import os
-from typing import List, Dict, Any, Union, Optional
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional
 from functools import partial
 from collections import defaultdict
 from contextlib import contextmanager
@@ -34,7 +35,7 @@ tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from .abc import BaseTrainer
 from ..hparams import CRDTrainingArguments
-from ..samples import BaseSample
+from ..samples import BaseSample, StackedSampleBatch
 from ..rewards import RewardBuffer
 from ..utils.base import filter_kwargs, create_generator, create_generator_by_prompt, to_broadcast_tensor
 from ..utils.logger_utils import setup_logger
@@ -42,6 +43,23 @@ from ..utils.noise_schedule import TimeSampler, flow_match_sigma
 from ..utils.dist import reduce_loss_info
 
 logger = setup_logger(__name__)
+
+
+@dataclass
+class _CRDBatch:
+    """A stacked micro-batch plus its pass-1 pre-computed old-model targets.
+
+    CRD uses a two-pass design: pass 1 pre-computes the old-model V predictions
+    for every micro-batch (against a frozen snapshot), pass 2 trains on them.
+    This bundles the device-resident batch with those per-timestep tensors so
+    pass 2 has typed, named access (``prepared.old_v_pred_list``) instead of
+    keying scratch onto the shared batch type.
+    """
+
+    batch: StackedSampleBatch
+    all_timesteps: torch.Tensor  # (T, B), scheduler scale [0, 1000]
+    all_random_noise: List[torch.Tensor]  # per-timestep noise (shape of clean_latents)
+    old_v_pred_list: List[torch.Tensor]  # per-timestep old-model V prediction
 
 
 # ========================= Decay Utilities =========================
@@ -395,7 +413,7 @@ class CRDTrainer(BaseTrainer):
 
     def _compute_crd_output(
         self,
-        batch: Dict[str, Any],
+        batch: StackedSampleBatch,
         timestep: torch.Tensor,
         noised_latents: torch.Tensor,
         guidance_scale: Optional[float] = None,
@@ -587,7 +605,7 @@ class CRDTrainer(BaseTrainer):
             # reused, not reloaded). The old model is a frozen snapshot
             # (_OLD_PARAMS_NAME), so per-batch old-V is independent of pass-2
             # weight updates.
-            sample_batches: List[Dict[str, Union[torch.Tensor, Any, List[Any]]]] = []
+            sample_batches: List[_CRDBatch] = []
             num_batches = (
                 len(samples) + self.training_args.per_device_batch_size - 1
             ) // self.training_args.per_device_batch_size
@@ -607,11 +625,10 @@ class CRDTrainer(BaseTrainer):
 
                     # Sample timesteps: (T, B) in scheduler scale [0, 1000]
                     all_timesteps = self._sample_timesteps(batch_size)
-                    batch['_all_timesteps'] = all_timesteps
-                    batch['_all_random_noise'] = []
+                    all_random_noise: List[torch.Tensor] = []
 
                     # Pre-compute old model predictions
-                    old_v_pred_list = []
+                    old_v_pred_list: List[torch.Tensor] = []
                     for t_idx in range(self.num_train_timesteps):
                         t_flat = all_timesteps[t_idx]  # (B,) scheduler scale [0, 1000]
                         sigma_broadcast = to_broadcast_tensor(flow_match_sigma(t_flat), clean_latents)
@@ -620,7 +637,7 @@ class CRDTrainer(BaseTrainer):
                             device=clean_latents.device,
                             dtype=clean_latents.dtype,
                         )
-                        batch['_all_random_noise'].append(noise)
+                        all_random_noise.append(noise)
                         noised_latents = (1 - sigma_broadcast) * clean_latents + sigma_broadcast * noise
 
                         if self.use_old_for_loss:
@@ -633,14 +650,20 @@ class CRDTrainer(BaseTrainer):
                                 old_output = self._compute_crd_output(batch, t_flat, noised_latents)
                         old_v_pred_list.append(old_output['noise_pred'].detach())
 
-                    batch['_old_v_pred_list'] = old_v_pred_list
-                    sample_batches.append(batch)
+                    sample_batches.append(
+                        _CRDBatch(
+                            batch=batch,
+                            all_timesteps=all_timesteps,
+                            all_random_noise=all_random_noise,
+                            old_v_pred_list=old_v_pred_list,
+                        )
+                    )
 
             # ==================== Training Loop ====================
             self.adapter.train()
             loss_info = defaultdict(list)
 
-            for batch in tqdm(
+            for prepared in tqdm(
                 sample_batches,
                 total=len(sample_batches),
                 desc=f'Epoch {self.epoch} Training',
@@ -648,11 +671,12 @@ class CRDTrainer(BaseTrainer):
                 disable=not self.show_progress_bar,
             ):
                 # Retrieve pre-computed data
+                batch = prepared.batch
                 batch_size = batch['all_latents'].shape[0]
                 clean_latents = batch['all_latents'][:, -1]
-                all_timesteps = batch['_all_timesteps']
-                all_random_noise = batch['_all_random_noise']
-                old_v_pred_list = batch['_old_v_pred_list']
+                all_timesteps = prepared.all_timesteps
+                all_random_noise = prepared.all_random_noise
+                old_v_pred_list = prepared.old_v_pred_list
                 # Iterate through timesteps
                 for t_idx in tqdm(
                     range(self.num_train_timesteps),

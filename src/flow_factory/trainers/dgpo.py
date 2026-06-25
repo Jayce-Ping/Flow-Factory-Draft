@@ -36,7 +36,7 @@ from diffusers.utils.torch_utils import randn_tensor
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from ..hparams import DGPOTrainingArguments
-from ..samples import BaseSample
+from ..samples import BaseSample, StackedSampleBatch
 from ..utils.base import (
     create_generator,
     create_generator_by_prompt,
@@ -763,8 +763,10 @@ class DGPOTrainer(BaseTrainer):
                 # here; the prefetch dividend is realised inside the single-pass
                 # trainers' optimize loops, not this builder. DGPO samples are
                 # final-latent-only, so the H2D is tiny regardless.
-                batch = BaseSample.stack([s.to(device) for s in samples_slice])
-                all_latents: torch.Tensor = batch["all_latents"]  # type: ignore[assignment]
+                batch: StackedSampleBatch = BaseSample.stack(
+                    [s.to(device) for s in samples_slice]
+                )
+                all_latents: torch.Tensor = batch["all_latents"]
                 clean_latents = all_latents[:, -1]
                 batch_size = clean_latents.shape[0]
 

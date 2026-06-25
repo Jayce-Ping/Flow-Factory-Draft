@@ -16,6 +16,7 @@
 
 from .samples import (
     BaseSample,
+    StackedSampleBatch,
     ImageConditionSample,
     VideoConditionSample,
     T2ISample,
@@ -31,6 +32,7 @@ from .samples import (
 __all__ = [
     # Sample classes
     "BaseSample",
+    "StackedSampleBatch",
     "ImageConditionSample",
     "VideoConditionSample",
     "T2ISample",

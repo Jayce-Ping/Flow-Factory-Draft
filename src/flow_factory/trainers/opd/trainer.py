@@ -238,8 +238,8 @@ class DiffusionOPDTrainer(BaseTrainer):
             # Swap teacher weights in OUTSIDE the autocast context.
             with self.adapter.use_named_parameters(teacher_name):
                 with self.autocast():
-                    for batch, micro_batch_samples in tqdm(
-                        self._iter_prefetched_sample_batches(
+                    for batch in tqdm(
+                        self._iter_prefetched_batches(
                             teacher_samples, per_device_batch_size
                         ),
                         total=num_batches,
@@ -258,7 +258,7 @@ class DiffusionOPDTrainer(BaseTrainer):
                         ]
                         # (B, num_train_steps, *latent)
                         mu_teacher_stacked = torch.stack(mu_teacher_steps, dim=1)
-                        for j, sample in enumerate(micro_batch_samples):
+                        for j, sample in enumerate(batch.samples):
                             sample.extra_kwargs["mu_teacher"] = (
                                 mu_teacher_stacked[j].to(self._mu_store_device).clone()
                             )
@@ -288,8 +288,8 @@ class DiffusionOPDTrainer(BaseTrainer):
             teacher_kl_count = torch.zeros(num_teachers, device=device)
             grad_norm = None
 
-            for batch, batch_samples in tqdm(
-                self._iter_prefetched_sample_batches(
+            for batch in tqdm(
+                self._iter_prefetched_batches(
                     shuffled_samples, per_device_batch_size
                 ),
                 total=num_batches,
@@ -299,7 +299,7 @@ class DiffusionOPDTrainer(BaseTrainer):
             ):
                 # Teacher index per sample in this (possibly source-mixed) micro-batch.
                 teacher_idx = torch.tensor(
-                    [self._teacher_index_for_sample(s) for s in batch_samples],
+                    [self._teacher_index_for_sample(s) for s in batch.samples],
                     device=device,
                     dtype=torch.long,
                 )  # (B,)

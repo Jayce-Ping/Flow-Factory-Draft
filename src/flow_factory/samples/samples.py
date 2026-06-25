@@ -55,6 +55,7 @@ logger = setup_logger(__name__)
 
 __all__ = [
     'BaseSample',
+    'StackedSampleBatch',
     'ImageConditionSample',
     'VideoConditionSample',
     'T2ISample',
@@ -68,9 +69,14 @@ __all__ = [
 
 @dataclass
 class BaseSample:
-    """
-    Base output class for Adapter models.
-    The tensors are without batch dimension.
+    """Per-sample output of an Adapter (strictly without a batch dimension).
+
+    Invariant: every tensor field holds a single sample (e.g. ``image`` is
+    ``(C, H, W)``, never ``(B, C, H, W)``); ``__post_init__`` relies on this to
+    canonicalize media. To batch samples for training use ``BaseSample.stack``,
+    which returns a :class:`StackedSampleBatch` (a dict subclass) rather than a
+    batched BaseSample -- a batched BaseSample would violate this invariant and
+    corrupt media in ``__post_init__`` (which keeps only index 0).
     """
     _id_fields : ClassVar[frozenset[str]] = frozenset({
         'prompt', 'prompt_ids', 'negative_prompt', 'negative_prompt_ids',
@@ -165,7 +171,11 @@ class BaseSample:
                 )
 
     def __post_init__(self):
-        """Post-initialization processing."""
+        """Canonicalize media fields, assuming a single sample (no batch dim).
+
+        Each media field is normalized to one sample's tensor, so this must never
+        run on batched data (batches live in :class:`StackedSampleBatch`).
+        """
         # Standardize image field to tensor (C, H, W)
         if self.image is not None:
             # -> (1, C, H, W) -> (C, H, W)
@@ -190,32 +200,22 @@ class BaseSample:
         return frozenset(fields)
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dict for memory tracking, excluding non-tensor fields."""
+        """Flatten to a plain dict, lifting ``extra_kwargs`` keys to the top level.
+
+        Used by ``stack()`` and ``**sample`` unpacking (e.g. reward-model kwargs).
+        """
         result = {f.name: getattr(self, f.name) for f in fields(self)}
         extra = result.pop('extra_kwargs', {})
+        collisions = set(extra) & set(result)
+        if collisions:
+            raise ValueError(
+                f"{type(self).__name__}.extra_kwargs keys collide with declared "
+                f"fields {sorted(collisions)}; extra_kwargs must hold only "
+                f"non-declared keys (got extra keys {sorted(extra)})."
+            )
         result.update(extra)
         return result
 
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> BaseSample:
-        """Create instance from dict, putting unknown fields into extra_kwargs."""
-        field_names = {f.name for f in fields(cls)}
-        known = {k: v for k, v in d.items() if k in field_names and k != 'extra_kwargs'}
-        
-        # Collect unknown fields
-        extra = {k: v for k, v in d.items() if k not in field_names}
-        
-        # Merge with incoming extra_kwargs and check for conflicts
-        incoming_extra = d.get('extra_kwargs', {})
-        conflicting_keys = set(incoming_extra) & (field_names - {'extra_kwargs'})
-        if conflicting_keys:
-            raise ValueError(
-                f"extra_kwargs contains reserved field names: {conflicting_keys}"
-            )
-        extra.update(incoming_extra)
-        
-        return cls(**known, extra_kwargs=extra)
-    
     def __getattr__(self, key: str) -> Any:
         """Access attributes. Check extra_kwargs if not found.
 
@@ -257,15 +257,6 @@ class BaseSample:
     def __iter__(self):
         """Allow iteration over keys (required for some mapping operations)."""
         return iter(self.keys())
-
-    def short_rep(self) -> Dict[str, Any]:
-        """Short representation for logging (replaces large tensors with shapes)."""
-        def tensor_to_repr(v):
-            if isinstance(v, torch.Tensor) and v.numel() > 16:
-                return f"Tensor{tuple(v.shape)}"
-            return v
-
-        return {k: tensor_to_repr(v) for k, v in self.to_dict().items()}
 
     def to(
         self,
@@ -413,41 +404,93 @@ class BaseSample:
         return values
 
     @classmethod
-    def stack(cls, samples: List[BaseSample]) -> Dict[str, Union[torch.Tensor, Dict, List, Any]]:
-        """Stack per-sample BaseSamples into one batched dict.
+    def stack(cls, samples: List[BaseSample]) -> StackedSampleBatch:
+        """Collate per-sample BaseSamples into one batched ``StackedSampleBatch``.
 
-        Returns a flat ``Dict[str, Any]`` (NOT a BaseSample) -- the batch
-        interchange format between the per-sample lifecycle (``List[BaseSample]``)
-        and ``adapter.forward(**batched_kwargs)``. Each sample is flattened via
-        ``to_dict()`` (which lifts ``extra_kwargs`` keys to the top level), then
-        ``_stack_values`` collates per key:
+        Thin alias for ``StackedSampleBatch(samples)`` -- the batch type owns the
+        collation; this stays the discoverable stacking entry point. See
+        :class:`StackedSampleBatch` for the per-key collation rules and the
+        returned type.
+
+        Raises:
+            ValueError: If ``samples`` is empty.
+        """
+        return StackedSampleBatch(samples)
+
+
+class StackedSampleBatch(dict):
+    """Batched, collated view of a ``List[BaseSample]`` (built from ``samples`` by
+    its constructor; also returned by ``BaseSample.stack``).
+
+    A plain ``str``-keyed ``dict`` subclass, so it is a drop-in for the
+    optimize-loop consumption: ``batch[key]``, ``batch.get(key)``, ``.items()``,
+    ``**batch`` into ``adapter.forward``, and in-place ``batch[key] = value`` all
+    keep working unchanged. Beyond a bare dict it:
+
+    - names the "batched samples" concept (instead of an anonymous ``Dict[str, Any]``),
+    - keeps a handle to the source per-sample objects (``batch.samples``) and the
+      originating type (``batch.sample_cls``) for per-sample access / introspection,
+    - exposes read-only attribute access (``batch.all_latents`` == ``batch["all_latents"]``).
+
+    It is intentionally NOT a ``BaseSample``: a batched sample would violate
+    ``BaseSample``'s "tensors without batch dim" invariant and re-trigger
+    ``__post_init__`` media canonicalization (which assumes no batch dim and keeps
+    only index 0).
+    """
+
+    def __init__(self, samples: List[BaseSample]) -> None:
+        """Collate a non-empty ``List[BaseSample]`` into the batched mapping.
+
+        Each sample is flattened via ``BaseSample.to_dict()`` (which lifts
+        ``extra_kwargs`` keys to the top level), then ``BaseSample._stack_values``
+        collates per key:
             - ``shared_fields()`` keys: take the first sample's value (not stacked).
             - tensors with matching shapes: ``torch.stack``; mismatched: list.
             - dicts: collated recursively; other types (str, Set, PIL): list.
 
-        Args:
-            samples: Non-empty list of BaseSample instances (each without a batch dim).
-
-        Returns:
-            Dict[str, Any]: batched values keyed by field / extra_kwargs name.
-
         Raises:
-            ValueError: If samples list is empty.
+            ValueError: If ``samples`` is empty.
         """
         if not samples:
             raise ValueError("No samples to stack.")
-        
+
         sample_cls = type(samples[0])
         sample_dicts = [s.to_dict() for s in samples]
-
         all_keys: set = set()
         for d in sample_dicts:
             all_keys.update(d.keys())
 
-        return {
-            key: sample_cls._stack_values(key, [d.get(key) for d in sample_dicts])
-            for key in all_keys
-        }
+        super().__init__(
+            {
+                key: sample_cls._stack_values(key, [d.get(key) for d in sample_dicts])
+                for key in all_keys
+            }
+        )
+        # ``samples``: the per-sample objects this batch was collated from. Stored
+        # as an instance attribute (NOT a mapping key) -> excluded from ``**batch``
+        # / ``.items()`` and resolved before ``__getattr__``. Callers needing
+        # per-sample access (e.g. OPD teacher routing / ``mu_teacher`` write-back)
+        # read ``batch.samples``.
+        self.samples = samples
+
+    @property
+    def sample_cls(self) -> type[BaseSample]:
+        """Originating ``BaseSample`` subclass (all samples share one type)."""
+        return type(self.samples[0])
+
+    def __getattr__(self, name: str) -> Any:
+        """Read-only attribute access over the mapping (sugar for ``batch[name]``).
+
+        Only invoked when normal attribute lookup fails, so the real ``samples``
+        attribute, the ``sample_cls`` property, and ``dict`` methods short-circuit
+        first.
+        """
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(
+                f"'{type(self).__name__}' has no attribute or key '{name}'"
+            )
 
 
 @dataclass
