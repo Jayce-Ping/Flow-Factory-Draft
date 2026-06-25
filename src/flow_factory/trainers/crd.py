@@ -582,10 +582,14 @@ class CRDTrainer(BaseTrainer):
         for inner_epoch in range(self.training_args.num_inner_epochs):
             # CRD does not shuffle samples (needs same-prompt grouping for centering)
             # Re-group samples into batches
-            sample_batches: List[Dict[str, Union[torch.Tensor, Any, List[Any]]]] = [
-                BaseSample.stack(samples[i:i + self.training_args.per_device_batch_size])
-                for i in range(0, len(samples), self.training_args.per_device_batch_size)
-            ]
+            # H2D reload via the shared prefetch helper (no-op when GPU-resident,
+            # the H2D point under CPU offload). Drained to a list because CRD reuses
+            # each batch across the two passes (precompute old-V, then train).
+            sample_batches: List[Dict[str, Union[torch.Tensor, Any, List[Any]]]] = list(
+                self._iter_prefetched_batches(
+                    samples, self.training_args.per_device_batch_size
+                )
+            )
 
             # ==================== Pre-compute: Old V Predictions ====================
             self.adapter.rollout()

@@ -224,7 +224,6 @@ class DiffusionOPDTrainer(BaseTrainer):
         fresh weight cache (so no stale-cast across swaps), with an explicit
         ``clear_autocast_cache`` as a belt-and-suspenders guard.
         """
-        device = self.accelerator.device
         per_device_batch_size = self.training_args.per_device_batch_size
 
         samples_by_teacher: Dict[int, List[BaseSample]] = defaultdict(list)
@@ -239,18 +238,17 @@ class DiffusionOPDTrainer(BaseTrainer):
             # Swap teacher weights in OUTSIDE the autocast context.
             with self.adapter.use_named_parameters(teacher_name):
                 with self.autocast():
-                    for batch_idx in tqdm(
-                        range(num_batches),
+                    for i, batch in enumerate(tqdm(
+                        self._iter_prefetched_batches(teacher_samples, per_device_batch_size),
                         total=num_batches,
                         desc=f"Epoch {self.epoch} Teacher[{teacher_name}] targets",
                         disable=not self.show_progress_bar,
-                    ):
-                        start = batch_idx * per_device_batch_size
-                        micro_batch_samples = [
-                            sample.to(device)
-                            for sample in teacher_samples[start : start + per_device_batch_size]
+                    )):
+                        # Side index recovers the sample objects for the per-sample
+                        # mu_teacher write-back (the iterator yields only the dict).
+                        micro_batch_samples = teacher_samples[
+                            i * per_device_batch_size : (i + 1) * per_device_batch_size
                         ]
-                        batch = BaseSample.stack(micro_batch_samples)
                         # mu_T at each training step: (B, *latent) per step.
                         mu_teacher_steps = [
                             self._forward_step(
@@ -263,9 +261,9 @@ class DiffusionOPDTrainer(BaseTrainer):
                         ]
                         # (B, num_train_steps, *latent)
                         mu_teacher_stacked = torch.stack(mu_teacher_steps, dim=1)
-                        for i, sample in enumerate(micro_batch_samples):
+                        for j, sample in enumerate(micro_batch_samples):
                             sample.extra_kwargs["mu_teacher"] = (
-                                mu_teacher_stacked[i].to(self._mu_store_device).clone()
+                                mu_teacher_stacked[j].to(self._mu_store_device).clone()
                             )
             # Belt-and-suspenders guard against a nested-autocast cache edge case.
             torch.clear_autocast_cache()
@@ -293,17 +291,16 @@ class DiffusionOPDTrainer(BaseTrainer):
             teacher_kl_count = torch.zeros(num_teachers, device=device)
             grad_norm = None
 
-            for batch_idx in tqdm(
-                range(num_batches),
+            for i, batch in enumerate(tqdm(
+                self._iter_prefetched_batches(shuffled_samples, per_device_batch_size),
                 total=num_batches,
                 desc=f"Epoch {self.epoch} Distill",
                 position=0,
                 disable=not self.show_progress_bar,
-            ):
-                start = batch_idx * per_device_batch_size
-                batch_samples = [
-                    s.to(device)
-                    for s in shuffled_samples[start : start + per_device_batch_size]
+            )):
+                # Side index recovers the sample objects for per-sample teacher routing.
+                batch_samples = shuffled_samples[
+                    i * per_device_batch_size : (i + 1) * per_device_batch_size
                 ]
                 # Teacher index per sample in this (possibly source-mixed) micro-batch.
                 teacher_idx = torch.tensor(
@@ -311,8 +308,7 @@ class DiffusionOPDTrainer(BaseTrainer):
                     device=device,
                     dtype=torch.long,
                 )  # (B,)
-                batch = BaseSample.stack(batch_samples)
-                # extra_kwargs tensors are not moved by BaseSample.to(); move explicitly.
+                # mu_teacher rides BaseSample.to() with the sample; ensure on device.
                 mu_teacher_all = batch["mu_teacher"]
                 if not isinstance(mu_teacher_all, torch.Tensor):
                     raise RuntimeError(
