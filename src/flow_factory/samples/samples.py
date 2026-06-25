@@ -421,22 +421,25 @@ class BaseSample:
 
     @classmethod
     def stack(cls, samples: List[BaseSample]) -> Dict[str, Union[torch.Tensor, Dict, List, Any]]:
-        """
-        Stack BaseSample instances into batched structures.
-        
-        Field behavior controlled by class methods:
-            - shared_fields(): Take first element only (shared across batch)
-            - stackable_fields(): Stack tensors/dicts with matching structure
-            - Other: Collect into lists
-        
+        """Stack per-sample BaseSamples into one batched dict.
+
+        Returns a flat ``Dict[str, Any]`` (NOT a BaseSample) -- the batch
+        interchange format between the per-sample lifecycle (``List[BaseSample]``)
+        and ``adapter.forward(**batched_kwargs)``. Each sample is flattened via
+        ``to_dict()`` (which lifts ``extra_kwargs`` keys to the top level), then
+        ``_stack_values`` collates per key:
+            - ``shared_fields()`` keys: take the first sample's value (not stacked).
+            - tensors with matching shapes: ``torch.stack``; mismatched: list.
+            - dicts: collated recursively; other types (str, Set, PIL): list.
+
         Args:
-            samples: List of BaseSample instances
-        
+            samples: Non-empty list of BaseSample instances (each without a batch dim).
+
         Returns:
-            Dictionary with processed values per field
-        
+            Dict[str, Any]: batched values keyed by field / extra_kwargs name.
+
         Raises:
-            ValueError: If samples list is empty
+            ValueError: If samples list is empty.
         """
         if not samples:
             raise ValueError("No samples to stack.")

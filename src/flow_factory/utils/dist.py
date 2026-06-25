@@ -510,8 +510,7 @@ def global_min_max_numpy(
     else:
         lo = float(np.min(x))
         hi = float(np.max(x))
-    # Fuse the MIN and MAX collectives into a single MIN all-reduce via
-    # max(h) == -min(-h): pack [lo, -hi] and MIN-reduce once (2 -> 1 call).
+    # Fuse min & max into one MIN all-reduce over [lo, -hi] (max(h) == -min(-h)).
     packed = torch.tensor(
         [lo, -hi], device=accelerator.device, dtype=torch.float64
     )
@@ -716,8 +715,7 @@ def global_tensor_stats(
     global_sum = packed[1].item()
     global_sum_sq = packed[2].item()
 
-    # Fuse the MIN and MAX collectives into a single MIN all-reduce via
-    # max(h) == -min(-h): MIN-reduce [local_min, -local_max].
+    # Fuse min & max into one MIN all-reduce over [local_min, -local_max].
     extrema = torch.tensor(
         [local_min, -local_max], device=accelerator.device, dtype=torch.float64
     )
@@ -788,9 +786,8 @@ def global_tensor_stats_batch(
     packed_sum = torch.tensor(sum_triples, device=device, dtype=torch.float64)
     packed_sum = accelerator.reduce(packed_sum, reduction="sum")
 
-    # Fuse the MIN(mins) and MAX(maxes) collectives into a single MIN
-    # all-reduce via max(h) == -min(-h): MIN-reduce [local_mins, -local_maxes]
-    # then negate the second half back to recover the global maxes.
+    # Fuse min & max into one MIN all-reduce over [local_mins, -local_maxes]
+    # (max(h) == -min(-h)); negate the second half back to recover the maxes.
     n = len(keys)
     packed_extrema = torch.tensor(
         local_mins + [-m for m in local_maxes], device=device, dtype=torch.float64

@@ -1074,19 +1074,14 @@ class QwenImageEditPlusAdapter(BaseAdapter):
 
         # 2. Transformer forward pass
         if do_classifier_free_guidance:
-            # Merge the conditional and unconditional CFG passes into a single
-            # batched forward (halves transformer calls in both rollout and
-            # training). cond/uncond share the same latent_model_input (image
-            # latents are CFG-invariant); their text streams can differ in
-            # length, so pad both to a common length and mask via
-            # encoder_hidden_states_mask (diffusers derives each sample's text
-            # length from it). The output is sliced to the generated-latent tokens
-            # exactly as before. Qwen-Image-Edit Plus RL does not enable
-            # cross-step feature caching, so collapsing the per-branch
-            # cache_context buckets is a no-op.
-            # Memory tradeoff: batching cond+uncond doubles peak activation memory
-            # vs two serial forwards; lower per_device_batch_size or resolution if
-            # this OOMs.
+            # Merge cond/uncond into one batched forward (halves transformer
+            # calls). cond/uncond share latent_model_input (image latents are
+            # CFG-invariant); pad both text streams to a common length and mask
+            # via encoder_hidden_states_mask (diffusers derives each sample's
+            # length from it). Output is sliced to the generated-latent tokens as
+            # before. RL has no cross-step caching, so dropping the per-branch
+            # cache_context is a no-op. Tradeoff: ~2x peak activation memory vs
+            # two serial forwards (lower batch/resolution if it OOMs).
             seq_len = max(prompt_embeds.shape[1], negative_prompt_embeds.shape[1])
             prompt_embeds = _pad_seq_dim(prompt_embeds, seq_len, 0.0)
             prompt_embeds_mask = _pad_seq_dim(prompt_embeds_mask, seq_len, 0)
