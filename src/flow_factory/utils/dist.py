@@ -173,10 +173,11 @@ def all_gather_tensor_list(
             gathered_tensors.append(this_tensor)
             offset += length
 
-    # Clean up temporary tensors
+    # Clean up temporary tensors. The caching allocator reuses these freed
+    # blocks automatically; calling torch.cuda.empty_cache() here would force a
+    # device synchronization and drop the allocator pool, making subsequent
+    # cudaMalloc slower in this gather hot path.
     del gathered_shapes, gathered_flat_tensors
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
     return gathered_tensors
 
@@ -509,8 +510,15 @@ def global_min_max_numpy(
     else:
         lo = float(np.min(x))
         hi = float(np.max(x))
-    lo = all_reduce_min_float(accelerator, lo)
-    hi = all_reduce_max_float(accelerator, hi)
+    # Fuse the MIN and MAX collectives into a single MIN all-reduce via
+    # max(h) == -min(-h): pack [lo, -hi] and MIN-reduce once (2 -> 1 call).
+    packed = torch.tensor(
+        [lo, -hi], device=accelerator.device, dtype=torch.float64
+    )
+    if _is_distributed():
+        dist.all_reduce(packed, op=dist.ReduceOp.MIN)
+    lo = float(packed[0].item())
+    hi = -float(packed[1].item())
     if not math.isfinite(lo) or not math.isfinite(hi):
         return 0.0, 0.0
     return lo, hi
@@ -684,8 +692,9 @@ def global_tensor_stats(
             with global statistics across all ranks.
 
     Note:
-        Uses 3 all-reduce calls: one SUM for a packed ``(count, sum, sum_sq)``
-        triple, one MIN, and one MAX.  Single-process runs skip collective ops.
+        Uses 2 all-reduce calls: one SUM for a packed ``(count, sum, sum_sq)``
+        triple, and one MIN that fuses the global min with the negated global
+        max (``max(h) == -min(-h)``).  Single-process runs skip collective ops.
     """
     x = x.detach().float()
     count = float(x.numel())
@@ -707,8 +716,15 @@ def global_tensor_stats(
     global_sum = packed[1].item()
     global_sum_sq = packed[2].item()
 
-    global_min = all_reduce_min_float(accelerator, local_min)
-    global_max = all_reduce_max_float(accelerator, local_max)
+    # Fuse the MIN and MAX collectives into a single MIN all-reduce via
+    # max(h) == -min(-h): MIN-reduce [local_min, -local_max].
+    extrema = torch.tensor(
+        [local_min, -local_max], device=accelerator.device, dtype=torch.float64
+    )
+    if _is_distributed():
+        dist.all_reduce(extrema, op=dist.ReduceOp.MIN)
+    global_min = float(extrema[0].item())
+    global_max = -float(extrema[1].item())
 
     if global_count < 1:
         return {"min": 0.0, "max": 0.0, "mean": 0.0, "std": 0.0}
@@ -725,7 +741,7 @@ def global_tensor_stats_batch(
     accelerator: Accelerator,
     tensors: Dict[str, torch.Tensor],
 ) -> Dict[str, Dict[str, float]]:
-    """Compute global stats for multiple tensors with only 3 all-reduce calls.
+    """Compute global stats for multiple tensors with only 2 all-reduce calls.
 
     Args:
         accelerator: Accelerator instance.
@@ -738,10 +754,11 @@ def global_tensor_stats_batch(
 
     Note:
         All tensors' ``(count, sum, sum_sq)`` are packed into one SUM reduce;
-        local mins and maxes are packed into one MIN and one MAX reduce.
-        The total communication cost is **3 all-reduce calls** regardless of
-        the number of tensors. Keys are sorted so packed slot order matches
-        across ranks; every rank must pass the **same** set of metric names.
+        local mins and negated local maxes are packed into a single MIN reduce
+        (``max(h) == -min(-h)``).  The total communication cost is **2
+        all-reduce calls** regardless of the number of tensors. Keys are sorted
+        so packed slot order matches across ranks; every rank must pass the
+        **same** set of metric names.
     """
     if not tensors:
         return {}
@@ -771,15 +788,17 @@ def global_tensor_stats_batch(
     packed_sum = torch.tensor(sum_triples, device=device, dtype=torch.float64)
     packed_sum = accelerator.reduce(packed_sum, reduction="sum")
 
-    # MIN reduce for local minimums
-    packed_min = torch.tensor(local_mins, device=device, dtype=torch.float64)
+    # Fuse the MIN(mins) and MAX(maxes) collectives into a single MIN
+    # all-reduce via max(h) == -min(-h): MIN-reduce [local_mins, -local_maxes]
+    # then negate the second half back to recover the global maxes.
+    n = len(keys)
+    packed_extrema = torch.tensor(
+        local_mins + [-m for m in local_maxes], device=device, dtype=torch.float64
+    )
     if _is_distributed():
-        dist.all_reduce(packed_min, op=dist.ReduceOp.MIN)
-
-    # MAX reduce for local maximums
-    packed_max = torch.tensor(local_maxes, device=device, dtype=torch.float64)
-    if _is_distributed():
-        dist.all_reduce(packed_max, op=dist.ReduceOp.MAX)
+        dist.all_reduce(packed_extrema, op=dist.ReduceOp.MIN)
+    packed_min = packed_extrema[:n]
+    packed_max = -packed_extrema[n:]
 
     # Unpack global results
     out: Dict[str, Dict[str, float]] = {}
