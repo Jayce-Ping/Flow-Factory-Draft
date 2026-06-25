@@ -4,6 +4,10 @@ downcast_bf16: 'no'
 fsdp_config:
   fsdp_version: 2
   fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  # FSDP2 prefetches the next all-gather implicitly and does NOT support the
+  # explicit forward_prefetch knob (accelerate raises if it is set non-None).
+  # Leave false/unset here; use the FSDP1 configs (fsdp_full_shard /
+  # fsdp_grad_op_shard) if you need to tune forward_prefetch.
   fsdp_forward_prefetch: false
   fsdp_offload_params: false
   fsdp_reshard_after_forward: true # FULL_SHARD. `false` for SHARD_GRAD_OP

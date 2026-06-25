@@ -4,7 +4,11 @@ downcast_bf16: 'no'
 fsdp_config:
   fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
   fsdp_backward_prefetch: BACKWARD_PRE
-  fsdp_forward_prefetch: false
+  # Overlap the next layer's param all-gather with the current forward compute
+  # (FSDP1 only). Speeds up multi-step rollout/forward at the cost of one extra
+  # layer's parameters in flight (slightly higher peak memory). Set false if the
+  # heaviest config OOMs.
+  fsdp_forward_prefetch: true
   fsdp_offload_params: false
   fsdp_sharding_strategy: SHARD_GRAD_OP
   fsdp_state_dict_type: FULL_STATE_DICT
