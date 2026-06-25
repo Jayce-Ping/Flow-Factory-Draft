@@ -1041,23 +1041,21 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         do_classifier_free_guidance = guidance_scale > 1.0 and has_negative_prompt
         guidance = None  # Always None for Qwen-Image-Edit Plus
 
-        # Prepare txt_seq_lens and negative_txt_seq_lens, which will be deprecated in `diffuers==0.39.0`,
-        # to update, just modify the following lines accordingly.
-        # Truncate prompt embeddings and masks to max valid lengths in the batch
-        txt_seq_lens, prompt_embeds_mask, prompt_embeds, _ = self._pad_batch_prompt(
+        # Truncate prompt embeddings and masks to the max valid length in the
+        # batch. diffusers (>=0.38) derives the per-sample text length from
+        # encoder_hidden_states_mask, so the deprecated txt_seq_lens is not passed.
+        _, prompt_embeds_mask, prompt_embeds, _ = self._pad_batch_prompt(
             prompt_embeds_mask=prompt_embeds_mask,
             prompt_embeds=prompt_embeds,
             device=device
         )
 
         if do_classifier_free_guidance:
-            negative_txt_seq_lens, negative_prompt_embeds_mask, negative_prompt_embeds, _ = self._pad_batch_prompt(
+            _, negative_prompt_embeds_mask, negative_prompt_embeds, _ = self._pad_batch_prompt(
                 prompt_embeds_mask=negative_prompt_embeds_mask,
                 prompt_embeds=negative_prompt_embeds,
                 device=device
             )
-        else:
-            negative_txt_seq_lens = None
 
         # Prepare model input (concatenate condition latents for I2I)
         latent_model_input = latents
@@ -1071,8 +1069,8 @@ class QwenImageEditPlusAdapter(BaseAdapter):
             # training). cond/uncond share the same latent_model_input (image
             # latents are CFG-invariant); their text streams can differ in
             # length, so pad both to a common length and mask via
-            # encoder_hidden_states_mask, passing the real per-sample lengths in
-            # txt_seq_lens. The output is sliced to the generated-latent tokens
+            # encoder_hidden_states_mask (diffusers derives each sample's text
+            # length from it). The output is sliced to the generated-latent tokens
             # exactly as before. Qwen-Image-Edit Plus RL does not enable
             # cross-step feature caching, so collapsing the per-branch
             # cache_context buckets is a no-op.
@@ -1095,7 +1093,6 @@ class QwenImageEditPlusAdapter(BaseAdapter):
                     [prompt_embeds, negative_prompt_embeds], dim=0
                 ),
                 img_shapes=img_shapes * 2,
-                txt_seq_lens=list(txt_seq_lens) + list(negative_txt_seq_lens),
                 attention_kwargs=attention_kwargs,
                 return_dict=False,
             )[0]
@@ -1118,7 +1115,6 @@ class QwenImageEditPlusAdapter(BaseAdapter):
                     encoder_hidden_states_mask=prompt_embeds_mask,
                     encoder_hidden_states=prompt_embeds,
                     img_shapes=img_shapes,
-                    txt_seq_lens=txt_seq_lens, # No need after diffusers 0.37.0 and will be deprecated in 0.39.0
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
                 )[0]

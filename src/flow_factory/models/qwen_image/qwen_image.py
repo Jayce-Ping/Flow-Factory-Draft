@@ -551,23 +551,21 @@ class QwenImageAdapter(BaseAdapter):
             )
         do_true_cfg = guidance_scale > 1.0 and has_negative_prompt
 
-        # Prepare txt_seq_lens and negative_txt_seq_lens, which will be deprecated in `diffuers==0.39.0`,
-        # to update, just modify the following lines accordingly.
-        # Truncate prompt embeddings and masks to max valid lengths in the batch
-        txt_seq_lens, prompt_embeds_mask, prompt_embeds, _ = self._pad_batch_prompt(
+        # Truncate prompt embeddings and masks to the max valid length in the
+        # batch. diffusers (>=0.38) derives the per-sample text length from
+        # encoder_hidden_states_mask, so the deprecated txt_seq_lens is not passed.
+        _, prompt_embeds_mask, prompt_embeds, _ = self._pad_batch_prompt(
             prompt_embeds_mask=prompt_embeds_mask,
             prompt_embeds=prompt_embeds,
             device=device
         )
 
         if do_true_cfg:
-            negative_txt_seq_lens, negative_prompt_embeds_mask, negative_prompt_embeds, _ = self._pad_batch_prompt(
+            _, negative_prompt_embeds_mask, negative_prompt_embeds, _ = self._pad_batch_prompt(
                 prompt_embeds_mask=negative_prompt_embeds_mask,
                 prompt_embeds=negative_prompt_embeds,
                 device=device
             )
-        else:
-            negative_txt_seq_lens = None
 
         # 2. Transformer forward pass
         if do_true_cfg:
@@ -575,11 +573,11 @@ class QwenImageAdapter(BaseAdapter):
             # batched forward (halves transformer calls in both rollout and
             # training). cond/uncond text lengths can differ after per-branch
             # padding, so pad both to a common sequence length; the
-            # encoder_hidden_states_mask masks the extra positions and the real
-            # per-sample lengths are still passed via txt_seq_lens, so the valid
-            # outputs match two separate forwards (bf16 differs only at the ULP
-            # level). Qwen-Image RL does not enable cross-step feature caching,
-            # so collapsing the per-branch cache_context buckets is a no-op.
+            # encoder_hidden_states_mask masks the extra positions (diffusers
+            # derives each sample's text length from it), so the valid outputs
+            # match two separate forwards (bf16 differs only at the ULP level).
+            # Qwen-Image RL does not enable cross-step feature caching, so
+            # collapsing the per-branch cache_context buckets is a no-op.
             seq_len = max(prompt_embeds.shape[1], negative_prompt_embeds.shape[1])
             prompt_embeds = _pad_seq_dim(prompt_embeds, seq_len, 0.0)
             prompt_embeds_mask = _pad_seq_dim(prompt_embeds_mask, seq_len, 0)
@@ -599,7 +597,6 @@ class QwenImageAdapter(BaseAdapter):
                     [prompt_embeds, negative_prompt_embeds], dim=0
                 ),
                 img_shapes=img_shapes * 2,
-                txt_seq_lens=list(txt_seq_lens) + list(negative_txt_seq_lens),
                 attention_kwargs=attention_kwargs,
                 return_dict=False,
             )[0]
@@ -621,7 +618,6 @@ class QwenImageAdapter(BaseAdapter):
                     encoder_hidden_states_mask=prompt_embeds_mask,
                     encoder_hidden_states=prompt_embeds,
                     img_shapes=img_shapes,
-                    txt_seq_lens=txt_seq_lens, # No need after diffusers 0.37.0 and will be deprecated in 0.39.0
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
                 )[0]
