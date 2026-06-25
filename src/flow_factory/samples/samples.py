@@ -266,21 +266,45 @@ class BaseSample:
 
         return {k: tensor_to_repr(v) for k, v in self.to_dict().items()}
 
-    def to(self, device: Union[torch.device, str], depth : int = 1) -> BaseSample:
-        """Move all tensor fields to specified device."""
+    def to(
+        self,
+        device: Union[torch.device, str],
+        depth: int = 1,
+        non_blocking: bool = False,
+        pin_memory: bool = False,
+    ) -> BaseSample:
+        """Move all tensor fields to ``device`` (in place).
+
+        Args:
+            device: Target device.
+            depth: 0 moves only direct tensor fields; 1 also moves tensor-list fields.
+            non_blocking: Forwarded to ``Tensor.to``. Enables truly asynchronous
+                H2D when the host source is pinned (used by the copy-stream prefetch
+                in the optimize loop).
+            pin_memory: When moving to CPU, return page-locked (pinned) tensors so a
+                subsequent H2D copy can be issued asynchronously. Ignored for
+                non-CPU targets. Implies a blocking D2H (the copy must finish before
+                the pinned buffer is filled).
+        """
         assert 0 <= depth <= 1, "Only depth 0 and 1 are supported."
         device = torch.device(device)
+        pin = pin_memory and device.type == "cpu"
+
+        def _move(t: torch.Tensor) -> torch.Tensor:
+            moved = t.to(device, non_blocking=non_blocking)
+            return moved.pin_memory() if pin else moved
+
         for field in fields(self):
             value = getattr(self, field.name)
             if isinstance(value, torch.Tensor):
-                setattr(self, field.name, value.to(device))
+                setattr(self, field.name, _move(value))
             elif depth == 1 and is_tensor_list(value):
                 setattr(
                     self,
                     field.name,
-                    [t.to(device) if isinstance(t, torch.Tensor) else t for t in value]
+                    [_move(t) if isinstance(t, torch.Tensor) else t for t in value]
                 )
-            
+
         return self
 
     def _hash_id_fields(self, hasher: hashlib._Hash) -> None:

@@ -16,7 +16,7 @@
 import json
 import os
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, Tuple, List, Union, Literal
+from typing import Dict, Any, Optional, Tuple, List, Union, Literal, Iterator
 from functools import partial
 import numpy as np
 import torch
@@ -46,6 +46,26 @@ from ..utils.logger_utils import setup_logger
 from ..utils.base import create_generator, create_generator_by_prompt, filter_kwargs, json_default
 
 logger = setup_logger(__name__)
+
+
+def _record_stream_on_batch(value: Any, stream: "torch.cuda.Stream") -> None:
+    """Recursively record a CUDA stream on every CUDA tensor in a stacked batch.
+
+    ``BaseSample.stack`` returns a dict whose values may be tensors, lists, or
+    nested dicts. Recording the consuming (default) stream on copy-stream-produced
+    tensors stops the caching allocator from reusing their memory until the
+    default stream is done, which is what makes the prefetch double buffer safe.
+    """
+    if isinstance(value, torch.Tensor):
+        if value.is_cuda:
+            value.record_stream(stream)
+    elif isinstance(value, dict):
+        for v in value.values():
+            _record_stream_on_batch(v, stream)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            _record_stream_on_batch(v, stream)
+
 
 class BaseTrainer(ABC):
     """
@@ -476,6 +496,12 @@ class BaseTrainer(ABC):
         ``RewardProcessor`` (see ``move_tensors_to_device`` in
         ``utils/base.py``).
 
+        Offloaded tensors are moved to **pinned** CPU memory (blocking D2H) so the
+        per-micro-batch H2D reload in ``optimize`` can be issued asynchronously and
+        overlapped with compute (see ``_iter_prefetched_batches``). The blocking
+        D2H keeps the ``sync_event`` ordering contract intact: data is fully
+        CPU-resident before ``add_samples`` records the event.
+
         No-op when ``training_args.offload_samples_to_cpu`` is False
         (default), preserving the legacy GPU-resident behaviour.
 
@@ -485,7 +511,74 @@ class BaseTrainer(ABC):
         if not self.training_args.offload_samples_to_cpu:
             return
         for sample in samples:
-            sample.to('cpu')
+            sample.to('cpu', pin_memory=True)
+
+    def _iter_prefetched_batches(
+        self,
+        samples: List[BaseSample],
+        per_device_batch_size: int,
+    ) -> Iterator[BaseSample]:
+        """Yield device-resident stacked micro-batches for the optimize loop.
+
+        When samples are CPU-offloaded (pinned), the next micro-batch's H2D copy is
+        issued on a dedicated copy stream so it overlaps with the current batch's
+        compute on the default stream (double buffering). ``wait_stream`` guarantees
+        the batch is fully copied before it is consumed and ``record_stream`` keeps
+        its memory alive until the default stream is done, so the prefetch cannot
+        clobber it.
+
+        Falls back to a plain blocking stack when offload is disabled or CUDA is
+        unavailable (GPU-resident samples make ``.to(device)`` a no-op), which is
+        byte-for-byte the original behaviour. Numerically equivalent in all cases:
+        only the timing of the data movement changes.
+
+        Args:
+            samples: Samples to iterate, already ordered for this inner epoch.
+            per_device_batch_size: Micro-batch size.
+
+        Yields:
+            Stacked ``BaseSample`` micro-batches resident on ``accelerator.device``.
+        """
+        device = self.accelerator.device
+        starts = list(range(0, len(samples), per_device_batch_size))
+
+        use_prefetch = (
+            torch.cuda.is_available()
+            and self.training_args.offload_samples_to_cpu
+            and len(starts) > 1
+        )
+        if not use_prefetch:
+            for start in starts:
+                batch_samples = [
+                    sample.to(device)
+                    for sample in samples[start:start + per_device_batch_size]
+                ]
+                yield BaseSample.stack(batch_samples)
+            return
+
+        copy_stream = torch.cuda.Stream(device)
+        compute_stream = torch.cuda.current_stream(device)
+
+        def _load(start: int) -> BaseSample:
+            with torch.cuda.stream(copy_stream):
+                moved = [
+                    sample.to(device, non_blocking=True)
+                    for sample in samples[start:start + per_device_batch_size]
+                ]
+                return BaseSample.stack(moved)
+
+        next_batch = _load(starts[0])
+        for i, _ in enumerate(starts):
+            batch = next_batch
+            # Wait for this batch's async H2D before the default stream uses it.
+            compute_stream.wait_stream(copy_stream)
+            # Keep the batch alive until the default stream finishes with it
+            # (BaseSample.stack returns a dict of tensors/lists/nested dicts).
+            _record_stream_on_batch(batch, compute_stream)
+            # Prefetch the next micro-batch so its H2D overlaps this batch's compute.
+            if i + 1 < len(starts):
+                next_batch = _load(starts[i + 1])
+            yield batch
 
     def sample_batch(
         self,

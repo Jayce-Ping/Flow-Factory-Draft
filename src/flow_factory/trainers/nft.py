@@ -267,19 +267,13 @@ class DiffusionNFTTrainer(BaseTrainer):
 
             loss_info = defaultdict(list)
 
-            for batch_idx in tqdm(
-                range(num_batches),
+            for batch in tqdm(
+                self._iter_prefetched_batches(shuffled_samples, per_device_batch_size),
                 total=num_batches,
                 desc=f'Epoch {self.epoch} Training',
                 position=0,
                 disable=not self.show_progress_bar,
             ):
-                start = batch_idx * per_device_batch_size
-                batch_samples = [
-                    sample.to(device)
-                    for sample in shuffled_samples[start:start + per_device_batch_size]
-                ]
-                batch = BaseSample.stack(batch_samples)
                 batch_size = batch['all_latents'].shape[0]
                 clean_latents = batch['all_latents'][:, -1]
 
