@@ -24,6 +24,7 @@ from collections import defaultdict
 from PIL import Image
 import torch
 from torch.nn.utils.rnn import pad_sequence
+import diffusers
 from diffusers.pipelines.qwenimage.pipeline_qwenimage import QwenImagePipeline
 from accelerate import Accelerator
 
@@ -84,6 +85,14 @@ class QwenImageAdapter(BaseAdapter):
     ddp_find_unused_parameters = True
 
     def __init__(self, config: Arguments, accelerator : Accelerator):
+        if not is_version_at_least("diffusers", "0.38.0"):
+            raise ImportError(
+                "QwenImageAdapter requires diffusers>=0.38.0 (the Qwen-Image "
+                "transformer derives the text sequence length from "
+                "encoder_hidden_states_mask; txt_seq_lens is no longer passed). "
+                f"Found diffusers {diffusers.__version__}. "
+                "Upgrade with `pip install -U 'diffusers>=0.38.0'`."
+            )
         super().__init__(config, accelerator)
         self.pipeline: QwenImagePipeline
         self.scheduler: FlowMatchEulerDiscreteSDEScheduler
