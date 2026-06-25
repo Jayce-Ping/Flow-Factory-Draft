@@ -580,23 +580,24 @@ class CRDTrainer(BaseTrainer):
             This may be refactored to the per-batch interleave pattern in the future.
         """
         for inner_epoch in range(self.training_args.num_inner_epochs):
-            # CRD does not shuffle samples (needs same-prompt grouping for centering)
-            # Re-group samples into batches
-            # H2D reload via the shared prefetch helper (no-op when GPU-resident,
-            # the H2D point under CPU offload). Drained to a list because CRD reuses
-            # each batch across the two passes (precompute old-V, then train).
-            sample_batches: List[Dict[str, Union[torch.Tensor, Any, List[Any]]]] = list(
-                self._iter_prefetched_batches(
-                    samples, self.training_args.per_device_batch_size
-                )
-            )
-
+            # CRD does not shuffle samples (needs same-prompt grouping for centering).
             # ==================== Pre-compute: Old V Predictions ====================
+            # Prefetch each micro-batch here so its H2D overlaps the heavy old-V
+            # forward, then keep the device-resident batch for pass 2 (it is
+            # reused, not reloaded). The old model is a frozen snapshot
+            # (_OLD_PARAMS_NAME), so per-batch old-V is independent of pass-2
+            # weight updates.
+            sample_batches: List[Dict[str, Union[torch.Tensor, Any, List[Any]]]] = []
+            num_batches = (
+                len(samples) + self.training_args.per_device_batch_size - 1
+            ) // self.training_args.per_device_batch_size
             self.adapter.rollout()
             with torch.no_grad(), self.autocast():
                 for batch in tqdm(
-                    sample_batches,
-                    total=len(sample_batches),
+                    self._iter_prefetched_batches(
+                        samples, self.training_args.per_device_batch_size
+                    ),
+                    total=num_batches,
                     desc=f'Epoch {self.epoch} Pre-computing Old V Predictions',
                     position=0,
                     disable=not self.show_progress_bar,
@@ -633,6 +634,7 @@ class CRDTrainer(BaseTrainer):
                         old_v_pred_list.append(old_output['noise_pred'].detach())
 
                     batch['_old_v_pred_list'] = old_v_pred_list
+                    sample_batches.append(batch)
 
             # ==================== Training Loop ====================
             self.adapter.train()

@@ -487,23 +487,28 @@ class BaseTrainer(ABC):
         for sample in samples:
             sample.to('cpu', pin_memory=True)
 
-    def _iter_prefetched_batches(
+    def _iter_prefetched_sample_batches(
         self,
         samples: List[BaseSample],
         per_device_batch_size: int,
-    ) -> Iterator[Dict[str, Any]]:
-        """Yield device-resident stacked micro-batch dicts for the optimize loop.
+    ) -> Iterator[Tuple[Dict[str, Any], List[BaseSample]]]:
+        """Yield ``(stacked_batch, device_resident_samples)`` for the optimize loop.
+
+        Same prefetch contract as :meth:`_iter_prefetched_batches`, but also hands
+        back the moved per-sample list so callers that need per-sample access
+        (teacher routing, ``mu_teacher`` write-back, group bookkeeping) get it
+        without a second move or a redundant side index.
 
         When samples are CPU-offloaded (pinned), the next micro-batch's H2D copy
         runs on a dedicated copy stream to overlap the current batch's compute;
         ``wait_stream`` ensures the batch is fully copied before use and
         ``record_stream`` keeps it alive until the default stream is done.
-        Otherwise (offload off, no CUDA, or a single batch) it falls back to a
-        plain blocking stack -- byte-for-byte the original behaviour. Numerically
-        equivalent either way; only the data-movement timing changes.
+        Otherwise (offload off, no CUDA, or a single batch) it is a plain blocking
+        stack. Numerically equivalent either way; only data-movement timing changes.
 
         Yields:
-            Dict[str, Any]: a stacked micro-batch (see ``BaseSample.stack``).
+            (Dict[str, Any], List[BaseSample]): the stacked micro-batch and the
+            device-resident samples it was stacked from.
         """
         device = self.accelerator.device
         starts = list(range(0, len(samples), per_device_batch_size))
@@ -519,27 +524,45 @@ class BaseTrainer(ABC):
                     sample.to(device)
                     for sample in samples[start:start + per_device_batch_size]
                 ]
-                yield BaseSample.stack(batch_samples)
+                yield BaseSample.stack(batch_samples), batch_samples
             return
 
         copy_stream = torch.cuda.Stream(device)
         compute_stream = torch.cuda.current_stream(device)
 
-        def _load(start: int) -> Dict[str, Any]:
+        def _load(start: int) -> Tuple[Dict[str, Any], List[BaseSample]]:
             with torch.cuda.stream(copy_stream):
                 moved = [
                     sample.to(device, non_blocking=True)
                     for sample in samples[start:start + per_device_batch_size]
                 ]
-                return BaseSample.stack(moved)
+                return BaseSample.stack(moved), moved
 
-        next_batch = _load(starts[0])
+        next_pair = _load(starts[0])
         for i, _ in enumerate(starts):
-            batch = next_batch
+            batch, batch_samples = next_pair
             compute_stream.wait_stream(copy_stream)  # batch H2D complete before use
             _record_stream_on_batch(batch, compute_stream)  # keep alive for compute stream
             if i + 1 < len(starts):
-                next_batch = _load(starts[i + 1])  # prefetch next, overlaps compute
+                next_pair = _load(starts[i + 1])  # prefetch next, overlaps compute
+            yield batch, batch_samples
+
+    def _iter_prefetched_batches(
+        self,
+        samples: List[BaseSample],
+        per_device_batch_size: int,
+    ) -> Iterator[Dict[str, Any]]:
+        """Yield device-resident stacked micro-batch dicts for the optimize loop.
+
+        Thin wrapper over :meth:`_iter_prefetched_sample_batches` for callers that
+        only need the stacked dict (see there for the prefetch/offload contract).
+
+        Yields:
+            Dict[str, Any]: a stacked micro-batch (see ``BaseSample.stack``).
+        """
+        for batch, _ in self._iter_prefetched_sample_batches(
+            samples, per_device_batch_size
+        ):
             yield batch
 
     def sample_batch(

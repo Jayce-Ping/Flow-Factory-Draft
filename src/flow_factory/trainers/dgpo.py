@@ -731,7 +731,7 @@ class DGPOTrainer(BaseTrainer):
     # =========================== Training Batch Builder ============================
     def _build_training_batches(
         self,
-        samples: List[BaseSample],
+        sample_slices: List[List[BaseSample]],
         shared_timesteps: torch.Tensor,
         inner_epoch: int,
     ) -> List[Dict[str, Any]]:
@@ -748,21 +748,22 @@ class DGPOTrainer(BaseTrainer):
         sequence on every rank).
         """
         training_batches: List[Dict[str, Any]] = []
-        bsz = self.training_args.per_device_batch_size
-        num_batches = (len(samples) + bsz - 1) // bsz
+        device = self.accelerator.device
         self.adapter.rollout()
 
         with torch.no_grad(), self.autocast():
-            # _iter_prefetched_batches performs the H2D reload (overlapped under
-            # offload); the side index recovers the slice for group bookkeeping.
-            for i, batch in enumerate(tqdm(
-                self._iter_prefetched_batches(samples, bsz),
-                total=num_batches,
+            for samples_slice in tqdm(
+                sample_slices,
                 desc=f"Epoch {self.epoch} Pre-computing",
                 position=0,
                 disable=not self.show_progress_bar,
-            )):
-                samples_slice = samples[i * bsz : (i + 1) * bsz]
+            ):
+                # Blocking H2D reload (no-op when GPU-resident). This two-phase
+                # builder has no per-batch compute to overlap, so prefetch is N/A
+                # here; the prefetch dividend is realised inside the single-pass
+                # trainers' optimize loops, not this builder. DGPO samples are
+                # final-latent-only, so the H2D is tiny regardless.
+                batch = BaseSample.stack([s.to(device) for s in samples_slice])
                 all_latents: torch.Tensor = batch["all_latents"]  # type: ignore[assignment]
                 clean_latents = all_latents[:, -1]
                 batch_size = clean_latents.shape[0]
@@ -852,9 +853,12 @@ class DGPOTrainer(BaseTrainer):
         )
 
         for inner_epoch in range(self.training_args.num_inner_epochs):
+            sample_slices = [
+                samples[i : i + bsz] for i in range(0, len(samples), bsz)
+            ]
             shared_timesteps = self._sample_shared_timesteps(inner_epoch)  # (T,)
             training_batches = self._build_training_batches(
-                samples,
+                sample_slices,
                 shared_timesteps,
                 inner_epoch,
             )

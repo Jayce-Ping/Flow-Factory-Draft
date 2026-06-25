@@ -238,17 +238,14 @@ class DiffusionOPDTrainer(BaseTrainer):
             # Swap teacher weights in OUTSIDE the autocast context.
             with self.adapter.use_named_parameters(teacher_name):
                 with self.autocast():
-                    for i, batch in enumerate(tqdm(
-                        self._iter_prefetched_batches(teacher_samples, per_device_batch_size),
+                    for batch, micro_batch_samples in tqdm(
+                        self._iter_prefetched_sample_batches(
+                            teacher_samples, per_device_batch_size
+                        ),
                         total=num_batches,
                         desc=f"Epoch {self.epoch} Teacher[{teacher_name}] targets",
                         disable=not self.show_progress_bar,
-                    )):
-                        # Side index recovers the sample objects for the per-sample
-                        # mu_teacher write-back (the iterator yields only the dict).
-                        micro_batch_samples = teacher_samples[
-                            i * per_device_batch_size : (i + 1) * per_device_batch_size
-                        ]
+                    ):
                         # mu_T at each training step: (B, *latent) per step.
                         mu_teacher_steps = [
                             self._forward_step(
@@ -291,17 +288,15 @@ class DiffusionOPDTrainer(BaseTrainer):
             teacher_kl_count = torch.zeros(num_teachers, device=device)
             grad_norm = None
 
-            for i, batch in enumerate(tqdm(
-                self._iter_prefetched_batches(shuffled_samples, per_device_batch_size),
+            for batch, batch_samples in tqdm(
+                self._iter_prefetched_sample_batches(
+                    shuffled_samples, per_device_batch_size
+                ),
                 total=num_batches,
                 desc=f"Epoch {self.epoch} Distill",
                 position=0,
                 disable=not self.show_progress_bar,
-            )):
-                # Side index recovers the sample objects for per-sample teacher routing.
-                batch_samples = shuffled_samples[
-                    i * per_device_batch_size : (i + 1) * per_device_batch_size
-                ]
+            ):
                 # Teacher index per sample in this (possibly source-mixed) micro-batch.
                 teacher_idx = torch.tensor(
                     [self._teacher_index_for_sample(s) for s in batch_samples],
