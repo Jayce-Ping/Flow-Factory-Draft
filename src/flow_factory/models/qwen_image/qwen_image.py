@@ -50,6 +50,22 @@ from ...utils.logger_utils import setup_logger
 logger = setup_logger(__name__)
 
 
+def _pad_seq_dim(x: torch.Tensor, target_len: int, value: float) -> torch.Tensor:
+    """Right-pad a tensor along its sequence dim (dim=1) up to ``target_len``.
+
+    Handles 2-D masks ``(B, L)`` and 3-D embeddings ``(B, L, D)``. Returns the
+    input unchanged when it is already at least ``target_len`` long. Used to
+    align cond/uncond text streams so they can be concatenated along the batch
+    dim for a single CFG forward.
+    """
+    pad = target_len - x.shape[1]
+    if pad <= 0:
+        return x
+    if x.dim() == 2:
+        return torch.nn.functional.pad(x, (0, pad), value=value)
+    return torch.nn.functional.pad(x, (0, 0, 0, pad), value=value)
+
+
 @dataclass
 class QwenImageSample(T2ISample):
     """Output class for Qwen-Image models."""
@@ -62,7 +78,11 @@ class QwenImageSample(T2ISample):
 
 class QwenImageAdapter(BaseAdapter):
     """Adapter for Qwen-Image text-to-image models."""
-    
+
+    # Qwen-Image runs with guidance=None, so the transformer's guidance embedder
+    # receives no gradient and DDP must scan for unused parameters.
+    ddp_find_unused_parameters = True
+
     def __init__(self, config: Arguments, accelerator : Accelerator):
         super().__init__(config, accelerator)
         self.pipeline: QwenImagePipeline
@@ -550,34 +570,40 @@ class QwenImageAdapter(BaseAdapter):
             negative_txt_seq_lens = None
 
         # 2. Transformer forward pass
-        # Conditional forward pass
-        with self.pipeline.transformer.cache_context("cond"):
-            noise_pred = self.transformer(
-                hidden_states=latents,
-                timestep=timestep / 1000,
+        if do_true_cfg:
+            # Merge the conditional and unconditional CFG passes into a single
+            # batched forward (halves transformer calls in both rollout and
+            # training). cond/uncond text lengths can differ after per-branch
+            # padding, so pad both to a common sequence length; the
+            # encoder_hidden_states_mask masks the extra positions and the real
+            # per-sample lengths are still passed via txt_seq_lens, so the valid
+            # outputs match two separate forwards (bf16 differs only at the ULP
+            # level). Qwen-Image RL does not enable cross-step feature caching,
+            # so collapsing the per-branch cache_context buckets is a no-op.
+            seq_len = max(prompt_embeds.shape[1], negative_prompt_embeds.shape[1])
+            prompt_embeds = _pad_seq_dim(prompt_embeds, seq_len, 0.0)
+            prompt_embeds_mask = _pad_seq_dim(prompt_embeds_mask, seq_len, 0)
+            negative_prompt_embeds = _pad_seq_dim(negative_prompt_embeds, seq_len, 0.0)
+            negative_prompt_embeds_mask = _pad_seq_dim(
+                negative_prompt_embeds_mask, seq_len, 0
+            )
+
+            both_pred = self.transformer(
+                hidden_states=torch.cat([latents, latents], dim=0),
+                timestep=torch.cat([timestep, timestep], dim=0) / 1000,
                 guidance=guidance,
-                encoder_hidden_states_mask=prompt_embeds_mask,
-                encoder_hidden_states=prompt_embeds,
-                img_shapes=img_shapes,
-                txt_seq_lens=txt_seq_lens, # No need after diffusers 0.37.0 and will be deprecated in 0.39.0
+                encoder_hidden_states_mask=torch.cat(
+                    [prompt_embeds_mask, negative_prompt_embeds_mask], dim=0
+                ),
+                encoder_hidden_states=torch.cat(
+                    [prompt_embeds, negative_prompt_embeds], dim=0
+                ),
+                img_shapes=img_shapes * 2,
+                txt_seq_lens=list(txt_seq_lens) + list(negative_txt_seq_lens),
                 attention_kwargs=attention_kwargs,
                 return_dict=False,
             )[0]
-
-        # CFG: unconditional forward pass
-        if do_true_cfg:
-            with self.pipeline.transformer.cache_context("uncond"):
-                neg_noise_pred = self.transformer(
-                    hidden_states=latents,
-                    timestep=timestep / 1000,
-                    guidance=guidance,
-                    encoder_hidden_states_mask=negative_prompt_embeds_mask,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    img_shapes=img_shapes,
-                    txt_seq_lens=negative_txt_seq_lens, # No need after diffusers 0.37.0 and will be deprecated in 0.39.0
-                    attention_kwargs=attention_kwargs,
-                    return_dict=False,
-                )[0]
+            noise_pred, neg_noise_pred = both_pred.chunk(2, dim=0)
 
             comb_pred = neg_noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
 
@@ -585,6 +611,20 @@ class QwenImageAdapter(BaseAdapter):
             cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
             noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
             noise_pred = comb_pred * (cond_norm / noise_norm)
+        else:
+            # Single conditional forward pass (no CFG).
+            with self.pipeline.transformer.cache_context("cond"):
+                noise_pred = self.transformer(
+                    hidden_states=latents,
+                    timestep=timestep / 1000,
+                    guidance=guidance,
+                    encoder_hidden_states_mask=prompt_embeds_mask,
+                    encoder_hidden_states=prompt_embeds,
+                    img_shapes=img_shapes,
+                    txt_seq_lens=txt_seq_lens, # No need after diffusers 0.37.0 and will be deprecated in 0.39.0
+                    attention_kwargs=attention_kwargs,
+                    return_dict=False,
+                )[0]
 
         # 3. Scheduler step
         output = self.scheduler.step(

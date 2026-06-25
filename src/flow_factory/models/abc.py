@@ -137,6 +137,15 @@ class BaseAdapter(ABC):
     # with a non-standard layout may override this with an explicit `LatentAxes`.
     LATENT_AXES: ClassVar[Optional[LatentAxes]] = None
 
+    # DDP-only knob (ignored under FSDP/DeepSpeed). Set True only for adapters
+    # whose training step can leave some trainable parameters without a gradient
+    # in a given iteration (e.g. Qwen-Image: guidance=None leaves the guidance
+    # embedder unused). The default False lets DDP use static buckets and overlap
+    # gradient all-reduce with backward; if an adapter actually needs True but
+    # leaves it False, DDP fails fast at the first backward with an explicit
+    # "didn't receive grad" error rather than silently producing wrong results.
+    ddp_find_unused_parameters: ClassVar[bool] = False
+
     def __init__(self, config: Arguments, accelerator : Accelerator):
         super().__init__()
         self.config = config

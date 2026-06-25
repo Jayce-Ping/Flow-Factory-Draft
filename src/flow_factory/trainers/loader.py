@@ -23,6 +23,7 @@ from accelerate.utils import set_seed, ProjectConfiguration
 import logging
 
 from ..models.loader import load_model
+from ..models.registry import get_model_adapter_class
 from .abc import BaseTrainer
 from .registry import get_trainer_class, list_registered_trainers
 from ..hparams import Arguments
@@ -31,7 +32,6 @@ from ..utils.env_utils import reconcile_config
 
 logger = setup_logger(__name__)
 
-ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True) # Fix issue that Qwen-Image uses different cache context for CFG forwards
 
 def load_trainer(config: Arguments) -> BaseTrainer:
     """
@@ -58,6 +58,16 @@ def load_trainer(config: Arguments) -> BaseTrainer:
         config.training_args.trainer_type = "my_package.trainers.PPOTrainer"
         trainer = load_trainer(config)
     """
+    # Resolve DDP find_unused_parameters from the adapter class (opt-in per
+    # model). Resolving via the registry imports only the class (no
+    # instantiation). This kwarg only affects the DDP backend; FSDP/DeepSpeed
+    # ignore it. Default False lets DDP use static buckets and overlap gradient
+    # all-reduce with backward; adapters that leave trainable params ungraded in
+    # some iterations (e.g. Qwen-Image) opt in via ddp_find_unused_parameters.
+    adapter_cls = get_model_adapter_class(config.model_args.model_type)
+    find_unused = getattr(adapter_cls, "ddp_find_unused_parameters", False)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=find_unused)
+
     # Initialize Accelerator
     accelerator_config = ProjectConfiguration(
         project_dir=os.path.join(config.log_args.save_dir, config.log_args.run_name),
