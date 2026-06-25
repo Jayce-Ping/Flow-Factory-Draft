@@ -69,6 +69,11 @@ class WanV2VSample(V2VSample):
     pass
 
 class Wan2_V2V_Adapter(BaseAdapter):
+    # Wan2.2 trains both transformer and transformer_2 but uses only one per
+    # timestep (boundary_ratio), so under DDP the other's trainable params get no
+    # gradient in a given step. Ignored under DeepSpeed/FSDP.
+    ddp_find_unused_parameters = True
+
     def __init__(self, config: Arguments, accelerator : Accelerator):
         super().__init__(config, accelerator)
         self._has_warned_multi_video_input = False

@@ -185,6 +185,13 @@ class BagelAdapter(BaseAdapter):
     # re-normalized by ``_normalize_condition_images``.
     python_format_columns: ClassVar[frozenset[str]] = frozenset({"condition_images"})
 
+    # Bagel is a mixture-of-transformer-experts model: the generation path uses
+    # *_moe_gen experts while the understanding/ViT path is unused during RL
+    # generation, and NaViT packing varies which sub-modules run per batch. Some
+    # trainable params can therefore receive no gradient in a given step, so DDP
+    # must scan for unused parameters. Ignored under DeepSpeed/FSDP.
+    ddp_find_unused_parameters = True
+
     def __init__(self, config: Arguments, accelerator: Accelerator):
         # Load tokenizer and transforms before super().__init__
         # because load_pipeline may need them, and base __init__ calls load_pipeline
