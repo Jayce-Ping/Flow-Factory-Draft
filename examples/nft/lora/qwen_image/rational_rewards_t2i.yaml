@@ -85,7 +85,7 @@ scheduler:
 # Optional rollout/throughput acceleration (off by default). See guidance/acceleration.md.
 # NFT is a decoupled trainer, so lossy rollout feature-caching is allowed here.
 # acceleration:
-#   shared_accelerator: "torch_compile"   # lossless, both stages. Options: torch_compile, attention_backend
+#   shared_accelerator: "torch_compile"   # lossless, both stages (attention backend -> model.attn_backend)
 #   shared_params: { mode: "regional" }   # regional (compile_repeated_blocks) | full
 #   rollout_accelerator: "diffusers_cache"  # lossy, rollout-only. Options: diffusers_cache, cache_dit
 #   rollout_params: { policy: "first_block", threshold: 0.08 }

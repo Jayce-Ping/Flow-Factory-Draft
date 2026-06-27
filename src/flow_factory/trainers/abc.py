@@ -93,6 +93,10 @@ class BaseTrainer(ABC):
 
         self._initialization()
         self.adapter.post_init()
+        # Apply the shared (lossless) accelerator last: after prepare, state-resume,
+        # EMA, and reference-parameter setup, so e.g. torch.compile wraps the final
+        # weights and keeps state_dict keys / parameter identity stable.
+        self._apply_shared_acceleration()
         self._init_logging_backend()
 
         self._patch_deepspeed_autocast(accelerator)
@@ -376,21 +380,24 @@ class BaseTrainer(ABC):
         # Load inference modules, excluding all bundle members (already prepared).
         self._load_inference_components(bundle_names)
 
-        # Build acceleration plugins now that the prepared transformer proxies are
-        # installed (shared accelerators like torch.compile mutate them in place).
+        # Build + validate acceleration plugins. The shared (lossless) accelerator
+        # is *applied* later via _apply_shared_acceleration(), after post_init()
+        # finishes any state-resume / EMA / reference setup.
         self._init_acceleration()
 
         # Initialize reward model
         self._init_reward_model()
 
     def _init_acceleration(self):
-        """Build and install acceleration plugins from ``config.acceleration_args``.
+        """Build and validate acceleration plugins from ``config.acceleration_args``.
 
         Two independent slots (both off by default):
 
-        * ``shared_accelerator`` — a lossless accelerator applied here via
-          :meth:`~BaseAccelerator.setup` (e.g. ``torch.compile``); it affects both
-          rollout and the training forward.
+        * ``shared_accelerator`` — a lossless accelerator (e.g. ``torch.compile``)
+          that affects both rollout and the training forward. Only built/validated
+          here; it is *applied* later by :meth:`_apply_shared_acceleration` (after
+          ``post_init`` finishes state-resume / EMA / reference setup), so it
+          transforms the final weights.
         * ``rollout_accelerator`` — applied per-epoch in :meth:`generate_samples`
           via :meth:`~BaseAccelerator.rollout_context`; may be lossy.
 
@@ -413,14 +420,7 @@ class BaseTrainer(ABC):
             validate_accelerator(
                 accelerator, slot="shared", paradigm=paradigm, trainer_name=trainer_name
             )
-            accelerator.setup(self.adapter)
             self.shared_accelerator = accelerator
-            if self.accelerator.is_main_process:
-                logger.info(
-                    "Acceleration: shared accelerator '%s' (safety=%s) applied.",
-                    accel_args.shared_accelerator,
-                    accelerator.safety,
-                )
 
         if accel_args.rollout_accelerator:
             accelerator = build_accelerator(
@@ -436,6 +436,26 @@ class BaseTrainer(ABC):
                     accel_args.rollout_accelerator,
                     accelerator.safety,
                 )
+
+    def _apply_shared_acceleration(self) -> None:
+        """Apply the shared (lossless) accelerator to the adapter.
+
+        Called from ``__init__`` AFTER ``adapter.post_init()`` so that compilation
+        happens once all weights are final — i.e. after ``accelerator.prepare``,
+        any ``state`` checkpoint resume, and EMA / reference-parameter snapshotting.
+        In-place compilation (``nn.Module.compile`` / ``compile_repeated_blocks``)
+        preserves parameter identity and ``state_dict`` keys, so checkpointing and
+        the ``copy_``-based EMA / ref / named-parameter swaps stay correct.
+        """
+        accelerator = getattr(self, "shared_accelerator", None)
+        if accelerator is None:
+            return
+        accelerator.setup(self.adapter)
+        if self.accelerator.is_main_process:
+            logger.info(
+                "Acceleration: shared accelerator (safety=%s) applied to adapter.",
+                accelerator.safety,
+            )
 
     def _rollout_acceleration(self) -> AbstractContextManager:
         """Return the rollout accelerator's context, or a no-op when disabled."""

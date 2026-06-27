@@ -34,11 +34,26 @@ class CompileAccelerator(BaseAccelerator):
     ``adapter.transformer``), so numerical behavior stays consistent across the
     two — safe even for coupled algorithms.
 
+    Both modes compile **in place** (``nn.Module.compile`` /
+    ``compile_repeated_blocks``), which preserves parameter identity and leaves
+    ``state_dict`` keys unchanged (no ``_orig_mod.`` prefix). Consequences:
+
+    * **Checkpointing** stays correct — save/load operate on the same keys.
+    * **EMA / reference / named-parameter swaps** stay correct — they mutate
+      ``param.data`` in place (``copy_``), which the compiled graph reads.
+    * **LoRA reference forwards** (``use_ref_parameters`` -> PEFT
+      ``disable_adapter``) toggle control flow, so Dynamo recompiles the
+      adapter-disabled path once; this is correct but adds a one-time recompile.
+
+    Applied after ``post_init`` (see ``BaseTrainer._apply_shared_acceleration``),
+    so it wraps the final, fully-loaded weights.
+
     Parameters (from ``acceleration.shared_params``):
         mode: ``"regional"`` (default) compiles only the repeated transformer
             blocks via diffusers' ``compile_repeated_blocks`` — fast warmup and
             robust to the variable image/sequence lengths set per resolution.
-            ``"full"`` compiles the whole module in place.
+            Requires the transformer to declare ``_repeated_blocks``. ``"full"``
+            compiles the whole module in place.
         compile_kwargs: Extra kwargs forwarded to the underlying compile call
             (e.g. ``{"mode": "max-autotune", "dynamic": true}``).
     """
@@ -64,11 +79,15 @@ class CompileAccelerator(BaseAccelerator):
         for name in transformer_names:
             module = adapter.get_component(name)
             if mode == "regional":
-                if not hasattr(module, "compile_repeated_blocks"):
+                # `compile_repeated_blocks` exists on every diffusers ModelMixin but
+                # only works when the model declares `_repeated_blocks`; check the
+                # unwrapped module so the error is actionable.
+                inner = adapter._unwrap(module)
+                if not getattr(inner, "_repeated_blocks", None):
                     raise ValueError(
-                        f"CompileAccelerator: component '{name}' "
-                        f"({type(adapter._unwrap(module)).__name__}) has no "
-                        "`compile_repeated_blocks`; use `mode: full` for whole-module compilation."
+                        f"CompileAccelerator: component '{name}' ({type(inner).__name__}) does "
+                        "not declare `_repeated_blocks`, so regional compilation is unavailable. "
+                        "Use `mode: full` for whole-module compilation."
                     )
                 module.compile_repeated_blocks(**compile_kwargs)
             else:

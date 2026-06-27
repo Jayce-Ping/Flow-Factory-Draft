@@ -32,8 +32,10 @@ logger = setup_logger(__name__)
 # Accelerator Registry Storage
 _ACCELERATOR_REGISTRY: Dict[str, str] = {
     # Lossless (safe for any algorithm, applied to the shared transformer).
+    # NOTE: attention-backend selection is handled by `model.attn_backend`
+    # (BaseAdapter._set_attention_backend); it is intentionally NOT an accelerator
+    # here to avoid a second, redundant set after prepare.
     'torch_compile': 'flow_factory.acceleration.torch_compile.CompileAccelerator',
-    'attention_backend': 'flow_factory.acceleration.attention_backend.AttentionBackendAccelerator',
     # Lossy (rollout-only; validator restricts to decoupled / distillation algos).
     'diffusers_cache': 'flow_factory.acceleration.diffusers_cache.DiffusersCacheAccelerator',
     'cache_dit': 'flow_factory.acceleration.cache_dit.CacheDitAccelerator',

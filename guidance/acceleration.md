@@ -33,7 +33,7 @@ default:
 ```yaml
 acceleration:
   # Lossless, applied to BOTH rollout and the training forward.
-  shared_accelerator: "torch_compile"        # torch_compile | attention_backend
+  shared_accelerator: "torch_compile"        # torch_compile
   shared_params: { mode: "regional" }        # regional (compile_repeated_blocks) | full
 
   # Rollout-only (Stage 3). May be lossy (paradigm-gated).
@@ -48,10 +48,14 @@ accepted in place of a registered id.
 
 | id | safety | stage | Notes |
 |----|--------|-------|-------|
-| `torch_compile` | lossless | both | `torch.compile` of the shared transformer. `mode: regional` uses diffusers' `compile_repeated_blocks` (fast warmup, robust to variable resolution); `mode: full` compiles the whole module. Extra `compile_kwargs` forwarded to the compile call. |
-| `attention_backend` | lossless | both | Sets an exact diffusers attention backend on every transformer. `backend`: `native` / `flash` / `flash_hub` / `_flash_3` / `_flash_3_hub` / `xformers`. Complements `model.attn_backend`. |
+| `torch_compile` | lossless | both | `torch.compile` of the shared transformer. `mode: regional` uses diffusers' `compile_repeated_blocks` (fast warmup, robust to variable resolution); `mode: full` compiles the whole module. Extra `compile_kwargs` forwarded to the compile call. Compiles in place (checkpoint- and EMA/ref-safe), applied after `post_init`. |
 | `diffusers_cache` | lossy | rollout | Diffusers-native feature caching (no extra dependency). `policy`: `first_block` (default) / `faster` / `pyramid` / `taylorseer` / `magcache`; remaining params forwarded to the policy's diffusers config (e.g. `threshold`). |
 | `cache_dit` | lossy | rollout | [cache-dit](https://github.com/vipshop/cache-dit) backend (DBCache/TaylorSeer). Requires `pip install flow-factory[acceleration]`. All params forwarded to `cache_dit.enable_cache`. |
+
+> Attention-backend selection (FlashAttention 2/3, xformers, native SDPA) is **not** an
+> accelerator — set it once via `model.attn_backend` (handled by
+> `BaseAdapter._set_attention_backend`), which already applies to every transformer
+> framework-wide and is lossless.
 
 ## Model cache-readiness (lossy caching)
 
@@ -62,7 +66,7 @@ FLUX.2-Klein — are cache-ready. Adapters that call the transformer bare (e.g. 
 need their forward wrapped in a `cache_context` first. Validate the reward distribution
 before/after enabling on a new model.
 
-`torch_compile` and `attention_backend` are model-agnostic and apply to every adapter.
+`torch_compile` is model-agnostic and applies to every adapter.
 
 ## Adding a new accelerator
 

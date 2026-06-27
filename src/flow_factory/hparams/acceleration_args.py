@@ -28,7 +28,7 @@ class AccelerationArguments(ArgABC):
     unaffected):
 
     * ``shared_*`` — a lossless accelerator applied to BOTH rollout and the
-      training forward (e.g. ``torch_compile``, ``attention_backend``).
+      training forward (e.g. ``torch_compile``).
     * ``rollout_*`` — an accelerator applied only during Stage-3 rollout. May be
       lossy (e.g. feature caching), in which case the trainer paradigm validator
       restricts it to decoupled / distillation algorithms.
@@ -47,7 +47,8 @@ class AccelerationArguments(ArgABC):
         metadata={
             "help": (
                 "Lossless accelerator id (or python path) applied to both rollout and training. "
-                "Options: 'torch_compile', 'attention_backend'. None disables it."
+                "Options: 'torch_compile'. None disables it. "
+                "(Attention backend is set via model.attn_backend, not here.)"
             )
         },
     )
