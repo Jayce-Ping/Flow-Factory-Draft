@@ -92,7 +92,7 @@ Stage 6: Policy Optimization
 
 ## Registry System
 
-All three registries map string keys → lazy import paths. Resolution: registry lookup → fallback to direct Python path → dynamic import. See `trainers/registry.py`, `models/registry.py`, `rewards/registry.py` for implementation.
+All four registries map string keys → lazy import paths. Resolution: registry lookup → fallback to direct Python path → dynamic import. See `trainers/registry.py`, `models/registry.py`, `rewards/registry.py`, `acceleration/registry.py` for implementation.
 
 ### Registered Components
 
@@ -147,6 +147,16 @@ All three registries map string keys → lazy import paths. Resolution: registry
 | `hpsv2` | `HPSv2RewardModel` | Pointwise |
 | `qwen_image_bench` | `QwenImageBenchRewardModel` | Pointwise |
 
+**Accelerators** (`acceleration/registry.py`):
+| Key | Class | Safety | Stage | Notes |
+|-----|-------|--------|-------|-------|
+| `torch_compile` | `CompileAccelerator` | lossless | both | `torch.compile` of the shared transformer (regional/full). |
+| `attention_backend` | `AttentionBackendAccelerator` | lossless | both | Sets an exact diffusers attention backend (FA2/FA3/xformers/native). |
+| `diffusers_cache` | `DiffusersCacheAccelerator` | lossy | rollout | Diffusers `CacheMixin` feature caching (first_block/faster/pyramid/taylorseer/magcache). |
+| `cache_dit` | `CacheDitAccelerator` | lossy | rollout | Optional `cache-dit` backend (DBCache/TaylorSeer). |
+
+Configured via the `acceleration:` block (`hparams/acceleration_args.py`): `shared_accelerator` (lossless, both stages) and `rollout_accelerator` (Stage-3 only). The `acceleration/validator.py` enforces that lossy accelerators are rollout-only and only on `decoupled`/`distillation` trainers (each trainer declares a `paradigm`), preserving train-inference consistency (constraints #7, #20a). Off by default.
+
 ---
 
 ## Extension Points
@@ -154,6 +164,7 @@ All three registries map string keys → lazy import paths. Resolution: registry
 - **New model adapter**: `guidance/new_model.md`, skill `/ff-new-model`, conventions `topics/adapter_conventions.md`
 - **New reward model**: `guidance/rewards.md`, skill `/ff-new-reward`
 - **New algorithm**: `guidance/algorithms.md`, skill `/ff-new-algorithm`
+- **New accelerator**: subclass `acceleration/abc.py::BaseAccelerator` (declare `safety`/`stage`), register in `acceleration/registry.py`
 
 ---
 
