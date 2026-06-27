@@ -34,6 +34,9 @@ _ACCELERATOR_REGISTRY: Dict[str, str] = {
     # Lossless (safe for any algorithm, applied to the shared transformer).
     'torch_compile': 'flow_factory.acceleration.torch_compile.CompileAccelerator',
     'attention_backend': 'flow_factory.acceleration.attention_backend.AttentionBackendAccelerator',
+    # Lossy (rollout-only; validator restricts to decoupled / distillation algos).
+    'diffusers_cache': 'flow_factory.acceleration.diffusers_cache.DiffusersCacheAccelerator',
+    'cache_dit': 'flow_factory.acceleration.cache_dit.CacheDitAccelerator',
 }
 _ACCELERATOR_REGISTRY = {k.lower(): v for k, v in _ACCELERATOR_REGISTRY.items()}
 
