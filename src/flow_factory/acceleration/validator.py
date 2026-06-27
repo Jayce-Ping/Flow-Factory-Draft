@@ -15,17 +15,23 @@
 # src/flow_factory/acceleration/validator.py
 """Paradigm-gated safety validation for accelerators (fail-fast, ``constraints.md`` #26).
 
-The correctness contract (``constraints.md`` #7 + #20a):
+The correctness contract (``constraints.md`` #7 + #20a) hinges on **symmetric
+application**, encoded by ``stage``, not on numerical bit-exactness:
 
-* A ``lossy`` accelerator changes ``noise_pred`` and cannot be replicated in the
-  Stage-6 training forward (which needs full gradient through every block). It is
-  therefore only valid in the ``rollout`` slot, and only for **decoupled** /
-  **distillation** algorithms — for **coupled** algorithms (GRPO / GRPO-Guard /
-  DPPO) the rollout log-prob becomes the PPO "old log-prob" and an approximated
-  rollout would bias the importance ratio -> silently wrong gradients.
-* A ``lossless`` accelerator is numerically ~identical and, because it mutates the
-  shared transformer used by both ``inference()`` and ``forward()``, is safe in
-  any slot for any algorithm.
+* ``stage='both'`` accelerators mutate the transformer persistently, so the exact
+  same transform is in both rollout ``inference()`` and training ``forward()``.
+  Rollout and training therefore stay CONSISTENT — even for numerically-approximate
+  transforms (e.g. Sage int8 attention) — so they are safe for any algorithm. They
+  belong in the ``shared`` slot; ``safety`` is not consulted for them.
+* ``stage='rollout'`` accelerators run only during Stage-3 rollout. If such an
+  accelerator changes outputs (``safety='lossy'``, e.g. feature caching), rollout
+  diverges from the training forward, which it cannot be replicated in (that needs
+  full gradient through every block). That is only safe when the rollout
+  trajectory's log-prob never feeds the loss — i.e. **decoupled** / **distillation**
+  algorithms. For **coupled** algorithms (GRPO / GRPO-Guard / DPPO) the rollout
+  log-prob becomes the PPO "old log-prob", so a divergent rollout biases the
+  importance ratio -> silently wrong gradients. A bit-identical rollout accelerator
+  (``safety='lossless'``) is safe for any paradigm.
 """
 
 from typing import Optional
@@ -70,24 +76,37 @@ def validate_accelerator(
             f"Unknown acceleration slot {slot!r} for '{name}'; expected 'shared' or 'rollout'."
         )
 
-    # The `shared` slot applies to BOTH rollout and the training forward, so only
-    # lossless accelerators may live there.
+    # The slot must match the accelerator's `stage`: `shared` accelerators mutate the
+    # transformer persistently (applied to both rollout and training via `setup`);
+    # `rollout` accelerators are a per-epoch context (`rollout_context`). A mismatch
+    # would silently no-op (e.g. a stage='both' accelerator in the rollout slot has
+    # no rollout_context), so reject it.
     if slot == "shared":
-        if accelerator.safety != "lossless":
-            raise ValueError(
-                f"Accelerator '{name}' (safety='{accelerator.safety}') is configured under "
-                "`acceleration.shared_accelerator`, but the shared slot is applied to BOTH "
-                "rollout and the training forward — only lossless accelerators are allowed there. "
-                "Move a lossy accelerator to `acceleration.rollout_accelerator`."
-            )
         if accelerator.stage != "both":
             raise ValueError(
                 f"Accelerator '{name}' (stage='{accelerator.stage}') cannot occupy the shared "
-                "slot; the shared slot requires a stage='both' accelerator."
+                "slot, which applies a persistent transform to both rollout and training. Put a "
+                "stage='both' accelerator here, or move this one to `acceleration.rollout_accelerator`."
             )
+        # No safety gate here: a stage='both' transform is applied identically to
+        # rollout `inference()` and training `forward()` (the same shared module), so
+        # rollout and training stay CONSISTENT even for numerically-approximate
+        # backends (e.g. Sage int8 attention). Train-inference consistency depends on
+        # symmetric application, not on bit-exactness.
         return
 
-    # slot == "rollout": lossless is always fine; lossy is gated on paradigm.
+    # slot == "rollout".
+    if accelerator.stage != "rollout":
+        raise ValueError(
+            f"Accelerator '{name}' (stage='{accelerator.stage}') cannot occupy the rollout slot, "
+            "which only runs a per-epoch `rollout_context`. Put a stage='both' accelerator under "
+            "`acceleration.shared_accelerator` instead."
+        )
+
+    # A rollout-only accelerator that changes outputs (`lossy`) makes rollout diverge
+    # from the training forward, so it is only safe when the rollout trajectory's
+    # log-prob never feeds the loss (decoupled / distillation). A `lossless`
+    # rollout accelerator (bit-identical) is safe for any paradigm.
     if accelerator.safety == "lossy":
         if paradigm is None:
             raise ValueError(
@@ -102,7 +121,7 @@ def validate_accelerator(
                 "cannot be replicated in the training forward; for coupled algorithms "
                 "(GRPO / GRPO-Guard / DPPO) this biases the PPO importance ratio and silently "
                 f"corrupts gradients. Allowed paradigms: {sorted(_LOSSY_SAFE_PARADIGMS)}. Use a "
-                "lossless accelerator (e.g. 'torch_compile') instead, or switch to a decoupled "
+                "stage='both' accelerator (e.g. 'torch_compile') instead, or switch to a decoupled "
                 "algorithm (NFT / AWM / DGPO / DPO / CRD)."
             )
         logger.warning(

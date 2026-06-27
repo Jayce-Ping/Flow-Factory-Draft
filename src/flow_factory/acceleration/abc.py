@@ -16,18 +16,30 @@
 """Abstract base class for the model-agnostic acceleration plugin layer.
 
 An accelerator is a pluggable speedup applied to a model adapter's transformer(s)
-without touching trainer or model math. Each accelerator declares two invariants
-that the validator (:mod:`flow_factory.acceleration.validator`) enforces against
-the trainer's RL paradigm:
+without touching trainer or model math. Each accelerator declares two markers that
+the validator (:mod:`flow_factory.acceleration.validator`) uses to preserve
+train-inference consistency against the trainer's RL paradigm:
 
-* ``safety`` — ``"lossless"`` (numerically ~identical; safe for any algorithm and
-  any stage because the same module backs both rollout ``inference()`` and the
-  training ``forward()``) or ``"lossy"`` (changes ``noise_pred``; only safe during
-  rollout for **decoupled / distillation** algorithms — see ``constraints.md`` #7
-  and #20a).
-* ``stage`` — ``"both"`` (a one-time mutation applied via :meth:`setup`, e.g.
-  ``torch.compile``) or ``"rollout"`` (a per-epoch context applied via
-  :meth:`rollout_context`, e.g. feature caching).
+* ``stage`` — *where/how* it is applied, and which config slot it belongs to:
+
+  - ``"both"``: a persistent, one-time mutation via :meth:`setup` (e.g.
+    ``torch.compile``, attention backend). Because it transforms the module shared
+    by rollout ``inference()`` and training ``forward()``, the two stay CONSISTENT
+    by construction — safe for any algorithm. Belongs in the ``shared`` slot.
+  - ``"rollout"``: a per-epoch context via :meth:`rollout_context` (e.g. feature
+    caching), torn down before the training forward. Belongs in the ``rollout`` slot.
+
+* ``safety`` — the train-inference consistency class, **only consulted for
+  ``stage='rollout'`` accelerators**:
+
+  - ``"lossless"``: bit-identical outputs (rollout unchanged) — safe for any paradigm.
+  - ``"lossy"``: changes outputs, so rollout diverges from the (un-accelerated)
+    training forward — only safe when the rollout log-prob never feeds the loss, i.e.
+    **decoupled / distillation** algorithms (see ``constraints.md`` #7, #20a).
+
+  For ``stage='both'`` accelerators ``safety`` is informational: a symmetric
+  transform is consistent regardless of numerical exactness, so even an approximate
+  attention backend (e.g. Sage int8) used in *both* stages is safe.
 
 Subclasses implement only what they need: ``setup`` defaults to a no-op,
 ``rollout_context`` defaults to yielding without modification.

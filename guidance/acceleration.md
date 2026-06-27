@@ -9,21 +9,29 @@ under `torch.no_grad()`), so that is where most accelerators apply.
 
 ## Safety model (read this first)
 
+The correctness axis is **symmetric application** (`stage`), not numerical bit-exactness.
 Every accelerator declares two markers, and a validator (`acceleration/validator.py`)
 enforces them against the trainer's `paradigm` before training starts (fail-fast):
 
-| `safety` | Meaning | Where allowed |
-|----------|---------|---------------|
-| `lossless` | Numerically ~identical; applied to the transformer shared by both rollout `inference()` and training `forward()`. | Any algorithm, any stage. |
-| `lossy` | Changes `noise_pred` (e.g. feature caching). Cannot be replicated in the training forward. | **Rollout only**, and only on `decoupled` / `distillation` trainers. |
+| marker | values | meaning |
+|--------|--------|---------|
+| `stage` | `both` / `rollout` | `both`: persistent transform applied to the transformer shared by rollout `inference()` and training `forward()` → **consistent by construction, safe for any algorithm** (the `shared` slot). `rollout`: per-epoch context, torn down before training (the `rollout` slot). |
+| `safety` | `lossless` / `lossy` | Only consulted for `stage='rollout'`. `lossy` = changes rollout outputs → diverges from training. `lossless` = bit-identical. |
 
-Why the restriction: for **coupled** algorithms (GRPO, GRPO-Guard, DPPO) the rollout's
-per-step log-prob becomes the PPO "old log-prob". Approximating the rollout while the
-training forward stays exact biases the importance ratio and silently corrupts gradients
-(`.agents/knowledge/constraints.md` #7, #20a). For **decoupled** algorithms (NFT, AWM,
-DGPO, DPO, CRD) and **distillation** (diffusion-opd), the rollout trajectory's log-prob
-does not enter the loss, so lossy caching only shifts the generated-sample distribution —
-acceptable and tunable. Monitor the reward mean/std when enabling a lossy accelerator.
+The single restriction: a **`lossy` rollout** accelerator is allowed **only on
+`decoupled` / `distillation`** trainers. Why: for **coupled** algorithms (GRPO,
+GRPO-Guard, DPPO) the rollout's per-step log-prob becomes the PPO "old log-prob";
+changing the rollout while the training forward stays exact biases the importance ratio
+and silently corrupts gradients (`.agents/knowledge/constraints.md` #7, #20a). For
+**decoupled** (NFT, AWM, DGPO, DPO, CRD) and **distillation** (diffusion-opd), the rollout
+log-prob does not enter the loss, so a lossy rollout only shifts the generated-sample
+distribution — acceptable and tunable. Monitor the reward mean/std when enabling it.
+
+A `stage='both'` accelerator is **always safe** — even a numerically-approximate one. For
+example, Sage int8 attention used as the attention backend runs in *both* rollout and
+training, so the two stay consistent; there is no need to reject it or give it a special
+"lossy" status. Numerical exactness only matters when a transform is applied to one stage
+but not the other, which is exactly what `stage='rollout'` + `safety='lossy'` captures.
 
 ## Configuration
 
