@@ -16,7 +16,8 @@
 import json
 import os
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, Tuple, List, Union, Literal, Iterator
+from contextlib import AbstractContextManager, nullcontext
+from typing import Dict, Any, ClassVar, Optional, Tuple, List, Union, Literal, Iterator
 from functools import partial
 import numpy as np
 import torch
@@ -40,6 +41,7 @@ from ..data_utils.loader import (
 )
 from ..rewards import load_reward_model, BaseRewardModel, MultiRewardLoader, RewardProcessor, RewardBuffer
 from ..advantage import AdvantageProcessor
+from ..acceleration import BaseAccelerator, build_accelerator, validate_accelerator
 from ..logger import load_logger, LogFormatter
 from ..samples import BaseSample, StackedSampleBatch
 from ..utils.logger_utils import setup_logger
@@ -61,6 +63,13 @@ class BaseTrainer(ABC):
     """
     Abstract Base Class for Flow-Factory trainers.
     """
+
+    # RL paradigm of this algorithm (``constraints.md`` #7). Read by the
+    # acceleration validator to gate lossy rollout accelerators: only
+    # 'decoupled' / 'distillation' trainers may use them. Concrete trainers
+    # MUST override this; leaving it None disables lossy acceleration.
+    paradigm: ClassVar[Optional[Literal["coupled", "decoupled", "distillation"]]] = None
+
     def __init__(
             self,
             accelerator: Accelerator,
@@ -367,8 +376,72 @@ class BaseTrainer(ABC):
         # Load inference modules, excluding all bundle members (already prepared).
         self._load_inference_components(bundle_names)
 
+        # Build acceleration plugins now that the prepared transformer proxies are
+        # installed (shared accelerators like torch.compile mutate them in place).
+        self._init_acceleration()
+
         # Initialize reward model
         self._init_reward_model()
+
+    def _init_acceleration(self):
+        """Build and install acceleration plugins from ``config.acceleration_args``.
+
+        Two independent slots (both off by default):
+
+        * ``shared_accelerator`` — a lossless accelerator applied here via
+          :meth:`~BaseAccelerator.setup` (e.g. ``torch.compile``); it affects both
+          rollout and the training forward.
+        * ``rollout_accelerator`` — applied per-epoch in :meth:`generate_samples`
+          via :meth:`~BaseAccelerator.rollout_context`; may be lossy.
+
+        Each accelerator is validated against this trainer's ``paradigm`` before
+        use (fail-fast, ``constraints.md`` #26).
+        """
+        accel_args = getattr(self.config, "acceleration_args", None)
+        self.shared_accelerator: Optional[BaseAccelerator] = None
+        self.rollout_accelerator: Optional[BaseAccelerator] = None
+        if accel_args is None:
+            return
+
+        trainer_name = type(self).__name__
+        paradigm = type(self).paradigm
+
+        if accel_args.shared_accelerator:
+            accelerator = build_accelerator(
+                accel_args.shared_accelerator, accel_args.shared_params
+            )
+            validate_accelerator(
+                accelerator, slot="shared", paradigm=paradigm, trainer_name=trainer_name
+            )
+            accelerator.setup(self.adapter)
+            self.shared_accelerator = accelerator
+            if self.accelerator.is_main_process:
+                logger.info(
+                    "Acceleration: shared accelerator '%s' (safety=%s) applied.",
+                    accel_args.shared_accelerator,
+                    accelerator.safety,
+                )
+
+        if accel_args.rollout_accelerator:
+            accelerator = build_accelerator(
+                accel_args.rollout_accelerator, accel_args.rollout_params
+            )
+            validate_accelerator(
+                accelerator, slot="rollout", paradigm=paradigm, trainer_name=trainer_name
+            )
+            self.rollout_accelerator = accelerator
+            if self.accelerator.is_main_process:
+                logger.info(
+                    "Acceleration: rollout accelerator '%s' (safety=%s) enabled.",
+                    accel_args.rollout_accelerator,
+                    accelerator.safety,
+                )
+
+    def _rollout_acceleration(self) -> AbstractContextManager:
+        """Return the rollout accelerator's context, or a no-op when disabled."""
+        if self.rollout_accelerator is not None:
+            return self.rollout_accelerator.rollout_context(self.adapter)
+        return nullcontext()
 
     def _synchronize_frozen_components(self):
         if self.accelerator.num_processes <= 1:
@@ -758,7 +831,9 @@ class BaseTrainer(ABC):
         samples: List[BaseSample] = []
         data_iter = iter(self.dataloader)
 
-        with torch.no_grad(), self.autocast():
+        # Stage-3-only acceleration (e.g. feature caching) is scoped to this loop
+        # so its state never leaks into the Stage-6 training forward.
+        with self._rollout_acceleration(), torch.no_grad(), self.autocast():
             for _ in tqdm(
                 range(self.training_args.num_batches_per_epoch),
                 desc=f'Epoch {self.epoch} Sampling',

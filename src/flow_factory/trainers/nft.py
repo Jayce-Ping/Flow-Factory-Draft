@@ -50,6 +50,10 @@ class DiffusionNFTTrainer(BaseTrainer):
     Reference: https://arxiv.org/abs/2509.16117
     """
 
+    # Decoupled paradigm: rollout trajectory log-probs do not enter the loss,
+    # so lossy rollout acceleration is permitted (constraints.md #7).
+    paradigm = "decoupled"
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 

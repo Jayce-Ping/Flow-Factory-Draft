@@ -122,6 +122,9 @@ class DGPOTrainer(BaseTrainer):
     Reference: [1] DGPO: Reinforcing Diffusion Models by Direct Group Preference Optimization (ICLR 2026).
     """
 
+    # Decoupled paradigm: lossy rollout acceleration is permitted (constraints.md #7).
+    paradigm = "decoupled"
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 

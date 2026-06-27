@@ -39,6 +39,7 @@ from .training_args import (
     get_training_args_class,
 )
 from .reward_args import RewardArguments, MultiRewardArguments
+from .acceleration_args import AccelerationArguments
 from .log_args import LogArguments
 from ..utils.logger_utils import setup_logger
 from ..utils.dist import get_world_size
@@ -147,6 +148,10 @@ class Arguments(ArgABC):
     log_args: LogArguments = field(
         default_factory=LogArguments,
         metadata={"help": "Arguments for logging configuration."},
+    )
+    acceleration_args: AccelerationArguments = field(
+        default_factory=AccelerationArguments,
+        metadata={"help": "Arguments for the acceleration plugin layer."},
     )
     reward_args: MultiRewardArguments = field(
         default_factory=MultiRewardArguments,
@@ -1000,6 +1005,7 @@ class Arguments(ArgABC):
             'train': ('training_args', training_args_cls),
             'eval': ('eval_args', EvaluationArguments),
             'log': ('log_args', LogArguments),
+            'acceleration': ('acceleration_args', AccelerationArguments),
             'rewards': ('reward_args', MultiRewardArguments),
             'eval_rewards': ('eval_reward_args', MultiRewardArguments),
         }

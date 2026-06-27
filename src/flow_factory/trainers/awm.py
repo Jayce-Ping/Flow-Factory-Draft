@@ -54,6 +54,9 @@ class AWMTrainer(BaseTrainer):
         - https://arxiv.org/pdf/2509.25050
     """
 
+    # Decoupled paradigm: lossy rollout acceleration is permitted (constraints.md #7).
+    paradigm = "decoupled"
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
