@@ -438,24 +438,39 @@ class BaseTrainer(ABC):
                 )
 
     def _apply_shared_acceleration(self) -> None:
-        """Apply the shared (lossless) accelerator to the adapter.
+        """Apply transformer-level (shared) acceleration to the adapter.
 
-        Called from ``__init__`` AFTER ``adapter.post_init()`` so that compilation
-        happens once all weights are final — i.e. after ``accelerator.prepare``,
-        any ``state`` checkpoint resume, and EMA / reference-parameter snapshotting.
+        Called from ``__init__`` AFTER ``adapter.post_init()`` so transforms wrap the
+        final weights — i.e. after ``accelerator.prepare``, any ``state`` checkpoint
+        resume, and EMA / reference-parameter snapshotting. Applied in order:
+
+        1. **Attention backend** from ``model.attn_backend`` — the single code path
+           for backend selection (replaces ``BaseAdapter._set_attention_backend``),
+           run here so it sits after ``prepare`` and before compile.
+        2. The configured **shared accelerator** (e.g. ``torch.compile``), applied
+           last so it captures the chosen attention backend.
+
         In-place compilation (``nn.Module.compile`` / ``compile_repeated_blocks``)
         preserves parameter identity and ``state_dict`` keys, so checkpointing and
         the ``copy_``-based EMA / ref / named-parameter swaps stay correct.
         """
+        # 1. Attention backend (lossless / both stages), sourced from model.attn_backend.
+        #    Always safe (applied to the shared transformer), so it bypasses the
+        #    paradigm validator; AttentionBackendAccelerator.setup is a no-op when
+        #    `model.attn_backend` is unset.
+        if self.model_args.attn_backend:
+            build_accelerator("attention_backend", {}).setup(self.adapter)
+
+        # 2. Configured shared accelerator (e.g. torch.compile), applied after the
+        #    backend so the compiled graph captures it.
         accelerator = getattr(self, "shared_accelerator", None)
-        if accelerator is None:
-            return
-        accelerator.setup(self.adapter)
-        if self.accelerator.is_main_process:
-            logger.info(
-                "Acceleration: shared accelerator (safety=%s) applied to adapter.",
-                accelerator.safety,
-            )
+        if accelerator is not None:
+            accelerator.setup(self.adapter)
+            if self.accelerator.is_main_process:
+                logger.info(
+                    "Acceleration: shared accelerator (safety=%s) applied to adapter.",
+                    accelerator.safety,
+                )
 
     def _rollout_acceleration(self) -> AbstractContextManager:
         """Return the rollout accelerator's context, or a no-op when disabled."""

@@ -48,7 +48,8 @@ class AccelerationArguments(ArgABC):
             "help": (
                 "Lossless accelerator id (or python path) applied to both rollout and training. "
                 "Options: 'torch_compile'. None disables it. "
-                "(Attention backend is set via model.attn_backend, not here.)"
+                "(Attention backend has its own knob, model.attn_backend, applied "
+                "automatically before this.)"
             )
         },
     )

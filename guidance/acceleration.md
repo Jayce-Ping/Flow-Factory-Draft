@@ -48,14 +48,25 @@ accepted in place of a registered id.
 
 | id | safety | stage | Notes |
 |----|--------|-------|-------|
+| `attention_backend` | lossless | both | Sets the diffusers attention backend on every transformer. Configured via `model.attn_backend` (see below); `backend` param can override. Forwards any backend (`native` / `flash` / `_flash_3` / `_flash_3_hub` / `sage` / `xformers`) to `set_attention_backend`. |
 | `torch_compile` | lossless | both | `torch.compile` of the shared transformer. `mode: regional` uses diffusers' `compile_repeated_blocks` (fast warmup, robust to variable resolution); `mode: full` compiles the whole module. Extra `compile_kwargs` forwarded to the compile call. Compiles in place (checkpoint- and EMA/ref-safe), applied after `post_init`. |
 | `diffusers_cache` | lossy | rollout | Diffusers-native feature caching (no extra dependency). `policy`: `first_block` (default) / `faster` / `pyramid` / `taylorseer` / `magcache`; remaining params forwarded to the policy's diffusers config (e.g. `threshold`). |
 | `cache_dit` | lossy | rollout | [cache-dit](https://github.com/vipshop/cache-dit) backend (DBCache/TaylorSeer). Requires `pip install flow-factory[acceleration]`. All params forwarded to `cache_dit.enable_cache`. |
 
-> Attention-backend selection (FlashAttention 2/3, xformers, native SDPA) is **not** an
-> accelerator — set it once via `model.attn_backend` (handled by
-> `BaseAdapter._set_attention_backend`), which already applies to every transformer
-> framework-wide and is lossless.
+### Attention backend
+
+Attention-backend selection keeps its dedicated config knob, `model.attn_backend`:
+
+```yaml
+model:
+  attn_backend: "_flash_3_hub"   # native | flash | flash_hub | _flash_3 | _flash_3_hub | sage | xformers
+```
+
+It is applied through `AttentionBackendAccelerator` by the trainer
+(`BaseTrainer._apply_shared_acceleration`) — after `accelerator.prepare` / `post_init`
+and **before** compile, so the compiled graph captures the chosen backend. This is the
+single code path for backend selection (the old `BaseAdapter._set_attention_backend` was
+removed); it applies whether or not an `acceleration:` block is present.
 
 ## Model cache-readiness (lossy caching)
 

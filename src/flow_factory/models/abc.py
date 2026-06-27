@@ -194,8 +194,10 @@ class BaseAdapter(ABC):
         # Set precision
         self._mix_precision()
 
-        # Set attention backend for all transformers
-        self._set_attention_backend()
+        # NOTE: attention-backend selection is applied later by the trainer's
+        # acceleration step (AttentionBackendAccelerator, from `model.attn_backend`),
+        # after accelerator.prepare()/post_init() and before torch.compile — see
+        # BaseTrainer._apply_shared_acceleration(). It is intentionally NOT set here.
 
         # Enable gradient checkpointing if needed
         if self.training_args.enable_gradient_checkpointing:
@@ -847,25 +849,6 @@ class BaseAdapter(ABC):
                     logger.info(f"Enabled gradient checkpointing for {comp_name}")
                 else:
                     logger.warning(f"{comp_name} does not support gradient checkpointing")
-
-    # ============================== Attention Backend ==============================
-    def _set_attention_backend(self) -> None:
-        """
-        Set attention backend for all transformer components.
-
-        Refer to https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends#available-backends
-        to see supported backends.
-        """
-        backend = self.model_args.attn_backend
-        if backend is None:
-            return
-        
-        for transformer_name in self.transformer_names:
-            transformer = self.get_component(transformer_name)
-            if hasattr(transformer, 'set_attention_backend'):
-                transformer.set_attention_backend(backend)
-                if self.accelerator.is_main_process:
-                    logger.info(f"Set attention backend '{backend}' for {transformer_name}")
 
     # ============================== Precision Management ==============================
     def _cast_module_mixed_precision(
