@@ -150,12 +150,12 @@ All four registries map string keys → lazy import paths. Resolution: registry 
 **Accelerators** (`acceleration/registry.py`):
 | Key | Class | Safety | Stage | Notes |
 |-----|-------|--------|-------|-------|
-| `attention_backend` | `AttentionBackendAccelerator` | lossless | both | Sets the diffusers attention backend on every transformer. Auto-applied from `model.attn_backend` by the trainer (before compile); this is the single code path for backend selection (the old `BaseAdapter._set_attention_backend` was removed). |
+| `attention_backend` | `AttentionBackendAccelerator` | lossless | both | Sets the diffusers attention backend on every transformer (requires a `backend` param). Listed as a `shared` entry (before `torch_compile`); this is the single code path for backend selection (the old `BaseAdapter._set_attention_backend` and the `model.attn_backend` knob were both removed — a config still setting `model.attn_backend` fails fast). Bagel forces flash_attention_2 at load and does not use it. |
 | `torch_compile` | `CompileAccelerator` | lossless | both | `torch.compile` of the shared transformer (regional/full); applied in-place after `post_init` so checkpoint keys / param identity stay stable. |
 | `diffusers_cache` | `DiffusersCacheAccelerator` | lossy | rollout | Diffusers `CacheMixin` feature caching (first_block/faster/pyramid/taylorseer/magcache). |
 | `cache_dit` | `CacheDitAccelerator` | lossy | rollout | Optional `cache-dit` backend (DBCache/TaylorSeer). |
 
-Configured via the `acceleration:` block (`hparams/acceleration_args.py`): `shared_accelerator` (lossless, both stages) and `rollout_accelerator` (Stage-3 only). Attention backend keeps its own knob, `model.attn_backend`, and is applied by the trainer's acceleration step (`BaseTrainer._apply_shared_acceleration`) — attention backend first, then the configured shared accelerator (e.g. compile). The `acceleration/validator.py` enforces that lossy accelerators are rollout-only and only on `decoupled`/`distillation` trainers (each trainer declares a `paradigm`), preserving train-inference consistency (constraints #7, #20a). Off by default.
+Configured via the `acceleration:` block (`hparams/acceleration_args.py`): two ordered lists of `{name, params}` entries — `shared` (lossless, both stages) and `rollout` (Stage-3 only). **List order is application order**: `shared` entries run their `setup()` in order (so `attention_backend` must precede `torch_compile`), and `rollout` entries nest their `rollout_context()` in order. The `acceleration/validator.py` enforces that lossy accelerators are rollout-only and only on `decoupled`/`distillation` trainers (each trainer declares a `paradigm`), preserving train-inference consistency (constraints #7, #20a). Off by default.
 
 ---
 

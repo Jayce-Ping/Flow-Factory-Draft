@@ -86,7 +86,7 @@ def validate_accelerator(
             raise ValueError(
                 f"Accelerator '{name}' (stage='{accelerator.stage}') cannot occupy the shared "
                 "slot, which applies a persistent transform to both rollout and training. Put a "
-                "stage='both' accelerator here, or move this one to `acceleration.rollout_accelerator`."
+                "stage='both' accelerator here, or move this one to the `acceleration.rollout` list."
             )
         # No safety gate here: a stage='both' transform is applied identically to
         # rollout `inference()` and training `forward()` (the same shared module), so
@@ -99,8 +99,8 @@ def validate_accelerator(
     if accelerator.stage != "rollout":
         raise ValueError(
             f"Accelerator '{name}' (stage='{accelerator.stage}') cannot occupy the rollout slot, "
-            "which only runs a per-epoch `rollout_context`. Put a stage='both' accelerator under "
-            "`acceleration.shared_accelerator` instead."
+            "which only runs a per-epoch `rollout_context`. Put a stage='both' accelerator in the "
+            "`acceleration.shared` list instead."
         )
 
     # A rollout-only accelerator that changes outputs (`lossy`) makes rollout diverge

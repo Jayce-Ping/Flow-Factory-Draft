@@ -82,13 +82,18 @@ train:
 scheduler:
   dynamics_type: "ODE"
 
-# Optional rollout/throughput acceleration (off by default). See guidance/acceleration.md.
-# NFT is a decoupled trainer, so lossy rollout feature-caching is allowed here.
+# Optional acceleration plugins (off by default). Applied in list order.
+# See guidance/acceleration.md. NFT is a decoupled trainer, so lossy rollout
+# feature-caching is allowed.
 # acceleration:
-#   shared_accelerator: "torch_compile"   # lossless, both stages (attention backend -> model.attn_backend)
-#   shared_params: { mode: "regional" }   # regional (compile_repeated_blocks) | full
-#   rollout_accelerator: "diffusers_cache"  # lossy, rollout-only. Options: diffusers_cache, cache_dit
-#   rollout_params: { policy: "first_block", threshold: 0.08 }
+#   shared:                          # lossless, applied to BOTH rollout and training (in order)
+#     - name: attention_backend      # set the attention backend first...
+#       params: { backend: _flash_3_varlen_hub }
+#     - name: torch_compile          # ...so the compiled graph captures it
+#       params: { mode: regional }   # regional (compile_repeated_blocks) | full
+#   rollout:                         # rollout-only (Stage 3); lossy -> decoupled/distillation only
+#     - name: diffusers_cache        # Options: diffusers_cache, cache_dit
+#       params: { policy: first_block, threshold: 0.08 }
 
 eval:
   resolution: 512

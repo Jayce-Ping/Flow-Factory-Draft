@@ -33,7 +33,7 @@ from .training_args import (
     get_training_args_class,
 )
 from .reward_args import RewardArguments, MultiRewardArguments
-from .acceleration_args import AccelerationArguments
+from .acceleration_args import AccelerationArguments, AccelerationSpec
 from .dataset_args import DatasetArguments, DatasetTrainSpec, DatasetEvalSpec
 from .log_args import LogArguments
 
@@ -57,6 +57,7 @@ __all__ = [
     "RewardArguments",
     "MultiRewardArguments",
     "AccelerationArguments",
+    "AccelerationSpec",
     "DatasetArguments",
     "DatasetTrainSpec",
     "DatasetEvalSpec",

@@ -48,7 +48,7 @@ class CompileAccelerator(BaseAccelerator):
     Applied after ``post_init`` (see ``BaseTrainer._apply_shared_acceleration``),
     so it wraps the final, fully-loaded weights.
 
-    Parameters (from ``acceleration.shared_params``):
+    Parameters (from the entry's ``params``):
         mode: ``"regional"`` (default) compiles only the repeated transformer
             blocks via diffusers' ``compile_repeated_blocks`` — fast warmup and
             robust to the variable image/sequence lengths set per resolution.

@@ -16,15 +16,15 @@
 """Attention-backend accelerator — the single code path that selects the
 diffusers attention backend for every transformer.
 
-This replaces the old ``BaseAdapter._set_attention_backend`` call: the backend is
-applied here (after ``accelerator.prepare`` / ``post_init`` and before compile)
-instead of in the adapter constructor, so all transformer-level acceleration flows
-through the same plugin mechanism.
+This replaces the old ``BaseAdapter._set_attention_backend`` call and the
+``model.attn_backend`` knob: the backend is now requested as an ``attention_backend``
+entry in the acceleration ``shared`` list and applied here (after
+``accelerator.prepare`` / ``post_init`` and before compile), so all transformer-level
+acceleration flows through the same plugin mechanism.
 
-The backend is read from ``model.attn_backend`` by default (so existing configs
-keep working) and may be overridden by an explicit ``backend`` param. Whatever
-string is given is forwarded to diffusers' ``set_attention_backend`` verbatim —
-including approximate backends like ``sage`` — matching the previous behavior.
+The backend name is taken from the required ``backend`` param and forwarded to
+diffusers' ``set_attention_backend`` verbatim — including approximate backends like
+``sage`` — matching the previous behavior.
 
 Marked ``stage='both'`` / ``safety='lossless'``: a backend is applied to the
 transformer shared by rollout ``inference()`` and training ``forward()``, so the
@@ -46,10 +46,10 @@ logger = setup_logger(__name__)
 class AttentionBackendAccelerator(BaseAccelerator):
     """Set the diffusers attention backend on every transformer component.
 
-    Parameters (from ``acceleration.shared_params``, all optional):
+    Parameters (from the entry's ``params``):
         backend: Backend name forwarded to ``transformer.set_attention_backend``
             (e.g. ``native`` / ``flash`` / ``_flash_3`` / ``_flash_3_hub`` /
-            ``sage`` / ``xformers``). Defaults to ``model.attn_backend``.
+            ``sage`` / ``xformers``). Required.
 
     See https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends
     for the full list of supported backends.
@@ -59,10 +59,12 @@ class AttentionBackendAccelerator(BaseAccelerator):
     stage = "both"
 
     def setup(self, adapter: "BaseAdapter") -> None:
-        backend = self.params.get("backend") or adapter.model_args.attn_backend
-        if backend is None:
-            # Nothing requested (no `backend` param and `model.attn_backend` unset).
-            return
+        backend = self.params.get("backend")
+        if not backend:
+            raise ValueError(
+                "AttentionBackendAccelerator requires a `backend` param, e.g. "
+                "`{ name: attention_backend, params: { backend: _flash_3_hub } }`."
+            )
 
         applied = False
         for name in adapter.transformer_names:
@@ -75,8 +77,10 @@ class AttentionBackendAccelerator(BaseAccelerator):
                         "AttentionBackendAccelerator: set backend '%s' for '%s'.", backend, name
                     )
         if not applied:
-            logger.warning(
-                "AttentionBackendAccelerator: backend '%s' requested but no transformer component "
-                "supports `set_attention_backend`; leaving the diffusers default.",
-                backend,
+            raise ValueError(
+                f"AttentionBackendAccelerator: backend '{backend}' requested but none of the "
+                f"adapter's transformer components {adapter.transformer_names} support "
+                "`set_attention_backend`. Models with a custom attention implementation (e.g. "
+                "Bagel, which forces flash_attention_2 at load) must not use this accelerator; "
+                "remove the `attention_backend` entry from the acceleration config."
             )

@@ -38,7 +38,8 @@ model:
   model_type: "bagel"  # Model adapter key; see src/flow_factory/models/registry.py for options
   resume_path: null # Path to load previous checkpoint/lora adapter
   resume_type: null # Options: lora, full, state. Null to auto-detect based on `finetune_type`
-  attn_backend: 'flash' # Options: auto, flash, sdpa
+  # Bagel forces flash_attention_2 at load (pip install -e ".[bagel]"); it has no diffusers
+  # attention backend, so it takes no acceleration `attention_backend` entry.
 
 # Training Configuration
 train:

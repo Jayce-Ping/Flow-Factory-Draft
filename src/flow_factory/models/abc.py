@@ -195,9 +195,10 @@ class BaseAdapter(ABC):
         self._mix_precision()
 
         # NOTE: attention-backend selection is applied later by the trainer's
-        # acceleration step (AttentionBackendAccelerator, from `model.attn_backend`),
-        # after accelerator.prepare()/post_init() and before torch.compile — see
-        # BaseTrainer._apply_shared_acceleration(). It is intentionally NOT set here.
+        # acceleration step (AttentionBackendAccelerator, configured as a `shared`
+        # entry in the acceleration block), after accelerator.prepare()/post_init()
+        # and before torch.compile — see BaseTrainer._apply_shared_acceleration().
+        # It is intentionally NOT set here.
 
         # Enable gradient checkpointing if needed
         if self.training_args.enable_gradient_checkpointing:

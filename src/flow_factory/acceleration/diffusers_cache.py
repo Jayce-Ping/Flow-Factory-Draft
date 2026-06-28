@@ -62,7 +62,7 @@ class DiffusersCacheAccelerator(BaseAccelerator):
     Lossy and rollout-scoped. The default policy is ``first_block`` (FirstBlockCache,
     aka FBCache) which is robust across models and needs only a single ``threshold``.
 
-    Parameters (from ``acceleration.rollout_params``):
+    Parameters (from the entry's ``params``):
         policy: One of ``first_block`` / ``faster`` / ``pyramid`` / ``taylorseer`` /
             ``magcache``. Defaults to ``first_block``.
         <other>: All remaining params are forwarded verbatim to the selected

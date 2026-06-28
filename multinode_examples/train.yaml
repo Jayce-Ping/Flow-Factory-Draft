@@ -30,7 +30,16 @@ model:
   model_type: "wan2_t2v"  # wan2_t2v, wan2_i2v, wan2_v2v
   resume_path: null # Path to load previous checkpoint/lora adapter
   resume_type: null # Options: lora, full, state. Null to auto-detect based on `finetune_type`
-  attn_backend: '_flash_3_hub' # Attention backend for training.
+
+# Optional acceleration plugins (off by default). Applied in list order.
+# See guidance/acceleration.md. GRPO is a coupled trainer, so only lossless
+# `shared` accelerators are allowed (lossy rollout caching would bias the PPO ratio).
+# acceleration:
+#   shared:                          # lossless, applied to BOTH rollout and training (in order)
+#     - name: attention_backend      # set the attention backend first...
+#       params: { backend: _flash_3_hub }
+#     - name: torch_compile          # ...so the compiled graph captures it
+#       params: { mode: regional }   # regional (compile_repeated_blocks) | full
 
 # Training Configuration
 train:

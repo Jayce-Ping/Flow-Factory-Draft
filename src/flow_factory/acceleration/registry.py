@@ -33,7 +33,7 @@ logger = setup_logger(__name__)
 _ACCELERATOR_REGISTRY: Dict[str, str] = {
     # Lossless (safe for any algorithm, applied to the shared transformer).
     # `attention_backend` is the single code path for attention-backend selection;
-    # it is auto-applied from `model.attn_backend` by the trainer (before compile).
+    # add it as a `shared` entry (before `torch_compile`) in the acceleration block.
     'attention_backend': 'flow_factory.acceleration.attention_backend.AttentionBackendAccelerator',
     'torch_compile': 'flow_factory.acceleration.torch_compile.CompileAccelerator',
     # Lossy (rollout-only; validator restricts to decoupled / distillation algos).

@@ -35,46 +35,64 @@ but not the other, which is exactly what `stage='rollout'` + `safety='lossy'` ca
 
 ## Configuration
 
-Add an optional `acceleration:` block to any config. Two independent slots, both off by
-default:
+Add an optional `acceleration:` block to any config. Two independent slots, each an
+**ordered list** of `{name, params}` entries (both empty by default). **List order is the
+application order**:
 
 ```yaml
 acceleration:
-  # Lossless, applied to BOTH rollout and the training forward.
-  shared_accelerator: "torch_compile"        # torch_compile
-  shared_params: { mode: "regional" }        # regional (compile_repeated_blocks) | full
+  # Lossless, applied to BOTH rollout and the training forward, in list order.
+  shared:
+    - name: attention_backend                # set the diffusers backend first...
+      params: { backend: _flash_3_hub }
+    - name: torch_compile                    # ...so the compiled graph captures it
+      params: { mode: regional }             # regional (compile_repeated_blocks) | full
 
-  # Rollout-only (Stage 3). May be lossy (paradigm-gated).
-  rollout_accelerator: "diffusers_cache"     # diffusers_cache | cache_dit | <lossless id>
-  rollout_params: { policy: "first_block", threshold: 0.08 }
+  # Rollout-only (Stage 3), nested in list order. May be lossy (paradigm-gated).
+  rollout:
+    - name: diffusers_cache                   # diffusers_cache | cache_dit | <lossless id>
+      params: { policy: first_block, threshold: 0.08 }
 ```
 
-Either slot may be omitted. A direct python path (e.g. `my_pkg.accel.MyAccelerator`) is
-accepted in place of a registered id.
+Either slot may be omitted or left empty. A single entry dict (without the list dashes) is
+accepted as shorthand for a one-element list. A direct python path (e.g.
+`my_pkg.accel.MyAccelerator`) is accepted in place of a registered id.
 
 ## Available accelerators
 
 | id | safety | stage | Notes |
 |----|--------|-------|-------|
-| `attention_backend` | lossless | both | Sets the diffusers attention backend on every transformer. Configured via `model.attn_backend` (see below); `backend` param can override. Forwards any backend (`native` / `flash` / `_flash_3` / `_flash_3_hub` / `sage` / `xformers`) to `set_attention_backend`. |
+| `attention_backend` | lossless | both | Sets the diffusers attention backend on every transformer. Requires a `backend` param. Forwards any backend (`native` / `flash` / `_flash_3` / `_flash_3_hub` / `sage` / `xformers`) to `set_attention_backend`. List it in `shared` **before** `torch_compile` so the compiled graph captures the backend. |
 | `torch_compile` | lossless | both | `torch.compile` of the shared transformer. `mode: regional` uses diffusers' `compile_repeated_blocks` (fast warmup, robust to variable resolution); `mode: full` compiles the whole module. Extra `compile_kwargs` forwarded to the compile call. Compiles in place (checkpoint- and EMA/ref-safe), applied after `post_init`. |
 | `diffusers_cache` | lossy | rollout | Diffusers-native feature caching (no extra dependency). `policy`: `first_block` (default) / `faster` / `pyramid` / `taylorseer` / `magcache`; remaining params forwarded to the policy's diffusers config (e.g. `threshold`). |
 | `cache_dit` | lossy | rollout | [cache-dit](https://github.com/vipshop/cache-dit) backend (DBCache/TaylorSeer). Requires `pip install flow-factory[acceleration]`. All params forwarded to `cache_dit.enable_cache`. |
 
 ### Attention backend
 
-Attention-backend selection keeps its dedicated config knob, `model.attn_backend`:
+Attention-backend selection is a `shared` accelerator (it transforms the module shared by
+rollout and training, so it is consistent for any algorithm — even an approximate kernel
+like Sage int8). It used to live under the dedicated `model.attn_backend` knob; that knob
+was **removed** and folded into the acceleration layer:
 
 ```yaml
-model:
-  attn_backend: "_flash_3_hub"   # native | flash | flash_hub | _flash_3 | _flash_3_hub | sage | xformers
+acceleration:
+  shared:
+    - name: attention_backend
+      params: { backend: _flash_3_hub }   # native | flash | flash_hub | _flash_3 | _flash_3_hub | sage | xformers
+    - name: torch_compile                 # optional; if present, list it AFTER attention_backend
+      params: { mode: regional }
 ```
 
 It is applied through `AttentionBackendAccelerator` by the trainer
-(`BaseTrainer._apply_shared_acceleration`) — after `accelerator.prepare` / `post_init`
-and **before** compile, so the compiled graph captures the chosen backend. This is the
-single code path for backend selection (the old `BaseAdapter._set_attention_backend` was
-removed); it applies whether or not an `acceleration:` block is present.
+(`BaseTrainer._apply_shared_acceleration`) — after `accelerator.prepare` / `post_init`, in
+list order. Place it **before** `torch_compile` so the compiled graph captures the chosen
+backend. This is the single code path for backend selection (the old
+`BaseAdapter._set_attention_backend` and `model.attn_backend` were both removed). A config
+that still sets `model.attn_backend` fails fast with a migration error.
+
+> **Bagel** forces `flash_attention_2` at model load (requires `pip install -e ".[bagel]"`)
+> and its custom transformer has no `set_attention_backend`, so it does **not** take an
+> `attention_backend` entry — omit it (the accelerator raises if applied to bagel).
 
 ## Model cache-readiness (lossy caching)
 
