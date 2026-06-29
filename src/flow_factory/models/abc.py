@@ -154,6 +154,10 @@ class BaseAdapter(ABC):
         self.training_args = config.training_args
         self.eval_args = config.eval_args
         self._mode : str = 'train' # ['train', 'eval', 'rollout']
+        # Set by the trainer's `_rollout_grad_context` only when a compile accelerator
+        # forces a grad-enabled rollout: detaches per-step latent feedback in
+        # `cast_latents` to keep rollout memory bounded. Off otherwise.
+        self._rollout_detach: bool = False
         self._named_parameters : Dict[str, NamedParametersInfo] = {}
 
         # Load pipeline and scheduler (delegated to subclasses)
@@ -232,7 +236,7 @@ class BaseAdapter(ABC):
         adapter routes through — breaks that chain so rollout memory stays bounded while
         each transformer call still executes the identical grad-mode graph.
         """
-        if getattr(self, "_rollout_detach", False) and latents.requires_grad:
+        if self._rollout_detach and latents.requires_grad:
             latents = latents.detach()
         target = self.latent_storage_dtype or default_dtype
         if target is None or latents.dtype == target:

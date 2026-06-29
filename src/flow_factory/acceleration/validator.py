@@ -18,11 +18,15 @@
 The correctness contract (``constraints.md`` #7 + #20a) hinges on **symmetric
 application**, encoded by ``stage``, not on numerical bit-exactness:
 
-* ``stage='both'`` accelerators mutate the transformer persistently, so the exact
-  same transform is in both rollout ``inference()`` and training ``forward()``.
-  Rollout and training therefore stay CONSISTENT — even for numerically-approximate
-  transforms (e.g. Sage int8 attention) — so they are safe for any algorithm. They
-  belong in the ``shared`` slot; ``safety`` is not consulted for them.
+* ``stage='both'`` accelerators mutate the transformer persistently, so the same
+  transform runs in both rollout ``inference()`` and training ``forward()``. When that
+  transform is identical across the two stages (exact, or symmetric-approximate like
+  Sage int8 attention) rollout and training stay CONSISTENT — safe for any algorithm.
+  They belong in the ``shared`` slot and are never rejected. ``safety`` is only used to
+  *warn*: a ``stage='both'`` + ``lossy`` accelerator (e.g. ``torch.compile``, which is
+  applied symmetrically but is not bit-exact across stages due to its grad/no-grad
+  graph split) is still allowed, but on a **coupled** trainer the on-policy PPO ratio
+  will be ≈1, not exactly 1, so the validator logs a warning.
 * ``stage='rollout'`` accelerators run only during Stage-3 rollout. If such an
   accelerator changes outputs (``safety='lossy'``, e.g. feature caching), rollout
   diverges from the training forward, which it cannot be replicated in (that needs
@@ -88,11 +92,25 @@ def validate_accelerator(
                 "slot, which applies a persistent transform to both rollout and training. Put a "
                 "stage='both' accelerator here, or move this one to the `acceleration.rollout` list."
             )
-        # No safety gate here: a stage='both' transform is applied identically to
-        # rollout `inference()` and training `forward()` (the same shared module), so
-        # rollout and training stay CONSISTENT even for numerically-approximate
-        # backends (e.g. Sage int8 attention). Train-inference consistency depends on
-        # symmetric application, not on bit-exactness.
+        # A stage='both' transform is applied to the SAME module in rollout
+        # `inference()` and training `forward()`. For a transform that is identical
+        # across the two stages (exact, or symmetric-approximate like Sage int8) this is
+        # consistent by construction — safe for any paradigm, no gate. A `lossy`
+        # stage='both' accelerator (e.g. torch.compile, whose grad/no-grad compiled-graph
+        # split leaves a ~1e-5 residual) is applied symmetrically but is NOT bit-exact
+        # across stages; it stays within clip_range so it is allowed, but on a coupled
+        # trainer the on-policy ratio will be ~1, not exactly 1 — warn so the user can
+        # pick eager / an exact attention backend if strict ratio==1 is required.
+        if accelerator.safety == "lossy" and paradigm == "coupled":
+            logger.warning(
+                "Accelerator '%s' (stage='both', safety='lossy') is applied symmetrically "
+                "but is not bit-exact across rollout and training (e.g. torch.compile's "
+                "grad/no-grad graph split). On the coupled trainer '%s' the on-policy PPO "
+                "ratio will be ~1 but NOT exactly 1 (within clip_range). Use eager or an "
+                "exact attention backend if a strictly bit-exact ratio is required.",
+                name,
+                trainer_name,
+            )
         return
 
     # slot == "rollout".

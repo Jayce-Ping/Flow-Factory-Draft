@@ -29,17 +29,24 @@ train-inference consistency against the trainer's RL paradigm:
   - ``"rollout"``: a per-epoch context via :meth:`rollout_context` (e.g. feature
     caching), torn down before the training forward. Belongs in the ``rollout`` slot.
 
-* ``safety`` — the train-inference consistency class, **only consulted for
-  ``stage='rollout'`` accelerators**:
+* ``safety`` — the train-inference consistency class:
 
-  - ``"lossless"``: bit-identical outputs (rollout unchanged) — safe for any paradigm.
-  - ``"lossy"``: changes outputs, so rollout diverges from the (un-accelerated)
-    training forward — only safe when the rollout log-prob never feeds the loss, i.e.
-    **decoupled / distillation** algorithms (see ``constraints.md`` #7, #20a).
+  - ``"lossless"``: **bit-exact across rollout and training**. For ``stage='rollout'``
+    this means the rollout output is bit-identical to the un-accelerated forward; for
+    ``stage='both'`` it means the shared transform produces identical results in both
+    stages (an exact transform, or a symmetric-approximate one such as Sage int8
+    attention whose same int8 kernel runs in both stages). Safe for any paradigm.
+  - ``"lossy"``: **NOT bit-exact across the two stages.**
 
-  For ``stage='both'`` accelerators ``safety`` is informational: a symmetric
-  transform is consistent regardless of numerical exactness, so even an approximate
-  attention backend (e.g. Sage int8) used in *both* stages is safe.
+    - ``stage='rollout'`` + lossy (e.g. feature caching): rollout diverges from the
+      training forward, which cannot replicate it — only safe when the rollout
+      log-prob never feeds the loss, i.e. **decoupled / distillation** algorithms
+      (validator *rejects* it on coupled; see ``constraints.md`` #7, #20a).
+    - ``stage='both'`` + lossy (e.g. ``torch.compile``, whose grad/no-grad
+      compiled-graph split leaves a ~1e-5 residual): applied symmetrically and stays
+      within ``clip_range``, so it is *allowed* on any paradigm — but the validator
+      *warns* on a coupled trainer that the on-policy PPO ratio will be ~1, not
+      bit-exact.
 
 Subclasses implement only what they need: ``setup`` defaults to a no-op,
 ``rollout_context`` defaults to yielding without modification.
@@ -82,8 +89,11 @@ class BaseAccelerator(ABC):
     # the grad-carrying output directly — an inner detach would let Inductor pick a
     # divergent inference kernel), and the trainer flags the rollout via
     # ``_rollout_grad_context`` so the latent feedback is detached in ``cast_latents``.
-    # Result: bit-exact on-policy ratio (max|ratio-1| == 0) for coupled training, with
-    # or without CFG. See ``guidance/acceleration.md``.
+    # Result: removes the dominant grad/no-grad divergence so the on-policy ratio is
+    # ~1 (well within ``clip_range``), but NOT strictly bit-exact — an intermittent
+    # ~1e-5 residual remains on a minority of samples (different Inductor kernel
+    # invocations + bf16 non-associativity). See
+    # ``CompileAccelerator._wrap_forward_grad_consistent`` for the full reason.
     requires_grad_rollout: ClassVar[bool] = False
 
     def __init_subclass__(cls, **kwargs: Any) -> None:

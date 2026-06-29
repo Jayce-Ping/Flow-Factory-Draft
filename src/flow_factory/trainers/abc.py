@@ -405,11 +405,9 @@ class BaseTrainer(ABC):
         Each accelerator is validated against this trainer's ``paradigm`` before
         use (fail-fast, ``constraints.md`` #26).
         """
-        accel_args = getattr(self.config, "acceleration_args", None)
+        accel_args = self.config.acceleration_args
         self.shared_accelerators: List[BaseAccelerator] = []
         self.rollout_accelerators: List[BaseAccelerator] = []
-        if accel_args is None:
-            return
 
         trainer_name = type(self).__name__
         paradigm = type(self).paradigm
@@ -491,10 +489,7 @@ class BaseTrainer(ABC):
         ``guidance/acceleration.md``) while the autograd graph never chains across
         denoising steps (memory stays bounded).
         """
-        needs_grad = any(
-            getattr(acc, "requires_grad_rollout", False)
-            for acc in getattr(self, "shared_accelerators", [])
-        )
+        needs_grad = any(acc.requires_grad_rollout for acc in self.shared_accelerators)
         if not needs_grad:
             with torch.no_grad():
                 yield
@@ -502,7 +497,7 @@ class BaseTrainer(ABC):
         # Compile active: the compiled-transformer wrapper forces grad locally and
         # detaches its output while this flag is set, so rollout matches the training
         # graph bit-for-bit without chaining autograd across steps.
-        prev = getattr(self.adapter, "_rollout_detach", False)
+        prev = self.adapter._rollout_detach
         self.adapter._rollout_detach = True
         try:
             yield

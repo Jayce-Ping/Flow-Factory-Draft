@@ -32,10 +32,21 @@ logger = setup_logger(__name__)
 class CompileAccelerator(BaseAccelerator):
     """Apply ``torch.compile`` to every transformer the adapter exposes.
 
-    Lossless and stage-``both``: the compiled module backs both rollout
-    ``inference()`` and the training ``forward()`` (they share
-    ``adapter.transformer``), so numerical behavior stays consistent across the
-    two — safe even for coupled algorithms.
+    Stage-``both`` but ``safety='lossy'``. The compiled module backs both rollout
+    ``inference()`` and the training ``forward()`` (they share ``adapter.transformer``),
+    so it is applied *symmetrically* — but, unlike an exact or symmetric-approximate
+    transform, ``torch.compile`` is NOT numerically identical across the two stages:
+    Inductor compiles a separate graph for grad vs no-grad mode, and even with the
+    grad-forced rollout fix below an intermittent ~1e-5 on-policy ratio residual remains
+    on a minority of samples (see :meth:`_wrap_forward_grad_consistent`). That is why it
+    is marked ``lossy`` rather than ``lossless`` (which here means *bit-exact across
+    stages*, not merely "applied to the shared module").
+
+    It stays well within ``clip_range`` — numerically on-policy — and is the main
+    compute speedup on real hardware, so it remains a ``stage='both'`` accelerator
+    allowed on coupled algorithms. The validator does not reject it, but it WARNS on a
+    coupled trainer that the on-policy PPO ratio will be ~1, not bit-exact. Use eager or
+    the ``attention_backend`` accelerator if a strictly bit-exact ratio is required.
 
     Both modes compile **in place** (``nn.Module.compile`` /
     ``compile_repeated_blocks``), which preserves parameter identity and leaves
@@ -61,7 +72,11 @@ class CompileAccelerator(BaseAccelerator):
             (e.g. ``{"mode": "max-autotune", "dynamic": true}``).
     """
 
-    safety = "lossless"
+    # `lossy` not because it is asymmetric (it is stage='both', applied to the shared
+    # module) but because it is NOT bit-exact across rollout vs training — see the class
+    # docstring and `_wrap_forward_grad_consistent`. The validator warns (does not
+    # reject) when this runs on a coupled trainer.
+    safety = "lossy"
     stage = "both"
     # Inductor compiles a separate graph for grad vs no-grad mode whose fused
     # kernels are NOT bit-identical. To keep rollout (Stage 3) and the training
@@ -140,10 +155,7 @@ class CompileAccelerator(BaseAccelerator):
         """
         get_base = getattr(module, "get_base_model", None)
         if callable(get_base):
-            try:
-                return get_base()
-            except Exception:
-                return module
+            return get_base()
         return module
 
     @staticmethod
@@ -165,7 +177,22 @@ class CompileAccelerator(BaseAccelerator):
         :meth:`BaseAdapter.cast_latents` (gated by ``adapter._rollout_detach``), which
         breaks the autograd graph chain across denoising steps so rollout memory stays
         bounded while every transformer call still executes the identical grad-mode
-        graph (bit-exact noise_pred → bit-exact on-policy ratio).
+        graph (near-exact noise_pred → on-policy ratio ≈ 1).
+
+        Known residual (NOT strictly bit-exact): forcing grad removes the *dominant*
+        divergence (the grad-vs-no-grad graph split), but it does not make the rollout
+        and training forwards a literally identical Inductor kernel invocation. They are
+        different call sites: the stored-then-reloaded latents may differ in
+        stride/contiguity, and the surrounding autograd graphs differ (rollout detaches
+        per step and discards the graph; training keeps it and backwards). For some
+        inputs Inductor's shape/layout-specialized, autotuned kernels then take a
+        different reduction order, and bf16's non-associative accumulation turns that
+        into an *intermittent* ~1e-5 on-policy ratio drift on a minority of
+        samples/ranks (value-dependent — some runs/shardings show exactly 0). This is
+        well within ``clip_range`` (1e-4), i.e. numerically on-policy, but not
+        bit-exact. Eager and the attention-backend accelerator stay exactly 0
+        (an attention kernel's forward is grad-mode-independent). Measured on 16×H20
+        (2-node ZeRO-2/FSDP2), SD3.5 + Qwen-Image, regional + full, CFG and no-CFG.
 
         Two entry points must be covered because the two compile modes dispatch
         differently:

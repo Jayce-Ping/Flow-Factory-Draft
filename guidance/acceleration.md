@@ -63,7 +63,7 @@ accepted as shorthand for a one-element list. A direct python path (e.g.
 | id | safety | stage | Notes |
 |----|--------|-------|-------|
 | `attention_backend` | lossless | both | Sets the diffusers attention backend on every transformer. Requires a `backend` param. Forwards any backend (`native` / `flash` / `_flash_3` / `_flash_3_hub` / `sage` / `xformers`) to `set_attention_backend`. List it in `shared` **before** `torch_compile` so the compiled graph captures the backend. |
-| `torch_compile` | lossless | both | `torch.compile` of the shared transformer. `mode: regional` uses diffusers' `compile_repeated_blocks` (fast warmup, robust to variable resolution); `mode: full` compiles the whole module. Extra `compile_kwargs` forwarded to the compile call. Compiles in place (checkpoint- and EMA/ref-safe), applied after `post_init`. |
+| `torch_compile` | lossy | both | `torch.compile` of the shared transformer. `mode: regional` uses diffusers' `compile_repeated_blocks` (fast warmup, robust to variable resolution); `mode: full` compiles the whole module. Extra `compile_kwargs` forwarded to the compile call. Compiles in place (checkpoint- and EMA/ref-safe), applied after `post_init`. Marked **lossy** because it is applied symmetrically but is **not bit-exact across rollout vs training** (grad/no-grad graph split → intermittent ~1e-5 on-policy residual, within `clip_range`); allowed on coupled algos, but the validator warns. |
 | `diffusers_cache` | lossy | rollout | Diffusers-native feature caching (no extra dependency). `policy`: `first_block` (default) / `faster` / `pyramid` / `taylorseer` / `magcache`; remaining params forwarded to the policy's diffusers config (e.g. `threshold`). |
 | `cache_dit` | lossy | rollout | [cache-dit](https://github.com/vipshop/cache-dit) backend (DBCache/TaylorSeer). Requires `pip install flow-factory[acceleration]`. All params forwarded to `cache_dit.enable_cache`. |
 
@@ -108,9 +108,15 @@ the ratio.
 `torch.enable_grad()` (overriding the `@torch.no_grad()` on `inference()`) and detaches only
 the per-step latent feedback (in `cast_latents`) to keep memory bounded. It also compiles the
 **base** transformer under any PEFT/LoRA wrapper (not the wrapper itself). With this, the
-on-policy ratio is **bit-exact** (`max|ratio-1| = 0.000e+00`, verified on SD3.5) for coupled
-training — **both with and without CFG** (CFG concatenates `[uncond, cond]` identically in
-rollout and training, so it aligns exactly).
+on-policy ratio is driven to **≈1, well within `clip_range` (1e-4)** — but **not strictly
+bit-exact**: an intermittent **~1e-5** residual remains on a minority of samples/ranks
+(16×H20, ZeRO-2/FSDP2, SD3.5+Qwen-Image, regional/full, CFG and no-CFG). Forcing grad removes
+the *dominant* grad-vs-no-grad graph split, but rollout and training are still distinct Inductor
+kernel invocations (different latent stride/contiguity + autograd-graph context), and bf16's
+non-associative accumulation surfaces a last-bit difference for some inputs. So compile is
+**numerically on-policy, not bit-exact** — if you need a strictly bit-exact ratio, use eager or
+the `attention_backend` accelerator (a backend's forward is grad-mode-independent and stays
+exactly 0). See `CompileAccelerator._wrap_forward_grad_consistent` for details.
 
 Two implementation notes that matter for correctness:
 - The grad-force wrapper must **not** detach its own output — an inner detach lets Inductor
