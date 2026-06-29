@@ -94,6 +94,34 @@ that still sets `model.attn_backend` fails fast with a migration error.
 > and its custom transformer has no `set_attention_backend`, so it does **not** take an
 > `attention_backend` entry — omit it (the accelerator raises if applied to bagel).
 
+### torch.compile train-inference consistency (coupled algorithms)
+
+For coupled algorithms (GRPO / GRPO-Guard / DPPO) the on-policy PPO ratio on the first inner
+step must be **1.0**. `torch.compile` (Inductor) threatens this because it compiles a
+**separate, numerically non-identical graph for grad vs no-grad mode** (Dynamo guards on
+`grad_mode`): rollout normally runs the transformer under `torch.no_grad()` and the training
+forward under grad, so a naive compiled rollout would diverge from training (~1e-5) and bias
+the ratio.
+
+`CompileAccelerator` handles this automatically (no user action needed): it declares
+`requires_grad_rollout = True`, so the trainer runs the rollout transformer under
+`torch.enable_grad()` (overriding the `@torch.no_grad()` on `inference()`) and detaches only
+the per-step latent feedback (in `cast_latents`) to keep memory bounded. It also compiles the
+**base** transformer under any PEFT/LoRA wrapper (not the wrapper itself). With this, the
+on-policy ratio is **bit-exact** (`max|ratio-1| = 0.000e+00`, verified on SD3.5) for coupled
+training — **both with and without CFG** (CFG concatenates `[uncond, cond]` identically in
+rollout and training, so it aligns exactly).
+
+Two implementation notes that matter for correctness:
+- The grad-force wrapper must **not** detach its own output — an inner detach lets Inductor
+  pick a divergent inference-optimized kernel and re-introduces ~1e-5 drift. The detach lives
+  at the latent-feedback chokepoint (`cast_latents`) instead.
+- Determinism knobs (`cudnn.deterministic`, `fallback_random`) are irrelevant here — the cause
+  was the grad-vs-no-grad graph split, not RNG (a `train-vs-train` recompute is exactly 0.0).
+
+See `.scratch/torch_compile_consistency_report.md` for the full analysis.
+
+
 ## Model cache-readiness (lossy caching)
 
 Feature caching reuses block outputs across denoising steps via the transformer's

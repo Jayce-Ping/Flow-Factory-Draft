@@ -222,7 +222,18 @@ class BaseAdapter(ABC):
         return self._DTYPE_MAP.get(val) if val else None
 
     def cast_latents(self, latents: torch.Tensor, default_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
-        """Cast latents to storage dtype with float16 overflow protection."""
+        """Cast latents to storage dtype with float16 overflow protection.
+
+        During a compile-accelerated rollout the trainer sets ``self._rollout_detach``
+        (see ``BaseTrainer._rollout_grad_context``): the compiled transformer is forced
+        to run under ``torch.enable_grad()`` for graph-consistency with training, so the
+        per-step latent feedback would otherwise chain an autograd graph across the
+        whole denoising loop. Detaching here — the single feedback chokepoint every
+        adapter routes through — breaks that chain so rollout memory stays bounded while
+        each transformer call still executes the identical grad-mode graph.
+        """
+        if getattr(self, "_rollout_detach", False) and latents.requires_grad:
+            latents = latents.detach()
         target = self.latent_storage_dtype or default_dtype
         if target is None or latents.dtype == target:
             return latents

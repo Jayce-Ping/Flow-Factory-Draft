@@ -468,6 +468,46 @@ class BaseTrainer(ABC):
                 stack.enter_context(accelerator.rollout_context(self.adapter))
             yield
 
+    @contextmanager
+    def _rollout_grad_context(self) -> Iterator[None]:
+        """Grad context for the Stage-3 rollout loop.
+
+        Default: ``torch.no_grad()`` (rollout needs no gradients — saves memory).
+
+        Exception: if any active **shared** accelerator declares
+        ``requires_grad_rollout`` (only ``torch_compile`` does), rollout instead runs
+        with grad enabled AND sets ``adapter._rollout_detach``. Reason:
+        ``torch.compile`` (Inductor) emits a *separate, numerically non-identical*
+        graph for grad vs no-grad mode (Dynamo guards on ``grad_mode``), so a no-grad
+        rollout would diverge from the grad-mode training forward and break the
+        coupled on-policy PPO ratio==1 invariant. The compiled transformer is wrapped
+        (see :class:`CompileAccelerator`) so its forward always executes under
+        ``torch.enable_grad()`` — overriding the ``@torch.no_grad()`` on
+        ``adapter.inference()``. The output is NOT detached inside that wrapper (an
+        inner detach lets Inductor pick a divergent inference kernel); instead the
+        per-step latent feedback is detached in ``BaseAdapter.cast_latents`` (gated by
+        this flag), so rollout and training share the identical grad-mode graph
+        (bit-exact on-policy ratio, with or without CFG — see
+        ``guidance/acceleration.md``) while the autograd graph never chains across
+        denoising steps (memory stays bounded).
+        """
+        needs_grad = any(
+            getattr(acc, "requires_grad_rollout", False)
+            for acc in getattr(self, "shared_accelerators", [])
+        )
+        if not needs_grad:
+            with torch.no_grad():
+                yield
+            return
+        # Compile active: the compiled-transformer wrapper forces grad locally and
+        # detaches its output while this flag is set, so rollout matches the training
+        # graph bit-for-bit without chaining autograd across steps.
+        prev = getattr(self.adapter, "_rollout_detach", False)
+        self.adapter._rollout_detach = True
+        try:
+            yield
+        finally:
+            self.adapter._rollout_detach = prev
 
     def _synchronize_frozen_components(self):
         if self.accelerator.num_processes <= 1:
@@ -859,7 +899,10 @@ class BaseTrainer(ABC):
 
         # Stage-3-only acceleration (e.g. feature caching) is scoped to this loop
         # so its state never leaks into the Stage-6 training forward.
-        with self._rollout_acceleration(), torch.no_grad(), self.autocast():
+        # Grad context is normally no_grad, but flips to enable_grad when a
+        # compile accelerator is active (see _rollout_grad_context) so rollout and
+        # training share the same compiled graph (bit-exact on-policy ratio).
+        with self._rollout_acceleration(), self._rollout_grad_context(), self.autocast():
             for _ in tqdm(
                 range(self.training_args.num_batches_per_epoch),
                 desc=f'Epoch {self.epoch} Sampling',

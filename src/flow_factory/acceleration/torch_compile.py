@@ -15,7 +15,10 @@
 # src/flow_factory/acceleration/torch_compile.py
 """Lossless ``torch.compile`` accelerator for the shared transformer(s)."""
 
+import functools
 from typing import TYPE_CHECKING, Any, Dict
+
+import torch
 
 from .abc import BaseAccelerator
 from ..utils.logger_utils import setup_logger
@@ -60,6 +63,11 @@ class CompileAccelerator(BaseAccelerator):
 
     safety = "lossless"
     stage = "both"
+    # Inductor compiles a separate graph for grad vs no-grad mode whose fused
+    # kernels are NOT bit-identical. To keep rollout (Stage 3) and the training
+    # forward (Stage 6) on the exact same graph — required for the coupled
+    # on-policy ratio==1 invariant — the rollout must run with grad enabled.
+    requires_grad_rollout = True
 
     def setup(self, adapter: "BaseAdapter") -> None:
         mode = self.params.get("mode", "regional")
@@ -78,20 +86,112 @@ class CompileAccelerator(BaseAccelerator):
 
         for name in transformer_names:
             module = adapter.get_component(name)
+            # The routed call chain is proxy(...) -> bundle(name, ...) ->
+            # members[name](...) -> PeftModel -> LoraModel -> the BASE transformer's
+            # __call__. So compilation and the grad-consistency wrap must target the
+            # unwrapped *base* transformer:
+            #   * `adapter._unwrap` peels the RoutedComponentProxy + DDP/FSDP/DeepSpeed
+            #     wrapper, but NOT PEFT — it returns the PeftModel.
+            #   * compiling the PeftModel is wrong: Dynamo specializes the LoRA wrapper
+            #     on grad mode in a way the outer grad-force cannot unify (noise_pred
+            #     drifts ~2.0 between rollout/train), AND the PeftModel has no
+            #     `_repeated_blocks` so regional compile is unavailable under LoRA.
+            #   * the base transformer keeps its LoRA submodules inside the compiled
+            #     graph (they still train), exposes `_repeated_blocks`, and the
+            #     grad-force wrap makes rollout/train bit-identical.
+            inner = self._peel_peft(adapter._unwrap(module))
             if mode == "regional":
                 # `compile_repeated_blocks` exists on every diffusers ModelMixin but
                 # only works when the model declares `_repeated_blocks`; check the
                 # unwrapped module so the error is actionable.
-                inner = adapter._unwrap(module)
                 if not getattr(inner, "_repeated_blocks", None):
                     raise ValueError(
                         f"CompileAccelerator: component '{name}' ({type(inner).__name__}) does "
                         "not declare `_repeated_blocks`, so regional compilation is unavailable. "
                         "Use `mode: full` for whole-module compilation."
                     )
-                module.compile_repeated_blocks(**compile_kwargs)
+                inner.compile_repeated_blocks(**compile_kwargs)
             else:
                 # nn.Module.compile compiles the module's forward in place, so the
                 # routed bundle call hits the compiled path on subsequent forwards.
-                module.compile(**compile_kwargs)
+                inner.compile(**compile_kwargs)
+            # Force every forward of the compiled transformer to run under
+            # torch.enable_grad() (overriding the @torch.no_grad() on
+            # adapter.inference()), and detach the output during rollout. This keeps
+            # rollout (Stage 3) and the training forward (Stage 6) on the SAME
+            # compiled graph — Inductor emits numerically different kernels for the
+            # grad vs no-grad graph, so a no-grad rollout would break the coupled
+            # on-policy ratio==1 invariant. Detaching during rollout (gated by the
+            # trainer's `adapter._rollout_detach` flag) stops autograd from chaining
+            # across denoising steps, so rollout memory stays bounded.
+            self._wrap_forward_grad_consistent(adapter, inner)
             logger.info("CompileAccelerator: compiled '%s' (mode=%s).", name, mode)
+
+    @staticmethod
+    def _peel_peft(module):
+        """Return the base transformer under a PEFT/LoRA wrapper (else ``module``).
+
+        ``adapter._unwrap`` peels the routing proxy + DDP/FSDP/DeepSpeed wrapper but
+        leaves a ``PeftModel`` in place. Compiling the ``PeftModel`` is incorrect:
+        Dynamo specializes the LoRA wrapper on grad mode in a way the grad-force wrap
+        cannot unify, and the wrapper hides the base model's ``_repeated_blocks``. The
+        base transformer keeps its LoRA submodules (they still train) while being the
+        actual compiled call target, so we compile/wrap it instead.
+        """
+        get_base = getattr(module, "get_base_model", None)
+        if callable(get_base):
+            try:
+                return get_base()
+            except Exception:
+                return module
+        return module
+
+    @staticmethod
+    def _wrap_forward_grad_consistent(adapter: "BaseAdapter", module) -> None:
+        """Force the compiled transformer to run grad-consistently across stages.
+
+        Wraps the module's call entry point(s) so every forward runs under
+        ``torch.enable_grad()`` — overriding the ``@torch.no_grad()`` on
+        ``adapter.inference()``. This pins rollout (Stage 3) and the training forward
+        (Stage 6) to the *same* Inductor graph: Inductor compiles a separate,
+        numerically non-identical graph for grad vs no-grad mode (Dynamo guards on
+        ``grad_mode``), so a no-grad rollout would diverge from the grad training
+        forward and break the coupled on-policy PPO ratio==1 invariant.
+
+        Crucially the output is **NOT detached here**: detaching inside the wrapper
+        lets Inductor see the result is unused-for-grad and pick a different
+        (inference-optimized) kernel, re-introducing the divergence. Instead the
+        rollout's per-step latent feedback is detached in
+        :meth:`BaseAdapter.cast_latents` (gated by ``adapter._rollout_detach``), which
+        breaks the autograd graph chain across denoising steps so rollout memory stays
+        bounded while every transformer call still executes the identical grad-mode
+        graph (bit-exact noise_pred → bit-exact on-policy ratio).
+
+        Two entry points must be covered because the two compile modes dispatch
+        differently:
+          * ``mode='regional'`` (``compile_repeated_blocks``): the top ``forward``
+            stays eager and calls the compiled blocks — wrapping ``forward`` suffices.
+          * ``mode='full'`` (``nn.Module.compile``): ``module(...)`` routes through
+            ``module._compiled_call_impl``, bypassing a reassigned ``forward`` — so
+            that attribute must be wrapped too.
+
+        Idempotent per attribute (``_ff_grad_consistent`` marker).
+        """
+
+        def _wrap(fn):
+            if fn is None or getattr(fn, "_ff_grad_consistent", False):
+                return fn
+
+            @functools.wraps(fn)
+            def wrapped(*args, **kwargs):
+                with torch.enable_grad():
+                    return fn(*args, **kwargs)
+
+            wrapped._ff_grad_consistent = True
+            return wrapped
+
+        # Regional + eager fallback: top-level forward.
+        module.forward = _wrap(module.forward)
+        # Full mode: nn.Module.compile() dispatches through _compiled_call_impl.
+        if getattr(module, "_compiled_call_impl", None) is not None:
+            module._compiled_call_impl = _wrap(module._compiled_call_impl)
