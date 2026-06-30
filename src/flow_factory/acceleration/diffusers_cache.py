@@ -116,6 +116,20 @@ class DiffusersCacheAccelerator(BaseAccelerator):
                     transformer.disable_cache()
                 transformer.enable_cache(self._build_config())
                 enabled.append(transformer)
+                # diffusers' HookRegistry caches its child-registry list the first time
+                # a `cache_context` sets a context. If a `cache_context` ran while the
+                # cache was DISABLED (e.g. during eval, where the adapter still opens
+                # `transformer.cache_context(...)`), that cache was populated EMPTY --
+                # before the per-block cache hooks above existed -- so a later
+                # `_set_context` never reaches the freshly added block hooks and the
+                # block forward raises "No context is set". Invalidate the stale cache on
+                # the unwrapped module (the exact object the adapter's `cache_context`
+                # targets) so the next context build rediscovers the new hooks. Safe/no-op
+                # when no such registry exists yet (the common no-eval path).
+                unwrapped = adapter.get_component_unwrapped(name)
+                cache_hook = getattr(unwrapped, "_diffusers_hook", None)
+                if cache_hook is not None:
+                    cache_hook._child_registries_cache = None
                 logger.info("DiffusersCacheAccelerator: cache enabled for '%s'.", name)
             yield
         finally:
