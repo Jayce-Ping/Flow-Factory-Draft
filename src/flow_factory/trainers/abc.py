@@ -468,9 +468,9 @@ class BaseTrainer(ABC):
 
     @contextmanager
     def _rollout_grad_context(self) -> Iterator[None]:
-        """Grad context for the Stage-3 rollout loop.
+        """Grad context for an ``adapter.inference()`` loop (Stage-3 rollout and eval).
 
-        Default: ``torch.no_grad()`` (rollout needs no gradients — saves memory).
+        Default: ``torch.no_grad()`` (inference needs no gradients — saves memory).
 
         Exception: if any active **shared** accelerator declares
         ``requires_grad_rollout`` (only ``torch_compile`` does), rollout instead runs
@@ -488,6 +488,15 @@ class BaseTrainer(ABC):
         (bit-exact on-policy ratio, with or without CFG — see
         ``guidance/acceleration.md``) while the autograd graph never chains across
         denoising steps (memory stays bounded).
+
+        Reused by the eval loop (:meth:`evaluate`). Eval does not compute the PPO
+        ratio, so graph consistency is irrelevant there — but the compiled
+        transformer's forward forces ``enable_grad`` *unconditionally*, so a bare
+        ``torch.no_grad()`` eval would still build an autograd graph that chains across
+        the whole denoising loop (memory grows with ``num_inference_steps`` → OOM).
+        Routing eval through this context enables the same per-step ``cast_latents``
+        detach, keeping eval memory bounded. With no grad-forcing accelerator active it
+        is exactly ``torch.no_grad()`` for both callers (no behavior change).
         """
         needs_grad = any(acc.requires_grad_rollout for acc in self.shared_accelerators)
         if not needs_grad:
@@ -960,7 +969,13 @@ class BaseTrainer(ABC):
 
         self.adapter.eval()
 
-        with torch.no_grad(), self.autocast(), self.adapter.use_ema_parameters():
+        # Use the rollout grad context (not a bare `torch.no_grad()`): when a
+        # grad-forcing shared accelerator (torch.compile) is active the compiled
+        # transformer forces `enable_grad`, so a plain `no_grad` here would let the
+        # autograd graph chain across the whole denoising loop (memory grows with
+        # num_inference_steps -> OOM). This context enables the per-step latent detach
+        # to keep eval memory bounded; with no such accelerator it is `torch.no_grad()`.
+        with self._rollout_grad_context(), self.autocast(), self.adapter.use_ema_parameters():
             for dataset_name, dataloader in self.eval_dataloaders.items():
                 buffer = self.eval_dataset_reward_buffers.get(dataset_name)
                 if buffer is None:
