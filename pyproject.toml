@@ -64,12 +64,8 @@ quantization = [
     "bitsandbytes>=0.45.3",
 ]
 
-# Rollout acceleration: richer feature-caching policies (DBCache / TaylorSeer).
-# Diffusers-native caching (the `diffusers_cache` accelerator) needs nothing extra;
-# this extra is only for the `cache_dit` accelerator.
-acceleration = [
-    "cache-dit>=0.2.0",
-]
+# Rollout feature-caching (the `diffusers_cache` accelerator) is diffusers-native and
+# needs no extra dependency, so there is no `acceleration` optional-dependency group.
 
 # Bagel adapter runtime (flash-attn varlen kernels + opencv transforms)
 bagel = [
@@ -105,7 +101,7 @@ geneval2 = [
 # flow-factory:  uv pip install hpsv2 --no-deps  (runtime works with protobuf 6+).
 
 all = [
-    "flow-factory[deepspeed,quantization,acceleration]",
+    "flow-factory[deepspeed,quantization]",
 ]
 
 [project.scripts]

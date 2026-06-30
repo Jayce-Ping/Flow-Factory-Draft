@@ -38,9 +38,24 @@ _ACCELERATOR_REGISTRY: Dict[str, str] = {
     'torch_compile': 'flow_factory.acceleration.torch_compile.CompileAccelerator',
     # Lossy (rollout-only; validator restricts to decoupled / distillation algos).
     'diffusers_cache': 'flow_factory.acceleration.diffusers_cache.DiffusersCacheAccelerator',
-    'cache_dit': 'flow_factory.acceleration.cache_dit.CacheDitAccelerator',
 }
 _ACCELERATOR_REGISTRY = {k.lower(): v for k, v in _ACCELERATOR_REGISTRY.items()}
+
+# Accelerators that were removed; mapped to an actionable migration message so a
+# config still naming them fails fast with guidance instead of a generic error.
+_REMOVED_ACCELERATORS: Dict[str, str] = {
+    'cache_dit': (
+        "The 'cache_dit' accelerator was removed. cache-dit only caches inside a "
+        "pipeline `__call__` it patches, but Flow-Factory's rollout drives the "
+        "transformer directly (adapter.inference()), so it was a silent no-op; its "
+        "transformer-only path also assumes enable-once (incompatible with the "
+        "per-epoch rollout lifecycle) and conflicts with the adapters' native "
+        "diffusers `cache_context`. Use the `diffusers_cache` accelerator instead "
+        "(diffusers-native FirstBlockCache / TaylorSeer / FasterCache; no extra "
+        "dependency): `{ name: diffusers_cache, params: { policy: first_block, "
+        "threshold: 0.08 } }`."
+    ),
+}
 
 
 def get_accelerator_class(identifier: str) -> Type[BaseAccelerator]:
@@ -60,6 +75,8 @@ def get_accelerator_class(identifier: str) -> Type[BaseAccelerator]:
         ImportError: If the accelerator cannot be loaded.
     """
     identifier_lower = identifier.lower()
+    if identifier_lower in _REMOVED_ACCELERATORS:
+        raise ValueError(_REMOVED_ACCELERATORS[identifier_lower])
     if identifier_lower in _ACCELERATOR_REGISTRY:
         class_path = _ACCELERATOR_REGISTRY[identifier_lower]
     else:

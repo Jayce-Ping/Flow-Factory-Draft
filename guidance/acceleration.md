@@ -50,7 +50,7 @@ acceleration:
 
   # Rollout-only (Stage 3), nested in list order. May be lossy (paradigm-gated).
   rollout:
-    - name: diffusers_cache                   # diffusers_cache | cache_dit | <lossless id>
+    - name: diffusers_cache                   # diffusers_cache | <lossless id>
       params: { policy: first_block, threshold: 0.08 }
 ```
 
@@ -64,8 +64,7 @@ accepted as shorthand for a one-element list. A direct python path (e.g.
 |----|--------|-------|-------|
 | `attention_backend` | lossless | both | Sets the diffusers attention backend on every transformer. Requires a `backend` param. Forwards any backend (`native` / `flash` / `_flash_3` / `_flash_3_hub` / `sage` / `xformers`) to `set_attention_backend`. List it in `shared` **before** `torch_compile` so the compiled graph captures the backend. |
 | `torch_compile` | lossy | both | `torch.compile` of the shared transformer. `mode: regional` uses diffusers' `compile_repeated_blocks` (fast warmup, robust to variable resolution); `mode: full` compiles the whole module. Extra `compile_kwargs` forwarded to the compile call. Compiles in place (checkpoint- and EMA/ref-safe), applied after `post_init`. Marked **lossy** because it is applied symmetrically but is **not bit-exact across rollout vs training** (grad/no-grad graph split → intermittent ~1e-5 on-policy residual, within `clip_range`); allowed on coupled algos, but the validator warns. |
-| `diffusers_cache` | lossy | rollout | Diffusers-native feature caching (no extra dependency). `policy`: `first_block` (default) / `faster` / `pyramid` / `taylorseer` / `magcache`; remaining params forwarded to the policy's diffusers config (e.g. `threshold`). |
-| `cache_dit` | lossy | rollout | [cache-dit](https://github.com/vipshop/cache-dit) backend (DBCache/TaylorSeer). Requires `pip install flow-factory[acceleration]`. All params forwarded to `cache_dit.enable_cache`. |
+| `diffusers_cache` | lossy | rollout | Diffusers-native feature caching (no extra dependency). `policy`: `first_block` (default) / `faster` / `pyramid` / `taylorseer` / `magcache`; remaining params forwarded to the policy's diffusers config (e.g. `threshold`). The single lossy rollout backend. |
 
 ### Attention backend
 

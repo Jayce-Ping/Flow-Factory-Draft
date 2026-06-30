@@ -40,7 +40,7 @@ model:
 #     - name: torch_compile          # ...so the compiled graph captures it
 #       params: { mode: regional }   # regional (compile_repeated_blocks) | full
 #   rollout:                         # rollout-only (Stage 3); lossy -> decoupled/distillation only
-#     - name: diffusers_cache        # Options: diffusers_cache, cache_dit
+#     - name: diffusers_cache        # Options: diffusers_cache
 #       params: { policy: first_block, threshold: 0.08 }
 
 log:

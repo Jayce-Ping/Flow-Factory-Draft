@@ -15,8 +15,8 @@
 # src/flow_factory/acceleration/__init__.py
 """Model-agnostic acceleration plugin layer.
 
-Concrete accelerators are resolved lazily through the registry (so optional
-dependencies such as ``cache-dit`` are only imported when actually requested).
+Concrete accelerators are resolved lazily through the registry, so an accelerator
+module (and any heavy import it needs) is only loaded when actually requested.
 """
 
 from .abc import BaseAccelerator
