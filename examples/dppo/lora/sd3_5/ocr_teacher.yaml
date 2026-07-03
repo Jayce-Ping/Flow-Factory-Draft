@@ -1,0 +1,126 @@
+# Checkpoint: https://huggingface.co/Jayce-Ping/OCR-Teacher
+# DPPO teacher config migrated from private flow_dppo/ocr.yaml.
+# Mapping: grpo + mask_type: kl_adv -> dppo + kl_mask_type: v-based; kl_beta=0.
+# Trains SD3.5-Medium LoRA on dataset/ocr with OCR reward (sync).
+
+# Environment Configuration
+launcher: "accelerate"  # Options: accelerate
+config_file: config/deepspeed/deepspeed_zero2.yaml  # Path to distributed config file (switch to config/accelerate_configs/fsdp2.yaml for limited GPU memory)
+num_processes: 8  # Number of processes to launch (overrides config file)
+main_process_port: 29500  # Port for distributed communication
+mixed_precision: "bf16"  # Options: no, fp16, bf16
+
+# Data Configuration
+data:
+  datasets:
+    - name: ocr  # Unique identifier (used in metrics, caching, reward routing)
+      dataset_dir: "dataset/ocr"  # Folder with train.jsonl / test.jsonl
+      train:  # Training participation config
+        weight: 1  # Mixing weight (integer); single-source so always 1
+        max_dataset_size: null  # Cap on training samples; null = use full dataset
+      eval: {}  # Eval participation (inherits shared `eval:` section)
+  preprocessing_batch_size: 32  # Batch size for preprocessing
+  dataloader_num_workers: 16  # Number of workers for DataLoader
+  force_reprocess: false  # Force reprocessing of the dataset (false = reuse cache)
+  cache_dir: "~/.cache/flow_factory/datasets"  # Cache directory for preprocessed datasets
+  sampler_type: "auto"  # Options: auto, distributed_k_repeat, group_contiguous
+
+# Model Configuration
+model:
+  finetune_type: 'lora'  # Options: full, lora
+  lora_rank: 32  # LoRA rank dimension
+  lora_alpha: 64  # LoRA scaling factor (typically 2x rank)
+  target_modules: "default"  # Options: all, default, or list of module names
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"  # HuggingFace model ID or local path
+  model_type: "sd3-5"  # Model type identifier for adapter selection
+  resume_path: null  # Local path or HF repo id for previous checkpoint/lora adapter
+  resume_type: null  # Options: lora, full, state. Null to auto-detect based on `finetune_type`
+
+log:
+  run_name: "dppo_ocr_teacher"  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
+  project: "Flow-Factory"  # Project name for logging
+  logging_backend: "wandb"  # Options: wandb, swanlab, tensorboard, none
+  save_dir: "saves/"  # Directory to save model checkpoints and logs
+  save_freq: 20  # Save frequency in epochs (0 to disable)
+  save_model_only: true  # Save only the model weights (not optimizer, scheduler, etc.)
+  verbose: false  # Print detailed progress during training
+
+# Training Configuration
+train:
+  max_epochs: 1000  # Maximum number of epochs to train
+  # Trainer settings
+  trainer_type: 'dppo'  # Options: 'grpo', 'grpo-guard', 'dppo', 'nft', 'awm'
+  advantage_aggregation: 'sum'  # Options: 'sum', 'gdpo'
+  # Advantage clipping
+  adv_clip_range: 10.0  # Advantage clipping range (parsed to symmetric (-10, 10))
+  # KL (decoupled: kl_type for ref penalty, kl_mask_type for trust-region mask)
+  kl_type: 'v-based'  # KL-vs-reference penalty space. Options: 'x-based', 'v-based'
+  kl_mask_type: 'v-based'  # DPPO trust-region mask space; matches private kl_adv + kl_type=v-based
+  kl_mask_threshold: 1.0e-6  # DPPO: zero-gradient when per-step KL(current||old) >= threshold and update is harmful
+  kl_beta: 0  # KL(current || reference) penalty; 0 disables ref term
+  ref_param_device: 'cuda'  # Options: cpu, cuda
+
+  # Sampling settings
+  resolution: 512  # Can be int or [height, width]
+  num_inference_steps: 10  # Number of denoising timesteps
+  guidance_scale: 1.0  # Guidance scale for sampling (1.0 = no CFG)
+
+  # Batch and sampling
+  per_device_batch_size: 8  # Batch size per device
+  group_size: 18  # Group size for GRPO/DPPO sampling
+  global_std: true  # Use global std for advantage normalization
+  unique_sample_num_per_epoch: 64  # Unique prompts sampled per epoch (global)
+  gradient_step_per_epoch: 2  # Optimizer steps per epoch
+  gradient_accumulation_steps: auto  # Options: auto, or positive integer
+  num_inner_epochs: 1  # Number of inner-loop passes over the same rollouts
+
+  # Optimization
+  learning_rate: 3.0e-4  # Initial learning rate
+  adam_weight_decay: 1.0e-4  # AdamW weight decay
+  adam_betas: [0.9, 0.999]  # AdamW betas
+  adam_epsilon: 1.0e-8  # AdamW epsilon
+  max_grad_norm: 1.0  # Max gradient norm for clipping
+
+  # EMA
+  ema_decay: 0.99  # EMA decay rate (0 to disable)
+  ema_update_interval: 4  # EMA update interval (in epochs)
+  ema_device: "cuda"  # Device to store EMA model (options: cpu, cuda)
+
+  # Gradient checkpointing
+  enable_gradient_checkpointing: false  # Enable gradient checkpointing to save memory
+
+  # Seed
+  seed: 42  # Random seed
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "CPS"  # Options: Flow-SDE, Dance-SDE, CPS, ODE
+  noise_level: 0.8  # Noise level for sampling
+  num_sde_steps: 3  # Number of noise steps
+  sde_steps: [0, 1, 2, 3, 4]  # Custom noise window; noise steps randomly selected from this list
+  seed: 42  # Scheduler seed (for noise step selection)
+
+# Evaluation settings
+eval:
+  resolution: 512  # Evaluation resolution
+  per_device_batch_size: 32  # Eval batch size
+  guidance_scale: 1.0  # Guidance scale for eval sampling
+  num_inference_steps: 40  # Number of eval timesteps
+  eval_freq: 20  # Eval frequency in epochs (0 to disable)
+  seed: 42  # Eval seed
+
+# Reward Model Configuration
+rewards:
+  - name: "ocr"  # Reward identifier (appears in log keys)
+    reward_model: "OCR"  # Reward model class (registry, case-insensitive)
+    batch_size: 64  # Inference batch size for this reward model
+    device: "cuda"  # Device to run reward model on
+    dtype: bfloat16  # Precision for reward model inference
+
+# Evaluation Reward Models
+eval_rewards:
+  - name: "ocr"  # Eval reward identifier
+    reward_model: "OCR"  # Reward model class (registry, case-insensitive)
+    batch_size: 64  # Inference batch size for this reward model
+    device: "cuda"  # Device to run reward model on
+    dtype: bfloat16  # Precision for reward model inference
