@@ -1,6 +1,4 @@
 # Checkpoint: https://huggingface.co/Jayce-Ping/Pickscore-Teacher
-# DPPO teacher config migrated from private flow_dppo/pickscore.yaml.
-# Mapping: grpo + mask_type: kl_adv -> dppo + kl_mask_type: v-based; kl_beta=0.
 # Trains SD3.5-Medium LoRA on dataset/pickscore with PickScore reward (async).
 
 # Environment Configuration
