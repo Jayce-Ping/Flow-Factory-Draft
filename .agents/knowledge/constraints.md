@@ -46,6 +46,9 @@ All target components (trainable **and** frozen-but-shardable) are bundled into 
 ### 9a. Sampler Geometric Constraints
 `DistributedKRepeatSampler` and `GroupContiguousSampler` require `M * K ≡ 0 (mod W * B * G)` where M=unique_sample_num, K=group_size, W=world_size, B=per_device_batch_size, G=gradient_step_per_epoch — **unless** `gradient_accumulation_steps` is set manually, in which case the constraint reduces to `M * K ≡ 0 (mod W * B)`. **GroupContiguousSampler** adds: `M ≡ 0 (mod W)`. **GroupDistributedSampler** (DGPO) requires: `K % W == 0` and `(W * B) % K == 0`; auto-aligned by `_align_for_group_distributed`. See `topics/samplers.md` for full details.
 
+### 9b. Checkpoint Save/Load Symmetry Under the Bundle
+Checkpoints are written and read for **trainable members only** — components whose `target_module_map[name]` is non-empty (`adapter.trainable_component_names`). Frozen-but-shardable bundle members (e.g. Wan2.2's `transformer_2`, kept in `target_components` only to be FSDP-sharded for memory; see #9) map to `None` and are skipped by both `save_checkpoint` and `_load_lora`/`_load_full_model`. Loaders MUST iterate `trainable_component_names`, not `target_components`, or resume logs a spurious error for a per-component subdir that was never written. `resume_type='state'` restores via `accelerator.load_state` into the prepared bundle root and is therefore keyed to bundle membership — resuming into a different `target_components` / bundle composition will mismatch.
+
 ### 10. DeepSpeed ZeRO-3 Is Unsupported
 Reward model sharding under ZeRO-3 is broken even with `GatherParameter` context manager (see the ZeRO-3 guard comment in `trainers/abc.py`). Only ZeRO-1 and ZeRO-2 are safe. Document this if users ask.
 

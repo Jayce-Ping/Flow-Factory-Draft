@@ -1617,7 +1617,13 @@ class BaseAdapter(ABC):
 
     def _load_lora(self, path: str) -> None:
         """Load LoRA adapters for target components with auto-format detection."""
-        for comp_name in self.model_args.target_components:
+        # Iterate only components that actually carry target modules. Frozen
+        # bundled members (e.g. Wan2.2's `transformer_2`, kept in
+        # `target_components` solely to be FSDP-sharded for memory) map to None
+        # in `target_module_map` and are skipped by `save_checkpoint`; iterating
+        # `target_components` here would instead look for a `.../transformer_2/`
+        # subdir that was never written and log a spurious error on every resume.
+        for comp_name in self.trainable_component_names:
             if not hasattr(self, comp_name):
                 logger.warning(f"Component {comp_name} not found, skipping")
                 continue
@@ -1716,7 +1722,10 @@ class BaseAdapter(ABC):
 
     def _load_full_model(self, path: str, strict: bool = True) -> None:
         """Load full model weights for target components."""
-        for comp_name in self.model_args.target_components:
+        # Match `save_checkpoint`: only components with target modules are
+        # written, so frozen bundled members (`target_module_map[name] is None`)
+        # must be skipped here rather than iterating all `target_components`.
+        for comp_name in self.trainable_component_names:
             if not hasattr(self, comp_name):
                 logger.warning(f"Component {comp_name} not found, skipping")
                 continue
