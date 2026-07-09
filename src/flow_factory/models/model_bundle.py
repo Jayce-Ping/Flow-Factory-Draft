@@ -65,6 +65,33 @@ class ModelBundle(nn.Module):
                 )
         self.members = nn.ModuleDict(members)
 
+    @property
+    def _no_split_modules(self):
+        """Aggregate the members' ``_no_split_modules`` so accelerate's FSDP
+        ``TRANSFORMER_BASED_WRAP`` can discover the transformer block class(es).
+
+        accelerate's ``set_auto_wrap_policy`` reads ``getattr(root, "_no_split_modules")``
+        off the single root passed to ``prepare`` (this bundle). Without this the
+        list is empty, ``transformer_layer_cls`` becomes an empty set, and the whole
+        bundle is wrapped as ONE FSDP unit -> one monolithic flat param (the full
+        unsharded model materialized on every rank) -> OOM at init for large models
+        (e.g. Wan2.2 A14B: ~53GB flat param). We surface the block-class *names* that
+        the underlying model classes already declare (e.g. diffusers
+        ``WanTransformer3DModel._no_split_modules == ['WanTransformerBlock']``);
+        accelerate then resolves each name to its class via ``get_module_class_from_name``
+        over this root's submodule tree and wraps per-block. Returns ``None`` when no
+        member declares any (accelerate keeps its prior fallback unchanged).
+        """
+        names: list[str] = []
+        # Walk members' submodule tree (NOT self, to avoid recursing on this property);
+        # collect every ``_no_split_modules`` a nested module declares.
+        for module in self.members.modules():
+            nsm = getattr(module, "_no_split_modules", None)
+            if nsm:
+                names.extend(nsm)
+        deduped = list(dict.fromkeys(names))
+        return deduped or None
+
     def forward(self, component_name: str, /, *args, **kwargs):
         """Dispatch the call to ``members[component_name]``.
 
