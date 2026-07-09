@@ -59,8 +59,11 @@ class ModelArguments(ArgABC):
         default=None,
         metadata={
             "help": "Torch dtype for frozen (`requires_grad=False`) parameters and floating-point "
-                    "buffers. `None` (default) falls back to the model inference dtype implied by "
-                    "`mixed_precision`, preserving prior behavior."
+                    "buffers. `None` (default) preserves each frozen component's original "
+                    "`from_pretrained` dtype and never downcasts -- released checkpoints deliberately "
+                    "ship components in different dtypes (e.g. Z-Image: transformer fp32, text encoder "
+                    "bf16), so forcing one uniform frozen dtype would override those choices. Set an "
+                    "explicit dtype (e.g. 'bf16') to cast all frozen params to it, e.g. to save memory."
         },
     )
 

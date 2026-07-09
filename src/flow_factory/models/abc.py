@@ -872,32 +872,39 @@ class BaseAdapter(ABC):
         self,
         component: torch.nn.Module,
         train_dtype: torch.dtype,
-        frozen_dtype: torch.dtype,
+        frozen_dtype: Optional[torch.dtype],
     ) -> int:
         """
         Set floating-point parameters/buffers without a trainable round-trip through frozen_dtype.
 
-        Trainable parameters use ``train_dtype``; frozen parameters and floating-point buffers use
-        ``frozen_dtype``. Integer/bool buffers are left unchanged (same as ``Module.to``).
+        Trainable parameters use ``train_dtype``. Frozen parameters and floating-point buffers use
+        ``frozen_dtype`` when it is set, or are left at their loaded dtype when ``frozen_dtype`` is
+        ``None`` (preserve). Integer/bool buffers are left unchanged (same as ``Module.to``).
         """ 
         n_trainable = 0
         for _, param in component.named_parameters():
             if param.requires_grad:
                 param.data = param.data.to(dtype=train_dtype)
                 n_trainable += 1
-            else:
+            elif frozen_dtype is not None:
                 param.data = param.data.to(dtype=frozen_dtype)
         for _, buf in component.named_buffers():
-            if buf.is_floating_point():
+            if buf.is_floating_point() and frozen_dtype is not None:
                 buf.data = buf.data.to(dtype=frozen_dtype)
         return n_trainable
 
     def _mix_precision(self):
-        """Set trainable params to ``trainable_parameters_dtype`` and frozen params + floating-point
-        buffers to ``frozen_parameters_dtype`` (falling back to the inference dtype when unset).
+        """Set trainable params to ``trainable_parameters_dtype``; by default leave frozen params
+        and floating-point buffers at their loaded (``from_pretrained``) dtype.
 
         This is the single place that decides every parameter's *original* dtype before
         ``accelerator.prepare``; the trainer only bundles + prepares.
+
+        Frozen-dtype policy: ``frozen_parameters_dtype=None`` (default) preserves each frozen
+        parameter/buffer's original dtype and never downcasts -- a released checkpoint deliberately
+        ships components in different dtypes (e.g. Z-Image: transformer fp32, text encoder bf16), and
+        forcing one uniform frozen dtype would override those choices. Set an explicit
+        ``frozen_parameters_dtype`` to opt into casting every frozen param to that dtype.
 
         FSDP2 caveat: FSDP2 shards each unit with ONE original dtype, and accelerate upcasts the
         trainable params to an fp32 master when ``mixed_precision != 'no'``. So a trained component
@@ -905,11 +912,10 @@ class BaseAdapter(ABC):
         is frozen-but-sharded) would otherwise mix fp32/low-precision within a unit and trip FSDP2's
         uniform-dtype assert. We therefore force the TRAINED components to a uniform fp32 original
         dtype here (compute stays low-precision via accelerate's ``MixedPrecisionPolicy``); untrained
-        components (text encoder / VAE, not sharded) keep ``frozen_parameters_dtype``.
+        components are cast to ``frozen_parameters_dtype`` when set, else preserved.
         """
-        inference_dtype = self._inference_dtype
         train_dtype = self.model_args.trainable_parameters_dtype
-        frozen_dtype = self.model_args.frozen_parameters_dtype or inference_dtype
+        frozen_dtype = self.model_args.frozen_parameters_dtype  # None -> preserve loaded dtype
 
         target_set = frozenset(self.model_args.target_components)
         component_names = self._resolve_component_names(None)
@@ -918,28 +924,37 @@ class BaseAdapter(ABC):
         # FSDP2: trained (sharded) components need a uniform fp32 original dtype.
         if self._is_fsdp2() and self.accelerator.mixed_precision != "no":
             for name in merged_names:
-                self.get_component(name).to(dtype=torch.float32 if name in target_set else frozen_dtype)
-            logger.info(f"FSDP2: trained components -> fp32 (uniform orig dtype); other components -> {frozen_dtype}")
+                if name in target_set:
+                    self.get_component(name).to(dtype=torch.float32)
+                elif frozen_dtype is not None:
+                    self.get_component(name).to(dtype=frozen_dtype)
+                # else: preserve the untrained component's loaded dtype
+            logger.info(
+                f"FSDP2: trained components -> fp32 (uniform orig dtype); "
+                f"other components -> {frozen_dtype or 'preserved (loaded dtype)'}"
+            )
             return
 
-        # Uniform dtype -> a single cast of every component suffices.
-        if train_dtype == frozen_dtype:
+        # Explicit uniform dtype -> a single cast of every component suffices.
+        if frozen_dtype is not None and train_dtype == frozen_dtype:
             for name in merged_names:
                 self.get_component(name).to(dtype=frozen_dtype)
             return
 
-        # Split: trainable -> train_dtype, frozen -> frozen_dtype (within trained components too).
+        # Split: trainable -> train_dtype; frozen -> frozen_dtype, or preserved when None.
         trainable_count = 0
         for name in merged_names:
             component = self.get_component(name)
             if name in target_set:
                 trainable_count += self._cast_module_mixed_precision(component, train_dtype, frozen_dtype)
-            else:
+            elif frozen_dtype is not None:
                 component.to(dtype=frozen_dtype)
+            # else: preserve the fully-frozen component's loaded dtype
 
         if trainable_count > 0:
             logger.info(
-                f"Set {trainable_count} trainable parameters to {train_dtype}, frozen params to {frozen_dtype}"
+                f"Set {trainable_count} trainable parameters to {train_dtype}; "
+                f"frozen params -> {frozen_dtype or 'preserved (loaded dtype)'}"
             )
 
     # ============================== LoRA Management ==============================
