@@ -346,6 +346,8 @@ class BaseTrainer(ABC):
         eval_dataloader_list = [eval_dataloaders[n] for n in eval_dataloader_names]
 
         # One prepare call -> one DDP/FSDP/DeepSpeed root for the whole bundle.
+        # (Parameter dtypes -- incl. the FSDP2 uniform-fp32 requirement for sharded trained
+        # components -- are already handled in the adapter's `_mix_precision`.)
         prepared = self.accelerator.prepare(model_bundle, self.optimizer, *eval_dataloader_list)
         self.model_bundle = prepared[0]
         self.optimizer = prepared[1]

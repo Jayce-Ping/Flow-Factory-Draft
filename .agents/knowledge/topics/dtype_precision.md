@@ -9,7 +9,7 @@
 | Component | Runtime dtype | Why |
 |-----------|--------------|-----|
 | Transformer (frozen) | `inference_dtype` (bf16/fp16) | Memory savings for frozen params |
-| Transformer (trainable) | `master_weight_dtype` (fp32/bf16) | Gradient precision |
+| Transformer (trainable) | `trainable_parameters_dtype` (fp32/bf16) | Gradient precision |
 | Scheduler math | `float32` always | `1/sigma` amplification (see below) |
 | Latent storage (trajectory) | `latent_storage_dtype` (configurable) | Memory vs. precision tradeoff |
 | Advantage computation | `float64` (numpy) | Normalization stability |

@@ -893,37 +893,54 @@ class BaseAdapter(ABC):
         return n_trainable
 
     def _mix_precision(self):
-        """Apply mixed precision to default pipeline modules plus any extra ``target_components`` names."""
-        # Get inference and master dtypes
-        inference_dtype = self._inference_dtype
-        master_dtype = self.model_args.master_weight_dtype
+        """Set trainable params to ``trainable_parameters_dtype`` and frozen params + floating-point
+        buffers to ``frozen_parameters_dtype`` (falling back to the inference dtype when unset).
 
-        # Get target components and all component names
+        This is the single place that decides every parameter's *original* dtype before
+        ``accelerator.prepare``; the trainer only bundles + prepares.
+
+        FSDP2 caveat: FSDP2 shards each unit with ONE original dtype, and accelerate upcasts the
+        trainable params to an fp32 master when ``mixed_precision != 'no'``. So a trained component
+        that also bundles frozen members (e.g. Wan2.2 trains ``transformer`` while ``transformer_2``
+        is frozen-but-sharded) would otherwise mix fp32/low-precision within a unit and trip FSDP2's
+        uniform-dtype assert. We therefore force the TRAINED components to a uniform fp32 original
+        dtype here (compute stays low-precision via accelerate's ``MixedPrecisionPolicy``); untrained
+        components (text encoder / VAE, not sharded) keep ``frozen_parameters_dtype``.
+        """
+        inference_dtype = self._inference_dtype
+        train_dtype = self.model_args.trainable_parameters_dtype
+        frozen_dtype = self.model_args.frozen_parameters_dtype or inference_dtype
+
         target_set = frozenset(self.model_args.target_components)
         component_names = self._resolve_component_names(None)
         merged_names = list(dict.fromkeys([*component_names, *self.model_args.target_components]))
 
-        # If master dtype is the same as inference dtype, cast all components to inference dtype
-        if master_dtype == inference_dtype:
-            # Cast all components to inference dtype
+        # FSDP2: trained (sharded) components need a uniform fp32 original dtype.
+        if self._is_fsdp2() and self.accelerator.mixed_precision != "no":
             for name in merged_names:
-                self.get_component(name).to(dtype=inference_dtype)
+                self.get_component(name).to(dtype=torch.float32 if name in target_set else frozen_dtype)
+            logger.info(f"FSDP2: trained components -> fp32 (uniform orig dtype); other components -> {frozen_dtype}")
             return
 
+        # Uniform dtype -> a single cast of every component suffices.
+        if train_dtype == frozen_dtype:
+            for name in merged_names:
+                self.get_component(name).to(dtype=frozen_dtype)
+            return
+
+        # Split: trainable -> train_dtype, frozen -> frozen_dtype (within trained components too).
         trainable_count = 0
         for name in merged_names:
             component = self.get_component(name)
             if name in target_set:
-                # Cast trainable parameters to master dtype
-                trainable_count += self._cast_module_mixed_precision(
-                    component, master_dtype, inference_dtype
-                )
+                trainable_count += self._cast_module_mixed_precision(component, train_dtype, frozen_dtype)
             else:
-                # Cast frozen parameters to inference dtype
-                component.to(dtype=inference_dtype)
+                component.to(dtype=frozen_dtype)
 
         if trainable_count > 0:
-            logger.info(f"Set {trainable_count} trainable parameters to {master_dtype}")
+            logger.info(
+                f"Set {trainable_count} trainable parameters to {train_dtype}, frozen params to {frozen_dtype}"
+            )
 
     # ============================== LoRA Management ==============================
     def apply_lora(
@@ -1181,37 +1198,21 @@ class BaseAdapter(ABC):
 
                 state_dict = clone_tensors_for_torch_save(self._unwrap(model).state_dict())
         elif self.accelerator.is_fsdp2:
-            # FSDP/FSDP2
+            # FSDP2: gather the full (unsharded) params to rank0 via the DTensor-aware API.
+            # NOTE: the previous `state_dict_keys` path toggled `requires_grad` at runtime to
+            # sub-select params, but FSDP2's `ignore_frozen_params` is keyed off the trainability
+            # captured at `fully_shard` time -- the runtime toggle is a no-op, so it yielded an
+            # EMPTY adapter. Gather straight through (LoRA params are exactly the trainable subset,
+            # so `ignore_frozen_params=True` returns them) and let the shared key-filter below
+            # narrow to `state_dict_keys` when provided.
             from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
-            if state_dict_keys is not None:
-                # Temporarily mark unwanted params as frozen
-                # This `requires_grad` trick does not work correctly. Don't know why.
-                original_state = {}
-                
-                # Freeze unwanted params
-                for name, param in model.named_parameters():
-                    original_state[name] = param.requires_grad
-                    param.requires_grad = is_param_match_key(name, state_dict_keys)
-                
-                options = StateDictOptions(
-                    full_state_dict=True,
-                    broadcast_from_rank0=True,
-                    cpu_offload=True,
-                    ignore_frozen_params=True,
-                )
-                state_dict = get_model_state_dict(model, options=options)
-                
-                # Restore original state
-                for name, param in model.named_parameters():
-                    param.requires_grad = original_state[name]
-            else:
-                options = StateDictOptions(
-                    full_state_dict=True, 
-                    broadcast_from_rank0=True, 
-                    cpu_offload=True, 
-                    ignore_frozen_params=ignore_frozen_params
-                )
-                state_dict = get_model_state_dict(model, options=options)
+            options = StateDictOptions(
+                full_state_dict=True,
+                broadcast_from_rank0=True,
+                cpu_offload=True,
+                ignore_frozen_params=ignore_frozen_params,
+            )
+            state_dict = get_model_state_dict(model, options=options)
         elif self.accelerator.distributed_type == DistributedType.FSDP:
             from torch.distributed.fsdp import FullStateDictConfig, StateDictType
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP

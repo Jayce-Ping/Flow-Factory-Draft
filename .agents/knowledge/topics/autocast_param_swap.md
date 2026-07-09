@@ -11,7 +11,7 @@
 - **Ref/EMA/named swap** — `copy_ema_to` does `param.data.copy_` (same `data_ptr`); a ref forward after the policy forward in one region reuses the policy cast → KL ≈ 0.
 - **`optimizer.step()`** — updates weights in place; if the region spans steps, later forwards reuse the pre-step cast → training frozen (loss flat).
 
-**Bites only** for fp32 trainable weights (`master_weight_dtype: fp32`); dormant for the bf16 default (nothing cached); LoRA's `disable_adapter()` ref path is safe (no `.data.copy_`).
+**Bites only** for fp32 trainable weights (`trainable_parameters_dtype: fp32`); dormant for the bf16 default (nothing cached); LoRA's `disable_adapter()` ref path is safe (no `.data.copy_`).
 
 **Rule**: wrap **each** forward (and its KL math) in its own `with self.autocast():`; never one autocast around the optimize loop. Per-forward (not `cache_enabled=False`) keeps the legit intra-forward reuse of two-pass-CFG adapters (e.g. `qwen_image_edit_plus.py` calls the transformer twice per forward). Precompute / sampling regions keep their outer autocast (weights constant).
 
