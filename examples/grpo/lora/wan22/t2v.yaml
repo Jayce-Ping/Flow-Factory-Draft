@@ -1,9 +1,11 @@
 # Environment Configuration
 launcher: "accelerate"  # Options: accelerate
 # Distributed sharding backend. For Wan2.2 you may set `target_components` to both `transformer`
-# and `transformer_2`; they are bundled into one prepared root, so DeepSpeed (ZeRO-1/2) and FSDP
-# (v1/v2) can all train and shard the two transformers together. FSDP full shard
-# (`config/accelerate_configs/fsdp_full_shard.yaml`) also shards model params; ZeRO-3 unsupported.
+# and `transformer_2`; they are bundled into one prepared root, so DeepSpeed (ZeRO-1/2) shards them
+# together. For FSDP prefer FSDP2 (`config/accelerate_configs/fsdp2.yaml`), NOT FSDP1
+# (`fsdp_full_shard.yaml`): Wan2.2 routes each timestep to only ONE transformer (boundary_ratio),
+# so the bundled two-transformer + per-block wrap trips FSDP1's single-root lazy-init (`_is_root`
+# assertion) on the first forward. ZeRO-3 unsupported.
 config_file: config/deepspeed/deepspeed_zero2.yaml
 num_processes: 8  # Number of processes to launch (overrides config file)
 main_process_port: 29500
