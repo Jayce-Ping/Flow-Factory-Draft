@@ -8,8 +8,8 @@
 
 | Component | Runtime dtype | Why |
 |-----------|--------------|-----|
-| Transformer (frozen) | `inference_dtype` (bf16/fp16) | Memory savings for frozen params |
-| Transformer (trainable) | `master_weight_dtype` (fp32/bf16) | Gradient precision |
+| Frozen params/buffers (frozen transformer base, VAE, text encoders) | `frozen_parameters_dtype` — default `None` **preserves each component's `from_pretrained` dtype** (no downcast) | Released checkpoints ship components in different dtypes (e.g. Z-Image: transformer fp32, text encoder bf16); set an explicit dtype to force one / save memory |
+| Transformer (trainable) | `trainable_parameters_dtype` (fp32/bf16) | Gradient precision |
 | Scheduler math | `float32` always | `1/sigma` amplification (see below) |
 | Latent storage (trajectory) | `latent_storage_dtype` (configurable) | Memory vs. precision tradeoff |
 | Advantage computation | `float64` (numpy) | Normalization stability |

@@ -46,11 +46,24 @@ class ModelArguments(ArgABC):
         metadata={"help": "Fine-tuning type. Options are ['full', 'lora']"}
     )
 
-    master_weight_dtype : Union[Literal['fp32', 'bf16', 'fp16', 'float16', 'bfloat16', 'float32'], torch.dtype] = field(
+    trainable_parameters_dtype : Union[Literal['fp32', 'bf16', 'fp16', 'float16', 'bfloat16', 'float32'], torch.dtype] = field(
         default='bfloat16',
         metadata={
-            "help": "Torch dtype for all trainable parameters (`requires_grad=True`). "
-                    "Non-trainable weights and floating-point buffers use the model inference dtype when they differ."
+            "help": "Torch dtype for all trainable parameters (`requires_grad=True`) -- i.e. the "
+                    "optimizer 'master weight' precision. (Renamed from the misnamed "
+                    "`master_weight_dtype`, which despite its name only ever set the *trainable* "
+                    "parameter dtype.)"
+        },
+    )
+    frozen_parameters_dtype : Optional[Union[Literal['fp32', 'bf16', 'fp16', 'float16', 'bfloat16', 'float32'], torch.dtype]] = field(
+        default=None,
+        metadata={
+            "help": "Torch dtype for frozen (`requires_grad=False`) parameters and floating-point "
+                    "buffers. `None` (default) preserves each frozen component's original "
+                    "`from_pretrained` dtype and never downcasts -- released checkpoints deliberately "
+                    "ship components in different dtypes (e.g. Z-Image: transformer fp32, text encoder "
+                    "bf16), so forcing one uniform frozen dtype would override those choices. Set an "
+                    "explicit dtype (e.g. 'bf16') to cast all frozen params to it, e.g. to save memory."
         },
     )
 
@@ -120,8 +133,10 @@ class ModelArguments(ArgABC):
                 "this knob — just drop the line.)"
             )
 
-        if isinstance(self.master_weight_dtype, str):
-            self.master_weight_dtype = dtype_map[self.master_weight_dtype]
+        if isinstance(self.trainable_parameters_dtype, str):
+            self.trainable_parameters_dtype = dtype_map[self.trainable_parameters_dtype]
+        if isinstance(self.frozen_parameters_dtype, str):
+            self.frozen_parameters_dtype = dtype_map[self.frozen_parameters_dtype]
 
         # Normalize target_components to list
         if isinstance(self.target_components, str):
@@ -139,7 +154,9 @@ class ModelArguments(ArgABC):
 
     def to_dict(self) -> dict[str, Any]:
         d = super().to_dict()
-        d['master_weight_dtype'] = str(self.master_weight_dtype).split('.')[-1]
+        d['trainable_parameters_dtype'] = str(self.trainable_parameters_dtype).split('.')[-1]
+        if self.frozen_parameters_dtype is not None:
+            d['frozen_parameters_dtype'] = str(self.frozen_parameters_dtype).split('.')[-1]
         return d
 
     def __str__(self) -> str:

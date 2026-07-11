@@ -871,58 +871,90 @@ class BaseAdapter(ABC):
         self,
         component: torch.nn.Module,
         train_dtype: torch.dtype,
-        frozen_dtype: torch.dtype,
+        frozen_dtype: Optional[torch.dtype],
     ) -> int:
         """
         Set floating-point parameters/buffers without a trainable round-trip through frozen_dtype.
 
-        Trainable parameters use ``train_dtype``; frozen parameters and floating-point buffers use
-        ``frozen_dtype``. Integer/bool buffers are left unchanged (same as ``Module.to``).
+        Trainable parameters use ``train_dtype``. Frozen parameters and floating-point buffers use
+        ``frozen_dtype`` when it is set, or are left at their loaded dtype when ``frozen_dtype`` is
+        ``None`` (preserve). Integer/bool buffers are left unchanged (same as ``Module.to``).
         """ 
         n_trainable = 0
         for _, param in component.named_parameters():
             if param.requires_grad:
                 param.data = param.data.to(dtype=train_dtype)
                 n_trainable += 1
-            else:
+            elif frozen_dtype is not None:
                 param.data = param.data.to(dtype=frozen_dtype)
         for _, buf in component.named_buffers():
-            if buf.is_floating_point():
+            if buf.is_floating_point() and frozen_dtype is not None:
                 buf.data = buf.data.to(dtype=frozen_dtype)
         return n_trainable
 
     def _mix_precision(self):
-        """Apply mixed precision to default pipeline modules plus any extra ``target_components`` names."""
-        # Get inference and master dtypes
-        inference_dtype = self._inference_dtype
-        master_dtype = self.model_args.master_weight_dtype
+        """Set trainable params to ``trainable_parameters_dtype``; by default leave frozen params
+        and floating-point buffers at their loaded (``from_pretrained``) dtype.
 
-        # Get target components and all component names
+        This is the single place that decides every parameter's *original* dtype before
+        ``accelerator.prepare``; the trainer only bundles + prepares.
+
+        Frozen-dtype policy: ``frozen_parameters_dtype=None`` (default) preserves each frozen
+        parameter/buffer's original dtype and never downcasts -- a released checkpoint deliberately
+        ships components in different dtypes (e.g. Z-Image: transformer fp32, text encoder bf16), and
+        forcing one uniform frozen dtype would override those choices. Set an explicit
+        ``frozen_parameters_dtype`` to opt into casting every frozen param to that dtype.
+
+        FSDP2 caveat: FSDP2 shards each unit with ONE original dtype, and accelerate upcasts the
+        trainable params to an fp32 master when ``mixed_precision != 'no'``. So a trained component
+        that also bundles frozen members (e.g. Wan2.2 trains ``transformer`` while ``transformer_2``
+        is frozen-but-sharded) would otherwise mix fp32/low-precision within a unit and trip FSDP2's
+        uniform-dtype assert. We therefore force the TRAINED components to a uniform fp32 original
+        dtype here (compute stays low-precision via accelerate's ``MixedPrecisionPolicy``); untrained
+        components are cast to ``frozen_parameters_dtype`` when set, else preserved.
+        """
+        train_dtype = self.model_args.trainable_parameters_dtype
+        frozen_dtype = self.model_args.frozen_parameters_dtype  # None -> preserve loaded dtype
+
         target_set = frozenset(self.model_args.target_components)
         component_names = self._resolve_component_names(None)
         merged_names = list(dict.fromkeys([*component_names, *self.model_args.target_components]))
 
-        # If master dtype is the same as inference dtype, cast all components to inference dtype
-        if master_dtype == inference_dtype:
-            # Cast all components to inference dtype
+        # FSDP2: trained (sharded) components need a uniform fp32 original dtype.
+        if self._is_fsdp2() and self.accelerator.mixed_precision != "no":
             for name in merged_names:
-                self.get_component(name).to(dtype=inference_dtype)
+                if name in target_set:
+                    self.get_component(name).to(dtype=torch.float32)
+                elif frozen_dtype is not None:
+                    self.get_component(name).to(dtype=frozen_dtype)
+                # else: preserve the untrained component's loaded dtype
+            logger.info(
+                f"FSDP2: trained components -> fp32 (uniform orig dtype); "
+                f"other components -> {frozen_dtype or 'preserved (loaded dtype)'}"
+            )
             return
 
+        # Explicit uniform dtype -> a single cast of every component suffices.
+        if frozen_dtype is not None and train_dtype == frozen_dtype:
+            for name in merged_names:
+                self.get_component(name).to(dtype=frozen_dtype)
+            return
+
+        # Split: trainable -> train_dtype; frozen -> frozen_dtype, or preserved when None.
         trainable_count = 0
         for name in merged_names:
             component = self.get_component(name)
             if name in target_set:
-                # Cast trainable parameters to master dtype
-                trainable_count += self._cast_module_mixed_precision(
-                    component, master_dtype, inference_dtype
-                )
-            else:
-                # Cast frozen parameters to inference dtype
-                component.to(dtype=inference_dtype)
+                trainable_count += self._cast_module_mixed_precision(component, train_dtype, frozen_dtype)
+            elif frozen_dtype is not None:
+                component.to(dtype=frozen_dtype)
+            # else: preserve the fully-frozen component's loaded dtype
 
         if trainable_count > 0:
-            logger.info(f"Set {trainable_count} trainable parameters to {master_dtype}")
+            logger.info(
+                f"Set {trainable_count} trainable parameters to {train_dtype}; "
+                f"frozen params -> {frozen_dtype or 'preserved (loaded dtype)'}"
+            )
 
     # ============================== LoRA Management ==============================
     def apply_lora(
@@ -1180,37 +1212,21 @@ class BaseAdapter(ABC):
 
                 state_dict = clone_tensors_for_torch_save(self._unwrap(model).state_dict())
         elif self.accelerator.is_fsdp2:
-            # FSDP/FSDP2
+            # FSDP2: gather the full (unsharded) params to rank0 via the DTensor-aware API.
+            # NOTE: the previous `state_dict_keys` path toggled `requires_grad` at runtime to
+            # sub-select params, but FSDP2's `ignore_frozen_params` is keyed off the trainability
+            # captured at `fully_shard` time -- the runtime toggle is a no-op, so it yielded an
+            # EMPTY adapter. Gather straight through (LoRA params are exactly the trainable subset,
+            # so `ignore_frozen_params=True` returns them) and let the shared key-filter below
+            # narrow to `state_dict_keys` when provided.
             from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
-            if state_dict_keys is not None:
-                # Temporarily mark unwanted params as frozen
-                # This `requires_grad` trick does not work correctly. Don't know why.
-                original_state = {}
-                
-                # Freeze unwanted params
-                for name, param in model.named_parameters():
-                    original_state[name] = param.requires_grad
-                    param.requires_grad = is_param_match_key(name, state_dict_keys)
-                
-                options = StateDictOptions(
-                    full_state_dict=True,
-                    broadcast_from_rank0=True,
-                    cpu_offload=True,
-                    ignore_frozen_params=True,
-                )
-                state_dict = get_model_state_dict(model, options=options)
-                
-                # Restore original state
-                for name, param in model.named_parameters():
-                    param.requires_grad = original_state[name]
-            else:
-                options = StateDictOptions(
-                    full_state_dict=True, 
-                    broadcast_from_rank0=True, 
-                    cpu_offload=True, 
-                    ignore_frozen_params=ignore_frozen_params
-                )
-                state_dict = get_model_state_dict(model, options=options)
+            options = StateDictOptions(
+                full_state_dict=True,
+                broadcast_from_rank0=True,
+                cpu_offload=True,
+                ignore_frozen_params=ignore_frozen_params,
+            )
+            state_dict = get_model_state_dict(model, options=options)
         elif self.accelerator.distributed_type == DistributedType.FSDP:
             from torch.distributed.fsdp import FullStateDictConfig, StateDictType
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -1616,7 +1632,13 @@ class BaseAdapter(ABC):
 
     def _load_lora(self, path: str) -> None:
         """Load LoRA adapters for target components with auto-format detection."""
-        for comp_name in self.model_args.target_components:
+        # Iterate only components that actually carry target modules. Frozen
+        # bundled members (e.g. Wan2.2's `transformer_2`, kept in
+        # `target_components` solely to be FSDP-sharded for memory) map to None
+        # in `target_module_map` and are skipped by `save_checkpoint`; iterating
+        # `target_components` here would instead look for a `.../transformer_2/`
+        # subdir that was never written and log a spurious error on every resume.
+        for comp_name in self.trainable_component_names:
             if not hasattr(self, comp_name):
                 logger.warning(f"Component {comp_name} not found, skipping")
                 continue
@@ -1715,7 +1737,10 @@ class BaseAdapter(ABC):
 
     def _load_full_model(self, path: str, strict: bool = True) -> None:
         """Load full model weights for target components."""
-        for comp_name in self.model_args.target_components:
+        # Match `save_checkpoint`: only components with target modules are
+        # written, so frozen bundled members (`target_module_map[name] is None`)
+        # must be skipped here rather than iterating all `target_components`.
+        for comp_name in self.trainable_component_names:
             if not hasattr(self, comp_name):
                 logger.warning(f"Component {comp_name} not found, skipping")
                 continue

@@ -25,7 +25,10 @@ model:
   finetune_type: 'lora' # Options: full, lora
   lora_rank : 64
   lora_alpha : 128
-  master_weight_dtype: "fp32" # Z-Image requires fp32 master weight for better performance
+  trainable_parameters_dtype: "fp32" # Z-Image trains the transformer in fp32 for numerical stability
+  # frozen_parameters_dtype unset -> preserve each frozen component's from_pretrained dtype (no downcast):
+  # Z-Image ships the transformer in fp32 but the text encoder in bf16, so forcing one frozen dtype
+  # would override that. Set an explicit dtype only to force a cast (e.g. bf16 to save memory).
   target_modules: "default" # Options: all, default, or list of module names like ["to_k", "to_q", "to_v", "to_out.0"]
   model_name_or_path: "Tongyi-MAI/Z-Image"  # Options: Tongyi-MAI/Z-Image, Tongyi-MAI/Z-Image-Turbo
   model_type: "z-image"
