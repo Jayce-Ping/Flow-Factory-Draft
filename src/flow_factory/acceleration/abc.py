@@ -23,9 +23,10 @@ train-inference consistency against the trainer's RL paradigm:
 * ``stage`` — *where/how* it is applied, and which config slot it belongs to:
 
   - ``"both"``: a persistent, one-time mutation via :meth:`setup` (e.g.
-    ``torch.compile``, attention backend). Because it transforms the module shared
-    by rollout ``inference()`` and training ``forward()``, the two stay CONSISTENT
-    by construction — safe for any algorithm. Belongs in the ``shared`` slot.
+    ``torch.compile``, attention backend) applied to the module used by both rollout
+    ``inference()`` and training ``forward()``. This marker describes application
+    scope, not numerical exactness; ``safety`` records measured cross-stage behavior.
+    Belongs in the ``shared`` slot.
   - ``"rollout"``: a per-epoch context via :meth:`rollout_context` (e.g. feature
     caching), torn down before the training forward. Belongs in the ``rollout`` slot.
 
@@ -41,7 +42,7 @@ train-inference consistency against the trainer's RL paradigm:
     - ``stage='rollout'`` + lossy (e.g. feature caching): rollout diverges from the
       training forward, which cannot replicate it — only safe when the rollout
       log-prob never feeds the loss, i.e. **decoupled / distillation** algorithms
-      (validator *rejects* it on coupled; see ``constraints.md`` #7, #20a).
+      (validator *rejects* it on coupled; see ``constraints.md`` #7).
     - ``stage='both'`` + lossy (e.g. ``torch.compile``, whose grad/no-grad
       compiled-graph split leaves a ~1e-5 residual): applied symmetrically and stays
       within ``clip_range``, so it is *allowed* on any paradigm — but the validator
@@ -80,11 +81,11 @@ class BaseAccelerator(ABC):
 
     # Whether this accelerator requires the Stage-3 rollout to run with autograd
     # ENABLED (instead of the default ``torch.no_grad()``) so the transformer
-    # executes the *same* graph in rollout and the training forward. Only
+    # uses the same grad-mode compiled path in rollout and training. Only
     # ``torch_compile`` needs this: Inductor compiles a separate, numerically
     # non-identical graph for grad vs no-grad mode (Dynamo guards on grad_mode),
-    # so a no-grad rollout would diverge from the grad training forward and break
-    # the on-policy PPO ratio==1 invariant for coupled algorithms. When set,
+    # so a no-grad rollout would diverge from the grad training forward and
+    # undermine coupled on-policy consistency. When set,
     # ``CompileAccelerator`` wraps the compiled transformer to force grad (returning
     # the grad-carrying output directly — an inner detach would let Inductor pick a
     # divergent inference kernel), and the trainer flags the rollout via

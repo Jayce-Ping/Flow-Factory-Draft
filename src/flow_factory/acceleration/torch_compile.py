@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # src/flow_factory/acceleration/torch_compile.py
-"""Lossless ``torch.compile`` accelerator for the shared transformer(s)."""
+"""Apply ``torch.compile`` persistently to the rollout/training transformer(s)."""
 
 import functools
 from typing import TYPE_CHECKING, Any, Dict
@@ -80,8 +80,8 @@ class CompileAccelerator(BaseAccelerator):
     stage = "both"
     # Inductor compiles a separate graph for grad vs no-grad mode whose fused
     # kernels are NOT bit-identical. To keep rollout (Stage 3) and the training
-    # forward (Stage 6) on the exact same graph — required for the coupled
-    # on-policy ratio==1 invariant — the rollout must run with grad enabled.
+    # forward (Stage 6) on the same grad-mode compiled path — preserving a
+    # numerically on-policy ratio within `clip_range` — rollout must run with grad enabled.
     requires_grad_rollout = True
 
     def setup(self, adapter: "BaseAdapter") -> None:
@@ -113,7 +113,8 @@ class CompileAccelerator(BaseAccelerator):
             #     `_repeated_blocks` so regional compile is unavailable under LoRA.
             #   * the base transformer keeps its LoRA submodules inside the compiled
             #     graph (they still train), exposes `_repeated_blocks`, and the
-            #     grad-force wrap makes rollout/train bit-identical.
+            #     grad-force wrap keeps rollout/training on the same grad-mode compiled
+            #     path (ratio ≈ 1 within `clip_range`, but not bit-exact).
             inner = self._peel_peft(adapter._unwrap(module))
             if mode == "regional":
                 # `compile_repeated_blocks` exists on every diffusers ModelMixin but
@@ -132,15 +133,14 @@ class CompileAccelerator(BaseAccelerator):
                 inner.compile(**compile_kwargs)
             # Force every forward of the compiled transformer to run under
             # torch.enable_grad() (overriding the @torch.no_grad() on
-            # adapter.inference()), and detach the output during rollout. This keeps
-            # rollout (Stage 3) and the training forward (Stage 6) on the SAME
-            # compiled graph — Inductor emits numerically different kernels for the
-            # grad vs no-grad graph, so a no-grad rollout would break the coupled
-            # on-policy ratio==1 invariant. Detaching during rollout (gated by the
-            # trainer's `adapter._rollout_detach` flag) stops autograd from chaining
-            # across denoising steps, so rollout memory stays bounded.
+            # adapter.inference()). This keeps rollout (Stage 3) and the training
+            # forward (Stage 6) on the same grad-mode compiled path — Inductor emits
+            # numerically different kernels for the grad vs no-grad graph. During
+            # rollout, `BaseAdapter.cast_latents` detaches the per-step latent feedback
+            # (gated by `adapter._rollout_detach`) so memory stays bounded.
             self._wrap_forward_grad_consistent(adapter, inner)
-            logger.info("CompileAccelerator: compiled '%s' (mode=%s).", name, mode)
+            if adapter.accelerator.is_main_process:
+                logger.info("CompileAccelerator: compiled '%s' (mode=%s).", name, mode)
 
     @staticmethod
     def _peel_peft(module):
@@ -165,10 +165,10 @@ class CompileAccelerator(BaseAccelerator):
         Wraps the module's call entry point(s) so every forward runs under
         ``torch.enable_grad()`` — overriding the ``@torch.no_grad()`` on
         ``adapter.inference()``. This pins rollout (Stage 3) and the training forward
-        (Stage 6) to the *same* Inductor graph: Inductor compiles a separate,
+        (Stage 6) to the same grad-mode compiled path: Inductor compiles a separate,
         numerically non-identical graph for grad vs no-grad mode (Dynamo guards on
         ``grad_mode``), so a no-grad rollout would diverge from the grad training
-        forward and break the coupled on-policy PPO ratio==1 invariant.
+        forward and undermine coupled on-policy consistency.
 
         Crucially the output is **NOT detached here**: detaching inside the wrapper
         lets Inductor see the result is unused-for-grad and pick a different
@@ -176,8 +176,8 @@ class CompileAccelerator(BaseAccelerator):
         rollout's per-step latent feedback is detached in
         :meth:`BaseAdapter.cast_latents` (gated by ``adapter._rollout_detach``), which
         breaks the autograd graph chain across denoising steps so rollout memory stays
-        bounded while every transformer call still executes the identical grad-mode
-        graph (near-exact noise_pred → on-policy ratio ≈ 1).
+        bounded while every transformer call still uses the same grad-mode compiled
+        path (near-exact noise_pred → on-policy ratio ≈ 1 within ``clip_range``).
 
         Known residual (NOT strictly bit-exact): forcing grad removes the *dominant*
         divergence (the grad-vs-no-grad graph split), but it does not make the rollout

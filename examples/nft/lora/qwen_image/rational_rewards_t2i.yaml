@@ -86,7 +86,7 @@ scheduler:
 # See guidance/acceleration.md. NFT is a decoupled trainer, so lossy rollout
 # feature-caching is allowed.
 # acceleration:
-#   shared:                          # lossless, applied to BOTH rollout and training (in order)
+#   shared:                          # persistent stage='both'; applied in list order
 #     - name: attention_backend      # set the attention backend first...
 #       params: { backend: _flash_3_varlen_hub }
 #     - name: torch_compile          # ...so the compiled graph captures it

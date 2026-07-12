@@ -88,8 +88,8 @@ class AccelerationArguments(ArgABC):
     empty by default, so existing configs are unaffected). List order is the
     application order:
 
-    * ``shared`` — lossless accelerators applied to BOTH rollout and the training
-      forward, in order, via each accelerator's ``setup()`` (e.g.
+    * ``shared`` — persistent ``stage='both'`` accelerators applied to rollout and
+      the training forward, in order, via each accelerator's ``setup()`` (e.g.
       ``attention_backend`` then ``torch_compile`` — backend first so the compiled
       graph captures it).
     * ``rollout`` — accelerators applied only during Stage-3 rollout, nested in

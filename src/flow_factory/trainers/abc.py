@@ -93,7 +93,7 @@ class BaseTrainer(ABC):
 
         self._initialization()
         self.adapter.post_init()
-        # Apply the shared (lossless) accelerator last: after prepare, state-resume,
+        # Apply persistent stage='both' accelerators last: after prepare, state-resume,
         # EMA, and reference-parameter setup, so e.g. torch.compile wraps the final
         # weights and keeps state_dict keys / parameter identity stable.
         self._apply_shared_acceleration()
@@ -382,8 +382,8 @@ class BaseTrainer(ABC):
         # Load inference modules, excluding all bundle members (already prepared).
         self._load_inference_components(bundle_names)
 
-        # Build + validate acceleration plugins. The shared (lossless) accelerator
-        # is *applied* later via _apply_shared_acceleration(), after post_init()
+        # Build + validate acceleration plugins. Persistent stage='both' accelerators
+        # are *applied* later via _apply_shared_acceleration(), after post_init()
         # finishes any state-resume / EMA / reference setup.
         self._init_acceleration()
 
@@ -396,9 +396,9 @@ class BaseTrainer(ABC):
         Two independent slots, each an **ordered list** (both empty by default).
         List order is the application order:
 
-        * ``shared`` — lossless accelerators (e.g. ``attention_backend`` then
-          ``torch_compile``) that affect both rollout and the training forward. Only
-          built/validated here; they are *applied* later by
+        * ``shared`` — persistent ``stage='both'`` accelerators (e.g.
+          ``attention_backend`` then ``torch_compile``) applied to both rollout and
+          the training forward. Only built/validated here; they are *applied* later by
           :meth:`_apply_shared_acceleration` (after ``post_init`` finishes
           state-resume / EMA / reference setup), so they transform the final weights.
         * ``rollout`` — accelerators applied per-epoch in :meth:`generate_samples`
@@ -435,7 +435,7 @@ class BaseTrainer(ABC):
                 )
 
     def _apply_shared_acceleration(self) -> None:
-        """Apply the shared (lossless) accelerators to the adapter, in config order.
+        """Apply persistent ``stage='both'`` accelerators in config order.
 
         Called from ``__init__`` AFTER ``adapter.post_init()`` so transforms wrap the
         final weights — i.e. after ``accelerator.prepare``, any ``state`` checkpoint
@@ -480,16 +480,15 @@ class BaseTrainer(ABC):
         ``torch.compile`` (Inductor) emits a *separate, numerically non-identical*
         graph for grad vs no-grad mode (Dynamo guards on ``grad_mode``), so a no-grad
         rollout would diverge from the grad-mode training forward and break the
-        coupled on-policy PPO ratio==1 invariant. The compiled transformer is wrapped
+        coupled on-policy consistency. The compiled transformer is wrapped
         (see :class:`CompileAccelerator`) so its forward always executes under
         ``torch.enable_grad()`` — overriding the ``@torch.no_grad()`` on
         ``adapter.inference()``. The output is NOT detached inside that wrapper (an
         inner detach lets Inductor pick a divergent inference kernel); instead the
         per-step latent feedback is detached in ``BaseAdapter.cast_latents`` (gated by
-        this flag), so rollout and training share the identical grad-mode graph
-        (bit-exact on-policy ratio, with or without CFG — see
-        ``guidance/acceleration.md``) while the autograd graph never chains across
-        denoising steps (memory stays bounded).
+        this flag), so rollout and training use the same grad-mode compiled path and
+        remain numerically on-policy (ratio ≈ 1 within ``clip_range``, but not
+        bit-exact) while the autograd graph never chains across denoising steps.
 
         Reused by the eval loop (:meth:`evaluate`). Eval does not compute the PPO
         ratio, so graph consistency is irrelevant there — but the compiled
@@ -505,9 +504,10 @@ class BaseTrainer(ABC):
             with torch.no_grad():
                 yield
             return
-        # Compile active: the compiled-transformer wrapper forces grad locally and
-        # detaches its output while this flag is set, so rollout matches the training
-        # graph bit-for-bit without chaining autograd across steps.
+        # Compile active: the compiled-transformer wrapper forces grad locally, while
+        # `BaseAdapter.cast_latents` detaches per-step latent feedback under this flag.
+        # Rollout and training use the same grad-mode compiled path without chaining
+        # autograd across denoising steps.
         prev = self.adapter._rollout_detach
         self.adapter._rollout_detach = True
         try:
@@ -907,7 +907,7 @@ class BaseTrainer(ABC):
         # so its state never leaks into the Stage-6 training forward.
         # Grad context is normally no_grad, but flips to enable_grad when a
         # compile accelerator is active (see _rollout_grad_context) so rollout and
-        # training share the same compiled graph (bit-exact on-policy ratio).
+        # training use the same grad-mode compiled path and remain numerically on-policy.
         with self._rollout_acceleration(), self._rollout_grad_context(), self.autocast():
             for _ in tqdm(
                 range(self.training_args.num_batches_per_epoch),

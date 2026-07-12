@@ -15,7 +15,7 @@
 # src/flow_factory/acceleration/validator.py
 """Paradigm-gated safety validation for accelerators (fail-fast, ``constraints.md`` #26).
 
-The correctness contract (``constraints.md`` #7 + #20a) hinges on **symmetric
+The correctness contract (``constraints.md`` #7) hinges on **symmetric
 application**, encoded by ``stage``, not on numerical bit-exactness:
 
 * ``stage='both'`` accelerators mutate the transformer persistently, so the same

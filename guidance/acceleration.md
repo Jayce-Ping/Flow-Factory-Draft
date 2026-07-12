@@ -15,23 +15,23 @@ enforces them against the trainer's `paradigm` before training starts (fail-fast
 
 | marker | values | meaning |
 |--------|--------|---------|
-| `stage` | `both` / `rollout` | `both`: persistent transform applied to the transformer shared by rollout `inference()` and training `forward()` → **consistent by construction, safe for any algorithm** (the `shared` slot). `rollout`: per-epoch context, torn down before training (the `rollout` slot). |
-| `safety` | `lossless` / `lossy` | Only consulted for `stage='rollout'`. `lossy` = changes rollout outputs → diverges from training. `lossless` = bit-identical. |
+| `stage` | `both` / `rollout` | `both`: persistent transform applied to both rollout `inference()` and training `forward()` (the `shared` slot). `rollout`: per-epoch context, torn down before training (the `rollout` slot). |
+| `safety` | `lossless` / `lossy` | Numerical consistency class. `lossless` = bit-identical; `lossy` = not bit-identical. It gates rollout-only accelerators and warns for lossy `stage='both'` accelerators. |
 
 The single restriction: a **`lossy` rollout** accelerator is allowed **only on
 `decoupled` / `distillation`** trainers. Why: for **coupled** algorithms (GRPO,
 GRPO-Guard, DPPO) the rollout's per-step log-prob becomes the PPO "old log-prob";
 changing the rollout while the training forward stays exact biases the importance ratio
-and silently corrupts gradients (`.agents/knowledge/constraints.md` #7, #20a). For
+and silently corrupts gradients (`.agents/knowledge/constraints.md` #7). For
 **decoupled** (NFT, AWM, DGPO, DPO, CRD) and **distillation** (diffusion-opd), the rollout
 log-prob does not enter the loss, so a lossy rollout only shifts the generated-sample
 distribution — acceptable and tunable. Monitor the reward mean/std when enabling it.
 
-A `stage='both'` accelerator is **always safe** — even a numerically-approximate one. For
-example, Sage int8 attention used as the attention backend runs in *both* rollout and
-training, so the two stay consistent; there is no need to reject it or give it a special
-"lossy" status. Numerical exactness only matters when a transform is applied to one stage
-but not the other, which is exactly what `stage='rollout'` + `safety='lossy'` captures.
+`stage='both'` means the transform persists on the module used by both rollout and
+training; it does not imply numerical exactness. The separate `safety` marker records
+measured cross-stage divergence. A lossy shared accelerator such as `torch_compile` is
+allowed on coupled trainers when its residual stays within `clip_range`, but the validator
+warns because the ratio is approximately 1 rather than bit-exact.
 
 ## Configuration
 
@@ -41,7 +41,7 @@ application order**:
 
 ```yaml
 acceleration:
-  # Lossless, applied to BOTH rollout and the training forward, in list order.
+  # Persistent stage='both' accelerators, applied to rollout and training in list order.
   shared:
     - name: attention_backend                # set the diffusers backend first...
       params: { backend: _flash_3_hub }
@@ -95,18 +95,19 @@ that still sets `model.attn_backend` fails fast with a migration error.
 
 ### torch.compile train-inference consistency (coupled algorithms)
 
-For coupled algorithms (GRPO / GRPO-Guard / DPPO) the on-policy PPO ratio on the first inner
-step must be **1.0**. `torch.compile` (Inductor) threatens this because it compiles a
+For coupled algorithms (GRPO / GRPO-Guard / DPPO), the first-inner-step PPO ratio must remain
+**numerically on-policy around 1 and within `clip_range`**. `torch.compile` (Inductor)
+threatens this because it compiles a
 **separate, numerically non-identical graph for grad vs no-grad mode** (Dynamo guards on
 `grad_mode`): rollout normally runs the transformer under `torch.no_grad()` and the training
-forward under grad, so a naive compiled rollout would diverge from training (~1e-5) and bias
-the ratio.
+forward under grad, so a naive compiled rollout would diverge from training and bias the ratio.
 
-`CompileAccelerator` handles this automatically (no user action needed): it declares
-`requires_grad_rollout = True`, so the trainer runs the rollout transformer under
-`torch.enable_grad()` (overriding the `@torch.no_grad()` on `inference()`) and detaches only
-the per-step latent feedback (in `cast_latents`) to keep memory bounded. It also compiles the
-**base** transformer under any PEFT/LoRA wrapper (not the wrapper itself). With this, the
+`CompileAccelerator` handles this automatically (no user action needed): its wrapper forces
+the compiled transformer to run under `torch.enable_grad()` (overriding the
+`@torch.no_grad()` on `inference()`). `BaseTrainer._rollout_grad_context` sets
+`adapter._rollout_detach`, and `BaseAdapter.cast_latents` detaches the per-step latent
+feedback to keep memory bounded. The accelerator also compiles the **base** transformer
+under any PEFT/LoRA wrapper (not the wrapper itself). With this, the
 on-policy ratio is driven to **≈1, well within `clip_range` (1e-4)** — but **not strictly
 bit-exact**: an intermittent **~1e-5** residual remains on a minority of samples/ranks
 (16×H20, ZeRO-2/FSDP2, SD3.5+Qwen-Image, regional/full, CFG and no-CFG). Forcing grad removes

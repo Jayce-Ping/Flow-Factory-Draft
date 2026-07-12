@@ -31,10 +31,10 @@ model:
   resume_path: null # Local path or HF repo id (e.g. 'owner/repo[/subdir][@rev]') for previous checkpoint/lora adapter
   resume_type: null # Options: lora, full, state. Null to auto-detect based on `finetune_type`
 # Optional acceleration plugins (off by default). Applied in list order.
-# See guidance/acceleration.md. GRPO is a coupled trainer, so only lossless
-# `shared` accelerators are allowed (lossy rollout caching would bias the PPO ratio).
+# See guidance/acceleration.md. GRPO is coupled, so lossy rollout caching is unsafe;
+# persistent `shared` accelerators run in both rollout and training.
 # acceleration:
-#   shared:                          # lossless, applied to BOTH rollout and training (in order)
+#   shared:                          # persistent stage='both'; applied in list order
 #     - name: attention_backend      # set the attention backend first...
 #       params: { backend: _flash_3_varlen_hub }
 #     - name: torch_compile          # ...so the compiled graph captures it

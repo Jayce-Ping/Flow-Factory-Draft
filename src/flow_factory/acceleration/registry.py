@@ -31,7 +31,7 @@ logger = setup_logger(__name__)
 
 # Accelerator Registry Storage
 _ACCELERATOR_REGISTRY: Dict[str, str] = {
-    # Lossless (safe for any algorithm, applied to the shared transformer).
+    # Persistent stage='both' accelerators applied to rollout and training.
     # `attention_backend` is the single code path for attention-backend selection;
     # add it as a `shared` entry (before `torch_compile`) in the acceleration block.
     'attention_backend': 'flow_factory.acceleration.attention_backend.AttentionBackendAccelerator',

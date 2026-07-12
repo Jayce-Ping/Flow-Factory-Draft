@@ -130,7 +130,8 @@ class DiffusersCacheAccelerator(BaseAccelerator):
                 cache_hook = getattr(unwrapped, "_diffusers_hook", None)
                 if cache_hook is not None:
                     cache_hook._child_registries_cache = None
-                logger.info("DiffusersCacheAccelerator: cache enabled for '%s'.", name)
+                if adapter.accelerator.is_main_process:
+                    logger.info("DiffusersCacheAccelerator: cache enabled for '%s'.", name)
             yield
         finally:
             for transformer in enabled:

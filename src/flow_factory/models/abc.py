@@ -234,7 +234,9 @@ class BaseAdapter(ABC):
         per-step latent feedback would otherwise chain an autograd graph across the
         whole denoising loop. Detaching here — the single feedback chokepoint every
         adapter routes through — breaks that chain so rollout memory stays bounded while
-        each transformer call still executes the identical grad-mode graph.
+        each transformer call uses the same grad-mode compiled path. Distinct Inductor
+        invocations can still leave an intermittent ~1e-5 on-policy ratio residual within
+        ``clip_range``, so this path is not bit-exact.
         """
         if self._rollout_detach and latents.requires_grad:
             latents = latents.detach()
