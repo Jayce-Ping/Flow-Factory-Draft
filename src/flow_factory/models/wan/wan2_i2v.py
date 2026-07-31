@@ -428,6 +428,7 @@ class Wan2_I2V_Adapter(BaseAdapter):
         return latents, torch.concat([mask_lat_size, latent_condition], dim=1)
 
     # ======================== Inference ========================
+    @torch.no_grad()
     def inference(
         self,
         # Oridinary arguments
