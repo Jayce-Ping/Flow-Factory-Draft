@@ -195,7 +195,7 @@ class CompileAccelerator(BaseAccelerator):
         and training forwards a literally identical Inductor kernel invocation. They are
         different call sites: the stored-then-reloaded latents may differ in
         stride/contiguity, and the surrounding autograd graphs differ (rollout detaches
-        per step and discards the graph; training keeps it and backwards). For some
+        stored outputs and discards the graph; training keeps it and backwards). For some
         inputs Inductor's shape/layout-specialized, autotuned kernels then take a
         different reduction order, and bf16's non-associative accumulation turns that
         into an *intermittent* ~1e-5 on-policy ratio drift on a minority of
