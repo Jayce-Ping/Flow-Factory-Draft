@@ -303,39 +303,17 @@ class GRPOGuardTrainer(GRPOTrainer):
 
     # =========================== Sampling Loop ============================
     def sample(self) -> List[BaseSample]:
-        """Generate rollouts for GRPO."""
-        self.adapter.rollout()
-        self.reward_buffer.clear()
-        samples = []
-        data_iter = iter(self.dataloader)
+        """Generate rollouts for GRPO-Guard with transition means."""
         trajectory_indices = compute_trajectory_indices(
             train_timestep_indices=self.adapter.scheduler.train_timesteps,
             num_inference_steps=self.training_args.num_inference_steps,
         )
-
-        with torch.no_grad(), self.autocast():
-            for batch_index in tqdm(
-                range(self.training_args.num_batches_per_epoch),
-                desc=f'Epoch {self.epoch} Sampling',
-                disable=not self.show_progress_bar,
-            ):
-                batch = next(data_iter)
-                sample_kwargs = {
-                    **self.training_args,
-                    'compute_log_prob': True,
-                    'trajectory_indices': trajectory_indices, # Selectively store required trajectory positions for memory efficiency
-                    'extra_call_back_kwargs': ['next_latents_mean'], # For GRPO-Guard, we need to store `next_latents_mean` for ratio normalization
-                    **batch,
-                }
-                sample_kwargs = filter_kwargs(self.adapter.inference, **sample_kwargs)
-                sample_batch = self.adapter.inference(**sample_kwargs)
-                # Deterministic D2H so reward_buffer sees CPU-resident samples
-                # (no-op when offload_samples_to_cpu is False).
-                self._maybe_offload_samples_to_cpu(sample_batch)
-                samples.extend(sample_batch)
-                self.reward_buffer.add_samples(sample_batch)
-
-        return samples
+        return self.generate_samples(
+            reward_buffer=self.reward_buffer,
+            compute_log_prob=True,
+            trajectory_indices=trajectory_indices,
+            extra_call_back_kwargs=["next_latents_mean"],
+        )
 
     def optimize(self, samples: List[BaseSample]) -> None:
         """Policy optimization (Stage 6): GRPO-Guard reweighted loss and optional KL."""
