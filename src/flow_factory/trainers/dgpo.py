@@ -344,7 +344,7 @@ class DGPOTrainer(BaseTrainer):
             guidance_scale: CFG scale; use ``1.0`` for the uncond branch.
 
         Returns:
-            Tensor ``(B, C, ...)``: the velocity prediction ``noise_pred``.
+            Tensor ``(B, C, ...)``: the velocity prediction ``velocity``.
         """
         t = timestep.view(-1)
         forward_kwargs = {
@@ -353,7 +353,7 @@ class DGPOTrainer(BaseTrainer):
             "t_next": torch.zeros_like(t),
             "latents": noised_latents,
             "compute_log_prob": False,
-            "return_kwargs": ["noise_pred"],
+            "return_kwargs": ["velocity"],
             "noise_level": 0.0,
             "guidance_scale": guidance_scale,
             **{
@@ -361,12 +361,12 @@ class DGPOTrainer(BaseTrainer):
             },
         }
         forward_kwargs = filter_kwargs(self.adapter.forward, **forward_kwargs)
-        noise_pred = self.adapter.forward(**forward_kwargs).noise_pred
-        assert noise_pred is not None, (
-            "adapter.forward must return `noise_pred` for DGPO "
-            "(ensure 'noise_pred' is in `return_kwargs`)"
+        velocity = self.adapter.forward(**forward_kwargs).velocity
+        assert velocity is not None, (
+            "adapter.forward must return `velocity` for DGPO "
+            "(ensure 'velocity' is in `return_kwargs`)"
         )
-        return noise_pred
+        return velocity
 
     # =========================== Group Bookkeeping ============================
     def _precompute_group_info(

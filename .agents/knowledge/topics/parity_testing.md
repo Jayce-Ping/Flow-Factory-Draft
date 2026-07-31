@@ -59,4 +59,4 @@ def compare_tensors(name: str, a: torch.Tensor, b: torch.Tensor, atol: float = 1
 ## Cross-refs
 
 - `adapter_conventions.md` (inference/forward identity, upstream alignment rules)
-- `dtype_precision.md` (noise dtype for comparison tolerance)
+- `dtype_precision.md` (tensor dtype for comparison tolerance)

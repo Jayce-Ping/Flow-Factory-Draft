@@ -242,7 +242,7 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler, SDESch
 
     def step(
         self,
-        noise_pred: torch.Tensor,
+        velocity: torch.Tensor,
         timestep: Union[float, torch.Tensor],
         latents: torch.Tensor,
         next_latents: Optional[torch.Tensor] = None,
@@ -251,7 +251,7 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler, SDESch
         noise_level : Optional[Union[int, float, torch.Tensor]] = None,
         compute_log_prob: bool = True,
         return_dict: bool = True,
-        return_kwargs : List[str] = ['next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob', 'noise_pred'],
+        return_kwargs : List[str] = ['next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob', 'velocity'],
         dynamics_type : Optional[Literal['Flow-SDE', 'Dance-SDE', 'CPS', 'ODE']] = None,
         sigma_max: Optional[float] = None,
     ) -> Union[FlowMatchEulerDiscreteSDESchedulerOutput, Tuple]:
@@ -307,7 +307,7 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler, SDESch
         # to the same precision that will be used during training (e.g. bfloat16).
         # This ensures log_prob is computed on identical values in both phases.
         _input_dtype = latents.dtype
-        noise_pred = noise_pred.float()
+        velocity = velocity.float()
         latents = latents.float()
         if next_latents is not None:
             next_latents = next_latents.float()
@@ -328,7 +328,7 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler, SDESch
         # 3. Compute next sample
         if dynamics_type == 'ODE':
             # ODE Sampling
-            next_latents_mean = latents + noise_pred * dt
+            next_latents_mean = latents + velocity * dt
             std_dev_t = torch.zeros_like(sigma)
 
             if next_latents is None:
@@ -345,15 +345,15 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler, SDESch
             sigma_max = to_broadcast_tensor(sigma_max, latents)
             std_dev_t = torch.sqrt(sigma / (1 - torch.where(sigma == 1.0, sigma_max, sigma))) * noise_level # (batch_size, 1, 1)
 
-            next_latents_mean = latents * (1 + std_dev_t**2 / (2 * sigma) * dt) + noise_pred * (1 + std_dev_t**2 * (1 - sigma) / (2 * sigma)) * dt
+            next_latents_mean = latents * (1 + std_dev_t**2 / (2 * sigma) * dt) + velocity * (1 + std_dev_t**2 * (1 - sigma) / (2 * sigma)) * dt
             
             if next_latents is None:
                 # Non-deterministic step, add noise to it
                 variance_noise = randn_tensor(
-                    noise_pred.shape,
+                    velocity.shape,
                     generator=generator,
-                    device=noise_pred.device,
-                    dtype=noise_pred.dtype,
+                    device=velocity.device,
+                    dtype=velocity.dtype,
                 )
                 # Last term of Equation (9)
                 next_latents = next_latents_mean + std_dev_t * torch.sqrt(-1 * dt) * variance_noise
@@ -371,16 +371,16 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler, SDESch
                 log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
 
         elif dynamics_type == "Dance-SDE":
-            pred_original_sample = latents - sigma * noise_pred
+            pred_original_sample = latents - sigma * velocity
             std_dev_t = noise_level
             log_term = 0.5 * noise_level**2 * (latents - pred_original_sample * (1 - sigma)) / sigma**2
-            next_latents_mean = latents + (noise_pred + log_term) * dt
+            next_latents_mean = latents + (velocity + log_term) * dt
             if next_latents is None:
                 variance_noise = randn_tensor(
-                    noise_pred.shape,
+                    velocity.shape,
                     generator=generator,
-                    device=noise_pred.device,
-                    dtype=noise_pred.dtype,
+                    device=velocity.device,
+                    dtype=velocity.dtype,
                 )
                 next_latents = next_latents_mean + std_dev_t * torch.sqrt(-1 * dt) * variance_noise
                 # Round-trip through storage dtype for train-inference consistency
@@ -400,16 +400,16 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler, SDESch
         elif dynamics_type == "CPS":
             # FlowCPS
             std_dev_t = sigma_prev * torch.sin(noise_level * torch.pi / 2)
-            x0 = latents - sigma * noise_pred
-            x1 = latents + noise_pred * (1 - sigma)
+            x0 = latents - sigma * velocity
+            x1 = latents + velocity * (1 - sigma)
             next_latents_mean = x0 * (1 - sigma_prev) + x1 * torch.sqrt(sigma_prev**2 - std_dev_t**2)
         
             if next_latents is None:
                 variance_noise = randn_tensor(
-                    noise_pred.shape,
+                    velocity.shape,
                     generator=generator,
-                    device=noise_pred.device,
-                    dtype=noise_pred.dtype,
+                    device=velocity.device,
+                    dtype=velocity.dtype,
                 )
                 next_latents = next_latents_mean + std_dev_t * variance_noise
                 # Round-trip through storage dtype for train-inference consistency
@@ -422,11 +422,11 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler, SDESch
 
         if not compute_log_prob:
             # # Empty tensor as placeholder
-            # log_prob = torch.empty((latents.shape[0]), dtype=torch.float32, device=noise_pred.device)
+            # log_prob = torch.empty((latents.shape[0]), dtype=torch.float32, device=velocity.device)
             log_prob = None # Use None to save memory
 
         if not return_dict:
-            return (next_latents, next_latents_mean, noise_pred, log_prob, std_dev_t, dt)
+            return (next_latents, next_latents_mean, velocity, log_prob, std_dev_t, dt)
 
         d = {}        
         for k in return_kwargs:

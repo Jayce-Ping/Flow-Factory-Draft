@@ -38,7 +38,7 @@ def cast_latents(self, latents, default_dtype=None):
 
 ## 1/sigma Error Amplification
 
-Scheduler math uses `1/sigma` to scale noise predictions. Near the end of the denoising schedule, sigma approaches zero and errors are amplified:
+Scheduler math uses `1/sigma` to scale velocity predictions. Near the end of the denoising schedule, sigma approaches zero and errors are amplified:
 
 ```
 Example: sigma = 0.01, epsilon_error = 1.5e-4

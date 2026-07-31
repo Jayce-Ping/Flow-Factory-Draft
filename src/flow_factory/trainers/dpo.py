@@ -68,7 +68,7 @@ class DPOTrainer(BaseTrainer):
 
     Loss:
         L = -log sigma(-beta/2 * ((theta_w_err - ref_w_err) - (theta_l_err - ref_l_err)))
-    where err = MSE(noise_pred, noise - x_0) averaged over spatial dims (same as flow_grpo train_sd3_dpo).
+    where err = MSE(velocity, noise - x_0) averaged over spatial dims (same as flow_grpo train_sd3_dpo).
 
     References:
     [1] Diffusion Model Alignment Using Direct Preference Optimization
@@ -394,11 +394,11 @@ class DPOTrainer(BaseTrainer):
         return t
 
     # ====================== Forward Helpers ======================
-    def _forward_noise_pred(self, latents: torch.Tensor, base_kwargs: Dict[str, Any]) -> torch.Tensor:
-        """Run a single forward pass and return the noise prediction."""
+    def _forward_velocity(self, latents: torch.Tensor, base_kwargs: Dict[str, Any]) -> torch.Tensor:
+        """Run a single forward pass and return the velocity prediction."""
         fwd_kwargs = {**base_kwargs, 'latents': latents}
         fwd_kwargs = filter_kwargs(self.adapter.forward, **fwd_kwargs)
-        return self.adapter.forward(**fwd_kwargs).noise_pred
+        return self.adapter.forward(**fwd_kwargs).velocity
 
     # ====================== Reward / advantage (Stages 4--5) ======================
     def prepare_feedback(self, samples: List[BaseSample]) -> None:
@@ -479,7 +479,7 @@ class DPOTrainer(BaseTrainer):
                 static_kwargs = {
                     **self.training_args,
                     'compute_log_prob': False,
-                    'return_kwargs': ['noise_pred'],
+                    'return_kwargs': ['velocity'],
                     'noise_level': 0.0,
                     **{k: v for k, v in chosen_batch.items()
                        if k not in _excluded_batch_keys},
@@ -510,13 +510,13 @@ class DPOTrainer(BaseTrainer):
 
                         # Policy forward
                         with self.autocast():
-                            theta_w_pred = self._forward_noise_pred(noised_chosen, base_kwargs)
-                            theta_l_pred = self._forward_noise_pred(noised_rejected, base_kwargs)
+                            theta_w_pred = self._forward_velocity(noised_chosen, base_kwargs)
+                            theta_l_pred = self._forward_velocity(noised_rejected, base_kwargs)
 
                         # Reference forward (frozen)
                         with torch.no_grad(), self.adapter.use_ref_parameters(), self.autocast():
-                            ref_w_pred = self._forward_noise_pred(noised_chosen, base_kwargs)
-                            ref_l_pred = self._forward_noise_pred(noised_rejected, base_kwargs)
+                            ref_w_pred = self._forward_velocity(noised_chosen, base_kwargs)
+                            ref_l_pred = self._forward_velocity(noised_rejected, base_kwargs)
 
                         # MSE errors per sample — target is flow-matching velocity (noise - x_0), same as
                         # flow_grpo train_sd3_dpo.py: target = noise - model_input

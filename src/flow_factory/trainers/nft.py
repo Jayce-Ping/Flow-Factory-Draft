@@ -215,7 +215,7 @@ class DiffusionNFTTrainer(BaseTrainer):
             noised_latents: Interpolated latents ``x_t = (1-σ) x_1 + σ noise`` with ``σ = t/1000``.
         
         Returns:
-            Dict with noise_pred.
+            Dict with velocity.
         """
         t_b = timestep.view(-1) # Scale [0, 1000]
 
@@ -225,7 +225,7 @@ class DiffusionNFTTrainer(BaseTrainer):
             't_next': torch.zeros_like(t_b),
             'latents': noised_latents,
             'compute_log_prob': False,
-            'return_kwargs': ['noise_pred'],
+            'return_kwargs': ['velocity'],
             'noise_level': 0.0,
             **{k: v for k, v in batch.items() if k not in ['all_latents', 'timesteps', 'advantage']},
         }
@@ -234,7 +234,7 @@ class DiffusionNFTTrainer(BaseTrainer):
         output = self.adapter.forward(**forward_kwargs)
         
         return {
-            'noise_pred': output.noise_pred,
+            'velocity': output.velocity,
         }
 
     def prepare_feedback(self, samples: List[BaseSample]) -> None:
@@ -293,7 +293,7 @@ class DiffusionNFTTrainer(BaseTrainer):
                         all_random_noise.append(noise)
                         noised_latents = (1 - sigma_broadcast) * clean_latents + sigma_broadcast * noise
                         old_output = self._compute_nft_output(batch, t_flat, noised_latents)
-                        old_v_pred_list.append(old_output['noise_pred'].detach())
+                        old_v_pred_list.append(old_output['velocity'].detach())
 
                 # ---------- Train this batch under current policy ----------
                 self.adapter.train()
@@ -315,7 +315,7 @@ class DiffusionNFTTrainer(BaseTrainer):
                         # 2. Forward pass for current policy
                         with self.autocast():
                             output = self._compute_nft_output(batch, t_flat, noised_latents)
-                        new_v_pred = output['noise_pred']
+                        new_v_pred = output['velocity']
 
                         # 3. Compute NFT loss
                         adv = batch['advantage']
@@ -358,7 +358,7 @@ class DiffusionNFTTrainer(BaseTrainer):
                                     ref_output = self._compute_nft_output(batch, t_flat, noised_latents)
                                 # KL-loss in v-space
                                 kl_div = torch.mean(
-                                    (new_v_pred - ref_output['noise_pred']) ** 2,
+                                    (new_v_pred - ref_output['velocity']) ** 2,
                                     dim=tuple(range(1, new_v_pred.ndim))
                                 )
                                 kl_loss = self.training_args.kl_beta * kl_div.mean()

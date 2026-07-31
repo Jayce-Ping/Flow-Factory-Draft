@@ -29,7 +29,7 @@ class SDESchedulerOutput(BaseOutput):
     std_dev_t: Optional[torch.FloatTensor] = None
     dt: Optional[torch.FloatTensor] = None
     log_prob: Optional[torch.FloatTensor] = None
-    noise_pred: Optional[torch.FloatTensor] = None
+    velocity: Optional[torch.FloatTensor] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {f.name: getattr(self, f.name) for f in fields(self)}

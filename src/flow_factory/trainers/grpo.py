@@ -174,7 +174,7 @@ class GRPOTrainer(BaseTrainer):
                         # 2. Forward pass
                         if self.enable_kl_loss:
                             if self.training_args.kl_type == 'v-based':
-                                return_kwargs = ['log_prob', 'noise_pred', 'dt']
+                                return_kwargs = ['log_prob', 'velocity', 'dt']
                             elif self.training_args.kl_type == 'x-based':
                                 return_kwargs = ['log_prob', 'next_latents', 'next_latents_mean', 'dt']
                         else:
@@ -207,7 +207,7 @@ class GRPOTrainer(BaseTrainer):
                                     ref_forward_inputs['compute_log_prob'] = False
                                     if self.training_args.kl_type == 'v-based':
                                         # KL in velocity space
-                                        ref_forward_inputs['return_kwargs'] = ['noise_pred']
+                                        ref_forward_inputs['return_kwargs'] = ['velocity']
                                         ref_output = self.adapter.forward(**ref_forward_inputs)
                                     elif self.training_args.kl_type == 'x-based':
                                         # KL in latent space
@@ -218,8 +218,8 @@ class GRPOTrainer(BaseTrainer):
                                 # See: issue #122, PR #123 (https://github.com/X-GenGroup/Flow-Factory/pull/123)
                                 if self.training_args.kl_type == 'v-based':
                                     kl_div = torch.mean(
-                                        ((output.noise_pred - ref_output.noise_pred) ** 2),
-                                        dim=tuple(range(1, output.noise_pred.ndim)), keepdim=True
+                                        ((output.velocity - ref_output.velocity) ** 2),
+                                        dim=tuple(range(1, output.velocity.ndim)), keepdim=True
                                     )
                                 elif self.training_args.kl_type == 'x-based':
                                     kl_div = torch.mean(
@@ -399,7 +399,7 @@ class GRPOGuardTrainer(GRPOTrainer):
                         return_kwargs = set(['log_prob', 'next_latents_mean', 'std_dev_t', 'dt'])
                         if self.enable_kl_loss:
                             if self.training_args.kl_type == 'v-based':
-                                return_kwargs.add('noise_pred')
+                                return_kwargs.add('velocity')
                             elif self.training_args.kl_type == 'x-based':
                                 return_kwargs.add('next_latents_mean')
 
@@ -434,7 +434,7 @@ class GRPOGuardTrainer(GRPOTrainer):
                                     ref_forward_inputs['compute_log_prob'] = False
                                     if self.training_args.kl_type == 'v-based':
                                         # KL in velocity space
-                                        ref_forward_inputs['return_kwargs'] = ['noise_pred']
+                                        ref_forward_inputs['return_kwargs'] = ['velocity']
                                         ref_output = self.adapter.forward(**ref_forward_inputs)
                                     elif self.training_args.kl_type == 'x-based':
                                         # KL in latent space
@@ -445,8 +445,8 @@ class GRPOGuardTrainer(GRPOTrainer):
                                 # See: issue #122, PR #123 (https://github.com/X-GenGroup/Flow-Factory/pull/123)
                                 if self.training_args.kl_type == 'v-based':
                                     kl_div = torch.mean(
-                                        ((output.noise_pred - ref_output.noise_pred) ** 2),
-                                        dim=tuple(range(1, output.noise_pred.ndim)), keepdim=True
+                                        ((output.velocity - ref_output.velocity) ** 2),
+                                        dim=tuple(range(1, output.velocity.ndim)), keepdim=True
                                     )
                                 elif self.training_args.kl_type == 'x-based':
                                     kl_div = torch.mean(
