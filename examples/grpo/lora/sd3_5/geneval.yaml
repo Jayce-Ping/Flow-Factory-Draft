@@ -38,7 +38,7 @@ model:
 #     - name: attention_backend      # set the attention backend first...
 #       params: { backend: _flash_3_hub }
 #     - name: torch_compile          # ...so the compiled graph captures it
-#       params: { mode: regional }   # regional (compile_repeated_blocks) | full
+#       params: { mode: auto }   # auto (default: full) | full
 
 log:
   run_name: null  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})

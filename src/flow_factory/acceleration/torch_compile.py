@@ -63,11 +63,11 @@ class CompileAccelerator(BaseAccelerator):
     so it wraps the final, fully-loaded weights.
 
     Parameters (from the entry's ``params``):
-        mode: ``"regional"`` (default) compiles only the repeated transformer
-            blocks via diffusers' ``compile_repeated_blocks`` — fast warmup and
-            robust to the variable image/sequence lengths set per resolution.
-            Requires the transformer to declare ``_repeated_blocks``. ``"full"``
-            compiles the whole module in place.
+        mode: ``"auto"`` (default) selects ``"regional"`` per transformer when
+            the unwrapped base model declares non-empty ``_repeated_blocks``;
+            otherwise it selects ``"full"``. ``"regional"`` forces diffusers'
+            ``compile_repeated_blocks`` and fails when the declaration is absent.
+            ``"full"`` compiles the whole module in place.
         compile_kwargs: Extra kwargs forwarded to the underlying compile call
             (e.g. ``{"mode": "max-autotune", "dynamic": true}``).
     """
@@ -85,12 +85,13 @@ class CompileAccelerator(BaseAccelerator):
     requires_grad_rollout = True
 
     def setup(self, adapter: "BaseAdapter") -> None:
-        mode = self.params.get("mode", "regional")
+        mode = self.params.get("mode", "auto")
         compile_kwargs: Dict[str, Any] = self.params.get("compile_kwargs", {})
 
-        if mode not in ("regional", "full"):
+        if mode not in ("auto", "regional", "full"):
             raise ValueError(
-                f"CompileAccelerator: unknown mode={mode!r}; expected 'regional' or 'full'."
+                f"CompileAccelerator: unknown mode={mode!r}; "
+                "expected 'auto', 'regional', or 'full'."
             )
 
         transformer_names = adapter.transformer_names
@@ -115,17 +116,9 @@ class CompileAccelerator(BaseAccelerator):
             #     graph (they still train), exposes `_repeated_blocks`, and the
             #     grad-force wrap keeps rollout/training on the same grad-mode compiled
             #     path (ratio ≈ 1 within `clip_range`, but not bit-exact).
-            inner = self._peel_peft(adapter._unwrap(module))
-            if mode == "regional":
-                # `compile_repeated_blocks` exists on every diffusers ModelMixin but
-                # only works when the model declares `_repeated_blocks`; check the
-                # unwrapped module so the error is actionable.
-                if not getattr(inner, "_repeated_blocks", None):
-                    raise ValueError(
-                        f"CompileAccelerator: component '{name}' ({type(inner).__name__}) does "
-                        "not declare `_repeated_blocks`, so regional compilation is unavailable. "
-                        "Use `mode: full` for whole-module compilation."
-                    )
+            inner: Any = self._peel_peft(adapter._unwrap(module))
+            effective_mode = self._resolve_compile_mode(inner, mode, name)
+            if effective_mode == "regional":
                 inner.compile_repeated_blocks(**compile_kwargs)
             else:
                 # nn.Module.compile compiles the module's forward in place, so the
@@ -140,7 +133,27 @@ class CompileAccelerator(BaseAccelerator):
             # (gated by `adapter._rollout_detach`) so memory stays bounded.
             self._wrap_forward_grad_consistent(adapter, inner)
             if adapter.accelerator.is_main_process:
-                logger.info("CompileAccelerator: compiled '%s' (mode=%s).", name, mode)
+                logger.info(
+                    "CompileAccelerator: compiled '%s' (mode=%s, effective=%s).",
+                    name,
+                    mode,
+                    effective_mode,
+                )
+
+    @staticmethod
+    def _resolve_compile_mode(module, mode: str, component_name: str) -> str:
+        """Resolve the configured compile mode for one unwrapped transformer."""
+        has_repeated_blocks = bool(getattr(module, "_repeated_blocks", None))
+        if mode == "auto":
+            return "regional" if has_repeated_blocks else "full"
+        if mode == "regional" and not has_repeated_blocks:
+            raise ValueError(
+                f"CompileAccelerator: component '{component_name}' "
+                f"({type(module).__name__}) does not declare `_repeated_blocks`, so regional "
+                "compilation is unavailable. Use `mode: auto` or `mode: full` for whole-module "
+                "compilation."
+            )
+        return mode
 
     @staticmethod
     def _peel_peft(module):
@@ -192,7 +205,8 @@ class CompileAccelerator(BaseAccelerator):
         well within ``clip_range`` (1e-4), i.e. numerically on-policy, but not
         bit-exact. Eager and the attention-backend accelerator stay exactly 0
         (an attention kernel's forward is grad-mode-independent). Measured on 16×H20
-        (2-node ZeRO-2/FSDP2), SD3.5 + Qwen-Image, regional + full, CFG and no-CFG.
+        (2-node ZeRO-2/FSDP2): SD3.5 full compilation, Qwen-Image regional/full
+        compilation, and CFG/no-CFG.
 
         Two entry points must be covered because the two compile modes dispatch
         differently:
@@ -214,7 +228,7 @@ class CompileAccelerator(BaseAccelerator):
                 with torch.enable_grad():
                     return fn(*args, **kwargs)
 
-            wrapped._ff_grad_consistent = True
+            setattr(wrapped, "_ff_grad_consistent", True)
             return wrapped
 
         # Regional + eager fallback: top-level forward.

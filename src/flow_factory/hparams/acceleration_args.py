@@ -104,7 +104,7 @@ class AccelerationArguments(ArgABC):
             - name: attention_backend
               params: { backend: _flash_3_hub }
             - name: torch_compile
-              params: { mode: regional }
+              params: { mode: auto }  # auto (default) | regional | full
           rollout:
             - name: diffusers_cache
               params: { policy: first_block, threshold: 0.08 }

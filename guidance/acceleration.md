@@ -46,7 +46,7 @@ acceleration:
     - name: attention_backend                # set the diffusers backend first...
       params: { backend: _flash_3_hub }
     - name: torch_compile                    # ...so the compiled graph captures it
-      params: { mode: regional }             # regional (compile_repeated_blocks) | full
+      params: { mode: auto }                 # auto (default) | regional | full
 
   # Rollout-only (Stage 3), nested in list order. May be lossy (paradigm-gated).
   rollout:
@@ -63,7 +63,7 @@ accepted as shorthand for a one-element list. A direct python path (e.g.
 | id | safety | stage | Notes |
 |----|--------|-------|-------|
 | `attention_backend` | lossless | both | Sets the diffusers attention backend on every transformer. Requires a `backend` param. Forwards any backend (`native` / `flash` / `_flash_3` / `_flash_3_hub` / `sage` / `xformers`) to `set_attention_backend`. List it in `shared` **before** `torch_compile` so the compiled graph captures the backend. |
-| `torch_compile` | lossy | both | `torch.compile` of the shared transformer. `mode: regional` uses diffusers' `compile_repeated_blocks` (fast warmup, robust to variable resolution); `mode: full` compiles the whole module. Extra `compile_kwargs` forwarded to the compile call. Compiles in place (checkpoint- and EMA/ref-safe), applied after `post_init`. Marked **lossy** because it is applied symmetrically but is **not bit-exact across rollout vs training** (grad/no-grad graph split → intermittent ~1e-5 on-policy residual, within `clip_range`); allowed on coupled algos, but the validator warns. |
+| `torch_compile` | lossy | both | `torch.compile` of the shared transformer. `mode: auto` (default) selects regional compilation when the base transformer declares `_repeated_blocks`, otherwise full compilation. Explicit `regional` forces diffusers' `compile_repeated_blocks`; explicit `full` compiles the whole module. Extra `compile_kwargs` are forwarded to the selected compile call. Compiles in place (checkpoint- and EMA/ref-safe), applied after `post_init`. Marked **lossy** because it is applied symmetrically but is **not bit-exact across rollout vs training** (grad/no-grad graph split → intermittent ~1e-5 on-policy residual, within `clip_range`); allowed on coupled algos, but the validator warns. |
 | `diffusers_cache` | lossy | rollout | Diffusers-native feature caching (no extra dependency). `policy`: `first_block` (default) / `faster` / `pyramid` / `taylorseer` / `magcache`; remaining params forwarded to the policy's diffusers config (e.g. `threshold`). The single lossy rollout backend. |
 
 ### Attention backend
@@ -79,7 +79,7 @@ acceleration:
     - name: attention_backend
       params: { backend: _flash_3_hub }   # native | flash | flash_hub | _flash_3 | _flash_3_hub | sage | xformers
     - name: torch_compile                 # optional; if present, list it AFTER attention_backend
-      params: { mode: regional }
+      params: { mode: auto }              # auto (default) | regional | full
 ```
 
 It is applied through `AttentionBackendAccelerator` by the trainer
@@ -92,6 +92,21 @@ that still sets `model.attn_backend` fails fast with a migration error.
 > **Bagel** forces `flash_attention_2` at model load (requires `pip install -e ".[bagel]"`)
 > and its custom transformer has no `set_attention_backend`, so it does **not** take an
 > `attention_backend` entry — omit it (the accelerator raises if applied to bagel).
+
+### torch.compile modes
+
+`mode: auto` is the default and resolves each unwrapped base transformer independently.
+Models with a non-empty `_repeated_blocks` declaration use regional compilation; models
+without one use full compilation. This lets multi-transformer adapters mix strategies when
+their components expose different capabilities. The selected strategy is logged per component.
+With the current diffusers model declarations, FLUX/FLUX.2, Qwen-Image, Z-Image, Wan, and
+LTX2 select regional; SD3.5 and the custom Bagel transformer select full.
+
+Use explicit `regional` only when you want to require `compile_repeated_blocks`; it fails fast
+when `_repeated_blocks` is missing or empty. Regional compilation usually has much lower
+cold-start cost and handles changing image/sequence lengths more robustly. Explicit `full`
+always compiles the whole transformer and is the compatibility override for models such as
+SD3.5, whose diffusers transformer currently does not declare `_repeated_blocks`.
 
 ### torch.compile train-inference consistency (coupled algorithms)
 
@@ -109,10 +124,11 @@ the compiled transformer to run under `torch.enable_grad()` (overriding the
 feedback to keep memory bounded. The accelerator also compiles the **base** transformer
 under any PEFT/LoRA wrapper (not the wrapper itself). With this, the
 on-policy ratio is driven to **≈1, well within `clip_range` (1e-4)** — but **not strictly
-bit-exact**: an intermittent **~1e-5** residual remains on a minority of samples/ranks
-(16×H20, ZeRO-2/FSDP2, SD3.5+Qwen-Image, regional/full, CFG and no-CFG). Forcing grad removes
-the *dominant* grad-vs-no-grad graph split, but rollout and training are still distinct Inductor
-kernel invocations (different latent stride/contiguity + autograd-graph context), and bf16's
+bit-exact**: an intermittent **~1e-5** residual remains on a minority of samples/ranks.
+Measurements covered 16×H20 with ZeRO-2/FSDP2, SD3.5 full compilation, Qwen-Image
+regional/full compilation, and CFG/no-CFG. Forcing grad removes the *dominant*
+grad-vs-no-grad graph split, but rollout and training are still distinct Inductor kernel
+invocations (different latent stride/contiguity + autograd-graph context), and bf16's
 non-associative accumulation surfaces a last-bit difference for some inputs. So compile is
 **numerically on-policy, not bit-exact** — if you need a strictly bit-exact ratio, use eager or
 the `attention_backend` accelerator (a backend's forward is grad-mode-independent and stays
