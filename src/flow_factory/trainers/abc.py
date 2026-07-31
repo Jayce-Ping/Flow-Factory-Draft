@@ -468,23 +468,6 @@ class BaseTrainer(ABC):
                 stack.enter_context(accelerator.rollout_context(self.adapter))
             yield
 
-    @contextmanager
-    def _rollout_grad_context(self) -> Iterator[None]:
-        """Grad context for an ``adapter.inference()`` loop (Stage-3 rollout and eval).
-
-        The outer inference, scheduler, and collector path always runs under
-        ``torch.no_grad()`` so rollout-old tensors never retain autograd graphs.
-        A shared accelerator that requires grad-mode consistency (currently only
-        ``torch_compile``) re-enables gradients locally inside the compiled
-        transformer wrapper. This preserves the training-equivalent compiled graph
-        without tracking CFG, scheduler, decoding, or collection operations.
-
-        Tensor collectors detach values before storing them. The same boundary is
-        reused by evaluation to keep memory independent of the denoising-step count.
-        """
-        with torch.no_grad():
-            yield
-
     def _synchronize_frozen_components(self):
         if self.accelerator.num_processes <= 1:
             return
@@ -877,7 +860,7 @@ class BaseTrainer(ABC):
         # so its state never leaks into the Stage-6 training forward.
         # The outer path stays no_grad; a compile accelerator re-enables gradients
         # only inside the transformer call to match the training compiled graph.
-        with self._rollout_acceleration(), self._rollout_grad_context(), self.autocast():
+        with self._rollout_acceleration(), torch.no_grad(), self.autocast():
             for _ in tqdm(
                 range(self.training_args.num_batches_per_epoch),
                 desc=f'Epoch {self.epoch} Sampling',
@@ -940,9 +923,7 @@ class BaseTrainer(ABC):
 
         self.adapter.eval()
 
-        # Use the rollout grad context so evaluation shares the same outer no_grad
-        # boundary as training rollout.
-        with self._rollout_grad_context(), self.autocast(), self.adapter.use_ema_parameters():
+        with torch.no_grad(), self.autocast(), self.adapter.use_ema_parameters():
             for dataset_name, dataloader in self.eval_dataloaders.items():
                 buffer = self.eval_dataset_reward_buffers.get(dataset_name)
                 if buffer is None:
