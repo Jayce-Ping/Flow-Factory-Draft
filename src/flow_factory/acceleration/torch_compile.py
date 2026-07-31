@@ -108,7 +108,7 @@ class CompileAccelerator(BaseAccelerator):
             #   * `adapter._unwrap` peels the RoutedComponentProxy + DDP/FSDP/DeepSpeed
             #     wrapper, but NOT PEFT — it returns the PeftModel.
             #   * compiling the PeftModel is wrong: Dynamo specializes the LoRA wrapper
-            #     on grad mode in a way the outer grad-force cannot unify (noise_pred
+            #     on grad mode in a way the outer grad-force cannot unify (velocity
             #     drifts ~2.0 between rollout/train), AND the PeftModel has no
             #     `_repeated_blocks` so regional compile is unavailable under LoRA.
             #   * the base transformer keeps its LoRA submodules inside the compiled
@@ -177,7 +177,7 @@ class CompileAccelerator(BaseAccelerator):
         :meth:`BaseAdapter.cast_latents` (gated by ``adapter._rollout_detach``), which
         breaks the autograd graph chain across denoising steps so rollout memory stays
         bounded while every transformer call still uses the same grad-mode compiled
-        path (near-exact noise_pred → on-policy ratio ≈ 1 within ``clip_range``).
+        path (near-exact velocity → on-policy ratio ≈ 1 within ``clip_range``).
 
         Known residual (NOT strictly bit-exact): forcing grad removes the *dominant*
         divergence (the grad-vs-no-grad graph split), but it does not make the rollout

@@ -135,7 +135,7 @@ def validate_accelerator(
         if paradigm not in _LOSSY_SAFE_PARADIGMS:
             raise ValueError(
                 f"Lossy rollout accelerator '{name}' is unsafe for the '{paradigm}' trainer "
-                f"'{trainer_name}'. Lossy acceleration changes `noise_pred` during rollout but "
+                f"'{trainer_name}'. Lossy acceleration changes `velocity` during rollout but "
                 "cannot be replicated in the training forward; for coupled algorithms "
                 "(GRPO / GRPO-Guard / DPPO) this biases the PPO importance ratio and silently "
                 f"corrupts gradients. Allowed paradigms: {sorted(_LOSSY_SAFE_PARADIGMS)}. Use a "
