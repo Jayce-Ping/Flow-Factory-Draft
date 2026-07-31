@@ -136,7 +136,7 @@ train:
 ```
 
 Here, `x-based` calculates the KL loss in the **latent space**,
-while v-based calculates it in the **predicted velocity space** (or **noise space**).
+while v-based calculates it in the **predicted velocity space**.
 The `kl_beta` parameter controls the coefficient of the KL divergence term.
 
 **Memory Considerations**: Since calculating KL loss requires maintaining a copy of the original model, *VRAM usage scales with the number of trainable parameters*. 
@@ -171,7 +171,7 @@ The two KL computations are **decoupled**: `kl_mask_type` selects the space of t
 ```yaml
 train:
     trainer_type: 'dppo'
-    kl_mask_type: 'x-based'    # Trust-region mask KL(current||old) space: 'x-based' (next_latents_mean) or 'v-based' (noise_pred)
+    kl_mask_type: 'x-based'    # Trust-region mask KL(current||old) space: 'x-based' (next_latents_mean) or 'v-based' (velocity)
     kl_mask_threshold: 1.0e-6  # Per-step KL trust-region; larger keeps more samples
     kl_type: 'x-based'         # KL(current||reference) penalty space: 'x-based' or 'v-based'
     kl_beta: 1.0e-3            # Optional KL(current||reference) penalty (0 disables)

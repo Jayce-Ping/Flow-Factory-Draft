@@ -20,7 +20,7 @@ All adapters that support CFG must follow a consistent two-stage pattern. Guidan
 - `forward()` receives `negative_prompt_embeds` (may be `None`).
 - **CFG condition**: `do_classifier_free_guidance = guidance_scale > 1.0 and negative_prompt_embeds is not None`.
 - If `guidance_scale > 1.0` but `negative_prompt_embeds is None`, emit `logger.warning(...)` and **fall back to the no-CFG path** (no error). The warning message must mention both the passed scale and the missing embeddings.
-- CFG formula: `noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)`.
+- CFG formula: `velocity = velocity_uncond + guidance_scale * (velocity_cond - velocity_uncond)`.
 
 ### Reference implementation
 

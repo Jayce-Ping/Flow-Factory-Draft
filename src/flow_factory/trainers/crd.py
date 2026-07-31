@@ -435,7 +435,7 @@ class CRDTrainer(BaseTrainer):
                 from the batch if ``guidance_scale > 1.0``.
 
         Returns:
-            Dict with ``noise_pred`` (velocity prediction), shape ``(B, C, H, W)``.
+            Dict with ``velocity`` (velocity prediction), shape ``(B, C, H, W)``.
         """
         t_b = timestep.view(-1)  # Scheduler scale [0, 1000]
         device = self.accelerator.device
@@ -446,7 +446,7 @@ class CRDTrainer(BaseTrainer):
             't_next': torch.zeros_like(t_b),
             'latents': noised_latents,
             'compute_log_prob': False,
-            'return_kwargs': ['noise_pred'],
+            'return_kwargs': ['velocity'],
             'noise_level': 0.0,
             **{
                 k: (v.to(device) if isinstance(v, torch.Tensor) else v)
@@ -458,7 +458,7 @@ class CRDTrainer(BaseTrainer):
             forward_kwargs['guidance_scale'] = guidance_scale
         forward_kwargs = filter_kwargs(self.adapter.forward, **forward_kwargs)
         output = self.adapter.forward(**forward_kwargs)
-        return {'noise_pred': output.noise_pred}
+        return {'velocity': output.velocity}
 
     def prepare_feedback(self, samples: List[BaseSample]) -> None:
         """Finalize rewards, compute advantages, and log advantage metrics."""
@@ -651,7 +651,7 @@ class CRDTrainer(BaseTrainer):
                             # Use reference model (original weights)
                             with self.adapter.use_ref_parameters():
                                 old_output = self._compute_crd_output(batch, t_flat, noised_latents)
-                        old_v_pred_list.append(old_output['noise_pred'].detach())
+                        old_v_pred_list.append(old_output['velocity'].detach())
 
                     sample_batches.append(
                         _CRDBatch(
@@ -700,18 +700,18 @@ class CRDTrainer(BaseTrainer):
                         # 2. Current model forward pass
                         with self.autocast():
                             output = self._compute_crd_output(batch, t_flat, noised_latents)
-                        forward_pred = output['noise_pred']
+                        forward_pred = output['velocity']
 
                         # 3. Reference model forward pass (for KL)
                         # If kl_cfg > 1.0, the adapter's forward() will do CFG automatically:
                         # it concatenates [neg_embeds, pos_embeds] and computes:
-                        #   noise_pred = uncond + kl_cfg * (cond - uncond)
+                        #   velocity = uncond + kl_cfg * (cond - uncond)
                         # The negative embeddings come from the batch (negative_prompt_embeds,
                         # negative_pooled_prompt_embeds stored by SD3_5Sample during rollout).
                         with torch.no_grad(), self.adapter.use_ref_parameters(), self.autocast():
                             cfg = self.kl_cfg if self.kl_cfg > 1.0 else None
                             ref_output = self._compute_crd_output(batch, t_flat, noised_latents, guidance_scale=cfg)
-                            ref_pred = ref_output['noise_pred']
+                            ref_pred = ref_output['velocity']
 
                         # 4. Compute implicit reward: r_theta = -(||pred_theta - v_target||^2 - ||pred_old - v_target||^2)
                         if self.adaptive_logp:

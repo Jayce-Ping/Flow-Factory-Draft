@@ -94,7 +94,7 @@ class DPPOTrainer(GRPOTrainer):
         # policy in `kl_mask_type` space, so only that per-step quantity is stored
         # (the ref-KL penalty compares current vs reference, never the old policy).
         mask_field = (
-            "noise_pred" if self.training_args.kl_mask_type == "v-based" else "next_latents_mean"
+            "velocity" if self.training_args.kl_mask_type == "v-based" else "next_latents_mean"
         )
         return self.generate_samples(
             reward_buffer=self.reward_buffer,
@@ -113,7 +113,7 @@ class DPPOTrainer(GRPOTrainer):
         kl_guidance_scale = self.training_args.kl_guidance_scale
         kl_mask_threshold = self.training_args.kl_mask_threshold
         # Mask space picks the single rollout-old tensor stored by sample().
-        mask_field = "noise_pred" if kl_mask_type == "v-based" else "next_latents_mean"
+        mask_field = "velocity" if kl_mask_type == "v-based" else "next_latents_mean"
         for inner_epoch in range(self.training_args.num_inner_epochs):
             shuffled_samples = self._order_samples_for_optimize(samples, inner_epoch)
 
@@ -169,12 +169,12 @@ class DPPOTrainer(GRPOTrainer):
                         # feed the x-based mask's variance scaling only.
                         return_kwargs = {"log_prob"}
                         if kl_mask_type == "v-based":
-                            return_kwargs.add("noise_pred")
+                            return_kwargs.add("velocity")
                         else:
                             return_kwargs.update(("next_latents_mean", "std_dev_t", "dt"))
                         if self.enable_kl_loss:
                             return_kwargs.add(
-                                "noise_pred" if kl_type == "v-based" else "next_latents_mean"
+                                "velocity" if kl_type == "v-based" else "next_latents_mean"
                             )
                         forward_inputs["return_kwargs"] = list(return_kwargs)
                         with self.autocast():
@@ -190,7 +190,7 @@ class DPPOTrainer(GRPOTrainer):
                         # uses the exact variance-scaled Gaussian KL; the v-based mask and the
                         # ref-KL penalty below use unscaled squared error (GRPO convention).
                         if kl_mask_type == "v-based":
-                            sq = (output.noise_pred - old_mask_tensor) ** 2
+                            sq = (output.velocity - old_mask_tensor) ** 2
                             kl_new_old = sq.mean(dim=tuple(range(1, sq.ndim)))
                         else:
                             sigma_t = self._effective_sigma(output.std_dev_t, output.dt)
@@ -225,7 +225,7 @@ class DPPOTrainer(GRPOTrainer):
                                     if kl_guidance_scale is not None:
                                         ref_forward_inputs["guidance_scale"] = kl_guidance_scale
                                     if kl_type == "v-based":
-                                        ref_forward_inputs["return_kwargs"] = ["noise_pred"]
+                                        ref_forward_inputs["return_kwargs"] = ["velocity"]
                                     else:
                                         ref_forward_inputs["return_kwargs"] = ["next_latents_mean"]
                                     ref_output = self.adapter.forward(**ref_forward_inputs)
@@ -233,8 +233,8 @@ class DPPOTrainer(GRPOTrainer):
                                 # kl_div must be computed outside `torch.no_grad()` for correct gradients.
                                 if kl_type == "v-based":
                                     kl_div = torch.mean(
-                                        ((output.noise_pred - ref_output.noise_pred) ** 2),
-                                        dim=tuple(range(1, output.noise_pred.ndim)),
+                                        ((output.velocity - ref_output.velocity) ** 2),
+                                        dim=tuple(range(1, output.velocity.ndim)),
                                         keepdim=True,
                                     )
                                 else:

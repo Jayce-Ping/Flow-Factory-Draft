@@ -18,7 +18,7 @@ Trajectory & Callback Collectors for Inference
 
 Memory-efficient recording utilities for denoising trajectories.
 - ``TrajectoryCollector``: records tensors (latents, log_probs) at specified steps.
-- ``CallbackCollector``: records named callback values (noise_level, noise_pred, …)
+- ``CallbackCollector``: records named callback values (noise_level, velocity, …)
   at specified steps. Drop-in replacement for the ``defaultdict(list)`` pattern.
 
 Both produce compact storage + lightweight index maps to eliminate redundant

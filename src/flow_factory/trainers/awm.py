@@ -284,7 +284,7 @@ class AWMTrainer(BaseTrainer):
         Returns:
             Dictionary with:
                 - log_prob: (B,)
-                - noise_pred: same shape as latents
+                - velocity: same shape as latents
         """
         t_b = timestep.view(-1)
 
@@ -294,7 +294,7 @@ class AWMTrainer(BaseTrainer):
             't_next': torch.zeros_like(t_b),
             'latents': noised_latents,
             'compute_log_prob': False,  # Compute log prob based on matching loss
-            'return_kwargs': ['noise_pred'],
+            'return_kwargs': ['velocity'],
             'noise_level': 0.0,
             **{k: v for k, v in batch.items() if k not in ['all_latents', 'timesteps', 'advantage']},
         }
@@ -308,7 +308,7 @@ class AWMTrainer(BaseTrainer):
         
         # Compute weighted log probability
         log_prob = self.compute_weighted_log_prob(
-            model_output=output.noise_pred,
+            model_output=output.velocity,
             target=target,
             timestep=timestep,
             weighting=self.weighting,
@@ -317,7 +317,7 @@ class AWMTrainer(BaseTrainer):
                 
         return {
             'log_prob': log_prob,             # (B,)
-            'noise_pred': output.noise_pred,  # Same shape as latents
+            'velocity': output.velocity,  # Same shape as latents
         }
 
     def prepare_feedback(self, samples: List[BaseSample]) -> None:
@@ -436,11 +436,11 @@ class AWMTrainer(BaseTrainer):
                                         batch, t_flat, noised_latents, clean_latents, noise
                                     )
                                 # KL-div in velocity space
-                                noise_pred = current_output['noise_pred']
-                                ref_noise_pred = ref_output['noise_pred']
+                                velocity = current_output['velocity']
+                                ref_velocity = ref_output['velocity']
 
                                 # Uniform across all dimensions except batch
-                                kl_div = ((noise_pred - ref_noise_pred) ** 2).mean(dim=tuple(range(1, noise_pred.ndim)))
+                                kl_div = ((velocity - ref_velocity) ** 2).mean(dim=tuple(range(1, velocity.ndim)))
                                 kl_loss = self.kl_beta * kl_div.mean()
                                 loss = loss + kl_loss
                                 loss_info['kl_div'].append(kl_div.detach())
@@ -454,10 +454,10 @@ class AWMTrainer(BaseTrainer):
                                         batch, t_flat, noised_latents, clean_latents, noise
                                     )
                                 # KL-div in velocity space
-                                noise_pred = current_output['noise_pred']
-                                ema_noise_pred = ema_output['noise_pred']
+                                velocity = current_output['velocity']
+                                ema_velocity = ema_output['velocity']
 
-                                ema_kl = ((noise_pred - ema_noise_pred) ** 2).mean(dim=tuple(range(1, noise_pred.ndim)))
+                                ema_kl = ((velocity - ema_velocity) ** 2).mean(dim=tuple(range(1, velocity.ndim)))
                                 ema_kl_loss = self.ema_kl_beta * ema_kl.mean()
                                 loss = loss + ema_kl_loss
                                 loss_info['ema_kl_div'].append(ema_kl.detach())

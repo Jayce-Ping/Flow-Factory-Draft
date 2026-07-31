@@ -1292,7 +1292,7 @@ class BagelAdapter(BaseAdapter):
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
             current_compute_log_prob = compute_log_prob and current_noise_level > 0
             return_kwargs = list(
-                set(["next_latents", "log_prob", "noise_pred"] + extra_call_back_kwargs)
+                set(["next_latents", "log_prob", "velocity"] + extra_call_back_kwargs)
             )
 
             # Single forward step: flow prediction + scheduler step. Context is
@@ -1548,7 +1548,7 @@ class BagelAdapter(BaseAdapter):
 
         # ── Scheduler step (timesteps stay in [0, 1000]) ──
         output = self.scheduler.step(
-            noise_pred=v_t,
+            velocity=v_t,
             timestep=t,
             latents=latents,
             timestep_next=t_next,
@@ -1613,11 +1613,11 @@ class BagelAdapter(BaseAdapter):
 
         Returns:
             ``SDESchedulerOutput`` with ``next_latents``, ``log_prob``,
-            ``noise_pred``, etc. depending on ``return_kwargs``.
+            ``velocity``, etc. depending on ``return_kwargs``.
         """
         if return_kwargs is None:
             return_kwargs = [
-                "noise_pred",
+                "velocity",
                 "next_latents",
                 "next_latents_mean",
                 "std_dev_t",

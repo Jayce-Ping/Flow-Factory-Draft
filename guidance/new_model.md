@@ -380,7 +380,7 @@ def inference(
             prompt_embeds=prompt_embeds,
             compute_log_prob=current_compute_log_prob,
             noise_level=noise_level,
-            return_kwargs=['next_latents', 'log_prob', 'noise_pred', ...],
+            return_kwargs=['next_latents', 'log_prob', 'velocity', ...],
             ...
         )
         
@@ -436,7 +436,7 @@ def inference(
 | Utility | Purpose |
 |---|---|
 | `create_trajectory_collector(indices, T)` | Selectively stores latents/log-probs only at specified timesteps |
-| `create_callback_collector(indices, T)` | Captures arbitrary per-step outputs (e.g., `noise_level`, `noise_pred`) |
+| `create_callback_collector(indices, T)` | Captures arbitrary per-step outputs (e.g., `noise_level`, `velocity`) |
 
 
 ### Step 6: Implement `forward()`
@@ -459,7 +459,7 @@ def forward(
     guidance_scale: float = 4.0,
     noise_level: Optional[float] = None,
     compute_log_prob: bool = True,
-    return_kwargs: List[str] = ['noise_pred', 'next_latents', 'log_prob', ...],
+    return_kwargs: List[str] = ['velocity', 'next_latents', 'log_prob', ...],
 ) -> SDESchedulerOutput:
     """
     Single denoising step: transformer forward + scheduler step.
@@ -471,7 +471,7 @@ def forward(
     Returns:
         SDESchedulerOutput with fields gated by `return_kwargs`:
         - next_latents: Denoised latents for the next step
-        - noise_pred: Model's velocity/noise prediction
+        - velocity: Model's velocity prediction
         - log_prob: Log-probability under the SDE formulation
         - next_latents_mean: Deterministic mean (before noise injection)
         - std_dev_t, dt: SDE statistics
@@ -482,7 +482,7 @@ def forward(
     #    (e.g., concatenate condition image latents, handle CFG doubling)
     
     # 2. Transformer forward pass
-    noise_pred = self.transformer(
+    velocity = self.transformer(
         hidden_states=latents,
         timestep=t.expand(batch_size) / 1000,
         encoder_hidden_states=prompt_embeds,
@@ -491,11 +491,11 @@ def forward(
     )[0]
     
     # 3. Post-process (e.g., extract target portion, apply CFG)
-    #    noise_pred = noise_pred[:, :latents.shape[1]]  # Remove condition tokens
+    #    velocity = velocity[:, :latents.shape[1]]  # Remove condition tokens
     
     # 4. Scheduler step — this handles SDE dynamics and log-prob computation
     output = self.scheduler.step(
-        noise_pred=noise_pred,
+        velocity=velocity,
         timestep=t,
         latents=latents,
         timestep_next=t_next,
