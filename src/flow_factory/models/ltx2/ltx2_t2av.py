@@ -669,7 +669,7 @@ class LTX2_T2AV_Adapter(BaseAdapter):
         # SDE control
         noise_level: Optional[float] = None,
         compute_log_prob: bool = True,
-        return_kwargs: List[str] = ["next_latents", "log_prob", "noise_pred"],
+        return_kwargs: List[str] = ["next_latents", "log_prob", "velocity"],
         # LTX-2.3 compatibility
         use_cross_timestep: bool = False,
         **kwargs,
@@ -916,7 +916,7 @@ class LTX2_T2AV_Adapter(BaseAdapter):
 
         # --- 8. Video: SDE scheduler step (with log_prob) ---
         video_output = self.scheduler.step(
-            noise_pred=video_pred,
+            velocity=video_pred,
             timestep=t,
             latents=video_latents,
             timestep_next=t_next,
@@ -929,7 +929,7 @@ class LTX2_T2AV_Adapter(BaseAdapter):
 
         # --- 9. Audio: SDE scheduler step (twin of video, with log_prob) ---
         audio_output = self.audio_scheduler.step(
-            noise_pred=audio_pred,
+            velocity=audio_pred,
             timestep=t,
             latents=audio_latents,
             timestep_next=t_next,
@@ -954,9 +954,9 @@ class LTX2_T2AV_Adapter(BaseAdapter):
                 [video_output.next_latents_mean, audio_output.next_latents_mean],
                 dim=1,
             )
-        if video_output.noise_pred is not None:
-            video_output.noise_pred = torch.cat(
-                [video_output.noise_pred, audio_pred],
+        if video_output.velocity is not None:
+            video_output.velocity = torch.cat(
+                [video_output.velocity, audio_pred],
                 dim=1,
             )
 
@@ -1188,7 +1188,7 @@ class LTX2_T2AV_Adapter(BaseAdapter):
             noise_level = self.scheduler.get_noise_level_for_timestep(t)
             t_next = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
             return_kw = list(
-                set(["next_latents", "log_prob", "noise_pred"] + extra_call_back_kwargs)
+                set(["next_latents", "log_prob", "velocity"] + extra_call_back_kwargs)
             )
             current_compute_log_prob: bool = compute_log_prob and noise_level > 0
 

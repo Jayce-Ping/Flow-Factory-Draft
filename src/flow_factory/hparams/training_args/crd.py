@@ -90,7 +90,7 @@ class CRDTrainingArguments(TrainingArguments):
             "help": (
                 "CFG scale for the teacher (reference) model during KL computation. "
                 "If > 1.0, the reference forward pass uses classifier-free guidance: "
-                "``noise_pred = uncond + kl_cfg * (cond - uncond)``. "
+                "``velocity = velocity_uncond + kl_cfg * (velocity_cond - velocity_uncond)``. "
                 "Set to 1.0 (default) to disable CFG on the teacher."
             )
         },

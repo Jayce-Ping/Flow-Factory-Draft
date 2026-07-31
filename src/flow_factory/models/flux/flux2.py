@@ -558,7 +558,7 @@ class Flux2Adapter(BaseAdapter):
         for i, t in enumerate(timesteps):
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
             t_next = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
-            return_kwargs = list(set(['next_latents', 'log_prob', 'noise_pred'] + extra_call_back_kwargs))
+            return_kwargs = list(set(['next_latents', 'log_prob', 'velocity'] + extra_call_back_kwargs))
             current_compute_log_prob = compute_log_prob and current_noise_level > 0
 
             output = self._forward(
@@ -774,7 +774,7 @@ class Flux2Adapter(BaseAdapter):
         guidance_scale: float = 4.0,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
-        return_kwargs: List[str] = ['noise_pred', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
+        return_kwargs: List[str] = ['velocity', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
         noise_level: Optional[float] = None,
     ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
         """
@@ -813,7 +813,7 @@ class Flux2Adapter(BaseAdapter):
             latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
 
         # Forward pass
-        noise_pred = self.transformer(
+        velocity = self.transformer(
             hidden_states=latent_model_input,
             timestep=t.expand(batch_size) / 1000,  # Scale timestep
             guidance=guidance,
@@ -825,11 +825,11 @@ class Flux2Adapter(BaseAdapter):
         )[0]
 
         # Extract only target latent predictions (exclude condition image part)
-        noise_pred = noise_pred[:, :latents.shape[1]]
+        velocity = velocity[:, :latents.shape[1]]
 
         # Scheduler step
         output = self.scheduler.step(
-            noise_pred=noise_pred,
+            velocity=velocity,
             timestep=t,
             latents=latents,
             timestep_next=t_next,
@@ -859,7 +859,7 @@ class Flux2Adapter(BaseAdapter):
         noise_level: Optional[float] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
-        return_kwargs: List[str] = ['noise_pred', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
+        return_kwargs: List[str] = ['velocity', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
     ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
         """
         General forward method handling both T2I and I2I, including ragged I2I batches.

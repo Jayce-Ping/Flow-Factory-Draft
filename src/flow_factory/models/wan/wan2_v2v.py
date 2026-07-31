@@ -373,7 +373,7 @@ class Wan2_V2V_Adapter(BaseAdapter):
         for i, t in enumerate(timesteps):
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
             t_next = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
-            return_kwargs = list(set(['next_latents', 'log_prob', 'noise_pred'] + extra_call_back_kwargs))
+            return_kwargs = list(set(['next_latents', 'log_prob', 'velocity'] + extra_call_back_kwargs))
             current_compute_log_prob = compute_log_prob and current_noise_level > 0
 
             output = self.forward(
@@ -465,7 +465,7 @@ class Wan2_V2V_Adapter(BaseAdapter):
         noise_level: Optional[float] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
-        return_kwargs: List[str] = ['noise_pred', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
+        return_kwargs: List[str] = ['velocity', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
     ) -> UniPCMultistepSDESchedulerOutput:
         """
         Core forward pass for V2V generation.
@@ -505,7 +505,7 @@ class Wan2_V2V_Adapter(BaseAdapter):
         latent_model_input = latents.to(dtype)
 
         # 3. Transformer forward pass
-        noise_pred = self.transformer(
+        velocity = self.transformer(
             hidden_states=latent_model_input,
             timestep=timestep,
             encoder_hidden_states=prompt_embeds,
@@ -515,18 +515,18 @@ class Wan2_V2V_Adapter(BaseAdapter):
 
         # 4. Apply CFG
         if do_classifier_free_guidance:
-            noise_uncond = self.transformer(
+            velocity_uncond = self.transformer(
                 hidden_states=latent_model_input,
                 timestep=timestep,
                 encoder_hidden_states=negative_prompt_embeds,
                 attention_kwargs=attention_kwargs,
                 return_dict=False,
             )[0]
-            noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
+            velocity = velocity_uncond + guidance_scale * (velocity - velocity_uncond)
 
         # 5. Scheduler step
         output = self.scheduler.step(
-            noise_pred=noise_pred,
+            velocity=velocity,
             timestep=t,
             latents=latents,
             timestep_next=t_next,

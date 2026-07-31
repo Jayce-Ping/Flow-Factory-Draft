@@ -400,7 +400,7 @@ class QwenImageAdapter(BaseAdapter):
         for i, t in enumerate(timesteps):
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
             t_next = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
-            return_kwargs = list(set(['next_latents', 'log_prob', 'noise_pred'] + extra_call_back_kwargs))
+            return_kwargs = list(set(['next_latents', 'log_prob', 'velocity'] + extra_call_back_kwargs))
             current_compute_log_prob = compute_log_prob and current_noise_level > 0
 
             output = self.forward(
@@ -498,7 +498,7 @@ class QwenImageAdapter(BaseAdapter):
         noise_level: Optional[float] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
-        return_kwargs: List[str] = ['noise_pred', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
+        return_kwargs: List[str] = ['velocity', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
     ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
         """
         Core forward pass for T2I generation.
@@ -585,18 +585,18 @@ class QwenImageAdapter(BaseAdapter):
                 attention_kwargs=attention_kwargs,
                 return_dict=False,
             )[0]
-            noise_pred, neg_noise_pred = both_pred.chunk(2, dim=0)
+            velocity, neg_velocity = both_pred.chunk(2, dim=0)
 
-            comb_pred = neg_noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
+            comb_pred = neg_velocity + guidance_scale * (velocity - neg_velocity)
 
             # Rescale norm (Qwen-Image specific)
-            cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
+            cond_norm = torch.norm(velocity, dim=-1, keepdim=True)
             noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
-            noise_pred = comb_pred * (cond_norm / noise_norm)
+            velocity = comb_pred * (cond_norm / noise_norm)
         else:
             # Single conditional forward pass (no CFG).
             with self.pipeline.transformer.cache_context("cond"):
-                noise_pred = self.transformer(
+                velocity = self.transformer(
                     hidden_states=latents,
                     timestep=timestep / 1000,
                     guidance=guidance,
@@ -609,7 +609,7 @@ class QwenImageAdapter(BaseAdapter):
 
         # 3. Scheduler step
         output = self.scheduler.step(
-            noise_pred=noise_pred,
+            velocity=velocity,
             timestep=t,
             latents=latents,
             timestep_next=t_next,
