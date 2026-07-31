@@ -64,7 +64,7 @@ accepted as shorthand for a one-element list. A direct python path (e.g.
 |----|--------|-------|-------|
 | `attention_backend` | lossless | both | Sets the diffusers attention backend on every transformer. Requires a `backend` param. Forwards any backend (`native` / `flash` / `_flash_3` / `_flash_3_hub` / `sage` / `xformers`) to `set_attention_backend`. List it in `shared` **before** `torch_compile` so the compiled graph captures the backend. |
 | `torch_compile` | lossy | both | `torch.compile` of the shared transformer. `mode: auto` (default) selects regional compilation when the base transformer declares `_repeated_blocks`, otherwise full compilation. Explicit `regional` forces diffusers' `compile_repeated_blocks`; explicit `full` compiles the whole module. Extra `compile_kwargs` are forwarded to the selected compile call. Compiles in place (checkpoint- and EMA/ref-safe), applied after `post_init`. Marked **lossy** because it is applied symmetrically but is **not bit-exact across rollout vs training** (grad/no-grad graph split → intermittent ~1e-5 on-policy residual, within `clip_range`); allowed on coupled algos, but the validator warns. |
-| `diffusers_cache` | lossy | rollout | Diffusers-native feature caching (no extra dependency). `policy`: `first_block` (default) / `faster` / `pyramid` / `taylorseer` / `magcache`; remaining params forwarded to the policy's diffusers config (e.g. `threshold`). The single lossy rollout backend. |
+| `diffusers_cache` | lossy | rollout | Diffusers-native feature caching (no extra dependency). Requires an adapter with `supports_diffusers_cache = True`, meaning every transformer forward branch uses `cache_context`. `policy`: `first_block` (default) / `faster` / `pyramid` / `taylorseer` / `magcache`; remaining params are forwarded to the policy config. |
 
 ### Attention backend
 
@@ -117,12 +117,12 @@ threatens this because it compiles a
 `grad_mode`): rollout normally runs the transformer under `torch.no_grad()` and the training
 forward under grad, so a naive compiled rollout would diverge from training and bias the ratio.
 
-`CompileAccelerator` handles this automatically (no user action needed): its wrapper forces
-the compiled transformer to run under `torch.enable_grad()` (overriding the
-`@torch.no_grad()` on `inference()`). `BaseTrainer._rollout_grad_context` sets
-`adapter._rollout_detach`, and `BaseAdapter.cast_latents` detaches the per-step latent
-feedback to keep memory bounded. The accelerator also compiles the **base** transformer
-under any PEFT/LoRA wrapper (not the wrapper itself). With this, the
+`CompileAccelerator` handles this automatically (no user action needed): rollout remains
+under an outer `torch.no_grad()`, while the wrapper runs only the compiled transformer under
+`torch.enable_grad()`. Scheduler/CFG operations therefore do not extend the graph, and
+trajectory/callback collectors detach rollout-old tensors before storage. The accelerator
+also compiles the **base** transformer under any PEFT/LoRA wrapper (not the wrapper itself).
+With this, the
 on-policy ratio is driven to **≈1, well within `clip_range` (1e-4)** — but **not strictly
 bit-exact**: an intermittent **~1e-5** residual remains on a minority of samples/ranks.
 Measurements covered 16×H20 with ZeRO-2/FSDP2, SD3.5 full compilation, Qwen-Image
@@ -136,8 +136,8 @@ exactly 0). See `CompileAccelerator._wrap_forward_grad_consistent` for details.
 
 Two implementation notes that matter for correctness:
 - The grad-force wrapper must **not** detach its own output — an inner detach lets Inductor
-  pick a divergent inference-optimized kernel and re-introduces ~1e-5 drift. The detach lives
-  at the latent-feedback chokepoint (`cast_latents`) instead.
+  pick a divergent inference-optimized kernel and re-introduces ~1e-5 drift. The outer
+  no-grad boundary stops graph propagation; collectors detach direct outputs before storage.
 - Determinism knobs (`cudnn.deterministic`, `fallback_random`) are irrelevant here — the cause
   was the grad-vs-no-grad graph split, not RNG (a `train-vs-train` recompute is exactly 0.0).
 
@@ -147,11 +147,15 @@ See `.scratch/torch_compile_consistency_report.md` for the full analysis.
 ## Model cache-readiness (lossy caching)
 
 Feature caching reuses block outputs across denoising steps via the transformer's
-`cache_context(...)`. Adapters that already wrap their transformer call in
-`transformer.cache_context(...)` — Qwen-Image, Qwen-Image-Edit-Plus, Wan2, LTX2,
-FLUX.2-Klein — are cache-ready. Adapters that call the transformer bare (e.g. FLUX.1)
-need their forward wrapped in a `cache_context` first. Validate the reward distribution
-before/after enabling on a new model.
+`cache_context(...)`. Readiness is explicit: an adapter opts in with
+`supports_diffusers_cache = True` only when every transformer forward branch has a context.
+The cache accelerator checks this capability before enabling any component and fails fast
+for unsupported adapters.
+
+Cache-ready adapters are FLUX.2-Klein, Qwen-Image, Qwen-Image-Edit-Plus, Wan T2V/I2V, and
+LTX2 T2AV/I2AV. Qwen merged CFG uses a shared `cond_uncond` context; no-CFG uses `cond`.
+FLUX.1/Kontext, FLUX.2, SD3.5, Z-Image, Wan V2V, and Bagel are not cache-ready. Validate
+the reward distribution before and after enabling caching on a supported model.
 
 `torch_compile` is model-agnostic and applies to every adapter.
 

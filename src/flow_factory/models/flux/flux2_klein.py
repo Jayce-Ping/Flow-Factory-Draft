@@ -73,7 +73,9 @@ class Flux2KleinSample(I2ISample):
 
 CONDITION_IMAGE_SIZE = (1024, 1024)
 
-class Flux2KleinAdapter(BaseAdapter):    
+class Flux2KleinAdapter(BaseAdapter):
+    supports_diffusers_cache = True
+
     def __init__(self, config: Arguments, accelerator : Accelerator):
         super().__init__(config, accelerator)
         self.pipeline: Flux2KleinPipeline

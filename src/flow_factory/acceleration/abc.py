@@ -79,24 +79,6 @@ class BaseAccelerator(ABC):
     safety: ClassVar[Literal["lossless", "lossy"]]
     stage: ClassVar[Literal["rollout", "both"]]
 
-    # Whether this accelerator requires the Stage-3 rollout to run with autograd
-    # ENABLED (instead of the default ``torch.no_grad()``) so the transformer
-    # uses the same grad-mode compiled path in rollout and training. Only
-    # ``torch_compile`` needs this: Inductor compiles a separate, numerically
-    # non-identical graph for grad vs no-grad mode (Dynamo guards on grad_mode),
-    # so a no-grad rollout would diverge from the grad training forward and
-    # undermine coupled on-policy consistency. When set,
-    # ``CompileAccelerator`` wraps the compiled transformer to force grad (returning
-    # the grad-carrying output directly — an inner detach would let Inductor pick a
-    # divergent inference kernel), and the trainer flags the rollout via
-    # ``_rollout_grad_context`` so the latent feedback is detached in ``cast_latents``.
-    # Result: removes the dominant grad/no-grad divergence so the on-policy ratio is
-    # ~1 (well within ``clip_range``), but NOT strictly bit-exact — an intermittent
-    # ~1e-5 residual remains on a minority of samples (different Inductor kernel
-    # invocations + bf16 non-associativity). See
-    # ``CompileAccelerator._wrap_forward_grad_consistent`` for the full reason.
-    requires_grad_rollout: ClassVar[bool] = False
-
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
         # Skip intermediate ABCs that intentionally leave the markers unset.

@@ -131,6 +131,10 @@ class BaseAdapter(ABC):
     # itself, independent of this declaration.
     python_format_columns: ClassVar[frozenset[str]] = frozenset()
 
+    # Opt in only when every transformer forward branch runs inside a diffusers
+    # ``cache_context``. The rollout cache accelerator rejects the default.
+    supports_diffusers_cache: ClassVar[bool] = False
+
     # Resolution-invariant latent axis roles for the model-agnostic latent state
     # API (see `latent_geometry.py`). ``None`` means "infer from latent ndim" via
     # `resolve_latent_axes`, which covers every standard 3D/4D/5D layout. Adapters
@@ -154,10 +158,6 @@ class BaseAdapter(ABC):
         self.training_args = config.training_args
         self.eval_args = config.eval_args
         self._mode : str = 'train' # ['train', 'eval', 'rollout']
-        # Set by the trainer's `_rollout_grad_context` only when a compile accelerator
-        # forces a grad-enabled rollout: detaches per-step latent feedback in
-        # `cast_latents` to keep rollout memory bounded. Off otherwise.
-        self._rollout_detach: bool = False
         self._named_parameters : Dict[str, NamedParametersInfo] = {}
 
         # Load pipeline and scheduler (delegated to subclasses)
@@ -226,20 +226,7 @@ class BaseAdapter(ABC):
         return self._DTYPE_MAP.get(val) if val else None
 
     def cast_latents(self, latents: torch.Tensor, default_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
-        """Cast latents to storage dtype with float16 overflow protection.
-
-        During a compile-accelerated rollout the trainer sets ``self._rollout_detach``
-        (see ``BaseTrainer._rollout_grad_context``): the compiled transformer is forced
-        to run under ``torch.enable_grad()`` for graph-consistency with training, so the
-        per-step latent feedback would otherwise chain an autograd graph across the
-        whole denoising loop. Detaching here — the single feedback chokepoint every
-        adapter routes through — breaks that chain so rollout memory stays bounded while
-        each transformer call uses the same grad-mode compiled path. Distinct Inductor
-        invocations can still leave an intermittent ~1e-5 on-policy ratio residual within
-        ``clip_range``, so this path is not bit-exact.
-        """
-        if self._rollout_detach and latents.requires_grad:
-            latents = latents.detach()
+        """Cast latents to storage dtype with float16 overflow protection."""
         target = self.latent_storage_dtype or default_dtype
         if target is None or latents.dtype == target:
             return latents

@@ -81,8 +81,8 @@ class CompileAccelerator(BaseAccelerator):
     # Inductor compiles a separate graph for grad vs no-grad mode whose fused
     # kernels are NOT bit-identical. To keep rollout (Stage 3) and the training
     # forward (Stage 6) on the same grad-mode compiled path — preserving a
-    # numerically on-policy ratio within `clip_range` — rollout must run with grad enabled.
-    requires_grad_rollout = True
+    # numerically on-policy ratio within `clip_range` — the transformer call itself
+    # must run with grad enabled even though the surrounding rollout remains no_grad.
 
     def setup(self, adapter: "BaseAdapter") -> None:
         mode = self.params.get("mode", "auto")
@@ -128,9 +128,8 @@ class CompileAccelerator(BaseAccelerator):
             # torch.enable_grad() (overriding the @torch.no_grad() on
             # adapter.inference()). This keeps rollout (Stage 3) and the training
             # forward (Stage 6) on the same grad-mode compiled path — Inductor emits
-            # numerically different kernels for the grad vs no-grad graph. During
-            # rollout, `BaseAdapter.cast_latents` detaches the per-step latent feedback
-            # (gated by `adapter._rollout_detach`) so memory stays bounded.
+            # numerically different kernels for the grad vs no-grad graph. The outer
+            # rollout remains no_grad, and collectors detach direct model outputs.
             self._wrap_forward_grad_consistent(adapter, inner)
             if adapter.accelerator.is_main_process:
                 logger.info(
@@ -185,12 +184,11 @@ class CompileAccelerator(BaseAccelerator):
 
         Crucially the output is **NOT detached here**: detaching inside the wrapper
         lets Inductor see the result is unused-for-grad and pick a different
-        (inference-optimized) kernel, re-introducing the divergence. Instead the
-        rollout's per-step latent feedback is detached in
-        :meth:`BaseAdapter.cast_latents` (gated by ``adapter._rollout_detach``), which
-        breaks the autograd graph chain across denoising steps so rollout memory stays
-        bounded while every transformer call still uses the same grad-mode compiled
-        path (near-exact velocity → on-policy ratio ≈ 1 within ``clip_range``).
+        (inference-optimized) kernel, re-introducing the divergence. The surrounding
+        rollout stays under ``torch.no_grad()``, so scheduler and CFG operations do not
+        extend the graph; collectors detach any direct model output before storage.
+        Every transformer call still uses the same grad-mode compiled path (near-exact
+        velocity → on-policy ratio ≈ 1 within ``clip_range``).
 
         Known residual (NOT strictly bit-exact): forcing grad removes the *dominant*
         divergence (the grad-vs-no-grad graph split), but it does not make the rollout

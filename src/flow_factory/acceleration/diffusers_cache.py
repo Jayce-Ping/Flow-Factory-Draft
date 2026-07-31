@@ -98,19 +98,30 @@ class DiffusersCacheAccelerator(BaseAccelerator):
 
     @contextmanager
     def rollout_context(self, adapter: "BaseAdapter") -> Iterator[None]:
+        if not adapter.supports_diffusers_cache:
+            raise ValueError(
+                f"DiffusersCacheAccelerator: adapter {type(adapter).__name__} does not support "
+                "diffusers feature caching because not every transformer forward branch runs "
+                "inside `cache_context`. Remove the accelerator or add complete adapter support."
+            )
+
         transformer_names = adapter.transformer_names
         if not transformer_names:
             raise ValueError("DiffusersCacheAccelerator: adapter exposes no transformer to cache.")
 
+        transformers = []
+        for name in transformer_names:
+            transformer = adapter.get_component(name)
+            if not callable(getattr(transformer, "enable_cache", None)):
+                raise ValueError(
+                    f"DiffusersCacheAccelerator: component '{name}' is not a diffusers "
+                    "CacheMixin (no callable `enable_cache`); use a different accelerator."
+                )
+            transformers.append((name, transformer))
+
         enabled: List["torch.nn.Module"] = []
         try:
-            for name in transformer_names:
-                transformer = adapter.get_component(name)
-                if not hasattr(transformer, "enable_cache"):
-                    raise ValueError(
-                        f"DiffusersCacheAccelerator: component '{name}' is not a diffusers "
-                        "CacheMixin (no `enable_cache`); use a different accelerator."
-                    )
+            for name, transformer in transformers:
                 # Defensive: clear any stale cache left enabled by a prior epoch.
                 if getattr(transformer, "is_cache_enabled", False):
                     transformer.disable_cache()

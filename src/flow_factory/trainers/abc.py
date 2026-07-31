@@ -472,48 +472,18 @@ class BaseTrainer(ABC):
     def _rollout_grad_context(self) -> Iterator[None]:
         """Grad context for an ``adapter.inference()`` loop (Stage-3 rollout and eval).
 
-        Default: ``torch.no_grad()`` (inference needs no gradients — saves memory).
+        The outer inference, scheduler, and collector path always runs under
+        ``torch.no_grad()`` so rollout-old tensors never retain autograd graphs.
+        A shared accelerator that requires grad-mode consistency (currently only
+        ``torch_compile``) re-enables gradients locally inside the compiled
+        transformer wrapper. This preserves the training-equivalent compiled graph
+        without tracking CFG, scheduler, decoding, or collection operations.
 
-        Exception: if any active **shared** accelerator declares
-        ``requires_grad_rollout`` (only ``torch_compile`` does), rollout instead runs
-        with grad enabled AND sets ``adapter._rollout_detach``. Reason:
-        ``torch.compile`` (Inductor) emits a *separate, numerically non-identical*
-        graph for grad vs no-grad mode (Dynamo guards on ``grad_mode``), so a no-grad
-        rollout would diverge from the grad-mode training forward and break the
-        coupled on-policy consistency. The compiled transformer is wrapped
-        (see :class:`CompileAccelerator`) so its forward always executes under
-        ``torch.enable_grad()`` — overriding the ``@torch.no_grad()`` on
-        ``adapter.inference()``. The output is NOT detached inside that wrapper (an
-        inner detach lets Inductor pick a divergent inference kernel); instead the
-        per-step latent feedback is detached in ``BaseAdapter.cast_latents`` (gated by
-        this flag), so rollout and training use the same grad-mode compiled path and
-        remain numerically on-policy (ratio ≈ 1 within ``clip_range``, but not
-        bit-exact) while the autograd graph never chains across denoising steps.
-
-        Reused by the eval loop (:meth:`evaluate`). Eval does not compute the PPO
-        ratio, so graph consistency is irrelevant there — but the compiled
-        transformer's forward forces ``enable_grad`` *unconditionally*, so a bare
-        ``torch.no_grad()`` eval would still build an autograd graph that chains across
-        the whole denoising loop (memory grows with ``num_inference_steps`` → OOM).
-        Routing eval through this context enables the same per-step ``cast_latents``
-        detach, keeping eval memory bounded. With no grad-forcing accelerator active it
-        is exactly ``torch.no_grad()`` for both callers (no behavior change).
+        Tensor collectors detach values before storing them. The same boundary is
+        reused by evaluation to keep memory independent of the denoising-step count.
         """
-        needs_grad = any(acc.requires_grad_rollout for acc in self.shared_accelerators)
-        if not needs_grad:
-            with torch.no_grad():
-                yield
-            return
-        # Compile active: the compiled-transformer wrapper forces grad locally, while
-        # `BaseAdapter.cast_latents` detaches per-step latent feedback under this flag.
-        # Rollout and training use the same grad-mode compiled path without chaining
-        # autograd across denoising steps.
-        prev = self.adapter._rollout_detach
-        self.adapter._rollout_detach = True
-        try:
+        with torch.no_grad():
             yield
-        finally:
-            self.adapter._rollout_detach = prev
 
     def _synchronize_frozen_components(self):
         if self.accelerator.num_processes <= 1:
@@ -905,9 +875,8 @@ class BaseTrainer(ABC):
 
         # Stage-3-only acceleration (e.g. feature caching) is scoped to this loop
         # so its state never leaks into the Stage-6 training forward.
-        # Grad context is normally no_grad, but flips to enable_grad when a
-        # compile accelerator is active (see _rollout_grad_context) so rollout and
-        # training use the same grad-mode compiled path and remain numerically on-policy.
+        # The outer path stays no_grad; a compile accelerator re-enables gradients
+        # only inside the transformer call to match the training compiled graph.
         with self._rollout_acceleration(), self._rollout_grad_context(), self.autocast():
             for _ in tqdm(
                 range(self.training_args.num_batches_per_epoch),
@@ -971,12 +940,8 @@ class BaseTrainer(ABC):
 
         self.adapter.eval()
 
-        # Use the rollout grad context (not a bare `torch.no_grad()`): when a
-        # grad-forcing shared accelerator (torch.compile) is active the compiled
-        # transformer forces `enable_grad`, so a plain `no_grad` here would let the
-        # autograd graph chain across the whole denoising loop (memory grows with
-        # num_inference_steps -> OOM). This context enables the per-step latent detach
-        # to keep eval memory bounded; with no such accelerator it is `torch.no_grad()`.
+        # Use the rollout grad context so evaluation shares the same outer no_grad
+        # boundary as training rollout.
         with self._rollout_grad_context(), self.autocast(), self.adapter.use_ema_parameters():
             for dataset_name, dataloader in self.eval_dataloaders.items():
                 buffer = self.eval_dataset_reward_buffers.get(dataset_name)
