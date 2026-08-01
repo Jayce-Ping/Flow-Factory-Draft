@@ -63,6 +63,7 @@ See `.agents/knowledge/architecture.md` "Module Dependency Graph" for full detai
 | `guidance/algorithms.md` | All 9 algorithms (GRPO, GRPO-Guard, DPPO, DPO, DGPO, DiffusionNFT, AWM, CRD, DiffusionOPD) deep dive |
 | `guidance/rewards.md` | Reward system design, custom model creation |
 | `guidance/new_model.md` | Step-by-step model adapter integration |
+| `guidance/acceleration.md` | Acceleration plugin layer (compile, attention backend, feature caching) |
 
 ## Available Skills
 

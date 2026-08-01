@@ -120,17 +120,19 @@ class ModelArguments(ArgABC):
         }
     )
 
-    attn_backend: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "Attention backend for transformers. "
-                    "Options: 'native', 'flash', 'flash_hub', '_flash_3', '_flash_3_hub', 'sage', 'xformers'. "
-                    "None means use diffusers default."
-                    "See https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends for all details."
-        },
-    )
-
     def __post_init__(self):
+        if "attn_backend" in self.extra_kwargs:
+            raise ValueError(
+                "`model.attn_backend` has been removed. Attention-backend selection now lives in "
+                "the acceleration layer as a `shared` accelerator. Replace it with:\n"
+                "  acceleration:\n"
+                "    shared:\n"
+                "      - name: attention_backend\n"
+                f"        params: {{ backend: {self.extra_kwargs['attn_backend']!r} }}\n"
+                "See guidance/acceleration.md. (Bagel forces flash_attention_2 at load and ignores "
+                "this knob — just drop the line.)"
+            )
+
         if isinstance(self.trainable_parameters_dtype, str):
             self.trainable_parameters_dtype = dtype_map[self.trainable_parameters_dtype]
         if isinstance(self.frozen_parameters_dtype, str):

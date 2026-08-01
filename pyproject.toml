@@ -64,6 +64,9 @@ quantization = [
     "bitsandbytes>=0.45.3",
 ]
 
+# Rollout feature-caching (the `diffusers_cache` accelerator) is diffusers-native and
+# needs no extra dependency, so there is no `acceleration` optional-dependency group.
+
 # Bagel adapter runtime (flash-attn varlen kernels + opencv transforms)
 bagel = [
     "flash-attn>=2.5.8",

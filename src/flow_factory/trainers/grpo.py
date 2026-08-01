@@ -46,7 +46,11 @@ class GRPOTrainer(BaseTrainer):
     [1] Flow-GRPO: Training Flow Matching Models via Online RL
         - https://arxiv.org/abs/2505.05470
     """
-    
+
+    # Coupled paradigm: rollout log-probs feed the PPO ratio, so lossy rollout
+    # acceleration is disallowed (constraints.md #7). Inherited by GRPOGuard/DPPO.
+    paradigm = "coupled"
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.training_args : GRPOTrainingArguments

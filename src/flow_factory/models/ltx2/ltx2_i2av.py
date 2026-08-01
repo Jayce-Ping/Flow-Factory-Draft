@@ -153,6 +153,8 @@ class LTX2_I2AV_Adapter(BaseAdapter):
     Shared logic with LTX2_T2AV_Adapter is handled via code duplication.
     """
 
+    supports_diffusers_cache = True
+
     def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
         self.pipeline: LTX2ImageToVideoPipeline

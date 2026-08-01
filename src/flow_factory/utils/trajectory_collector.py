@@ -129,7 +129,7 @@ class TrajectoryCollector:
     def collect(self, value: torch.Tensor, step_idx: int) -> None:
         """Conditionally collect tensor at given step."""
         if self.should_collect(step_idx):
-            self._collected.append(value)
+            self._collected.append(value.detach())
             self._collected_indices.append(step_idx)
     
     def get_result(self) -> Optional[List[torch.Tensor]]:
@@ -276,6 +276,8 @@ class CallbackCollector:
             elif hasattr(output, key):
                 val = getattr(output, key)
             if val is not None:
+                if isinstance(val, torch.Tensor):
+                    val = val.detach()
                 self._data[key].append(val)
     
     def get_result(self) -> Dict[str, Any]:

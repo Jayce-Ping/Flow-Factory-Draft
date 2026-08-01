@@ -30,7 +30,15 @@ model:
   model_type: "flux1"
   resume_path: null # Local path or HF repo id (e.g. 'owner/repo[/subdir][@rev]') for previous checkpoint/lora adapter
   resume_type: null # Options: lora, full, state. Null to auto-detect based on `finetune_type`
-  # attn_backend: '_flash_3_hub' # Use flash attention 3 backend.
+# Optional acceleration plugins (off by default). Applied in list order.
+# See guidance/acceleration.md. Shared accelerators (attention_backend, torch_compile)
+# are available below; this adapter is not diffusers-cache-ready.
+# acceleration:
+#   shared:                          # persistent stage='both'; applied in list order
+#     - name: attention_backend      # set the attention backend first...
+#       params: { backend: _flash_3_hub }
+#     - name: torch_compile          # ...so the compiled graph captures it
+#       params: { mode: auto }   # auto (default: regional) | regional | full
 
 log:
   run_name: null  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})

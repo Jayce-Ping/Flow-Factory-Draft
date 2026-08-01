@@ -72,6 +72,10 @@ logger = setup_logger(__name__)
 class DiffusionOPDTrainer(BaseTrainer):
     """Multi-teacher on-policy distillation trainer (ODE + SDE)."""
 
+    # Distillation paradigm: no reward/advantage stage and rollout log-probs do not
+    # enter the loss, so lossy rollout acceleration is permitted (constraints.md #7).
+    paradigm = "distillation"
+
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.training_args: DiffusionOPDTrainingArguments

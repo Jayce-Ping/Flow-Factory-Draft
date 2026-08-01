@@ -68,6 +68,7 @@ class QwenImageAdapter(BaseAdapter):
     # Qwen-Image runs with guidance=None, so the transformer's guidance embedder
     # receives no gradient and DDP must scan for unused parameters.
     ddp_find_unused_parameters = True
+    supports_diffusers_cache = True
 
     def __init__(self, config: Arguments, accelerator : Accelerator):
         if not is_version_at_least("diffusers", "0.37.0"):
@@ -560,9 +561,9 @@ class QwenImageAdapter(BaseAdapter):
             # calls). Pad both text streams to a common length; the
             # encoder_hidden_states_mask masks the extra positions and diffusers
             # derives each sample's length from it, so valid outputs match two
-            # separate forwards. RL has no cross-step caching, so dropping the
-            # per-branch cache_context is a no-op. Tradeoff: ~2x peak activation
-            # memory vs two serial forwards (lower batch/resolution if it OOMs).
+            # separate forwards. The merged cond/uncond batch shares one
+            # cache_context. Tradeoff: ~2x peak activation memory vs two serial
+            # forwards (lower batch/resolution if it OOMs).
             seq_len = max(prompt_embeds.shape[1], negative_prompt_embeds.shape[1])
             prompt_embeds = _pad_seq_dim(prompt_embeds, seq_len, 0.0)
             prompt_embeds_mask = _pad_seq_dim(prompt_embeds_mask, seq_len, 0)
@@ -571,20 +572,21 @@ class QwenImageAdapter(BaseAdapter):
                 negative_prompt_embeds_mask, seq_len, 0
             )
 
-            both_pred = self.transformer(
-                hidden_states=torch.cat([latents, latents], dim=0),
-                timestep=torch.cat([timestep, timestep], dim=0) / 1000,
-                guidance=guidance,
-                encoder_hidden_states_mask=torch.cat(
-                    [prompt_embeds_mask, negative_prompt_embeds_mask], dim=0
-                ),
-                encoder_hidden_states=torch.cat(
-                    [prompt_embeds, negative_prompt_embeds], dim=0
-                ),
-                img_shapes=img_shapes * 2,
-                attention_kwargs=attention_kwargs,
-                return_dict=False,
-            )[0]
+            with self.pipeline.transformer.cache_context("cond_uncond"):
+                both_pred = self.transformer(
+                    hidden_states=torch.cat([latents, latents], dim=0),
+                    timestep=torch.cat([timestep, timestep], dim=0) / 1000,
+                    guidance=guidance,
+                    encoder_hidden_states_mask=torch.cat(
+                        [prompt_embeds_mask, negative_prompt_embeds_mask], dim=0
+                    ),
+                    encoder_hidden_states=torch.cat(
+                        [prompt_embeds, negative_prompt_embeds], dim=0
+                    ),
+                    img_shapes=img_shapes * 2,
+                    attention_kwargs=attention_kwargs,
+                    return_dict=False,
+                )[0]
             velocity, neg_velocity = both_pred.chunk(2, dim=0)
 
             comb_pred = neg_velocity + guidance_scale * (velocity - neg_velocity)

@@ -79,6 +79,7 @@ class Wan2_I2V_Adapter(BaseAdapter):
     # timestep (boundary_ratio), so under DDP the other's trainable params get no
     # gradient in a given step. Ignored under DeepSpeed/FSDP.
     ddp_find_unused_parameters = True
+    supports_diffusers_cache = True
 
     def __init__(self, config: Arguments, accelerator : Accelerator):
         super().__init__(config, accelerator)
@@ -427,6 +428,7 @@ class Wan2_I2V_Adapter(BaseAdapter):
         return latents, torch.concat([mask_lat_size, latent_condition], dim=1)
 
     # ======================== Inference ========================
+    @torch.no_grad()
     def inference(
         self,
         # Oridinary arguments

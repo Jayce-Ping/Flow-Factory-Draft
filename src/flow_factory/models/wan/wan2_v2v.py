@@ -281,6 +281,7 @@ class Wan2_V2V_Adapter(BaseAdapter):
     
 
     # ============================ Inference ============================
+    @torch.no_grad()
     def inference(
         self,
         # Ordinary inputs

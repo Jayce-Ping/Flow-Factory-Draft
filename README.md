@@ -15,12 +15,14 @@ git submodule update --init
 pip install -e ./diffusers
 ```
 
-* **[2026-02-01]** Support for multiple **Attention Backends**! You can now optimize memory and speed by setting the `attn_backend` parameter in your config:
+* **[2026-02-01]** Support for multiple **Attention Backends**! Attention-backend selection now lives in the unified `acceleration:` block (the old `model.attn_backend` knob was removed), where it can be combined with `torch.compile` and feature caching — applied in list order:
 ```yaml
-  model:
-      attn_backend: "flash" # Options: "native", "xformers", "flash_hub", "_flash_3_hub", "_flash_3_varlen_hub"
+  acceleration:
+    shared:
+      - name: attention_backend
+        params: { backend: "flash" } # Options: "native", "xformers", "flash_hub", "_flash_3_hub", "_flash_3_varlen_hub"
 ```
-This experimental feature leverages `diffusers`'s `transformer.set_attention_backend`. Check the [official diffusers documentation](https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends#available-backends) for all available options.
+This experimental feature leverages `diffusers`'s `transformer.set_attention_backend`. Check the [official diffusers documentation](https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends#available-backends) for all available options. See [`guidance/acceleration.md`](guidance/acceleration.md) for the full acceleration layer.
 > We recommend installing the `kernels` package (`pip install kernels`) and using `flash_hub`, `flash_varlen_hub`, `_flash_3_hub`, or `_flash_3_varlen_hub` to avoid the complexity and potential incompatibility of installing Flash-Attention directly.
 
 # 📕 Table of Contents

@@ -140,6 +140,8 @@ class LTX2_T2AV_Adapter(BaseAdapter):
     receives stochastic SDE treatment for policy gradient training.
     """
 
+    supports_diffusers_cache = True
+
     def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
         self.pipeline: LTX2Pipeline

@@ -145,6 +145,9 @@ class CRDTrainer(BaseTrainer):
     Reference: https://arxiv.org/abs/2603.14128
     """
 
+    # Decoupled paradigm: lossy rollout acceleration is permitted (constraints.md #7).
+    paradigm = "decoupled"
+
     _OLD_PARAMS_NAME = '_crd_old'
     _SAMPLING_PARAMS_NAME = '_crd_sampling'
 

@@ -16,7 +16,8 @@
 import json
 import os
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, Tuple, List, Union, Literal, Iterator
+from contextlib import ExitStack, contextmanager
+from typing import Dict, Any, ClassVar, Optional, Tuple, List, Union, Literal, Iterator
 from functools import partial
 import numpy as np
 import torch
@@ -40,6 +41,7 @@ from ..data_utils.loader import (
 )
 from ..rewards import load_reward_model, BaseRewardModel, MultiRewardLoader, RewardProcessor, RewardBuffer
 from ..advantage import AdvantageProcessor
+from ..acceleration import BaseAccelerator, build_accelerator, validate_accelerator
 from ..logger import load_logger, LogFormatter
 from ..samples import BaseSample, StackedSampleBatch
 from ..utils.logger_utils import setup_logger
@@ -61,6 +63,13 @@ class BaseTrainer(ABC):
     """
     Abstract Base Class for Flow-Factory trainers.
     """
+
+    # RL paradigm of this algorithm (``constraints.md`` #7). Read by the
+    # acceleration validator to gate lossy rollout accelerators: only
+    # 'decoupled' / 'distillation' trainers may use them. Concrete trainers
+    # MUST override this; leaving it None disables lossy acceleration.
+    paradigm: ClassVar[Optional[Literal["coupled", "decoupled", "distillation"]]] = None
+
     def __init__(
             self,
             accelerator: Accelerator,
@@ -84,6 +93,10 @@ class BaseTrainer(ABC):
 
         self._initialization()
         self.adapter.post_init()
+        # Apply persistent stage='both' accelerators last: after prepare, state-resume,
+        # EMA, and reference-parameter setup, so e.g. torch.compile wraps the final
+        # weights and keeps state_dict keys / parameter identity stable.
+        self._apply_shared_acceleration()
         self._init_logging_backend()
 
         self._patch_deepspeed_autocast(accelerator)
@@ -369,8 +382,91 @@ class BaseTrainer(ABC):
         # Load inference modules, excluding all bundle members (already prepared).
         self._load_inference_components(bundle_names)
 
+        # Build + validate acceleration plugins. Persistent stage='both' accelerators
+        # are *applied* later via _apply_shared_acceleration(), after post_init()
+        # finishes any state-resume / EMA / reference setup.
+        self._init_acceleration()
+
         # Initialize reward model
         self._init_reward_model()
+
+    def _init_acceleration(self):
+        """Build and validate acceleration plugins from ``config.acceleration_args``.
+
+        Two independent slots, each an **ordered list** (both empty by default).
+        List order is the application order:
+
+        * ``shared`` — persistent ``stage='both'`` accelerators (e.g.
+          ``attention_backend`` then ``torch_compile``) applied to both rollout and
+          the training forward. Only built/validated here; they are *applied* later by
+          :meth:`_apply_shared_acceleration` (after ``post_init`` finishes
+          state-resume / EMA / reference setup), so they transform the final weights.
+        * ``rollout`` — accelerators applied per-epoch in :meth:`generate_samples`
+          via :meth:`~BaseAccelerator.rollout_context`; may be lossy.
+
+        Each accelerator is validated against this trainer's ``paradigm`` before
+        use (fail-fast, ``constraints.md`` #26).
+        """
+        accel_args = self.config.acceleration_args
+        self.shared_accelerators: List[BaseAccelerator] = []
+        self.rollout_accelerators: List[BaseAccelerator] = []
+
+        trainer_name = type(self).__name__
+        paradigm = type(self).paradigm
+
+        for spec in accel_args.shared:
+            accelerator = build_accelerator(spec.name, spec.params)
+            validate_accelerator(
+                accelerator, slot="shared", paradigm=paradigm, trainer_name=trainer_name
+            )
+            self.shared_accelerators.append(accelerator)
+
+        for spec in accel_args.rollout:
+            accelerator = build_accelerator(spec.name, spec.params)
+            validate_accelerator(
+                accelerator, slot="rollout", paradigm=paradigm, trainer_name=trainer_name
+            )
+            self.rollout_accelerators.append(accelerator)
+            if self.accelerator.is_main_process:
+                logger.info(
+                    "Acceleration: rollout accelerator '%s' (safety=%s) enabled.",
+                    spec.name,
+                    accelerator.safety,
+                )
+
+    def _apply_shared_acceleration(self) -> None:
+        """Apply persistent ``stage='both'`` accelerators in config order.
+
+        Called from ``__init__`` AFTER ``adapter.post_init()`` so transforms wrap the
+        final weights — i.e. after ``accelerator.prepare``, any ``state`` checkpoint
+        resume, and EMA / reference-parameter snapshotting.
+
+        Each entry's ``setup`` runs in list order, so a config that lists
+        ``attention_backend`` before ``torch_compile`` sets the backend first and
+        then compiles the graph capturing it. In-place compilation
+        (``nn.Module.compile`` / ``compile_repeated_blocks``) preserves parameter
+        identity and ``state_dict`` keys, so checkpointing and the ``copy_``-based
+        EMA / ref / named-parameter swaps stay correct.
+        """
+        for accelerator in self.shared_accelerators:
+            accelerator.setup(self.adapter)
+            if self.accelerator.is_main_process:
+                logger.info(
+                    "Acceleration: shared accelerator '%s' (safety=%s) applied to adapter.",
+                    type(accelerator).__name__,
+                    accelerator.safety,
+                )
+
+    @contextmanager
+    def _rollout_acceleration(self) -> Iterator[None]:
+        """Nest every rollout accelerator's context (first in list = outermost).
+
+        A no-op when no rollout accelerator is configured.
+        """
+        with ExitStack() as stack:
+            for accelerator in self.rollout_accelerators:
+                stack.enter_context(accelerator.rollout_context(self.adapter))
+            yield
 
     def _synchronize_frozen_components(self):
         if self.accelerator.num_processes <= 1:
@@ -760,7 +856,11 @@ class BaseTrainer(ABC):
         samples: List[BaseSample] = []
         data_iter = iter(self.dataloader)
 
-        with torch.no_grad(), self.autocast():
+        # Stage-3-only acceleration (e.g. feature caching) is scoped to this loop
+        # so its state never leaks into the Stage-6 training forward.
+        # The outer path stays no_grad; a compile accelerator re-enables gradients
+        # only inside the transformer call to match the training compiled graph.
+        with self._rollout_acceleration(), torch.no_grad(), self.autocast():
             for _ in tqdm(
                 range(self.training_args.num_batches_per_epoch),
                 desc=f'Epoch {self.epoch} Sampling',
