@@ -101,10 +101,11 @@ class TeacherConfig(ArgABC):
 class DiffusionOPDTrainingArguments(TrainingArguments):
     r"""Training arguments for the DiffusionOPD distillation trainer.
 
-    Supports both ODE and SDE dynamics: the per-step loss is
-    ``kl_div_j = 0.5 * ||mu_S - mu_T||^2 / denom`` where ``denom`` is the
-    scheduler's transition variance (``1`` for ODE), so no extra config is
-    needed to switch dynamics — only ``scheduler.dynamics_type``.
+    Selects the distillation space with ``loss_target`` and independently
+    enables detached error self-normalization with ``self_normalize``.
+    ``xt`` matches transition means and supports ODE or SDE dynamics; ``v``
+    and ``x0`` are ODE-only velocity-derived targets. Under SDE, the ``xt``
+    loss remains divided by the scheduler's transition variance.
     """
 
     teachers: List[TeacherConfig] = field(
@@ -129,9 +130,40 @@ class DiffusionOPDTrainingArguments(TrainingArguments):
             )
         },
     )
+    loss_target: Literal["xt", "v", "x0"] = field(
+        default="xt",
+        metadata={
+            "help": (
+                "Distillation target space: 'xt' matches the one-step transition mean; "
+                "'v' matches velocity; 'x0' matches the predicted clean latent. "
+                "The 'v' and 'x0' targets require ODE dynamics."
+            )
+        },
+    )
+    self_normalize: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Divide each sample's target-space MSE by its detached mean absolute "
+                "student-teacher error plus 1e-8."
+            )
+        },
+    )
 
     def __post_init__(self):
         super().__post_init__()
+
+        valid_loss_targets = ("xt", "v", "x0")
+        if self.loss_target not in valid_loss_targets:
+            raise ValueError(
+                "train.loss_target must be one of "
+                f"{valid_loss_targets}, got {self.loss_target!r}."
+            )
+        if not isinstance(self.self_normalize, bool):
+            raise TypeError(
+                "train.self_normalize must be a bool, "
+                f"got {type(self.self_normalize).__name__}: {self.self_normalize!r}."
+            )
 
         # Standardize to (frac_lo, frac_hi); a float f -> (0.0, f). Mirrors NFT's
         # `timestep_range` convention so the trainer can derive distillation-step

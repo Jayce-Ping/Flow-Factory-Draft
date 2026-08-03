@@ -33,10 +33,11 @@
 
 Flow-Factory provides unified implementations of state-of-the-art RL algorithms for flow-matching models. All algorithms share the same model adapter and reward interfaces, enabling direct comparison under controlled conditions.
 
-At a high level, the supported algorithms fall into two paradigms:
+At a high level, the supported algorithms fall into three paradigms:
 
 - **Coupled paradigm (GRPO and variants)**: Training timesteps are coupled with the SDE-based sampling dynamics, requiring tractable log-probability computation for policy gradient optimization.
-- **Decoupled paradigm (DPO, DiffusionNFT, AWM, DGPO, CRD, DiffusionOPD)**: Training timesteps are decoupled from the actual sampling dynamics, making them inherently solver-agnostic — any ODE solver can be used for trajectory generation without modifying the training procedure.
+- **Decoupled paradigm (DPO, DiffusionNFT, AWM, DGPO, CRD)**: Training timesteps are decoupled from the actual sampling dynamics, making them inherently solver-agnostic.
+- **Distillation paradigm (DiffusionOPD)**: The student rolls out on-policy trajectories, then matches routed teacher targets without a reward or advantage stage.
 
 ## GRPO
 
@@ -508,33 +509,51 @@ train:
 
 ## DiffusionOPD: On-Policy Distillation
 
-This algorithm is introduced in [[14]](#ref14). **DiffusionOPD** is a *decoupled-paradigm* multi-task distillation method: instead of jointly optimizing several rewards from scratch, it first trains one task-specialized **teacher** per task (e.g. GenEval, OCR, aesthetics) and then distills their capabilities into a single unified **student** along the student's own rollout trajectories. This reduces reward conflict and catastrophic forgetting relative to multi-reward RL.
+This algorithm is introduced in [[14]](#ref14). **DiffusionOPD** is a multi-task distillation method: instead of jointly optimizing several rewards from scratch, it first trains one task-specialized **teacher** per task (e.g. GenEval, OCR, aesthetics) and then distills their capabilities into a single unified **student** along the student's own rollout trajectories. This reduces reward conflict and catastrophic forgetting relative to multi-reward RL.
 
-Unlike the policy-gradient algorithms above, the loss is a closed-form **per-step KL on the denoising transition** — a pathwise mean-matching objective that covers both stochastic SDE samplers and deterministic ODE samplers:
+Unlike the policy-gradient algorithms above, DiffusionOPD directly matches teacher and student predictions at each student-visited state. For ODE dynamics, let `x_t` be the shared current state, `v` the predicted velocity, `dt` the scheduler step, and `sigma = flow_match_sigma(t)`. The configured target `y` is:
 
 ```
-kl_div_j = 0.5 * || mu_S - mu_T ||^2 / denom
+loss_target = "xt": y = mu = x_t + v * dt
+loss_target = "v":  y = v
+loss_target = "x0": y = x_t - sigma * v
 ```
 
-where `mu_S` / `mu_T` are the student / teacher transition means at the student-visited state `x_j`, and `denom` is the scheduler's transition variance for the active dynamics (centralized in `scheduler.get_kl_divergence_denominator`):
+Here `xt` means the **one-step transition mean** `mu`, not the shared current input `x_t`. Because teacher and student receive the same `x_t`, the ODE target differences obey:
 
-| `dynamics_type` | `denom` | resulting `kl_div_j` |
+```
+MSE(xt) = dt^2 * MSE(v)
+MSE(x0) = sigma^2 * MSE(v)
+```
+
+For target error `d = y_S - y_T`, the per-sample spatial loss is:
+
+```
+self_normalize = false: mean(d^2)
+self_normalize = true:  mean(d^2) / (stop_gradient(mean(abs(d))) + 1e-8)
+```
+
+`loss_target` and `self_normalize` are independent, producing six combinations: `xt`, `xt_norm`, `v`, `v_norm`, `x0`, and `x0_norm`. The detached denominator follows DiffusionNFT-style self-normalization: it rescales each realized student-teacher gap without allowing gradients through the scale.
+
+The dynamics support matrix is:
+
+| `loss_target` | ODE | SDE | Additional denominator |
 |---|---|---|
-| `ODE` | `1.0` | pure mean matching: `0.5 * ||μ_S − μ_T||²` |
-| `Flow-SDE`, `Dance-SDE` | `std_dev_t² · (-dt)` | Gaussian transition KL: `||μ_S − μ_T||² / (2 σ̄²)` |
-| `CPS` | `std_dev_t²` | `||μ_S − μ_T||² / (2 std_dev_t²)` |
+| `xt` | Yes | Yes | SDE transition variance from `scheduler.get_kl_divergence_denominator()` |
+| `v` | Yes | No | None |
+| `x0` | Yes | No | None |
 
-There is no loss-scaling coefficient (DiffusionOPD has no REINFORCE term). Rewards are used **only** for periodic eval monitoring (`evaluate()`), never in the distillation loss.
+`v` and `x0` fail fast under non-ODE dynamics because the target conversion assumes the ODE relation `mu = x_t + v * dt`. The `xt` target remains valid for Flow-SDE, Dance-SDE, and CPS; after optional self-normalization it is divided by the scheduler transition variance. No target uses the historical `0.5` multiplier. Rewards are used **only** for periodic eval monitoring (`evaluate()`), never in the distillation loss.
 
 ### How it works (2-pass per epoch)
 
 Built directly on the multi-dataset infrastructure (`data.datasets`, per-source `source`/`source_id`, `train_dataloaders_by_source`), so each teacher is routed to one or more training datasets:
 
 1. **`sample()`** — the student rolls out on-policy trajectories over the multi-source dataloader (each sample tagged with its `source`), reusing the standard sampling pipeline.
-2. **`optimize()` PASS 1** (`no_grad`) — for each teacher (exactly **one** weight swap, via the named-parameter snapshot), forward over its routed samples' stored states `x_j` and cache the teacher means `mu_T` on each sample.
-3. **`optimize()` PASS 2** (student params only) — a standard gradient loop forwards the student at the same `x_j`, matching each sample's `mu_S` to its own cached `mu_T` (a micro-batch may mix teachers; the batch-mean is an implicit per-teacher KL averaged over the batch).
+2. **`optimize()` PASS 1** (`no_grad`) — for each teacher (exactly **one** weight swap, via the named-parameter snapshot), forward over its routed samples' stored states `x_j`, project into the configured target space, and cache the detached teacher target on each sample.
+3. **`optimize()` PASS 2** (student params only) — a standard gradient loop forwards the student at the same `x_j`, applies the same projection, and matches each sample to its own cached teacher target. A micro-batch may mix teachers.
 
-Teacher swaps are thus **M-per-epoch** (one per teacher), the gradient loop runs with student params only (no autocast-cache toggling, no DDP bypass), and the loss is a clean student-vs-cached-target MSE.
+Teacher swaps are thus **M-per-epoch** (one per teacher), the gradient loop runs with student params only (no autocast-cache toggling, no DDP bypass), and metrics are logged as `train/distill_loss` and `train/distill_loss_<teacher_name>`.
 
 Which denoising steps are distilled is set by `train.timestep_range` (default `0.99`), the same fraction idiom NFT uses: a float `f` selects the band `[0, f]` of the trajectory's step indices (the first `f`-fraction of denoising steps, skipping the near-clean tail), and a tuple is an explicit `[lo, hi]` band. This reproduces upstream DiffusionOPD's `timestep_fraction` and is **dynamics-agnostic** — it selects by trajectory step index rather than the SDE-only stochastic-step set, so it works identically under ODE and SDE.
 
@@ -560,6 +579,8 @@ train:
   teacher_param_device: 'cuda'  # teacher snapshot device: 'cuda' (fast swaps) / 'cpu' (low VRAM)
   guidance_scale: 1.0           # student CFG for rollout + forward
   timestep_range: 0.99          # distill the first 99% of denoising steps (upstream timestep_fraction)
+  loss_target: "xt"             # Options: xt, v, x0 (v/x0 require ODE)
+  self_normalize: false         # Independent detached error normalization
 
 scheduler:
   dynamics_type: "ODE"  # mean matching; switch to Flow-SDE + noise_level>0 for SDE distillation

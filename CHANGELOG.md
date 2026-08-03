@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased — `feature/opd-loss-targets`
+
+- Added `train.loss_target` with `xt`, `v`, and `x0` target spaces for
+  DiffusionOPD. The `v` and `x0` targets are restricted to ODE dynamics;
+  `xt` continues to support ODE and SDE.
+- Added independent `train.self_normalize`. When enabled, each sample's
+  target-space MSE is divided by its detached mean absolute student-teacher
+  error plus `1e-8`, enabling `xt_norm`, `v_norm`, and `x0_norm`.
+- Generalized the teacher cache from transition means to projected teacher
+  targets. No adapter, scheduler-output, or base-trainer interface changed.
+
+### Breaking changes
+
+- Removed the historical `0.5` multiplier from the DiffusionOPD objective.
+  Existing YAML remains valid and defaults to `loss_target: xt` with
+  `self_normalize: false`, but its loss and gradients are now 2x their
+  previous values.
+- Renamed DiffusionOPD training metrics from `train/kl_div` and
+  `train/kl_div_<teacher_name>` to `train/distill_loss` and
+  `train/distill_loss_<teacher_name>`, because the configurable targets and
+  objective scale are not generally a Gaussian KL.
+
+---
+
 ## Unreleased — `feat/diffusion-opd` (merge to `main`)
 
 **Full range:** `652f7315..e4496c6` (2026-05-26 … 2026-06-02)
