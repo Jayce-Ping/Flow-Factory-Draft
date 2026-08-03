@@ -60,119 +60,18 @@ tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 from ...hparams import DiffusionOPDTrainingArguments
 from ...hparams.training_args.opd import resolve_distill_step_band
 from ...samples import BaseSample
-from ...utils.base import filter_kwargs, to_broadcast_tensor
+from ...utils.base import filter_kwargs
 from ...utils.logger_utils import setup_logger
-from ...utils.noise_schedule import flow_match_sigma
 from ...utils.trajectory_collector import compute_trajectory_indices
 from ..abc import BaseTrainer
-from .common import load_teachers
+from .common import (
+    compute_per_sample_distillation_loss,
+    load_teachers,
+    project_distillation_target,
+    validate_loss_target_for_dynamics,
+)
 
 logger = setup_logger(__name__)
-
-
-def _validate_loss_target_for_dynamics(loss_target: str, dynamics_type: str) -> None:
-    """Validate that the configured target is defined for the scheduler dynamics."""
-    if loss_target in ("v", "x0") and dynamics_type != "ODE":
-        raise ValueError(
-            "DiffusionOPD velocity-derived targets require ODE dynamics: "
-            f"received loss_target={loss_target!r} with dynamics_type={dynamics_type!r}. "
-            "Use scheduler.dynamics_type='ODE' or set train.loss_target='xt'."
-        )
-
-
-def _project_distillation_target(
-    *,
-    loss_target: str,
-    latents: torch.Tensor,
-    timestep: torch.Tensor,
-    next_latents_mean: Optional[torch.Tensor],
-    velocity: Optional[torch.Tensor],
-) -> torch.Tensor:
-    """Project a scheduler step output into the configured distillation space."""
-    if not isinstance(latents, torch.Tensor):
-        raise TypeError(
-            "Expected `latents` to be a torch.Tensor when projecting a DiffusionOPD "
-            f"target, got {type(latents).__name__}: {latents!r}."
-        )
-    if not isinstance(timestep, torch.Tensor):
-        raise TypeError(
-            "Expected `timestep` to be a torch.Tensor when projecting a DiffusionOPD "
-            f"target, got {type(timestep).__name__}: {timestep!r}."
-        )
-
-    if loss_target == "xt":
-        if not isinstance(next_latents_mean, torch.Tensor):
-            raise ValueError(
-                "Expected `next_latents_mean` to be a torch.Tensor for "
-                f"loss_target='xt', got {type(next_latents_mean).__name__}."
-            )
-        target = next_latents_mean
-        target_name = "next_latents_mean"
-    elif loss_target in ("v", "x0"):
-        if not isinstance(velocity, torch.Tensor):
-            raise ValueError(
-                "Expected `velocity` to be a torch.Tensor for "
-                f"loss_target={loss_target!r}, got {type(velocity).__name__}."
-            )
-        target = velocity
-        target_name = "velocity"
-    else:
-        raise ValueError(
-            "DiffusionOPD loss_target must be one of ('xt', 'v', 'x0'), " f"got {loss_target!r}."
-        )
-
-    if target.shape != latents.shape:
-        raise ValueError(
-            "DiffusionOPD target projection requires `latents` and "
-            f"`{target_name}` to have the same shape, got "
-            f"latents={tuple(latents.shape)} and {target_name}={tuple(target.shape)}."
-        )
-    if loss_target != "x0":
-        return target
-
-    latents_float = latents.float()
-    sigma = to_broadcast_tensor(flow_match_sigma(timestep.float()), latents_float)
-    return latents_float - sigma * target.float()
-
-
-def _compute_per_sample_distillation_loss(
-    student_target: torch.Tensor,
-    teacher_target: torch.Tensor,
-    *,
-    self_normalize: bool,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """Compute target-space MSE with optional detached self-normalization."""
-    if not isinstance(student_target, torch.Tensor) or not isinstance(teacher_target, torch.Tensor):
-        raise TypeError(
-            "Expected `student_target` and `teacher_target` to be torch.Tensor values, "
-            f"got {type(student_target).__name__} and {type(teacher_target).__name__}."
-        )
-    if student_target.shape != teacher_target.shape:
-        raise ValueError(
-            "DiffusionOPD loss requires matching shapes for `student_target` and "
-            f"`teacher_target`, got {tuple(student_target.shape)} and "
-            f"{tuple(teacher_target.shape)}."
-        )
-    if student_target.ndim < 2:
-        raise ValueError(
-            "DiffusionOPD loss requires target tensors with a batch dimension and at "
-            f"least one feature dimension, got shape {tuple(student_target.shape)}."
-        )
-    if not isinstance(self_normalize, bool):
-        raise TypeError(
-            "Expected `self_normalize` to be a bool, "
-            f"got {type(self_normalize).__name__}: {self_normalize!r}."
-        )
-    if eps <= 0:
-        raise ValueError(f"Expected `eps` to be positive, got {eps!r}.")
-
-    error = student_target.float() - teacher_target.float()
-    per_sample_mse = error.square().flatten(1).mean(dim=1)
-    if not self_normalize:
-        return per_sample_mse
-    scale = error.abs().flatten(1).mean(dim=1).detach()
-    return per_sample_mse / (scale + eps)
 
 
 class DiffusionOPDTrainer(BaseTrainer):
@@ -188,7 +87,7 @@ class DiffusionOPDTrainer(BaseTrainer):
 
         scheduler = self.adapter.scheduler
         self._is_sde = scheduler.dynamics_type != "ODE"
-        _validate_loss_target_for_dynamics(
+        validate_loss_target_for_dynamics(
             self.training_args.loss_target,
             scheduler.dynamics_type,
         )
@@ -445,7 +344,7 @@ class DiffusionOPDTrainer(BaseTrainer):
                             )
                             # Each sample is matched to its own routed teacher target.
                             teacher_target = teacher_target_all[:, idx]
-                            per_sample_distill_loss = _compute_per_sample_distillation_loss(
+                            per_sample_distill_loss = compute_per_sample_distillation_loss(
                                 student_target,
                                 teacher_target,
                                 self_normalize=self.training_args.self_normalize,
@@ -619,7 +518,7 @@ class DiffusionOPDTrainer(BaseTrainer):
         forward_inputs["return_kwargs"] = return_kwargs
         output = self.adapter.forward(**forward_inputs)
 
-        target = _project_distillation_target(
+        target = project_distillation_target(
             loss_target=self.training_args.loss_target,
             latents=latents,
             timestep=t,
