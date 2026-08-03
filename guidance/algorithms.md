@@ -538,7 +538,7 @@ self_normalize = true:  mean(d^2) / (stop_gradient(mean(abs(d))) + 1e-8)
 The dynamics support matrix is:
 
 | `loss_target` | ODE | SDE | Additional denominator |
-|---|---|---|
+|---|---|---|---|
 | `xt` | Yes | Yes | SDE transition variance from `scheduler.get_kl_divergence_denominator()` |
 | `v` | Yes | No | None |
 | `x0` | Yes | No | None |

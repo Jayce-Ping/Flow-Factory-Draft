@@ -152,7 +152,7 @@ train:
   ema_device: "cuda"  # Device to store EMA model. Options: cpu, cuda
 
   enable_gradient_checkpointing: false  # Trade compute for memory savings
-  offload_samples_to_cpu: false  # Offload rollout samples (+ cached teacher means) to CPU
+  offload_samples_to_cpu: false  # Offload rollout samples (+ cached teacher targets) to CPU
   seed: 42  # Random seed for reproducibility
 
 # Scheduler Configuration
