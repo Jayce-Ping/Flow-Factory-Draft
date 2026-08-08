@@ -1,10 +1,13 @@
 # DiffusionOPD: multi-teacher on-policy distillation (GenEval + PickScore + OCR).
 #
 # One LoRA teacher per dataset is distilled into a single student LoRA along the
-# student's own rollout trajectories via a per-step mean-matching KL:
-#     kl_div_j = 0.5 * || mu_S - mu_T ||^2 / denom
-# where `denom` is the scheduler transition variance (1.0 for ODE). Rewards are
-# used ONLY for periodic eval monitoring, never in the distillation loss.
+# student's own rollout trajectories via a configurable per-step target loss.
+# The default matches transition means:
+#     distill_loss_j = || mu_S - mu_T ||^2 / denom
+# where `denom` is the scheduler transition variance (1.0 for ODE). Set
+# `loss_target` to `v` or `x0` for ODE-only alternatives, and independently
+# enable detached error normalization with `self_normalize`. Rewards are used
+# ONLY for periodic eval monitoring, never in the distillation loss.
 #
 # Teacher checkpoints below use the original `~/checkpoints/...` paths
 # (placeholders to be uploaded); each must share the student's LoRA
@@ -12,8 +15,8 @@
 # into the student's active adapter slot.
 #
 # To distill under SDE instead of ODE, set `scheduler.dynamics_type` to an SDE
-# variant (e.g. Flow-SDE) and `scheduler.noise_level > 0`; the loss picks up the
-# transition-variance denominator automatically (no other change needed).
+# variant (e.g. Flow-SDE) and `scheduler.noise_level > 0` while keeping
+# `loss_target: xt`; the loss picks up the transition-variance denominator.
 
 # Environment Configuration
 launcher: "accelerate"  # Options: accelerate
@@ -127,6 +130,8 @@ train:
   num_inference_steps: 10  # Number of denoising timesteps in the on-policy rollout
   guidance_scale: 1.0  # Student CFG for rollout + forward (1.0 = no guidance)
   timestep_range: 0.99  # Distill the first 99% of denoising steps (upstream timestep_fraction); float f -> band [0, f]
+  loss_target: "xt"  # Options: xt, v, x0. Velocity-derived v/x0 targets require ODE dynamics.
+  self_normalize: false  # Options: true, false. Normalize by detached per-sample mean absolute error.
 
   per_device_batch_size: 3  # Batch size per GPU device
   group_size: 1  # Rollouts generated per prompt (under SDE these differ; under ODE they are identical)
@@ -147,7 +152,7 @@ train:
   ema_device: "cuda"  # Device to store EMA model. Options: cpu, cuda
 
   enable_gradient_checkpointing: false  # Trade compute for memory savings
-  offload_samples_to_cpu: false  # Offload rollout samples (+ cached teacher means) to CPU
+  offload_samples_to_cpu: false  # Offload rollout samples (+ cached teacher targets) to CPU
   seed: 42  # Random seed for reproducibility
 
 # Scheduler Configuration

@@ -13,13 +13,12 @@
 # limitations under the License.
 
 # src/flow_factory/trainers/opd/common.py
-"""Teacher-loading helper for the DiffusionOPD trainer.
+"""Shared target-space math and teacher loading for DiffusionOPD.
 
-The trainer's 2-pass design (teacher targets pre-computed in a no_grad pass,
-then a student-only gradient loop) removes the reference implementation's hot
-swap machinery, so this module needs exactly one helper: :func:`load_teachers`,
-which loads each teacher LoRA checkpoint into a named-parameter snapshot using
-the adapter primitives already in :mod:`flow_factory.models.abc`.
+Target projection is shared by the teacher and student passes; the per-sample
+loss consumes their projected outputs. Teacher loading stores each teacher LoRA
+checkpoint in a named-parameter snapshot using the adapter primitives in
+:mod:`flow_factory.models.abc`.
 """
 
 from __future__ import annotations
@@ -29,12 +28,170 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from ...utils.base import to_broadcast_tensor
 from ...utils.logger_utils import setup_logger
+from ...utils.noise_schedule import flow_match_sigma
 
 if TYPE_CHECKING:
     from ...models.abc import BaseAdapter
 
 logger = setup_logger(__name__, rank_zero_only=True)
+
+
+def validate_loss_target_for_dynamics(loss_target: str, dynamics_type: str) -> None:
+    """Validate that the target is defined for the scheduler dynamics.
+
+    Args:
+        loss_target: Configured target space (``xt``, ``v``, or ``x0``).
+        dynamics_type: Active scheduler dynamics.
+
+    Raises:
+        ValueError: ``v`` or ``x0`` is requested for non-ODE dynamics.
+    """
+    if loss_target in ("v", "x0") and dynamics_type != "ODE":
+        raise ValueError(
+            "DiffusionOPD velocity-derived targets require ODE dynamics: "
+            f"received loss_target={loss_target!r} with dynamics_type={dynamics_type!r}. "
+            "Use scheduler.dynamics_type='ODE' or set train.loss_target='xt'."
+        )
+
+
+def _require_matching_target(
+    value: Optional[torch.Tensor],
+    *,
+    name: str,
+    loss_target: str,
+    latents: torch.Tensor,
+) -> torch.Tensor:
+    """Validate and return one model output used as a target."""
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(
+            f"Expected `{name}` to be a torch.Tensor for loss_target={loss_target!r}, "
+            f"got {type(value).__name__}: {value!r}."
+        )
+    if value.shape != latents.shape:
+        raise ValueError(
+            "DiffusionOPD target projection requires the same shape for `latents` "
+            f"and `{name}`, got latents={tuple(latents.shape)} and "
+            f"{name}={tuple(value.shape)}."
+        )
+    return value
+
+
+def project_distillation_target(
+    *,
+    loss_target: str,
+    latents: torch.Tensor,
+    timestep: torch.Tensor,
+    next_latents_mean: Optional[torch.Tensor],
+    velocity: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Project a scheduler step output into the configured target space.
+
+    Args:
+        loss_target: Target space (``xt``, ``v``, or ``x0``).
+        latents: Current noisy latent state.
+        timestep: Current scheduler-scale timestep.
+        next_latents_mean: Predicted one-step transition mean.
+        velocity: Predicted flow velocity.
+
+    Returns:
+        The prediction represented in the configured target space.
+
+    Raises:
+        TypeError: A required input is not a tensor.
+        ValueError: The target is unsupported or a model output shape differs
+            from ``latents``.
+    """
+    if not isinstance(latents, torch.Tensor):
+        raise TypeError(
+            "Expected `latents` to be a torch.Tensor when projecting a DiffusionOPD "
+            f"target, got {type(latents).__name__}: {latents!r}."
+        )
+
+    if loss_target == "xt":
+        return _require_matching_target(
+            next_latents_mean,
+            name="next_latents_mean",
+            loss_target=loss_target,
+            latents=latents,
+        )
+    if loss_target not in ("v", "x0"):
+        raise ValueError(
+            f"DiffusionOPD loss_target must be one of ('xt', 'v', 'x0'), got {loss_target!r}."
+        )
+
+    velocity = _require_matching_target(
+        velocity,
+        name="velocity",
+        loss_target=loss_target,
+        latents=latents,
+    )
+    if loss_target == "v":
+        return velocity
+
+    if not isinstance(timestep, torch.Tensor):
+        raise TypeError(
+            "Expected `timestep` to be a torch.Tensor for loss_target='x0', "
+            f"got {type(timestep).__name__}: {timestep!r}."
+        )
+    latents_float = latents.float()
+    sigma = to_broadcast_tensor(flow_match_sigma(timestep.float()), latents_float)
+    return latents_float - sigma * velocity.float()
+
+
+def compute_per_sample_distillation_loss(
+    student_target: torch.Tensor,
+    teacher_target: torch.Tensor,
+    *,
+    self_normalize: bool,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Compute target-space MSE with optional detached self-normalization.
+
+    Args:
+        student_target: Student prediction in the configured target space.
+        teacher_target: Detached teacher prediction in the same target space.
+        self_normalize: Whether to divide by detached mean absolute error.
+        eps: Positive denominator floor added after self-normalization.
+
+    Returns:
+        Per-sample loss reduced over all non-batch dimensions.
+
+    Raises:
+        TypeError: Targets are not tensors or ``self_normalize`` is not bool.
+        ValueError: Target shapes are invalid or ``eps`` is not positive.
+    """
+    if not isinstance(student_target, torch.Tensor) or not isinstance(teacher_target, torch.Tensor):
+        raise TypeError(
+            "Expected `student_target` and `teacher_target` to be torch.Tensor values, "
+            f"got {type(student_target).__name__} and {type(teacher_target).__name__}."
+        )
+    if student_target.shape != teacher_target.shape:
+        raise ValueError(
+            "DiffusionOPD loss requires matching shapes for `student_target` and "
+            f"`teacher_target`, got {tuple(student_target.shape)} and "
+            f"{tuple(teacher_target.shape)}."
+        )
+    if student_target.ndim < 2:
+        raise ValueError(
+            "DiffusionOPD loss requires target tensors with a batch dimension and at "
+            f"least one feature dimension, got shape {tuple(student_target.shape)}."
+        )
+    if not isinstance(self_normalize, bool):
+        raise TypeError(
+            "Expected `self_normalize` to be a bool, "
+            f"got {type(self_normalize).__name__}: {self_normalize!r}."
+        )
+    if eps <= 0:
+        raise ValueError(f"Expected `eps` to be positive, got {eps!r}.")
+
+    error = student_target.float() - teacher_target.float()
+    per_sample_mse = error.square().flatten(1).mean(dim=1)
+    if not self_normalize:
+        return per_sample_mse
+    scale = error.abs().flatten(1).mean(dim=1).detach()
+    return per_sample_mse / (scale + eps)
 
 
 def load_teachers(

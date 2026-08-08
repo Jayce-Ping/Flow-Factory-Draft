@@ -16,10 +16,10 @@
 """DiffusionOPD on-policy distillation trainer.
 
 Distills several task-specialized LoRA teachers into a single student along
-the student's own rollout trajectories using a pathwise mean-matching loss.
-Supports both ODE and SDE dynamics — the per-step transition variance is
-supplied by ``scheduler.get_kl_divergence_denominator`` so the loss is
-dynamics-agnostic.
+the student's own rollout trajectories. The target space is configurable as
+the one-step transition mean (``xt``), velocity (``v``), or predicted clean
+latent (``x0``), with optional detached self-normalization. The transition-mean
+target supports ODE and SDE dynamics; velocity-derived targets are ODE-only.
 
 Reference:
 [1] On-Policy Distillation of Diffusion Models — https://github.com/ali-vilab/DiffusionOPD
@@ -34,10 +34,10 @@ Design (2-pass, per epoch):
                  reusing the standard ``generate_samples`` pipeline.
   optimize()  -> PASS 1 (no_grad): for each teacher (ONE weight swap), forward
                  over its routed samples' stored states x_j and cache the teacher
-                 mean mu_T_j on each sample.
+                 target on each sample.
               -> PASS 2 (student params only): standard gradient loop that
-                 forwards the student at the same x_j and matches mu_S to the
-                 cached mu_T_j.
+                 forwards the student at the same x_j and matches its projected
+                 target to the cached teacher target.
 
 This keeps teacher swaps to M-per-epoch, runs the gradient loop with student
 params only (no autocast-cache disable, no DDP bypass), and reuses proven FF
@@ -64,7 +64,12 @@ from ...utils.base import filter_kwargs
 from ...utils.logger_utils import setup_logger
 from ...utils.trajectory_collector import compute_trajectory_indices
 from ..abc import BaseTrainer
-from .common import load_teachers
+from .common import (
+    compute_per_sample_distillation_loss,
+    load_teachers,
+    project_distillation_target,
+    validate_loss_target_for_dynamics,
+)
 
 logger = setup_logger(__name__)
 
@@ -82,8 +87,12 @@ class DiffusionOPDTrainer(BaseTrainer):
 
         scheduler = self.adapter.scheduler
         self._is_sde = scheduler.dynamics_type != "ODE"
-        # Teacher mu_T and student mu_S are computed at the SAME stored state x_j
-        # with the SAME noise_level so the transition means are comparable.
+        validate_loss_target_for_dynamics(
+            self.training_args.loss_target,
+            scheduler.dynamics_type,
+        )
+        # Teacher and student targets are computed at the SAME stored state x_j
+        # with the SAME noise_level so their projections are comparable.
         self._student_noise_level = float(scheduler.noise_level) if self._is_sde else 0.0
 
         # --- Teachers: load each LoRA checkpoint into a named snapshot ---
@@ -131,7 +140,7 @@ class DiffusionOPDTrainer(BaseTrainer):
                         "with this `name` and `train.enabled: true`."
                     )
 
-        self._mu_store_device = (
+        self._teacher_target_store_device = (
             "cpu" if self.training_args.offload_samples_to_cpu else self.accelerator.device
         )
 
@@ -140,7 +149,9 @@ class DiffusionOPDTrainer(BaseTrainer):
             f"{self._teacher_names}, dynamics={scheduler.dynamics_type!r} "
             f"(is_sde={self._is_sde}, student_noise_level={self._student_noise_level}), "
             f"datasets={sorted(self._available_sources)}, "
-            f"student_gs={student_gs}, teacher_gs={self._teacher_gs}."
+            f"student_gs={student_gs}, teacher_gs={self._teacher_gs}, "
+            f"loss_target={self.training_args.loss_target!r}, "
+            f"self_normalize={self.training_args.self_normalize}."
         )
 
     # =============================== Lifecycle ===============================
@@ -198,7 +209,7 @@ class DiffusionOPDTrainer(BaseTrainer):
 
     # =============================== Optimization ===============================
     def optimize(self, samples: List[BaseSample]) -> None:
-        """Two-pass distillation: cache teacher means, then student gradient loop."""
+        """Cache teacher targets, then optimize the student in the selected target space."""
         if not samples:
             logger.warning("DiffusionOPD optimize() received no samples; skipping epoch.")
             return
@@ -221,7 +232,7 @@ class DiffusionOPDTrainer(BaseTrainer):
         samples: List[BaseSample],
         train_timesteps: torch.Tensor,
     ) -> None:
-        """PASS 1: cache each teacher's per-step mean mu_T on its routed samples.
+        """PASS 1: cache each teacher's projected target on its routed samples.
 
         One ``use_named_parameters`` swap per teacher (performed OUTSIDE the
         autocast block); a per-teacher ``autocast`` scope gives each teacher a
@@ -243,28 +254,27 @@ class DiffusionOPDTrainer(BaseTrainer):
             with self.adapter.use_named_parameters(teacher_name):
                 with self.autocast():
                     for batch in tqdm(
-                        self._iter_prefetched_batches(
-                            teacher_samples, per_device_batch_size
-                        ),
+                        self._iter_prefetched_batches(teacher_samples, per_device_batch_size),
                         total=num_batches,
                         desc=f"Epoch {self.epoch} Teacher[{teacher_name}] targets",
                         disable=not self.show_progress_bar,
                     ):
-                        # mu_T at each training step: (B, *latent) per step.
-                        mu_teacher_steps = [
+                        # Teacher target at each training step: (B, *latent) per step.
+                        teacher_target_steps = [
                             self._forward_step(
                                 batch,
                                 timestep_index,
                                 guidance_scale=teacher_gs,
-                                return_kwargs=["next_latents_mean"],
                             )[0].detach()
                             for timestep_index in train_timesteps
                         ]
                         # (B, num_train_steps, *latent)
-                        mu_teacher_stacked = torch.stack(mu_teacher_steps, dim=1)
+                        teacher_target_stacked = torch.stack(teacher_target_steps, dim=1)
                         for j, sample in enumerate(batch.samples):
-                            sample.extra_kwargs["mu_teacher"] = (
-                                mu_teacher_stacked[j].to(self._mu_store_device).clone()
+                            sample.extra_kwargs["teacher_target"] = (
+                                teacher_target_stacked[j]
+                                .to(self._teacher_target_store_device)
+                                .clone()
                             )
             # Belt-and-suspenders guard against a nested-autocast cache edge case.
             torch.clear_autocast_cache()
@@ -274,7 +284,7 @@ class DiffusionOPDTrainer(BaseTrainer):
         samples: List[BaseSample],
         train_timesteps: torch.Tensor,
     ) -> None:
-        """PASS 2: student-only gradient loop matching mu_S to the cached mu_T."""
+        """PASS 2: match student targets to cached teacher targets."""
         device = self.accelerator.device
         per_device_batch_size = self.training_args.per_device_batch_size
         num_batches = math.ceil(len(samples) / per_device_batch_size)
@@ -284,18 +294,16 @@ class DiffusionOPDTrainer(BaseTrainer):
             shuffled_samples = self._order_samples_for_optimize(samples, inner_epoch)
 
             self.adapter.train()
-            # Per-teacher KL accumulators over the current gradient-accumulation window.
+            # Per-teacher loss accumulators over the current gradient-accumulation window.
             # Fixed (num_teachers,) shape so the cross-rank reduce in `_log_distill_metrics`
             # is collective-safe regardless of which teachers each rank's micro-batches held.
             num_teachers = len(self._teacher_names)
-            teacher_kl_sum = torch.zeros(num_teachers, device=device)
-            teacher_kl_count = torch.zeros(num_teachers, device=device)
+            teacher_loss_sum = torch.zeros(num_teachers, device=device)
+            teacher_loss_count = torch.zeros(num_teachers, device=device)
             grad_norm = None
 
             for batch in tqdm(
-                self._iter_prefetched_batches(
-                    shuffled_samples, per_device_batch_size
-                ),
+                self._iter_prefetched_batches(shuffled_samples, per_device_batch_size),
                 total=num_batches,
                 desc=f"Epoch {self.epoch} Distill",
                 position=0,
@@ -307,15 +315,15 @@ class DiffusionOPDTrainer(BaseTrainer):
                     device=device,
                     dtype=torch.long,
                 )  # (B,)
-                # mu_teacher rides BaseSample.to() with the sample; ensure on device.
-                mu_teacher_all = batch["mu_teacher"]
-                if not isinstance(mu_teacher_all, torch.Tensor):
+                # teacher_target rides BaseSample.to() with the sample; ensure on device.
+                teacher_target_all = batch["teacher_target"]
+                if not isinstance(teacher_target_all, torch.Tensor):
                     raise RuntimeError(
-                        "Expected cached teacher means `mu_teacher` (a tensor) on every "
-                        f"sample, got {type(mu_teacher_all).__name__}. PASS 1 "
+                        "Expected cached `teacher_target` (a tensor) on every sample, "
+                        f"got {type(teacher_target_all).__name__}. PASS 1 "
                         "(_precompute_teacher_targets) must run before PASS 2."
                     )
-                mu_teacher_all = mu_teacher_all.to(device)
+                teacher_target_all = teacher_target_all.to(device)
 
                 for idx, timestep_index in enumerate(
                     tqdm(
@@ -328,39 +336,45 @@ class DiffusionOPDTrainer(BaseTrainer):
                 ):
                     with self.accumulate_gradients():
                         with self.autocast():
-                            # mu_S: (B, *latent) student transition mean at this step.
-                            mu_S, std_dev_t, dt = self._forward_step(
+                            student_target, std_dev_t, dt = self._forward_step(
                                 batch,
                                 timestep_index,
                                 guidance_scale=self.training_args.guidance_scale,
-                                return_kwargs=["next_latents_mean", "std_dev_t", "dt"],
+                                include_transition_stats=True,
                             )
-                            # Each sample is matched to ITS OWN routed teacher: mu_teacher
-                            # was cached per-sample in PASS 1, so a micro-batch may mix teachers.
-                            mu_T = mu_teacher_all[:, idx]  # (B, *latent) this sample's teacher mean
-                            # Per-sample MSE between student and teacher transition means.
-                            per_sample_mse = (
-                                (mu_S.float() - mu_T.float()).pow(2).flatten(1).mean(dim=1)
-                            )  # (B,)
-                            # Transition variance sigma_bar^2: 1.0 (ODE) or (B, 1, 1) (SDE).
-                            denom = self.adapter.scheduler.get_kl_divergence_denominator(
-                                std_dev_t, dt
+                            # Each sample is matched to its own routed teacher target.
+                            teacher_target = teacher_target_all[:, idx]
+                            per_sample_distill_loss = compute_per_sample_distillation_loss(
+                                student_target,
+                                teacher_target,
+                                self_normalize=self.training_args.self_normalize,
                             )
-                            if isinstance(denom, torch.Tensor):
-                                # denom is per-sample-constant, so reduce (B,1,1) -> (B,).
-                                denom = denom.reshape(per_sample_mse.shape[0], -1).mean(
+                            if self._is_sde:
+                                # Validation guarantees SDE uses the xt transition-mean target.
+                                denom = self.adapter.scheduler.get_kl_divergence_denominator(
+                                    std_dev_t, dt
+                                )
+                                if not isinstance(denom, torch.Tensor):
+                                    raise TypeError(
+                                        "Expected an SDE KL denominator tensor for "
+                                        f"dynamics_type={self.adapter.scheduler.dynamics_type!r}, "
+                                        f"got {type(denom).__name__}: {denom!r}."
+                                    )
+                                denom = denom.reshape(per_sample_distill_loss.shape[0], -1).mean(
                                     dim=1
-                                )  # (B,)
-                            per_sample_kl = 0.5 * (per_sample_mse / denom)  # (B,)
-                            loss = per_sample_kl.mean()  # scalar (mean over batch)
+                                )
+                                per_sample_distill_loss = per_sample_distill_loss / denom
+                            loss = per_sample_distill_loss.mean()
 
                         self.accelerator.backward(loss)
 
-                        # Accumulate per-teacher KL sums/counts for logging (detached).
+                        # Accumulate per-teacher loss sums/counts for logging (detached).
                         with torch.no_grad():
-                            teacher_kl_sum.index_add_(0, teacher_idx, per_sample_kl.detach())
-                            teacher_kl_count.index_add_(
-                                0, teacher_idx, torch.ones_like(per_sample_kl)
+                            teacher_loss_sum.index_add_(
+                                0, teacher_idx, per_sample_distill_loss.detach()
+                            )
+                            teacher_loss_count.index_add_(
+                                0, teacher_idx, torch.ones_like(per_sample_distill_loss)
                             )
 
                         if self.accelerator.sync_gradients:
@@ -371,41 +385,40 @@ class DiffusionOPDTrainer(BaseTrainer):
                             self.optimizer.step()
                             self.optimizer.zero_grad()
                             self._log_distill_metrics(
-                                teacher_kl_sum, teacher_kl_count, grad_norm
+                                teacher_loss_sum, teacher_loss_count, grad_norm
                             )
                             self.step += 1
-                            teacher_kl_sum.zero_()
-                            teacher_kl_count.zero_()
+                            teacher_loss_sum.zero_()
+                            teacher_loss_count.zero_()
 
     # =============================== Helpers ===============================
     def _log_distill_metrics(
         self,
-        teacher_kl_sum: torch.Tensor,
-        teacher_kl_count: torch.Tensor,
+        teacher_loss_sum: torch.Tensor,
+        teacher_loss_count: torch.Tensor,
         grad_norm: Optional[torch.Tensor],
     ) -> None:
-        """Globally reduce per-teacher KL sums/counts and log per-teacher + overall means.
+        """Globally reduce per-teacher loss sums/counts and log their means.
 
-        Logs one ``train/kl_div_{teacher_name}`` per teacher seen this window
-        (the KL averaged over that teacher's samples x timesteps) plus the
-        overall ``train/kl_div`` (averaged across all teachers). The reduce
+        Logs one ``train/distill_loss_{teacher_name}`` per teacher seen this
+        window plus the overall ``train/distill_loss``. The reduce
         operates on fixed ``(num_teachers,)`` tensors, identical on every rank,
         so it is collective-safe even when teachers are unevenly distributed
         across ranks/micro-batches.
         """
         # Pack sum + count into one tensor so the cross-rank reduction is a single
         # collective (the pack-and-reduce idiom used across utils/dist.py).
-        packed = torch.stack([teacher_kl_sum, teacher_kl_count])  # (2, num_teachers)
+        packed = torch.stack([teacher_loss_sum, teacher_loss_count])
         packed = cast(torch.Tensor, self.accelerator.reduce(packed, reduction="sum"))
         g_sum, g_count = packed[0], packed[1]
 
         metrics: Dict[str, Any] = {}
         total_count = g_count.sum()
         if total_count > 0:
-            metrics["kl_div"] = g_sum.sum() / total_count
+            metrics["distill_loss"] = g_sum.sum() / total_count
         for teacher_idx, name in enumerate(self._teacher_names):
             if g_count[teacher_idx] > 0:
-                metrics[f"kl_div_{name}"] = g_sum[teacher_idx] / g_count[teacher_idx]
+                metrics[f"distill_loss_{name}"] = g_sum[teacher_idx] / g_count[teacher_idx]
         if grad_norm is not None:
             metrics["grad_norm"] = grad_norm
 
@@ -461,16 +474,14 @@ class DiffusionOPDTrainer(BaseTrainer):
         batch: Dict[str, Any],
         timestep_index: Union[int, torch.Tensor],
         guidance_scale: float,
-        return_kwargs: List[str],
+        include_transition_stats: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Forward the adapter at stored trajectory step ``timestep_index``.
+        """Forward one stored step and return its configured target projection.
 
         Replays the rollout transition ``x_j -> x_{j+1}`` (current/next latents
         and ``t``/``t_next`` come from the stored trajectory, fetched via the
-        same index maps GRPO uses). Returns ``(mu, std_dev_t, dt)`` where ``mu``
-        is the (validated non-None) transition mean ``next_latents_mean`` and
-        ``std_dev_t``/``dt`` are the SDE statistics used by the loss denominator
-        (present on the student pass, ``None``/zero under ODE).
+        same index maps GRPO uses). Returns ``(target, std_dev_t, dt)``;
+        transition statistics are requested only for the student pass.
         """
         latents_index_map = batch["latent_index_map"]
         num_timesteps = batch["timesteps"].shape[1]
@@ -498,12 +509,20 @@ class DiffusionOPDTrainer(BaseTrainer):
             "guidance_scale": guidance_scale,
         }
         forward_inputs = filter_kwargs(self.adapter.forward, **forward_inputs)
-        forward_inputs["return_kwargs"] = list(return_kwargs)
+        target_output_name = (
+            "next_latents_mean" if self.training_args.loss_target == "xt" else "velocity"
+        )
+        return_kwargs = [target_output_name]
+        if include_transition_stats:
+            return_kwargs.extend(["std_dev_t", "dt"])
+        forward_inputs["return_kwargs"] = return_kwargs
         output = self.adapter.forward(**forward_inputs)
 
-        if output.next_latents_mean is None:
-            raise RuntimeError(
-                "DiffusionOPD requires `next_latents_mean` from adapter.forward, got None. "
-                f"Ensure the adapter/scheduler returns it (return_kwargs={list(return_kwargs)})."
-            )
-        return output.next_latents_mean, output.std_dev_t, output.dt
+        target = project_distillation_target(
+            loss_target=self.training_args.loss_target,
+            latents=latents,
+            timestep=t,
+            next_latents_mean=output.next_latents_mean,
+            velocity=output.velocity,
+        )
+        return target, output.std_dev_t, output.dt
