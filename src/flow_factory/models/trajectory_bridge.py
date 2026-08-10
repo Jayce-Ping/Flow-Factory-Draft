@@ -124,6 +124,21 @@ def _trajectory_value_at(values: torch.Tensor, position: int, *, identifier: str
     return values[:, position]
 
 
+def _legacy_next_timestep(timesteps: torch.Tensor, step_index: int) -> torch.Tensor:
+    """Return the stored next timestep, or the terminal ``0`` the legacy replay used.
+
+    Adapters store one timestep per denoising step ``(B, T)`` while latents keep
+    ``T + 1`` rollout positions, so the final transition has no stored ``t_next``.
+    """
+    if timesteps.ndim != 2:
+        raise ValueError(
+            f"expected batched legacy timesteps shape (B, T), received {tuple(timesteps.shape)}"
+        )
+    if step_index + 1 >= timesteps.shape[1]:
+        return torch.tensor(0, device=timesteps.device)
+    return timesteps[:, step_index + 1]
+
+
 def _validate_structured_trajectory(
     adapter: Any,
     batch: StackedSampleBatch,
@@ -280,6 +295,7 @@ def _get_replay_step(
                 f"at step_index={step_index}"
             )
         log_prob = None
+        component_log_probs: Optional[Dict[str, torch.Tensor]] = None
         if trajectory.log_probs is not None:
             if trajectory.log_prob_index_map is None:
                 log_prob_position = step_index
@@ -295,6 +311,15 @@ def _get_replay_step(
                 log_prob_position,
                 identifier="structured log_probs",
             )
+            if trajectory.component_log_probs is not None:
+                component_log_probs = {
+                    name: _trajectory_value_at(
+                        trajectory.component_log_probs[name],
+                        log_prob_position,
+                        identifier=f"structured component {name!r} log_probs",
+                    )
+                    for name in adapter.trajectory_component_order
+                }
         return ReplayStep(
             state=LatentState(state),
             next_state=LatentState(next_state),
@@ -305,6 +330,7 @@ def _get_replay_step(
                 next_sigma=next_sigma if sigma_presence[0] else None,
             ),
             log_prob=log_prob,
+            component_log_probs=component_log_probs,
         )
 
     _require_legacy_tensors(
@@ -353,14 +379,151 @@ def _get_replay_step(
                     batch["timesteps"], step_index, identifier="legacy timesteps"
                 )
             },
-            next_timestep={
-                "latent": _trajectory_value_at(
-                    batch["timesteps"], step_index + 1, identifier="legacy timesteps"
-                )
-            },
+            next_timestep={"latent": _legacy_next_timestep(batch["timesteps"], step_index)},
         ),
         log_prob=log_prob,
+        component_log_probs=None if log_prob is None else {"latent": log_prob},
     )
+
+
+def _shared_callback_index_map(batch: StackedSampleBatch, field: str) -> torch.Tensor:
+    index_map = batch["callback_index_map"]
+    if index_map.ndim == 1:
+        return index_map
+    if index_map.ndim != 2:
+        raise ValueError(
+            f"expected legacy callback_index_map shape (T,) or (B, T) for callback {field!r}, "
+            f"received {tuple(index_map.shape)}"
+        )
+    if not bool(torch.equal(index_map, index_map[:1].expand_as(index_map))):
+        raise ValueError(
+            f"expected one shared legacy callback_index_map across the batch for callback "
+            f"{field!r}, received per-sample maps {index_map.tolist()}"
+        )
+    return index_map[0]
+
+
+def _get_replay_callback(
+    adapter: Any,
+    batch: StackedSampleBatch,
+    step_index: int,
+    field: str,
+) -> LatentState:
+    if not isinstance(step_index, int) or isinstance(step_index, bool):
+        raise TypeError(
+            f"expected int step_index for get_replay_callback, received "
+            f"{type(step_index).__name__}: {step_index!r}"
+        )
+    if step_index < 0:
+        raise ValueError(f"expected non-negative step_index, received {step_index}")
+    if not isinstance(field, str) or not field:
+        raise ValueError(
+            f"expected a non-empty callback field name, received {field!r} "
+            f"at step_index={step_index}"
+        )
+
+    trajectory = batch.get("trajectory")
+    if trajectory is not None:
+        if not isinstance(trajectory, StructuredTrajectory):
+            raise TypeError(
+                "expected StructuredTrajectory or None for batch['trajectory'], "
+                f"received {type(trajectory).__name__} at step_index={step_index}"
+            )
+        _validate_structured_trajectory(adapter, batch, trajectory)
+        if trajectory.callbacks is None or field not in trajectory.callbacks:
+            raise ValueError(
+                f"expected structured callback field {field!r} in stored fields "
+                f"{trajectory.callback_fields} at step_index={step_index}"
+            )
+        stored = trajectory.callbacks[field]
+        expected_names = adapter.trajectory_component_order
+        if tuple(stored) != expected_names:
+            raise ValueError(
+                f"expected callback {field!r} component order {expected_names}, received "
+                f"{tuple(stored)} at step_index={step_index}"
+            )
+        expected_batch_size = len(batch.samples)
+        components: Dict[str, torch.Tensor] = {}
+        for name in expected_names:
+            indexed = stored[name]
+            if not indexed.batched or indexed.values.shape[0] != expected_batch_size:
+                raise ValueError(
+                    f"expected batched callback {field!r} component {name!r} with batch size "
+                    f"{expected_batch_size}, received batched={indexed.batched} and values "
+                    f"shape {tuple(indexed.values.shape)}"
+                )
+            components[name] = indexed.at(
+                step_index, identifier=f"callback {field!r} component {name!r}"
+            )
+        return LatentState(components)
+
+    _require_legacy_tensors(
+        batch,
+        (field, "callback_index_map"),
+        operation="get_replay_callback",
+        step_index=step_index,
+    )
+    index_map = _shared_callback_index_map(batch, field)
+    stored_position = _map_position(
+        index_map,
+        f"callback {field!r} callback_index_map",
+        step_index,
+        upper_bound=batch[field].shape[1],
+    )
+    return LatentState({"latent": batch[field][:, stored_position]})
+
+
+def _get_state_active_numel(adapter: Any, state: LatentState) -> Dict[str, int]:
+    if not isinstance(state, LatentState):
+        raise TypeError(
+            f"expected LatentState for get_state_active_numel, received {type(state).__name__}"
+        )
+    expected_names = adapter.trajectory_component_order
+    if state.component_names != expected_names:
+        raise ValueError(
+            "expected state component keys/order to match trajectory_component_order "
+            f"{expected_names}, received {state.component_names}"
+        )
+    active_numel: Dict[str, int] = {}
+    for name in expected_names:
+        values = state.components[name]
+        if values.ndim < 2 or values.shape[0] <= 0:
+            raise ValueError(
+                f"expected batched state component {name!r} with shape (B, ...) and a positive "
+                f"batch size, received {tuple(values.shape)}"
+            )
+        active_numel[name] = int(values.numel() // values.shape[0])
+    return active_numel
+
+
+def _get_train_step_indices(adapter: Any) -> torch.Tensor:
+    group = adapter.scheduler_group
+    primary_name = group.primary_name
+    indices = group.primary.train_timesteps
+    if not isinstance(indices, torch.Tensor) or indices.ndim != 1:
+        raise TypeError(
+            f"expected 1-D torch.Tensor train step indices from scheduler component "
+            f"{primary_name!r}, received {type(indices).__name__}"
+        )
+    if indices.dtype not in _SIGNED_INTEGER_DTYPES:
+        raise TypeError(
+            f"expected signed integer train step indices from scheduler component "
+            f"{primary_name!r}, received dtype {indices.dtype}"
+        )
+    for name in group.names:
+        if name == primary_name:
+            continue
+        other = group[name].train_timesteps
+        if not isinstance(other, torch.Tensor) or not torch.equal(
+            other.to(indices.device), indices
+        ):
+            received = other.tolist() if isinstance(other, torch.Tensor) else other
+            raise ValueError(
+                "expected aligned scheduler-group train step indices; component "
+                f"{name!r} received {received} but primary {primary_name!r} declares "
+                f"{indices.tolist()}"
+            )
+    return indices
 
 
 def _add_forward_process_noise(
@@ -462,12 +625,16 @@ def _forward_state(
     def wrap(value: Optional[torch.Tensor]) -> Optional[LatentState]:
         return None if value is None else LatentState({"latent": value})
 
+    def wrap_statistic(value: Optional[torch.Tensor]) -> Optional[Dict[str, torch.Tensor]]:
+        return None if value is None else {"latent": value}
+
     return MultiModalStepOutput(
         next_state=wrap(output.next_latents),
         next_state_mean=wrap(output.next_latents_mean),
-        std_dev_t=output.std_dev_t,
-        dt=output.dt,
+        std_dev_t=wrap_statistic(output.std_dev_t),
+        dt=wrap_statistic(output.dt),
         log_prob=output.log_prob,
+        component_log_probs=wrap_statistic(output.log_prob),
         velocity=wrap(output.velocity),
     )
 

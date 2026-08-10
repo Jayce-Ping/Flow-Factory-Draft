@@ -91,8 +91,11 @@ from .runtime import ClassicPipelineRuntime, ComponentRuntime
 from .trajectory_bridge import (
     _add_forward_process_noise,
     _forward_state,
+    _get_replay_callback,
     _get_replay_step,
+    _get_state_active_numel,
     _get_terminal_state,
+    _get_train_step_indices,
     _reduce_latent_values,
     _resolve_component_latent_axes,
 )
@@ -2378,6 +2381,46 @@ class BaseAdapter(ABC):
             Current/next states, component times, and optional stored log probability.
         """
         return _get_replay_step(self, batch, step_index)
+
+    def get_replay_callback(
+        self, batch: StackedSampleBatch, step_index: int, field: str
+    ) -> LatentState:
+        """Read one stored rollout callback trajectory for every component.
+
+        Args:
+            batch: Collated sample batch containing structured or legacy callback data.
+            step_index: Global rollout transition index.
+            field: Callback field name, e.g. ``"velocity"`` or ``"next_latents_mean"``.
+
+        Returns:
+            Stored callback state keyed by component.
+        """
+        return _get_replay_callback(self, batch, step_index, field)
+
+    def get_state_active_numel(self, state: LatentState) -> Mapping[str, int]:
+        """Count each component's active stochastic degrees of freedom.
+
+        The default counts every non-batch element. Adapters whose components carry
+        masked or conditioning positions may override this.
+
+        Args:
+            state: Batched latent state in ``trajectory_component_order``.
+
+        Returns:
+            Positive per-component element counts in component order.
+        """
+        return _get_state_active_numel(self, state)
+
+    def get_train_step_indices(self) -> torch.Tensor:
+        """Return the primary scheduler's positional training step indices.
+
+        Every scheduler-group member must declare the same positional indices;
+        their numeric timestep values may differ.
+
+        Returns:
+            One-dimensional tensor of rollout positions to train on.
+        """
+        return _get_train_step_indices(self)
 
     def add_forward_process_noise(
         self,

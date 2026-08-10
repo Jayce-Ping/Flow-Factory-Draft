@@ -30,6 +30,7 @@ from .samples import (
 from .trajectory import (
     ComponentTimes,
     ComponentTrajectory,
+    IndexedTrajectoryTensor,
     LatentState,
     MultiModalStepOutput,
     NoisedState,
@@ -52,6 +53,7 @@ __all__ = [
     "I2AVSample",
     "V2VSample",
     "ComponentTrajectory",
+    "IndexedTrajectoryTensor",
     "StructuredTrajectory",
     "LatentState",
     "ComponentTimes",

@@ -49,6 +49,171 @@ def _move_tensor(tensor: torch.Tensor, device: Union[torch.device, str]) -> torc
     return tensor.to(device)
 
 
+_SIGNED_INTEGER_DTYPES = (torch.int8, torch.int16, torch.int32, torch.int64)
+
+
+@dataclass
+class IndexedTrajectoryTensor:
+    """Store one compact per-step tensor plus its sparse rollout-position map.
+
+    Args:
+        values: Stored entries shaped ``(stored, *shape)`` per sample or
+            ``(B, stored, *shape)`` once ``batched`` is set.
+        index_map: Map from rollout positions to stored indices, where ``-1``
+            marks an uncollected rollout position.
+        batched: Whether ``values`` carries a leading batch axis.
+    """
+
+    values: torch.Tensor
+    index_map: torch.Tensor
+    batched: bool = False
+
+    def __post_init__(self) -> None:
+        for name in ("values", "index_map"):
+            value = getattr(self, name)
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(
+                    f"expected torch.Tensor for IndexedTrajectoryTensor.{name}, "
+                    f"received {type(value).__name__}"
+                )
+        if not isinstance(self.batched, bool):
+            raise TypeError(
+                "expected bool for IndexedTrajectoryTensor.batched, "
+                f"received {type(self.batched).__name__}: {self.batched!r}"
+            )
+        if self.index_map.ndim != 1:
+            raise ValueError(
+                "expected IndexedTrajectoryTensor.index_map shape (T,), "
+                f"received {tuple(self.index_map.shape)}"
+            )
+        if self.index_map.dtype not in _SIGNED_INTEGER_DTYPES:
+            raise TypeError(
+                "expected signed integer IndexedTrajectoryTensor.index_map, "
+                f"received dtype {self.index_map.dtype}"
+            )
+        stored_axis = 1 if self.batched else 0
+        if self.values.ndim <= stored_axis:
+            raise ValueError(
+                f"expected IndexedTrajectoryTensor.values with stored axis {stored_axis}, "
+                f"received shape {tuple(self.values.shape)} for batched={self.batched}"
+            )
+        num_stored = self.values.shape[stored_axis]
+        if self.index_map.numel() and (
+            self.index_map.min().item() < -1 or self.index_map.max().item() >= num_stored
+        ):
+            raise ValueError(
+                f"expected IndexedTrajectoryTensor.index_map values for {num_stored} stored "
+                f"entries in range [0, {num_stored - 1}] or uncollected sentinel -1, received "
+                f"{self.index_map.tolist()}"
+            )
+
+    @property
+    def num_stored(self) -> int:
+        """Return the number of compact stored entries."""
+        return int(self.values.shape[1 if self.batched else 0])
+
+    def at(
+        self, rollout_position: int, *, identifier: str = "IndexedTrajectoryTensor"
+    ) -> torch.Tensor:
+        """Read the stored entry recorded for one rollout position.
+
+        Args:
+            rollout_position: Rollout transition index to read.
+            identifier: Caller-facing name used in error messages.
+
+        Returns:
+            Stored tensor slice for ``rollout_position``.
+        """
+        if not isinstance(rollout_position, int) or isinstance(rollout_position, bool):
+            raise TypeError(
+                f"expected int rollout_position for {identifier}, received "
+                f"{type(rollout_position).__name__}: {rollout_position!r}"
+            )
+        if rollout_position < 0 or rollout_position >= self.index_map.shape[0]:
+            raise ValueError(
+                f"expected {identifier} rollout position in [0, {self.index_map.shape[0] - 1}], "
+                f"received {rollout_position} with index map contents {self.index_map.tolist()}"
+            )
+        stored_position = int(self.index_map[rollout_position].item())
+        if stored_position == -1:
+            raise ValueError(
+                f"{identifier} at rollout position {rollout_position} received uncollected "
+                f"sentinel -1; index map contents {self.index_map.tolist()}"
+            )
+        return self.values[:, stored_position] if self.batched else self.values[stored_position]
+
+    def to(self, device: Union[torch.device, str]) -> "IndexedTrajectoryTensor":
+        """Move stored values and the index map to a device in place.
+
+        Args:
+            device: Target tensor device.
+
+        Returns:
+            This indexed tensor after moving its tensors.
+        """
+        return self.map_tensors(lambda tensor: _move_tensor(tensor, device))
+
+    def map_tensors(
+        self, transform: Callable[[torch.Tensor], torch.Tensor]
+    ) -> "IndexedTrajectoryTensor":
+        """Transform stored values and the index map in place.
+
+        Args:
+            transform: Tensor transformation callback.
+
+        Returns:
+            This indexed tensor after transforming its tensors.
+        """
+        self.values = transform(self.values)
+        self.index_map = transform(self.index_map)
+        return self
+
+    @classmethod
+    def stack(cls, tensors: List["IndexedTrajectoryTensor"]) -> "IndexedTrajectoryTensor":
+        """Stack per-sample indexed tensors sharing one index map.
+
+        Args:
+            tensors: Non-empty unbatched indexed tensors with identical index maps
+                and stored shapes.
+
+        Returns:
+            Batched indexed tensor.
+        """
+        if not tensors:
+            raise ValueError("expected non-empty IndexedTrajectoryTensor list to stack, received 0")
+        first = tensors[0]
+        for sample_index, indexed in enumerate(tensors):
+            if not isinstance(indexed, cls):
+                raise TypeError(
+                    f"expected IndexedTrajectoryTensor at sample index {sample_index}, "
+                    f"received {type(indexed).__name__}"
+                )
+            if indexed.batched:
+                raise ValueError(
+                    "expected unbatched IndexedTrajectoryTensor entries to stack, received "
+                    f"batched=True at sample index {sample_index}"
+                )
+            if sample_index == 0:
+                continue
+            if not torch.equal(indexed.index_map, first.index_map):
+                raise ValueError(
+                    f"expected shared IndexedTrajectoryTensor.index_map "
+                    f"{first.index_map.tolist()}, received {indexed.index_map.tolist()} "
+                    f"for sample index {sample_index}"
+                )
+            if indexed.values.shape != first.values.shape:
+                raise ValueError(
+                    f"expected IndexedTrajectoryTensor.values shape "
+                    f"{tuple(first.values.shape)}, received {tuple(indexed.values.shape)} "
+                    f"for sample index {sample_index}"
+                )
+        return cls(
+            values=torch.stack([indexed.values for indexed in tensors]),
+            index_map=first.index_map,
+            batched=True,
+        )
+
+
 @dataclass
 class ComponentTrajectory:
     """Store one component's compact latent states and full scheduler trajectory.
@@ -187,11 +352,17 @@ class StructuredTrajectory:
         components: Component trajectories in authoritative iteration order.
         log_probs: Optional per-step joint scalar log probabilities.
         log_prob_index_map: Optional shared rollout-position map for ``log_probs``.
+        component_log_probs: Optional per-component scalar log probabilities sharing
+            ``log_prob_index_map``, keyed in authoritative component order.
+        callbacks: Optional named per-component callback trajectories, e.g.
+            ``{"velocity": {"latent": IndexedTrajectoryTensor(...)}}``.
     """
 
     components: Mapping[str, ComponentTrajectory]
     log_probs: Optional[torch.Tensor] = None
     log_prob_index_map: Optional[torch.Tensor] = None
+    component_log_probs: Optional[Mapping[str, torch.Tensor]] = None
+    callbacks: Optional[Mapping[str, Mapping[str, IndexedTrajectoryTensor]]] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.components, Mapping):
@@ -260,6 +431,80 @@ class StructuredTrajectory:
                     f"[0, {log_prob_length - 1}] or uncollected sentinel -1, received "
                     f"{self.log_prob_index_map.tolist()}"
                 )
+        self._validate_component_log_probs()
+        self._validate_callbacks()
+
+    def _validate_component_log_probs(self) -> None:
+        if self.component_log_probs is None:
+            return
+        validated = _validate_component_mapping(
+            self.component_log_probs, "StructuredTrajectory.component_log_probs"
+        )
+        expected_names = tuple(self.components)
+        if tuple(validated) != expected_names:
+            raise ValueError(
+                "expected StructuredTrajectory.component_log_probs component order "
+                f"{expected_names}, received {tuple(validated)}"
+            )
+        for name, values in validated.items():
+            if values.ndim not in (1, 2):
+                raise ValueError(
+                    f"expected StructuredTrajectory.component_log_probs[{name!r}] shape "
+                    f"(T,) or (B, T), received {tuple(values.shape)}"
+                )
+            if self.log_probs is not None and values.shape != self.log_probs.shape:
+                raise ValueError(
+                    f"expected StructuredTrajectory.component_log_probs[{name!r}] shape "
+                    f"{tuple(self.log_probs.shape)} to match log_probs, received "
+                    f"{tuple(values.shape)}"
+                )
+        self.component_log_probs = validated
+
+    def _validate_callbacks(self) -> None:
+        if self.callbacks is None:
+            return
+        if not isinstance(self.callbacks, Mapping):
+            raise TypeError(
+                "expected Mapping[str, Mapping[str, IndexedTrajectoryTensor]] for "
+                f"StructuredTrajectory.callbacks, received {type(self.callbacks).__name__}"
+            )
+        expected_names = tuple(self.components)
+        validated: Dict[str, Dict[str, IndexedTrajectoryTensor]] = {}
+        for field_name, component_values in self.callbacks.items():
+            if not isinstance(field_name, str) or not field_name:
+                raise ValueError(
+                    "expected non-empty string StructuredTrajectory.callbacks field names, "
+                    f"received {field_name!r}"
+                )
+            if not isinstance(component_values, Mapping):
+                raise TypeError(
+                    f"expected Mapping[str, IndexedTrajectoryTensor] for "
+                    f"StructuredTrajectory.callbacks[{field_name!r}], received "
+                    f"{type(component_values).__name__}"
+                )
+            for name, indexed in component_values.items():
+                if not isinstance(indexed, IndexedTrajectoryTensor):
+                    raise TypeError(
+                        f"expected IndexedTrajectoryTensor for "
+                        f"StructuredTrajectory.callbacks[{field_name!r}][{name!r}], received "
+                        f"{type(indexed).__name__}"
+                    )
+            if tuple(component_values) != expected_names:
+                raise ValueError(
+                    f"expected StructuredTrajectory.callbacks[{field_name!r}] component order "
+                    f"{expected_names}, received {tuple(component_values)}"
+                )
+            validated[field_name] = dict(component_values)
+        if not validated:
+            raise ValueError(
+                "expected at least one StructuredTrajectory.callbacks field, received none"
+            )
+        self.callbacks = validated
+
+    @property
+    def callback_fields(self) -> Tuple[str, ...]:
+        """Return stored callback field names in declaration order."""
+        return () if self.callbacks is None else tuple(self.callbacks)
 
     @property
     def component_names(self) -> Tuple[str, ...]:
@@ -295,6 +540,14 @@ class StructuredTrajectory:
             self.log_probs = transform(self.log_probs)
         if self.log_prob_index_map is not None:
             self.log_prob_index_map = transform(self.log_prob_index_map)
+        if self.component_log_probs is not None:
+            self.component_log_probs = {
+                name: transform(values) for name, values in self.component_log_probs.items()
+            }
+        if self.callbacks is not None:
+            for component_values in self.callbacks.values():
+                for indexed in component_values.values():
+                    indexed.map_tensors(transform)
         return self
 
     @classmethod
@@ -340,6 +593,16 @@ class StructuredTrajectory:
                     "expected shared log_prob_index_map "
                     f"{first.log_prob_index_map.tolist()}, received "
                     f"{trajectory.log_prob_index_map.tolist()} for sample index {sample_index}"
+                )
+            if (first.component_log_probs is None) != (trajectory.component_log_probs is None):
+                raise ValueError(
+                    "expected identical component_log_probs presence across samples, "
+                    f"received mismatch at sample index {sample_index}"
+                )
+            if trajectory.callback_fields != first.callback_fields:
+                raise ValueError(
+                    f"expected identical callback field names {first.callback_fields}, "
+                    f"received {trajectory.callback_fields} for sample index {sample_index}"
                 )
 
         components: Dict[str, ComponentTrajectory] = {}
@@ -399,6 +662,27 @@ class StructuredTrajectory:
                         f"expected log_probs shape {expected_log_prob_shape}, received "
                         f"{tuple(trajectory.log_probs.shape)} for sample index {sample_index}"
                     )
+        component_log_probs: Optional[Dict[str, torch.Tensor]] = None
+        if first.component_log_probs is not None:
+            component_log_probs = {
+                name: torch.stack(
+                    [trajectory.component_log_probs[name] for trajectory in trajectories]
+                )
+                for name in expected_names
+            }
+
+        callbacks: Optional[Dict[str, Dict[str, IndexedTrajectoryTensor]]] = None
+        if first.callback_fields:
+            callbacks = {
+                field_name: {
+                    name: IndexedTrajectoryTensor.stack(
+                        [trajectory.callbacks[field_name][name] for trajectory in trajectories]
+                    )
+                    for name in expected_names
+                }
+                for field_name in first.callback_fields
+            }
+
         return cls(
             components=components,
             log_probs=(
@@ -407,6 +691,8 @@ class StructuredTrajectory:
                 else None
             ),
             log_prob_index_map=first.log_prob_index_map,
+            component_log_probs=component_log_probs,
+            callbacks=callbacks,
         )
 
 
@@ -478,12 +764,20 @@ class ReplayStep:
         next_state: Stored next component latent state.
         times: Current and next scheduler coordinates.
         log_prob: Optional stored joint scalar log probability.
+        component_log_probs: Optional stored per-component scalar log probabilities.
     """
 
     state: LatentState
     next_state: LatentState
     times: ComponentTimes
     log_prob: Optional[torch.Tensor] = None
+    component_log_probs: Optional[Mapping[str, torch.Tensor]] = None
+
+    def __post_init__(self) -> None:
+        if self.component_log_probs is not None:
+            self.component_log_probs = _validate_component_mapping(
+                self.component_log_probs, "ReplayStep.component_log_probs"
+            )
 
 
 @dataclass
@@ -508,15 +802,28 @@ class MultiModalStepOutput:
     Args:
         next_state: Optional sampled next latent state.
         next_state_mean: Optional transition mean latent state.
-        std_dev_t: Optional transition standard deviation.
-        dt: Optional scheduler step size.
+        std_dev_t: Optional per-component transition standard deviation.
+        dt: Optional per-component scheduler step size.
         log_prob: Optional joint scalar transition log probability.
+        component_log_probs: Optional per-component scalar transition log probabilities.
         velocity: Optional predicted velocity state.
     """
 
     next_state: Optional[LatentState] = None
     next_state_mean: Optional[LatentState] = None
-    std_dev_t: Optional[torch.Tensor] = None
-    dt: Optional[torch.Tensor] = None
+    std_dev_t: Optional[Mapping[str, torch.Tensor]] = None
+    dt: Optional[Mapping[str, torch.Tensor]] = None
     log_prob: Optional[torch.Tensor] = None
+    component_log_probs: Optional[Mapping[str, torch.Tensor]] = None
     velocity: Optional[LatentState] = None
+
+    def __post_init__(self) -> None:
+        for field_name in ("std_dev_t", "dt", "component_log_probs"):
+            values = getattr(self, field_name)
+            if values is None:
+                continue
+            setattr(
+                self,
+                field_name,
+                _validate_component_mapping(values, f"MultiModalStepOutput.{field_name}"),
+            )

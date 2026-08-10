@@ -18,7 +18,7 @@ Group Relative Policy Optimization (GRPO) Trainer.
 Implements GRPO algorithm for flow matching models.
 """
 import os
-from typing import List, Dict, Optional, Any, Union, Literal, Callable
+from typing import List, Dict, Mapping, Optional, Any, Tuple, Union, Literal, Callable
 from functools import partial
 from collections import defaultdict
 import torch
@@ -28,13 +28,25 @@ tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from .abc import BaseTrainer
 from ..hparams import GRPOTrainingArguments
-from ..samples import BaseSample
-from ..utils.base import filter_kwargs, create_generator_by_prompt
+from ..samples import (
+    BaseSample,
+    LatentState,
+    MultiModalStepOutput,
+    ReplayStep,
+    StackedSampleBatch,
+)
+from ..utils.base import create_generator_by_prompt
 from ..utils.logger_utils import setup_logger
 from ..utils.trajectory_collector import TrajectoryCollector, compute_trajectory_indices
 from ..utils.dist import reduce_loss_info
 
 logger = setup_logger(__name__)
+
+# Reference-KL space -> (MultiModalStepOutput attribute, legacy `return_kwargs` request).
+KL_SPACE_FIELDS: Dict[str, Tuple[str, str]] = {
+    "v-based": ("velocity", "velocity"),
+    "x-based": ("next_state_mean", "next_latents_mean"),
+}
 
 
 # ============================ GRPO Trainer ============================
@@ -61,10 +73,157 @@ class GRPOTrainer(BaseTrainer):
         """Check if KL penalty is enabled."""
         return self.training_args.kl_beta > 0.0
 
+    # =========================== Structured replay helpers ============================
+    def _replay_forward_kwargs(self, batch: StackedSampleBatch) -> Dict[str, Any]:
+        """Training arguments the batch does not already carry.
+
+        Legacy replay unpacked ``batch`` after ``training_args``, so batch-level
+        values win on shared keys.
+        """
+        return {key: value for key, value in {**self.training_args}.items() if key not in batch}
+
+    def _replay_forward(
+        self,
+        batch: StackedSampleBatch,
+        replay: ReplayStep,
+        return_fields: Tuple[str, ...],
+    ) -> MultiModalStepOutput:
+        """Replay one stored transition through the current policy."""
+        return self.adapter.forward_state(
+            batch=batch,
+            state=replay.state,
+            times=replay.times,
+            next_state=replay.next_state,
+            compute_log_prob=True,
+            return_fields=return_fields,
+            noise_level=self.adapter.scheduler.noise_level,
+            **self._replay_forward_kwargs(batch),
+        )
+
+    def _reference_forward(
+        self,
+        batch: StackedSampleBatch,
+        replay: ReplayStep,
+        return_fields: Tuple[str, ...],
+        **overrides: Any,
+    ) -> MultiModalStepOutput:
+        """Replay the same transition through the frozen reference parameters.
+
+        Only the forward itself is wrapped in ``no_grad``/``use_ref_parameters`` so
+        the caller keeps the KL arithmetic on the policy graph.
+        """
+        forward_kwargs = self._replay_forward_kwargs(batch)
+        forward_kwargs.update(overrides)
+        with torch.no_grad(), self.adapter.use_ref_parameters():
+            return self.adapter.forward_state(
+                batch=batch,
+                state=replay.state,
+                times=replay.times,
+                next_state=replay.next_state,
+                compute_log_prob=False,
+                return_fields=return_fields,
+                noise_level=self.adapter.scheduler.noise_level,
+                **forward_kwargs,
+            )
+
+    def _require_replay_log_prob(self, replay: ReplayStep, step_index: int) -> torch.Tensor:
+        """Return the stored rollout joint log probability for one transition."""
+        if replay.log_prob is None:
+            raise ValueError(
+                f"expected a stored joint log probability at step_index={step_index} for "
+                f"{type(self).__name__} replay, received None; rerun sampling with "
+                "compute_log_prob=True"
+            )
+        return replay.log_prob
+
+    def _kl_space_fields(self, kl_space: str, argument_name: str) -> Tuple[str, str]:
+        """Resolve the output attribute and legacy request name for a KL space."""
+        if kl_space not in KL_SPACE_FIELDS:
+            raise ValueError(
+                f"expected {argument_name} in {tuple(KL_SPACE_FIELDS)}, received {kl_space!r}"
+            )
+        return KL_SPACE_FIELDS[kl_space]
+
+    def _require_output_state(
+        self, output: MultiModalStepOutput, field: str, source: str
+    ) -> LatentState:
+        """Return a required latent-state field in authoritative component order."""
+        state = getattr(output, field)
+        expected_names = self.adapter.trajectory_component_order
+        if state is None:
+            raise ValueError(
+                f"expected {source} forward output field {field!r} in component order "
+                f"{expected_names}, received None; request it through return_fields"
+            )
+        if state.component_names != expected_names:
+            raise ValueError(
+                f"expected {source} forward output field {field!r} in component order "
+                f"{expected_names}, received {state.component_names}"
+            )
+        return state
+
+    def _require_component_mapping(
+        self,
+        values: Optional[Mapping[str, torch.Tensor]],
+        field: str,
+        source: str,
+    ) -> Mapping[str, torch.Tensor]:
+        """Return a required per-component mapping in authoritative component order."""
+        expected_names = self.adapter.trajectory_component_order
+        if values is None:
+            raise ValueError(
+                f"expected {source} {field} for {type(self).__name__} replay in component "
+                f"order {expected_names}, received None"
+            )
+        if tuple(values) != expected_names:
+            raise ValueError(
+                f"expected {source} {field} for {type(self).__name__} replay in component "
+                f"order {expected_names}, received {tuple(values)}"
+            )
+        return values
+
+    def _component_squared_errors(
+        self, new_state: LatentState, old_state: LatentState, source: str
+    ) -> Dict[str, torch.Tensor]:
+        """Per-component mean squared error over each component's active elements."""
+        expected_names = self.adapter.trajectory_component_order
+        if old_state.component_names != expected_names:
+            raise ValueError(
+                f"expected {source} state in component order {expected_names}, "
+                f"received {old_state.component_names}"
+            )
+        return {
+            name: (new_state.components[name] - old_state.components[name])
+            .flatten(1)
+            .pow(2)
+            .mean(dim=1)
+            for name in expected_names
+        }
+
+    def _reference_kl_divergence(
+        self,
+        output: MultiModalStepOutput,
+        ref_output: MultiModalStepOutput,
+        replay: ReplayStep,
+    ) -> torch.Tensor:
+        """Scalar policy-vs-reference squared error in the configured KL space."""
+        output_field, _ = self._kl_space_fields(self.training_args.kl_type, "kl_type")
+        errors = self._component_squared_errors(
+            self._require_output_state(output, output_field, "policy"),
+            self._require_output_state(ref_output, output_field, "reference"),
+            "reference",
+        )
+        return torch.mean(
+            self.adapter.reduce_latent_values(
+                errors,
+                active_numel=self.adapter.get_state_active_numel(replay.state),
+            )
+        )
+
     def start(self):
         """Main training loop."""
         while self.should_continue_training():
-            self.adapter.scheduler.set_seed(self.epoch + self.training_args.seed)
+            self.adapter.set_trajectory_seed(self.epoch + self.training_args.seed)
             
             # Save checkpoint
             if (
@@ -98,7 +257,7 @@ class GRPOTrainer(BaseTrainer):
     def sample(self) -> List[BaseSample]:
         """Generate rollouts for GRPO (stores full trajectory + log-probs)."""
         trajectory_indices = compute_trajectory_indices(
-            train_timestep_indices=self.adapter.scheduler.train_timesteps,
+            train_timestep_indices=self.adapter.get_train_step_indices(),
             num_inference_steps=self.training_args.num_inference_steps,
         )
         return self.generate_samples(
@@ -121,6 +280,19 @@ class GRPOTrainer(BaseTrainer):
         """Policy optimization (Stage 6): PPO-style clipped loss and optional KL."""
         per_device_batch_size = self.training_args.per_device_batch_size
         num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
+        train_step_indices = self.adapter.get_train_step_indices()
+        # Forward fields: the ratio needs `log_prob`, and `dt` keeps the legacy request
+        # shape; the reference KL space adds its own comparison field.
+        if self.enable_kl_loss:
+            _, ref_return_field = self._kl_space_fields(self.training_args.kl_type, 'kl_type')
+            return_fields = (
+                ('log_prob', 'velocity', 'dt')
+                if self.training_args.kl_type == 'v-based'
+                else ('log_prob', 'next_latents', 'next_latents_mean', 'dt')
+            )
+        else:
+            ref_return_field = None
+            return_fields = ('log_prob', 'dt')
         for inner_epoch in range(self.training_args.num_inner_epochs):
             # Shuffle unless disabled for pack-composition-dependent adapters.
             shuffled_samples = self._order_samples_for_optimize(samples, inner_epoch)
@@ -138,55 +310,22 @@ class GRPOTrainer(BaseTrainer):
                 position=0,
                 disable=not self.show_progress_bar,
             ):
-                latents_index_map = batch['latent_index_map']  # (T+1,) LongTensor
-                log_probs_index_map = batch['log_prob_index_map']  # (T,) LongTensor
                 # Iterate through timesteps
-                for idx, timestep_index in enumerate(tqdm(
-                    self.adapter.scheduler.train_timesteps,
+                for timestep_index in tqdm(
+                    train_step_indices,
                     desc=f'Epoch {self.epoch} Timestep',
                     position=1,
                     leave=False,
                     disable=not self.show_progress_bar,
-                )):
+                ):
+                    step_index = int(timestep_index)
                     with self.accumulate_gradients():
                         # 1. Prepare inputs
-                        # Get old log prob
-                        old_log_prob = batch['log_probs'][:, log_probs_index_map[timestep_index]]
-                        # Get current timestep data
-                        num_timesteps = batch['timesteps'].shape[1]
-                        t = batch['timesteps'][:, timestep_index]
-                        t_next = (
-                            batch['timesteps'][:, timestep_index + 1]
-                            if timestep_index + 1 < num_timesteps
-                            else torch.tensor(0, device=self.accelerator.device)
-                        )
-                        # Get latents
-                        latents = batch['all_latents'][:, latents_index_map[timestep_index]]
-                        next_latents = batch['all_latents'][:, latents_index_map[timestep_index + 1]]
-                        # Prepare forward input
-                        forward_inputs = {
-                            **self.training_args, # Pass kwargs like `guidance_scale` and `do_classifier_free_guidance`
-                            't': t,
-                            't_next': t_next,
-                            'latents': latents,
-                            'next_latents': next_latents,
-                            'compute_log_prob': True,
-                            'noise_level': self.adapter.scheduler.noise_level,
-                            **batch
-                        }
-                        forward_inputs = filter_kwargs(self.adapter.forward, **forward_inputs)
+                        replay = self.adapter.get_replay_step(batch, step_index)
+                        old_log_prob = self._require_replay_log_prob(replay, step_index)
                         # 2. Forward pass
-                        if self.enable_kl_loss:
-                            if self.training_args.kl_type == 'v-based':
-                                return_kwargs = ['log_prob', 'velocity', 'dt']
-                            elif self.training_args.kl_type == 'x-based':
-                                return_kwargs = ['log_prob', 'next_latents', 'next_latents_mean', 'dt']
-                        else:
-                            return_kwargs = ['log_prob', 'dt']
-
-                        forward_inputs['return_kwargs'] = return_kwargs
                         with self.autocast():
-                            output = self.adapter.forward(**forward_inputs)
+                            output = self._replay_forward(batch, replay, return_fields)
 
                         # 3. Compute loss
                         # Clip advantages
@@ -206,32 +345,12 @@ class GRPOTrainer(BaseTrainer):
                         # 4. Compute KL-div
                         if self.enable_kl_loss:
                             with self.autocast():
-                                with torch.no_grad(), self.adapter.use_ref_parameters():
-                                    ref_forward_inputs = forward_inputs.copy()
-                                    ref_forward_inputs['compute_log_prob'] = False
-                                    if self.training_args.kl_type == 'v-based':
-                                        # KL in velocity space
-                                        ref_forward_inputs['return_kwargs'] = ['velocity']
-                                        ref_output = self.adapter.forward(**ref_forward_inputs)
-                                    elif self.training_args.kl_type == 'x-based':
-                                        # KL in latent space
-                                        ref_forward_inputs['return_kwargs'] = ['next_latents_mean']
-                                        ref_output = self.adapter.forward(**ref_forward_inputs)
-
+                                ref_output = self._reference_forward(
+                                    batch, replay, (ref_return_field,)
+                                )
                                 # kl_div must be computed outside `torch.no_grad()` for correct gradient behavior.
                                 # See: issue #122, PR #123 (https://github.com/X-GenGroup/Flow-Factory/pull/123)
-                                if self.training_args.kl_type == 'v-based':
-                                    kl_div = torch.mean(
-                                        ((output.velocity - ref_output.velocity) ** 2),
-                                        dim=tuple(range(1, output.velocity.ndim)), keepdim=True
-                                    )
-                                elif self.training_args.kl_type == 'x-based':
-                                    kl_div = torch.mean(
-                                        ((output.next_latents_mean - ref_output.next_latents_mean) ** 2),
-                                        dim=tuple(range(1, output.next_latents_mean.ndim)), keepdim=True
-                                    )
-
-                                kl_div = torch.mean(kl_div)
+                                kl_div = self._reference_kl_divergence(output, ref_output, replay)
                                 kl_loss = self.training_args.kl_beta * kl_div
                                 loss += kl_loss
                                 loss_info['kl_div'].append(kl_div.detach())
@@ -309,7 +428,7 @@ class GRPOGuardTrainer(GRPOTrainer):
     def sample(self) -> List[BaseSample]:
         """Generate rollouts for GRPO-Guard with transition means."""
         trajectory_indices = compute_trajectory_indices(
-            train_timestep_indices=self.adapter.scheduler.train_timesteps,
+            train_timestep_indices=self.adapter.get_train_step_indices(),
             num_inference_steps=self.training_args.num_inference_steps,
         )
         return self.generate_samples(
@@ -319,10 +438,65 @@ class GRPOGuardTrainer(GRPOTrainer):
             extra_call_back_kwargs=["next_latents_mean"],
         )
 
+    def _guard_ratio(
+        self,
+        output: MultiModalStepOutput,
+        replay: ReplayStep,
+        old_state_mean: LatentState,
+    ) -> torch.Tensor:
+        """Variance-reweighted importance ratio, per component then DOF-reduced.
+
+        Each component contributes ``(delta_log_prob * scale + mse / (2 * scale))``
+        with ``scale = sqrt(-dt) * std_dev_t``; the terms are combined by active
+        stochastic degrees of freedom before a single exponentiation.
+        """
+        expected_names = self.adapter.trajectory_component_order
+        new_state_mean = self._require_output_state(output, "next_state_mean", "policy")
+        std_dev_t = self._require_component_mapping(output.std_dev_t, "std_dev_t", "policy output")
+        dt = self._require_component_mapping(output.dt, "dt", "policy output")
+        new_log_probs = self._require_component_mapping(
+            output.component_log_probs, "component_log_probs", "policy output"
+        )
+        old_log_probs = self._require_component_mapping(
+            replay.component_log_probs, "component_log_probs", "stored rollout"
+        )
+        if old_state_mean.component_names != expected_names:
+            raise ValueError(
+                f"expected stored rollout next_latents_mean in component order "
+                f"{expected_names}, received {old_state_mean.component_names}"
+            )
+        guard_terms = {}
+        for name in expected_names:
+            scale_factor = torch.sqrt(-dt[name]) * std_dev_t[name]
+            mse = (
+                (new_state_mean.components[name] - old_state_mean.components[name])
+                .flatten(1)
+                .pow(2)
+                .mean(dim=1)
+            )
+            guard_terms[name] = (new_log_probs[name] - old_log_probs[name]) * scale_factor + mse / (
+                2 * scale_factor
+            )
+        return torch.exp(
+            self.adapter.reduce_latent_values(
+                guard_terms,
+                active_numel=self.adapter.get_state_active_numel(replay.state),
+            )
+        )
+
     def optimize(self, samples: List[BaseSample]) -> None:
         """Policy optimization (Stage 6): GRPO-Guard reweighted loss and optional KL."""
         per_device_batch_size = self.training_args.per_device_batch_size
         num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
+        train_step_indices = self.adapter.get_train_step_indices()
+        # The reweighted ratio always needs the transition mean, its std, and dt.
+        return_fields = {'log_prob', 'next_latents_mean', 'std_dev_t', 'dt'}
+        if self.enable_kl_loss:
+            _, ref_return_field = self._kl_space_fields(self.training_args.kl_type, 'kl_type')
+            return_fields.add(ref_return_field)
+        else:
+            ref_return_field = None
+        return_fields = tuple(return_fields)
         for inner_epoch in range(self.training_args.num_inner_epochs):
             # Shuffle unless disabled for pack-composition-dependent adapters.
             shuffled_samples = self._order_samples_for_optimize(samples, inner_epoch)
@@ -339,55 +513,25 @@ class GRPOGuardTrainer(GRPOTrainer):
                 position=0,
                 disable=not self.show_progress_bar,
             ):
-                latents_index_map = batch['latent_index_map']  # (T+1,) LongTensor
-                log_probs_index_map = batch['log_prob_index_map']  # (T,) LongTensor
-                callback_index_map = batch['callback_index_map'][0]  # (T,) LongTensor, shared across batch.
                 # Iterate through timesteps
-                for idx, timestep_index in enumerate(tqdm(
-                    self.adapter.scheduler.train_timesteps,
+                for timestep_index in tqdm(
+                    train_step_indices,
                     desc=f'Epoch {self.epoch} Timestep',
                     position=1,
                     leave=False,
                     disable=not self.show_progress_bar,
-                )):
+                ):
+                    step_index = int(timestep_index)
                     with self.accumulate_gradients():
                         # 1. Prepare inputs
-                        # Get old log prob
-                        old_log_prob = batch['log_probs'][:, log_probs_index_map[timestep_index]]
-                        # Get current timestep data
-                        num_timesteps = batch['timesteps'].shape[1]
-                        t = batch['timesteps'][:, timestep_index]
-                        t_next = (
-                            batch['timesteps'][:, timestep_index + 1]
-                            if timestep_index + 1 < num_timesteps
-                            else torch.tensor(0, device=self.accelerator.device)
+                        replay = self.adapter.get_replay_step(batch, step_index)
+                        self._require_replay_log_prob(replay, step_index)
+                        old_state_mean = self.adapter.get_replay_callback(
+                            batch, step_index, 'next_latents_mean'
                         )
-                        # Get latents
-                        latents = batch['all_latents'][:, latents_index_map[timestep_index]]
-                        next_latents = batch['all_latents'][:, latents_index_map[timestep_index + 1]]
-                        # Prepare forward input
-                        forward_inputs = {
-                            **self.training_args, # Pass kwargs like `guidance_scale` and `do_classifier_free_guidance`
-                            't': t,
-                            't_next': t_next,
-                            'latents': latents,
-                            'next_latents': next_latents,
-                            'compute_log_prob': True,
-                            'noise_level': self.adapter.scheduler.noise_level,
-                            **batch
-                        }
-                        forward_inputs = filter_kwargs(self.adapter.forward, **forward_inputs)
                         # 2. Forward pass
-                        return_kwargs = set(['log_prob', 'next_latents_mean', 'std_dev_t', 'dt'])
-                        if self.enable_kl_loss:
-                            if self.training_args.kl_type == 'v-based':
-                                return_kwargs.add('velocity')
-                            elif self.training_args.kl_type == 'x-based':
-                                return_kwargs.add('next_latents_mean')
-
-                        forward_inputs['return_kwargs'] = list(return_kwargs)
                         with self.autocast():
-                            output = self.adapter.forward(**forward_inputs)
+                            output = self._replay_forward(batch, replay, return_fields)
 
                         # 3. Compute loss
                         # Clip advantages
@@ -395,10 +539,7 @@ class GRPOGuardTrainer(GRPOTrainer):
                         adv_clip_range = self.training_args.adv_clip_range
                         adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
                         # Reweighted ratio
-                        scale_factor = torch.sqrt(-output.dt) * output.std_dev_t
-                        old_next_latents_mean = batch['next_latents_mean'][:, callback_index_map[timestep_index]]
-                        mse = (output.next_latents_mean - old_next_latents_mean).flatten(1).pow(2).mean(dim=1)
-                        ratio = torch.exp((output.log_prob - old_log_prob) * scale_factor + mse / (2 * scale_factor))
+                        ratio = self._guard_ratio(output, replay, old_state_mean)
                         # PPO-style clipped loss
                         ratio_clip_range = self.training_args.clip_range
 
@@ -411,32 +552,12 @@ class GRPOGuardTrainer(GRPOTrainer):
                         # 4. Compute KL-div
                         if self.enable_kl_loss:
                             with self.autocast():
-                                with torch.no_grad(), self.adapter.use_ref_parameters():
-                                    ref_forward_inputs = forward_inputs.copy()
-                                    ref_forward_inputs['compute_log_prob'] = False
-                                    if self.training_args.kl_type == 'v-based':
-                                        # KL in velocity space
-                                        ref_forward_inputs['return_kwargs'] = ['velocity']
-                                        ref_output = self.adapter.forward(**ref_forward_inputs)
-                                    elif self.training_args.kl_type == 'x-based':
-                                        # KL in latent space
-                                        ref_forward_inputs['return_kwargs'] = ['next_latents_mean']
-                                        ref_output = self.adapter.forward(**ref_forward_inputs)
-
+                                ref_output = self._reference_forward(
+                                    batch, replay, (ref_return_field,)
+                                )
                                 # kl_div must be computed outside `torch.no_grad()` for correct gradient behavior.
                                 # See: issue #122, PR #123 (https://github.com/X-GenGroup/Flow-Factory/pull/123)
-                                if self.training_args.kl_type == 'v-based':
-                                    kl_div = torch.mean(
-                                        ((output.velocity - ref_output.velocity) ** 2),
-                                        dim=tuple(range(1, output.velocity.ndim)), keepdim=True
-                                    )
-                                elif self.training_args.kl_type == 'x-based':
-                                    kl_div = torch.mean(
-                                        ((output.next_latents_mean - ref_output.next_latents_mean) ** 2),
-                                        dim=tuple(range(1, output.next_latents_mean.ndim)), keepdim=True
-                                    )
-
-                                kl_div = torch.mean(kl_div)
+                                kl_div = self._reference_kl_divergence(output, ref_output, replay)
                                 kl_loss = self.training_args.kl_beta * kl_div
                                 loss += kl_loss
                                 loss_info['kl_div'].append(kl_div.detach())
