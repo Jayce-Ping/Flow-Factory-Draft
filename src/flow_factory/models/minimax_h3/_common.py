@@ -14,6 +14,7 @@
 
 """Model-independent MiniMax H3 multimodal trajectory helpers."""
 
+import math
 from typing import Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
@@ -504,6 +505,11 @@ def build_structured_trajectories(
                 f"expected component {component!r} with non-empty generated rows, "
                 f"received {tuple(values.shape)}"
             )
+        if values.shape[1] == 0:
+            raise ValueError(
+                f"expected states[{component!r}] stored dimension greater than zero, "
+                f"received {tuple(values.shape)}"
+            )
         batch_size = values.shape[0] if batch_size is None else batch_size
         if values.shape[0] != batch_size:
             raise ValueError(
@@ -542,6 +548,9 @@ def build_structured_trajectories(
         validated_callback_maps,
         batch_size=batch_size,
         num_transitions=num_transitions,
+        component_rows={
+            component: states[component].shape[2] for component in MINIMAX_H3_COMPONENT_ORDER
+        },
     )
 
     trajectories: List[StructuredTrajectory] = []
@@ -593,8 +602,13 @@ def _validate_sigma_transform_inputs(sigma: torch.Tensor, shift: float, function
             f"expected torch.Tensor sigma for {function}, received {type(sigma).__name__}"
         )
     _validate_unit_interval_tensor(sigma, f"{function} sigma")
-    if not isinstance(shift, (int, float)) or isinstance(shift, bool) or shift <= 0:
-        raise ValueError(f"expected positive shift for {function}, received {shift!r}")
+    if (
+        not isinstance(shift, (int, float))
+        or isinstance(shift, bool)
+        or not math.isfinite(float(shift))
+        or shift <= 0
+    ):
+        raise ValueError(f"expected finite positive shift for {function}, received {shift!r}")
 
 
 def _validate_unit_interval_tensor(values: torch.Tensor, field: str) -> None:
@@ -640,11 +654,10 @@ def _validate_component_times(times: ComponentTimes, state: LatentState) -> None
                     f"received {tuple(coordinate.shape)}"
                 )
             reference = state.components[component]
-            if coordinate.dtype != reference.dtype or coordinate.device != reference.device:
+            if coordinate.device != reference.device:
                 raise ValueError(
-                    f"expected ComponentTimes.{field}[{component!r}] dtype/device to match "
-                    f"state {reference.dtype}/{reference.device}, received "
-                    f"{coordinate.dtype}/{coordinate.device}"
+                    f"expected ComponentTimes.{field}[{component!r}] device to match "
+                    f"state {reference.device}, received {coordinate.device}"
                 )
             if not bool(torch.isfinite(coordinate).all()):
                 raise ValueError(
@@ -660,8 +673,8 @@ def _validate_component_times(times: ComponentTimes, state: LatentState) -> None
                 )
     for component in MINIMAX_H3_COMPONENT_ORDER:
         if not torch.allclose(
-            times.timestep[component],
-            times.sigma[component] * 1000,
+            times.timestep[component].float(),
+            times.sigma[component].float() * 1000,
             rtol=0,
             atol=1e-5,
         ):
@@ -832,6 +845,7 @@ def _validate_callbacks(
     *,
     batch_size: int,
     num_transitions: int,
+    component_rows: Mapping[str, int],
 ) -> Dict[str, Dict[str, torch.Tensor]]:
     if callbacks is None:
         if index_maps is not None:
@@ -866,6 +880,11 @@ def _validate_callbacks(
                     f"expected callbacks[{field!r}][{component!r}] shaped "
                     f"({batch_size}, stored, N, {width}), received "
                     f"{getattr(values, 'shape', None)}"
+                )
+            if values.shape[2] != component_rows[component]:
+                raise ValueError(
+                    f"callback {field!r} component {component!r} row geometry expected "
+                    f"{component_rows[component]}, received {values.shape[2]}"
                 )
             stored_length = stored_lengths.setdefault(component, values.shape[1])
             if values.shape[1] != stored_length:

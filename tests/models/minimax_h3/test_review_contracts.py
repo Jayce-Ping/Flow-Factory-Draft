@@ -131,11 +131,38 @@ def test_trajectory_builder_rejects_empty_batches_and_rows(
         )
 
 
+def test_trajectory_builder_rejects_zero_stored_states_and_callback_row_mismatch() -> None:
+    with pytest.raises(ValueError, match=r"stored dimension.*greater than zero"):
+        minimax_core.build_structured_trajectories(
+            states={
+                "video": torch.zeros(1, 0, 2, 96),
+                "audio": torch.zeros(1, 0, 3, 32),
+            },
+            state_index_map=torch.full((4,), -1),
+            schedule=_schedule(),
+        )
+    with pytest.raises(ValueError, match=r"callback.*video.*row geometry.*2.*3"):
+        minimax_core.build_structured_trajectories(
+            states={
+                "video": torch.zeros(1, 2, 2, 96),
+                "audio": torch.zeros(1, 2, 3, 32),
+            },
+            state_index_map=torch.tensor([0, 1, -1, -1]),
+            schedule=_schedule(),
+            callbacks={
+                "velocity": {
+                    "video": torch.zeros(1, 1, 3, 96),
+                    "audio": torch.zeros(1, 1, 3, 32),
+                }
+            },
+            callback_index_map=torch.tensor([0, -1, -1]),
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "bad_value", "message"),
     [
         ("sigma", torch.tensor([float("nan")]), r"sigma.*finite.*\[0, 1\]"),
-        ("timestep", torch.tensor([250.0], dtype=torch.float64), r"dtype.*state"),
         ("next_sigma", torch.tensor([0.1]), r"next_sigma.*zero"),
         ("timestep", torch.tensor([251.0]), r"timestep.*sigma.*1000"),
     ],
@@ -165,6 +192,33 @@ def test_component_times_validation_is_complete(
             times,
             generator=torch.Generator().manual_seed(1),
         )
+
+
+def test_component_times_allow_float32_coordinates_for_bfloat16_state() -> None:
+    state = LatentState(
+        {
+            "video": torch.zeros(1, 2, 96, dtype=torch.bfloat16),
+            "audio": torch.zeros(1, 3, 32, dtype=torch.bfloat16),
+        }
+    )
+    times = ComponentTimes(
+        timestep={"video": torch.tensor([250.0]), "audio": torch.tensor([250.0])},
+        next_timestep={"video": torch.zeros(1), "audio": torch.zeros(1)},
+        sigma={"video": torch.tensor([0.25]), "audio": torch.tensor([0.25])},
+        next_sigma={"video": torch.zeros(1), "audio": torch.zeros(1)},
+    )
+    result = minimax_core.draw_forward_process_noise(
+        state, times, generator=torch.Generator().manual_seed(1)
+    )
+    assert result.state.components["video"].dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("shift", [float("nan"), float("inf"), float("-inf")])
+def test_common_shift_transforms_reject_nonfinite_shift(shift: float) -> None:
+    with pytest.raises(ValueError, match=r"finite.*shift"):
+        minimax_core.shift_sigma(torch.tensor([0.5]), shift)
+    with pytest.raises(ValueError, match=r"finite.*shift"):
+        minimax_core.inverse_shift_sigma(torch.tensor([0.5]), shift)
 
 
 @pytest.mark.parametrize(
@@ -210,11 +264,7 @@ def test_trajectory_schedule_validation_is_complete(
     message: str,
 ) -> None:
     schedule_length = len(schedule["video"][0])
-    state_map = (
-        torch.tensor([0, 1])
-        if schedule_length == 2
-        else torch.tensor([0, 1, -1])
-    )
+    state_map = torch.tensor([0, 1]) if schedule_length == 2 else torch.tensor([0, 1, -1])
     with pytest.raises((TypeError, ValueError), match=message):
         minimax_core.build_structured_trajectories(
             states={

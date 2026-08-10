@@ -66,22 +66,19 @@ def test_step_rejects_conflicting_dynamics_override() -> None:
 
 
 @pytest.mark.parametrize("dynamics_type", ["Flow-SDE", "Dance-SDE", "CPS"])
-def test_zero_variance_log_prob_fails_with_context(dynamics_type: str) -> None:
+def test_zero_variance_log_prob_returns_zero_sentinel(dynamics_type: str) -> None:
     scheduler = MiniMaxH3SDEScheduler(
         dynamics_type=dynamics_type,
         noise_level=0.0,
     )
     scheduler.set_timesteps(3)
-    with pytest.raises(
-        ValueError,
-        match=rf"zero transition variance.*{dynamics_type}.*noise_level.*0",
-    ):
-        scheduler.step(
-            torch.ones(1, 2),
-            scheduler.timesteps[0],
-            torch.zeros(1, 2),
-            compute_log_prob=True,
-        )
+    output = scheduler.step(
+        torch.ones(1, 2),
+        scheduler.timesteps[0],
+        torch.zeros(1, 2),
+        compute_log_prob=True,
+    )
+    assert torch.equal(output.log_prob, torch.zeros(1))
 
 
 def test_constructor_and_return_fields_fail_fast_on_unknown_values() -> None:
@@ -115,6 +112,13 @@ def test_loader_accepts_shift_and_all_scheduler_arguments() -> None:
     assert scheduler.seed == 17
 
 
+def test_loader_filters_real_diffusers_private_config_metadata() -> None:
+    upstream = type("MiniMaxH3Scheduler", (), {})()
+    upstream.config = {"shift": 12.0, "_use_default_values": ["shift"]}
+    scheduler = load_scheduler(upstream, SchedulerArguments())
+    assert scheduler.shift == 12.0
+
+
 @pytest.mark.parametrize("shift", [float("nan"), float("inf"), 0.0])
 def test_shift_requires_a_finite_positive_value(shift: float) -> None:
     with pytest.raises(ValueError, match=r"positive finite shift"):
@@ -130,6 +134,63 @@ def test_step_rejects_empty_batches() -> None:
             scheduler.timesteps[0],
             torch.empty(0, 2),
         )
+
+
+@pytest.mark.parametrize("noise_level", [float("nan"), float("inf"), float("-inf")])
+def test_noise_level_must_be_finite_in_constructor_and_step(noise_level: float) -> None:
+    with pytest.raises(ValueError, match=r"finite.*noise_level"):
+        MiniMaxH3SDEScheduler(noise_level=noise_level)
+    scheduler = MiniMaxH3SDEScheduler()
+    scheduler.set_timesteps(3)
+    with pytest.raises(ValueError, match=r"finite.*noise_level"):
+        scheduler.step(
+            torch.ones(1, 2),
+            scheduler.timesteps[0],
+            torch.zeros(1, 2),
+            noise_level=noise_level,
+        )
+
+
+def test_batched_implicit_and_explicit_coordinates_match_batch_cardinality() -> None:
+    scheduler = MiniMaxH3SDEScheduler(dynamics_type="ODE")
+    scheduler.set_timesteps(3)
+    with pytest.raises(ValueError, match=r"timestep.*batch size 2.*3"):
+        scheduler.step(torch.ones(2, 1), scheduler.timesteps, torch.zeros(2, 1))
+    with pytest.raises(ValueError, match=r"sigma.*batch size 2.*3"):
+        scheduler.step(
+            torch.ones(2, 1),
+            scheduler.timesteps[0],
+            torch.zeros(2, 1),
+            sigma=torch.tensor([1.0, 0.8, 0.6]),
+            sigma_next=torch.tensor([0.8, 0.6, 0.4]),
+        )
+
+
+@pytest.mark.parametrize("dynamics_type", ["Flow-SDE", "Dance-SDE", "CPS"])
+def test_deterministic_last_step_returns_zero_log_prob(dynamics_type: str) -> None:
+    scheduler = MiniMaxH3SDEScheduler(
+        dynamics_type=dynamics_type,
+        noise_level=0.4,
+    )
+    scheduler.set_timesteps(3)
+    output = scheduler.step(
+        torch.ones(2, 1),
+        scheduler.timesteps[-1],
+        torch.zeros(2, 1),
+    )
+    assert torch.equal(output.log_prob, torch.zeros(2))
+
+
+def test_eval_sde_step_returns_zero_log_prob_sentinel() -> None:
+    scheduler = MiniMaxH3SDEScheduler(dynamics_type="Flow-SDE")
+    scheduler.set_timesteps(3)
+    scheduler.eval()
+    output = scheduler.step(
+        torch.ones(2, 1),
+        scheduler.timesteps[0],
+        torch.zeros(2, 1),
+    )
+    assert torch.equal(output.log_prob, torch.zeros(2))
 
 
 @pytest.mark.parametrize("dynamics_type", ["Flow-SDE", "Dance-SDE", "CPS"])
@@ -160,9 +221,10 @@ def test_sde_formula_oracle_is_independent_and_complete(dynamics_type: str) -> N
     x0 = latents + (1 - (1 - sigma)) * velocity_h3
     if dynamics_type == "Flow-SDE":
         std = torch.sqrt(sigma / (1 - sigma)) * noise_level
-        mean = latents * (1 + std**2 / (2 * sigma) * dt) + standard_velocity * (
-            1 + std**2 * (1 - sigma) / (2 * sigma)
-        ) * dt
+        mean = (
+            latents * (1 + std**2 / (2 * sigma) * dt)
+            + standard_velocity * (1 + std**2 * (1 - sigma) / (2 * sigma)) * dt
+        )
         scale = std * torch.sqrt(-dt)
         denominator = std**2 * (-dt)
     elif dynamics_type == "Dance-SDE":
