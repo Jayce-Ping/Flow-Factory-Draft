@@ -91,10 +91,11 @@ from .runtime import ClassicPipelineRuntime, ComponentRuntime
 from .trajectory_bridge import (
     _add_forward_process_noise,
     _apply_forward_process_noise,
+    _build_forward_state_kwargs,
     _build_training_component_times,
+    _default_forward_state,
     _default_reduce_component_latent_values,
     _default_reduce_latent_values,
-    _forward_state,
     _get_replay_callback,
     _get_replay_step,
     _get_state_active_numel,
@@ -190,6 +191,22 @@ class BaseAdapter(ABC):
     # leaves it False, DDP fails fast at the first backward with an explicit
     # "didn't receive grad" error rather than silently producing wrong results.
     ddp_find_unused_parameters: ClassVar[bool] = False
+
+    # Public wrappers that own a shared contract (argument ownership, validation)
+    # and delegate the component-specific part to the protected hook of the same
+    # name. Overriding one would silently bypass that contract, so subclasses are
+    # rejected at class creation instead of at training time.
+    _BOUNDARY_OWNING_METHODS: ClassVar[Tuple[str, ...]] = ("forward_state",)
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        for name in BaseAdapter._BOUNDARY_OWNING_METHODS:
+            if name in cls.__dict__:
+                raise TypeError(
+                    f"adapter {cls.__name__} must not override BaseAdapter.{name}: it owns the "
+                    f"shared forward-argument boundary (state-owned, trajectory-storage and "
+                    f"trainer-metadata keys). Override the protected hook _{name} instead."
+                )
 
     def __init__(self, config: Arguments, accelerator : Accelerator):
         super().__init__()
@@ -2514,18 +2531,24 @@ class BaseAdapter(ABC):
         noise_level: Optional[float] = None,
         **kwargs: Any,
     ) -> MultiModalStepOutput:
-        """Bridge a one-component state into the existing adapter ``forward`` API.
+        """Run one state through the model, owning the forward-argument boundary.
 
-        Trainer-owned training arguments remain caller inputs in ``kwargs``. They
-        must not collide with state-owned forward arguments. Batch-level state-owned
-        keys are discarded in favor of the bridge-owned state, times, return fields,
-        and noise level; explicit kwargs with those names raise an error.
+        This wrapper resolves the arguments the model may see and then dispatches
+        to :meth:`_forward_state`. Override the hook, not this method, so a
+        component-specific implementation cannot bypass the shared boundary:
+
+        - explicit kwargs naming a state-owned argument (``t``, ``latents``, ...)
+          or a bridge-owned one (trajectory storage, trainer metadata) raise;
+        - batch-level state-owned keys are dropped in favor of the bridge-owned
+          state, times, return fields and noise level;
+        - trajectory storage and trainer metadata (e.g. ``advantage``) are read
+          from the batch by the bridge and never forwarded to the model.
 
         Args:
             batch: Collated sample batch supplying conditioning arguments.
-            state: Current state containing exactly ``"latent"``.
-            times: Current and next times containing exactly ``"latent"``.
-            next_state: Optional stored next state containing exactly ``"latent"``.
+            state: Current state in ``trajectory_component_order``.
+            times: Current and next times in ``trajectory_component_order``.
+            next_state: Optional stored next state in ``trajectory_component_order``.
             compute_log_prob: Whether to compute transition log probability.
             return_fields: Existing scheduler output fields requested from ``forward``.
             noise_level: Existing scheduler noise-level override.
@@ -2534,7 +2557,53 @@ class BaseAdapter(ABC):
         Returns:
             Multi-modal wrapper around the unchanged legacy scheduler output.
         """
-        return _forward_state(
+        return self._forward_state(
+            batch=batch,
+            state=state,
+            times=times,
+            next_state=next_state,
+            compute_log_prob=compute_log_prob,
+            return_fields=return_fields,
+            noise_level=noise_level,
+            forward_kwargs=_build_forward_state_kwargs(self, batch, kwargs),
+        )
+
+    def _forward_state(
+        self,
+        *,
+        batch: StackedSampleBatch,
+        state: LatentState,
+        times: ComponentTimes,
+        next_state: Optional[LatentState],
+        compute_log_prob: bool,
+        return_fields: Tuple[str, ...],
+        noise_level: Optional[float],
+        forward_kwargs: Mapping[str, Any],
+    ) -> MultiModalStepOutput:
+        """Pack one state for this adapter's ``forward`` and unpack the output.
+
+        Default single-component behavior: require exactly ``"latent"``, map the
+        state and times onto the legacy ``forward`` arguments, and wrap the
+        scheduler output. Heterogeneous adapters override this hook to pack and
+        unpack their own components; ``forward_kwargs`` is already stripped of
+        state-owned, trajectory-storage and trainer-metadata keys, so an override
+        may forward it as-is (after the usual signature filtering).
+
+        Args:
+            batch: Collated sample batch, for conditioning an override needs to
+                derive per component; storage fields must not be forwarded.
+            state: Current state in ``trajectory_component_order``.
+            times: Current and next times in ``trajectory_component_order``.
+            next_state: Optional stored next state in ``trajectory_component_order``.
+            compute_log_prob: Whether to compute transition log probability.
+            return_fields: Existing scheduler output fields requested from ``forward``.
+            noise_level: Existing scheduler noise-level override.
+            forward_kwargs: Model-conditioning arguments resolved by the wrapper.
+
+        Returns:
+            Multi-modal wrapper around this adapter's scheduler output.
+        """
+        return _default_forward_state(
             self,
             batch=batch,
             state=state,
@@ -2543,7 +2612,7 @@ class BaseAdapter(ABC):
             compute_log_prob=compute_log_prob,
             return_fields=return_fields,
             noise_level=noise_level,
-            kwargs=kwargs,
+            forward_kwargs=forward_kwargs,
         )
 
     def reduce_component_latent_values(

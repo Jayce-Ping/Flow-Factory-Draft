@@ -679,18 +679,20 @@ def _add_forward_process_noise(
     )
 
 
-def _forward_state(
+def _build_forward_state_kwargs(
     adapter: Any,
-    *,
     batch: StackedSampleBatch,
-    state: LatentState,
-    times: ComponentTimes,
-    next_state: Optional[LatentState],
-    compute_log_prob: bool,
-    return_fields: Tuple[str, ...],
-    noise_level: Optional[float],
     kwargs: Mapping[str, Any],
-) -> MultiModalStepOutput:
+) -> Dict[str, Any]:
+    """Resolve the forward arguments every ``forward_state`` override may pass on.
+
+    Owns the whole argument boundary: the state, times, return fields and noise
+    level belong to the bridge, and trajectory storage plus trainer metadata are
+    read from the batch rather than forwarded. Batch conditioning is resolved
+    first and explicit kwargs are layered on top; trainers drop the keys the batch
+    already carries before calling, which reproduces the legacy precedence of
+    ``forward(**training_args, **batch)``.
+    """
     collisions = tuple(name for name in _STATE_OWNED_FORWARD_KEYS if name in kwargs)
     if collisions:
         raise ValueError(
@@ -700,9 +702,30 @@ def _forward_state(
     if owned:
         raise ValueError(
             f"explicit forward_state kwargs collide with trainer-owned arguments {owned}; the "
-            "bridge reads trajectory storage and trainer metadata from the batch and never "
-            "forwards them to adapter.forward"
+            f"{type(adapter).__name__} bridge reads trajectory storage and trainer metadata from "
+            "the batch and never forwards them to the model"
         )
+    forward_kwargs = {
+        key: value
+        for key, value in batch.items()
+        if key not in _BRIDGE_OWNED_BATCH_KEYS and key not in _STATE_OWNED_FORWARD_KEYS
+    }
+    forward_kwargs.update(kwargs)
+    return forward_kwargs
+
+
+def _default_forward_state(
+    adapter: Any,
+    *,
+    batch: StackedSampleBatch,
+    state: LatentState,
+    times: ComponentTimes,
+    next_state: Optional[LatentState],
+    compute_log_prob: bool,
+    return_fields: Tuple[str, ...],
+    noise_level: Optional[float],
+    forward_kwargs: Mapping[str, Any],
+) -> MultiModalStepOutput:
     expected_names = ("latent",)
     received = {
         "state": state.component_names,
@@ -720,13 +743,6 @@ def _forward_state(
             f"expected exactly component order {expected_names} for default forward_state, "
             f"received {received}"
         )
-    forward_kwargs = {
-        key: value
-        for key, value in batch.items()
-        if key not in _BRIDGE_OWNED_BATCH_KEYS and key not in _STATE_OWNED_FORWARD_KEYS
-    }
-    forward_kwargs.update(kwargs)
-    forward_kwargs = filter_kwargs(adapter.forward, **forward_kwargs)
     output = adapter.forward(
         t=times.timestep["latent"],
         t_next=times.next_timestep["latent"],
@@ -735,7 +751,7 @@ def _forward_state(
         compute_log_prob=compute_log_prob,
         return_kwargs=return_fields,
         noise_level=noise_level,
-        **forward_kwargs,
+        **filter_kwargs(adapter.forward, **forward_kwargs),
     )
     if not isinstance(output, SDESchedulerOutput):
         raise TypeError(

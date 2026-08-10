@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from types import SimpleNamespace
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import pytest
 import torch
@@ -21,9 +21,12 @@ import torch
 from flow_factory.models.abc import BaseAdapter
 from flow_factory.samples import (
     BaseSample,
+    ComponentTimes,
     ComponentTrajectory,
     IndexedTrajectoryTensor,
     LatentState,
+    MultiModalStepOutput,
+    StackedSampleBatch,
     StructuredTrajectory,
 )
 from flow_factory.scheduler import SchedulerGroup, SDESchedulerOutput
@@ -505,6 +508,111 @@ def test_forward_state_never_forwards_trainer_metadata_or_trajectory_storage() -
         "log_probs",
         "log_prob_index_map",
     }
+
+
+class StructuredForwardStateAdapterFake(StructuredAdapterFake):
+    """Structured adapter overriding only the protected forward-state hook."""
+
+    def _forward_state(
+        self,
+        *,
+        batch: StackedSampleBatch,
+        state: LatentState,
+        times: ComponentTimes,
+        next_state: Optional[LatentState],
+        compute_log_prob: bool,
+        return_fields: Tuple[str, ...],
+        noise_level: Optional[float],
+        forward_kwargs: Dict[str, Any],
+    ) -> MultiModalStepOutput:
+        """Record the kwargs the common wrapper handed over, per component."""
+        self.hook_forward_kwargs = forward_kwargs
+        return MultiModalStepOutput(
+            velocity=LatentState({name: value + 3 for name, value in state.components.items()})
+        )
+
+
+def _structured_forward_state_adapter() -> StructuredForwardStateAdapterFake:
+    adapter = object.__new__(StructuredForwardStateAdapterFake)
+    adapter.pipeline = SimpleNamespace(scheduler=SchedulerFake())
+    return adapter
+
+
+def _structured_state_and_times() -> Any:
+    state = LatentState({"video": torch.zeros(2, 3), "audio": torch.ones(2, 5)})
+    times = ComponentTimes(
+        timestep={"video": torch.full((2,), 900.0), "audio": torch.full((2,), 800.0)},
+        next_timestep={"video": torch.zeros(2), "audio": torch.zeros(2)},
+    )
+    return state, times
+
+
+def test_forward_state_hands_a_structured_override_clean_forward_kwargs() -> None:
+    adapter = _structured_forward_state_adapter()
+    batch = _trainer_metadata_batch()
+    state, times = _structured_state_and_times()
+
+    output = adapter.forward_state(
+        batch=batch,
+        state=state,
+        times=times,
+        compute_log_prob=False,
+        return_fields=("velocity",),
+        guidance_scale=3.5,
+    )
+
+    assert "advantage" in batch
+    assert adapter.hook_forward_kwargs["guidance_scale"] == 3.5
+    assert torch.equal(adapter.hook_forward_kwargs["prompt_embeds"], batch["prompt_embeds"])
+    assert not set(adapter.hook_forward_kwargs) & {
+        "advantage",
+        "trajectory",
+        "timesteps",
+        "all_latents",
+        "latent_index_map",
+        "log_probs",
+        "log_prob_index_map",
+        "t",
+        "t_next",
+        "latents",
+        "next_latents",
+        "compute_log_prob",
+        "return_kwargs",
+        "noise_level",
+    }
+    assert torch.equal(output.velocity.components["audio"], state.components["audio"] + 3)
+
+
+def test_overriding_the_public_forward_state_fails_at_class_creation() -> None:
+    with pytest.raises(
+        TypeError,
+        match=r"must not override BaseAdapter.forward_state.*_forward_state",
+    ):
+
+        class BypassingAdapterFake(AdapterFake):
+            """Adapter attempting to replace the common ownership boundary."""
+
+            def forward_state(self, **kwargs: Any) -> MultiModalStepOutput:
+                """Never reached: the override is rejected at class creation."""
+                raise AssertionError("unreachable")
+
+
+def test_forward_state_override_cannot_bypass_the_ownership_boundary() -> None:
+    adapter = _structured_forward_state_adapter()
+    batch = _trainer_metadata_batch()
+    state, times = _structured_state_and_times()
+
+    with pytest.raises(ValueError, match=r"collide with trainer-owned arguments"):
+        adapter.forward_state(
+            batch=batch,
+            state=state,
+            times=times,
+            compute_log_prob=False,
+            return_fields=("velocity",),
+            advantage=torch.zeros(2),
+        )
+
+    assert not hasattr(adapter, "hook_forward_kwargs")
 
 
 def test_forward_state_rejects_explicit_trainer_metadata_kwargs() -> None:
