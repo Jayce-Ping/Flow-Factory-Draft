@@ -13,12 +13,36 @@
 # limitations under the License.
 
 import inspect
+import json
+from importlib import metadata
 
 import pytest
 import torch
 
 from flow_factory.models.minimax_h3 import dependency
 from flow_factory.models.runtime import ModularPipelineRuntime
+
+
+def _read_diffusers_direct_url() -> tuple[str, dict]:
+    distribution = metadata.distribution("diffusers")
+    version = distribution.version
+    direct_url_text = distribution.read_text("direct_url.json")
+    assert direct_url_text is not None, (
+        "installed diffusers must expose direct_url.json for exact revision verification; "
+        f"version={version!r}, direct_url.json={direct_url_text!r}"
+    )
+    try:
+        direct_url = json.loads(direct_url_text)
+    except json.JSONDecodeError as error:
+        raise AssertionError(
+            "installed diffusers direct_url.json must contain valid JSON; "
+            f"version={version!r}, direct_url.json={direct_url_text!r}"
+        ) from error
+    assert isinstance(direct_url, dict), (
+        "installed diffusers direct_url.json must contain an object; "
+        f"version={version!r}, direct_url.json={direct_url!r}"
+    )
+    return version, direct_url
 
 
 @pytest.fixture(scope="module")
@@ -29,6 +53,17 @@ def pinned_symbols():
             "the dependency failure contract is covered separately"
         )
     return dependency.require_minimax_h3_support()
+
+
+def test_installed_diffusers_revision_matches_required_commit(pinned_symbols) -> None:
+    version, direct_url = _read_diffusers_direct_url()
+    vcs_info = direct_url.get("vcs_info")
+    diagnostic = f"version={version!r}, direct_url.json={direct_url!r}"
+
+    assert isinstance(vcs_info, dict), diagnostic
+    assert vcs_info.get("vcs") == "git", diagnostic
+    assert vcs_info.get("requested_revision") == dependency.MINIMAX_H3_DIFFUSERS_COMMIT, diagnostic
+    assert vcs_info.get("commit_id") == dependency.MINIMAX_H3_DIFFUSERS_COMMIT, diagnostic
 
 
 def test_real_pinned_symbols_preserve_workflows_and_callable_surfaces(pinned_symbols) -> None:
