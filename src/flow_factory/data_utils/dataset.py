@@ -32,7 +32,8 @@ from datasets.utils.logging import disable_progress_bar
 from PIL import Image
 from torch.utils.data import Dataset
 
-from ..utils.audio import load_audio
+from ..samples.references import canonicalize_reference_manifest
+from ..utils.audio import _load_audio_backend, load_audio
 from ..utils.base import (
     filter_kwargs,
     pil_image_to_tensor,
@@ -62,48 +63,59 @@ EXTRA_PYTHON_FORMAT_COLUMNS = frozenset({METADATA_COLUMN})
 # Protocol Definitions
 # ========================================================================================
 
+
 class TextEncodeCallable(Protocol):
     """Protocol for text encoding functions."""
-    def __call__(self, prompt: Union[str, List[str]], **kwargs: Any) -> Dict[str, Any]:
-        ...
+
+    def __call__(self, prompt: Union[str, List[str]], **kwargs: Any) -> Dict[str, Any]: ...
+
 
 class ImageEncodeCallable(Protocol):
     """Protocol for image encoding functions."""
-    def __call__(self, image: Union[Image.Image, List[Image.Image]], **kwargs: Any) -> Dict[str, Any]:
-        ...
+
+    def __call__(
+        self, image: Union[Image.Image, List[Image.Image]], **kwargs: Any
+    ) -> Dict[str, Any]: ...
+
 
 class VideoEncodeCallable(Protocol):
     """Protocol for video encoding functions."""
-    def __call__(self, video: Union[List[Image.Image], List[List[Image.Image]]], **kwargs: Any) -> Dict[str, Any]:
-        ...
+
+    def __call__(
+        self, video: Union[List[Image.Image], List[List[Image.Image]]], **kwargs: Any
+    ) -> Dict[str, Any]: ...
+
 
 class PreprocessCallable(Protocol):
     """Protocol for preprocessing functions that handle multi-modal inputs."""
+
     def __call__(
         self,
         prompt: Optional[Union[str, List[str]]],
         images: Optional[Union[Image.Image, List[Image.Image], List[List[Image.Image]]]],
-        videos: Optional[Union[List[Image.Image], List[List[Image.Image]], List[List[List[Image.Image]]]]],
-        **kwargs: Any
-    ) -> Dict[str, Any]:
-        ...
+        videos: Optional[
+            Union[List[Image.Image], List[List[Image.Image]], List[List[List[Image.Image]]]]
+        ],
+        **kwargs: Any,
+    ) -> Dict[str, Any]: ...
 
 
 # ========================================================================================
 # GeneralDataset Class
 # ========================================================================================
 
+
 class GeneralDataset(Dataset):
     """
     General-purpose dataset for multi-modal data (text, images, videos).
-    
+
     Supports:
     - Loading from JSONL or TXT files
     - Optional preprocessing with caching
     - Distributed preprocessing across multiple GPUs
     - Automatic cache management and merging
     """
-    
+
     @staticmethod
     def check_exists(dataset_dir: str, split: str) -> bool:
         """Check if dataset files exist for a given split."""
@@ -183,11 +195,29 @@ class GeneralDataset(Dataset):
         self.image_dir = image_dir
         self.video_dir = video_dir
         self.audio_dir = audio_dir
+        self._uses_ordered_references = _supports_ordered_references(preprocess_func)
 
         if self.shard_index is not None and self.shard_index > 0:
             disable_progress_bar()
 
         raw_dataset = self._load_raw_dataset()
+        self._ordered_reference_source_hash = ""
+        if self._uses_ordered_references:
+            if "references" not in raw_dataset.column_names:
+                raise ValueError(
+                    "ordered-reference preprocessing requires a references column, "
+                    f"got columns={raw_dataset.column_names!r} in {self.data_root!r}"
+                )
+            canonical_manifests = [
+                canonicalize_reference_manifest(references, row_index=row_index)
+                for row_index, references in enumerate(raw_dataset["references"])
+            ]
+            self._ordered_reference_source_hash = hashlib.sha256(
+                "\n".join(canonical_manifests).encode("utf-8")
+            ).hexdigest()
+            extra_hash_strs = list(extra_hash_strs or []) + [
+                f"ordered-references:{self._ordered_reference_source_hash}"
+            ]
 
         if max_dataset_size is not None and len(raw_dataset) > max_dataset_size:
             raw_dataset = raw_dataset.select(range(max_dataset_size))
@@ -212,14 +242,20 @@ class GeneralDataset(Dataset):
         """Load raw dataset from JSONL or TXT file."""
         jsonl_path = os.path.join(self.data_root, f"{self.split}.jsonl")
         txt_path = os.path.join(self.data_root, f"{self.split}.txt")
-        
+
         if os.path.exists(jsonl_path):
             raw_dataset = load_dataset("json", data_files=jsonl_path, split="train")
-            self.image_dir = os.path.join(self.data_root, "images") if self.image_dir is None else self.image_dir
-            self.video_dir = os.path.join(self.data_root, "videos") if self.video_dir is None else self.video_dir
-            self.audio_dir = os.path.join(self.data_root, "audios") if self.audio_dir is None else self.audio_dir
+            self.image_dir = (
+                os.path.join(self.data_root, "images") if self.image_dir is None else self.image_dir
+            )
+            self.video_dir = (
+                os.path.join(self.data_root, "videos") if self.video_dir is None else self.video_dir
+            )
+            self.audio_dir = (
+                os.path.join(self.data_root, "audios") if self.audio_dir is None else self.audio_dir
+            )
         elif os.path.exists(txt_path):
-            with open(txt_path, 'r', encoding='utf-8') as f:
+            with open(txt_path, "r", encoding="utf-8") as f:
                 prompts = [line.strip() for line in f if line.strip()]
             raw_dataset = HFDataset.from_dict({"prompt": prompts})
             self.image_dir = None if self.image_dir is None else self.image_dir
@@ -228,7 +264,7 @@ class GeneralDataset(Dataset):
             logger.info(f"Loaded {len(prompts)} prompts from {txt_path}")
         else:
             raise FileNotFoundError(f"Could not find {jsonl_path} or {txt_path}")
-        
+
         return raw_dataset
 
     def _preprocess_dataset(
@@ -299,6 +335,7 @@ class GeneralDataset(Dataset):
                 "image_dir": self.image_dir,
                 "video_dir": self.video_dir,
                 "audio_dir": self.audio_dir,
+                "data_root": self.data_root,
             },
             remove_columns=raw_dataset.column_names,
             new_fingerprint=shard_fingerprint,
@@ -314,12 +351,12 @@ class GeneralDataset(Dataset):
     def _shard_dataset(self, dataset: HFDataset, shard_index: int, num_shards: int) -> HFDataset:
         """
         Split dataset into shards for distributed preprocessing.
-        
+
         Args:
             dataset: Full dataset to shard
             shard_index: Index of current shard (0 to num_shards-1)
             num_shards: Total number of shards
-            
+
         Returns:
             Sharded subset of the dataset
         """
@@ -334,6 +371,7 @@ class GeneralDataset(Dataset):
         image_dir: Optional[str],
         video_dir: Optional[str],
         audio_dir: Optional[str],
+        data_root: str,
     ) -> Dict[str, Any]:
         """
         Preprocess a batch of samples.
@@ -378,32 +416,46 @@ class GeneralDataset(Dataset):
             forces every downstream consumer to handle three input shapes.
         """
         assert self._preprocess_func is not None, "Preprocess function must be provided."
+        if self._uses_ordered_references and len(batch["prompt"]) != 1:
+            raise ValueError(
+                "ordered-reference preprocessing expected B=1, "
+                f"received B={len(batch['prompt'])} for split={self.split!r}"
+            )
         # The columns that are used in preprocess and maintained in the final results.
-        PREPROCESS_COLUMNS = ('prompt', 'negative_prompt', 'images', 'videos', 'audios')
-        
+        PREPROCESS_COLUMNS = (
+            "prompt",
+            "negative_prompt",
+            "images",
+            "videos",
+            "audios",
+        )
+        metadata_excluded_columns = set(PREPROCESS_COLUMNS)
+        if self._uses_ordered_references:
+            metadata_excluded_columns.update({"references", "reference_manifest"})
+
         # 1. Prepare prompt inputs (text)
         prompt = batch["prompt"]
         negative_prompt = batch.get("negative_prompt", None)
-        prompt_args = {'prompt': prompt}
+        prompt_args = {"prompt": prompt}
         if negative_prompt is not None:
-            prompt_args['negative_prompt'] = negative_prompt
-        
-        # 2. Prepare image inputs (only when image_dir exists and batch has images)
-        if 'image' in batch:
-            batch['images'] = batch.pop('image')  # Rename for consistency
+            prompt_args["negative_prompt"] = negative_prompt
 
-        image_args = {'images': None}
+        # 2. Prepare image inputs (only when image_dir exists and batch has images)
+        if "image" in batch:
+            batch["images"] = batch.pop("image")  # Rename for consistency
+
+        image_args = {"images": None}
         if image_dir is not None and "images" in batch:
             img_paths_list = batch["images"]
-            batch['images'] = []  # Clear
-            image_args['images'] = []
+            batch["images"] = []  # Clear
+            image_args["images"] = []
             for img_paths in img_paths_list:
                 if not img_paths:
                     # Empty sample contributes [] to both args and batch so the
                     # column stays a homogeneous List[List[...]] (MultiImageBatch)
                     # and HF.map(batched=True) sees matching column lengths.
-                    image_args['images'].append([])
-                    batch['images'].append([])
+                    image_args["images"].append([])
+                    batch["images"].append([])
                 else:
                     if isinstance(img_paths, str):
                         img_paths = [img_paths]
@@ -411,28 +463,28 @@ class GeneralDataset(Dataset):
                         Image.open(_resolve_path(image_dir, img_path)).convert("RGB")
                         for img_path in img_paths
                     ]
-                    image_args['images'].append(images)
+                    image_args["images"].append(images)
                     # Persist as PIL (not tensors) so HF stores this column via the
                     # Image feature. Ragged image tensors (variable size/count, e.g.
                     # multi-reference I2I) are not Arrow-serializable.
-                    batch['images'].append(images)
+                    batch["images"].append(images)
 
         # 3. Prepare video inputs (only when video_dir exists and batch has videos)
-        if 'video' in batch:
-            batch['videos'] = batch.pop('video')  # Rename for consistency
+        if "video" in batch:
+            batch["videos"] = batch.pop("video")  # Rename for consistency
 
-        video_args = {'videos': None}
+        video_args = {"videos": None}
         if video_dir is not None and "videos" in batch:
             video_paths_list = batch["videos"]
-            batch['videos'] = []  # Clear
-            video_args['videos'] = []
+            batch["videos"] = []  # Clear
+            video_args["videos"] = []
             for video_paths in video_paths_list:
                 if not video_paths:
                     # Empty sample contributes [] to both args and batch so the
                     # column stays a homogeneous List[List[...]] (MultiVideoBatch)
                     # and HF.map(batched=True) sees matching column lengths.
-                    video_args['videos'].append([])
-                    batch['videos'].append([])
+                    video_args["videos"].append([])
+                    batch["videos"].append([])
                 else:
                     if isinstance(video_paths, str):
                         video_paths = [video_paths]
@@ -441,28 +493,26 @@ class GeneralDataset(Dataset):
                         load_video_frames(_resolve_path(video_dir, video_path))
                         for video_path in video_paths
                     ]
-                    video_pts = [
-                        pil_image_to_tensor(video) for video in videos
-                    ]
-                    video_args['videos'].append(videos)
-                    batch['videos'].append(video_pts)
+                    video_pts = [pil_image_to_tensor(video) for video in videos]
+                    video_args["videos"].append(videos)
+                    batch["videos"].append(video_pts)
 
         # 4. Prepare audio inputs (only when audio_dir exists and batch has audios)
-        if 'audio' in batch:
-            batch['audios'] = batch.pop('audio')  # Rename for consistency
+        if "audio" in batch:
+            batch["audios"] = batch.pop("audio")  # Rename for consistency
 
-        audio_args = {'audios': None}
+        audio_args = {"audios": None}
         if audio_dir is not None and "audios" in batch:
             audio_paths_list = batch["audios"]
-            batch['audios'] = []  # Clear
-            audio_args['audios'] = []
+            batch["audios"] = []  # Clear
+            audio_args["audios"] = []
             for audio_paths in audio_paths_list:
                 if not audio_paths:
                     # Empty sample contributes [] to both args and batch so the
                     # column stays a homogeneous List[List[Tensor]] (MultiAudioBatch)
                     # and HF.map(batched=True) sees matching column lengths.
-                    audio_args['audios'].append([])
-                    batch['audios'].append([])
+                    audio_args["audios"].append([])
+                    batch["audios"].append([])
                 else:
                     if isinstance(audio_paths, str):
                         audio_paths = [audio_paths]
@@ -472,11 +522,32 @@ class GeneralDataset(Dataset):
                     ]
                     # Always store as List[Tensor] (no single-audio unwrap) so
                     # downstream encode_audio sees a uniform type within the batch.
-                    audio_args['audios'].append(audios)
-                    batch['audios'].append(audios)
+                    audio_args["audios"].append(audios)
+                    batch["audios"].append(audios)
+
+        reference_args: Dict[str, Any] = {}
+        if self._uses_ordered_references:
+            raw_references = batch.pop("references")
+            loaded_reference_batch = []
+            canonical_manifests = []
+            for row_offset, references in enumerate(raw_references):
+                manifest = canonicalize_reference_manifest(references, row_index=row_offset)
+                canonical_manifests.append(manifest)
+                loaded_reference_batch.append(
+                    [_load_ordered_reference(entry, data_root) for entry in json.loads(manifest)]
+                )
+            reference_args["references"] = loaded_reference_batch
+            batch["reference_manifest"] = canonical_manifests
 
         # 5. Call preprocess function with filtered kwargs
-        input_args = {**prompt_args, **image_args, **video_args, **audio_args, **self._preprocess_kwargs}
+        input_args = {
+            **prompt_args,
+            **image_args,
+            **video_args,
+            **audio_args,
+            **reference_args,
+            **self._preprocess_kwargs,
+        }
         filtered_args = filter_kwargs(self._preprocess_func, **input_args)
         preprocess_res = self._preprocess_func(**filtered_args)
 
@@ -514,6 +585,8 @@ class GeneralDataset(Dataset):
 
         # 7. Prepare final results
         batch_dict = {**batch, **final_res}
+        if self._uses_ordered_references:
+            _validate_arrow_safe_ordered_result(batch_dict, len(batch["prompt"]))
         # Pack non-preprocess fields into the METADATA_COLUMN (dict[list] -> list[dict]).
         # At sample time, BaseTrainer._inject_batch_metadata stores each per-sample
         # dict as a single JSON string under `sample.extra_kwargs['metadata']`.
@@ -522,8 +595,8 @@ class GeneralDataset(Dataset):
         # Complex values (nested lists/dicts) in the source JSONL must already be
         # stored as JSON strings for Arrow compatibility.
         batch_dict[METADATA_COLUMN] = [
-            {k: v[idx] for k,v in batch.items() if k not in PREPROCESS_COLUMNS}
-            for idx in range(len(batch['prompt']))
+            {k: v[idx] for k, v in batch.items() if k not in metadata_excluded_columns}
+            for idx in range(len(batch["prompt"]))
         ]
 
         return batch_dict
@@ -532,10 +605,10 @@ class GeneralDataset(Dataset):
     def load_merged(cls, merged_cache_path: str) -> "GeneralDataset":
         """
         Load preprocessed dataset from merged cache.
-        
+
         Args:
             merged_cache_path: Path to merged cache directory
-            
+
         Returns:
             GeneralDataset instance with loaded data
         """
@@ -548,7 +621,7 @@ class GeneralDataset(Dataset):
         instance.processed_dataset = loaded
         _apply_torch_format(instance.processed_dataset)
         return instance
-    
+
     @staticmethod
     def compute_cache_path(
         dataset_dir: str,
@@ -584,22 +657,26 @@ class GeneralDataset(Dataset):
         cutoff_str = str(max_dataset_size) if max_dataset_size else "full"
         funcs_hash = _compute_encode_funcs_hash(preprocess_func, digits=16)
         hashable_kwargs = _select_cache_relevant_kwargs(preprocess_func, preprocess_kwargs)
-        kwargs_hash = hashlib.md5(
-            str(sorted(hashable_kwargs.items())).encode()
-        ).hexdigest()[:16]
+        kwargs_hash = hashlib.md5(str(sorted(hashable_kwargs.items())).encode()).hexdigest()[:16]
         extra_hash = "|".join(extra_hash_strs) if extra_hash_strs else ""
 
         combined = (
             f"{dataset_name}|{split}|{cutoff_str}|{funcs_hash}|{kwargs_hash}"
             f"|{extra_hash}|fmtv{_PREPROCESS_FORMAT_VERSION}"
         )
-        fingerprint = hashlib.md5(combined.encode()).hexdigest()[:min(digits, 32)]
+        fingerprint = hashlib.md5(combined.encode()).hexdigest()[: min(digits, 32)]
 
         logger.debug(
             "compute_cache_path: dataset=%s split=%s cutoff=%s funcs=%s kwargs=%s "
             "extra=%s hashable_keys=%s -> %s",
-            dataset_name, split, cutoff_str, funcs_hash, kwargs_hash, extra_hash,
-            sorted(hashable_kwargs), fingerprint,
+            dataset_name,
+            split,
+            cutoff_str,
+            funcs_hash,
+            kwargs_hash,
+            extra_hash,
+            sorted(hashable_kwargs),
+            fingerprint,
         )
         return os.path.join(os.path.expanduser(cache_dir), fingerprint)
 
@@ -626,9 +703,7 @@ class GeneralDataset(Dataset):
         return f"_shard{shard_idx:04d}of{num_shards - 1:04d}"
 
     @staticmethod
-    def build_part_arrow_path(
-        merged_cache_path: str, shard_idx: int, num_shards: int
-    ) -> str:
+    def build_part_arrow_path(merged_cache_path: str, shard_idx: int, num_shards: int) -> str:
         """Deterministic per-rank Arrow file path inside ``{merged_cache_path}.tmp``.
 
         Single source of truth for the per-rank cache file layout. Called by:
@@ -711,8 +786,7 @@ class GeneralDataset(Dataset):
                 f"(merged_cache_path={merged_cache_path})"
             )
         part_arrow_paths = [
-            cls.build_part_arrow_path(merged_cache_path, i, num_shards)
-            for i in range(num_shards)
+            cls.build_part_arrow_path(merged_cache_path, i, num_shards) for i in range(num_shards)
         ]
         for p in part_arrow_paths:
             if not os.path.isfile(p):
@@ -724,9 +798,7 @@ class GeneralDataset(Dataset):
 
         template = HFDataset.from_file(part_arrow_paths[0])
         state = {
-            "_data_files": [
-                {"filename": os.path.relpath(p, build_dir)} for p in part_arrow_paths
-            ],
+            "_data_files": [{"filename": os.path.relpath(p, build_dir)} for p in part_arrow_paths],
             "_fingerprint": os.path.basename(merged_cache_path),
             "_format_columns": None,
             "_format_kwargs": {},
@@ -748,7 +820,7 @@ class GeneralDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.processed_dataset[idx]
-    
+
     @staticmethod
     def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -776,7 +848,7 @@ class GeneralDataset(Dataset):
             # Classify value types
             is_tensor = [isinstance(v, torch.Tensor) for v in values]
             is_list = [isinstance(v, list) for v in values]
-            
+
             if all(is_tensor):
                 # Case 1: All elements are tensors
                 shapes = [v.shape for v in values]
@@ -794,11 +866,10 @@ class GeneralDataset(Dataset):
                 # variable-shape samples as List[Tensor]; unbind the stacked ones
                 # so the whole column is a consistent List[List[Tensor]].
                 collated_batch[key] = [
-                    list(torch.unbind(v, dim=0))
-                    if isinstance(v, torch.Tensor) else v
+                    list(torch.unbind(v, dim=0)) if isinstance(v, torch.Tensor) else v
                     for v in values
                 ]
-            
+
             else:
                 # Case 3: Other types (lists, ints, strs, and python-format
                 # columns: metadata dicts and PIL image columns).
@@ -812,6 +883,102 @@ class GeneralDataset(Dataset):
 # ========================================================================================
 # Utility Functions
 # ========================================================================================
+
+
+def _supports_ordered_references(preprocess_func: Optional[Callable]) -> bool:
+    """Return whether a bound preprocessor explicitly opts into ordered references."""
+    if preprocess_func is None:
+        return False
+    owner = getattr(preprocess_func, "__self__", None)
+    return bool(
+        getattr(preprocess_func, "supports_ordered_references", False)
+        or getattr(owner, "supports_ordered_references", False)
+    )
+
+
+def _load_ordered_reference(entry: Dict[str, Any], data_root: str) -> Dict[str, Any]:
+    """Load one validated ordered reference without changing its position."""
+    kind = entry["kind"]
+    resolved_path = _resolve_path(data_root, entry["path"])
+    loaded = dict(entry)
+    if kind == "image":
+        loaded["media"] = Image.open(resolved_path).convert("RGB")
+        return loaded
+    if kind == "video":
+        loaded["frames"] = load_video_frames(resolved_path)
+        if "fps" not in loaded:
+            metadata = iio.immeta(resolved_path)
+            fps = metadata.get("fps")
+            if not isinstance(fps, (int, float)) or isinstance(fps, bool) or fps <= 0:
+                raise ValueError(
+                    f"expected positive video fps for ordered reference {entry['path']!r}, "
+                    f"got {fps!r} from metadata={metadata!r}"
+                )
+            loaded["fps"] = fps
+        if "audio_path" in loaded:
+            audio_path = _resolve_path(data_root, loaded["audio_path"])
+            requested_rate = loaded.get("sample_rate")
+            if requested_rate is None:
+                audio, source_rate = _load_audio_backend(audio_path)
+                loaded["audio"] = audio
+                loaded["sample_rate"] = source_rate
+            else:
+                loaded["audio"] = load_audio(audio_path, sample_rate=int(requested_rate))
+        return loaded
+    if kind == "audio":
+        requested_rate = loaded.get("sample_rate")
+        if requested_rate is None:
+            audio, source_rate = _load_audio_backend(resolved_path)
+            loaded["media"] = audio
+            loaded["sample_rate"] = source_rate
+        else:
+            loaded["media"] = load_audio(resolved_path, sample_rate=int(requested_rate))
+        return loaded
+    raise ValueError(
+        f"expected ordered reference kind in ('image', 'video', 'audio'), got {kind!r}"
+    )
+
+
+def _validate_arrow_safe_ordered_result(
+    batch_dict: Dict[str, Any], expected_batch_size: int
+) -> None:
+    """Reject transient media and malformed columns before Arrow serialization."""
+    for column_name, values in batch_dict.items():
+        if not isinstance(values, list) or len(values) != expected_batch_size:
+            received_length = len(values) if isinstance(values, list) else None
+            raise ValueError(
+                f"expected ordered-reference column {column_name!r} to have outer "
+                f"B={expected_batch_size}, got type={type(values).__name__}, "
+                f"length={received_length}"
+            )
+        _validate_arrow_safe_value(values, column_name)
+
+
+def _validate_arrow_safe_value(value: Any, field_path: str) -> None:
+    if value is None:
+        raise ValueError(
+            f"expected Arrow-safe ordered-reference value for {field_path!r}, got None"
+        )
+    if isinstance(value, Image.Image):
+        raise TypeError(
+            f"expected Arrow-safe ordered-reference value for {field_path!r}, "
+            f"got PIL.Image {value!r}"
+        )
+    if isinstance(value, torch.Tensor):
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_arrow_safe_value(item, f"{field_path}[{index}]")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _validate_arrow_safe_value(item, f"{field_path}.{key}")
+        return
+    if not isinstance(value, (str, int, float, bool)):
+        raise TypeError(
+            f"expected Arrow-safe scalar/list/dict/tensor for {field_path!r}, "
+            f"got {type(value).__name__}: {value!r}"
+        )
 
 
 def _move_to_cpu(obj):
@@ -881,28 +1048,29 @@ def _apply_torch_format(dataset: HFDataset) -> None:
 def _resolve_path(base_dir: str, path: str) -> str:
     """Resolve path: use as-is if absolute, otherwise join with base_dir."""
     return path if os.path.isabs(path) else os.path.join(base_dir, path)
-    
+
+
 def load_video_frames(video_path: str, fps: Optional[int] = None) -> List[Image.Image]:
     """
     Load video frames using imageio (diffusers standard).
-    
+
     Args:
         video_path: Path to video file
         fps: If specified, resample video to this frame rate
-        
+
     Returns:
         List of PIL Images representing video frames
     """
     frames = [Image.fromarray(frame) for frame in iio.imread(video_path)]
-    
+
     if fps is not None:
         # Uniform resampling based on target fps
         metadata = iio.immeta(video_path)
-        original_fps = metadata.get('fps', 30)
+        original_fps = metadata.get("fps", 30)
         step = original_fps / fps
         indices = [int(i * step) for i in range(int(len(frames) / step))]
         frames = [frames[i] for i in indices if i < len(frames)]
-    
+
     return frames
 
 
@@ -913,16 +1081,16 @@ def _compute_function_hash(func: Optional[Callable], digits: int = 16) -> str:
     """
     _MAX_DIGITS = 32
     digits = min(digits, _MAX_DIGITS)
-    
+
     if func is None:
         return "none" * 4
-    
+
     # Extract class context for bound methods
     class_prefix = ""
-    if hasattr(func, '__self__'):
+    if hasattr(func, "__self__"):
         class_name = func.__self__.__class__.__qualname__
         class_prefix = f"{class_name}:"
-    
+
     try:
         # Method 1: Source code + class context
         source = inspect.getsource(func)
@@ -934,7 +1102,7 @@ def _compute_function_hash(func: Optional[Callable], digits: int = 16) -> str:
         try:
             module = inspect.getmodule(func)
             module_name = module.__name__ if module else "unknown"
-            func_name = getattr(func, '__qualname__', getattr(func, '__name__', 'anonymous'))
+            func_name = getattr(func, "__qualname__", getattr(func, "__name__", "anonymous"))
             signature = class_prefix + f"{module_name}.{func_name}"
             return hashlib.md5(signature.encode()).hexdigest()[:digits]
         except:
@@ -956,8 +1124,10 @@ def _collect_named_params(func: Optional[Callable]) -> set[str]:
     except (TypeError, ValueError):
         return set()
     return {
-        p.name for p in sig.parameters.values()
-        if p.kind not in (
+        p.name
+        for p in sig.parameters.values()
+        if p.kind
+        not in (
             inspect.Parameter.VAR_KEYWORD,
             inspect.Parameter.VAR_POSITIONAL,
         )
@@ -1018,13 +1188,13 @@ def _select_cache_relevant_kwargs(
 def _compute_encode_funcs_hash(*funcs: Optional[Callable], digits: int = 16) -> str:
     """
     Compute joint hash for multiple functions.
-    
+
     Ensures cache is invalidated when any preprocessing logic changes.
-    
+
     Args:
         *funcs: Variable number of functions to hash
         digits: Number of hash digits to return
-        
+
     Returns:
         Hexadecimal hash string representing joint hash
     """

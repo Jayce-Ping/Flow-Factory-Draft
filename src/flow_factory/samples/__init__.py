@@ -14,18 +14,24 @@
 
 # src/flow_factory/samples/__init__.py
 
+from .references import canonicalize_reference_manifest, parse_reference_manifest
 from .samples import (
     BaseSample,
-    StackedSampleBatch,
-    ImageConditionSample,
-    VideoConditionSample,
-    T2ISample,
-    T2VSample,
-    T2AVSample,
+    I2AVSample,
     I2ISample,
     I2VSample,
-    I2AVSample,
+    ImageConditionSample,
+    MiniMaxH3FL2VASample,
+    MiniMaxH3Ref2VASample,
+    MiniMaxH3T2VASample,
+    OrderedReferenceConditionSample,
+    Ref2AVSample,
+    StackedSampleBatch,
+    T2AVSample,
+    T2ISample,
+    T2VSample,
     V2VSample,
+    VideoConditionSample,
 )
 from .trajectory import (
     ComponentTimes,
@@ -37,7 +43,6 @@ from .trajectory import (
     ReplayStep,
     StructuredTrajectory,
 )
-
 
 __all__ = [
     # Sample classes
@@ -52,6 +57,13 @@ __all__ = [
     "I2VSample",
     "I2AVSample",
     "V2VSample",
+    "OrderedReferenceConditionSample",
+    "Ref2AVSample",
+    "MiniMaxH3T2VASample",
+    "MiniMaxH3FL2VASample",
+    "MiniMaxH3Ref2VASample",
+    "canonicalize_reference_manifest",
+    "parse_reference_manifest",
     "ComponentTrajectory",
     "IndexedTrajectoryTensor",
     "StructuredTrajectory",
