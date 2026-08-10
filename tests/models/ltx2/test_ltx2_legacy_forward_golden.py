@@ -15,12 +15,15 @@
 """Baseline oracle for the unchanged public concatenated LTX2 ``forward``.
 
 ``legacy_forward_golden.json`` was captured by running the pre-Task-4A
-implementation (commit ``ee6d247``) against the shared fakes; see
-``.scratch/sdd/generate_ltx2_legacy_golden.py``. The expectations therefore never
-come from the new component-return branch, which this module never calls.
+implementation against the shared fakes; see ``generate_legacy_forward_golden.py``
+in this directory. The expectations therefore never come from the new
+component-return branch, which this module never calls. The recorded commit and
+adapter blob hashes are re-verified against this repository's Git objects, so the
+provenance is auditable rather than a handwritten label.
 """
 
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
@@ -46,7 +49,9 @@ from flow_factory.models.ltx2.ltx2_i2av import LTX2_I2AV_Adapter
 from flow_factory.models.ltx2.ltx2_t2av import LTX2_T2AV_Adapter
 from flow_factory.scheduler import SDESchedulerOutput
 
-GOLDEN = json.loads((Path(__file__).parent / "legacy_forward_golden.json").read_text())
+TESTS_DIR = Path(__file__).resolve().parent
+REPO = TESTS_DIR.parents[2]
+GOLDEN = json.loads((TESTS_DIR / "legacy_forward_golden.json").read_text())
 ADAPTERS = {"t2av": LTX2_T2AV_Adapter, "i2av": LTX2_I2AV_Adapter}
 OUTPUT_FIELDS = (
     "next_latents",
@@ -90,7 +95,12 @@ def _run(name: str, *, compute_log_prob: bool, fields: Tuple[str, ...]) -> Dict[
         **extra,
         **forward_conditioning_kwargs(),
     )
-    return {"output": output, "log": log, "post_draw": torch.randn(4)}
+    return {
+        "output": output,
+        "log": log,
+        "rng_state_sum": int(torch.get_rng_state().sum().item()),
+        "post_draw": torch.randn(4),
+    }
 
 
 def _cases() -> List[Tuple[str, str, bool, Tuple[str, ...]]]:
@@ -140,7 +150,7 @@ def test_legacy_forward_keeps_the_scheduler_order_and_rng_position(
     result = _run(name, compute_log_prob=compute_log_prob, fields=fields)
 
     assert [list(entry) for entry in result["log"]] == golden["dispatch_log"]
-    assert int(torch.get_rng_state().sum().item()) != 0
+    assert result["rng_state_sum"] == golden["rng_state_sum"]
     assert torch.allclose(
         result["post_draw"],
         torch.tensor(golden["post_forward_draw"], dtype=torch.float32),
@@ -149,6 +159,48 @@ def test_legacy_forward_keeps_the_scheduler_order_and_rng_position(
     )
 
 
-def test_the_golden_file_was_captured_from_the_pre_task_4a_implementation() -> None:
-    assert GOLDEN["oracle_commit"] == "ee6d247"
+def _git(*args: str) -> str:
+    result = subprocess.run(["git", *args], cwd=REPO, check=True, capture_output=True, text=True)
+    return result.stdout.strip()
+
+
+def test_the_golden_file_records_a_commit_that_exists_in_this_repository() -> None:
+    commit = GOLDEN["oracle_commit"]
+
+    assert len(commit) == 40
+    assert _git("rev-parse", f"{commit}^{{commit}}") == commit
+    assert _git("rev-parse", f"{GOLDEN['oracle_commit_ref']}^{{commit}}") == commit
+
+
+def test_the_golden_file_records_the_pre_task_4a_adapter_blobs() -> None:
+    commit = GOLDEN["oracle_commit"]
+    blobs = GOLDEN["oracle_blobs"]
+
+    assert set(blobs) == {
+        "src/flow_factory/models/ltx2/ltx2_t2av.py",
+        "src/flow_factory/models/ltx2/ltx2_i2av.py",
+    }
+    for path, blob in blobs.items():
+        assert _git("rev-parse", f"{commit}:{path}") == blob
+        # The adapters changed in Task 4A, so the oracle blobs must not be the current ones.
+        assert _git("rev-parse", f"HEAD:{path}") != blob
+
+
+def test_the_generator_pins_the_recorded_identity_and_refuses_other_checkouts(
+    tmp_path: Path,
+) -> None:
+    import generate_legacy_forward_golden as generator
+
+    identity = generator.resolve_oracle_identity()
+
+    assert identity["oracle_commit"] == GOLDEN["oracle_commit"]
+    assert identity["oracle_blobs"] == GOLDEN["oracle_blobs"]
+    with pytest.raises(ValueError, match=r"oracle worktree.*HEAD.*ee6d247.*received"):
+        generator.require_oracle_worktree(REPO, identity["oracle_commit"])
+    with pytest.raises(FileNotFoundError, match=r"expected an oracle worktree"):
+        generator.require_oracle_worktree(tmp_path / "missing", identity["oracle_commit"])
+
+
+def test_the_golden_file_covers_every_recorded_case() -> None:
+    assert GOLDEN["oracle_commit_ref"] == "ee6d247"
     assert len(GOLDEN["cases"]) == 12

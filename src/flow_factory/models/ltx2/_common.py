@@ -228,6 +228,10 @@ def build_ltx2_joint_forward_kwargs(
 ) -> Dict[str, Any]:
     """Pack an ordered component state for the legacy concatenated ``forward``.
 
+    The caller runs the full input contract first (``validate_ltx2_forward_state_inputs``
+    or its I2AV superset); only the component order is re-checked here, so an unvalidated
+    caller still gets the contextual error instead of a ``KeyError``.
+
     Args:
         adapter: Adapter whose ``forward`` will receive the packed arguments.
         batch: Collated batch supplying conditioning and ``video_seq_len``.
@@ -242,7 +246,7 @@ def build_ltx2_joint_forward_kwargs(
     Returns:
         Keyword arguments for ``adapter.forward`` in component-return mode.
     """
-    validate_ltx2_forward_state_inputs(adapter, state=state, times=times, next_state=next_state)
+    _require_ltx2_component_orders(adapter, state=state, times=times, next_state=next_state)
 
     timestep = times.timestep["video"]
     next_timestep = times.next_timestep["video"]
@@ -303,11 +307,7 @@ def validate_ltx2_forward_state_inputs(
     Raises:
         ValueError: If any order, shape, dtype, device or mask expectation fails.
     """
-    _require_ltx2_component_order(adapter, state.component_names, "state")
-    _require_ltx2_component_order(adapter, tuple(times.timestep), "times.timestep")
-    _require_ltx2_component_order(adapter, tuple(times.next_timestep), "times.next_timestep")
-    if next_state is not None:
-        _require_ltx2_component_order(adapter, next_state.component_names, "next_state")
+    _require_ltx2_component_orders(adapter, state=state, times=times, next_state=next_state)
 
     name = type(adapter).__name__
     video = state.components["video"]
@@ -450,16 +450,32 @@ def attach_ltx2_state_masks(
     return output
 
 
-def validate_i2av_component_masks(
-    adapter: Any, *, batch: StackedSampleBatch, state: LatentState
+def validate_i2av_forward_state_inputs(
+    adapter: Any,
+    *,
+    batch: StackedSampleBatch,
+    state: LatentState,
+    times: ComponentTimes,
+    next_state: Optional[LatentState],
 ) -> None:
-    """Check the I2AV state masks against the batch conditioning mask.
+    """Check the shared component contract, then the I2AV conditioning contract.
+
+    The shared contract runs first so a missing or reordered component is reported
+    with its expected/received context instead of failing where this function reads
+    ``active_masks['video']``.
 
     Args:
         adapter: Adapter running the component forward.
         batch: Collated batch that must carry ``conditioning_mask``.
         state: Current state whose masks describe the stochastic video tokens.
+        times: Current and next times in authoritative component order.
+        next_state: Optional stored next state in authoritative component order.
+
+    Raises:
+        ValueError: If the shared contract fails or the masks disagree with the
+            batch conditioning mask.
     """
+    validate_ltx2_forward_state_inputs(adapter, state=state, times=times, next_state=next_state)
     conditioning_mask = batch.get("conditioning_mask")
     if conditioning_mask is None:
         raise ValueError(
@@ -527,6 +543,21 @@ def _align_statistic_rank(
             f"{tuple(statistic.shape)}"
         )
     return statistic.reshape((statistic.shape[0],) + (1,) * (reference.ndim - 1))
+
+
+def _require_ltx2_component_orders(
+    adapter: Any,
+    *,
+    state: LatentState,
+    times: ComponentTimes,
+    next_state: Optional[LatentState],
+) -> None:
+    """Check every component mapping the joint forward indexes by name."""
+    _require_ltx2_component_order(adapter, state.component_names, "state")
+    _require_ltx2_component_order(adapter, tuple(times.timestep), "times.timestep")
+    _require_ltx2_component_order(adapter, tuple(times.next_timestep), "times.next_timestep")
+    if next_state is not None:
+        _require_ltx2_component_order(adapter, next_state.component_names, "next_state")
 
 
 def _require_ltx2_component_order(adapter: Any, received: Tuple[str, ...], field: str) -> None:

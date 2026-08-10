@@ -2070,6 +2070,11 @@
     }
   },
   "noise_scale": 0.125,
-  "oracle_commit": "ee6d247",
+  "oracle_blobs": {
+    "src/flow_factory/models/ltx2/ltx2_i2av.py": "228fa1df199a2d02e635fc2c9d66f4e838450a05",
+    "src/flow_factory/models/ltx2/ltx2_t2av.py": "4c8105b5ba84afb000677ca1349f49621481ce6a"
+  },
+  "oracle_commit": "ee6d247e14b0192a741d236a0a9d491aa10042fa",
+  "oracle_commit_ref": "ee6d247",
   "seed": 20260810
 }

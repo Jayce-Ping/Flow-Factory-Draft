@@ -555,6 +555,99 @@ def test_i2av_component_statistics_broadcast_onto_the_packed_video_latents() -> 
         assert torch.broadcast_shapes(statistic.shape, video_shape) == video_shape
 
 
+def _reversed_state() -> LatentState:
+    return LatentState(
+        {"audio": _audio_latents(), "video": _video_latents()},
+        active_masks={
+            "audio": torch.ones(BATCH_SIZE, AUDIO_SEQ_LEN, 1, dtype=torch.bool),
+            "video": (~_conditioning_mask().bool()).unsqueeze(-1),
+        },
+    )
+
+
+def _video_only_state() -> LatentState:
+    return LatentState(
+        {"video": _video_latents()},
+        active_masks={"video": (~_conditioning_mask().bool()).unsqueeze(-1)},
+    )
+
+
+def _audio_only_state() -> LatentState:
+    return LatentState(
+        {"audio": _audio_latents()},
+        active_masks={"audio": torch.ones(BATCH_SIZE, AUDIO_SEQ_LEN, 1, dtype=torch.bool)},
+    )
+
+
+@pytest.mark.parametrize("cls", [LTX2_T2AV_Adapter, LTX2_I2AV_Adapter])
+@pytest.mark.parametrize(
+    "build_state,received",
+    [
+        (_reversed_state, r"\('audio', 'video'\)"),
+        (_video_only_state, r"\('video',\)"),
+        (_audio_only_state, r"\('audio',\)"),
+    ],
+    ids=["reversed", "video_only", "audio_only"],
+)
+def test_forward_state_rejects_a_broken_state_component_order(
+    cls: type, build_state: Any, received: str
+) -> None:
+    adapter = _adapter(cls)
+    batch = _i2av_batch() if cls is LTX2_I2AV_Adapter else _t2av_batch()
+
+    with pytest.raises(
+        ValueError, match=rf"{cls.__name__} state component order.*'video', 'audio'.*{received}"
+    ):
+        adapter.forward_state(batch=batch, state=build_state(), times=_times(), guidance_scale=1.0)
+
+
+@pytest.mark.parametrize("cls", [LTX2_T2AV_Adapter, LTX2_I2AV_Adapter])
+def test_forward_state_rejects_broken_time_component_order(cls: type) -> None:
+    adapter = _adapter(cls)
+    case = _forward_state_case(cls)
+    timestep = torch.full((BATCH_SIZE,), TIMESTEP)
+    times = ComponentTimes(
+        timestep={"audio": timestep, "video": timestep},
+        next_timestep={"audio": torch.zeros(BATCH_SIZE), "video": torch.zeros(BATCH_SIZE)},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{cls.__name__} times.timestep component order.*'video', 'audio'.*"
+        r"\('audio', 'video'\)",
+    ):
+        adapter.forward_state(times=times, guidance_scale=1.0, **case)
+
+
+def test_i2av_forward_state_checks_the_common_contract_before_the_conditioning_mask() -> None:
+    adapter = _adapter(LTX2_I2AV_Adapter)
+
+    # A batch without conditioning_mask would fail the I2AV mask check, but the broken
+    # component order has to be reported first with the shared contextual message.
+    with pytest.raises(ValueError, match=r"state component order.*\('audio', 'video'\)"):
+        adapter.forward_state(
+            batch=_i2av_batch(with_conditioning_mask=False),
+            state=_reversed_state(),
+            times=_times(),
+            guidance_scale=1.0,
+        )
+
+
+def test_i2av_forward_state_reports_a_time_mismatch_before_the_conditioning_mask() -> None:
+    adapter = _adapter(LTX2_I2AV_Adapter)
+    times = _times()
+    times.timestep["video"] = torch.tensor(TIMESTEP)
+    times.timestep["audio"] = torch.tensor(TIMESTEP)
+
+    with pytest.raises(ValueError, match=r"times\.timestep\['video'\].*\(2,\).*\(\)"):
+        adapter.forward_state(
+            batch=_i2av_batch(with_conditioning_mask=False),
+            state=_state(masked=True),
+            times=times,
+            guidance_scale=1.0,
+        )
+
+
 def test_i2av_forward_state_requires_the_batch_conditioning_mask() -> None:
     adapter = _adapter(LTX2_I2AV_Adapter)
 

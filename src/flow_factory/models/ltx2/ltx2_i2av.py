@@ -67,7 +67,7 @@ from ._common import (
     build_ltx2_training_component_times,
     combine_modality_log_prob,
     draw_ltx2_forward_process_noise,
-    validate_i2av_component_masks,
+    validate_i2av_forward_state_inputs,
 )
 
 logger = setup_logger(__name__)
@@ -1217,7 +1217,9 @@ class LTX2_I2AV_Adapter(BaseAdapter):
         Returns:
             Ordered component step output carrying the input active masks.
         """
-        validate_i2av_component_masks(self, batch=batch, state=state)
+        validate_i2av_forward_state_inputs(
+            self, batch=batch, state=state, times=times, next_state=next_state
+        )
         output = self.forward(
             **build_ltx2_joint_forward_kwargs(
                 self,
