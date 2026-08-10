@@ -50,7 +50,7 @@ import math
 import os
 from collections import defaultdict
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, Union, cast
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
 import tqdm as tqdm_
@@ -59,16 +59,22 @@ tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from ...hparams import DiffusionOPDTrainingArguments
 from ...hparams.training_args.opd import resolve_distill_step_band
-from ...samples import BaseSample
-from ...utils.base import filter_kwargs
+from ...samples import (
+    BaseSample,
+    LatentState,
+    MultiModalStepOutput,
+    ReplayStep,
+    StackedSampleBatch,
+)
 from ...utils.logger_utils import setup_logger
 from ...utils.trajectory_collector import compute_trajectory_indices
 from ..abc import BaseTrainer
 from .common import (
-    compute_per_sample_distillation_loss,
+    TARGET_REQUEST_FIELDS,
+    compute_structured_distillation_loss,
     load_teachers,
-    project_distillation_target,
-    validate_loss_target_for_dynamics,
+    project_distillation_target_state,
+    resolve_scheduler_group_dynamics,
 )
 
 logger = setup_logger(__name__)
@@ -85,15 +91,17 @@ class DiffusionOPDTrainer(BaseTrainer):
         super().__init__(**kwargs)
         self.training_args: DiffusionOPDTrainingArguments
 
-        scheduler = self.adapter.scheduler
-        self._is_sde = scheduler.dynamics_type != "ODE"
-        validate_loss_target_for_dynamics(
-            self.training_args.loss_target,
-            scheduler.dynamics_type,
+        scheduler_group = self.adapter.scheduler_group
+        # Every component scheduler must agree on the dynamics family: the KL
+        # denominator is 1 under ODE and a transition variance under SDE.
+        self._is_sde = resolve_scheduler_group_dynamics(
+            self.adapter, self.training_args.loss_target
         )
         # Teacher and student targets are computed at the SAME stored state x_j
         # with the SAME noise_level so their projections are comparable.
-        self._student_noise_level = float(scheduler.noise_level) if self._is_sde else 0.0
+        self._student_noise_level = (
+            float(scheduler_group.primary.noise_level) if self._is_sde else 0.0
+        )
 
         # --- Teachers: load each LoRA checkpoint into a named snapshot ---
         teachers = self.training_args.teachers
@@ -146,7 +154,7 @@ class DiffusionOPDTrainer(BaseTrainer):
 
         logger.info(
             f"DiffusionOPDTrainer initialized: {len(self._teacher_names)} teacher(s) "
-            f"{self._teacher_names}, dynamics={scheduler.dynamics_type!r} "
+            f"{self._teacher_names}, dynamics={scheduler_group.primary.dynamics_type!r} "
             f"(is_sde={self._is_sde}, student_noise_level={self._student_noise_level}), "
             f"datasets={sorted(self._available_sources)}, "
             f"student_gs={student_gs}, teacher_gs={self._teacher_gs}, "
@@ -158,7 +166,7 @@ class DiffusionOPDTrainer(BaseTrainer):
     def start(self) -> None:
         """Main training loop (mirrors GRPO/NFT: save -> eval -> sample -> optimize)."""
         while self.should_continue_training():
-            self.adapter.scheduler.set_seed(self.epoch + self.training_args.seed)
+            self.adapter.set_trajectory_seed(self.epoch + self.training_args.seed)
 
             if (
                 self.log_args.save_freq > 0
@@ -259,23 +267,28 @@ class DiffusionOPDTrainer(BaseTrainer):
                         desc=f"Epoch {self.epoch} Teacher[{teacher_name}] targets",
                         disable=not self.show_progress_bar,
                     ):
-                        # Teacher target at each training step: (B, *latent) per step.
+                        # Teacher target per component at each training step.
                         teacher_target_steps = [
                             self._forward_step(
                                 batch,
-                                timestep_index,
+                                int(timestep_index),
                                 guidance_scale=teacher_gs,
-                            )[0].detach()
+                            )[1]
                             for timestep_index in train_timesteps
                         ]
-                        # (B, num_train_steps, *latent)
-                        teacher_target_stacked = torch.stack(teacher_target_steps, dim=1)
-                        for j, sample in enumerate(batch.samples):
-                            sample.extra_kwargs["teacher_target"] = (
-                                teacher_target_stacked[j]
-                                .to(self._teacher_target_store_device)
-                                .clone()
+                        # {component: (B, num_train_steps, *latent)}
+                        teacher_target_stacked = {
+                            name: torch.stack(
+                                [step.components[name].detach() for step in teacher_target_steps],
+                                dim=1,
                             )
+                            for name in self.adapter.trajectory_component_order
+                        }
+                        for j, sample in enumerate(batch.samples):
+                            sample.extra_kwargs["teacher_target"] = {
+                                name: values[j].to(self._teacher_target_store_device).clone()
+                                for name, values in teacher_target_stacked.items()
+                            }
             # Belt-and-suspenders guard against a nested-autocast cache edge case.
             torch.clear_autocast_cache()
 
@@ -316,14 +329,9 @@ class DiffusionOPDTrainer(BaseTrainer):
                     dtype=torch.long,
                 )  # (B,)
                 # teacher_target rides BaseSample.to() with the sample; ensure on device.
-                teacher_target_all = batch["teacher_target"]
-                if not isinstance(teacher_target_all, torch.Tensor):
-                    raise RuntimeError(
-                        "Expected cached `teacher_target` (a tensor) on every sample, "
-                        f"got {type(teacher_target_all).__name__}. PASS 1 "
-                        "(_precompute_teacher_targets) must run before PASS 2."
-                    )
-                teacher_target_all = teacher_target_all.to(device)
+                teacher_target_all = self._require_teacher_target_cache(
+                    batch, num_steps=len(train_timesteps)
+                )
 
                 for idx, timestep_index in enumerate(
                     tqdm(
@@ -334,36 +342,36 @@ class DiffusionOPDTrainer(BaseTrainer):
                         disable=not self.show_progress_bar,
                     )
                 ):
+                    step_index = int(timestep_index)
                     with self.accumulate_gradients():
                         with self.autocast():
-                            student_target, std_dev_t, dt = self._forward_step(
+                            replay, student_target, output = self._forward_step(
                                 batch,
-                                timestep_index,
+                                step_index,
                                 guidance_scale=self.training_args.guidance_scale,
-                                include_transition_stats=True,
+                                include_transition_stats=self._is_sde,
                             )
                             # Each sample is matched to its own routed teacher target.
-                            teacher_target = teacher_target_all[:, idx]
-                            per_sample_distill_loss = compute_per_sample_distillation_loss(
-                                student_target,
-                                teacher_target,
-                                self_normalize=self.training_args.self_normalize,
+                            teacher_target = LatentState(
+                                {
+                                    name: values[:, idx]
+                                    for name, values in teacher_target_all.items()
+                                }
                             )
-                            if self._is_sde:
-                                # Validation guarantees SDE uses the xt transition-mean target.
-                                denom = self.adapter.scheduler.get_kl_divergence_denominator(
-                                    std_dev_t, dt
-                                )
-                                if not isinstance(denom, torch.Tensor):
-                                    raise TypeError(
-                                        "Expected an SDE KL denominator tensor for "
-                                        f"dynamics_type={self.adapter.scheduler.dynamics_type!r}, "
-                                        f"got {type(denom).__name__}: {denom!r}."
-                                    )
-                                denom = denom.reshape(per_sample_distill_loss.shape[0], -1).mean(
-                                    dim=1
-                                )
-                                per_sample_distill_loss = per_sample_distill_loss / denom
+                            # Validation guarantees SDE uses the xt transition-mean target.
+                            denominators = (
+                                self._component_kl_denominators(output, replay, step_index)
+                                if self._is_sde
+                                else None
+                            )
+                            per_sample_distill_loss = compute_structured_distillation_loss(
+                                self.adapter,
+                                student_target=student_target,
+                                teacher_target=teacher_target,
+                                state=replay.state,
+                                self_normalize=self.training_args.self_normalize,
+                                denominators=denominators,
+                            )
                             loss = per_sample_distill_loss.mean()
 
                         self.accelerator.backward(loss)
@@ -469,60 +477,165 @@ class DiffusionOPDTrainer(BaseTrainer):
             )
         return self._source_to_teacher[dataset]
 
+    def _replay_forward_kwargs(self, batch: StackedSampleBatch) -> Dict[str, Any]:
+        """Training arguments the batch does not already carry.
+
+        Legacy replay unpacked ``batch`` after ``training_args``, so batch-level
+        values win on shared keys.
+        """
+        return {key: value for key, value in {**self.training_args}.items() if key not in batch}
+
     def _forward_step(
         self,
-        batch: Dict[str, Any],
-        timestep_index: Union[int, torch.Tensor],
+        batch: StackedSampleBatch,
+        step_index: int,
         guidance_scale: float,
         include_transition_stats: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[ReplayStep, LatentState, MultiModalStepOutput]:
         """Forward one stored step and return its configured target projection.
 
-        Replays the rollout transition ``x_j -> x_{j+1}`` (current/next latents
-        and ``t``/``t_next`` come from the stored trajectory, fetched via the
-        same index maps GRPO uses). Returns ``(target, std_dev_t, dt)``;
-        transition statistics are requested only for the student pass.
+        Replays the rollout transition ``x_j -> x_{j+1}`` through
+        :meth:`BaseAdapter.get_replay_step` / :meth:`BaseAdapter.forward_state`,
+        so states, times and per-component sigmas come from the trajectory
+        rather than from legacy index maps. Returns
+        ``(replay, target, output)``; the transition statistics are requested
+        only for the stochastic student pass.
         """
-        latents_index_map = batch["latent_index_map"]
-        num_timesteps = batch["timesteps"].shape[1]
-
-        t = batch["timesteps"][:, timestep_index]
-        t_next = (
-            batch["timesteps"][:, timestep_index + 1]
-            if timestep_index + 1 < num_timesteps
-            else torch.zeros_like(t)
-        )
-        latents = batch["all_latents"][:, latents_index_map[timestep_index]]
-        next_latents = batch["all_latents"][:, latents_index_map[timestep_index + 1]]
-
-        forward_inputs = {
-            **self.training_args,
-            **batch,
-            "t": t,
-            "t_next": t_next,
-            "latents": latents,
-            "next_latents": next_latents,
-            "compute_log_prob": False,
-            "noise_level": self._student_noise_level,
-            # guidance_scale set before filter_kwargs so it is dropped for adapters
-            # whose forward() does not accept it (overrides the training_args value).
-            "guidance_scale": guidance_scale,
-        }
-        forward_inputs = filter_kwargs(self.adapter.forward, **forward_inputs)
-        target_output_name = (
-            "next_latents_mean" if self.training_args.loss_target == "xt" else "velocity"
-        )
-        return_kwargs = [target_output_name]
+        replay = self.adapter.get_replay_step(batch, step_index)
+        return_fields = (TARGET_REQUEST_FIELDS[self.training_args.loss_target],)
         if include_transition_stats:
-            return_kwargs.extend(["std_dev_t", "dt"])
-        forward_inputs["return_kwargs"] = return_kwargs
-        output = self.adapter.forward(**forward_inputs)
+            return_fields += ("std_dev_t", "dt")
 
-        target = project_distillation_target(
-            loss_target=self.training_args.loss_target,
-            latents=latents,
-            timestep=t,
-            next_latents_mean=output.next_latents_mean,
-            velocity=output.velocity,
+        forward_kwargs = self._replay_forward_kwargs(batch)
+        # guidance_scale overrides the training_args value; adapters whose
+        # forward() does not accept it drop it in the bridge's filter step.
+        forward_kwargs["guidance_scale"] = guidance_scale
+        output = self.adapter.forward_state(
+            batch=batch,
+            state=replay.state,
+            times=replay.times,
+            next_state=replay.next_state,
+            compute_log_prob=False,
+            return_fields=return_fields,
+            noise_level=self._student_noise_level,
+            **forward_kwargs,
         )
-        return target, output.std_dev_t, output.dt
+        target = project_distillation_target_state(
+            self.adapter,
+            loss_target=self.training_args.loss_target,
+            state=replay.state,
+            output=output,
+            times=replay.times,
+        )
+        return replay, target, output
+
+    def _require_teacher_target_cache(
+        self,
+        batch: StackedSampleBatch,
+        num_steps: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Return the PASS 1 teacher cache for this micro-batch, on the compute device.
+
+        The cache is an ordered component mapping of stacked per-step targets
+        (``{component: (B, num_steps, *latent)}``) that rides
+        :meth:`BaseSample.to` with the sample.
+        """
+        expected_names = self.adapter.trajectory_component_order
+        cached = batch.get("teacher_target")
+        if not isinstance(cached, Mapping):
+            received = "None" if cached is None else type(cached).__name__
+            raise ValueError(
+                "expected DiffusionOPDTrainer cached 'teacher_target' as an ordered component "
+                f"mapping in component order {expected_names}, received {received}; PASS 1 "
+                "(_precompute_teacher_targets) must run before PASS 2"
+            )
+        if tuple(cached) != expected_names:
+            raise ValueError(
+                "expected DiffusionOPDTrainer cached 'teacher_target' in component order "
+                f"{expected_names}, received {tuple(cached)}"
+            )
+        batch_size = len(batch.samples)
+        device = self.accelerator.device
+        resolved: Dict[str, torch.Tensor] = {}
+        for name in expected_names:
+            values = cached[name]
+            if not isinstance(values, torch.Tensor):
+                raise TypeError(
+                    f"expected a torch.Tensor DiffusionOPDTrainer cached 'teacher_target' for "
+                    f"component {name!r}, received {type(values).__name__}"
+                )
+            if values.ndim < 3 or values.shape[:2] != (batch_size, num_steps):
+                raise ValueError(
+                    f"expected DiffusionOPDTrainer cached 'teacher_target' component {name!r} "
+                    f"with {num_steps} stored distillation steps and shape "
+                    f"({batch_size}, {num_steps}, ...), received {tuple(values.shape)}"
+                )
+            resolved[name] = values.to(device)
+        return resolved
+
+    def _require_component_statistic(
+        self,
+        values: Optional[Mapping[str, torch.Tensor]],
+        field: str,
+        step_index: int,
+    ) -> Mapping[str, torch.Tensor]:
+        """Return one transition statistic mapping required by stochastic dynamics."""
+        expected_names = self.adapter.trajectory_component_order
+        if not isinstance(values, Mapping) or tuple(values) != expected_names:
+            received = (
+                "None"
+                if values is None
+                else (str(tuple(values)) if isinstance(values, Mapping) else type(values).__name__)
+            )
+            raise ValueError(
+                f"expected DiffusionOPDTrainer replay at step_index={step_index} to carry "
+                f"{field} in component order {expected_names}, received {received}; request "
+                "'std_dev_t' and 'dt' through return_fields"
+            )
+        return values
+
+    def _component_kl_denominators(
+        self,
+        output: MultiModalStepOutput,
+        replay: ReplayStep,
+        step_index: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Per-component SDE KL denominators for one replayed transition.
+
+        Each component is normalized by its OWN scheduler's transition
+        variance, so a heterogeneous multi-modal group never borrows the
+        primary scheduler's noise schedule.
+        """
+        expected_names = self.adapter.trajectory_component_order
+        std_dev_t = self._require_component_statistic(output.std_dev_t, "std_dev_t", step_index)
+        dt = self._require_component_statistic(output.dt, "dt", step_index)
+        batch_size = replay.state.components[expected_names[0]].shape[0]
+
+        denominators: Dict[str, torch.Tensor] = {}
+        for name in expected_names:
+            scheduler = self.adapter.scheduler_group[name]
+            denominator = scheduler.get_kl_divergence_denominator(std_dev_t[name], dt[name])
+            if not isinstance(denominator, torch.Tensor):
+                raise TypeError(
+                    f"expected a torch.Tensor KL denominator from the {name!r} scheduler "
+                    f"({type(scheduler).__name__}, dynamics_type="
+                    f"{scheduler.dynamics_type!r}) at step_index={step_index}, received "
+                    f"{type(denominator).__name__}: {denominator!r}"
+                )
+            # A scalar-like (B, 1, ...) denominator carries one value per sample;
+            # anything else would silently average distinct per-element scales.
+            if denominator.shape[0] != batch_size or denominator.numel() != batch_size:
+                raise ValueError(
+                    f"expected DiffusionOPDTrainer KL denominator at step_index={step_index} "
+                    f"for component {name!r} to hold one value per sample with shape "
+                    f"({batch_size},), received {tuple(denominator.shape)}"
+                )
+            reference = replay.state.components[name]
+            if not denominator.is_floating_point() or denominator.device != reference.device:
+                raise ValueError(
+                    f"expected DiffusionOPDTrainer KL denominator at step_index={step_index} "
+                    f"for component {name!r} as a floating tensor on the replay device "
+                    f"{reference.device}, received {denominator.dtype} on {denominator.device}"
+                )
+            denominators[name] = denominator.reshape(batch_size)
+        return denominators
