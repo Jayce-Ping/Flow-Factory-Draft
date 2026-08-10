@@ -17,13 +17,19 @@
 ``legacy_forward_golden.json`` was captured by running the pre-Task-4A
 implementation against the shared fakes; see ``generate_legacy_forward_golden.py``
 in this directory. The expectations therefore never come from the new
-component-return branch, which this module never calls. The recorded commit and
-adapter blob hashes are re-verified against this repository's Git objects, so the
-provenance is auditable rather than a handwritten label.
+component-return branch, which this module never calls.
+
+Provenance is checked in two layers. The recorded identity is always compared with
+the fixed commit/blob constants below, and every output/order/RNG comparison reads
+only the JSON, so the whole oracle runs from a source export or a shallow clone.
+The live ``git rev-parse`` cross-check that ties those constants to real objects
+runs only where Git and the referenced objects are available.
 """
 
 import json
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
@@ -53,6 +59,14 @@ TESTS_DIR = Path(__file__).resolve().parent
 REPO = TESTS_DIR.parents[2]
 GOLDEN = json.loads((TESTS_DIR / "legacy_forward_golden.json").read_text())
 ADAPTERS = {"t2av": LTX2_T2AV_Adapter, "i2av": LTX2_I2AV_Adapter}
+ORACLE_COMMIT = "ee6d247e14b0192a741d236a0a9d491aa10042fa"
+ORACLE_COMMIT_REF = "ee6d247"
+ORACLE_BLOBS = {
+    "src/flow_factory/models/ltx2/ltx2_t2av.py": "4c8105b5ba84afb000677ca1349f49621481ce6a",
+    "src/flow_factory/models/ltx2/ltx2_i2av.py": "228fa1df199a2d02e635fc2c9d66f4e838450a05",
+}
+SEED = 20260810
+NOISE_SCALE = 0.125
 OUTPUT_FIELDS = (
     "next_latents",
     "next_latents_mean",
@@ -159,48 +173,128 @@ def test_legacy_forward_keeps_the_scheduler_order_and_rng_position(
     )
 
 
-def _git(*args: str) -> str:
-    result = subprocess.run(["git", *args], cwd=REPO, check=True, capture_output=True, text=True)
+def _git_object(ref: str) -> Optional[str]:
+    """Return the object hash ``ref`` resolves to, or ``None`` when Git cannot resolve it.
+
+    Source exports have no Git binary or repository and shallow clones lack the oracle
+    objects; the caller skips its cross-check there instead of failing the whole oracle.
+    """
+    if shutil.which("git") is None or not (REPO / ".git").exists():
+        return None
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", ref],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
     return result.stdout.strip()
 
 
-def test_the_golden_file_records_a_commit_that_exists_in_this_repository() -> None:
-    commit = GOLDEN["oracle_commit"]
+def _resolved_or_skip(ref: str) -> str:
+    resolved = _git_object(ref)
+    if resolved is None:
+        pytest.skip(f"Git object {ref!r} cannot be resolved in this checkout")
+    return resolved
 
-    assert len(commit) == 40
-    assert _git("rev-parse", f"{commit}^{{commit}}") == commit
-    assert _git("rev-parse", f"{GOLDEN['oracle_commit_ref']}^{{commit}}") == commit
+
+def test_the_golden_file_matches_the_fixed_oracle_identity() -> None:
+    assert GOLDEN["oracle_commit"] == ORACLE_COMMIT
+    assert GOLDEN["oracle_commit_ref"] == ORACLE_COMMIT_REF
+    assert ORACLE_COMMIT.startswith(ORACLE_COMMIT_REF)
+    assert GOLDEN["oracle_blobs"] == ORACLE_BLOBS
+    assert GOLDEN["seed"] == SEED
+    assert GOLDEN["noise_scale"] == NOISE_SCALE
 
 
-def test_the_golden_file_records_the_pre_task_4a_adapter_blobs() -> None:
-    commit = GOLDEN["oracle_commit"]
-    blobs = GOLDEN["oracle_blobs"]
+def test_the_golden_file_covers_every_recorded_case() -> None:
+    assert len(GOLDEN["cases"]) == 12
+    assert {key.split("|")[0] for key in GOLDEN["cases"]} == {"t2av", "i2av"}
 
-    assert set(blobs) == {
-        "src/flow_factory/models/ltx2/ltx2_t2av.py",
-        "src/flow_factory/models/ltx2/ltx2_i2av.py",
-    }
-    for path, blob in blobs.items():
-        assert _git("rev-parse", f"{commit}:{path}") == blob
+
+def test_the_recorded_commit_matches_the_git_objects() -> None:
+    assert _resolved_or_skip(f"{ORACLE_COMMIT}^{{commit}}") == ORACLE_COMMIT
+    assert _resolved_or_skip(f"{ORACLE_COMMIT_REF}^{{commit}}") == ORACLE_COMMIT
+
+
+def test_the_recorded_blobs_match_the_git_objects() -> None:
+    for path, blob in ORACLE_BLOBS.items():
+        assert _resolved_or_skip(f"{ORACLE_COMMIT}:{path}") == blob
         # The adapters changed in Task 4A, so the oracle blobs must not be the current ones.
-        assert _git("rev-parse", f"HEAD:{path}") != blob
+        assert _resolved_or_skip(f"HEAD:{path}") != blob
 
 
 def test_the_generator_pins_the_recorded_identity_and_refuses_other_checkouts(
     tmp_path: Path,
 ) -> None:
+    _resolved_or_skip(f"{ORACLE_COMMIT}^{{commit}}")
     import generate_legacy_forward_golden as generator
 
     identity = generator.resolve_oracle_identity()
 
-    assert identity["oracle_commit"] == GOLDEN["oracle_commit"]
-    assert identity["oracle_blobs"] == GOLDEN["oracle_blobs"]
+    assert identity["oracle_commit"] == ORACLE_COMMIT
+    assert identity["oracle_blobs"] == ORACLE_BLOBS
     with pytest.raises(ValueError, match=r"oracle worktree.*HEAD.*ee6d247.*received"):
         generator.require_oracle_worktree(REPO, identity["oracle_commit"])
     with pytest.raises(FileNotFoundError, match=r"expected an oracle worktree"):
         generator.require_oracle_worktree(tmp_path / "missing", identity["oracle_commit"])
 
 
-def test_the_golden_file_covers_every_recorded_case() -> None:
-    assert GOLDEN["oracle_commit_ref"] == "ee6d247"
-    assert len(GOLDEN["cases"]) == 12
+GIT_DEPENDENT_TESTS = (
+    test_the_recorded_commit_matches_the_git_objects,
+    test_the_recorded_blobs_match_the_git_objects,
+)
+
+
+def _run_git_independent_assertions() -> int:
+    """Execute every golden comparison that must survive without Git, returning the case count."""
+    checked = 0
+    for key, name, compute_log_prob, fields in _cases():
+        test_legacy_concatenated_forward_matches_the_pre_task_4a_oracle(
+            key, name, compute_log_prob, fields
+        )
+        test_legacy_forward_keeps_the_scheduler_order_and_rng_position(
+            key, name, compute_log_prob, fields
+        )
+        checked += 1
+    test_the_golden_file_matches_the_fixed_oracle_identity()
+    test_the_golden_file_covers_every_recorded_case()
+    return checked
+
+
+def _simulate_unavailable_git(monkeypatch: pytest.MonkeyPatch, mode: str, tmp_path: Path) -> None:
+    """Make ``_git_object`` see a source export, a non-repository, or a shallow clone."""
+    if mode == "no_git_binary":
+        monkeypatch.setattr(shutil, "which", lambda name: None)
+    elif mode == "no_repository":
+        monkeypatch.setattr(sys.modules[__name__], "REPO", tmp_path)
+    elif mode == "unresolvable_objects":
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *args, **kwargs: SimpleNamespace(returncode=128, stdout="", stderr="fatal"),
+        )
+    else:
+        raise ValueError(f"expected a known simulation mode, received {mode!r}")
+
+
+@pytest.mark.parametrize("mode", ["no_git_binary", "no_repository", "unresolvable_objects"])
+def test_golden_comparisons_still_run_when_git_lookup_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, mode: str, tmp_path: Path
+) -> None:
+    _simulate_unavailable_git(monkeypatch, mode, tmp_path)
+
+    assert _git_object(f"{ORACLE_COMMIT}^{{commit}}") is None
+    assert _run_git_independent_assertions() == 12
+
+
+@pytest.mark.parametrize("mode", ["no_git_binary", "no_repository", "unresolvable_objects"])
+@pytest.mark.parametrize("test", GIT_DEPENDENT_TESTS, ids=lambda test: test.__name__)
+def test_provenance_cross_checks_skip_when_git_lookup_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, mode: str, tmp_path: Path, test: Any
+) -> None:
+    _simulate_unavailable_git(monkeypatch, mode, tmp_path)
+
+    with pytest.raises(pytest.skip.Exception, match=r"cannot be resolved"):
+        test()
