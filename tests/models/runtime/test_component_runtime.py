@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
@@ -19,6 +20,7 @@ import pytest
 import torch
 import torch.nn as nn
 from accelerate import DistributedType
+from diffusers.modular_pipelines.modular_pipeline import ModularPipeline
 
 from flow_factory.models.abc import BaseAdapter
 from flow_factory.models.model_bundle import ModelBundle, RoutedComponentProxy
@@ -140,16 +142,39 @@ class BagelContainerFake(nn.Module):
 
 
 class ModularPipelineFake:
-    """Lazy modular pipeline that materializes requested component names."""
+    """Match pinned ModularPipeline's public spec and materialized-value APIs."""
 
     def __init__(self, unavailable: List[str] | None = None) -> None:
-        self.components = {
+        self.pretrained_specs = {
             "text_encoder": "text encoder spec",
             "transformer": "transformer spec",
             "vae": "vae spec",
         }
+        self.config_specs: Dict[str, Any] = {}
         self.unavailable = set(unavailable or [])
         self.load_calls: List[List[str]] = []
+
+    @property
+    def component_names(self) -> List[str]:
+        """Expose declared from-pretrained names like pinned ModularPipeline."""
+        return list(self.pretrained_specs)
+
+    @property
+    def config_component_names(self) -> List[str]:
+        """Expose declared from-config names like pinned ModularPipeline."""
+        return list(self.config_specs)
+
+    @property
+    def components(self) -> Dict[str, Any]:
+        """Expose only materialized values, never the complete lazy spec table."""
+        names = [*self.component_names, *self.config_component_names]
+        return {
+            name: getattr(self, name) for name in names if getattr(self, name, None) is not None
+        }
+
+    def get_component_spec(self, name: str) -> Any:
+        """Return one declared spec through the pinned public API."""
+        return {**self.pretrained_specs, **self.config_specs}[name]
 
     def load_components(self, names: List[str]) -> None:
         """Materialize every available requested component."""
@@ -157,6 +182,17 @@ class ModularPipelineFake:
         for name in names:
             if name not in self.unavailable:
                 setattr(self, name, TrackingModule())
+
+
+def test_pinned_modular_pipeline_public_spec_api_shape() -> None:
+    assert isinstance(inspect.getattr_static(ModularPipeline, "component_names"), property)
+    assert isinstance(inspect.getattr_static(ModularPipeline, "config_component_names"), property)
+    assert isinstance(inspect.getattr_static(ModularPipeline, "components"), property)
+    assert tuple(inspect.signature(ModularPipeline.get_component_spec).parameters) == (
+        "self",
+        "name",
+    )
+    assert "names" in inspect.signature(ModularPipeline.load_components).parameters
 
 
 def test_classic_runtime_prefers_prepared_component_over_canonical() -> None:
@@ -242,11 +278,36 @@ def test_modular_runtime_materializes_only_selected_names() -> None:
     pipeline = ModularPipelineFake()
     runtime = ModularPipelineRuntime(pipeline)
 
+    assert pipeline.components == {}
+    assert runtime.declared_component_names == ["text_encoder", "transformer", "vae"]
+
     runtime.materialize_components(["vae"])
 
     assert pipeline.load_calls == [["vae"]]
     assert runtime.get_component("vae") is pipeline.vae
     assert not hasattr(pipeline, "transformer")
+
+
+def test_modular_runtime_uses_pinned_public_component_spec_api_shape() -> None:
+    pipeline = ModularPipelineFake()
+    pipeline.config_specs["scheduler"] = "scheduler config spec"
+    pipeline.transformer = TrackingModule()
+    runtime = ModularPipelineRuntime(pipeline)
+
+    assert pipeline.components == {"transformer": pipeline.transformer}
+    assert runtime.canonical_components == {
+        "text_encoder": "text encoder spec",
+        "transformer": "transformer spec",
+        "vae": "vae spec",
+        "scheduler": "scheduler config spec",
+    }
+    assert runtime.declared_component_names == [
+        "scheduler",
+        "text_encoder",
+        "transformer",
+        "vae",
+    ]
+    assert runtime.get_component("transformer") is pipeline.transformer
 
 
 def test_modular_runtime_reports_materialization_failure_context() -> None:
@@ -262,7 +323,7 @@ def test_modular_runtime_reports_materialization_failure_context() -> None:
 
 def test_modular_materialize_none_preserves_all_declared_specs_lazily() -> None:
     pipeline = ModularPipelineFake()
-    pipeline.components.update(
+    pipeline.pretrained_specs.update(
         {
             "scheduler": "scheduler spec",
             "tokenizer": "tokenizer spec",
@@ -282,7 +343,7 @@ def test_modular_materialize_none_preserves_all_declared_specs_lazily() -> None:
 
 def test_modular_none_enumerates_only_materialized_modules_without_loading_specs() -> None:
     pipeline = ModularPipelineFake()
-    pipeline.components.update(
+    pipeline.pretrained_specs.update(
         {
             "scheduler": "scheduler spec",
             "tokenizer": "tokenizer spec",
@@ -458,7 +519,7 @@ class ModularAdapterFake(ExistingStyleAdapterFake):
     def load_pipeline(self) -> ModularPipelineFake:
         """Return a lazy pipeline with a declared scheduler spec."""
         pipeline = ModularPipelineFake()
-        pipeline.components["scheduler"] = "scheduler spec"
+        pipeline.config_specs["scheduler"] = "scheduler spec"
         return pipeline
 
     def build_component_runtime(self) -> ModularPipelineRuntime:
