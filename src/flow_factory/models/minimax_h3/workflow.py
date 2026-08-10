@@ -70,7 +70,6 @@ _GEOMETRY_FIELDS = (
     "latent_width",
     "num_audio_latents",
 )
-_PUBLIC_GUIDANCE_FIELDS = ("negative_prompt", "guidance_scale")
 _CALLBACK_STATE_FIELDS = {
     "next_latents": "next_state",
     "next_latents_mean": "next_state_mean",
@@ -183,7 +182,7 @@ def map_h3_training_component_times(
 
 def preprocess_h3_workflow(adapter: Any, **kwargs: Any) -> Dict[str, Any]:
     """Encode one Arrow-safe B=1 workflow input with pinned blocks."""
-    _reject_public_guidance(adapter.workflow, kwargs, "preprocess")
+    _validate_public_no_cfg_inputs(adapter.workflow, kwargs, "preprocess")
     _validate_workflow_media_inputs(adapter.workflow, kwargs, "preprocess")
     prompt = _single_outer_value(kwargs.get("prompt"), "prompt", adapter.workflow)
     values: Dict[str, Any] = {
@@ -193,16 +192,7 @@ def preprocess_h3_workflow(adapter: Any, **kwargs: Any) -> Dict[str, Any]:
         "num_frames": kwargs["num_frames"],
     }
     if adapter.workflow == "fl2va":
-        images = _single_outer_value(
-            kwargs.get("images", kwargs.get("condition_images")),
-            "images",
-            adapter.workflow,
-        )
-        if not isinstance(images, (list, tuple)) or not 1 <= len(images) <= 2:
-            raise ValueError(
-                "MiniMax H3 workflow='fl2va' field='images' expected one or two ordered "
-                f"images, received {images!r}"
-            )
+        images = _validate_fl2va_condition_images(kwargs, "preprocess")
         values["image"] = images[0]
         if len(images) == 2:
             values["last_image"] = images[1]
@@ -227,8 +217,11 @@ def preprocess_h3_workflow(adapter: Any, **kwargs: Any) -> Dict[str, Any]:
 
 def infer_h3_workflow(adapter: Any, **kwargs: Any) -> List[Any]:
     """Run one B=1 target-only rollout and return a structured sample."""
-    _reject_public_guidance(adapter.workflow, kwargs, "inference")
+    _validate_public_no_cfg_inputs(adapter.workflow, kwargs, "inference")
     _validate_workflow_media_inputs(adapter.workflow, kwargs, "inference")
+    condition_images = None
+    if adapter.workflow == "fl2va":
+        condition_images = _validate_fl2va_condition_images(kwargs, "inference")
     prompt = kwargs.get("prompt")
     prompt_value = _single_outer_value(prompt, "prompt", adapter.workflow)
     prompt_embeds = kwargs["prompt_embeds"]
@@ -378,13 +371,6 @@ def infer_h3_workflow(adapter: Any, **kwargs: Any) -> List[Any]:
                 else _index_map(num_transitions, transition_positions)
             ),
         )[0]
-    condition_images = None
-    if adapter.workflow == "fl2va":
-        condition_images = _single_outer_value(
-            kwargs.get("images", kwargs.get("condition_images")),
-            "images",
-            adapter.workflow,
-        )
     sample = _build_h3_sample(
         type(adapter),
         prompt=prompt_value,
@@ -616,13 +602,48 @@ def _append_state(storage: Dict[str, List[torch.Tensor]], state: LatentState) ->
         storage[component].append(state.components[component].detach())
 
 
-def _reject_public_guidance(workflow: str, values: Mapping[str, Any], boundary: str) -> None:
-    present = tuple(field for field in _PUBLIC_GUIDANCE_FIELDS if field in values)
-    if present:
+def _validate_public_no_cfg_inputs(workflow: str, values: Mapping[str, Any], boundary: str) -> None:
+    if "guidance_scale" in values:
+        guidance_scale = values["guidance_scale"]
+        if (
+            isinstance(guidance_scale, bool)
+            or not isinstance(guidance_scale, (int, float))
+            or float(guidance_scale) != 1.0
+        ):
+            raise ValueError(
+                f"MiniMax H3 workflow={workflow!r} public {boundary} guidance_scale "
+                f"expected neutral 1.0, received {guidance_scale!r}"
+            )
+    if "negative_prompt" not in values:
+        return
+    negative_prompt = values["negative_prompt"]
+    if isinstance(negative_prompt, (list, tuple)):
+        if len(negative_prompt) != 1:
+            raise ValueError(
+                f"MiniMax H3 workflow={workflow!r} public {boundary} negative_prompt "
+                f"requires outer B=1, received {negative_prompt!r}"
+            )
+        negative_prompt = negative_prompt[0]
+    if negative_prompt is not None and (
+        not isinstance(negative_prompt, str) or negative_prompt != ""
+    ):
         raise ValueError(
-            f"MiniMax H3 workflow={workflow!r} public {boundary} rejects guidance "
-            f"arguments={present}; the model has no CFG"
+            f"MiniMax H3 workflow={workflow!r} public {boundary} negative_prompt "
+            f"expected None or empty string, received {negative_prompt!r}; model has no CFG"
         )
+
+
+def _validate_fl2va_condition_images(values: Mapping[str, Any], boundary: str) -> Sequence[Any]:
+    outer_images = values.get("images")
+    if outer_images is None:
+        outer_images = values.get("condition_images")
+    images = _single_outer_value(outer_images, "images", "fl2va")
+    if not isinstance(images, (list, tuple)) or not 1 <= len(images) <= 2:
+        raise ValueError(
+            f"MiniMax H3 workflow='fl2va' public {boundary} field='images' expected "
+            f"one or two ordered images, received {images!r}"
+        )
+    return images
 
 
 def _validate_workflow_media_inputs(

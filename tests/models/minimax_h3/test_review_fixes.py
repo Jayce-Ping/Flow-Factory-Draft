@@ -136,9 +136,11 @@ def test_preprocess_rejects_cross_workflow_inputs(
         adapter.preprocess_func(prompt=["describe"], height=64, width=96, num_frames=5, **extra)
 
 
-@pytest.mark.parametrize("field,value", [("negative_prompt", None), ("guidance_scale", 1.0)])
+@pytest.mark.parametrize(
+    "field,value", [("negative_prompt", ["avoid this"]), ("guidance_scale", 2.0)]
+)
 @pytest.mark.parametrize("method", ["preprocess_func", "inference"])
-def test_public_execution_rejects_any_guidance_argument(
+def test_public_execution_rejects_non_neutral_guidance(
     monkeypatch, method: str, field: str, value: Any
 ) -> None:
     monkeypatch.setattr(
@@ -152,6 +154,127 @@ def test_public_execution_rejects_any_guidance_argument(
         arguments.update(height=64, width=96, num_frames=5)
     with pytest.raises(ValueError, match=f"{field}"):
         getattr(adapter, method)(**arguments)
+
+
+def test_public_preprocess_accepts_neutral_guidance_inputs(monkeypatch) -> None:
+    monkeypatch.setattr(
+        workflow,
+        "encode_h3_workflow_inputs",
+        lambda *args, **kwargs: {"prompt_embeds": torch.zeros(1, 2, 4)},
+    )
+    adapter = _adapter(MiniMaxH3T2VAAdapter)
+
+    result = adapter.preprocess_func(
+        prompt=["describe"],
+        negative_prompt=None,
+        guidance_scale=1.0,
+        height=64,
+        width=96,
+        num_frames=5,
+    )
+
+    assert result["prompt_embeds"].shape == (1, 2, 4)
+
+
+class _ReachedH3Blocks(RuntimeError):
+    pass
+
+
+@pytest.mark.parametrize(
+    "trainer_class",
+    [
+        GRPOTrainer,
+        GRPOGuardTrainer,
+        DPPOTrainer,
+        DPOTrainer,
+        DGPOTrainer,
+        DiffusionNFTTrainer,
+        AWMTrainer,
+        CRDTrainer,
+        DiffusionOPDTrainer,
+    ],
+)
+def test_base_trainer_sample_batch_accepts_default_h3_neutral_guidance(
+    monkeypatch, trainer_class: type
+) -> None:
+    def reached_blocks(*args, **kwargs):
+        raise _ReachedH3Blocks
+
+    monkeypatch.setattr(workflow, "prepare_h3_rollout_state", reached_blocks)
+    adapter = _adapter(MiniMaxH3T2VAAdapter)
+    trainer = object.__new__(trainer_class)
+    trainer.adapter = adapter
+    trainer.training_args = {"guidance_scale": 1.0}
+
+    with pytest.raises(_ReachedH3Blocks):
+        trainer.sample_batch(
+            {
+                "prompt": ["describe"],
+                "negative_prompt": None,
+                "prompt_embeds": torch.zeros(1, 2, 4),
+                "layout": {},
+                "geometry": {},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "images",
+    [
+        [[]],
+        [["first", "middle", "last"]],
+        [["first"], ["second"]],
+    ],
+)
+@pytest.mark.parametrize("field", ["images", "condition_images"])
+def test_fl2va_inference_rejects_invalid_condition_cardinality_before_blocks(
+    monkeypatch, field: str, images: List[List[Any]]
+) -> None:
+    block_calls: List[Any] = []
+
+    def reached_blocks(*args, **kwargs):
+        block_calls.append((args, kwargs))
+        raise _ReachedH3Blocks
+
+    monkeypatch.setattr(workflow, "prepare_h3_rollout_state", reached_blocks)
+    adapter = _adapter(MiniMaxH3FL2VAAdapter)
+
+    with pytest.raises(ValueError, match=r"workflow='fl2va'.*(B=1|one or two)"):
+        adapter.inference(
+            prompt=["describe"],
+            prompt_embeds=torch.zeros(1, 2, 4),
+            layout={},
+            geometry={},
+            **{field: images},
+        )
+
+    assert block_calls == []
+
+
+@pytest.mark.parametrize("images", [[["first"]], [["first", "last"]]])
+@pytest.mark.parametrize("field", ["images", "condition_images"])
+def test_fl2va_inference_preserves_valid_order_before_blocks(
+    monkeypatch, field: str, images: List[List[Any]]
+) -> None:
+    captured: List[Any] = []
+
+    def reached_blocks(pipeline, values, **kwargs):
+        captured.append(values[field])
+        raise _ReachedH3Blocks
+
+    monkeypatch.setattr(workflow, "prepare_h3_rollout_state", reached_blocks)
+    adapter = _adapter(MiniMaxH3FL2VAAdapter)
+
+    with pytest.raises(_ReachedH3Blocks):
+        adapter.inference(
+            prompt=["describe"],
+            prompt_embeds=torch.zeros(1, 2, 4),
+            layout={},
+            geometry={},
+            **{field: images},
+        )
+
+    assert captured == [images]
 
 
 def test_pinned_preprocessing_runs_under_no_grad(monkeypatch) -> None:
