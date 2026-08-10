@@ -7,6 +7,15 @@ description: "Complete workflow for adding a new model adapter. Covers analysis,
 
 > **Authoritative reference**: `guidance/new_model.md` — read it first.
 
+## Related Topics
+
+- Backend component discovery, materialization, lifecycle, and scheduler ownership:
+  [Component Runtime](../../knowledge/topics/component_runtime.md)
+- Structured rollout, replay bridges, callbacks, and multi-component reductions:
+  [Structured Trajectory](../../knowledge/topics/structured_trajectory.md)
+- MiniMax H3 workflow, input, scheduling, dependency, and verification constraints:
+  [MiniMax H3](../../knowledge/topics/minimax_h3.md)
+
 ## Prerequisites
 
 Before starting, ensure you understand:

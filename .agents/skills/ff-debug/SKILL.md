@@ -10,6 +10,9 @@ description: "Bug fixing and debugging for ANY error, crash, loss divergence, gr
 - NaN, loss divergence, wrong gradients -> `topics/train_inference_consistency.md`
 - Dtype mismatch, overflow, precision -> `topics/dtype_precision.md`
 - Frozen/flat loss or KL ≈ 0 -> `topics/autocast_param_swap.md` (#20a)
+- Missing/double-moved components, lazy loading, scheduler order -> [Component Runtime](../../knowledge/topics/component_runtime.md)
+- Replay/index-map/callback/active-mask failures -> [Structured Trajectory](../../knowledge/topics/structured_trajectory.md)
+- MiniMax H3 input, schedule, reference, or dependency failures -> [MiniMax H3](../../knowledge/topics/minimax_h3.md)
 
 ## Two Pathways
 

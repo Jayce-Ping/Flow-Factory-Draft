@@ -21,18 +21,13 @@ All three registries support a **direct Python path** fallback (e.g., `my_packag
 `@register_trainer` and `@register_reward_model` decorators exist for convenience but the canonical entries are the static dicts. If you use the decorator, ensure the static dict is also updated if the class should be discoverable by default.
 
 ### 5. Adapter Component Runtime Contract
-Existing `BaseAdapter` subclasses keep implementing `load_pipeline()` and use the default
-`ClassicPipelineRuntime`. Adapters backed by lazy modular pipelines or explicit pseudo-pipeline
-containers override the concrete `build_component_runtime()` hook instead; they must retain
-`adapter.pipeline` as the backend compatibility alias and ensure the canonical scheduler is
-materialized before scheduler construction. Trainer stage lifecycle must call the adapter's public
-component methods, preserving model-specific override points. Runtime-wide device and dtype
-enumeration includes only materialized canonical `torch.nn.Module` entries; declared lazy specs,
-optional `None` entries, and pseudo-pipeline aliases are not implicitly loaded or moved.
-`materialize_components(None)` means already-materialized modules, never all declared specs.
-Text-encoder/transformer role groups include non-`None` declarations/specs only.
-The canonical scheduler remains `adapter.scheduler`; `adapter.scheduler_group` owns ordered mode
-and seed dispatch, and its immutable names must equal `trajectory_component_order`.
+Canonical lookup, prepared/replacement overrides, declared specs, and materialized-module
+enumeration are distinct. Lifecycle operations include only canonical materialized modules;
+`materialize_components(None)` never means all declarations. `adapter.pipeline` and the canonical
+`adapter.scheduler` remain compatible, public adapter lifecycle overrides remain authoritative,
+and `scheduler_group.names` must equal `trajectory_component_order`. Distributed preparation stays
+inside `ModelBundle`/`RoutedComponentProxy`. Details:
+[Component Runtime](topics/component_runtime.md).
 
 ---
 
@@ -105,9 +100,12 @@ The `RewardProcessor` dispatches differently based on the model type. Do not cha
 
 **Two-layer hierarchy**: Task-level samples (`T2ISample`, `I2VSample`, `I2AVSample`, ...) are defined in `samples/samples.py` and inherit from `BaseSample` or its condition mixins (`ImageConditionSample`, `VideoConditionSample`). Model-specific samples (`LTX2Sample`, `LTX2I2AVSample`, ...) MUST inherit from the appropriate task-level sample — never from another model-specific sample across files. This mirrors the flat adapter hierarchy: `LTX2I2AVSample(I2AVSample)`, NOT `LTX2I2AVSample(LTX2Sample)`.
 
-Legacy trajectory fields remain authoritative when `BaseSample.trajectory is None`. Structured
-trajectory collation requires identical ordered component keys and shared state/log-prob index maps;
-component mapping iteration never defines scheduler RNG order.
+Legacy fields are authoritative when `BaseSample.trajectory is None`; otherwise the structured
+trajectory is authoritative. Structured state maps have length `T + 1`, transition maps have length `T`,
+`-1` means uncollected at that position, and a whole absent category is `None`. Component order
+defines scheduler/RNG dispatch. H3 and LTX2 are structured-only; H3 additionally requires B=1,
+no CFG, and video-before-audio scheduler order. Details:
+[Structured Trajectory](topics/structured_trajectory.md) and [MiniMax H3](topics/minimax_h3.md).
 
 ---
 

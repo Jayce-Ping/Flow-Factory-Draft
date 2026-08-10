@@ -7,6 +7,9 @@
 | Touching dtype/precision, mixed precision config, debugging NaN/overflow | `topics/dtype_precision.md` |
 | Editing a trainer `optimize()` loop / autocast scope, ref/EMA/named param swaps | `topics/autocast_param_swap.md` |
 | Adding or modifying a model adapter | `topics/adapter_conventions.md` |
+| Changing component discovery/materialization, lifecycle, scheduler groups, or distributed preparation | [Component Runtime](topics/component_runtime.md) |
+| Changing trajectory collection/replay, index maps, callbacks, active masks, or multi-component noise | [Structured Trajectory](topics/structured_trajectory.md) |
+| Changing MiniMax H3 adapters, workflows, references, schedules, pins, examples, or claims | [MiniMax H3](topics/minimax_h3.md) |
 | Adding adapter, upgrading diffusers, debugging output quality | `topics/parity_testing.md` |
 | Touching `TimeSampler`, `adapter.forward(t=...)`, `timestep_range`, `flow_match_sigma` | `topics/timestep_sigma.md` |
 | Editing `data_utils/sampler*`, hparams sampler/batch fields | `topics/samplers.md` |

@@ -11,6 +11,9 @@ description: "Feature development with cross-module impact analysis. Covers trai
 - Trainer/scheduler changes -> `topics/train_inference_consistency.md`
 - Trainer `optimize()` loop, autocast scope, ref/EMA/named param swaps -> `topics/autocast_param_swap.md`
 - Precision changes -> `topics/dtype_precision.md`
+- Component discovery/materialization or scheduler groups -> [Component Runtime](../../knowledge/topics/component_runtime.md)
+- Trajectory collection/replay or multi-component noise -> [Structured Trajectory](../../knowledge/topics/structured_trajectory.md)
+- MiniMax H3 adapters, workflows, references, or dependency pin -> [MiniMax H3](../../knowledge/topics/minimax_h3.md)
 
 ## Impact Analysis Checklist
 

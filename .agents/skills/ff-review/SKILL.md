@@ -103,6 +103,9 @@ Additionally, read based on diff scope:
 | `scheduler/` | `topics/train_inference_consistency.md`, `topics/dtype_precision.md` |
 | New adapter | `topics/adapter_conventions.md`, `topics/parity_testing.md` |
 | dtype/precision | `topics/dtype_precision.md`, `topics/autocast_param_swap.md` |
+| Component lifecycle/runtime | [Component Runtime](../../knowledge/topics/component_runtime.md) |
+| Structured/multi-component trajectory | [Structured Trajectory](../../knowledge/topics/structured_trajectory.md) |
+| MiniMax H3 | [MiniMax H3](../../knowledge/topics/minimax_h3.md) |
 
 ## Common Issues Found in Review
 

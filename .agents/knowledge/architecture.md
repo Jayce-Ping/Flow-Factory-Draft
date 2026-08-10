@@ -188,68 +188,16 @@ Details: `topics/adapter_conventions.md`
 ### Sample Dataclass Hierarchy
 Two-layer structure (constraint #14): task-level samples (`T2ISample`, `I2VSample`, `I2AVSample`, ...) live in `samples/samples.py` and inherit from `BaseSample` or condition mixins. Model-specific samples (`LTX2Sample`, `LTX2I2AVSample`, ...) inherit from the matching task-level sample — never from another model-specific sample.
 
-`BaseSample.trajectory` is the opt-in structured path for independently shaped/timed latent
-components; legacy trajectory fields remain unchanged and authoritative when it is `None`.
-LTX2 T2AV/I2AV rollouts are the first adapters to opt in: they publish an authoritative
-`StructuredTrajectory` and leave every legacy trajectory field `None`
-(see `topics/adapter_conventions.md` gotcha #12).
+Legacy and multi-component trajectory authority, index maps, replay bridges, and trainer
+consumption: [Structured Trajectory](topics/structured_trajectory.md).
 
 ### Component Management
-`BaseAdapter` delegates component discovery, canonical access, runtime overrides, lazy
-materialization, and stage-device lifecycle to `models/runtime/`. Runtime overrides include
-prepared/proxied modules and LoRA/checkpoint replacements; all are excluded from manual device
-management. Declared lazy specs are separate from materialized module enumeration, so stage-wide
-operations and `materialize_components(None)` never materialize tokenizers, schedulers, processors,
-or configs implicitly. Explicit names are required to materialize a lazy spec. Role groups retain
-non-`None` modular specs but exclude absent classic optional components. The default
-`ClassicPipelineRuntime` preserves eager DiffusionPipeline behavior;
-`ModularPipelineRuntime` materializes selected lazy component specs; and
-`PseudoPipelineRuntime` manages explicit containers and non-enumerated aliases such as Bagel's
-`transformer -> bagel.language_model`. `adapter.pipeline` remains the backend compatibility alias,
-while `ModelBundle` and `RoutedComponentProxy` remain the sole distributed preparation runtime.
-`SchedulerGroup` separately provides immutable component names and ordered scheduler mode/seed
-dispatch; its primary scheduler remains available through `adapter.scheduler`.
+Classic/modular/pseudo backend ownership, component lookup/materialization, scheduler groups, and
+distributed preparation: [Component Runtime](topics/component_runtime.md).
 
-#### Component runtime enumeration boundaries
-- **Date**: 2026-08-10
-- **Symptom**: Lazy stage-wide operations could materialize non-module specs, Bagel's nested
-  transformer could be moved twice, and trainers bypassed adapter lifecycle overrides.
-- **Root Cause**: The first runtime abstraction conflated declared specs, materialized modules,
-  aliases, and prepared/replacement overrides under one component-name path.
-- **Fix**: Split declared and materialized discovery, added non-enumerated pseudo aliases and
-  generic device-excluded overrides, and restored trainer routing through adapter lifecycle APIs.
-- **Lesson**: Discovery for explicit lookup and enumeration for lifecycle operations require
-  separate contracts; aliases and overrides must remain addressable without becoming lifecycle
-  roots.
-- **Related Constraint**: #5.
-
-#### Optional role discovery and lazy default materialization
-- **Date**: 2026-08-10
-- **Symptom**: A declared classic `transformer_2=None` entered the transformer role group and
-  adapter freezing called `requires_grad_` on `None`; separately, `materialize_components(None)`
-  eagerly loaded every modular spec.
-- **Root Cause**: Role discovery filtered names rather than non-`None` values, and the default
-  materialization request expanded declared names instead of materialized modules.
-- **Fix**: Role discovery now excludes `None` values while retaining non-`None` modular specs;
-  default materialization uses already-materialized module names, and normal canonical lookup
-  returns direct materialized attributes before consulting the expensive declared component map.
-- **Lesson**: Optional declarations are valid for explicit compatibility lookup but cannot imply
-  role membership, and an omitted lazy-materialization selection must never mean "load all."
-- **Related Constraint**: #5.
-
-#### Structured trajectory bridge ownership boundaries
-- **Date**: 2026-08-10
-- **Symptom**: Batch-level state arguments could be forwarded twice, partial active-count
-  overrides were rejected, and a plain mapping with structured trajectory data raised an
-  incidental attribute error.
-- **Root Cause**: The legacy bridge did not separate bridge-owned forward arguments from
-  batch conditioning, and treated optional component metadata as a complete mapping.
-- **Fix**: The bridge now strips state-owned batch keys, accepts ordered partial active-count
-  overrides while rejecting unknown components, and validates the structured batch type before
-  accessing batch metadata.
-- **Lesson**: Bridge-owned values must have one authoritative source; optional component
-  metadata should be consumed in authoritative component order without requiring every key.
-- **Related Constraint**: #5, #26.
+### MiniMax H3
+Workflow partitions, execution constraints, ordered references, dependency verification, and
+support boundaries: [MiniMax H3](topics/minimax_h3.md).
 
 ### Reward Processing
 `RewardProcessor` dispatches by model type:
