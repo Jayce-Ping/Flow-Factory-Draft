@@ -189,7 +189,13 @@ Details: `topics/adapter_conventions.md`
 Two-layer structure (constraint #14): task-level samples (`T2ISample`, `I2VSample`, `I2AVSample`, ...) live in `samples/samples.py` and inherit from `BaseSample` or condition mixins. Model-specific samples (`LTX2Sample`, `LTX2I2AVSample`, ...) inherit from the matching task-level sample — never from another model-specific sample.
 
 ### Component Management
-`BaseAdapter` discovers pipeline components and manages lifecycle: freezing, LoRA, offloading, mode switching (`train`/`eval`/`rollout`).
+`BaseAdapter` delegates component discovery, canonical access, prepared overrides, lazy
+materialization, and stage-device lifecycle to `models/runtime/`. The default
+`ClassicPipelineRuntime` preserves eager DiffusionPipeline behavior;
+`ModularPipelineRuntime` materializes selected lazy component specs; and
+`PseudoPipelineRuntime` manages explicit containers such as Bagel. `adapter.pipeline` remains the
+backend compatibility alias, while `ModelBundle` and `RoutedComponentProxy` remain the sole
+distributed preparation runtime.
 
 ### Reward Processing
 `RewardProcessor` dispatches by model type:

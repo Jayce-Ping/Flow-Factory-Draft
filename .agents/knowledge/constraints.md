@@ -20,8 +20,12 @@ All three registries support a **direct Python path** fallback (e.g., `my_packag
 ### 4. Decorator Registration
 `@register_trainer` and `@register_reward_model` decorators exist for convenience but the canonical entries are the static dicts. If you use the decorator, ensure the static dict is also updated if the class should be discoverable by default.
 
-### 5. Adapter `load_pipeline()` Must Return a DiffusionPipeline
-Every `BaseAdapter` subclass's `load_pipeline()` must return a `diffusers.DiffusionPipeline` (or compatible object). The base class's `__init__` immediately accesses `.scheduler` on the returned object.
+### 5. Adapter Component Runtime Contract
+Existing `BaseAdapter` subclasses keep implementing `load_pipeline()` and use the default
+`ClassicPipelineRuntime`. Adapters backed by lazy modular pipelines or explicit pseudo-pipeline
+containers override the concrete `build_component_runtime()` hook instead; they must retain
+`adapter.pipeline` as the backend compatibility alias and ensure the canonical scheduler is
+materialized before scheduler construction.
 
 ---
 
@@ -65,7 +69,8 @@ Reward model sharding under ZeRO-3 is broken even with `GatherParameter` context
 
 ### 12. BaseAdapter Abstract Methods
 Subclasses of `BaseAdapter` MUST implement these **4 abstract methods**:
-- `load_pipeline()` → returns a DiffusionPipeline
+- `load_pipeline()` → returns the adapter backend pipeline/container (the default runtime expects
+  a DiffusionPipeline-compatible eager object)
 - `decode_latents()` → latents → pixels
 - `inference()` → full multi-step denoising (corresponds to pipeline `__call__`)
 - `forward()` → single-step denoising for training loss computation

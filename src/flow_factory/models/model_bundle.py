@@ -120,11 +120,11 @@ class ModelBundle(nn.Module):
 class RoutedComponentProxy:
     """Callable proxy that routes a component's forward through a `ModelBundle`.
 
-    Installed as an adapter component (in ``adapter._components``) after
-    ``prepare``. Calling it invokes the prepared bundle root (driving grad-sync /
-    param-gather), while every attribute access falls through to the inner
-    module, so adapter code that does ``self.transformer(...)`` /
-    ``self.transformer.config`` keeps working unchanged.
+    Installed as an adapter's prepared component runtime override after ``prepare``.
+    Calling it invokes the prepared bundle root (driving grad-sync / param-gather),
+    while every attribute access falls through to the inner module, so adapter code
+    that does ``self.transformer(...)`` / ``self.transformer.config`` keeps working
+    unchanged.
 
     Not an ``nn.Module`` on purpose: it must not register the inner module as a
     submodule (that would double-count parameters under the bundle root). Use

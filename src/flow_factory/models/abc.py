@@ -66,6 +66,7 @@ from ..utils.checkpoint import (
 from ..samples import BaseSample
 from .latent_geometry import LatentAxes, infer_latent_axes
 from .model_bundle import RoutedComponentProxy
+from .runtime import ClassicPipelineRuntime, ComponentRuntime
 from ..ema import EMAModuleWrapper
 from ..scheduler import (
     load_scheduler as _load_scheduler,
@@ -160,12 +161,18 @@ class BaseAdapter(ABC):
         self._mode : str = 'train' # ['train', 'eval', 'rollout']
         self._named_parameters : Dict[str, NamedParametersInfo] = {}
 
-        # Load pipeline and scheduler (delegated to subclasses)
-        self.pipeline = self.load_pipeline()
+        # Build the component runtime while preserving the public pipeline alias.
+        self.component_runtime = self.build_component_runtime()
+        self.pipeline = self.component_runtime.pipeline
+        if (
+            getattr(self.pipeline, "scheduler", None) is None
+            and "scheduler" in self.component_runtime.component_names
+        ):
+            self.component_runtime.materialize_components(["scheduler"])
         self.pipeline.scheduler = self.load_scheduler()
-        
-        # Initialize prepared components cache
-        self._components: Dict[str, torch.nn.Module] = {}
+
+        # Compatibility alias: the runtime mapping is the sole authoritative cache.
+        self._components = self.component_runtime.prepared_components
 
         # Cache target module mapping
         self.target_module_map = self._init_target_module_map()
@@ -243,6 +250,14 @@ class BaseAdapter(ABC):
         """Load and return the diffusion pipeline. Must be implemented by subclasses."""
         pass
 
+    def build_component_runtime(self) -> ComponentRuntime:
+        """Build the component runtime used by this adapter.
+
+        Returns:
+            Classic runtime wrapping the subclass's existing ``load_pipeline`` result.
+        """
+        return ClassicPipelineRuntime(self.load_pipeline())
+
     def load_scheduler(self) -> SDESchedulerMixin:
         """Load and return the scheduler."""
         scheduler = _load_scheduler(
@@ -274,7 +289,7 @@ class BaseAdapter(ABC):
         encapsulated acknowledgement of that contract; readers via
         ``get_component`` see a plain ``nn.Module``.
         """
-        self._components[name] = cast(torch.nn.Module, module)
+        self.component_runtime.set_prepared_component(name, cast(torch.nn.Module, module))
     
     def get_component(self, name: str) -> torch.nn.Module:
         """Get a component, preferring the prepared version if available.
@@ -284,19 +299,21 @@ class BaseAdapter(ABC):
         that routes forwards through the prepared root; use ``_unwrap`` to recover
         the real module.
         """
-        return self._components.get(name) or getattr(self.pipeline, name)
+        return cast(torch.nn.Module, self.component_runtime.get_component(name))
 
     def get_component_unwrapped(self, name: str) -> torch.nn.Module:
         """Get the original unwrapped component."""
-        return getattr(self.pipeline, name)
+        return cast(torch.nn.Module, self.component_runtime.get_canonical_component(name))
     
     def get_component_config(self, name: str):
         """Get the config of a component."""
-        return getattr(self.pipeline, name).config
+        return self.component_runtime.get_canonical_component(name).config
 
     def prepare_components(self, accelerator: Accelerator, component_names: List[str]):
         """Prepare specified components with the accelerator."""
-        components = [getattr(self.pipeline, name) for name in component_names]
+        components = [
+            self.component_runtime.get_canonical_component(name) for name in component_names
+        ]
         prepared = accelerator.prepare(*components)
         for name, module in zip(component_names, prepared):
             self.set_component(name, module)
@@ -306,13 +323,7 @@ class BaseAdapter(ABC):
     @property
     def text_encoder_names(self) -> List[str]:
         """Get all text encoder component names from pipeline."""
-        names = [
-            name for name, value in vars(self.pipeline).items()
-            if 'text_encoder' in name
-            and not name.startswith('_')
-            and isinstance(value, torch.nn.Module)
-        ]
-        return sorted(names)
+        return self.component_runtime.text_encoder_names
 
     @property
     def text_encoders(self) -> List[torch.nn.Module]:
@@ -365,7 +376,9 @@ class BaseAdapter(ABC):
     @property
     def audio_vae(self) -> Optional[torch.nn.Module]:
         """Get audio VAE if available in pipeline, preferring prepared version."""
-        return self._components.get('audio_vae') or getattr(self.pipeline, 'audio_vae', None)
+        if "audio_vae" not in self.component_runtime.component_names:
+            return None
+        return self.get_component("audio_vae")
 
     @audio_vae.setter
     def audio_vae(self, module: torch.nn.Module):
@@ -375,13 +388,7 @@ class BaseAdapter(ABC):
     @property
     def transformer_names(self) -> List[str]:
         """Get all transformer component names."""
-        names = [
-            name for name, value in vars(self.pipeline).items()
-            if 'transformer' in name
-            and not name.startswith('_')
-            and isinstance(value, torch.nn.Module)
-        ]
-        return sorted(names)
+        return self.component_runtime.transformer_names
 
     @property
     def transformers(self) -> List[torch.nn.Module]:
@@ -2005,7 +2012,7 @@ class BaseAdapter(ABC):
         Prepared (FSDP/DeepSpeed wrapped) components are managed by the
         accelerator and should not be manually moved.
         """
-        return name not in self._components
+        return not self.component_runtime.is_prepared(name)
 
     def _resolve_component_names(self, components: Optional[Union[str, List[str]]] = None) -> List[str]:
         """
@@ -2014,27 +2021,7 @@ class BaseAdapter(ABC):
         Handles group names ('text_encoders', 'transformers') by expanding them,
         and passes through concrete names ('text_encoder', 'vae', 'transformer_2') as-is.
         """
-        if components is None:
-            return [
-                name
-                for name, comp in self.pipeline.components.items()
-                if isinstance(comp, torch.nn.Module)
-            ]
-        
-        if isinstance(components, str):
-            components = [components]
-        
-        resolved = []
-        for comp in components:
-            if comp == 'text_encoders':
-                resolved.extend(self.text_encoder_names)
-            elif comp == 'transformers':
-                resolved.extend(self.transformer_names)
-            else:
-                resolved.append(comp)
-        
-        # Deduplicate preserving order
-        return list(dict.fromkeys(resolved))
+        return self.component_runtime.resolve_component_names(components)
 
     def on_load_components(
         self,
@@ -2049,16 +2036,7 @@ class BaseAdapter(ABC):
                         None loads all components.
             device: Target device. Defaults to accelerator device.
         """
-        device = device or self.device
-        names = self._resolve_component_names(components)
-        
-        for name in names:
-            # Skip components that are managed by the accelerator
-            if not self._should_manage_device(name):
-                continue
-            component = self.get_component(name)
-            if component is not None and hasattr(component, 'to'):
-                component.to(device)
+        self.component_runtime.load_components(components, device=device or self.device)
 
     def off_load_components(self, components: Optional[Union[str, List[str]]] = None):
         """
@@ -2068,15 +2046,7 @@ class BaseAdapter(ABC):
             components: Component name(s) or group names ('text_encoders', 'transformers').
                         None off-loads all components.
         """
-        names = self._resolve_component_names(components)
-        
-        for name in names:
-            # Skip components that are managed by the accelerator
-            if not self._should_manage_device(name):
-                continue
-            component = self.get_component(name)
-            if component is not None and hasattr(component, 'to'):
-                component.to('cpu')
+        self.component_runtime.unload_components(components)
 
     def on_load(self, device: Optional[Union[torch.device, str]] = None):
         """Load all components to device."""

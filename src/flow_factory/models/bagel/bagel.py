@@ -88,6 +88,7 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ..runtime import ComponentRuntime, PseudoPipelineRuntime
 
 # Bagel's LLM attention (qwen2_navit) hard-requires flash-attn's varlen kernel,
 # imported transitively by the `.modeling` imports below. Fail fast here with
@@ -241,6 +242,22 @@ class BagelAdapter(BaseAdapter):
         # vae.decode is unaffected), so this is safe.
         pipeline.vae.reg.sample = False
         return pipeline
+
+    def build_component_runtime(self) -> ComponentRuntime:
+        """Build Bagel's explicit pseudo-pipeline component runtime.
+
+        Returns:
+            Runtime exposing Bagel's model, transformer alias, and VAE.
+        """
+        pipeline = self.load_pipeline()
+        return PseudoPipelineRuntime(
+            pipeline,
+            {
+                "bagel": pipeline.bagel,
+                "transformer": pipeline.transformer,
+                "vae": pipeline.vae,
+            },
+        )
 
     def load_scheduler(self) -> FlowMatchEulerDiscreteSDEScheduler:
         """
