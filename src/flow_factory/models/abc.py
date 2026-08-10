@@ -96,6 +96,7 @@ from .trajectory_bridge import (
     _get_state_active_numel,
     _get_terminal_state,
     _get_train_step_indices,
+    _reduce_component_latent_values,
     _reduce_latent_values,
     _resolve_component_latent_axes,
 )
@@ -2489,6 +2490,27 @@ class BaseAdapter(ABC):
             kwargs=kwargs,
         )
 
+    def reduce_component_latent_values(
+        self,
+        values: Mapping[str, torch.Tensor],
+        *,
+        state: Optional[LatentState] = None,
+    ) -> Mapping[str, torch.Tensor]:
+        """Reduce each component separately to one scalar per sample.
+
+        The default averages every non-batch element. Adapters whose components
+        carry masked or conditioning positions may override this to average only
+        the active positions, which a global element sum cannot recover.
+
+        Args:
+            values: Raw per-element component tensors in ``trajectory_component_order``.
+            state: Optional replay state supplying component masks to an override.
+
+        Returns:
+            One ``(B,)`` tensor per component, in ``trajectory_component_order``.
+        """
+        return _reduce_component_latent_values(self, values, state=state)
+
     def reduce_latent_values(
         self,
         values: Mapping[str, torch.Tensor],
@@ -2497,6 +2519,9 @@ class BaseAdapter(ABC):
     ) -> torch.Tensor:
         """Reduce component values by a global per-sample element-weighted mean.
 
+        Prefer passing raw per-element tensors whenever only a global result is
+        needed, so every element is weighted exactly once. ``active_numel`` is for
+        values already reduced per component, which a global sum cannot recover.
         A single-component ``(B,)`` value is returned unchanged to preserve the
         legacy scalar scale and tensor identity.
 

@@ -102,7 +102,9 @@ class DPPOTrainer(GRPOTrainer):
         new_state = self._require_output_state(output, output_field, "policy")
         component_kl: Dict[str, torch.Tensor]
         if kl_mask_type == "v-based":
-            component_kl = self._component_squared_errors(new_state, old_state, "stored rollout")
+            component_kl = self._component_squared_error_elements(
+                new_state, old_state, "stored rollout"
+            )
         else:
             expected_names = self.adapter.trajectory_component_order
             if old_state.component_names != expected_names:
@@ -117,14 +119,11 @@ class DPPOTrainer(GRPOTrainer):
             component_kl = {}
             for name in expected_names:
                 sigma_t = self._effective_sigma(name, std_dev_t[name], dt[name])
-                kl_elem = gaussian_kl_div(
+                component_kl[name] = gaussian_kl_div(
                     new_state.components[name], old_state.components[name], sigma_t
                 )
-                component_kl[name] = kl_elem.flatten(1).mean(dim=1)
-        return self.adapter.reduce_latent_values(
-            component_kl,
-            active_numel=self.adapter.get_state_active_numel(replay.state),
-        )
+        # Raw per-element values, so one global reduction weights every element once.
+        return self.adapter.reduce_latent_values(component_kl)
 
     # =========================== Sampling Loop ============================
     def sample(self) -> List[BaseSample]:
@@ -160,15 +159,15 @@ class DPPOTrainer(GRPOTrainer):
         _, mask_field = self._kl_space_fields(kl_mask_type, "kl_mask_type")
         # Forward fields: the mask uses kl_mask_type; the ref penalty uses kl_type.
         # std_dev_t/dt feed the x-based mask's variance scaling only.
-        return_fields = {"log_prob", mask_field}
+        requested_fields = {"log_prob", mask_field}
         if kl_mask_type == "x-based":
-            return_fields.update(("std_dev_t", "dt"))
+            requested_fields.update(("std_dev_t", "dt"))
         if self.enable_kl_loss:
             _, ref_return_field = self._kl_space_fields(kl_type, "kl_type")
-            return_fields.add(ref_return_field)
+            requested_fields.add(ref_return_field)
         else:
             ref_return_field = None
-        return_fields = tuple(return_fields)
+        return_fields = self._canonical_return_fields(requested_fields)
         for inner_epoch in range(self.training_args.num_inner_epochs):
             shuffled_samples = self._order_samples_for_optimize(samples, inner_epoch)
 
@@ -206,7 +205,10 @@ class DPPOTrainer(GRPOTrainer):
                         adv = batch["advantage"]
                         adv_clip_range = self.training_args.adv_clip_range
                         adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
-                        ratio = torch.exp(output.log_prob - old_log_prob)
+                        new_log_prob = self._require_policy_log_prob(
+                            output, step_index, self._replay_batch_size(replay)
+                        )
+                        ratio = torch.exp(new_log_prob - old_log_prob)
 
                         # Per-step KL(current || old) for the trust-region mask.
                         kl_new_old = self._trust_region_kl(output, replay, old_mask_state)
@@ -240,7 +242,7 @@ class DPPOTrainer(GRPOTrainer):
                                     batch, replay, (ref_return_field,), **ref_overrides
                                 )
                                 # kl_div must be computed outside `torch.no_grad()` for correct gradients.
-                                kl_div = self._reference_kl_divergence(output, ref_output, replay)
+                                kl_div = self._reference_kl_divergence(output, ref_output)
                                 kl_loss = self.training_args.kl_beta * kl_div
                                 loss += kl_loss
                                 loss_info["kl_div"].append(kl_div.detach())

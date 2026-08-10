@@ -47,13 +47,16 @@ class AdapterFake(BaseAdapter):
     def forward(self, **kwargs: Any) -> SDESchedulerOutput:
         """Record and return a deterministic scheduler output."""
         self.forward_kwargs = kwargs
+        latents = kwargs["latents"]
+        # Schedulers broadcast per-sample statistics to (B, 1, ..., 1).
+        broadcast_shape = (latents.shape[0],) + (1,) * (latents.ndim - 1)
         return SDESchedulerOutput(
-            next_latents=kwargs["latents"] + 1,
-            next_latents_mean=kwargs["latents"] + 2,
-            std_dev_t=torch.tensor([0.25]),
-            dt=torch.tensor([-0.5]),
-            log_prob=torch.tensor([0.75]),
-            velocity=kwargs["latents"] + 3,
+            next_latents=latents + 1,
+            next_latents_mean=latents + 2,
+            std_dev_t=torch.full(broadcast_shape, 0.25),
+            dt=torch.full(broadcast_shape, -0.5),
+            log_prob=torch.full((latents.shape[0],), 0.75),
+            velocity=latents + 3,
         )
 
 
@@ -369,7 +372,7 @@ def test_legacy_forward_state_preserves_arguments_and_wraps_output() -> None:
     assert torch.equal(
         output.next_state.components["latent"], replay.state.components["latent"] + 1
     )
-    assert torch.equal(output.log_prob, torch.tensor([0.75]))
+    assert torch.equal(output.log_prob, torch.tensor([0.75, 0.75]))
 
 
 def test_forward_state_removes_batch_level_state_owned_keys() -> None:

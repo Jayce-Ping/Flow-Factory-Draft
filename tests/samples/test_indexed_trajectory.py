@@ -16,10 +16,12 @@ import pytest
 import torch
 
 from flow_factory.samples import (
+    ComponentTimes,
     ComponentTrajectory,
     IndexedTrajectoryTensor,
     LatentState,
     MultiModalStepOutput,
+    ReplayStep,
     StructuredTrajectory,
 )
 
@@ -178,8 +180,8 @@ def test_structured_trajectory_stack_requires_identical_callback_fields() -> Non
 def test_multi_modal_step_output_validates_component_statistic_mappings() -> None:
     output = MultiModalStepOutput(
         next_state_mean=LatentState({"latent": torch.zeros(2, 3)}),
-        std_dev_t={"latent": torch.tensor([0.25])},
-        dt={"latent": torch.tensor([-0.5])},
+        std_dev_t={"latent": torch.full((2, 1), 0.25)},
+        dt={"latent": torch.full((2, 1), -0.5)},
         log_prob=torch.tensor([0.75, 0.5]),
         component_log_probs={"latent": torch.tensor([0.75, 0.5])},
     )
@@ -189,3 +191,127 @@ def test_multi_modal_step_output_validates_component_statistic_mappings() -> Non
 
     with pytest.raises(TypeError, match=r"MultiModalStepOutput.std_dev_t\['latent'\].*float"):
         MultiModalStepOutput(std_dev_t={"latent": 0.25})
+
+
+def _times(names: tuple) -> ComponentTimes:
+    return ComponentTimes(
+        timestep={name: torch.tensor([500.0, 500.0]) for name in names},
+        next_timestep={name: torch.tensor(0) for name in names},
+    )
+
+
+def test_structured_trajectory_validates_component_order_without_joint_log_probs() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"component_log_probs component order \('video', 'audio'\).*\('audio', 'video'\)",
+    ):
+        StructuredTrajectory(
+            components={"video": _component(), "audio": _component(5.0)},
+            component_log_probs={
+                "audio": torch.tensor([0.1, 0.2]),
+                "video": torch.tensor([0.3, 0.4]),
+            },
+        )
+
+
+def test_structured_trajectory_requires_consistent_component_log_prob_lengths() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"component_log_probs\['audio'\] shape \(2,\).*'video'.*\(3,\)",
+    ):
+        StructuredTrajectory(
+            components={"video": _component(), "audio": _component(5.0)},
+            component_log_probs={
+                "video": torch.tensor([0.1, 0.2]),
+                "audio": torch.tensor([0.3, 0.4, 0.5]),
+            },
+        )
+
+
+def test_structured_trajectory_stack_reports_component_log_prob_shape_mismatch() -> None:
+    first = StructuredTrajectory(
+        components={"latent": _component()},
+        component_log_probs={"latent": torch.tensor([0.1, 0.2])},
+    )
+    other = StructuredTrajectory(
+        components={"latent": _component(10.0)},
+        component_log_probs={"latent": torch.tensor([10.1, 10.2, 10.3])},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"component_log_probs\['latent'\].*\(2,\).*\(3,\).*sample index 1",
+    ):
+        StructuredTrajectory.stack([first, other])
+
+
+def test_replay_step_requires_common_component_order() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"ReplayStep.next_state component order \('video', 'audio'\).*\('audio', 'video'\)",
+    ):
+        ReplayStep(
+            state=LatentState({"video": torch.zeros(2, 3), "audio": torch.zeros(2, 4)}),
+            next_state=LatentState({"audio": torch.zeros(2, 4), "video": torch.zeros(2, 3)}),
+            times=_times(("video", "audio")),
+        )
+
+
+def test_replay_step_requires_a_shared_batch_size() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"ReplayStep.next_state\['audio'\].*batch size 2.*\(3, 4\)",
+    ):
+        ReplayStep(
+            state=LatentState({"video": torch.zeros(2, 3), "audio": torch.zeros(2, 4)}),
+            next_state=LatentState({"video": torch.zeros(2, 3), "audio": torch.zeros(3, 4)}),
+            times=_times(("video", "audio")),
+        )
+
+
+def test_replay_step_requires_scalar_component_log_probabilities() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"ReplayStep.component_log_probs\['latent'\].*\(2,\).*\(2, 3\)",
+    ):
+        ReplayStep(
+            state=LatentState({"latent": torch.zeros(2, 3)}),
+            next_state=LatentState({"latent": torch.zeros(2, 3)}),
+            times=_times(("latent",)),
+            log_prob=torch.zeros(2),
+            component_log_probs={"latent": torch.zeros(2, 3)},
+        )
+
+
+def test_multi_modal_step_output_requires_common_component_order() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"MultiModalStepOutput.std_dev_t component order "
+        r"\('video', 'audio'\).*\('audio', 'video'\)",
+    ):
+        MultiModalStepOutput(
+            next_state_mean=LatentState({"video": torch.zeros(2, 3), "audio": torch.zeros(2, 4)}),
+            std_dev_t={"audio": torch.zeros(2, 1), "video": torch.zeros(2, 1)},
+        )
+
+
+def test_multi_modal_step_output_requires_a_shared_batch_size() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"MultiModalStepOutput.std_dev_t\['latent'\].*batch size 2.*\(3, 1\)",
+    ):
+        MultiModalStepOutput(
+            next_state_mean=LatentState({"latent": torch.zeros(2, 3)}),
+            std_dev_t={"latent": torch.zeros(3, 1)},
+        )
+
+
+def test_multi_modal_step_output_requires_scalar_component_log_probabilities() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"MultiModalStepOutput.component_log_probs\['latent'\].*\(2,\).*\(2, 3\)",
+    ):
+        MultiModalStepOutput(
+            next_state_mean=LatentState({"latent": torch.zeros(2, 3)}),
+            component_log_probs={"latent": torch.zeros(2, 3)},
+        )

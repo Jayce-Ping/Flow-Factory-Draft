@@ -47,6 +47,15 @@ KL_SPACE_FIELDS: Dict[str, Tuple[str, str]] = {
     "v-based": ("velocity", "velocity"),
     "x-based": ("next_state_mean", "next_latents_mean"),
 }
+# Canonical `return_kwargs` order, so a requested set always produces one tuple.
+CANONICAL_RETURN_FIELDS: Tuple[str, ...] = (
+    "log_prob",
+    "next_latents",
+    "next_latents_mean",
+    "std_dev_t",
+    "dt",
+    "velocity",
+)
 
 
 # ============================ GRPO Trainer ============================
@@ -136,6 +145,39 @@ class GRPOTrainer(BaseTrainer):
             )
         return replay.log_prob
 
+    def _require_policy_log_prob(
+        self, output: MultiModalStepOutput, step_index: int, batch_size: int
+    ) -> torch.Tensor:
+        """Return the current-policy joint log probability for the PPO ratio."""
+        log_prob = output.log_prob
+        if isinstance(log_prob, torch.Tensor) and log_prob.shape == (batch_size,):
+            return log_prob
+        received = (
+            tuple(log_prob.shape) if isinstance(log_prob, torch.Tensor) else type(log_prob).__name__
+        )
+        raise ValueError(
+            f"expected policy log_prob for {type(self).__name__} replay at "
+            f"step_index={step_index} to be a tensor of shape (B,) with batch size "
+            f"{batch_size}, received {received}; request 'log_prob' through return_fields "
+            "and keep compute_log_prob=True"
+        )
+
+    def _replay_batch_size(self, replay: ReplayStep) -> int:
+        """Return the replay batch size from the primary component state."""
+        primary = self.adapter.trajectory_component_order[0]
+        return replay.state.components[primary].shape[0]
+
+    def _canonical_return_fields(self, fields: Any) -> Tuple[str, ...]:
+        """Order requested scheduler output fields deterministically."""
+        requested = set(fields)
+        unknown = tuple(sorted(requested.difference(CANONICAL_RETURN_FIELDS)))
+        if unknown:
+            raise ValueError(
+                f"unknown return field {unknown[0]!r}; expected a subset of "
+                f"{CANONICAL_RETURN_FIELDS}"
+            )
+        return tuple(name for name in CANONICAL_RETURN_FIELDS if name in requested)
+
     def _kl_space_fields(self, kl_space: str, argument_name: str) -> Tuple[str, str]:
         """Resolve the output attribute and legacy request name for a KL space."""
         if kl_space not in KL_SPACE_FIELDS:
@@ -182,10 +224,14 @@ class GRPOTrainer(BaseTrainer):
             )
         return values
 
-    def _component_squared_errors(
+    def _component_squared_error_elements(
         self, new_state: LatentState, old_state: LatentState, source: str
     ) -> Dict[str, torch.Tensor]:
-        """Per-component mean squared error over each component's active elements."""
+        """Raw per-element squared error for each component, in component order.
+
+        Errors stay unreduced so a global reduction can weight every element once;
+        pre-reducing per component and rescaling cannot recover a masked sum.
+        """
         expected_names = self.adapter.trajectory_component_order
         if old_state.component_names != expected_names:
             raise ValueError(
@@ -193,10 +239,7 @@ class GRPOTrainer(BaseTrainer):
                 f"received {old_state.component_names}"
             )
         return {
-            name: (new_state.components[name] - old_state.components[name])
-            .flatten(1)
-            .pow(2)
-            .mean(dim=1)
+            name: (new_state.components[name] - old_state.components[name]) ** 2
             for name in expected_names
         }
 
@@ -204,21 +247,15 @@ class GRPOTrainer(BaseTrainer):
         self,
         output: MultiModalStepOutput,
         ref_output: MultiModalStepOutput,
-        replay: ReplayStep,
     ) -> torch.Tensor:
         """Scalar policy-vs-reference squared error in the configured KL space."""
         output_field, _ = self._kl_space_fields(self.training_args.kl_type, "kl_type")
-        errors = self._component_squared_errors(
+        errors = self._component_squared_error_elements(
             self._require_output_state(output, output_field, "policy"),
             self._require_output_state(ref_output, output_field, "reference"),
             "reference",
         )
-        return torch.mean(
-            self.adapter.reduce_latent_values(
-                errors,
-                active_numel=self.adapter.get_state_active_numel(replay.state),
-            )
-        )
+        return torch.mean(self.adapter.reduce_latent_values(errors))
 
     def start(self):
         """Main training loop."""
@@ -285,14 +322,15 @@ class GRPOTrainer(BaseTrainer):
         # shape; the reference KL space adds its own comparison field.
         if self.enable_kl_loss:
             _, ref_return_field = self._kl_space_fields(self.training_args.kl_type, 'kl_type')
-            return_fields = (
-                ('log_prob', 'velocity', 'dt')
+            requested_fields = (
+                {'log_prob', 'velocity', 'dt'}
                 if self.training_args.kl_type == 'v-based'
-                else ('log_prob', 'next_latents', 'next_latents_mean', 'dt')
+                else {'log_prob', 'next_latents', 'next_latents_mean', 'dt'}
             )
         else:
             ref_return_field = None
-            return_fields = ('log_prob', 'dt')
+            requested_fields = {'log_prob', 'dt'}
+        return_fields = self._canonical_return_fields(requested_fields)
         for inner_epoch in range(self.training_args.num_inner_epochs):
             # Shuffle unless disabled for pack-composition-dependent adapters.
             shuffled_samples = self._order_samples_for_optimize(samples, inner_epoch)
@@ -333,7 +371,10 @@ class GRPOTrainer(BaseTrainer):
                         adv_clip_range = self.training_args.adv_clip_range
                         adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
                         # PPO-style clipped loss
-                        ratio = torch.exp(output.log_prob - old_log_prob)
+                        new_log_prob = self._require_policy_log_prob(
+                            output, step_index, self._replay_batch_size(replay)
+                        )
+                        ratio = torch.exp(new_log_prob - old_log_prob)
                         ratio_clip_range = self.training_args.clip_range
 
                         unclipped_loss = -adv * ratio
@@ -350,7 +391,7 @@ class GRPOTrainer(BaseTrainer):
                                 )
                                 # kl_div must be computed outside `torch.no_grad()` for correct gradient behavior.
                                 # See: issue #122, PR #123 (https://github.com/X-GenGroup/Flow-Factory/pull/123)
-                                kl_div = self._reference_kl_divergence(output, ref_output, replay)
+                                kl_div = self._reference_kl_divergence(output, ref_output)
                                 kl_loss = self.training_args.kl_beta * kl_div
                                 loss += kl_loss
                                 loss_info['kl_div'].append(kl_div.detach())
@@ -443,12 +484,19 @@ class GRPOGuardTrainer(GRPOTrainer):
         output: MultiModalStepOutput,
         replay: ReplayStep,
         old_state_mean: LatentState,
+        step_index: int = 0,
     ) -> torch.Tensor:
         """Variance-reweighted importance ratio, per component then DOF-reduced.
 
         Each component contributes ``(delta_log_prob * scale + mse / (2 * scale))``
         with ``scale = sqrt(-dt) * std_dev_t``; the terms are combined by active
         stochastic degrees of freedom before a single exponentiation.
+
+        Args:
+            output: Current-policy step output.
+            replay: Stored rollout transition being replayed.
+            old_state_mean: Stored rollout transition mean.
+            step_index: Rollout position, reported by validation errors.
         """
         expected_names = self.adapter.trajectory_component_order
         new_state_mean = self._require_output_state(output, "next_state_mean", "policy")
@@ -465,18 +513,24 @@ class GRPOGuardTrainer(GRPOTrainer):
                 f"expected stored rollout next_latents_mean in component order "
                 f"{expected_names}, received {old_state_mean.component_names}"
             )
+        batch_size = self._replay_batch_size(replay)
+        # Guard reweights per component, but the joint log probability must still be a
+        # well-formed (B,) tensor before any PPO arithmetic consumes this ratio.
+        self._require_policy_log_prob(output, step_index, batch_size)
+        component_mse = self.adapter.reduce_component_latent_values(
+            self._component_squared_error_elements(
+                new_state_mean, old_state_mean, "stored rollout"
+            ),
+            state=replay.state,
+        )
         guard_terms = {}
         for name in expected_names:
-            scale_factor = torch.sqrt(-dt[name]) * std_dev_t[name]
-            mse = (
-                (new_state_mean.components[name] - old_state_mean.components[name])
-                .flatten(1)
-                .pow(2)
-                .mean(dim=1)
-            )
-            guard_terms[name] = (new_log_probs[name] - old_log_probs[name]) * scale_factor + mse / (
-                2 * scale_factor
-            )
+            scale_factor = torch.sqrt(
+                -self._scalar_component_statistic(dt, "dt", name, batch_size)
+            ) * self._scalar_component_statistic(std_dev_t, "std_dev_t", name, batch_size)
+            guard_terms[name] = (
+                new_log_probs[name] - old_log_probs[name]
+            ) * scale_factor + component_mse[name] / (2 * scale_factor)
         return torch.exp(
             self.adapter.reduce_latent_values(
                 guard_terms,
@@ -484,19 +538,45 @@ class GRPOGuardTrainer(GRPOTrainer):
             )
         )
 
+    def _scalar_component_statistic(
+        self,
+        values: Mapping[str, torch.Tensor],
+        field: str,
+        component: str,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """Flatten a broadcast ``(B, 1, ...)`` scheduler statistic to ``(B,)``.
+
+        The Guard ratio combines statistics with ``(B,)`` log probabilities and
+        ``(B,)`` component errors, so a leftover broadcast axis would silently
+        produce a cross-product instead of a per-sample scale.
+        """
+        statistic = values[component]
+        if statistic.ndim < 1 or statistic.shape[0] != batch_size:
+            raise ValueError(
+                f"expected policy output {field} for component {component!r} to use batch "
+                f"size {batch_size}, received shape {tuple(statistic.shape)}"
+            )
+        if statistic.numel() != batch_size:
+            raise ValueError(
+                f"expected policy output {field} for component {component!r} to hold exactly "
+                f"one value per sample, received shape {tuple(statistic.shape)}"
+            )
+        return statistic.reshape(batch_size)
+
     def optimize(self, samples: List[BaseSample]) -> None:
         """Policy optimization (Stage 6): GRPO-Guard reweighted loss and optional KL."""
         per_device_batch_size = self.training_args.per_device_batch_size
         num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
         train_step_indices = self.adapter.get_train_step_indices()
         # The reweighted ratio always needs the transition mean, its std, and dt.
-        return_fields = {'log_prob', 'next_latents_mean', 'std_dev_t', 'dt'}
+        requested_fields = {'log_prob', 'next_latents_mean', 'std_dev_t', 'dt'}
         if self.enable_kl_loss:
             _, ref_return_field = self._kl_space_fields(self.training_args.kl_type, 'kl_type')
-            return_fields.add(ref_return_field)
+            requested_fields.add(ref_return_field)
         else:
             ref_return_field = None
-        return_fields = tuple(return_fields)
+        return_fields = self._canonical_return_fields(requested_fields)
         for inner_epoch in range(self.training_args.num_inner_epochs):
             # Shuffle unless disabled for pack-composition-dependent adapters.
             shuffled_samples = self._order_samples_for_optimize(samples, inner_epoch)
@@ -539,7 +619,7 @@ class GRPOGuardTrainer(GRPOTrainer):
                         adv_clip_range = self.training_args.adv_clip_range
                         adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
                         # Reweighted ratio
-                        ratio = self._guard_ratio(output, replay, old_state_mean)
+                        ratio = self._guard_ratio(output, replay, old_state_mean, step_index)
                         # PPO-style clipped loss
                         ratio_clip_range = self.training_args.clip_range
 
@@ -557,7 +637,7 @@ class GRPOGuardTrainer(GRPOTrainer):
                                 )
                                 # kl_div must be computed outside `torch.no_grad()` for correct gradient behavior.
                                 # See: issue #122, PR #123 (https://github.com/X-GenGroup/Flow-Factory/pull/123)
-                                kl_div = self._reference_kl_divergence(output, ref_output, replay)
+                                kl_div = self._reference_kl_divergence(output, ref_output)
                                 kl_loss = self.training_args.kl_beta * kl_div
                                 loss += kl_loss
                                 loss_info['kl_div'].append(kl_div.detach())

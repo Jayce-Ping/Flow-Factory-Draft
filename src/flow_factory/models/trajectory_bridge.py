@@ -652,6 +652,41 @@ def _resolve_component_latent_axes(
     return adapter.resolve_latent_axes(latents)
 
 
+def _reduce_component_latent_values(
+    adapter: Any,
+    values: Mapping[str, torch.Tensor],
+    *,
+    state: Optional[LatentState],
+) -> Dict[str, torch.Tensor]:
+    if not isinstance(values, Mapping) or not values:
+        raise ValueError(
+            f"expected non-empty Mapping[str, torch.Tensor] for values, received "
+            f"{type(values).__name__}"
+        )
+    expected_names = adapter.trajectory_component_order
+    if tuple(values) != expected_names:
+        raise ValueError(
+            f"expected values keys/order to match trajectory_component_order "
+            f"{expected_names}, received {tuple(values)}"
+        )
+    if state is not None and state.component_names != expected_names:
+        raise ValueError(
+            f"expected state component order {expected_names}, received {state.component_names}"
+        )
+    reduced: Dict[str, torch.Tensor] = {}
+    for name in expected_names:
+        component_values = values[name]
+        if not isinstance(component_values, torch.Tensor) or component_values.ndim < 1:
+            raise ValueError(
+                f"expected values[{name!r}] to be a batched torch.Tensor with a leading "
+                f"batch dimension, received shape "
+                f"{tuple(getattr(component_values, 'shape', ()))}"
+            )
+        batch_size = component_values.shape[0]
+        reduced[name] = component_values.reshape(batch_size, -1).mean(dim=1)
+    return reduced
+
+
 def _reduce_latent_values(
     adapter: Any,
     values: Mapping[str, torch.Tensor],

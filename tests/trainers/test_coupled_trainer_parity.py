@@ -72,13 +72,16 @@ class AdapterFake(BaseAdapter):
     def forward(self, **kwargs: Any) -> SDESchedulerOutput:
         """Record kwargs and return a deterministic scheduler output."""
         self.forward_kwargs = kwargs
+        latents = kwargs["latents"]
+        # Schedulers broadcast per-sample statistics to (B, 1, ..., 1).
+        broadcast_shape = (latents.shape[0],) + (1,) * (latents.ndim - 1)
         return SDESchedulerOutput(
-            next_latents=kwargs["latents"] + 1,
-            next_latents_mean=kwargs["latents"] + 2,
-            std_dev_t=torch.tensor([0.25]),
-            dt=torch.tensor([-0.5]),
+            next_latents=latents + 1,
+            next_latents_mean=latents + 2,
+            std_dev_t=torch.full(broadcast_shape, 0.25),
+            dt=torch.full(broadcast_shape, -0.5),
             log_prob=torch.tensor([0.75, 0.5]),
-            velocity=kwargs["latents"] + 3,
+            velocity=latents + 3,
         )
 
     @contextmanager
@@ -94,9 +97,34 @@ class StructuredAdapterFake(AdapterFake):
     trajectory_component_order = ("video", "audio")
 
 
+class MaskedAdapterFake(AdapterFake):
+    """Adapter whose latent keeps only its first two positions active."""
+
+    active_numel = 2
+
+    def get_state_active_numel(self, state: LatentState) -> Dict[str, int]:
+        """Count only the active latent prefix."""
+        return {"latent": self.active_numel}
+
+    def reduce_component_latent_values(
+        self, values: Dict[str, torch.Tensor], *, state: Optional[LatentState] = None
+    ) -> Dict[str, torch.Tensor]:
+        """Average each component over its active prefix only."""
+        return {
+            "latent": values["latent"].flatten(1)[:, : self.active_numel].mean(dim=1),
+        }
+
+
 def _adapter(dynamics_type: str = "Flow-SDE") -> AdapterFake:
     adapter = object.__new__(AdapterFake)
     adapter.pipeline = SimpleNamespace(scheduler=SchedulerFake(dynamics_type))
+    adapter.scheduler_group = adapter.build_scheduler_group()
+    return adapter
+
+
+def _masked_adapter() -> MaskedAdapterFake:
+    adapter = object.__new__(MaskedAdapterFake)
+    adapter.pipeline = SimpleNamespace(scheduler=SchedulerFake())
     adapter.scheduler_group = adapter.build_scheduler_group()
     return adapter
 
@@ -224,12 +252,10 @@ def test_grpo_reference_kl_matches_legacy_velocity_formula() -> None:
     new_velocity = torch.randn(2, 3, 4)
     ref_velocity = torch.randn(2, 3, 4)
     trainer = _trainer(GRPOTrainer, _adapter(), kl_type="v-based")
-    replay = _replay({"latent": torch.zeros(2, 3, 4)})
 
     kl_div = trainer._reference_kl_divergence(
         MultiModalStepOutput(velocity=LatentState({"latent": new_velocity})),
         MultiModalStepOutput(velocity=LatentState({"latent": ref_velocity})),
-        replay,
     )
 
     assert torch.equal(kl_div, _legacy_squared_error_kl(new_velocity, ref_velocity))
@@ -240,33 +266,30 @@ def test_grpo_reference_kl_matches_legacy_next_state_mean_formula() -> None:
     new_mean = torch.randn(2, 6)
     ref_mean = torch.randn(2, 6)
     trainer = _trainer(GRPOTrainer, _adapter(), kl_type="x-based")
-    replay = _replay({"latent": torch.zeros(2, 6)})
 
     kl_div = trainer._reference_kl_divergence(
         MultiModalStepOutput(next_state_mean=LatentState({"latent": new_mean})),
         MultiModalStepOutput(next_state_mean=LatentState({"latent": ref_mean})),
-        replay,
     )
 
     assert torch.equal(kl_div, _legacy_squared_error_kl(new_mean, ref_mean))
 
 
-def test_grpo_reference_kl_weights_components_by_active_degrees_of_freedom() -> None:
+def test_grpo_reference_kl_reduces_raw_elements_across_components() -> None:
+    """A global element mean, not an unweighted average of component means."""
     torch.manual_seed(2)
     new_video, ref_video = torch.randn(2, 3, 4), torch.randn(2, 3, 4)
     new_audio, ref_audio = torch.randn(2, 5), torch.randn(2, 5)
     trainer = _trainer(GRPOTrainer, _structured_adapter(), kl_type="v-based")
-    replay = _replay({"video": torch.zeros(2, 3, 4), "audio": torch.zeros(2, 5)})
 
     kl_div = trainer._reference_kl_divergence(
         MultiModalStepOutput(velocity=LatentState({"video": new_video, "audio": new_audio})),
         MultiModalStepOutput(velocity=LatentState({"video": ref_video, "audio": ref_audio})),
-        replay,
     )
 
-    video_mse = (new_video - ref_video).flatten(1).pow(2).mean(dim=1)
-    audio_mse = (new_audio - ref_audio).flatten(1).pow(2).mean(dim=1)
-    expected = torch.mean((video_mse * 12 + audio_mse * 5) / 17)
+    video_sum = (new_video - ref_video).flatten(1).pow(2).sum(dim=1)
+    audio_sum = (new_audio - ref_audio).flatten(1).pow(2).sum(dim=1)
+    expected = torch.mean((video_sum + audio_sum) / 17)
     assert torch.equal(kl_div, expected)
 
 
@@ -306,27 +329,69 @@ def test_grpo_replay_forward_passes_state_and_training_arguments() -> None:
     assert adapter.forward_kwargs["return_kwargs"] == ("log_prob", "dt")
 
 
-def test_guard_ratio_matches_legacy_single_component_formula() -> None:
+def _guard_output(
+    new_mean: Dict[str, torch.Tensor],
+    new_log_probs: Dict[str, torch.Tensor],
+    std_dev_t: Optional[Dict[str, torch.Tensor]],
+    dt: Optional[Dict[str, torch.Tensor]],
+) -> MultiModalStepOutput:
+    joint = None
+    for value in new_log_probs.values():
+        joint = value if joint is None else joint + value
+    return MultiModalStepOutput(
+        next_state_mean=LatentState(dict(new_mean)),
+        std_dev_t=std_dev_t,
+        dt=dt,
+        log_prob=joint,
+        component_log_probs=dict(new_log_probs),
+    )
+
+
+@pytest.mark.parametrize("latent_shape", [(2, 3, 4), (2, 3, 4, 5)])
+def test_guard_ratio_normalizes_broadcast_scheduler_statistics(latent_shape: Any) -> None:
+    """Schedulers emit ``(B, 1, ...)`` statistics; the scalar formula needs ``(B,)``."""
     torch.manual_seed(3)
-    new_mean, old_mean = torch.randn(2, 4), torch.randn(2, 4)
+    new_mean, old_mean = torch.randn(*latent_shape), torch.randn(*latent_shape)
     new_log_prob, old_log_prob = torch.randn(2), torch.randn(2)
-    std_dev_t, dt = torch.tensor([0.3]), torch.tensor([-0.4])
+    broadcast_shape = (2,) + (1,) * (len(latent_shape) - 1)
+    std_dev_t = torch.tensor([0.3, 0.35]).reshape(broadcast_shape)
+    dt = torch.tensor([-0.4, -0.45]).reshape(broadcast_shape)
     trainer = _trainer(GRPOGuardTrainer, _adapter())
-    replay = _replay({"latent": torch.zeros(2, 4)}, log_prob=old_log_prob)
-    output = MultiModalStepOutput(
-        next_state_mean=LatentState({"latent": new_mean}),
-        std_dev_t={"latent": std_dev_t},
-        dt={"latent": dt},
-        log_prob=new_log_prob,
-        component_log_probs={"latent": new_log_prob},
+    replay = _replay({"latent": torch.zeros(*latent_shape)}, log_prob=old_log_prob)
+    output = _guard_output(
+        {"latent": new_mean}, {"latent": new_log_prob}, {"latent": std_dev_t}, {"latent": dt}
     )
 
     ratio = trainer._guard_ratio(output, replay, LatentState({"latent": old_mean}))
 
-    scale_factor = torch.sqrt(-dt) * std_dev_t
+    scale_factor = torch.sqrt(-dt.reshape(2)) * std_dev_t.reshape(2)
     mse = (new_mean - old_mean).flatten(1).pow(2).mean(dim=1)
     expected = torch.exp((new_log_prob - old_log_prob) * scale_factor + mse / (2 * scale_factor))
+    assert ratio.shape == (2,)
     assert torch.equal(ratio, expected)
+
+
+def test_guard_ratio_matches_the_legacy_formula_for_a_single_sample() -> None:
+    """With one sample the legacy broadcast was harmless, so values must match."""
+    torch.manual_seed(12)
+    new_mean, old_mean = torch.randn(1, 3, 4), torch.randn(1, 3, 4)
+    new_log_prob, old_log_prob = torch.randn(1), torch.randn(1)
+    std_dev_t, dt = torch.full((1, 1, 1), 0.3), torch.full((1, 1, 1), -0.4)
+    trainer = _trainer(GRPOGuardTrainer, _adapter())
+    replay = _replay({"latent": torch.zeros(1, 3, 4)}, log_prob=old_log_prob)
+    output = _guard_output(
+        {"latent": new_mean}, {"latent": new_log_prob}, {"latent": std_dev_t}, {"latent": dt}
+    )
+
+    ratio = trainer._guard_ratio(output, replay, LatentState({"latent": old_mean}))
+
+    legacy_scale = torch.sqrt(-dt) * std_dev_t
+    legacy_mse = (new_mean - old_mean).flatten(1).pow(2).mean(dim=1)
+    legacy = torch.exp(
+        (new_log_prob - old_log_prob) * legacy_scale + legacy_mse / (2 * legacy_scale)
+    )
+    assert legacy.shape == (1, 1, 1)
+    assert torch.equal(ratio, legacy.reshape(1))
 
 
 def test_guard_ratio_weights_two_components_by_active_degrees_of_freedom() -> None:
@@ -335,8 +400,14 @@ def test_guard_ratio_weights_two_components_by_active_degrees_of_freedom() -> No
     new_audio, old_audio = torch.randn(2, 5), torch.randn(2, 5)
     new_log_probs = {"video": torch.randn(2), "audio": torch.randn(2)}
     old_log_probs = {"video": torch.randn(2), "audio": torch.randn(2)}
-    std = {"video": torch.tensor([0.3]), "audio": torch.tensor([0.6])}
-    dt = {"video": torch.tensor([-0.4]), "audio": torch.tensor([-0.2])}
+    std = {
+        "video": torch.tensor([0.3, 0.32]).reshape(2, 1, 1),
+        "audio": torch.tensor([0.6, 0.62]).reshape(2, 1),
+    }
+    dt = {
+        "video": torch.tensor([-0.4, -0.42]).reshape(2, 1, 1),
+        "audio": torch.tensor([-0.2, -0.22]).reshape(2, 1),
+    }
     trainer = _trainer(GRPOGuardTrainer, _structured_adapter())
     replay = ReplayStep(
         state=LatentState({"video": torch.zeros(2, 3, 4), "audio": torch.zeros(2, 5)}),
@@ -348,39 +419,99 @@ def test_guard_ratio_weights_two_components_by_active_degrees_of_freedom() -> No
         log_prob=old_log_probs["video"] + old_log_probs["audio"],
         component_log_probs=old_log_probs,
     )
-    output = MultiModalStepOutput(
-        next_state_mean=LatentState({"video": new_video, "audio": new_audio}),
-        std_dev_t=std,
-        dt=dt,
-        log_prob=new_log_probs["video"] + new_log_probs["audio"],
-        component_log_probs=new_log_probs,
-    )
+    output = _guard_output({"video": new_video, "audio": new_audio}, new_log_probs, std, dt)
 
     ratio = trainer._guard_ratio(
         output, replay, LatentState({"video": old_video, "audio": old_audio})
     )
 
     terms = {}
-    for name, new_value, old_value, numel in (
-        ("video", new_video, old_video, 12),
-        ("audio", new_audio, old_audio, 5),
+    for name, new_value, old_value in (
+        ("video", new_video, old_video),
+        ("audio", new_audio, old_audio),
     ):
-        scale = torch.sqrt(-dt[name]) * std[name]
+        scale = torch.sqrt(-dt[name].reshape(2)) * std[name].reshape(2)
         mse = (new_value - old_value).flatten(1).pow(2).mean(dim=1)
         terms[name] = (new_log_probs[name] - old_log_probs[name]) * scale + mse / (2 * scale)
     expected = torch.exp((terms["video"] * 12 + terms["audio"] * 5) / 17)
     assert torch.equal(ratio, expected)
 
 
+def test_guard_ratio_rejects_statistic_with_multiple_non_batch_values() -> None:
+    torch.manual_seed(8)
+    log_prob = torch.zeros(2)
+    trainer = _trainer(GRPOGuardTrainer, _adapter())
+    replay = _replay({"latent": torch.zeros(2, 3, 4)}, log_prob=log_prob)
+    output = _guard_output(
+        {"latent": torch.zeros(2, 3, 4)},
+        {"latent": log_prob},
+        {"latent": torch.full((2, 3, 1), 0.3)},
+        {"latent": torch.full((2, 1, 1), -0.4)},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"std_dev_t.*component 'latent'.*one value per sample.*\(2, 3, 1\)",
+    ):
+        trainer._guard_ratio(output, replay, LatentState({"latent": torch.zeros(2, 3, 4)}))
+
+
+def test_guard_statistic_normalization_rejects_a_mismatched_batch_size() -> None:
+    """The replay batch size, not the policy output's own state, drives the formula."""
+    trainer = _trainer(GRPOGuardTrainer, _adapter())
+
+    with pytest.raises(ValueError, match=r"std_dev_t.*component 'latent'.*batch size 2.*\(1, 1\)"):
+        trainer._scalar_component_statistic(
+            {"latent": torch.full((1, 1), 0.3)}, "std_dev_t", "latent", 2
+        )
+
+
+def test_guard_mean_squared_error_uses_overridable_component_reducer() -> None:
+    """A masked adapter reduces each component over active elements only."""
+    torch.manual_seed(9)
+    new_mean, old_mean = torch.randn(2, 4), torch.randn(2, 4)
+    new_log_prob, old_log_prob = torch.randn(2), torch.randn(2)
+    std_dev_t = torch.tensor([0.3, 0.35]).reshape(2, 1)
+    dt = torch.tensor([-0.4, -0.45]).reshape(2, 1)
+    trainer = _trainer(GRPOGuardTrainer, _masked_adapter())
+    replay = _replay({"latent": torch.zeros(2, 4)}, log_prob=old_log_prob)
+    output = _guard_output(
+        {"latent": new_mean}, {"latent": new_log_prob}, {"latent": std_dev_t}, {"latent": dt}
+    )
+
+    ratio = trainer._guard_ratio(output, replay, LatentState({"latent": old_mean}))
+
+    scale_factor = torch.sqrt(-dt.reshape(2)) * std_dev_t.reshape(2)
+    active_mse = (new_mean - old_mean)[:, :2].pow(2).mean(dim=1)
+    expected = torch.exp(
+        (new_log_prob - old_log_prob) * scale_factor + active_mse / (2 * scale_factor)
+    )
+    assert torch.equal(ratio, expected)
+
+
+def test_guard_ratio_requires_a_well_formed_policy_log_probability() -> None:
+    log_prob = torch.zeros(2)
+    trainer = _trainer(GRPOGuardTrainer, _adapter())
+    replay = _replay({"latent": torch.zeros(2, 4)}, log_prob=log_prob)
+    output = MultiModalStepOutput(
+        next_state_mean=LatentState({"latent": torch.zeros(2, 4)}),
+        std_dev_t={"latent": torch.full((2, 1), 0.3)},
+        dt={"latent": torch.full((2, 1), -0.4)},
+        component_log_probs={"latent": log_prob},
+    )
+
+    with pytest.raises(
+        ValueError, match=r"policy log_prob.*GRPOGuardTrainer.*step_index=4.*NoneType"
+    ):
+        trainer._guard_ratio(output, replay, LatentState({"latent": torch.zeros(2, 4)}), 4)
+
+
 def test_guard_ratio_requires_component_standard_deviation() -> None:
     trainer = _trainer(GRPOGuardTrainer, _adapter())
     log_prob = torch.zeros(2)
     replay = _replay({"latent": torch.zeros(2, 4)}, log_prob=log_prob)
-    output = MultiModalStepOutput(
-        next_state_mean=LatentState({"latent": torch.zeros(2, 4)}),
-        dt={"latent": torch.tensor([-0.4])},
-        log_prob=log_prob,
-        component_log_probs={"latent": log_prob},
+    output = _guard_output(
+        {"latent": torch.zeros(2, 4)}, {"latent": log_prob}, None, {"latent": torch.zeros(2, 1)}
     )
 
     with pytest.raises(
@@ -393,12 +524,11 @@ def test_guard_ratio_requires_old_component_log_probabilities() -> None:
     trainer = _trainer(GRPOGuardTrainer, _adapter())
     log_prob = torch.zeros(2)
     replay = _replay({"latent": torch.zeros(2, 4)})
-    output = MultiModalStepOutput(
-        next_state_mean=LatentState({"latent": torch.zeros(2, 4)}),
-        std_dev_t={"latent": torch.tensor([0.3])},
-        dt={"latent": torch.tensor([-0.4])},
-        log_prob=log_prob,
-        component_log_probs={"latent": log_prob},
+    output = _guard_output(
+        {"latent": torch.zeros(2, 4)},
+        {"latent": log_prob},
+        {"latent": torch.full((2, 1), 0.3)},
+        {"latent": torch.full((2, 1), -0.4)},
     )
 
     with pytest.raises(
@@ -426,7 +556,8 @@ def test_dppo_velocity_mask_kl_matches_legacy_formula() -> None:
 def test_dppo_state_mask_kl_matches_legacy_gaussian_formula() -> None:
     torch.manual_seed(6)
     new_mean, old_mean = torch.randn(2, 3, 4), torch.randn(2, 3, 4)
-    std_dev_t, dt = torch.tensor([0.3]), torch.tensor([-0.4])
+    std_dev_t = torch.tensor([0.3, 0.32]).reshape(2, 1, 1)
+    dt = torch.tensor([-0.4, -0.42]).reshape(2, 1, 1)
     trainer = _trainer(DPPOTrainer, _adapter(), kl_mask_type="x-based")
     replay = _replay({"latent": torch.zeros(2, 3, 4)})
 
@@ -446,11 +577,18 @@ def test_dppo_state_mask_kl_matches_legacy_gaussian_formula() -> None:
 
 
 def test_dppo_state_mask_uses_each_component_scheduler_denominator() -> None:
+    """Per-component sigma, then one raw global element mean across components."""
     torch.manual_seed(7)
     new_video, old_video = torch.randn(2, 3, 4), torch.randn(2, 3, 4)
     new_audio, old_audio = torch.randn(2, 5), torch.randn(2, 5)
-    std = {"video": torch.tensor([0.3]), "audio": torch.tensor([0.6])}
-    dt = {"video": torch.tensor([-0.4]), "audio": torch.tensor([-0.2])}
+    std = {
+        "video": torch.tensor([0.3, 0.32]).reshape(2, 1, 1),
+        "audio": torch.tensor([0.6, 0.62]).reshape(2, 1),
+    }
+    dt = {
+        "video": torch.tensor([-0.4, -0.42]).reshape(2, 1, 1),
+        "audio": torch.tensor([-0.2, -0.22]).reshape(2, 1),
+    }
     trainer = _trainer(
         DPPOTrainer,
         _structured_adapter(video_dynamics="Flow-SDE", audio_dynamics="CPS"),
@@ -470,9 +608,68 @@ def test_dppo_state_mask_uses_each_component_scheduler_denominator() -> None:
 
     video_sigma = std["video"] * torch.sqrt(-dt["video"])
     audio_sigma = std["audio"]
-    video_kl = gaussian_kl_div(new_video, old_video, video_sigma).flatten(1).mean(dim=1)
-    audio_kl = gaussian_kl_div(new_audio, old_audio, audio_sigma).flatten(1).mean(dim=1)
-    assert torch.equal(kl_new_old, (video_kl * 12 + audio_kl * 5) / 17)
+    video_sum = gaussian_kl_div(new_video, old_video, video_sigma).flatten(1).sum(dim=1)
+    audio_sum = gaussian_kl_div(new_audio, old_audio, audio_sigma).flatten(1).sum(dim=1)
+    assert torch.equal(kl_new_old, (video_sum + audio_sum) / 17)
+
+
+@pytest.mark.parametrize(
+    "trainer_cls", [GRPOTrainer, GRPOGuardTrainer, DPPOTrainer], ids=["grpo", "guard", "dppo"]
+)
+def test_policy_log_probability_must_be_present_before_ppo_arithmetic(trainer_cls: type) -> None:
+    trainer = _trainer(trainer_cls, _adapter())
+    output = MultiModalStepOutput(next_state_mean=LatentState({"latent": torch.zeros(2, 4)}))
+
+    with pytest.raises(
+        ValueError,
+        match=rf"policy log_prob.*{trainer_cls.__name__}.*step_index=2.*batch size 2.*NoneType",
+    ):
+        trainer._require_policy_log_prob(output, 2, 2)
+
+
+@pytest.mark.parametrize(
+    "trainer_cls", [GRPOTrainer, GRPOGuardTrainer, DPPOTrainer], ids=["grpo", "guard", "dppo"]
+)
+def test_policy_log_probability_must_be_one_scalar_per_sample(trainer_cls: type) -> None:
+    trainer = _trainer(trainer_cls, _adapter())
+    output = MultiModalStepOutput(log_prob=torch.zeros(2, 3, 4))
+
+    with pytest.raises(
+        ValueError,
+        match=rf"policy log_prob.*{trainer_cls.__name__}.*step_index=2.*batch size 2"
+        r".*\(2, 3, 4\)",
+    ):
+        trainer._require_policy_log_prob(output, 2, 2)
+
+
+def test_policy_log_probability_returns_validated_tensor() -> None:
+    trainer = _trainer(GRPOTrainer, _adapter())
+    log_prob = torch.tensor([0.25, -0.5])
+    output = MultiModalStepOutput(log_prob=log_prob)
+
+    assert trainer._require_policy_log_prob(output, 0, 2) is log_prob
+
+
+def test_return_fields_use_a_deterministic_canonical_order() -> None:
+    trainer = _trainer(GRPOTrainer, _adapter())
+
+    assert trainer._canonical_return_fields({"dt", "log_prob", "velocity"}) == (
+        "log_prob",
+        "dt",
+        "velocity",
+    )
+    assert trainer._canonical_return_fields({"velocity", "log_prob"}) == ("log_prob", "velocity")
+    assert trainer._canonical_return_fields(["std_dev_t", "next_latents_mean"]) == (
+        "next_latents_mean",
+        "std_dev_t",
+    )
+
+
+def test_return_fields_reject_unknown_scheduler_output_names() -> None:
+    trainer = _trainer(GRPOTrainer, _adapter())
+
+    with pytest.raises(ValueError, match=r"unknown return field 'entropy'"):
+        trainer._canonical_return_fields({"log_prob", "entropy"})
 
 
 def test_dppo_effective_sigma_rejects_ode_component() -> None:

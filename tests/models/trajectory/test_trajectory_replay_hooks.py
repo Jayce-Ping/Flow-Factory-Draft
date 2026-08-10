@@ -48,13 +48,16 @@ class AdapterFake(BaseAdapter):
         """Return a deterministic scheduler output honouring ``return_kwargs``."""
         self.forward_kwargs = kwargs
         requested = set(kwargs.get("return_kwargs") or ())
+        latents = kwargs["latents"]
+        # Schedulers broadcast per-sample statistics to (B, 1, ..., 1).
+        broadcast_shape = (latents.shape[0],) + (1,) * (latents.ndim - 1)
         return SDESchedulerOutput(
-            next_latents=kwargs["latents"] + 1 if "next_latents" in requested else None,
-            next_latents_mean=(kwargs["latents"] + 2 if "next_latents_mean" in requested else None),
-            std_dev_t=torch.tensor([0.25]) if "std_dev_t" in requested else None,
-            dt=torch.tensor([-0.5]) if "dt" in requested else None,
+            next_latents=latents + 1 if "next_latents" in requested else None,
+            next_latents_mean=(latents + 2 if "next_latents_mean" in requested else None),
+            std_dev_t=torch.full(broadcast_shape, 0.25) if "std_dev_t" in requested else None,
+            dt=torch.full(broadcast_shape, -0.5) if "dt" in requested else None,
             log_prob=torch.tensor([0.75, 0.5]) if kwargs.get("compute_log_prob") else None,
-            velocity=kwargs["latents"] + 3 if "velocity" in requested else None,
+            velocity=latents + 3 if "velocity" in requested else None,
         )
 
 
@@ -235,6 +238,33 @@ def test_structured_replay_callback_requires_named_field() -> None:
         )
 
 
+def test_default_component_reducer_means_each_component_over_non_batch_elements() -> None:
+    torch.manual_seed(11)
+    video, audio = torch.randn(2, 3, 4), torch.randn(2, 5)
+
+    reduced = _structured_adapter().reduce_component_latent_values({"video": video, "audio": audio})
+
+    assert tuple(reduced) == ("video", "audio")
+    assert torch.equal(reduced["video"], video.flatten(1).mean(dim=1))
+    assert torch.equal(reduced["audio"], audio.flatten(1).mean(dim=1))
+
+
+def test_component_reducer_requires_declared_component_order() -> None:
+    adapter = _structured_adapter()
+
+    with pytest.raises(ValueError, match=r"\('video', 'audio'\).*\('audio', 'video'\)"):
+        adapter.reduce_component_latent_values(
+            {"audio": torch.zeros(2, 5), "video": torch.zeros(2, 3, 4)}
+        )
+
+
+def test_component_reducer_rejects_unbatched_component_values() -> None:
+    adapter = _adapter()
+
+    with pytest.raises(ValueError, match=r"values\['latent'\].*batched.*\(\)"):
+        adapter.reduce_component_latent_values({"latent": torch.tensor(1.0)})
+
+
 def test_default_state_active_numel_counts_non_batch_elements() -> None:
     state = LatentState({"video": torch.zeros(2, 3, 4), "audio": torch.zeros(2, 5)})
 
@@ -297,8 +327,8 @@ def test_legacy_forward_state_wraps_component_statistics() -> None:
         return_fields=("log_prob", "next_latents_mean", "std_dev_t", "dt"),
     )
 
-    assert torch.equal(output.std_dev_t["latent"], torch.tensor([0.25]))
-    assert torch.equal(output.dt["latent"], torch.tensor([-0.5]))
+    assert torch.equal(output.std_dev_t["latent"], torch.full((2, 1), 0.25))
+    assert torch.equal(output.dt["latent"], torch.full((2, 1), -0.5))
     assert torch.equal(output.component_log_probs["latent"], output.log_prob)
     assert output.velocity is None
 

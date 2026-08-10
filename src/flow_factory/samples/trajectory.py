@@ -45,6 +45,46 @@ def _validate_component_mapping(
     return result
 
 
+def _require_component_order(
+    received: Tuple[str, ...], expected: Tuple[str, ...], identifier: str
+) -> None:
+    if received != expected:
+        raise ValueError(f"expected {identifier} component order {expected}, received {received}")
+
+
+def _batch_size_of(state: "LatentState", identifier: str) -> int:
+    first_name = state.component_names[0]
+    first = state.components[first_name]
+    if first.ndim < 1:
+        raise ValueError(
+            f"expected batched tensor for {identifier}[{first_name!r}], "
+            f"received shape {tuple(first.shape)}"
+        )
+    return first.shape[0]
+
+
+def _require_component_batch_size(
+    values: Mapping[str, torch.Tensor], batch_size: int, identifier: str
+) -> None:
+    for name, value in values.items():
+        if value.ndim < 1 or value.shape[0] != batch_size:
+            raise ValueError(
+                f"expected {identifier}[{name!r}] to use batch size {batch_size}, "
+                f"received shape {tuple(value.shape)}"
+            )
+
+
+def _require_scalar_per_sample(
+    values: Mapping[str, torch.Tensor], batch_size: int, identifier: str
+) -> None:
+    for name, value in values.items():
+        if value.shape != (batch_size,):
+            raise ValueError(
+                f"expected {identifier}[{name!r}] shape {(batch_size,)}, "
+                f"received {tuple(value.shape)}"
+            )
+
+
 def _move_tensor(tensor: torch.Tensor, device: Union[torch.device, str]) -> torch.Tensor:
     return tensor.to(device)
 
@@ -446,6 +486,8 @@ class StructuredTrajectory:
                 "expected StructuredTrajectory.component_log_probs component order "
                 f"{expected_names}, received {tuple(validated)}"
             )
+        reference_name = expected_names[0]
+        reference_shape = validated[reference_name].shape
         for name, values in validated.items():
             if values.ndim not in (1, 2):
                 raise ValueError(
@@ -457,6 +499,24 @@ class StructuredTrajectory:
                     f"expected StructuredTrajectory.component_log_probs[{name!r}] shape "
                     f"{tuple(self.log_probs.shape)} to match log_probs, received "
                     f"{tuple(values.shape)}"
+                )
+            # Components share one rollout schedule, so their stored lengths must agree
+            # even when no joint log probability is stored to compare against.
+            if values.shape != reference_shape:
+                raise ValueError(
+                    f"expected StructuredTrajectory.component_log_probs[{name!r}] shape "
+                    f"{tuple(reference_shape)} to match component {reference_name!r}, "
+                    f"received {tuple(values.shape)}"
+                )
+        if self.log_prob_index_map is not None:
+            stored_length = reference_shape[-1]
+            if self.log_prob_index_map.numel() and (
+                self.log_prob_index_map.max().item() >= stored_length
+            ):
+                raise ValueError(
+                    "expected StructuredTrajectory.component_log_probs stored length to cover "
+                    f"log_prob_index_map values up to "
+                    f"{self.log_prob_index_map.max().item()}, received length {stored_length}"
                 )
         self.component_log_probs = validated
 
@@ -664,6 +724,15 @@ class StructuredTrajectory:
                     )
         component_log_probs: Optional[Dict[str, torch.Tensor]] = None
         if first.component_log_probs is not None:
+            for name in expected_names:
+                expected_shape = tuple(first.component_log_probs[name].shape)
+                for sample_index, trajectory in enumerate(trajectories[1:], start=1):
+                    received_shape = tuple(trajectory.component_log_probs[name].shape)
+                    if received_shape != expected_shape:
+                        raise ValueError(
+                            f"expected component_log_probs[{name!r}] shape {expected_shape}, "
+                            f"received {received_shape} for sample index {sample_index}"
+                        )
             component_log_probs = {
                 name: torch.stack(
                     [trajectory.component_log_probs[name] for trajectory in trajectories]
@@ -778,6 +847,24 @@ class ReplayStep:
             self.component_log_probs = _validate_component_mapping(
                 self.component_log_probs, "ReplayStep.component_log_probs"
             )
+        expected_names = self.state.component_names
+        batch_size = _batch_size_of(self.state, "ReplayStep.state")
+        _require_component_order(
+            self.next_state.component_names, expected_names, "ReplayStep.next_state"
+        )
+        _require_component_order(
+            tuple(self.times.timestep), expected_names, "ReplayStep.times.timestep"
+        )
+        _require_component_batch_size(
+            self.next_state.components, batch_size, "ReplayStep.next_state"
+        )
+        if self.component_log_probs is not None:
+            _require_component_order(
+                tuple(self.component_log_probs), expected_names, "ReplayStep.component_log_probs"
+            )
+            _require_scalar_per_sample(
+                self.component_log_probs, batch_size, "ReplayStep.component_log_probs"
+            )
 
 
 @dataclass
@@ -827,3 +914,40 @@ class MultiModalStepOutput:
                 field_name,
                 _validate_component_mapping(values, f"MultiModalStepOutput.{field_name}"),
             )
+        reference = self._reference_state()
+        if reference is None:
+            return
+        expected_names, batch_size = reference
+        for field_name in ("next_state", "next_state_mean", "velocity"):
+            state = getattr(self, field_name)
+            if state is None:
+                continue
+            _require_component_order(
+                state.component_names, expected_names, f"MultiModalStepOutput.{field_name}"
+            )
+            _require_component_batch_size(
+                state.components, batch_size, f"MultiModalStepOutput.{field_name}"
+            )
+        for field_name in ("std_dev_t", "dt", "component_log_probs"):
+            values = getattr(self, field_name)
+            if values is None:
+                continue
+            _require_component_order(
+                tuple(values), expected_names, f"MultiModalStepOutput.{field_name}"
+            )
+            _require_component_batch_size(values, batch_size, f"MultiModalStepOutput.{field_name}")
+        if self.component_log_probs is not None:
+            _require_scalar_per_sample(
+                self.component_log_probs, batch_size, "MultiModalStepOutput.component_log_probs"
+            )
+
+    def _reference_state(self) -> Optional[Tuple[Tuple[str, ...], int]]:
+        """Return the component order and batch size the other fields must match."""
+        for field_name in ("next_state", "next_state_mean", "velocity"):
+            state = getattr(self, field_name)
+            if state is not None:
+                return (
+                    state.component_names,
+                    _batch_size_of(state, f"MultiModalStepOutput.{field_name}"),
+                )
+        return None
