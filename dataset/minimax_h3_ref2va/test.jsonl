@@ -1,0 +1,2 @@
+{"prompt":"Compose a short audiovisual scene while preserving the ordered references.","references":[{"kind":"image","path":"references/style.png"},{"kind":"video","path":"references/motion.mp4","fps":12.0},{"kind":"audio","path":"references/ambience.wav","sample_rate":16000}]}
+{"prompt":"Use the clip motion first, its separate soundtrack, then the style image.","references":[{"kind":"video","path":"references/motion.mp4","fps":12.0,"audio_path":"references/soundtrack.wav","sample_rate":16000},{"kind":"image","path":"references/style.png"}]}
