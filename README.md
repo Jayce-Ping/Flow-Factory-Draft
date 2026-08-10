@@ -109,7 +109,11 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
 
 See [`Algorithm Guidance`](guidance/algorithms.md) for more information.
 
-> Model and algorithm are fully decoupled in Flow-Factory, enabling all listed model–algorithm combinations to work out of the box. The configurations under `examples/` have been verified to yield measurable performance gains. For unlisted combinations, find the closest (task, algorithm) config and swap in the desired model or algorithm parameters.
+> Model and algorithm adapters are decoupled at the framework interface, but this does not imply
+> every combination has completed training validation. Validation status varies by example:
+> training-verified configurations include documented hardware and reward-trend evidence, while
+> MiniMax H3 examples are schema/API validated only. Treat unlisted combinations as starting
+> points that require their own compatibility and training evidence.
 
 # 💾 Hardware Requirements
 

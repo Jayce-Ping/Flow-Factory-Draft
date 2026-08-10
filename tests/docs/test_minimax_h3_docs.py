@@ -28,6 +28,14 @@ def _text(path: str) -> str:
 
 def test_readme_documents_h3_links_pin_and_limits() -> None:
     text = _text("README.md")
+    assert (
+        "The configurations under `examples/` have been verified to yield measurable "
+        "performance gains."
+    ) not in text
+    assert "Validation status varies by example" in text
+    assert "hardware and reward-trend evidence" in text
+    assert "MiniMax H3 examples are schema/API validated only" in text
+
     for model_type, link in zip(
         ("minimax-h3-t2va", "minimax-h3-fl2va", "minimax-h3-ref2va"),
         EXAMPLE_LINKS,

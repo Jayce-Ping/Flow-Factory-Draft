@@ -16,11 +16,38 @@ import inspect
 import json
 from importlib import metadata
 
+import numpy as np
 import pytest
 import torch
+from PIL import Image
 
 from flow_factory.models.minimax_h3 import dependency
 from flow_factory.models.runtime import ModularPipelineRuntime
+
+EXECUTED_NO_WEIGHT_BLOCKS = frozenset(
+    {
+        "ResizeStep",
+        "RefSetupStep",
+        "NoKeyframeAnchorsStep",
+        "PrepareLayoutStep",
+        "RefPrepareLayoutStep",
+        "PrepareConditionLatentsStep",
+        "PrepareLatentsStep",
+        "FL2VAPrepareLatentsStep",
+        "Ref2VAPrepareLatentsStep",
+        "SetTimestepsStep",
+        "AfterDenoiseStep",
+    }
+)
+SIGNATURE_ONLY_BLOCK_REASONS = {
+    "TextEncoderStep": "requires checkpoint-backed text encoder, tokenizer, and processor",
+    "FL2VATextEncoderStep": "requires checkpoint-backed text encoder, tokenizer, and processor",
+    "Ref2VATextEncoderStep": "requires checkpoint-backed text encoder, tokenizer, and processor",
+    "KeyframeEncoderStep": "requires the checkpoint-backed video VAE",
+    "ReferenceEncoderStep": "requires checkpoint-backed video and audio VAEs",
+    "VideoDecodeStep": "requires the checkpoint-backed video VAE",
+    "AudioDecodeStep": "requires the checkpoint-backed audio VAE",
+}
 
 
 def _read_diffusers_direct_url() -> tuple[str, dict]:
@@ -50,15 +77,22 @@ def pinned_symbols():
     if dependency._SYMBOLS is None:
         pytest.skip(
             "installed diffusers does not expose MiniMax H3 modular symbols; "
-            "the dependency failure contract is covered separately"
+            "H3-specific execution/provenance tests do not run and make no installed-pin claim; "
+            "the environment-independent pyproject pin contract is covered separately"
         )
     return dependency.require_minimax_h3_support()
 
 
-def test_installed_diffusers_revision_matches_required_commit(pinned_symbols) -> None:
+def test_h3_capable_environment_installed_diffusers_provenance_matches_pin(
+    pinned_symbols,
+) -> None:
+    """Verify provenance only after the installed package passes the H3 feature gate."""
     version, direct_url = _read_diffusers_direct_url()
     vcs_info = direct_url.get("vcs_info")
-    diagnostic = f"version={version!r}, direct_url.json={direct_url!r}"
+    diagnostic = (
+        "H3-capable environment must come from the exact project pin; "
+        f"version={version!r}, direct_url.json={direct_url!r}"
+    )
 
     assert isinstance(vcs_info, dict), diagnostic
     assert vcs_info.get("vcs") == "git", diagnostic
@@ -118,6 +152,160 @@ def test_real_pinned_symbols_preserve_workflows_and_callable_surfaces(pinned_sym
     assert tuple(inspect.signature(pinned_symbols.AudioReference).parameters) == (
         "audio",
         "sample_rate",
+    )
+
+
+def test_real_pinned_blocks_execute_no_weight_pipeline_state_transitions(pinned_symbols) -> None:
+    executed = set()
+
+    t2va_pipeline = pinned_symbols.MiniMaxH3ModularPipeline.from_config({"workflow": "t2va"})
+    scheduler_class = t2va_pipeline.get_component_spec("scheduler").type_hint
+    t2va_pipeline.register_components(
+        scheduler=scheduler_class(shift=12.0),
+        audio_scheduler=scheduler_class(shift=3.0),
+    )
+    assert t2va_pipeline.scheduler.config.shift == 12.0
+    assert t2va_pipeline.audio_scheduler.config.shift == 3.0
+    t2va_state = pinned_symbols.PipelineState(
+        values={
+            "text_token_tags": torch.tensor([1, 1]),
+            "height": 32,
+            "width": 32,
+            "num_frames": 124,
+        }
+    )
+    returned_pipeline, t2va_state = pinned_symbols.NoKeyframeAnchorsStep()(
+        t2va_pipeline, t2va_state
+    )
+    assert returned_pipeline is t2va_pipeline
+    assert t2va_state.values["keyframe_anchors"] == ()
+    executed.add("NoKeyframeAnchorsStep")
+
+    _, t2va_state = pinned_symbols.PrepareLayoutStep()(t2va_pipeline, t2va_state)
+    assert t2va_state.values["position_ids"].shape[1] == 3
+    assert t2va_state.values["num_latent_frames"] == 37
+    executed.add("PrepareLayoutStep")
+
+    t2va_state.values.update(
+        {
+            "generator": torch.Generator().manual_seed(0),
+            "latents": torch.zeros(1, 24, 37, 2, 2),
+            "audio_latents": torch.zeros(2, 32, 207),
+        }
+    )
+    _, t2va_state = pinned_symbols.PrepareLatentsStep()(t2va_pipeline, t2va_state)
+    assert t2va_state.values["latents"].shape == (37, 96)
+    assert t2va_state.values["audio_latents"].shape == (414, 32)
+    executed.add("PrepareLatentsStep")
+
+    condition_state = pinned_symbols.PipelineState(
+        values={
+            "generator": torch.Generator().manual_seed(0),
+            "num_condition_video_rows": 1,
+            "condition_latents": [torch.zeros(1, 24, 1, 2, 2)],
+        }
+    )
+    _, condition_state = pinned_symbols.PrepareConditionLatentsStep()(
+        t2va_pipeline, condition_state
+    )
+    assert condition_state.values["condition_rows"].shape == (1, 96)
+    executed.add("PrepareConditionLatentsStep")
+
+    t2va_state.values["num_inference_steps"] = 3
+    _, t2va_state = pinned_symbols.SetTimestepsStep()(t2va_pipeline, t2va_state)
+    assert len(t2va_state.values["timesteps"]) == 2
+    assert len(t2va_state.values["audio_timesteps"]) == 2
+    assert len(t2va_state.values["row_timestep_plan"]) == 2
+    executed.add("SetTimestepsStep")
+
+    _, t2va_state = pinned_symbols.AfterDenoiseStep()(t2va_pipeline, t2va_state)
+    assert t2va_state.values["latents"].shape == (1, 24, 37, 2, 2)
+    assert t2va_state.values["audio_latents"].shape == (2, 32, 207)
+    executed.add("AfterDenoiseStep")
+
+    fl2va_pipeline = pinned_symbols.MiniMaxH3ModularPipeline.from_config({"workflow": "fl2va"})
+    fl2va_pipeline.load_components(names=["image_processor"])
+    resize_state = pinned_symbols.PipelineState(
+        values={
+            "image": Image.new("RGB", (16, 16)),
+            "last_image": None,
+            "height": 32,
+            "width": 32,
+        }
+    )
+    _, resize_state = pinned_symbols.ResizeStep()(fl2va_pipeline, resize_state)
+    assert resize_state.values["keyframe_anchors"] == ("first",)
+    assert resize_state.values["keyframes"][0].size == (32, 32)
+    executed.add("ResizeStep")
+
+    fl2va_state = pinned_symbols.PipelineState(
+        values={
+            "condition_rows": torch.ones(1, 96),
+            "latents": torch.zeros(2, 96),
+        }
+    )
+    _, fl2va_state = pinned_symbols.FL2VAPrepareLatentsStep()(fl2va_pipeline, fl2va_state)
+    assert fl2va_state.values["latents"].shape == (3, 96)
+    assert torch.equal(fl2va_state.values["latents"][0], torch.ones(96))
+    executed.add("FL2VAPrepareLatentsStep")
+
+    ref2va_pipeline = pinned_symbols.MiniMaxH3ModularPipeline.from_config({"workflow": "ref2va"})
+    reference = pinned_symbols.VideoReference(
+        frames=np.zeros((1, 32, 32, 3), dtype=np.uint8),
+        fps=24.0,
+        audio=None,
+        sample_rate=None,
+    )
+    setup_state = pinned_symbols.PipelineState(
+        values={
+            "references": [reference],
+            "height": 32,
+            "width": 32,
+            "num_frames": 124,
+        }
+    )
+    _, setup_state = pinned_symbols.RefSetupStep()(ref2va_pipeline, setup_state)
+    normalized_references = setup_state.values["normalized_references"]
+    assert len(normalized_references) == 1
+    assert normalized_references[0].kind == "video"
+    executed.add("RefSetupStep")
+
+    ref_layout_state = pinned_symbols.PipelineState(
+        values={
+            "text_token_tags": torch.tensor([1, 1]),
+            "normalized_references": normalized_references,
+            "condition_latents": [torch.zeros(1, 24, 1, 2, 2)],
+            "audio_condition_latents": [],
+            "height": 32,
+            "width": 32,
+            "num_frames": 124,
+        }
+    )
+    _, ref_layout_state = pinned_symbols.RefPrepareLayoutStep()(ref2va_pipeline, ref_layout_state)
+    assert ref_layout_state.values["position_ids"].shape[1] == 3
+    assert ref_layout_state.values["num_condition_video_rows"] == 1
+    assert ref_layout_state.values["num_condition_audio_rows"] == 0
+    executed.add("RefPrepareLayoutStep")
+
+    ref_latents_state = pinned_symbols.PipelineState(
+        values={
+            "condition_rows": torch.ones(1, 96),
+            "latents": torch.zeros(2, 96),
+            "audio_condition_latents": [torch.ones(1, 32)],
+            "num_condition_audio_rows": 1,
+            "audio_latents": torch.zeros(2, 32),
+        }
+    )
+    _, ref_latents_state = pinned_symbols.Ref2VAPrepareLatentsStep()(
+        ref2va_pipeline, ref_latents_state
+    )
+    assert ref_latents_state.values["latents"].shape == (3, 96)
+    assert ref_latents_state.values["audio_latents"].shape == (3, 32)
+    executed.add("Ref2VAPrepareLatentsStep")
+
+    assert executed == EXECUTED_NO_WEIGHT_BLOCKS
+    assert EXECUTED_NO_WEIGHT_BLOCKS | set(SIGNATURE_ONLY_BLOCK_REASONS) == set(
+        dependency._BLOCK_FIELDS
     )
 
 
