@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
@@ -156,7 +157,12 @@ class ModularPipelineFake:
 
     @property
     def component_names(self) -> List[str]:
-        """Expose declared from-pretrained names like pinned ModularPipeline."""
+        """Expose only names currently present in ``components``."""
+        return list(self.components)
+
+    @property
+    def pretrained_component_names(self) -> List[str]:
+        """Expose every declared lazy from-pretrained component name."""
         return list(self.pretrained_specs)
 
     @property
@@ -167,14 +173,14 @@ class ModularPipelineFake:
     @property
     def components(self) -> Dict[str, Any]:
         """Expose only materialized values, never the complete lazy spec table."""
-        names = [*self.component_names, *self.config_component_names]
+        names = [*self.pretrained_component_names, *self.config_component_names]
         return {
             name: getattr(self, name) for name in names if getattr(self, name, None) is not None
         }
 
     def get_component_spec(self, name: str) -> Any:
-        """Return one declared spec through the pinned public API."""
-        return {**self.pretrained_specs, **self.config_specs}[name]
+        """Return a defensive copy like pinned ModularPipeline."""
+        return deepcopy({**self.pretrained_specs, **self.config_specs}[name])
 
     def load_components(self, names: List[str]) -> None:
         """Materialize every available requested component."""
@@ -185,13 +191,26 @@ class ModularPipelineFake:
 
 
 def test_pinned_modular_pipeline_public_spec_api_shape() -> None:
-    assert isinstance(inspect.getattr_static(ModularPipeline, "component_names"), property)
-    assert isinstance(inspect.getattr_static(ModularPipeline, "config_component_names"), property)
-    assert isinstance(inspect.getattr_static(ModularPipeline, "components"), property)
-    assert tuple(inspect.signature(ModularPipeline.get_component_spec).parameters) == (
-        "self",
-        "name",
+    pipeline = object.__new__(ModularPipeline)
+    pretrained_spec = SimpleNamespace(
+        default_creation_method="from_pretrained",
+        values=[],
     )
+    config_spec = SimpleNamespace(default_creation_method="from_config", values=[])
+    pipeline._component_specs = {
+        "transformer": pretrained_spec,
+        "processor": config_spec,
+    }
+    pipeline.processor = SimpleNamespace()
+
+    assert pipeline.component_names == ["processor"]
+    assert pipeline.pretrained_component_names == ["transformer"]
+    assert pipeline.config_component_names == ["processor"]
+    assert pipeline.components == {"processor": pipeline.processor}
+    copied_spec = pipeline.get_component_spec("transformer")
+    assert copied_spec is not pretrained_spec
+    copied_spec.values.append("mutated")
+    assert pretrained_spec.values == []
     assert "names" in inspect.signature(ModularPipeline.load_components).parameters
 
 
@@ -294,6 +313,13 @@ def test_modular_runtime_uses_pinned_public_component_spec_api_shape() -> None:
     pipeline.transformer = TrackingModule()
     runtime = ModularPipelineRuntime(pipeline)
 
+    assert pipeline.component_names == ["transformer"]
+    assert pipeline.pretrained_component_names == [
+        "text_encoder",
+        "transformer",
+        "vae",
+    ]
+    assert pipeline.config_component_names == ["scheduler"]
     assert pipeline.components == {"transformer": pipeline.transformer}
     assert runtime.canonical_components == {
         "text_encoder": "text encoder spec",

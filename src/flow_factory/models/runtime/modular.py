@@ -27,14 +27,15 @@ class ModularPipelineRuntime(ComponentRuntime):
         Raises:
             TypeError: If the public spec API has an incompatible shape.
         """
-        component_names = getattr(self.pipeline, "component_names", None)
+        pretrained_component_names = getattr(self.pipeline, "pretrained_component_names", None)
         config_component_names = getattr(self.pipeline, "config_component_names", None)
-        if not isinstance(component_names, list) or not all(
-            isinstance(name, str) and name for name in component_names
+        if not isinstance(pretrained_component_names, list) or not all(
+            isinstance(name, str) and name for name in pretrained_component_names
         ):
             raise TypeError(
-                "Modular pipeline component_names must be a list of non-empty strings, "
-                f"got {type(component_names).__name__}: {component_names!r}."
+                "Modular pipeline pretrained_component_names must be a list of non-empty strings, "
+                f"got {type(pretrained_component_names).__name__}: "
+                f"{pretrained_component_names!r}."
             )
         if not isinstance(config_component_names, list) or not all(
             isinstance(name, str) and name for name in config_component_names
@@ -50,7 +51,7 @@ class ModularPipelineRuntime(ComponentRuntime):
                 f"got {get_component_spec!r}."
             )
 
-        declared_names = list(dict.fromkeys([*component_names, *config_component_names]))
+        declared_names = list(dict.fromkeys([*pretrained_component_names, *config_component_names]))
         return {name: get_component_spec(name) for name in declared_names}
 
     def _get_materialized_component(self, name: str) -> Any:

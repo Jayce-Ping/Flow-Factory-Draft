@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any, ClassVar, Dict, List
 
@@ -72,6 +73,10 @@ class WorkflowPipelineFake:
 
     @property
     def component_names(self) -> List[str]:
+        return list(self.components)
+
+    @property
+    def pretrained_component_names(self) -> List[str]:
         return list(self.pretrained_specs)
 
     @property
@@ -80,13 +85,13 @@ class WorkflowPipelineFake:
 
     @property
     def components(self) -> Dict[str, Any]:
-        names = [*self.component_names, *self.config_component_names]
+        names = [*self.pretrained_component_names, *self.config_component_names]
         return {
             name: getattr(self, name) for name in names if getattr(self, name, None) is not None
         }
 
     def get_component_spec(self, name: str) -> Any:
-        return {**self.pretrained_specs, **self.config_specs}[name]
+        return deepcopy({**self.pretrained_specs, **self.config_specs}[name])
 
     @classmethod
     def from_pretrained(cls, model_name_or_path: str, *, workflow: str) -> "WorkflowPipelineFake":
@@ -195,6 +200,9 @@ def test_workflow_adapter_loads_pruned_runtime_and_exact_setup_components(
     assert adapter_class.__bases__ == (BaseAdapter,)
     assert WorkflowPipelineFake.calls == [("MiniMaxAI/MiniMax-H3", workflow)]
     assert isinstance(adapter.component_runtime, ModularPipelineRuntime)
+    assert adapter.pipeline.component_names == list(adapter.pipeline.components)
+    assert transformer_name in adapter.pipeline.pretrained_component_names
+    assert "unrelated" in adapter.pipeline.pretrained_component_names
     assert set(adapter.pipeline.components) == {
         transformer_name,
         "scheduler",
