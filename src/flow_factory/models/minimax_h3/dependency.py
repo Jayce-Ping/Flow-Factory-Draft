@@ -54,6 +54,7 @@ class MiniMaxH3Symbols:
     """Hold all pinned upstream classes used by the shared H3 core."""
 
     MiniMaxH3ModularPipeline: Type[Any]
+    MiniMaxH3Blocks: Type[Any]
     PipelineState: Type[Any]
     ResizeStep: Type[Any]
     RefSetupStep: Type[Any]
@@ -105,6 +106,7 @@ try:
         MiniMaxH3Ref2VATextEncoderStep,
         MiniMaxH3TextEncoderStep,
     )
+    from diffusers.modular_pipelines.minimax_h3.modular_blocks_minimax_h3 import MiniMaxH3Blocks
     from diffusers.modular_pipelines.minimax_h3.modular_pipeline import MiniMaxH3ModularPipeline
     from diffusers.modular_pipelines.minimax_h3.references import (
         MiniMaxH3AudioReference,
@@ -115,6 +117,7 @@ try:
 
     _SYMBOLS = MiniMaxH3Symbols(
         MiniMaxH3ModularPipeline=MiniMaxH3ModularPipeline,
+        MiniMaxH3Blocks=MiniMaxH3Blocks,
         PipelineState=PipelineState,
         ResizeStep=MiniMaxH3ResizeStep,
         RefSetupStep=MiniMaxH3Ref2VASetupStep,
@@ -174,14 +177,12 @@ def _probe_symbol_bundle(symbols: MiniMaxH3Symbols) -> None:
             "PipelineState must support PipelineState(values=...) and preserve a readable values mapping"
         )
 
-    pipeline_class = symbols.MiniMaxH3ModularPipeline
-    workflow_map = getattr(pipeline_class, "_workflow_map", None)
+    workflow_blocks_class = symbols.MiniMaxH3Blocks
+    workflow_map = getattr(workflow_blocks_class, "_workflow_map", None)
     if not isinstance(workflow_map, dict) or any(
         workflow not in workflow_map for workflow in _WORKFLOWS
     ):
-        raise ValueError(
-            "MiniMaxH3ModularPipeline._workflow_map must declare t2va, fl2va, and ref2va"
-        )
+        raise ValueError("MiniMaxH3Blocks._workflow_map must declare t2va, fl2va, and ref2va")
 
     for field in _BLOCK_FIELDS:
         block_class = getattr(symbols, field)

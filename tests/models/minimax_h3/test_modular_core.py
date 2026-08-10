@@ -187,7 +187,11 @@ class AudioDecodeStep(FakeWorkflowBlock):
 
 
 class FakeModularPipeline:
-    _workflow_map = {"t2va": {}, "fl2va": {}, "ref2va": {}}
+    pass
+
+
+class FakeMiniMaxH3Blocks:
+    _workflow_map = {"t2va": {}, "fl2va": ({}, {}), "ref2va": {}}
 
 
 class FakeReference:
@@ -197,6 +201,7 @@ class FakeReference:
 @dataclasses.dataclass(frozen=True)
 class FakeSymbols:
     MiniMaxH3ModularPipeline: type = FakeModularPipeline
+    MiniMaxH3Blocks: type = FakeMiniMaxH3Blocks
     PipelineState: type = FakePipelineState
     ResizeStep: type = ResizeStep
     RefSetupStep: type = RefSetupStep
@@ -844,7 +849,13 @@ def test_dependency_probe_rejects_block_without_pipeline_state_call_contract(mon
 
 @pytest.mark.parametrize(
     "broken_field",
-    ["PipelineState", "PrepareLatentsStep", "Ref2VATextEncoderStep", "SetTimestepsStep"],
+    [
+        "PipelineState",
+        "MiniMaxH3Blocks",
+        "PrepareLatentsStep",
+        "Ref2VATextEncoderStep",
+        "SetTimestepsStep",
+    ],
 )
 def test_dependency_probe_rejects_incompatible_api_with_actionable_pin(monkeypatch, broken_field):
     from flow_factory.models.minimax_h3 import dependency
