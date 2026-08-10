@@ -29,9 +29,19 @@ import pytest
 import torch
 
 from flow_factory.models.abc import BaseAdapter
-from flow_factory.samples import BaseSample, LatentState
-from flow_factory.scheduler import SDESchedulerMixin, SDESchedulerOutput
+from flow_factory.samples import (
+    BaseSample,
+    ComponentTimes,
+    LatentState,
+    MultiModalStepOutput,
+    ReplayStep,
+)
+from flow_factory.scheduler import SchedulerGroup, SDESchedulerMixin, SDESchedulerOutput
 from flow_factory.trainers.opd import DiffusionOPDTrainer
+from flow_factory.trainers.opd.common import (
+    compute_structured_distillation_loss,
+    project_distillation_target_state,
+)
 
 # Per-scope additive bias, so a teacher swap is observable in the output and a
 # forgotten swap cannot be mistaken for a correct one.
@@ -160,6 +170,124 @@ def _adapter(weight: float = 0.7, dynamics_type: str = "ODE") -> TrainableAdapte
     adapter.active_scope = "student"
     adapter.forward_calls = []
     adapter.events = []
+    return adapter
+
+
+class SnapshotModuleFake(torch.nn.Module):
+    """One-parameter component the real named-parameter snapshots operate on."""
+
+    def __init__(self, value: float) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor(value))
+
+
+class SnapshotAdapterFake(TrainableAdapterFake):
+    """Teacher swaps go through the real ``BaseAdapter`` named-parameter machinery.
+
+    ``velocity`` reads the live parameter instead of a scope label, so a missing,
+    leaked or unrestored swap changes the produced tensors rather than only a
+    bookkeeping string.
+    """
+
+    @property
+    def weight(self) -> torch.nn.Parameter:
+        """Expose the live component parameter."""
+        return self.snapshot_module.weight
+
+    def get_component(self, name: str) -> torch.nn.Module:
+        """Resolve the single snapshot-backed component."""
+        if name != "snapshot_module":
+            raise KeyError(f"expected component 'snapshot_module', received {name!r}")
+        return self.snapshot_module
+
+    def get_trainable_parameters(self) -> List[torch.Tensor]:
+        """Expose the live component parameter."""
+        return [self.snapshot_module.weight]
+
+    def velocity(self, latents: torch.Tensor, scope: str) -> torch.Tensor:
+        """Model output driven purely by the currently installed weight."""
+        return latents * self.weight
+
+    @contextmanager
+    def use_named_parameters(self, name: str) -> Iterator[None]:
+        """Record the scope around the real snapshot swap."""
+        previous = self.active_scope
+        self.active_scope = name
+        self.events.append(f"enter:{name}")
+        try:
+            with BaseAdapter.use_named_parameters(self, name):
+                self.observed_weights.append((name, float(self.weight)))
+                yield
+        finally:
+            self.active_scope = previous
+            self.events.append(f"exit:{name}")
+
+
+def _snapshot_adapter(
+    student_weight: float, teacher_weights: Dict[str, float]
+) -> SnapshotAdapterFake:
+    """Adapter with one real named-parameter snapshot per teacher."""
+    adapter = object.__new__(SnapshotAdapterFake)
+    adapter.pipeline = SimpleNamespace(scheduler=SchedulerFake())
+    adapter.scheduler_group = adapter.build_scheduler_group()
+    adapter.snapshot_module = SnapshotModuleFake(student_weight)
+    adapter.target_module_map = {"snapshot_module": ["weight"]}
+    adapter._named_parameters = {}
+    adapter.active_scope = "student"
+    adapter.forward_calls = []
+    adapter.events = []
+    adapter.observed_weights = []
+    for name, value in teacher_weights.items():
+        with torch.no_grad():
+            adapter.snapshot_module.weight.fill_(value)
+        adapter.add_named_parameters(name, target_components=["snapshot_module"], device="cpu")
+    with torch.no_grad():
+        adapter.snapshot_module.weight.fill_(student_weight)
+    return adapter
+
+
+class TwoComponentAdapterFake(BaseAdapter):
+    """Adapter declaring a heterogeneous video/audio stochastic contract."""
+
+    trajectory_component_order = ("video", "audio")
+
+    def load_pipeline(self) -> Any:
+        """Return an unused pipeline fake."""
+        raise NotImplementedError
+
+    def decode_latents(self, latents: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        """Return latents unchanged."""
+        return latents
+
+    def inference(self, **kwargs: Any) -> List[BaseSample]:
+        """Return no samples."""
+        return []
+
+    def forward(self, **kwargs: Any) -> SDESchedulerOutput:
+        """Unused: this adapter is driven through the structured surface."""
+        raise NotImplementedError
+
+    def train(self, mode: bool = True) -> None:
+        """Record the train-mode switch."""
+        self.events.append("mode:train" if mode else "mode:eval")
+
+    def ema_step(self, step: int) -> None:
+        """Record the sampling-EMA advance."""
+        self.events.append(f"ema_step:{step}")
+
+
+def _two_component_adapter(
+    video_dynamics: str = "Flow-SDE", audio_dynamics: str = "Flow-SDE"
+) -> TwoComponentAdapterFake:
+    adapter = object.__new__(TwoComponentAdapterFake)
+    video = SchedulerFake(video_dynamics)
+    adapter.pipeline = SimpleNamespace(scheduler=video)
+    adapter.scheduler_group = SchedulerGroup(
+        {"video": video, "audio": SchedulerFake(audio_dynamics)},
+        primary_name="video",
+    )
+    adapter.events = []
+    adapter.forward_calls = []
     return adapter
 
 
@@ -768,7 +896,7 @@ def test_stochastic_pass_uses_every_component_scheduler_denominator() -> None:
     trainer = _single_teacher_trainer(adapter, is_sde=True)
     batch = BaseSample.stack(_single_step_samples())
     replay, _, output = trainer._forward_step(
-        batch, 0, guidance_scale=3.0, include_transition_stats=True
+        batch, 0, guidance_scale=3.0, context="student", include_transition_stats=True
     )
 
     denominators = trainer._component_kl_denominators(output, replay, step_index=0)
@@ -782,7 +910,7 @@ def test_stochastic_pass_rejects_a_denominator_that_is_not_one_value_per_sample(
     trainer = _single_teacher_trainer(adapter, is_sde=True)
     batch = BaseSample.stack(_single_step_samples())
     replay, _, output = trainer._forward_step(
-        batch, 0, guidance_scale=3.0, include_transition_stats=True
+        batch, 0, guidance_scale=3.0, context="student", include_transition_stats=True
     )
     object.__setattr__(output, "std_dev_t", {"latent": torch.full((2, 3), 0.5)})
     object.__setattr__(output, "dt", {"latent": torch.full((2, 3), -0.5)})
@@ -799,7 +927,7 @@ def test_stochastic_pass_rejects_missing_transition_statistics() -> None:
     adapter = _adapter(dynamics_type="Flow-SDE")
     trainer = _single_teacher_trainer(adapter, is_sde=True)
     batch = BaseSample.stack(_single_step_samples())
-    replay, _, output = trainer._forward_step(batch, 0, guidance_scale=3.0)
+    replay, _, output = trainer._forward_step(batch, 0, guidance_scale=3.0, context="student")
 
     with pytest.raises(
         ValueError,
@@ -809,11 +937,209 @@ def test_stochastic_pass_rejects_missing_transition_statistics() -> None:
         trainer._component_kl_denominators(output, replay, step_index=0)
 
 
+# ==================== Real named-parameter snapshot swaps ====================
+
+
+def test_optimize_swaps_real_teacher_weights_and_restores_the_student() -> None:
+    adapter = _snapshot_adapter(0.7, {"teacher_a": 2.0, "teacher_b": -3.0})
+    trainer = _two_teacher_trainer(adapter)
+    samples = _mixed_source_samples()
+
+    trainer.optimize(samples)
+
+    # Each context installed its own snapshot, and neither leaked into the other.
+    assert adapter.observed_weights == [("teacher_a", 2.0), ("teacher_b", -3.0)]
+    # The live student weight is back after both contexts closed.
+    assert torch.equal(adapter.weight.detach(), torch.tensor(0.7))
+    student_calls = [call for call in adapter.forward_calls if call["scope"] == "student"]
+    assert all(call["requires_grad"] for call in student_calls)
+
+
+def test_teacher_targets_are_cached_from_the_swapped_in_teacher_weights() -> None:
+    adapter = _snapshot_adapter(0.7, {"teacher_a": 2.0, "teacher_b": -3.0})
+    trainer = _two_teacher_trainer(adapter)
+    samples = _mixed_source_samples()
+
+    trainer.optimize(samples)
+
+    for sample, teacher_weight in zip(samples, [2.0, -3.0] * 2):
+        latents = sample.all_latents[0]
+        stored = sample.extra_kwargs["teacher_target"]["latent"][0]
+        assert torch.equal(stored, latents + latents * teacher_weight)
+
+
+def test_every_real_teacher_swap_closes_before_the_first_student_forward() -> None:
+    adapter = _snapshot_adapter(0.7, {"teacher_a": 2.0, "teacher_b": -3.0})
+    events: List[str] = []
+    adapter.events = events
+    trainer = _two_teacher_trainer(adapter, events=events, accelerator=AcceleratorFake(events))
+
+    trainer.optimize(_mixed_source_samples())
+
+    last_exit = max(index for index, event in enumerate(events) if event.startswith("exit:"))
+    first_student = min(index for index, event in enumerate(events) if event == "forward:student")
+    assert last_exit < first_student
+    assert [event for event in events if event.startswith(("enter:", "exit:"))] == [
+        "enter:teacher_a",
+        "exit:teacher_a",
+        "enter:teacher_b",
+        "exit:teacher_b",
+    ]
+
+
+# ============ Two-component stochastic path: denominators to backward ============
+
+
+def _two_component_replay(video: torch.Tensor, audio: torch.Tensor) -> ReplayStep:
+    return ReplayStep(
+        state=LatentState({"video": video, "audio": audio}),
+        next_state=LatentState({"video": video, "audio": audio}),
+        times=ComponentTimes(
+            timestep={"video": torch.full((2,), 700.0), "audio": torch.full((2,), 650.0)},
+            next_timestep={"video": torch.full((2,), 300.0), "audio": torch.full((2,), 250.0)},
+        ),
+    )
+
+
+def test_two_component_stochastic_path_backpropagates_each_component_denominator() -> None:
+    """`_component_kl_denominators` -> projection -> structured loss -> backward."""
+    torch.manual_seed(21)
+    adapter = _two_component_adapter()
+    trainer = _single_teacher_trainer(adapter, is_sde=True)
+    weight = torch.nn.Parameter(torch.tensor(0.6))
+    video, audio = torch.randn(2, 3, 4), torch.randn(2, 5)
+    replay = _two_component_replay(video, audio)
+    teacher = LatentState({"video": torch.randn(2, 3, 4), "audio": torch.randn(2, 5)})
+    output = MultiModalStepOutput(
+        next_state_mean=LatentState({"video": video * weight, "audio": audio * weight}),
+        # Distinct per-component statistics: one shared denominator would be wrong.
+        std_dev_t={"video": torch.full((2, 1, 1), 0.5), "audio": torch.full((2, 1), 0.25)},
+        dt={"video": torch.full((2, 1, 1), -0.5), "audio": torch.full((2, 1), -0.125)},
+    )
+
+    denominators = trainer._component_kl_denominators(output, replay, step_index=1)
+    student_target = project_distillation_target_state(
+        adapter,
+        loss_target="xt",
+        state=replay.state,
+        output=output,
+        times=replay.times,
+    )
+    loss = compute_structured_distillation_loss(
+        adapter,
+        student_target=student_target,
+        teacher_target=teacher,
+        state=replay.state,
+        self_normalize=False,
+        denominators=denominators,
+    ).mean()
+    loss.backward()
+
+    assert torch.equal(denominators["video"], torch.full((2,), 0.5**2 * 0.5))
+    assert torch.equal(denominators["audio"], torch.full((2,), 0.25**2 * 0.125))
+
+    oracle_weight = torch.nn.Parameter(torch.tensor(0.6))
+    video_error = (video * oracle_weight - teacher.components["video"]).square()
+    audio_error = (audio * oracle_weight - teacher.components["audio"]).square()
+    oracle = (
+        (video_error / denominators["video"].reshape(2, 1, 1)).flatten(1).sum(dim=1)
+        + (audio_error / denominators["audio"].reshape(2, 1)).flatten(1).sum(dim=1)
+    ) / 17
+    oracle_loss = oracle.mean()
+    oracle_loss.backward()
+
+    assert torch.equal(loss.detach(), oracle_loss.detach())
+    assert torch.equal(weight.grad, oracle_weight.grad)
+
+
+class ScalarDenominatorSchedulerFake(SchedulerFake):
+    """Scheduler collapsing the transition variance to a batch-less scalar."""
+
+    def get_kl_divergence_denominator(
+        self, std_dev_t: torch.Tensor, dt: torch.Tensor
+    ) -> torch.Tensor:
+        """Return a 0-dim denominator shared by the whole batch."""
+        return (std_dev_t.float() ** 2 * (-dt.float())).clamp_min(1e-8).mean()
+
+
+def test_two_component_denominators_reject_a_scalar_without_a_batch_axis() -> None:
+    """A 0-dim denominator must fail the contract, not crash on ``shape[0]``."""
+    adapter = _two_component_adapter()
+    adapter.scheduler_group = SchedulerGroup(
+        {
+            "video": ScalarDenominatorSchedulerFake("Flow-SDE"),
+            "audio": SchedulerFake("Flow-SDE"),
+        },
+        primary_name="video",
+    )
+    trainer = _single_teacher_trainer(adapter, is_sde=True)
+    replay = _two_component_replay(torch.zeros(2, 3), torch.zeros(2, 5))
+    output = MultiModalStepOutput(
+        next_state_mean=LatentState({"video": torch.zeros(2, 3), "audio": torch.zeros(2, 5)}),
+        std_dev_t={"video": torch.full((2, 1), 0.5), "audio": torch.full((2, 1), 0.25)},
+        dt={"video": torch.full((2, 1), -0.5), "audio": torch.full((2, 1), -0.125)},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"step_index=1.*component 'video'.*one value per sample.*\(2,\).*\(\)",
+    ):
+        trainer._component_kl_denominators(output, replay, step_index=1)
+
+
+# ==================== Teacher / student / step error context ====================
+
+
+class DropVelocityAdapterFake(TrainableAdapterFake):
+    """Adapter that omits the requested velocity for one scope only."""
+
+    def forward(self, **kwargs: Any) -> SDESchedulerOutput:
+        """Return the normal output with the velocity stripped for ``drop_scope``."""
+        output = super().forward(**kwargs)
+        if self.active_scope == self.drop_scope:
+            output.velocity = None
+        return output
+
+
+def _drop_velocity_adapter(drop_scope: str) -> DropVelocityAdapterFake:
+    adapter = object.__new__(DropVelocityAdapterFake)
+    adapter.pipeline = SimpleNamespace(scheduler=SchedulerFake())
+    adapter.scheduler_group = adapter.build_scheduler_group()
+    adapter.weight = torch.nn.Parameter(torch.tensor(0.7))
+    adapter.active_scope = "student"
+    adapter.drop_scope = drop_scope
+    adapter.forward_calls = []
+    adapter.events = []
+    return adapter
+
+
+def test_teacher_projection_errors_name_the_teacher_and_the_step() -> None:
+    adapter = _drop_velocity_adapter("teacher_b")
+    trainer = _two_teacher_trainer(adapter, loss_target="v")
+
+    with pytest.raises(
+        ValueError,
+        match=r"teacher 'teacher_b' pass at step_index=0.*velocity.*received None",
+    ):
+        trainer.optimize(_mixed_source_samples())
+
+
+def test_student_projection_errors_name_the_student_pass_and_the_step() -> None:
+    adapter = _drop_velocity_adapter("student")
+    trainer = _two_teacher_trainer(adapter, loss_target="v")
+
+    with pytest.raises(
+        ValueError,
+        match=r"student pass at step_index=0.*velocity.*received None",
+    ):
+        trainer.optimize(_mixed_source_samples())
+
+
 # ============================ Lifecycle ============================
 
 
 def test_start_seeds_every_component_scheduler_before_each_epoch() -> None:
-    adapter = _adapter()
+    adapter = _two_component_adapter()
     trainer = _two_teacher_trainer(adapter)
     iterations = iter([True, False])
     trainer.should_continue_training = lambda: next(iterations)
@@ -823,7 +1149,10 @@ def test_start_seeds_every_component_scheduler_before_each_epoch() -> None:
 
     trainer.start()
 
-    assert adapter.scheduler_group.primary.seeds == [9]
+    seeds = {
+        name: adapter.scheduler_group[name].seeds for name in adapter.trajectory_component_order
+    }
+    assert seeds == {"video": [9], "audio": [9]}
     assert f"ema_step:{4}" in adapter.events
     assert trainer.epoch == 5
 
@@ -849,7 +1178,7 @@ def test_pass_two_projects_the_student_target_as_a_latent_state() -> None:
     trainer = _single_teacher_trainer(adapter)
     batch = BaseSample.stack(_single_step_samples())
 
-    replay, target, _ = trainer._forward_step(batch, 0, guidance_scale=3.0)
+    replay, target, _ = trainer._forward_step(batch, 0, guidance_scale=3.0, context="student")
 
     assert isinstance(target, LatentState)
     assert target.component_names == ("latent",)

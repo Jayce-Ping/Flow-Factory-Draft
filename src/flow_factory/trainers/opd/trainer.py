@@ -273,6 +273,7 @@ class DiffusionOPDTrainer(BaseTrainer):
                                 batch,
                                 int(timestep_index),
                                 guidance_scale=teacher_gs,
+                                context=f"teacher {teacher_name!r}",
                             )[1]
                             for timestep_index in train_timesteps
                         ]
@@ -349,6 +350,7 @@ class DiffusionOPDTrainer(BaseTrainer):
                                 batch,
                                 step_index,
                                 guidance_scale=self.training_args.guidance_scale,
+                                context="student",
                                 include_transition_stats=self._is_sde,
                             )
                             # Each sample is matched to its own routed teacher target.
@@ -490,6 +492,7 @@ class DiffusionOPDTrainer(BaseTrainer):
         batch: StackedSampleBatch,
         step_index: int,
         guidance_scale: float,
+        context: str,
         include_transition_stats: bool = False,
     ) -> Tuple[ReplayStep, LatentState, MultiModalStepOutput]:
         """Forward one stored step and return its configured target projection.
@@ -500,6 +503,15 @@ class DiffusionOPDTrainer(BaseTrainer):
         rather than from legacy index maps. Returns
         ``(replay, target, output)``; the transition statistics are requested
         only for the stochastic student pass.
+
+        Args:
+            batch: Collated micro-batch replayed at this step.
+            step_index: Global rollout transition index.
+            guidance_scale: Scale overriding the configured training value.
+            context: Which pass is running (``"teacher 'name'"`` or
+                ``"student"``); projection errors are raised with this and the
+                step index so a two-pass failure is attributable.
+            include_transition_stats: Whether to request ``std_dev_t``/``dt``.
         """
         replay = self.adapter.get_replay_step(batch, step_index)
         return_fields = (TARGET_REQUEST_FIELDS[self.training_args.loss_target],)
@@ -526,6 +538,7 @@ class DiffusionOPDTrainer(BaseTrainer):
             state=replay.state,
             output=output,
             times=replay.times,
+            context=f"{context} pass at step_index={step_index}",
         )
         return replay, target, output
 
@@ -624,7 +637,11 @@ class DiffusionOPDTrainer(BaseTrainer):
                 )
             # A scalar-like (B, 1, ...) denominator carries one value per sample;
             # anything else would silently average distinct per-element scales.
-            if denominator.shape[0] != batch_size or denominator.numel() != batch_size:
+            if (
+                denominator.ndim == 0
+                or denominator.shape[0] != batch_size
+                or denominator.numel() != batch_size
+            ):
                 raise ValueError(
                     f"expected DiffusionOPDTrainer KL denominator at step_index={step_index} "
                     f"for component {name!r} to hold one value per sample with shape "

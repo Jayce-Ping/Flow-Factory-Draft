@@ -370,6 +370,179 @@ def test_structured_projection_rejects_an_unknown_target_space() -> None:
         )
 
 
+# ======================= Replay time contract validation =======================
+
+
+def _structured_state() -> LatentState:
+    return LatentState({"video": torch.zeros(2, 3), "audio": torch.zeros(2, 5)})
+
+
+def _structured_output() -> MultiModalStepOutput:
+    return MultiModalStepOutput(
+        next_state_mean=LatentState({"video": torch.zeros(2, 3), "audio": torch.zeros(2, 5)}),
+        velocity=LatentState({"video": torch.zeros(2, 3), "audio": torch.zeros(2, 5)}),
+    )
+
+
+def _structured_times(**overrides: Any) -> ComponentTimes:
+    fields: Dict[str, Any] = {
+        "timestep": {"video": torch.zeros(2), "audio": torch.zeros(2)},
+        "next_timestep": {"video": torch.zeros(2), "audio": torch.zeros(2)},
+        "sigma": {"video": torch.zeros(2), "audio": torch.zeros(2)},
+        "next_sigma": {"video": torch.zeros(2), "audio": torch.zeros(2)},
+    }
+    fields.update(overrides)
+    return ComponentTimes(**fields)
+
+
+@pytest.mark.parametrize("loss_target", ["xt", "v", "x0"])
+def test_structured_projection_validates_the_times_contract_for_every_target(
+    loss_target: str,
+) -> None:
+    """`xt` and `v` never read a sigma, but a drifted replay is still a bug.
+
+    The whole `ComponentTimes` contract is checked before the target branch, so
+    a corrupted sigma cannot slip through the two targets that ignore it.
+    """
+    adapter = _structured_adapter()
+
+    with pytest.raises(ValueError, match=r"sigma.*component 'video'.*one value per sample"):
+        project_distillation_target_state(
+            adapter,
+            loss_target=loss_target,
+            state=_structured_state(),
+            output=_structured_output(),
+            times=_structured_times(
+                sigma={"video": torch.zeros(2, 3), "audio": torch.zeros(2)},
+            ),
+        )
+
+
+def test_structured_projection_rejects_a_timestep_component_order_mismatch() -> None:
+    adapter = _structured_adapter()
+
+    with pytest.raises(
+        ValueError,
+        match=r"timestep.*component order \('video', 'audio'\), received \('audio', 'video'\)",
+    ):
+        project_distillation_target_state(
+            adapter,
+            loss_target="xt",
+            state=_structured_state(),
+            output=_structured_output(),
+            times=ComponentTimes(
+                timestep={"audio": torch.zeros(2), "video": torch.zeros(2)},
+                next_timestep={"audio": torch.zeros(2), "video": torch.zeros(2)},
+            ),
+        )
+
+
+@pytest.mark.parametrize("field", ["timestep", "next_timestep", "sigma", "next_sigma"])
+def test_structured_projection_rejects_a_time_field_that_is_not_one_value_per_sample(
+    field: str,
+) -> None:
+    adapter = _structured_adapter()
+    drifted = {"video": torch.zeros(2, 3), "audio": torch.zeros(2)}
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{field}.*component 'video'.*one value per sample.*\(2,\).*\(2, 3\)",
+    ):
+        project_distillation_target_state(
+            adapter,
+            loss_target="xt",
+            state=_structured_state(),
+            output=_structured_output(),
+            times=_structured_times(**{field: drifted}),
+        )
+
+
+@pytest.mark.parametrize("field", ["timestep", "next_timestep", "sigma", "next_sigma"])
+def test_structured_projection_rejects_a_time_field_on_another_device(field: str) -> None:
+    adapter = _structured_adapter()
+    elsewhere = {"video": torch.zeros(2, device="meta"), "audio": torch.zeros(2)}
+
+    with pytest.raises(ValueError, match=rf"{field}.*component 'video'.*device"):
+        project_distillation_target_state(
+            adapter,
+            loss_target="xt",
+            state=_structured_state(),
+            output=_structured_output(),
+            times=_structured_times(**{field: elsewhere}),
+        )
+
+
+def test_structured_projection_accepts_the_legacy_terminal_scalar_zero_next_timestep() -> None:
+    """The legacy single-``latent`` replay stores the terminal ``t_next`` as scalar 0."""
+    adapter = _adapter()
+
+    projected = project_distillation_target_state(
+        adapter,
+        loss_target="v",
+        state=LatentState({"latent": torch.zeros(2, 3)}),
+        output=MultiModalStepOutput(velocity=LatentState({"latent": torch.ones(2, 3)})),
+        times=ComponentTimes(
+            timestep={"latent": torch.zeros(2)},
+            next_timestep={"latent": torch.tensor(0)},
+        ),
+    )
+
+    assert torch.equal(projected.components["latent"], torch.ones(2, 3))
+
+
+def test_structured_projection_rejects_a_scalar_next_timestep_for_a_component_group() -> None:
+    """The terminal fallback is documented for the legacy single component only."""
+    adapter = _structured_adapter()
+
+    with pytest.raises(
+        ValueError,
+        match=r"next_timestep.*component 'video'.*one value per sample.*\(2,\).*\(\)",
+    ):
+        project_distillation_target_state(
+            adapter,
+            loss_target="xt",
+            state=_structured_state(),
+            output=_structured_output(),
+            times=ComponentTimes(
+                timestep={"video": torch.zeros(2), "audio": torch.zeros(2)},
+                next_timestep={"video": torch.tensor(0), "audio": torch.zeros(2)},
+            ),
+        )
+
+
+def test_structured_projection_rejects_a_non_zero_scalar_next_timestep() -> None:
+    adapter = _adapter()
+
+    with pytest.raises(
+        ValueError,
+        match=r"next_timestep.*component 'latent'.*terminal.*scalar 0.*received 250",
+    ):
+        project_distillation_target_state(
+            adapter,
+            loss_target="v",
+            state=LatentState({"latent": torch.zeros(2, 3)}),
+            output=MultiModalStepOutput(velocity=LatentState({"latent": torch.zeros(2, 3)})),
+            times=ComponentTimes(
+                timestep={"latent": torch.zeros(2)},
+                next_timestep={"latent": torch.tensor(250)},
+            ),
+        )
+
+
+def test_structured_projection_errors_carry_the_caller_context() -> None:
+    adapter = _adapter()
+
+    with pytest.raises(ValueError, match=r"teacher 'teacher_a' pass at step_index=3.*velocity"):
+        project_distillation_target_state(
+            adapter,
+            loss_target="v",
+            state=LatentState({"latent": torch.zeros(2, 3)}),
+            output=MultiModalStepOutput(),
+            times=_legacy_times(torch.zeros(2)),
+            context="teacher 'teacher_a' pass at step_index=3",
+        )
+
+
 # ============================ Distillation loss ============================
 
 
@@ -457,9 +630,11 @@ def test_structured_loss_divides_each_component_by_its_own_denominator() -> None
     torch.manual_seed(8)
     student = {"video": torch.randn(2, 3, 4), "audio": torch.randn(2, 5)}
     teacher = {"video": torch.randn(2, 3, 4), "audio": torch.randn(2, 5)}
+    # Deliberately not powers of two: dividing before or after the reduction is
+    # only bit-identical for exactly representable scalings.
     denominators = {
-        "video": torch.tensor([0.5, 2.0]),
-        "audio": torch.tensor([4.0, 0.25]),
+        "video": torch.tensor([0.3, 1.7]),
+        "audio": torch.tensor([2.5, 0.7]),
     }
     adapter = _structured_adapter("Flow-SDE", "CPS")
 
@@ -472,26 +647,79 @@ def test_structured_loss_divides_each_component_by_its_own_denominator() -> None
         denominators=denominators,
     )
 
-    # Element-weighted oracle: each component contributes its own mean squared
-    # error divided by its own denominator, weighted by its element count.
-    video_mean = (student["video"] - teacher["video"]).float().square().flatten(1).mean(dim=1)
-    audio_mean = (student["audio"] - teacher["audio"]).float().square().flatten(1).mean(dim=1)
-    expected = (
-        12 * (video_mean / denominators["video"]) + 5 * (audio_mean / denominators["audio"])
-    ) / 17
-    assert torch.equal(loss, expected)
+    # Raw-element oracle: the denominator divides every element of its own
+    # component, and exactly one active-DOF weighted reduction follows.
+    video_error = (student["video"] - teacher["video"]).float().square()
+    audio_error = (student["audio"] - teacher["audio"]).float().square()
+    video_sum = (video_error / denominators["video"].reshape(2, 1, 1)).flatten(1).sum(dim=1)
+    audio_sum = (audio_error / denominators["audio"].reshape(2, 1)).flatten(1).sum(dim=1)
+    assert torch.equal(loss, (video_sum + audio_sum) / 17)
 
 
-def test_one_component_stochastic_loss_is_the_legacy_loss_over_the_denominator() -> None:
-    """Self-normalization and the KL denominator compose exactly as the legacy trainer.
+def test_structured_loss_divides_raw_elements_before_the_single_masked_reduction() -> None:
+    """A per-sample active count must divide the already-scaled raw elements.
 
-    Both are per-sample scalar divisions, so their relative order is not
-    observable; what this pins is that the stochastic path still applies the
-    detached self-normalization AND the denominator, and nothing else.
+    Component-meaning before the denominator would make the loss depend on the
+    full element count instead of the mask, so the two samples below (3 and 1
+    active positions) are the discriminating case.
+    """
+    torch.manual_seed(10)
+    student, teacher = torch.randn(2, 4), torch.randn(2, 4)
+    denominator = torch.tensor([0.5, 3.0])
+    mask = torch.tensor([[1.0, 1.0, 1.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
+    adapter = _dynamic_mask_adapter()
+
+    loss = compute_structured_distillation_loss(
+        adapter,
+        student_target=LatentState({"latent": student}),
+        teacher_target=LatentState({"latent": teacher}),
+        state=LatentState({"latent": mask}),
+        self_normalize=False,
+        denominators={"latent": denominator},
+    )
+
+    scaled = (student - teacher).float().square() / denominator.reshape(2, 1)
+    assert torch.equal(loss, (scaled * mask).sum(dim=1) / mask.sum(dim=1))
+
+
+def test_one_component_stochastic_loss_scales_raw_elements_then_self_normalizes() -> None:
+    """The denominator divides raw elements; the detached scale divides the reduction.
+
+    Self-normalization stays a per-sample scalar applied to the reduced loss —
+    exactly the legacy arithmetic — while the denominator moved inside the
+    reduction so a masked reducer sees the scaled elements.
     """
     torch.manual_seed(9)
     student, teacher = torch.randn(2, 3, 4), torch.randn(2, 3, 4)
-    denominator = torch.tensor([0.25, 1.5])
+    denominator = torch.tensor([0.3, 1.7])
+    adapter = _adapter("Flow-SDE")
+
+    loss = compute_structured_distillation_loss(
+        adapter,
+        student_target=LatentState({"latent": student}),
+        teacher_target=LatentState({"latent": teacher}),
+        state=LatentState({"latent": torch.zeros(2, 3, 4)}),
+        self_normalize=True,
+        denominators={"latent": denominator},
+    )
+
+    error = (student - teacher).float()
+    scaled = error.square() / denominator.reshape(2, 1, 1)
+    scale = error.abs().flatten(1).mean(dim=1)
+    assert torch.equal(loss, scaled.flatten(1).mean(dim=1) / (scale + 1e-8))
+
+
+def test_one_component_stochastic_loss_stays_legacy_exact_for_a_binary_denominator() -> None:
+    """Division by an exactly representable denominator commutes with the reduction.
+
+    The legacy trainer divided the reduced per-sample loss by the denominator.
+    Moving that division inside the reduction is mathematically identical and,
+    for a power-of-two denominator, bit-identical — which is what the real SDE
+    schedulers produce for the transition variance in the production oracle.
+    """
+    torch.manual_seed(11)
+    student, teacher = torch.randn(2, 3, 4), torch.randn(2, 3, 4)
+    denominator = torch.tensor([0.25, 0.125])
     adapter = _adapter("Flow-SDE")
 
     loss = compute_structured_distillation_loss(

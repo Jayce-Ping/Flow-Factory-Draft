@@ -55,11 +55,12 @@ _TARGET_OUTPUT_FIELDS: Mapping[str, str] = {
 }
 
 
-def _require_known_loss_target(loss_target: str) -> None:
+def _require_known_loss_target(loss_target: str, context: Optional[str] = None) -> None:
     """Validate the configured target space name."""
     if loss_target not in LOSS_TARGETS:
         raise ValueError(
-            f"DiffusionOPD loss_target must be one of {LOSS_TARGETS}, got {loss_target!r}."
+            f"{_context_prefix(context)}DiffusionOPD loss_target must be one of "
+            f"{LOSS_TARGETS}, got {loss_target!r}."
         )
 
 
@@ -276,69 +277,121 @@ def compute_per_sample_distillation_loss(
     return per_sample_mse / (scale + eps)
 
 
+def _context_prefix(context: Optional[str]) -> str:
+    """Render the caller context (teacher/student pass and step) as a message prefix."""
+    if context is None:
+        return ""
+    if not isinstance(context, str) or not context:
+        raise ValueError(
+            f"expected a non-empty string or None for the DiffusionOPD projection context, "
+            f"received {context!r}"
+        )
+    return f"{context}: "
+
+
 def _require_state(
     adapter: "BaseAdapter",
     value: object,
     *,
     role: str,
+    context: Optional[str] = None,
 ) -> LatentState:
     """Validate a structured latent argument against the adapter component order."""
+    prefix = _context_prefix(context)
     if not isinstance(value, LatentState):
         raise TypeError(
-            f"expected LatentState for DiffusionOPD {role}, received {type(value).__name__}"
+            f"{prefix}expected LatentState for DiffusionOPD {role}, "
+            f"received {type(value).__name__}"
         )
     expected_names = adapter.trajectory_component_order
     if value.component_names != expected_names:
         raise ValueError(
-            f"expected DiffusionOPD {role} in component order {expected_names}, "
+            f"{prefix}expected DiffusionOPD {role} in component order {expected_names}, "
             f"received {value.component_names}"
         )
     return value
 
 
-def _resolve_component_sigmas(
+def _validate_component_times(
     adapter: "BaseAdapter",
     times: ComponentTimes,
+    state: LatentState,
     batch_size: int,
-) -> Dict[str, torch.Tensor]:
-    """Resolve the per-component noise level used by the ``x0`` projection."""
+    context: Optional[str] = None,
+) -> None:
+    """Validate the whole replay time contract before any target branch runs.
+
+    Every present coordinate must cover the authoritative component order and
+    carry exactly one value per sample on the state device. The single
+    documented exception is the legacy terminal ``t_next``: the one-component
+    replay stores it as a shared 0-dim scalar zero because adapters keep one
+    timestep per denoising step while latents keep one more rollout position.
+    """
+    prefix = _context_prefix(context)
     expected_names = adapter.trajectory_component_order
     if not isinstance(times, ComponentTimes):
         raise TypeError(
-            f"expected ComponentTimes for DiffusionOPD replay times, received "
+            f"{prefix}expected ComponentTimes for DiffusionOPD replay times, received "
             f"{type(times).__name__}"
         )
-    if tuple(times.timestep) != expected_names:
-        raise ValueError(
-            f"expected DiffusionOPD replay times in component order {expected_names}, "
-            f"received {tuple(times.timestep)}"
-        )
+    fields: Dict[str, Optional[Mapping[str, torch.Tensor]]] = {
+        "timestep": times.timestep,
+        "next_timestep": times.next_timestep,
+        "sigma": times.sigma,
+        "next_sigma": times.next_sigma,
+    }
+    for field, values in fields.items():
+        if values is None:
+            continue
+        if tuple(values) != expected_names:
+            raise ValueError(
+                f"{prefix}expected DiffusionOPD replay {field} in component order "
+                f"{expected_names}, received {tuple(values)}"
+            )
+        for name in expected_names:
+            value = values[name]
+            reference = state.components[name]
+            if value.shape != (batch_size,):
+                terminal = (
+                    field == "next_timestep" and expected_names == ("latent",) and value.ndim == 0
+                )
+                if not terminal:
+                    raise ValueError(
+                        f"{prefix}expected DiffusionOPD replay {field} for component {name!r} "
+                        f"to hold one value per sample with shape {(batch_size,)}, received "
+                        f"{tuple(value.shape)}"
+                    )
+                if bool(value.ne(0).item()):
+                    raise ValueError(
+                        f"{prefix}expected the DiffusionOPD replay {field} for component "
+                        f"{name!r} terminal fallback to be the scalar 0, received {value}"
+                    )
+            if value.device != reference.device:
+                raise ValueError(
+                    f"{prefix}expected DiffusionOPD replay {field} for component {name!r} on "
+                    f"the replay state device {reference.device}, received {value.device}"
+                )
+
+
+def _resolve_component_sigmas(
+    adapter: "BaseAdapter",
+    times: ComponentTimes,
+    context: Optional[str] = None,
+) -> Dict[str, torch.Tensor]:
+    """Resolve the per-component noise level used by the ``x0`` projection."""
+    expected_names = adapter.trajectory_component_order
     if times.sigma is None:
         # The flow-matching fallback (sigma = timestep / 1000) is the legacy
         # single-latent contract; a structured trajectory must store sigmas.
         if expected_names != ("latent",):
             raise ValueError(
-                f"DiffusionOPD loss_target='x0' requires per-component sigmas in component "
-                f"order {expected_names}; the replay carries no stored sigma and the "
-                "flow-matching fallback is only defined for the legacy single 'latent' "
-                "component."
+                f"{_context_prefix(context)}DiffusionOPD loss_target='x0' requires "
+                f"per-component sigmas in component order {expected_names}; the replay "
+                "carries no stored sigma and the flow-matching fallback is only defined "
+                "for the legacy single 'latent' component."
             )
         return {"latent": flow_match_sigma(times.timestep["latent"].float())}
-    if tuple(times.sigma) != expected_names:
-        raise ValueError(
-            f"expected DiffusionOPD replay sigma in component order {expected_names}, "
-            f"received {tuple(times.sigma)}"
-        )
-    sigmas: Dict[str, torch.Tensor] = {}
-    for name in expected_names:
-        sigma = times.sigma[name]
-        if sigma.ndim > 1 or sigma.numel() not in (1, batch_size):
-            raise ValueError(
-                f"expected DiffusionOPD sigma for component {name!r} to hold one value per "
-                f"sample with shape ({batch_size},), received {tuple(sigma.shape)}"
-            )
-        sigmas[name] = sigma
-    return sigmas
+    return {name: times.sigma[name] for name in expected_names}
 
 
 def project_distillation_target_state(
@@ -348,6 +401,7 @@ def project_distillation_target_state(
     state: LatentState,
     output: MultiModalStepOutput,
     times: ComponentTimes,
+    context: Optional[str] = None,
 ) -> LatentState:
     """Project a structured step output into the configured target space.
 
@@ -362,6 +416,8 @@ def project_distillation_target_state(
         state: Replay state the prediction was produced from.
         output: Structured scheduler output carrying the requested field.
         times: Replay coordinates supplying the ``x0`` noise level.
+        context: Optional caller description (teacher/student pass and replay
+            step) prefixed to every raised message.
 
     Returns:
         A :class:`LatentState` in ``trajectory_component_order`` holding the
@@ -372,14 +428,17 @@ def project_distillation_target_state(
         ValueError: The target is unsupported, a component is missing, or a
             component shape/device/sigma is inconsistent with the state.
     """
-    _require_known_loss_target(loss_target)
-    state = _require_state(adapter, state, role="replay state")
+    prefix = _context_prefix(context)
+    _require_known_loss_target(loss_target, context=context)
+    state = _require_state(adapter, state, role="replay state", context=context)
     if not isinstance(output, MultiModalStepOutput):
         raise TypeError(
-            f"expected MultiModalStepOutput for DiffusionOPD forward output, received "
+            f"{prefix}expected MultiModalStepOutput for DiffusionOPD forward output, received "
             f"{type(output).__name__}"
         )
     expected_names = adapter.trajectory_component_order
+    batch_size = state.components[expected_names[0]].shape[0]
+    _validate_component_times(adapter, times, state, batch_size, context=context)
     field = _TARGET_OUTPUT_FIELDS[loss_target]
     predicted = getattr(output, field)
     if not isinstance(predicted, LatentState) or predicted.component_names != expected_names:
@@ -393,30 +452,30 @@ def project_distillation_target_state(
             )
         )
         raise ValueError(
-            f"expected DiffusionOPD forward output field {field!r} for "
+            f"{prefix}expected DiffusionOPD forward output field {field!r} for "
             f"loss_target={loss_target!r} in component order {expected_names}, received "
             f"{received}; request it through return_fields."
         )
-    batch_size = state.components[expected_names[0]].shape[0]
     for name in expected_names:
         reference = state.components[name]
         value = predicted.components[name]
         if value.shape != reference.shape:
             raise ValueError(
-                f"expected DiffusionOPD forward output field {field!r} component {name!r} to "
-                f"match the replay state shape {tuple(reference.shape)}, received "
+                f"{prefix}expected DiffusionOPD forward output field {field!r} component "
+                f"{name!r} to match the replay state shape {tuple(reference.shape)}, received "
                 f"{tuple(value.shape)}"
             )
         if value.device != reference.device:
             raise ValueError(
-                f"expected DiffusionOPD forward output field {field!r} component {name!r} on "
-                f"the replay state device {reference.device}, received {value.device}"
+                f"{prefix}expected DiffusionOPD forward output field {field!r} component "
+                f"{name!r} on the replay state device {reference.device}, received "
+                f"{value.device}"
             )
 
     if loss_target in ("xt", "v"):
         return LatentState({name: predicted.components[name] for name in expected_names})
 
-    sigmas = _resolve_component_sigmas(adapter, times, batch_size)
+    sigmas = _resolve_component_sigmas(adapter, times, context=context)
     projected: Dict[str, torch.Tensor] = {}
     for name in expected_names:
         latents = state.components[name].float()
@@ -478,10 +537,13 @@ def compute_structured_distillation_loss(
 ) -> torch.Tensor:
     """Compute the per-sample structured distillation loss.
 
-    Self-normalization stays global: one detached scale per sample is shared by
-    every component so the relative component weighting is preserved. The
-    per-component KL denominators of stochastic dynamics are applied after that
-    normalization, matching the legacy ``per_sample_loss / denominator`` order.
+    The per-component KL denominators of stochastic dynamics divide the raw
+    squared-error elements of their own component, so exactly one state-aware
+    reduction runs over already-scaled elements and a masked model never sees a
+    pre-reduced value. Self-normalization stays global and is applied to that
+    single reduction: one detached scale per sample shared by every component,
+    which both preserves the relative component weighting and keeps the legacy
+    ``per_sample_loss / (scale + eps)`` arithmetic bit-identical.
 
     Args:
         adapter: Adapter owning the reduction and component order.
@@ -531,26 +593,19 @@ def compute_structured_distillation_loss(
         absolute = {name: errors[name].abs() for name in expected_names}
         scale = adapter.reduce_latent_values(absolute, state=state).detach()
 
-    if denominators is None:
-        per_sample_loss = adapter.reduce_latent_values(squared, state=state)
-        if scale is None:
-            return per_sample_loss
-        return per_sample_loss / (scale + eps)
+    values = squared
+    if denominators is not None:
+        batch_size = student_target.components[expected_names[0]].shape[0]
+        _validate_component_denominators(adapter, denominators, batch_size)
+        values = {
+            name: squared[name] / to_broadcast_tensor(denominators[name], squared[name])
+            for name in expected_names
+        }
 
-    batch_size = student_target.components[expected_names[0]].shape[0]
-    _validate_component_denominators(adapter, denominators, batch_size)
-    per_component = adapter.reduce_component_latent_values(squared, state=state)
-    normalized: Dict[str, torch.Tensor] = {}
-    for name in expected_names:
-        component_loss = per_component[name]
-        if scale is not None:
-            component_loss = component_loss / (scale + eps)
-        normalized[name] = component_loss / denominators[name]
-    return adapter.reduce_latent_values(
-        normalized,
-        active_numel=adapter.get_state_active_numel(state),
-        state=state,
-    )
+    per_sample_loss = adapter.reduce_latent_values(values, state=state)
+    if scale is None:
+        return per_sample_loss
+    return per_sample_loss / (scale + eps)
 
 
 def load_teachers(
