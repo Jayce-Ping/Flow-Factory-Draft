@@ -242,23 +242,12 @@ def build_ltx2_joint_forward_kwargs(
     Returns:
         Keyword arguments for ``adapter.forward`` in component-return mode.
     """
-    _require_ltx2_component_order(adapter, state.component_names, "state")
-    _require_ltx2_component_order(adapter, tuple(times.timestep), "times.timestep")
-    _require_ltx2_component_order(adapter, tuple(times.next_timestep), "times.next_timestep")
-    if next_state is not None:
-        _require_ltx2_component_order(adapter, next_state.component_names, "next_state")
+    validate_ltx2_forward_state_inputs(adapter, state=state, times=times, next_state=next_state)
 
-    timestep = _require_joint_coordinate(adapter, times.timestep, "timestep")
-    next_timestep = _require_joint_coordinate(adapter, times.next_timestep, "next_timestep")
-
+    timestep = times.timestep["video"]
+    next_timestep = times.next_timestep["video"]
     video = state.components["video"]
     audio = state.components["audio"]
-    if video.ndim != 3 or audio.ndim != 3 or video.shape[0] != audio.shape[0]:
-        raise ValueError(
-            f"expected packed (B, S, C) video and audio components sharing a batch size for "
-            f"{type(adapter).__name__} forward_state, received video {tuple(video.shape)} and "
-            f"audio {tuple(audio.shape)}"
-        )
     video_seq_len = video.shape[1]
     stored_seq_len = batch.get("video_seq_len")
     if not isinstance(stored_seq_len, int) or isinstance(stored_seq_len, bool):
@@ -290,6 +279,139 @@ def build_ltx2_joint_forward_kwargs(
         "_return_components": True,
         **call_kwargs,
     }
+
+
+def validate_ltx2_forward_state_inputs(
+    adapter: Any,
+    *,
+    state: LatentState,
+    times: ComponentTimes,
+    next_state: Optional[LatentState],
+) -> None:
+    """Check every component input the joint LTX2 forward is about to consume.
+
+    The concatenated ``forward`` cannot see component boundaries, so a mismatch in
+    channel count, dtype, device or stored next state would either raise deep inside
+    ``torch.cat`` or silently mis-attribute one modality's values to the other.
+
+    Args:
+        adapter: Adapter running the component forward.
+        state: Current state in authoritative component order.
+        times: Current and next times in authoritative component order.
+        next_state: Optional stored next state in authoritative component order.
+
+    Raises:
+        ValueError: If any order, shape, dtype, device or mask expectation fails.
+    """
+    _require_ltx2_component_order(adapter, state.component_names, "state")
+    _require_ltx2_component_order(adapter, tuple(times.timestep), "times.timestep")
+    _require_ltx2_component_order(adapter, tuple(times.next_timestep), "times.next_timestep")
+    if next_state is not None:
+        _require_ltx2_component_order(adapter, next_state.component_names, "next_state")
+
+    name = type(adapter).__name__
+    video = state.components["video"]
+    audio = state.components["audio"]
+    for component, values in (("video", video), ("audio", audio)):
+        if values.ndim != 3:
+            raise ValueError(
+                f"expected {name} state component {component!r} packed as (B, S, C), received "
+                f"shape {tuple(values.shape)}"
+            )
+    if audio.shape[0] != video.shape[0]:
+        raise ValueError(
+            f"expected {name} batch size of state component 'audio' to match 'video' "
+            f"({video.shape[0]}), received {audio.shape[0]}"
+        )
+    if audio.shape[2] != video.shape[2]:
+        raise ValueError(
+            f"expected {name} channel dimension of state component 'audio' to match 'video' "
+            f"({video.shape[2]}), received {audio.shape[2]}"
+        )
+    if audio.dtype is not video.dtype:
+        raise ValueError(
+            f"expected {name} dtype of state component 'audio' to match 'video' "
+            f"({video.dtype}), received {audio.dtype}"
+        )
+    if audio.device != video.device:
+        raise ValueError(
+            f"expected {name} device of state component 'audio' to match 'video' "
+            f"({video.device}), received {audio.device}"
+        )
+
+    batch_size = video.shape[0]
+    for field in ("timestep", "next_timestep"):
+        values = getattr(times, field)
+        for component in LTX2_COMPONENT_ORDER:
+            coordinate = values[component]
+            identifier = f"times.{field}[{component!r}]"
+            if not isinstance(coordinate, torch.Tensor):
+                raise TypeError(
+                    f"expected {name} {identifier} as a torch.Tensor, received "
+                    f"{type(coordinate).__name__}: {coordinate!r}"
+                )
+            if coordinate.shape != (batch_size,):
+                raise ValueError(
+                    f"expected {name} {identifier} with one coordinate per sample, shape "
+                    f"({batch_size},), received {tuple(coordinate.shape)}"
+                )
+            if coordinate.device != video.device:
+                raise ValueError(
+                    f"expected {name} {identifier} on the state device {video.device}, received "
+                    f"{coordinate.device}"
+                )
+    _require_joint_coordinate(adapter, times.timestep, "timestep")
+    _require_joint_coordinate(adapter, times.next_timestep, "next_timestep")
+
+    if next_state is None:
+        return
+    for component in LTX2_COMPONENT_ORDER:
+        current = state.components[component]
+        stored = next_state.components[component]
+        identifier = f"next_state component {component!r}"
+        if stored.shape != current.shape:
+            raise ValueError(
+                f"expected {name} {identifier} to match the state shape "
+                f"{tuple(current.shape)}, received {tuple(stored.shape)}"
+            )
+        if stored.dtype is not current.dtype:
+            raise ValueError(
+                f"expected {name} {identifier} dtype {current.dtype}, received {stored.dtype}"
+            )
+        if stored.device != current.device:
+            raise ValueError(
+                f"expected {name} {identifier} device {current.device}, received {stored.device}"
+            )
+    _require_matching_state_masks(adapter, state=state, next_state=next_state)
+
+
+def _require_matching_state_masks(
+    adapter: Any, *, state: LatentState, next_state: LatentState
+) -> None:
+    """Require the stored next state to carry exactly the current static masks."""
+    name = type(adapter).__name__
+    if state.active_masks is None:
+        if next_state.active_masks is not None:
+            raise ValueError(
+                f"expected {name} next_state active_masks to be None because the state carries "
+                f"none, received {tuple(next_state.active_masks)}"
+            )
+        return
+    if next_state.active_masks is None:
+        raise ValueError(
+            f"expected {name} next_state active_masks to be present because the state carries "
+            "masks, received None"
+        )
+    for component in LTX2_COMPONENT_ORDER:
+        current = state.active_masks[component]
+        stored = next_state.active_masks[component]
+        identifier = f"next_state active_masks[{component!r}]"
+        if stored.shape != current.shape or not bool(torch.equal(stored, current)):
+            raise ValueError(
+                f"expected {name} {identifier} to equal the state mask of shape "
+                f"{tuple(current.shape)} with {int(current.sum().item())} active entries, "
+                f"received shape {tuple(stored.shape)} with {int(stored.sum().item())}"
+            )
 
 
 def attach_ltx2_state_masks(

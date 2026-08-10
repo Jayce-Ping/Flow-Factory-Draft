@@ -12,13 +12,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 import torch
 from diffusers.utils.torch_utils import randn_tensor
+from ltx2_fakes import (
+    AUDIO_SCHEDULER_OFFSET,
+    AUDIO_SEQ_LEN,
+    BATCH_SIZE,
+    CHANNELS,
+    FRAME_RATE,
+    FRAME_SEQ_LEN,
+    GENERATED_VIDEO_NUMEL,
+    HEIGHT,
+    NUM_FRAMES,
+    TEXT_DIM,
+    TEXT_SEQ_LEN,
+    TIMESTEP,
+    VIDEO_SCHEDULER_OFFSET,
+    VIDEO_SEQ_LEN,
+    WIDTH,
+    PipelineFake,
+    SchedulerFake,
+    TransformerFake,
+    audio_latents,
+    conditioning_mask,
+    forward_conditioning_kwargs,
+    video_latents,
+)
 
 from flow_factory.models.ltx2.ltx2_i2av import LTX2_I2AV_Adapter, LTX2I2AVSample
 from flow_factory.models.ltx2.ltx2_t2av import LTX2_T2AV_Adapter, LTX2Sample
@@ -26,195 +49,28 @@ from flow_factory.samples import ComponentTimes, LatentState, MultiModalStepOutp
 from flow_factory.scheduler import SDESchedulerOutput
 from flow_factory.utils.noise_schedule import flow_match_sigma
 
-BATCH_SIZE = 2
-CHANNELS = 2
-HEIGHT = 64
-WIDTH = 96
-NUM_FRAMES = 9
-FRAME_RATE = 24.0
-LATENT_F = 2
-LATENT_H = 2
-LATENT_W = 3
-FRAME_SEQ_LEN = LATENT_H * LATENT_W
-VIDEO_SEQ_LEN = LATENT_F * FRAME_SEQ_LEN
-AUDIO_SEQ_LEN = 3
-TEXT_SEQ_LEN = 4
-TEXT_DIM = 8
-TIMESTEP = 500.0
-# The conditioning frame occupies the first packed frame; only the remaining
-# frame is stepped, so I2AV's stochastic video DOF is one frame of tokens.
-GENERATED_VIDEO_NUMEL = (VIDEO_SEQ_LEN - FRAME_SEQ_LEN) * CHANNELS
-
-
-class SchedulerFake:
-    """Deterministic scheduler twin recording every dispatch it receives."""
-
-    def __init__(self, offset: float, log: List[Tuple[str, Any]]) -> None:
-        self.offset = offset
-        self.log = log
-        self.steps: List[Dict[str, Any]] = []
-
-    def step(
-        self,
-        *,
-        velocity: torch.Tensor,
-        timestep: torch.Tensor,
-        latents: torch.Tensor,
-        timestep_next: Optional[torch.Tensor] = None,
-        next_latents: Optional[torch.Tensor] = None,
-        compute_log_prob: bool = True,
-        return_dict: bool = True,
-        return_kwargs: Any = (),
-        noise_level: Optional[float] = None,
-    ) -> SDESchedulerOutput:
-        """Return an affine transition whose statistics identify this twin."""
-        self.steps.append({"latents": latents, "velocity": velocity, "timestep": timestep})
-        batch_size = latents.shape[0]
-        broadcast = (batch_size,) + (1,) * (latents.ndim - 1)
-        return SDESchedulerOutput(
-            next_latents=latents + self.offset * velocity,
-            next_latents_mean=latents + 0.5 * self.offset * velocity,
-            std_dev_t=torch.full(broadcast, self.offset),
-            dt=torch.full(broadcast, -self.offset),
-            log_prob=(
-                velocity.reshape(batch_size, -1).mean(dim=1) * self.offset
-                if compute_log_prob
-                else None
-            ),
-            velocity=velocity if "velocity" in tuple(return_kwargs) else None,
-        )
-
-    def eval(self) -> None:
-        """Record one eval dispatch."""
-        self.log.append(("eval", self.offset))
-
-    def train(self, mode: bool = True) -> None:
-        """Record one train dispatch."""
-        self.log.append(("train", self.offset))
-
-    def rollout(self, mode: bool = True) -> None:
-        """Record one rollout dispatch."""
-        self.log.append(("rollout", self.offset))
-
-    def set_seed(self, seed: int) -> None:
-        """Record one seed dispatch."""
-        self.log.append(("set_seed", self.offset))
-
-
-class TransformerFake:
-    """Joint video/audio transformer returning affine velocity predictions."""
-
-    dtype = torch.float32
-
-    def __init__(self) -> None:
-        self.rope = SimpleNamespace(prepare_video_coords=self._video_coords)
-        self.audio_rope = SimpleNamespace(prepare_audio_coords=self._audio_coords)
-
-    def _video_coords(
-        self,
-        batch_size: int,
-        num_frames: int,
-        height: int,
-        width: int,
-        device: torch.device,
-        fps: Optional[float] = None,
-    ) -> torch.Tensor:
-        return torch.zeros(batch_size, 3, num_frames * height * width, device=device)
-
-    def _audio_coords(
-        self, batch_size: int, audio_num_frames: int, device: torch.device
-    ) -> torch.Tensor:
-        return torch.zeros(batch_size, 1, audio_num_frames, device=device)
-
-    @contextmanager
-    def cache_context(self, name: str) -> Iterator[None]:
-        """Provide the diffusers cache-context interface."""
-        yield
-
-    def __call__(
-        self,
-        *,
-        hidden_states: torch.Tensor,
-        audio_hidden_states: torch.Tensor,
-        **kwargs: Any,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return per-modality velocity predictions."""
-        return hidden_states * 0.5 + 1.0, audio_hidden_states * -0.25 + 2.0
-
-
-class PipelineFake:
-    """LTX2 pipeline stand-in exposing the geometry the forward pass reads."""
-
-    vae_spatial_compression_ratio = 32
-    vae_temporal_compression_ratio = 8
-    transformer_spatial_patch_size = 1
-    transformer_temporal_patch_size = 1
-    audio_sampling_rate = 16384
-    audio_hop_length = 256
-    audio_vae_temporal_compression_ratio = 8
-
-    def __init__(self, scheduler: SchedulerFake, transformer: TransformerFake) -> None:
-        self.scheduler = scheduler
-        self.transformer = transformer
-
-    def _unpack_latents(
-        self,
-        latents: torch.Tensor,
-        num_frames: int,
-        height: int,
-        width: int,
-        patch_size: int,
-        patch_size_t: int,
-    ) -> torch.Tensor:
-        batch_size, seq_len, channels = latents.shape
-        if seq_len != num_frames * height * width:
-            raise ValueError(
-                f"expected packed sequence {num_frames * height * width}, received {seq_len}"
-            )
-        return latents.reshape(batch_size, num_frames, height, width, channels).permute(
-            0, 4, 1, 2, 3
-        )
-
-    def _pack_latents(
-        self, latents: torch.Tensor, patch_size: int, patch_size_t: int
-    ) -> torch.Tensor:
-        batch_size, channels = latents.shape[0], latents.shape[1]
-        return latents.permute(0, 2, 3, 4, 1).reshape(batch_size, -1, channels)
-
 
 def _adapter(cls: type, dispatch_log: Optional[List[Tuple[str, Any]]] = None) -> Any:
     log: List[Tuple[str, Any]] = [] if dispatch_log is None else dispatch_log
     transformer = TransformerFake()
     adapter = object.__new__(cls)
-    adapter.pipeline = PipelineFake(SchedulerFake(0.5, log), transformer)
+    adapter.pipeline = PipelineFake(SchedulerFake(VIDEO_SCHEDULER_OFFSET, log), transformer)
     adapter.component_runtime = SimpleNamespace(get_component=lambda name: transformer)
-    adapter.load_scheduler = lambda: SchedulerFake(0.25, log)
+    adapter.load_scheduler = lambda: SchedulerFake(AUDIO_SCHEDULER_OFFSET, log)
     adapter.scheduler_group = adapter.build_scheduler_group()
     return adapter
 
 
 def _video_latents() -> torch.Tensor:
-    return (
-        torch.arange(BATCH_SIZE * VIDEO_SEQ_LEN * CHANNELS, dtype=torch.float32).reshape(
-            BATCH_SIZE, VIDEO_SEQ_LEN, CHANNELS
-        )
-        / 10.0
-    )
+    return video_latents()
 
 
 def _audio_latents() -> torch.Tensor:
-    return (
-        torch.arange(BATCH_SIZE * AUDIO_SEQ_LEN * CHANNELS, dtype=torch.float32).reshape(
-            BATCH_SIZE, AUDIO_SEQ_LEN, CHANNELS
-        )
-        / 5.0
-    )
+    return audio_latents()
 
 
 def _conditioning_mask() -> torch.Tensor:
-    mask = torch.zeros(BATCH_SIZE, VIDEO_SEQ_LEN)
-    mask[:, :FRAME_SEQ_LEN] = 1.0
-    return mask
+    return conditioning_mask()
 
 
 def _state(*, masked: bool = False) -> LatentState:
@@ -271,16 +127,7 @@ def _i2av_batch(*, with_conditioning_mask: bool = True) -> Any:
 
 
 def _forward_kwargs() -> Dict[str, Any]:
-    return {
-        "connector_prompt_embeds": torch.zeros(BATCH_SIZE, TEXT_SEQ_LEN, TEXT_DIM),
-        "connector_audio_prompt_embeds": torch.zeros(BATCH_SIZE, TEXT_SEQ_LEN, TEXT_DIM),
-        "connector_attention_mask": torch.ones(BATCH_SIZE, TEXT_SEQ_LEN),
-        "guidance_scale": 1.0,
-        "height": HEIGHT,
-        "width": WIDTH,
-        "num_frames": NUM_FRAMES,
-        "frame_rate": FRAME_RATE,
-    }
+    return forward_conditioning_kwargs()
 
 
 @pytest.mark.parametrize("cls", [LTX2_T2AV_Adapter, LTX2_I2AV_Adapter])
@@ -300,18 +147,19 @@ def test_scheduler_group_pairs_twin_instances_behind_the_video_primary(cls: type
 
 
 @pytest.mark.parametrize("cls", [LTX2_T2AV_Adapter, LTX2_I2AV_Adapter])
-def test_scheduler_group_dispatches_video_before_audio(cls: type) -> None:
+@pytest.mark.parametrize("lifecycle", ["eval", "train", "rollout", "set_seed"])
+def test_scheduler_group_dispatches_video_before_audio(cls: type, lifecycle: str) -> None:
     dispatch_log: List[Tuple[str, Any]] = []
     adapter = _adapter(cls, dispatch_log)
 
-    adapter.set_trajectory_seed(7)
-    adapter.scheduler_group.eval()
+    if lifecycle == "set_seed":
+        adapter.set_trajectory_seed(7)
+    else:
+        getattr(adapter.scheduler_group, lifecycle)()
 
     assert dispatch_log == [
-        ("set_seed", 0.5),
-        ("set_seed", 0.25),
-        ("eval", 0.5),
-        ("eval", 0.25),
+        (lifecycle, VIDEO_SCHEDULER_OFFSET),
+        (lifecycle, AUDIO_SCHEDULER_OFFSET),
     ]
 
 
@@ -469,6 +317,191 @@ def test_t2av_forward_state_rejects_decoupled_component_timesteps() -> None:
             times=_times(audio_timestep=250.0),
             guidance_scale=1.0,
         )
+
+
+def _forward_state_case(cls: type) -> Dict[str, Any]:
+    """Return the minimal valid ``forward_state`` inputs for one adapter class."""
+    if cls is LTX2_I2AV_Adapter:
+        return {"batch": _i2av_batch(), "state": _state(masked=True)}
+    return {"batch": _t2av_batch(), "state": _state()}
+
+
+@pytest.mark.parametrize("cls", [LTX2_T2AV_Adapter, LTX2_I2AV_Adapter])
+@pytest.mark.parametrize("field", ["timestep", "next_timestep"])
+def test_forward_state_rejects_a_scalar_time_coordinate(cls: type, field: str) -> None:
+    adapter = _adapter(cls)
+    case = _forward_state_case(cls)
+    times = _times()
+    getattr(times, field)["video"] = torch.tensor(TIMESTEP)
+    getattr(times, field)["audio"] = torch.tensor(TIMESTEP)
+
+    with pytest.raises(ValueError, match=rf"times\.{field}\['video'\].*\(2,\).*\(\)"):
+        adapter.forward_state(times=times, guidance_scale=1.0, **case)
+
+
+@pytest.mark.parametrize("cls", [LTX2_T2AV_Adapter, LTX2_I2AV_Adapter])
+def test_forward_state_rejects_a_time_coordinate_with_the_wrong_batch_size(cls: type) -> None:
+    adapter = _adapter(cls)
+    case = _forward_state_case(cls)
+    times = _times()
+    times.timestep["audio"] = torch.full((BATCH_SIZE + 1,), TIMESTEP)
+
+    with pytest.raises(ValueError, match=r"times\.timestep\['audio'\].*\(2,\).*\(3,\)"):
+        adapter.forward_state(times=times, guidance_scale=1.0, **case)
+
+
+@pytest.mark.parametrize("cls", [LTX2_T2AV_Adapter, LTX2_I2AV_Adapter])
+def test_forward_state_rejects_a_time_coordinate_on_another_device(cls: type) -> None:
+    adapter = _adapter(cls)
+    case = _forward_state_case(cls)
+    times = _times()
+    times.next_timestep["video"] = torch.zeros(BATCH_SIZE, device="meta")
+
+    with pytest.raises(ValueError, match=r"times\.next_timestep\['video'\].*device.*cpu.*meta"):
+        adapter.forward_state(times=times, guidance_scale=1.0, **case)
+
+
+@pytest.mark.parametrize("cls", [LTX2_T2AV_Adapter, LTX2_I2AV_Adapter])
+def test_forward_state_rejects_components_with_different_channel_counts(cls: type) -> None:
+    adapter = _adapter(cls)
+    case = _forward_state_case(cls)
+    state = LatentState(
+        {
+            "video": case["state"].components["video"],
+            "audio": torch.zeros(BATCH_SIZE, AUDIO_SEQ_LEN, CHANNELS + 1),
+        },
+        active_masks=None if case["state"].active_masks is None else case["state"].active_masks,
+    )
+
+    with pytest.raises(ValueError, match=r"channel.*'audio'.*2.*3"):
+        adapter.forward_state(batch=case["batch"], state=state, times=_times(), guidance_scale=1.0)
+
+
+@pytest.mark.parametrize("cls", [LTX2_T2AV_Adapter, LTX2_I2AV_Adapter])
+def test_forward_state_rejects_components_with_different_dtypes(cls: type) -> None:
+    adapter = _adapter(cls)
+    case = _forward_state_case(cls)
+    state = LatentState(
+        {
+            "video": case["state"].components["video"],
+            "audio": case["state"].components["audio"].double(),
+        },
+        active_masks=case["state"].active_masks,
+    )
+
+    with pytest.raises(ValueError, match=r"dtype.*'audio'.*float32.*float64"):
+        adapter.forward_state(batch=case["batch"], state=state, times=_times(), guidance_scale=1.0)
+
+
+@pytest.mark.parametrize("cls", [LTX2_T2AV_Adapter, LTX2_I2AV_Adapter])
+def test_forward_state_rejects_components_on_different_devices(cls: type) -> None:
+    adapter = _adapter(cls)
+    case = _forward_state_case(cls)
+    state = LatentState(
+        {
+            "video": case["state"].components["video"],
+            "audio": case["state"].components["audio"].to("meta"),
+        },
+        active_masks=case["state"].active_masks,
+    )
+
+    with pytest.raises(ValueError, match=r"device.*'audio'.*cpu.*meta"):
+        adapter.forward_state(batch=case["batch"], state=state, times=_times(), guidance_scale=1.0)
+
+
+@pytest.mark.parametrize("cls", [LTX2_T2AV_Adapter, LTX2_I2AV_Adapter])
+def test_forward_state_rejects_a_next_state_component_shape_drift(cls: type) -> None:
+    adapter = _adapter(cls)
+    case = _forward_state_case(cls)
+    next_state = LatentState(
+        {
+            "video": case["state"].components["video"],
+            "audio": torch.zeros(BATCH_SIZE, AUDIO_SEQ_LEN + 1, CHANNELS),
+        },
+        active_masks=None,
+    )
+
+    with pytest.raises(ValueError, match=r"next_state.*'audio'.*\(2, 3, 2\).*\(2, 4, 2\)"):
+        adapter.forward_state(
+            batch=case["batch"],
+            state=case["state"],
+            times=_times(),
+            next_state=next_state,
+            guidance_scale=1.0,
+        )
+
+
+@pytest.mark.parametrize("cls", [LTX2_T2AV_Adapter, LTX2_I2AV_Adapter])
+def test_forward_state_rejects_a_next_state_component_dtype_drift(cls: type) -> None:
+    adapter = _adapter(cls)
+    case = _forward_state_case(cls)
+    next_state = LatentState(
+        {
+            "video": case["state"].components["video"].double(),
+            "audio": case["state"].components["audio"].double(),
+        },
+        active_masks=case["state"].active_masks,
+    )
+
+    with pytest.raises(ValueError, match=r"next_state.*'video'.*dtype.*float32.*float64"):
+        adapter.forward_state(
+            batch=case["batch"],
+            state=case["state"],
+            times=_times(),
+            next_state=next_state,
+            guidance_scale=1.0,
+        )
+
+
+def test_forward_state_rejects_a_next_state_mask_drift() -> None:
+    adapter = _adapter(LTX2_T2AV_Adapter)
+    state = _state(masked=True)
+    drifted = dict(state.active_masks)
+    drifted["video"] = torch.ones(BATCH_SIZE, VIDEO_SEQ_LEN, 1, dtype=torch.bool)
+    next_state = LatentState(dict(state.components), active_masks=drifted)
+
+    with pytest.raises(ValueError, match=r"next_state.*active_masks\['video'\].*state"):
+        adapter.forward_state(
+            batch=_t2av_batch(),
+            state=state,
+            times=_times(),
+            next_state=next_state,
+            guidance_scale=1.0,
+        )
+
+
+def test_forward_state_rejects_a_next_state_that_drops_the_masks() -> None:
+    adapter = _adapter(LTX2_T2AV_Adapter)
+    state = _state(masked=True)
+    next_state = LatentState(dict(state.components))
+
+    with pytest.raises(ValueError, match=r"next_state.*active_masks.*present.*None"):
+        adapter.forward_state(
+            batch=_t2av_batch(),
+            state=state,
+            times=_times(),
+            next_state=next_state,
+            guidance_scale=1.0,
+        )
+
+
+def test_forward_state_accepts_a_next_state_carrying_the_same_masks() -> None:
+    adapter = _adapter(LTX2_T2AV_Adapter)
+    state = _state(masked=True)
+    next_state = LatentState(dict(state.components), active_masks=dict(state.active_masks))
+
+    output = adapter.forward_state(
+        batch=_t2av_batch(),
+        state=state,
+        times=_times(),
+        next_state=next_state,
+        compute_log_prob=True,
+        return_fields=("next_latents", "log_prob"),
+        guidance_scale=1.0,
+    )
+
+    assert output.log_prob.shape == (BATCH_SIZE,)
+    assert tuple(output.next_state.active_masks) == ("video", "audio")
 
 
 def test_t2av_forward_state_rejects_a_video_sequence_length_mismatch() -> None:
