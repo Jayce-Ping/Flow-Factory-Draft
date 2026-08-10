@@ -20,12 +20,11 @@ from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple,
 
 import torch
 from accelerate import Accelerator
-from PIL import Image
-
 from diffusers.pipelines.ltx2.pipeline_ltx2_image2video import (
     LTX2ImageToVideoPipeline,
     rescale_noise_cfg,
 )
+from PIL import Image
 
 from ...hparams import *
 from ...samples import (
@@ -63,10 +62,15 @@ from ._common import (
     LTX2_COMPONENT_ORDER,
     attach_ltx2_state_masks,
     build_ltx2_component_step_output,
+    build_ltx2_full_component_schedule,
     build_ltx2_joint_forward_kwargs,
+    build_ltx2_legacy_callback_view,
+    build_ltx2_rollout_log_probs,
+    build_ltx2_structured_trajectories,
     build_ltx2_training_component_times,
     combine_modality_log_prob,
     draw_ltx2_forward_process_noise,
+    split_ltx2_callback_results,
     validate_i2av_forward_state_inputs,
 )
 
@@ -799,7 +803,9 @@ class LTX2_I2AV_Adapter(BaseAdapter):
         audio_modality_scale = audio_modality_scale or modality_scale
         audio_guidance_rescale = audio_guidance_rescale or guidance_rescale
 
-        if (guidance_scale > 1.0 or audio_guidance_scale > 1.0) and negative_connector_prompt_embeds is None:
+        if (
+            guidance_scale > 1.0 or audio_guidance_scale > 1.0
+        ) and negative_connector_prompt_embeds is None:
             logger.warning(
                 "Passed `guidance_scale` > 1.0, but no `negative_connector_prompt_embeds` provided. "
                 "Classifier-free guidance will be disabled."
@@ -1442,14 +1448,16 @@ class LTX2_I2AV_Adapter(BaseAdapter):
             log_prob_collector = create_trajectory_collector(
                 trajectory_indices, num_inference_steps
             )
+            component_log_prob_collectors = {
+                name: create_trajectory_collector(trajectory_indices, num_inference_steps)
+                for name in LTX2_COMPONENT_ORDER
+            }
         callback_collector = create_callback_collector(trajectory_indices, num_inference_steps)
 
         for i, t in enumerate(timesteps):
             noise_level = self.scheduler.get_noise_level_for_timestep(t)
             t_next = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
-            return_kw = list(
-                set(["next_latents", "log_prob", "velocity"] + extra_call_back_kwargs)
-            )
+            return_kw = list(set(["next_latents", "log_prob", "velocity"] + extra_call_back_kwargs))
             current_compute_log_prob: bool = compute_log_prob and noise_level > 0
 
             output = self.forward(
@@ -1484,15 +1492,21 @@ class LTX2_I2AV_Adapter(BaseAdapter):
                 compute_log_prob=current_compute_log_prob,
                 return_kwargs=return_kw,
                 use_cross_timestep=use_cross_timestep,
+                _return_components=True,
             )
 
-            latents = self.cast_latents(output.next_latents)
+            # The component output is authoritative; the concatenated view only
+            # advances the loop state and feeds the legacy callback collector.
+            legacy_view = build_ltx2_legacy_callback_view(self, output)
+            latents = self.cast_latents(legacy_view.next_latents)
             latent_collector.collect(latents, i + 1)
             if current_compute_log_prob:
                 log_prob_collector.collect(output.log_prob, i)
+                for name in LTX2_COMPONENT_ORDER:
+                    component_log_prob_collectors[name].collect(output.component_log_probs[name], i)
             callback_collector.collect_step(
                 step_idx=i,
-                output=output,
+                output=legacy_view,
                 keys=extra_call_back_kwargs,
                 capturable={"noise_level": noise_level},
             )
@@ -1513,14 +1527,38 @@ class LTX2_I2AV_Adapter(BaseAdapter):
             generator=generator,
         )
 
-        # 8. Construct samples
-        all_lats = latent_collector.get_result()
-        lat_map = latent_collector.get_index_map()
-        all_log_probs = log_prob_collector.get_result() if compute_log_prob else None
-        lp_map = log_prob_collector.get_index_map() if compute_log_prob else None
-        cb_res = callback_collector.get_result()
+        # 8. Split the concatenated rollout into authoritative component trajectories
+        collected_states = latent_collector.get_result()
+        structured_callbacks, legacy_callbacks = split_ltx2_callback_results(
+            self, callback_collector.get_result()
+        )
         callback_index_map = callback_collector.get_index_map()
+        trajectories = (
+            build_ltx2_structured_trajectories(
+                self,
+                states=torch.stack(collected_states, dim=1),
+                state_index_map=latent_collector.get_index_map(),
+                video_seq_len=video_seq_len,
+                schedule=build_ltx2_full_component_schedule(self, timesteps),
+                callbacks=structured_callbacks,
+                callback_index_map=callback_index_map if structured_callbacks else None,
+                # The conditioning frame is never stepped, so it carries no
+                # stochastic degrees of freedom for any downstream reducer.
+                video_active_mask=~conditioning_mask.bool(),
+                **build_ltx2_rollout_log_probs(
+                    self,
+                    log_prob_collector=log_prob_collector if compute_log_prob else None,
+                    component_log_prob_collectors=(
+                        component_log_prob_collectors if compute_log_prob else None
+                    ),
+                    num_transitions=num_inference_steps,
+                ),
+            )
+            if collected_states
+            else None
+        )
 
+        # 9. Construct samples
         prompt_list = prompt if isinstance(prompt, list) else [prompt] * batch_size
         condition_images_list = standardize_image_batch(condition_images, "pt")
         if isinstance(condition_images_list, torch.Tensor):
@@ -1528,13 +1566,8 @@ class LTX2_I2AV_Adapter(BaseAdapter):
 
         samples = [
             LTX2I2AVSample(
-                timesteps=timesteps,
-                all_latents=torch.stack([l[b] for l in all_lats], dim=0) if all_lats else None,
-                log_probs=(
-                    torch.stack([l[b] for l in all_log_probs], dim=0) if all_log_probs else None
-                ),
-                latent_index_map=lat_map,
-                log_prob_index_map=lp_map,
+                # Authoritative video/audio trajectory; legacy fields stay unset.
+                trajectory=None if trajectories is None else trajectories[b],
                 video=video[b],
                 audio=audio_waveform[b] if audio_waveform is not None else None,
                 audio_sample_rate=(
@@ -1570,8 +1603,8 @@ class LTX2_I2AV_Adapter(BaseAdapter):
                     else None
                 ),
                 extra_kwargs={
-                    **{k: v[b] for k, v in cb_res.items()},
-                    "callback_index_map": callback_index_map,
+                    **{k: v[b] for k, v in legacy_callbacks.items()},
+                    **({"callback_index_map": callback_index_map} if legacy_callbacks else {}),
                     "duration_s": duration_s,
                 },
             )

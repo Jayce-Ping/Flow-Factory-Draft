@@ -190,6 +190,9 @@ Two-layer structure (constraint #14): task-level samples (`T2ISample`, `I2VSampl
 
 `BaseSample.trajectory` is the opt-in structured path for independently shaped/timed latent
 components; legacy trajectory fields remain unchanged and authoritative when it is `None`.
+LTX2 T2AV/I2AV rollouts are the first adapters to opt in: they publish an authoritative
+`StructuredTrajectory` and leave every legacy trajectory field `None`
+(see `topics/adapter_conventions.md` gotcha #12).
 
 ### Component Management
 `BaseAdapter` delegates component discovery, canonical access, runtime overrides, lazy

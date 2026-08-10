@@ -16,17 +16,20 @@
 """Shared helpers for the LTX2 (T2AV / I2AV) adapters."""
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
 from ...samples import (
     ComponentTimes,
+    ComponentTrajectory,
+    IndexedTrajectoryTensor,
     LatentState,
     MultiModalStepOutput,
     NoisedState,
     StackedSampleBatch,
+    StructuredTrajectory,
 )
 from ...scheduler import SDESchedulerOutput
 from ...utils.base import filter_kwargs
@@ -35,6 +38,17 @@ from ...utils.noise_schedule import flow_match_sigma
 # Both LTX2 adapters expose one joint video+audio policy, so the authoritative
 # component order is fixed here rather than derived from any mapping iteration.
 LTX2_COMPONENT_ORDER: Tuple[str, ...] = ("video", "audio")
+
+# Latent-shaped scheduler outputs a trainer replays per component. Every other
+# callback result stays a legacy ``extra_kwargs`` entry because it either carries
+# no component structure (``noise_level``) or is a per-sample statistic.
+LTX2_STRUCTURED_CALLBACK_FIELDS: Tuple[str, ...] = (
+    "next_latents",
+    "next_latents_mean",
+    "velocity",
+)
+
+_SIGNED_INTEGER_DTYPES = (torch.int8, torch.int16, torch.int32, torch.int64)
 
 
 def combine_modality_log_prob(
@@ -212,6 +226,628 @@ def build_ltx2_component_step_output(
         component_log_probs=component_log_probs,
         velocity=LatentState({"video": video_velocity, "audio": audio_velocity}),
     )
+
+
+def build_ltx2_legacy_callback_view(
+    adapter: Any, output: MultiModalStepOutput
+) -> SDESchedulerOutput:
+    """Rebuild the concatenated scheduler output the legacy rollout published.
+
+    The component forward is authoritative, but the rollout still advances its
+    loop state and feeds the callback collector with the single ``[video|audio]``
+    tensor the pre-collector loop used. Concatenating the component fields here
+    reproduces that view without a further model or scheduler call, so no extra
+    dispatch or random draw enters the rollout.
+
+    Args:
+        adapter: Adapter whose component forward produced ``output``.
+        output: Ordered component step output.
+
+    Returns:
+        Legacy-shaped scheduler output carrying the concatenated latent fields,
+        the video component's per-sample statistics, and the joint log prob.
+    """
+    name = type(adapter).__name__
+    if not isinstance(output, MultiModalStepOutput):
+        raise TypeError(
+            f"expected MultiModalStepOutput from the {name} component forward, "
+            f"received {type(output).__name__}: {output!r}"
+        )
+    if output.next_state is None:
+        raise ValueError(
+            f"expected the {name} component forward to return next_state so the rollout can "
+            "advance, received None"
+        )
+
+    def concatenated(state: Optional[LatentState]) -> Optional[torch.Tensor]:
+        if state is None:
+            return None
+        _require_ltx2_component_order(adapter, state.component_names, "component step output")
+        return torch.cat([state.components[key] for key in LTX2_COMPONENT_ORDER], dim=1)
+
+    def video_statistic(values: Optional[Mapping[str, torch.Tensor]]) -> Optional[torch.Tensor]:
+        return None if values is None else values["video"]
+
+    return SDESchedulerOutput(
+        next_latents=concatenated(output.next_state),
+        next_latents_mean=concatenated(output.next_state_mean),
+        std_dev_t=video_statistic(output.std_dev_t),
+        dt=video_statistic(output.dt),
+        log_prob=output.log_prob,
+        velocity=concatenated(output.velocity),
+    )
+
+
+def split_ltx2_callback_results(
+    adapter: Any, callback_results: Mapping[str, Any]
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
+    """Partition the collected callbacks into structured and legacy results.
+
+    Args:
+        adapter: Adapter that produced the rollout, named in every error.
+        callback_results: Collected callbacks keyed by requested field name.
+
+    Returns:
+        Latent-shaped fields the structured trajectory owns, and the remaining
+        results that stay legacy ``extra_kwargs`` entries. Both keep the
+        requested field order.
+    """
+    if not isinstance(callback_results, Mapping):
+        raise TypeError(
+            f"expected Mapping callback results for {type(adapter).__name__}, "
+            f"received {type(callback_results).__name__}"
+        )
+    structured: Dict[str, torch.Tensor] = {}
+    legacy: Dict[str, Any] = {}
+    for field, values in callback_results.items():
+        if field not in LTX2_STRUCTURED_CALLBACK_FIELDS:
+            legacy[field] = values
+            continue
+        if not isinstance(values, torch.Tensor):
+            raise TypeError(
+                f"expected the {type(adapter).__name__} structured callback {field!r} to be a "
+                f"torch.Tensor shaped (B, stored, V + A, C), received "
+                f"{type(values).__name__}: {values!r}"
+            )
+        structured[field] = values
+    return structured, legacy
+
+
+def build_ltx2_rollout_log_probs(
+    adapter: Any,
+    *,
+    log_prob_collector: Optional[Any],
+    component_log_prob_collectors: Optional[Mapping[str, Any]],
+    num_transitions: int,
+) -> Dict[str, Any]:
+    """Batch the collected joint/component log probabilities and their shared map.
+
+    Args:
+        adapter: Adapter that produced the rollout, named in every error.
+        log_prob_collector: Joint log-probability collector, or ``None`` when the
+            rollout computed no log probabilities.
+        component_log_prob_collectors: Per-component collectors that recorded at
+            exactly the joint collection steps.
+        num_transitions: Number of rollout transitions ``T``.
+
+    Returns:
+        Structured-trajectory builder arguments, empty when the rollout stored no
+        transition log probability.
+    """
+    joint = None if log_prob_collector is None else log_prob_collector.get_result()
+    if not joint:
+        return {}
+    _require_ltx2_component_order(
+        adapter, tuple(component_log_prob_collectors), "component log-probability collectors"
+    )
+    return {
+        "log_probs": torch.stack(joint, dim=1),
+        "component_log_probs": {
+            component: torch.stack(component_log_prob_collectors[component].get_result(), dim=1)
+            for component in LTX2_COMPONENT_ORDER
+        },
+        "log_prob_index_map": build_ltx2_sparse_transition_map(
+            adapter, log_prob_collector.collected_indices, num_transitions
+        ),
+    }
+
+
+def build_ltx2_sparse_transition_map(
+    adapter: Any, collected_indices: List[int], num_transitions: int
+) -> torch.Tensor:
+    """Build the signed rollout-transition map for a sparsely collected stream.
+
+    The rollout collector publishes a dense identity map whenever it was asked
+    for every position, which misdescribes a stream that only some transitions
+    contribute to -- log probabilities stop once the schedule leaves the SDE
+    window. This rebuilds the map from the transitions that actually stored a
+    value, keeping the collector ``-1`` sentinel for the rest.
+
+    Args:
+        adapter: Adapter that produced the rollout, named in every error.
+        collected_indices: Rollout transition indices that stored a value, in
+            storage order.
+        num_transitions: Number of rollout transitions ``T``.
+
+    Returns:
+        Signed map of length ``T``.
+    """
+    name = type(adapter).__name__
+    if num_transitions < 1:
+        raise ValueError(
+            f"expected at least one {name} rollout transition to map, received {num_transitions}"
+        )
+    index_map = torch.full((num_transitions,), -1, dtype=torch.long)
+    for stored_position, transition in enumerate(collected_indices):
+        if not isinstance(transition, int) or isinstance(transition, bool):
+            raise TypeError(
+                f"expected int {name} collected transition indices, received "
+                f"{type(transition).__name__}: {transition!r}"
+            )
+        if transition < 0 or transition >= num_transitions:
+            raise ValueError(
+                f"expected {name} collected transition indices in [0, {num_transitions - 1}], "
+                f"received {collected_indices}"
+            )
+        index_map[transition] = stored_position
+    return index_map
+
+
+def build_ltx2_full_component_schedule(
+    adapter: Any, rollout_timesteps: torch.Tensor
+) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
+    """Extend the rollout timesteps into the full per-component schedule.
+
+    A rollout of ``T`` transitions visits ``T + 1`` coordinates, and the last one
+    is the terminal ``0`` the loop steps toward but never enumerates. Both LTX2
+    schedulers currently run the same numeric schedule, yet each component owns
+    its own tensors so a future asymmetric schedule needs no caller change.
+
+    Args:
+        adapter: Adapter whose rollout produced the timesteps.
+        rollout_timesteps: Enumerated rollout coordinates of shape ``(T,)``.
+
+    Returns:
+        Full ``(T + 1,)`` timesteps and sigmas per component, in authoritative order.
+    """
+    name = type(adapter).__name__
+    if not isinstance(rollout_timesteps, torch.Tensor):
+        raise TypeError(
+            f"expected torch.Tensor rollout timesteps for the {name} full component schedule, "
+            f"received {type(rollout_timesteps).__name__}: {rollout_timesteps!r}"
+        )
+    if rollout_timesteps.ndim != 1 or rollout_timesteps.shape[0] < 1:
+        raise ValueError(
+            f"expected {name} rollout timesteps shaped (T,) with at least one transition, "
+            f"received {tuple(rollout_timesteps.shape)}"
+        )
+    terminal = torch.zeros(1, dtype=rollout_timesteps.dtype, device=rollout_timesteps.device)
+    full_timesteps = torch.cat([rollout_timesteps, terminal])
+    full_sigmas = flow_match_sigma(full_timesteps)
+    return {
+        component: (full_timesteps.clone(), full_sigmas.clone())
+        for component in LTX2_COMPONENT_ORDER
+    }
+
+
+def build_ltx2_structured_trajectories(
+    adapter: Any,
+    *,
+    states: torch.Tensor,
+    state_index_map: torch.Tensor,
+    video_seq_len: int,
+    schedule: Mapping[str, Tuple[torch.Tensor, torch.Tensor]],
+    log_probs: Optional[torch.Tensor] = None,
+    component_log_probs: Optional[Mapping[str, torch.Tensor]] = None,
+    log_prob_index_map: Optional[torch.Tensor] = None,
+    callbacks: Optional[Mapping[str, torch.Tensor]] = None,
+    callback_index_map: Optional[torch.Tensor] = None,
+    video_active_mask: Optional[torch.Tensor] = None,
+) -> List[StructuredTrajectory]:
+    """Split batched concatenated rollout results into one trajectory per sample.
+
+    The rollout keeps collecting the single ``[video|audio]`` tensor the legacy
+    loop collected, which is what preserves the numerics and the RNG stream; this
+    helper performs the component split afterwards, so every stored tensor is a
+    view of exactly the same values.
+
+    Args:
+        adapter: Adapter that produced the rollout, named in every error.
+        states: Collected states shaped ``(B, stored, V + A, C)``.
+        state_index_map: Rollout-position map of length ``T + 1`` using ``-1``
+            for an uncollected position.
+        video_seq_len: Number of leading video tokens in each collected state.
+        schedule: Full ``(T + 1,)`` timesteps/sigmas per component.
+        log_probs: Optional joint log probabilities shaped ``(B, stored)``.
+        component_log_probs: Optional per-component log probabilities sharing the
+            joint compact length and map.
+        log_prob_index_map: Rollout-transition map of length ``T`` for the log
+            probabilities.
+        callbacks: Optional latent-shaped callback results, each shaped like
+            ``states``.
+        callback_index_map: Rollout-transition map of length ``T`` shared by every
+            callback field.
+        video_active_mask: Optional ``(B, V)`` or ``(B, V, 1)`` boolean mask
+            marking the video tokens that carry stochastic degrees of freedom.
+
+    Returns:
+        One ``StructuredTrajectory`` per sample, in batch order.
+    """
+    name = type(adapter).__name__
+    _require_ltx2_component_order(adapter, adapter.trajectory_component_order, "adapter")
+
+    if not isinstance(states, torch.Tensor):
+        raise TypeError(
+            f"expected torch.Tensor states for the {name} structured trajectory builder, "
+            f"received {type(states).__name__}: {states!r}"
+        )
+    if states.ndim != 4:
+        raise ValueError(
+            f"expected {name} collected states shaped (B, stored, V + A, C), "
+            f"received {tuple(states.shape)}"
+        )
+    batch_size, num_stored, total_seq_len, _ = states.shape
+    if not isinstance(video_seq_len, int) or isinstance(video_seq_len, bool):
+        raise TypeError(
+            f"expected int video_seq_len for the {name} structured trajectory builder, "
+            f"received {type(video_seq_len).__name__}: {video_seq_len!r}"
+        )
+    if video_seq_len < 1 or video_seq_len >= total_seq_len:
+        raise ValueError(
+            f"expected {name} video_seq_len in [1, {total_seq_len - 1}] to split the collected "
+            f"states shaped {tuple(states.shape)}, received {video_seq_len}"
+        )
+
+    schedule_length = _validate_ltx2_component_schedule(adapter, schedule)
+    num_transitions = schedule_length - 1
+    _validate_ltx2_index_map(
+        adapter,
+        state_index_map,
+        field="state_index_map",
+        expected_length=schedule_length,
+        num_stored=num_stored,
+        stored_description=f"{num_stored} stored states",
+    )
+    _validate_ltx2_rollout_log_probs(
+        adapter,
+        log_probs=log_probs,
+        component_log_probs=component_log_probs,
+        log_prob_index_map=log_prob_index_map,
+        batch_size=batch_size,
+        num_transitions=num_transitions,
+    )
+    structured_callbacks = _validate_ltx2_rollout_callbacks(
+        adapter,
+        callbacks=callbacks,
+        callback_index_map=callback_index_map,
+        batch_size=batch_size,
+        total_seq_len=total_seq_len,
+        num_transitions=num_transitions,
+    )
+    component_masks = _validate_ltx2_video_active_mask(
+        adapter,
+        video_active_mask,
+        states=states,
+        video_seq_len=video_seq_len,
+    )
+
+    def split(values: torch.Tensor, component: str) -> torch.Tensor:
+        return (
+            values[..., :video_seq_len, :]
+            if component == "video"
+            else values[..., video_seq_len:, :]
+        )
+
+    trajectories: List[StructuredTrajectory] = []
+    for sample_index in range(batch_size):
+        components: Dict[str, ComponentTrajectory] = {}
+        for component in LTX2_COMPONENT_ORDER:
+            timesteps, sigmas = schedule[component]
+            components[component] = ComponentTrajectory(
+                states=split(states[sample_index], component),
+                timesteps=timesteps,
+                sigmas=sigmas,
+                state_index_map=state_index_map,
+                active_mask=(
+                    None if component_masks is None else component_masks[component][sample_index]
+                ),
+            )
+        trajectories.append(
+            StructuredTrajectory(
+                components=components,
+                log_probs=None if log_probs is None else log_probs[sample_index],
+                log_prob_index_map=None if log_probs is None else log_prob_index_map,
+                component_log_probs=(
+                    None
+                    if component_log_probs is None
+                    else {
+                        component: component_log_probs[component][sample_index]
+                        for component in LTX2_COMPONENT_ORDER
+                    }
+                ),
+                callbacks=(
+                    None
+                    if not structured_callbacks
+                    else {
+                        field: {
+                            component: IndexedTrajectoryTensor(
+                                values=split(values[sample_index], component),
+                                index_map=callback_index_map,
+                            )
+                            for component in LTX2_COMPONENT_ORDER
+                        }
+                        for field, values in structured_callbacks.items()
+                    }
+                ),
+            )
+        )
+    return trajectories
+
+
+def _validate_ltx2_component_schedule(
+    adapter: Any, schedule: Mapping[str, Tuple[torch.Tensor, torch.Tensor]]
+) -> int:
+    """Validate the full per-component schedule and return its shared length."""
+    name = type(adapter).__name__
+    if not isinstance(schedule, Mapping):
+        raise TypeError(
+            f"expected Mapping[str, Tuple[torch.Tensor, torch.Tensor]] schedule for {name}, "
+            f"received {type(schedule).__name__}"
+        )
+    _require_ltx2_component_order(adapter, tuple(schedule), "schedule")
+    schedule_length: Optional[int] = None
+    for component in LTX2_COMPONENT_ORDER:
+        entry = schedule[component]
+        if not isinstance(entry, tuple) or len(entry) != 2:
+            raise TypeError(
+                f"expected a (timesteps, sigmas) pair for the {name} component {component!r} "
+                f"schedule, received {type(entry).__name__}: {entry!r}"
+            )
+        timesteps, sigmas = entry
+        for field, values in (("timesteps", timesteps), ("sigmas", sigmas)):
+            if not isinstance(values, torch.Tensor):
+                raise TypeError(
+                    f"expected torch.Tensor for the {name} component {component!r} {field}, "
+                    f"received {type(values).__name__}: {values!r}"
+                )
+            if values.ndim != 1:
+                raise ValueError(
+                    f"expected {name} component {component!r} {field} shaped (T + 1,), "
+                    f"received {tuple(values.shape)}"
+                )
+        if timesteps.shape != sigmas.shape:
+            raise ValueError(
+                f"expected {name} component {component!r} timesteps/sigmas of one shared length, "
+                f"received timesteps {tuple(timesteps.shape)} and sigmas {tuple(sigmas.shape)}"
+            )
+        if timesteps.shape[0] < 2:
+            raise ValueError(
+                f"expected {name} component {component!r} full schedule to hold at least one "
+                f"rollout transition plus the terminal coordinate, shape (T + 1,) with T >= 1, "
+                f"received {tuple(timesteps.shape)}"
+            )
+        if float(timesteps[-1]) != 0.0 or float(sigmas[-1]) != 0.0:
+            raise ValueError(
+                f"expected the {name} component {component!r} full schedule to end at the "
+                f"terminal zero coordinate, received timestep {float(timesteps[-1])} and sigma "
+                f"{float(sigmas[-1])}"
+            )
+        if schedule_length is None:
+            schedule_length = timesteps.shape[0]
+        elif timesteps.shape[0] != schedule_length:
+            raise ValueError(
+                f"expected every {name} component schedule to share one length "
+                f"{schedule_length}, received {timesteps.shape[0]} for component {component!r}"
+            )
+    return int(schedule_length)
+
+
+def _validate_ltx2_index_map(
+    adapter: Any,
+    index_map: torch.Tensor,
+    *,
+    field: str,
+    expected_length: int,
+    num_stored: int,
+    stored_description: str,
+) -> None:
+    """Validate one sparse rollout map against the entries it addresses."""
+    name = type(adapter).__name__
+    if not isinstance(index_map, torch.Tensor):
+        raise TypeError(
+            f"expected torch.Tensor {field} for {name}, "
+            f"received {type(index_map).__name__}: {index_map!r}"
+        )
+    if index_map.ndim != 1:
+        raise ValueError(
+            f"expected {name} {field} shaped ({expected_length},), "
+            f"received {tuple(index_map.shape)}"
+        )
+    if index_map.dtype not in _SIGNED_INTEGER_DTYPES:
+        raise TypeError(f"expected {name} signed integer {field}, received dtype {index_map.dtype}")
+    if index_map.shape[0] != expected_length:
+        raise ValueError(
+            f"expected {name} {field} length {expected_length} to match the rollout schedule, "
+            f"received {index_map.shape[0]}"
+        )
+    if int(index_map.min().item()) < -1 or int(index_map.max().item()) >= num_stored:
+        raise ValueError(
+            f"expected {name} {field} values in [-1, {num_stored - 1}] for {stored_description}, "
+            f"received {index_map.tolist()}"
+        )
+
+
+def _validate_ltx2_rollout_log_probs(
+    adapter: Any,
+    *,
+    log_probs: Optional[torch.Tensor],
+    component_log_probs: Optional[Mapping[str, torch.Tensor]],
+    log_prob_index_map: Optional[torch.Tensor],
+    batch_size: int,
+    num_transitions: int,
+) -> None:
+    """Validate the joint and per-component log probabilities and their shared map."""
+    name = type(adapter).__name__
+    if log_probs is None:
+        if component_log_probs is not None:
+            raise ValueError(
+                f"expected {name} component_log_probs to accompany the joint log_probs, received "
+                f"components {tuple(component_log_probs)} with log_probs=None"
+            )
+        if log_prob_index_map is not None:
+            raise ValueError(
+                f"expected {name} log_probs alongside a log_prob_index_map, received "
+                f"log_probs=None with map {log_prob_index_map.tolist()}"
+            )
+        return
+    if not isinstance(log_probs, torch.Tensor):
+        raise TypeError(
+            f"expected torch.Tensor log_probs for {name}, "
+            f"received {type(log_probs).__name__}: {log_probs!r}"
+        )
+    if log_probs.ndim != 2 or log_probs.shape[0] != batch_size:
+        raise ValueError(
+            f"expected {name} log_probs shaped ({batch_size}, stored), "
+            f"received {tuple(log_probs.shape)}"
+        )
+    if log_prob_index_map is None:
+        raise ValueError(
+            f"expected a log_prob_index_map alongside log_probs for {name}, received None with "
+            f"log_probs shaped {tuple(log_probs.shape)}"
+        )
+    _validate_ltx2_index_map(
+        adapter,
+        log_prob_index_map,
+        field="log_prob_index_map",
+        expected_length=num_transitions,
+        num_stored=log_probs.shape[1],
+        stored_description=f"{log_probs.shape[1]} stored log probabilities",
+    )
+    if component_log_probs is None:
+        return
+    if not isinstance(component_log_probs, Mapping):
+        raise TypeError(
+            f"expected Mapping[str, torch.Tensor] component_log_probs for {name}, "
+            f"received {type(component_log_probs).__name__}"
+        )
+    _require_ltx2_component_order(adapter, tuple(component_log_probs), "component_log_probs")
+    for component in LTX2_COMPONENT_ORDER:
+        values = component_log_probs[component]
+        if not isinstance(values, torch.Tensor):
+            raise TypeError(
+                f"expected torch.Tensor {name} component_log_probs[{component!r}], "
+                f"received {type(values).__name__}: {values!r}"
+            )
+        if values.shape != log_probs.shape:
+            raise ValueError(
+                f"expected {name} component_log_probs[{component!r}] shaped "
+                f"{tuple(log_probs.shape)} to match the joint log_probs, received "
+                f"{tuple(values.shape)}"
+            )
+
+
+def _validate_ltx2_rollout_callbacks(
+    adapter: Any,
+    *,
+    callbacks: Optional[Mapping[str, torch.Tensor]],
+    callback_index_map: Optional[torch.Tensor],
+    batch_size: int,
+    total_seq_len: int,
+    num_transitions: int,
+) -> Dict[str, torch.Tensor]:
+    """Validate the latent-shaped callback results and return them in order."""
+    name = type(adapter).__name__
+    if callbacks is not None and not isinstance(callbacks, Mapping):
+        raise TypeError(
+            f"expected Mapping[str, torch.Tensor] callbacks for {name}, "
+            f"received {type(callbacks).__name__}"
+        )
+    structured: Dict[str, torch.Tensor] = {} if callbacks is None else dict(callbacks)
+    if not structured:
+        return structured
+    if callback_index_map is None:
+        raise ValueError(
+            f"expected a callback_index_map alongside callback fields {tuple(structured)} for "
+            f"{name}, received None"
+        )
+    for field, values in structured.items():
+        if not isinstance(field, str) or not field:
+            raise ValueError(
+                f"expected non-empty string {name} callback field names, received {field!r}"
+            )
+        if not isinstance(values, torch.Tensor):
+            raise TypeError(
+                f"expected the {name} callback {field!r} to be a torch.Tensor, "
+                f"received {type(values).__name__}: {values!r}"
+            )
+        if values.ndim != 4 or values.shape[0] != batch_size or values.shape[2] != total_seq_len:
+            raise ValueError(
+                f"expected {name} callback {field!r} shaped (B, stored, V + A, C) matching the "
+                f"collected states ({batch_size}, stored, {total_seq_len}, C), received "
+                f"{tuple(values.shape)}"
+            )
+        _validate_ltx2_index_map(
+            adapter,
+            callback_index_map,
+            field="callback_index_map",
+            expected_length=num_transitions,
+            num_stored=values.shape[1],
+            stored_description=f"{values.shape[1]} stored callback {field!r} entries",
+        )
+    return structured
+
+
+def _validate_ltx2_video_active_mask(
+    adapter: Any,
+    video_active_mask: Optional[torch.Tensor],
+    *,
+    states: torch.Tensor,
+    video_seq_len: int,
+) -> Optional[Dict[str, torch.Tensor]]:
+    """Return the per-component static masks, or none when nothing is conditioned.
+
+    Audio carries no fixed conditioning, but the trainer bridge reads either every
+    component's mask or none, so a full-active audio mask accompanies the video one.
+    """
+    if video_active_mask is None:
+        return None
+    name = type(adapter).__name__
+    batch_size, _, total_seq_len, _ = states.shape
+    if not isinstance(video_active_mask, torch.Tensor):
+        raise TypeError(
+            f"expected torch.Tensor or None video_active_mask for {name}, "
+            f"received {type(video_active_mask).__name__}: {video_active_mask!r}"
+        )
+    if video_active_mask.dtype is not torch.bool:
+        raise TypeError(
+            f"expected {name} video_active_mask dtype torch.bool marking the generated video "
+            f"tokens, received {video_active_mask.dtype}"
+        )
+    if tuple(video_active_mask.shape) not in (
+        (batch_size, video_seq_len),
+        (batch_size, video_seq_len, 1),
+    ):
+        raise ValueError(
+            f"expected {name} video_active_mask shaped ({batch_size}, {video_seq_len}) or "
+            f"({batch_size}, {video_seq_len}, 1), received {tuple(video_active_mask.shape)}"
+        )
+    counts = video_active_mask.reshape(batch_size, -1).sum(dim=1)
+    if int(counts.min().item()) <= 0:
+        raise ValueError(
+            f"expected {name} video_active_mask to leave a positive generated token count for "
+            f"every sample, received counts {counts.tolist()}"
+        )
+    video_mask = (
+        video_active_mask if video_active_mask.ndim == 3 else video_active_mask.unsqueeze(-1)
+    )
+    return {
+        "video": video_mask,
+        "audio": torch.ones(
+            (batch_size, total_seq_len - video_seq_len, 1),
+            dtype=torch.bool,
+            device=states.device,
+        ),
+    }
 
 
 def build_ltx2_joint_forward_kwargs(
