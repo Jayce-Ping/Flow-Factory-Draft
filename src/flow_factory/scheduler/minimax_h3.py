@@ -645,9 +645,14 @@ class MiniMaxH3SDEScheduler(SchedulerMixin, ConfigMixin, SDESchedulerMixin):
             values = -((sample.detach() - mean) ** 2)
         else:
             variance = std_dev_t * torch.sqrt(-dt)
+            safe_variance = torch.where(
+                variance == 0,
+                torch.ones_like(variance),
+                variance,
+            )
             values = (
-                -((sample.detach() - mean) ** 2) / (2 * variance**2)
-                - torch.log(variance)
+                -((sample.detach() - mean) ** 2) / (2 * safe_variance**2)
+                - torch.log(safe_variance)
                 - math.log(math.sqrt(2 * math.pi))
             )
         return values.mean(dim=tuple(range(1, values.ndim)))

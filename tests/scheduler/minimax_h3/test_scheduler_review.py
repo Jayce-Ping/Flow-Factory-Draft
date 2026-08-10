@@ -206,6 +206,23 @@ def test_mixed_batched_deterministic_and_stochastic_log_probs_are_finite() -> No
     assert torch.isfinite(output.log_prob).all()
 
 
+def test_mixed_batched_log_prob_backward_has_only_finite_gradients() -> None:
+    scheduler = MiniMaxH3SDEScheduler(dynamics_type="Flow-SDE")
+    scheduler.set_timesteps(3)
+    velocity = torch.tensor([[0.3, -0.2], [1.1, 0.7]], requires_grad=True)
+    output = scheduler.step(
+        velocity,
+        scheduler.timesteps[torch.tensor([0, 2])],
+        torch.tensor([[0.4, -0.8], [0.2, 0.9]]),
+        generator=torch.Generator().manual_seed(19),
+    )
+    output.log_prob.sum().backward()
+    assert output.log_prob[1].item() == 0.0
+    assert torch.isfinite(output.log_prob).all()
+    assert velocity.grad is not None
+    assert torch.isfinite(velocity.grad).all()
+
+
 @pytest.mark.parametrize(
     ("kwargs", "field"),
     [
