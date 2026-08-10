@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Mapping
+from typing import Any, Dict, List, Mapping, Optional
 
 import torch.nn as nn
 
@@ -25,13 +25,38 @@ class PseudoPipelineRuntime(ComponentRuntime):
     Args:
         pipeline: Compatibility container retained as ``adapter.pipeline``.
         components: Explicit canonical component mapping.
+        aliases: Addressable component aliases excluded from device lifecycle
+            enumeration.
     """
 
-    def __init__(self, pipeline: Any, components: Mapping[str, Any]) -> None:
+    def __init__(
+        self,
+        pipeline: Any,
+        components: Mapping[str, Any],
+        aliases: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """Initialize an explicit pseudo-pipeline runtime.
+
+        Args:
+            pipeline: Compatibility pipeline/container.
+            components: Canonical modules managed by stage lifecycle.
+            aliases: Addressable module aliases excluded from stage lifecycle.
+
+        Raises:
+            TypeError: If a component or alias is not a ``torch.nn.Module``.
+            ValueError: If an alias duplicates a canonical component name.
+        """
         super().__init__(pipeline)
+        aliases = aliases or {}
+        duplicate_names = set(components).intersection(aliases)
+        if duplicate_names:
+            raise ValueError(
+                "Pseudo-pipeline aliases must not duplicate canonical component names; "
+                f"received duplicates={sorted(duplicate_names)}."
+            )
         invalid = {
             name: type(component).__name__
-            for name, component in components.items()
+            for name, component in {**components, **aliases}.items()
             if not isinstance(component, nn.Module)
         }
         if invalid:
@@ -40,19 +65,27 @@ class PseudoPipelineRuntime(ComponentRuntime):
                 f"received invalid entries={invalid}."
             )
         self._canonical_components: Dict[str, Any] = dict(components)
+        self._alias_components: Dict[str, Any] = dict(aliases)
 
     @property
     def canonical_components(self) -> Mapping[str, Any]:
         """Return the explicit canonical component mapping."""
         return self._canonical_components
 
+    @property
+    def alias_components(self) -> Mapping[str, Any]:
+        """Return explicit addressable aliases excluded from device lifecycle."""
+        return self._alias_components
+
     def _get_materialized_component(self, name: str) -> Any:
+        if name in self._alias_components:
+            return self._alias_components[name]
         return self._canonical_components.get(name)
 
     def _materialize_components(self, names: List[str]) -> None:
-        missing = [name for name in names if name not in self._canonical_components]
+        missing = [name for name in names if name not in self.declared_components]
         if missing:
             raise RuntimeError(
                 "Pseudo-pipeline is missing required explicit components; "
-                f"expected={missing}, received={self.component_names}."
+                f"expected={missing}, received={self.declared_component_names}."
             )

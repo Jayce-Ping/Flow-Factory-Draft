@@ -265,7 +265,7 @@ class BaseTrainer(ABC):
         Returns:
             Tuple of (train_dataloader, eval_dataloaders_by_name).
         """
-        self.adapter.component_runtime.load_components(
+        self.adapter.on_load_components(
             components=self.adapter.preprocessing_modules,
             device=self.accelerator.device
         )
@@ -284,7 +284,7 @@ class BaseTrainer(ABC):
             preprocess_func=self.adapter.preprocess_func,
         )
 
-        self.adapter.component_runtime.unload_components(
+        self.adapter.off_load_components(
             components=self.adapter.preprocessing_modules,
         )
 
@@ -320,11 +320,11 @@ class BaseTrainer(ABC):
             modules_to_load.extend(self.adapter.preprocessing_modules)
         
         # Resolve group names → concrete names, then deduplicate & exclude prepared
-        resolved = self.adapter.component_runtime.resolve_component_names(modules_to_load)
+        resolved = self.adapter._resolve_component_names(modules_to_load)
         resolved = [m for m in resolved if m not in prepared_names]
         
         if resolved:
-            self.adapter.component_runtime.load_components(
+            self.adapter.on_load_components(
                 components=resolved,
                 device=self.accelerator.device,
             )

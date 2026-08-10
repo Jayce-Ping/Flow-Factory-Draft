@@ -166,13 +166,15 @@ class BaseAdapter(ABC):
         self.pipeline = self.component_runtime.pipeline
         if (
             getattr(self.pipeline, "scheduler", None) is None
-            and "scheduler" in self.component_runtime.component_names
+            and "scheduler" in self.component_runtime.declared_component_names
         ):
             self.component_runtime.materialize_components(["scheduler"])
         self.pipeline.scheduler = self.load_scheduler()
 
-        # Compatibility alias: the runtime mapping is the sole authoritative cache.
-        self._components = self.component_runtime.prepared_components
+        # Compatibility alias: the runtime override mapping is the sole authoritative cache.
+        self._components: Dict[str, torch.nn.Module] = cast(
+            Dict[str, torch.nn.Module], self.component_runtime.override_components
+        )
 
         # Cache target module mapping
         self.target_module_map = self._init_target_module_map()
@@ -280,24 +282,24 @@ class BaseAdapter(ABC):
         return self.accelerator.unwrap_model(model)
 
     def set_component(self, name: str, module: Union[torch.nn.Module, RoutedComponentProxy]):
-        """Cache a component for this name.
+        """Install a component override for this name.
 
-        Accepts either a real ``nn.Module`` (a prepared module, a freshly loaded
-        checkpoint module, etc.) or a transparent ``RoutedComponentProxy``
-        installed after ``accelerator.prepare``. The proxy is stored as an
-        ``nn.Module`` stand-in (it duck-types one), so the cast is the single,
-        encapsulated acknowledgement of that contract; readers via
-        ``get_component`` see a plain ``nn.Module``.
+        Accepts either a real ``nn.Module`` (a LoRA wrapper, checkpoint replacement,
+        accelerator-prepared module, etc.) or a transparent ``RoutedComponentProxy``
+        installed after ``accelerator.prepare``. Every override is excluded from
+        runtime device management. The proxy is stored as an ``nn.Module`` stand-in
+        (it duck-types one), so the cast is the single, encapsulated acknowledgement
+        of that contract; readers via ``get_component`` see a plain ``nn.Module``.
         """
-        self.component_runtime.set_prepared_component(name, cast(torch.nn.Module, module))
+        self.component_runtime.set_component_override(name, cast(torch.nn.Module, module))
     
     def get_component(self, name: str) -> torch.nn.Module:
-        """Get a component, preferring the prepared version if available.
+        """Get a component, preferring the runtime override if available.
 
-        After `accelerator.prepare`, trainable/bundled components resolve to a
-        transparent `RoutedComponentProxy` (a duck-typed nn.Module stand-in)
-        that routes forwards through the prepared root; use ``_unwrap`` to recover
-        the real module.
+        Overrides also include LoRA/checkpoint replacement modules. After
+        `accelerator.prepare`, trainable/bundled components resolve to a transparent
+        `RoutedComponentProxy` (a duck-typed nn.Module stand-in) that routes forwards
+        through the prepared root; use ``_unwrap`` to recover the real module.
         """
         return cast(torch.nn.Module, self.component_runtime.get_component(name))
 
@@ -376,7 +378,7 @@ class BaseAdapter(ABC):
     @property
     def audio_vae(self) -> Optional[torch.nn.Module]:
         """Get audio VAE if available in pipeline, preferring prepared version."""
-        if "audio_vae" not in self.component_runtime.component_names:
+        if "audio_vae" not in self.component_runtime.declared_component_names:
             return None
         return self.get_component("audio_vae")
 
@@ -2009,10 +2011,10 @@ class BaseAdapter(ABC):
     def _should_manage_device(self, name: str) -> bool:
         """
         Check if a component's device should be manually managed.
-        Prepared (FSDP/DeepSpeed wrapped) components are managed by the
-        accelerator and should not be manually moved.
+        Runtime overrides (prepared/proxied, LoRA, or checkpoint replacements)
+        are never manually moved.
         """
-        return not self.component_runtime.is_prepared(name)
+        return not self.component_runtime.has_component_override(name)
 
     def _resolve_component_names(self, components: Optional[Union[str, List[str]]] = None) -> List[str]:
         """
@@ -2036,7 +2038,7 @@ class BaseAdapter(ABC):
                         None loads all components.
             device: Target device. Defaults to accelerator device.
         """
-        self.component_runtime.load_components(components, device=device or self.device)
+        self.component_runtime.load_stage_components(components, device=device or self.device)
 
     def off_load_components(self, components: Optional[Union[str, List[str]]] = None):
         """
@@ -2046,7 +2048,7 @@ class BaseAdapter(ABC):
             components: Component name(s) or group names ('text_encoders', 'transformers').
                         None off-loads all components.
         """
-        self.component_runtime.unload_components(components)
+        self.component_runtime.unload_stage_components(components)
 
     def on_load(self, device: Optional[Union[torch.device, str]] = None):
         """Load all components to device."""

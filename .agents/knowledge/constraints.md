@@ -25,7 +25,10 @@ Existing `BaseAdapter` subclasses keep implementing `load_pipeline()` and use th
 `ClassicPipelineRuntime`. Adapters backed by lazy modular pipelines or explicit pseudo-pipeline
 containers override the concrete `build_component_runtime()` hook instead; they must retain
 `adapter.pipeline` as the backend compatibility alias and ensure the canonical scheduler is
-materialized before scheduler construction.
+materialized before scheduler construction. Trainer stage lifecycle must call the adapter's public
+component methods, preserving model-specific override points. Runtime-wide device and dtype
+enumeration includes only materialized canonical `torch.nn.Module` entries; declared lazy specs,
+optional `None` entries, and pseudo-pipeline aliases are not implicitly loaded or moved.
 
 ---
 

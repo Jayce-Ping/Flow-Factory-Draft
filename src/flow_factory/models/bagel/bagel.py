@@ -254,9 +254,9 @@ class BagelAdapter(BaseAdapter):
             pipeline,
             {
                 "bagel": pipeline.bagel,
-                "transformer": pipeline.transformer,
                 "vae": pipeline.vae,
             },
+            aliases={"transformer": pipeline.transformer},
         )
 
     def load_scheduler(self) -> FlowMatchEulerDiscreteSDEScheduler:

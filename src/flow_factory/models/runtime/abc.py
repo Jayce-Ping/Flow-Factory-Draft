@@ -19,17 +19,25 @@ import torch
 
 
 class ComponentRuntime(ABC):
-    """Manage canonical and distributed-prepared model components.
+    """Manage canonical components and device-excluded runtime overrides.
 
     Args:
         pipeline: Backend pipeline or explicit component container.
     """
 
     def __init__(self, pipeline: Any) -> None:
+        """Initialize a component runtime.
+
+        Args:
+            pipeline: Backend pipeline or explicit component container.
+
+        Raises:
+            ValueError: If ``pipeline`` is ``None``.
+        """
         if pipeline is None:
             raise ValueError("ComponentRuntime requires a pipeline/container instance, got None.")
         self.pipeline = pipeline
-        self.prepared_components: Dict[str, Any] = {}
+        self.override_components: Dict[str, Any] = {}
 
     @property
     @abstractmethod
@@ -38,57 +46,119 @@ class ComponentRuntime(ABC):
         pass
 
     @property
+    def alias_components(self) -> Mapping[str, Any]:
+        """Return addressable aliases excluded from module lifecycle enumeration."""
+        return {}
+
+    @property
+    def declared_components(self) -> Mapping[str, Any]:
+        """Return every declared canonical component/spec and addressable alias."""
+        return {**self.canonical_components, **self.alias_components}
+
+    @property
+    def declared_component_names(self) -> List[str]:
+        """Return all declared component/spec and alias names."""
+        return sorted(self.declared_components)
+
+    @property
+    def materialized_component_names(self) -> List[str]:
+        """Return materialized canonical module names, excluding aliases."""
+        return [
+            name
+            for name in sorted(self.canonical_components)
+            if isinstance(self._get_materialized_component(name), torch.nn.Module)
+        ]
+
+    @property
     def component_names(self) -> List[str]:
-        """Return canonical module/spec names in deterministic order."""
-        return sorted(self.canonical_components)
+        """Return materialized canonical module names for compatibility."""
+        return self.materialized_component_names
 
     @property
     def text_encoder_names(self) -> List[str]:
-        """Return canonical text encoder component names."""
-        return [name for name in self.component_names if "text_encoder" in name]
+        """Return declared text encoder component and alias names."""
+        return self._role_component_names("text_encoder")
 
     @property
     def transformer_names(self) -> List[str]:
-        """Return canonical transformer component names."""
-        return [name for name in self.component_names if "transformer" in name]
+        """Return declared transformer component and alias names."""
+        return self._role_component_names("transformer")
 
-    def set_prepared_component(self, name: str, module: Any) -> None:
-        """Install an accelerator-prepared component override.
+    @property
+    def prepared_components(self) -> Dict[str, Any]:
+        """Return the component override mapping under its compatibility name."""
+        return self.override_components
+
+    def set_component_override(self, name: str, module: Any) -> None:
+        """Install a component override excluded from runtime device management.
+
+        Overrides include accelerator-prepared modules, routed proxies, LoRA wrappers,
+        and checkpoint replacement modules.
 
         Args:
-            name: Canonical component name to override.
-            module: Prepared module or routed proxy.
+            name: Component name to override.
+            module: Replacement module or routed proxy.
+
+        Raises:
+            ValueError: If the name is empty or the replacement is ``None``.
         """
         if not name:
-            raise ValueError("Prepared component name must be non-empty.")
+            raise ValueError("Component override name must be non-empty.")
         if module is None:
             raise ValueError(
-                f"Prepared component '{name}' must be a module or routed proxy, got None."
+                f"Component override '{name}' must be a module or routed proxy, got None."
             )
-        self.prepared_components[name] = module
+        self.override_components[name] = module
+
+    def has_component_override(self, name: str) -> bool:
+        """Return whether a component has a runtime override.
+
+        Args:
+            name: Component name.
+
+        Returns:
+            True when an override is installed.
+        """
+        return name in self.override_components
+
+    def set_prepared_component(self, name: str, module: Any) -> None:
+        """Install a component override under the prepared compatibility API.
+
+        Args:
+            name: Component name to override.
+            module: Replacement module or routed proxy.
+
+        Raises:
+            ValueError: If the name is empty or the replacement is ``None``.
+        """
+        self.set_component_override(name, module)
 
     def is_prepared(self, name: str) -> bool:
-        """Return whether a component has an accelerator-prepared override.
+        """Return whether a component has an override under the compatibility API.
 
         Args:
-            name: Canonical component name.
+            name: Component name.
 
         Returns:
-            True when a prepared override is installed.
+            True when an override is installed.
         """
-        return name in self.prepared_components
+        return self.has_component_override(name)
 
     def get_component(self, name: str) -> Any:
-        """Return a component with prepared-over-canonical precedence.
+        """Return a component with override-over-canonical precedence.
 
         Args:
             name: Canonical component name.
 
         Returns:
-            Prepared override when present, otherwise the canonical component.
+            Runtime override when present, otherwise the canonical component.
+
+        Raises:
+            ValueError: If the component name is unknown.
+            RuntimeError: If a required canonical component remains unavailable.
         """
-        if self.is_prepared(name):
-            return self.prepared_components[name]
+        if self.has_component_override(name):
+            return self.override_components[name]
         return self.get_canonical_component(name)
 
     def get_canonical_component(self, name: str) -> Any:
@@ -99,10 +169,17 @@ class ComponentRuntime(ABC):
 
         Returns:
             Canonical backend component.
+
+        Raises:
+            ValueError: If the component name is unknown.
+            RuntimeError: If a required component remains unavailable.
         """
-        self.materialize_components([name])
+        self._validate_declared_names([name])
+        self._materialize_components([name])
         component = self._get_materialized_component(name)
         if component is None:
+            if self._allows_none_component(name):
+                return None
             raise RuntimeError(
                 f"Canonical component '{name}' remained unavailable after materialization; "
                 f"expected={[name]}, received={self._materialized_component_names()}."
@@ -121,9 +198,12 @@ class ComponentRuntime(ABC):
 
         Returns:
             Deduplicated concrete component names in request order.
+
+        Raises:
+            ValueError: If an explicit component name is unknown.
         """
         if components is None:
-            return self.component_names
+            return self.materialized_component_names
         requested = [components] if isinstance(components, str) else components
         resolved: List[str] = []
         for name in requested:
@@ -133,7 +213,9 @@ class ComponentRuntime(ABC):
                 resolved.extend(self.transformer_names)
             else:
                 resolved.append(name)
-        return list(dict.fromkeys(resolved))
+        resolved = list(dict.fromkeys(resolved))
+        self._validate_declared_names(resolved)
+        return resolved
 
     def materialize_components(
         self,
@@ -143,21 +225,22 @@ class ComponentRuntime(ABC):
 
         Args:
             components: Component name, names, groups, or ``None`` for all.
+
+        Raises:
+            ValueError: If an explicit component name is unknown.
+            RuntimeError: If a required component cannot be materialized.
         """
+        requested = self.declared_component_names if components is None else components
         names = [
-            name for name in self.resolve_component_names(components) if not self.is_prepared(name)
+            name
+            for name in self.resolve_component_names(requested)
+            if not self.has_component_override(name)
         ]
         if not names:
             return
-        unknown = [name for name in names if name not in self.canonical_components]
-        if unknown:
-            raise ValueError(
-                "Cannot materialize unknown components; "
-                f"expected={unknown}, received={self.component_names}."
-            )
         self._materialize_components(names)
 
-    def load_components(
+    def load_stage_components(
         self,
         components: Optional[Union[str, List[str]]] = None,
         device: Optional[Union[torch.device, str]] = None,
@@ -167,14 +250,26 @@ class ComponentRuntime(ABC):
         Args:
             components: Component name, names, groups, or ``None`` for all.
             device: Target device.
+
+        Raises:
+            ValueError: If a component name is unknown or ``device`` is ``None``.
+            RuntimeError: If a required component cannot be materialized.
         """
         names = [
-            name for name in self.resolve_component_names(components) if not self.is_prepared(name)
+            name
+            for name in self.resolve_component_names(components)
+            if self._should_manage_device(name)
         ]
+        if names and device is None:
+            raise ValueError(
+                f"Component runtime device must not be None when loading components {names}."
+            )
         self.materialize_components(names)
         for name in names:
             component = self._get_materialized_component(name)
             if component is None:
+                if self._allows_none_component(name):
+                    continue
                 raise RuntimeError(
                     f"Cannot load component '{name}' because it is not materialized; "
                     f"expected={[name]}, received={self._materialized_component_names()}."
@@ -182,7 +277,7 @@ class ComponentRuntime(ABC):
             if hasattr(component, "to"):
                 component.to(device)
 
-    def unload_components(
+    def unload_stage_components(
         self,
         components: Optional[Union[str, List[str]]] = None,
     ) -> None:
@@ -190,14 +285,50 @@ class ComponentRuntime(ABC):
 
         Args:
             components: Component name, names, groups, or ``None`` for all.
+
+        Raises:
+            ValueError: If an explicit component name is unknown.
         """
         names = [
-            name for name in self.resolve_component_names(components) if not self.is_prepared(name)
+            name
+            for name in self.resolve_component_names(components)
+            if self._should_manage_device(name)
         ]
         for name in names:
             component = self._get_materialized_component(name)
             if component is not None and hasattr(component, "to"):
                 component.to("cpu")
+
+    def load_components(
+        self,
+        components: Optional[Union[str, List[str]]] = None,
+        device: Optional[Union[torch.device, str]] = None,
+    ) -> None:
+        """Load stage components under the Task 1 compatibility API.
+
+        Args:
+            components: Component name, names, groups, or ``None`` for all.
+            device: Target device.
+
+        Raises:
+            ValueError: If a component name is unknown or ``device`` is ``None``.
+            RuntimeError: If a required component cannot be materialized.
+        """
+        self.load_stage_components(components, device)
+
+    def unload_components(
+        self,
+        components: Optional[Union[str, List[str]]] = None,
+    ) -> None:
+        """Unload stage components under the Task 1 compatibility API.
+
+        Args:
+            components: Component name, names, groups, or ``None`` for all.
+
+        Raises:
+            ValueError: If an explicit component name is unknown.
+        """
+        self.unload_stage_components(components)
 
     @abstractmethod
     def _get_materialized_component(self, name: str) -> Any:
@@ -211,8 +342,25 @@ class ComponentRuntime(ABC):
 
     def _materialized_component_names(self) -> List[str]:
         """Return names that currently resolve to materialized components."""
-        return [
-            name
-            for name in self.component_names
-            if self._get_materialized_component(name) is not None
-        ]
+        return self.materialized_component_names
+
+    def _allows_none_component(self, name: str) -> bool:
+        """Return whether an explicitly requested declared component may be ``None``."""
+        return False
+
+    def _role_component_names(self, role: str) -> List[str]:
+        """Return declared names matching a component role."""
+        return [name for name in self.declared_component_names if role in name]
+
+    def _should_manage_device(self, name: str) -> bool:
+        """Return whether runtime stage lifecycle owns a component's device."""
+        return not self.has_component_override(name) and name not in self.alias_components
+
+    def _validate_declared_names(self, names: List[str]) -> None:
+        """Fail fast when explicitly requested names are not declared."""
+        unknown = [name for name in names if name not in self.declared_components]
+        if unknown:
+            raise ValueError(
+                "Cannot resolve unknown components; "
+                f"expected={unknown}, received={self.declared_component_names}."
+            )

@@ -189,13 +189,29 @@ Details: `topics/adapter_conventions.md`
 Two-layer structure (constraint #14): task-level samples (`T2ISample`, `I2VSample`, `I2AVSample`, ...) live in `samples/samples.py` and inherit from `BaseSample` or condition mixins. Model-specific samples (`LTX2Sample`, `LTX2I2AVSample`, ...) inherit from the matching task-level sample — never from another model-specific sample.
 
 ### Component Management
-`BaseAdapter` delegates component discovery, canonical access, prepared overrides, lazy
-materialization, and stage-device lifecycle to `models/runtime/`. The default
+`BaseAdapter` delegates component discovery, canonical access, runtime overrides, lazy
+materialization, and stage-device lifecycle to `models/runtime/`. Runtime overrides include
+prepared/proxied modules and LoRA/checkpoint replacements; all are excluded from manual device
+management. Declared lazy specs are separate from materialized module enumeration, so stage-wide
+operations never materialize tokenizers, schedulers, processors, or configs implicitly. The default
 `ClassicPipelineRuntime` preserves eager DiffusionPipeline behavior;
 `ModularPipelineRuntime` materializes selected lazy component specs; and
-`PseudoPipelineRuntime` manages explicit containers such as Bagel. `adapter.pipeline` remains the
-backend compatibility alias, while `ModelBundle` and `RoutedComponentProxy` remain the sole
-distributed preparation runtime.
+`PseudoPipelineRuntime` manages explicit containers and non-enumerated aliases such as Bagel's
+`transformer -> bagel.language_model`. `adapter.pipeline` remains the backend compatibility alias,
+while `ModelBundle` and `RoutedComponentProxy` remain the sole distributed preparation runtime.
+
+#### Component runtime enumeration boundaries
+- **Date**: 2026-08-10
+- **Symptom**: Lazy stage-wide operations could materialize non-module specs, Bagel's nested
+  transformer could be moved twice, and trainers bypassed adapter lifecycle overrides.
+- **Root Cause**: The first runtime abstraction conflated declared specs, materialized modules,
+  aliases, and prepared/replacement overrides under one component-name path.
+- **Fix**: Split declared and materialized discovery, added non-enumerated pseudo aliases and
+  generic device-excluded overrides, and restored trainer routing through adapter lifecycle APIs.
+- **Lesson**: Discovery for explicit lookup and enumeration for lifecycle operations require
+  separate contracts; aliases and overrides must remain addressable without becoming lifecycle
+  roots.
+- **Related Constraint**: #5.
 
 ### Reward Processing
 `RewardProcessor` dispatches by model type:

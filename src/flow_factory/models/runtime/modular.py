@@ -22,7 +22,11 @@ class ModularPipelineRuntime(ComponentRuntime):
 
     @property
     def canonical_components(self) -> Mapping[str, Any]:
-        """Return modular component specifications exposed by the pipeline."""
+        """Return modular component specifications exposed by the pipeline.
+
+        Raises:
+            TypeError: If ``pipeline.components`` is not a mapping.
+        """
         components = getattr(self.pipeline, "components", None)
         if not isinstance(components, Mapping):
             raise TypeError(
@@ -50,6 +54,6 @@ class ModularPipelineRuntime(ComponentRuntime):
         if missing:
             raise RuntimeError(
                 "Modular component materialization failed; "
-                f"expected={missing}, received_specs={self.component_names}, "
+                f"expected={missing}, received_specs={self.declared_component_names}, "
                 f"materialized={self._materialized_component_names()}."
             )
