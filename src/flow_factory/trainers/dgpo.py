@@ -389,7 +389,11 @@ class DGPOTrainer(BaseTrainer):
 
         Args:
             unique_id: Group identifier shared by every sample of the group.
-            component_name: Component the noise belongs to.
+            component_name: Component the noise belongs to. The default namespace
+                keys off ``component_index`` because the index, not the name, is
+                the authoritative order; the name stays part of the keyword
+                contract so overrides can extend the draw per component and so
+                the caller's mismatch errors can name the offending component.
             component_index: Component position in ``trajectory_component_order``.
             shape: Per-sample noise shape for this component.
             dtype: Per-sample noise dtype for this component.
@@ -416,6 +420,8 @@ class DGPOTrainer(BaseTrainer):
         clean_state: LatentState,
         samples: List[BaseSample],
         inner_epoch: int,
+        *,
+        timestep_index: Optional[int] = None,
     ) -> LatentState:
         """Build per-``unique_id`` shared noise for every trajectory component.
 
@@ -432,25 +438,32 @@ class DGPOTrainer(BaseTrainer):
             clean_state: Terminal clean state supplying per-component geometry.
             samples: Micro-batch samples, aligned with the state batch dimension.
             inner_epoch: Inner epoch index, part of the seed namespace.
+            timestep_index: Training timestep the caller is building, reported by
+                validation errors. The noise itself does not depend on it.
 
         Returns:
             Batched noise state in ``trajectory_component_order``.
         """
+        component_names = self.adapter.trajectory_component_order
+        context = (
+            f"inner_epoch={inner_epoch}, timestep_index={timestep_index}, "
+            f"component order {component_names}"
+        )
         batch_size = state_batch_size(self, clean_state, "terminal clean state")
         if len(samples) != batch_size:
             raise ValueError(
-                f"expected {type(self).__name__} shared noise to receive one sample per "
-                f"terminal state row, i.e. {batch_size} samples, received {len(samples)}"
+                f"expected {type(self).__name__} shared noise ({context}) to receive one "
+                f"sample per terminal state row, i.e. {batch_size} samples, received "
+                f"{len(samples)}"
             )
-        component_names = self.adapter.trajectory_component_order
         references: Dict[str, torch.Tensor] = {}
         for name in component_names:
             component = clean_state.components[name]
             if component.ndim < 2 or component.shape[0] != batch_size:
                 raise ValueError(
-                    f"expected {type(self).__name__} terminal clean component {name!r} to be "
-                    f"batched with shape (B, ...) and batch size {batch_size}, received "
-                    f"{tuple(component.shape)}"
+                    f"expected {type(self).__name__} terminal clean component {name!r} "
+                    f"({context}) to be batched with shape (B, ...) and batch size "
+                    f"{batch_size}, received {tuple(component.shape)}"
                 )
             references[name] = component
 
@@ -483,13 +496,17 @@ class DGPOTrainer(BaseTrainer):
                 ):
                     raise ValueError(
                         f"expected {type(self).__name__} shared noise for unique_id="
-                        f"{unique_id} component {name!r} to match the clean per-sample "
-                        f"shape/dtype/device ({tuple(reference.shape[1:])}, {reference.dtype}, "
-                        f"{reference.device}), received ({tuple(noise.shape)}, {noise.dtype}, "
-                        f"{noise.device})"
+                        f"{unique_id} ({context}) component {name!r} to match the clean "
+                        f"per-sample shape/dtype/device ({tuple(reference.shape[1:])}, "
+                        f"{reference.dtype}, {reference.device}), received "
+                        f"({tuple(noise.shape)}, {noise.dtype}, {noise.device})"
                     )
                 rows[name].append(noise)
-        return LatentState({name: torch.stack(rows[name], dim=0) for name in component_names})
+        return require_latent_state(
+            self,
+            LatentState({name: torch.stack(rows[name], dim=0) for name in component_names}),
+            f"shared noise ({context})",
+        )
 
     # =========================== Group DGPO Loss ============================
     def _compute_per_sample_preference(
@@ -618,7 +635,10 @@ class DGPOTrainer(BaseTrainer):
         )
         if self.use_shared_noise:
             noise = self._shared_group_noise(
-                clean_state, p["samples_slice"], p["inner_epoch"]
+                clean_state,
+                p["samples_slice"],
+                p["inner_epoch"],
+                timestep_index=t_idx,
             )
             noised = self.adapter.apply_forward_process_noise(clean_state, times, noise)
         else:
@@ -684,21 +704,50 @@ class DGPOTrainer(BaseTrainer):
                     guidance_scale=ref_cfg,
                 )
 
-        if self.use_ema_ref:
-            # Guaranteed non-None: use_ema_ref → compute_old_v → old_v assigned.
-            assert old_v is not None
-            ref_dgpo_v = old_v
-        else:
-            # Guaranteed non-None: not use_ema_ref → ref_v branch taken.
-            assert ref_v is not None
-            ref_dgpo_v = ref_v
-
         return {
             "model_v": model_v,
             "old_v": old_v,
             "ref_v": ref_v,
-            "ref_dgpo_v": ref_dgpo_v,
+            "ref_dgpo_v": self._select_dgpo_reference(old_v, ref_v),
         }
+
+    def _select_dgpo_reference(
+        self,
+        old_v: Optional[LatentState],
+        ref_v: Optional[LatentState],
+    ) -> LatentState:
+        """Pick the velocity the group preference measures the policy against.
+
+        Both branches are reachable only when the configuration flags agree with
+        the forwards :meth:`_forward_velocities` actually ran, so a ``None`` here
+        means the gating flags drifted apart — report them instead of failing on
+        a bare truth check.
+
+        Args:
+            old_v: Old-policy (``ema_ref``) velocity, or ``None`` if not computed.
+            ref_v: Frozen-reference velocity, or ``None`` if not computed.
+
+        Returns:
+            The velocity state to use as the DGPO reference.
+        """
+        if self.use_ema_ref:
+            if old_v is None:
+                raise ValueError(
+                    f"expected {type(self).__name__} to hold an old policy velocity as the "
+                    "DGPO reference when use_ema_ref=True, received None; the old-policy "
+                    f"forward is gated by _requires_ema_ref={self._requires_ema_ref} "
+                    f"(clip_dsm={self.clip_dsm}, clip_kl={self.clip_kl}, "
+                    f"use_ema_ref={self.use_ema_ref}), so no 'ema_ref' forward ran"
+                )
+            return old_v
+        if ref_v is None:
+            raise ValueError(
+                f"expected {type(self).__name__} to hold a reference velocity as the DGPO "
+                "reference when use_ema_ref=False, received None; the reference forward is "
+                f"gated by enable_kl_loss={self.enable_kl_loss} (kl_beta={self.kl_beta}) or "
+                f"use_ema_ref={self.use_ema_ref}"
+            )
+        return ref_v
 
     def _compute_dsm_loss(
         self,

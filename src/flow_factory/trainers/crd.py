@@ -447,17 +447,43 @@ class CRDTrainer(BaseTrainer):
         return {}
 
     def _rebuild_noised_state(
-        self, clean_state: LatentState, step: _CRDStep
+        self,
+        clean_state: LatentState,
+        step: _CRDStep,
+        *,
+        timestep_index: Optional[int] = None,
     ) -> NoisedState:
         """Reapply a pass-1 noise draw to the terminal state, consuming no RNG.
+
+        Pass 1 and pass 2 resolve the terminal state independently, so a stored
+        noise that no longer matches the reloaded geometry would silently
+        broadcast into a different forward process. Check it before applying and
+        name the timestep the drift belongs to.
 
         Args:
             clean_state: Terminal clean state reloaded for pass 2.
             step: Pass-1 state carrying the component times and the drawn noise.
+            timestep_index: Training timestep this step replays, reported by
+                validation errors.
 
         Returns:
             The same noised state and target velocity pass 1 evaluated.
         """
+        for name in self.adapter.trajectory_component_order:
+            clean = clean_state.components[name]
+            noise = step.noise.components[name]
+            if (
+                noise.shape != clean.shape
+                or noise.dtype != clean.dtype
+                or noise.device != clean.device
+            ):
+                raise ValueError(
+                    f"expected {type(self).__name__} pass-1 noise at "
+                    f"timestep_index={timestep_index} component {name!r} to match the "
+                    f"reloaded terminal state ({tuple(clean.shape)}, {clean.dtype}, "
+                    f"{clean.device}), received ({tuple(noise.shape)}, {noise.dtype}, "
+                    f"{noise.device})"
+                )
         return self.adapter.apply_forward_process_noise(clean_state, step.times, step.noise)
 
     def _precompute_old_velocities(self, batch: StackedSampleBatch) -> _CRDBatch:
@@ -801,7 +827,9 @@ class CRDTrainer(BaseTrainer):
                     with self.accumulate_gradients():
                         # 1. Replay the pass-1 forward process without drawing noise
                         step = prepared.steps[t_idx]
-                        noised = self._rebuild_noised_state(clean_state, step)
+                        noised = self._rebuild_noised_state(
+                            clean_state, step, timestep_index=t_idx
+                        )
                         old_velocity = step.old_velocity
 
                         # 2. Current model forward pass
