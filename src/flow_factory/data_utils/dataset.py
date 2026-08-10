@@ -907,9 +907,6 @@ def _load_ordered_reference(
             loaded["media"] = Image.open(resolved_path).convert("RGB")
         elif kind == "video":
             frames, fps, audio, sample_rate = _decode_ordered_video(resolved_path)
-            _require_finite_positive_rate(
-                fps, "fps", row_index, reference_index, kind, resolved_path
-            )
             effective_fps = entry.get("fps", fps)
             _require_finite_positive_rate(
                 effective_fps,

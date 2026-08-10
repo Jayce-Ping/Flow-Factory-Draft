@@ -244,12 +244,6 @@ def test_soundtrack_decode_error_reports_soundtrack_path_and_context(tmp_path: P
         (
             "video",
             "flow_factory.data_utils.dataset._decode_ordered_video",
-            (np.zeros((1, 2, 2, 3), dtype=np.uint8), None, None, None),
-            "fps",
-        ),
-        (
-            "video",
-            "flow_factory.data_utils.dataset._decode_ordered_video",
             (np.zeros((1, 2, 2, 3), dtype=np.uint8), float("nan"), None, None),
             "fps",
         ),
@@ -294,6 +288,43 @@ def test_decoded_rates_must_be_finite_positive_with_context(
             preprocess_kwargs={"workflow": "ref2va", "width": 768},
             preprocessing_batch_size=1,
             force_reprocess=True,
+        )
+
+
+def test_video_uses_manifest_fps_when_decoder_has_no_rate(tmp_path: Path, monkeypatch) -> None:
+    frames = np.zeros((1, 2, 2, 3), dtype=np.uint8)
+    monkeypatch.setattr(
+        "flow_factory.data_utils.dataset._decode_ordered_video",
+        lambda media_path: (frames, None, None, None),
+    )
+
+    loaded = _load_ordered_reference(
+        {"kind": "video", "path": "media.mp4", "fps": 24.0},
+        data_root=str(tmp_path),
+        row_index=3,
+        reference_index=4,
+    )
+
+    assert loaded["frames"] is frames
+    assert loaded["fps"] == 24.0
+
+
+def test_video_without_override_rejects_missing_decoded_fps(tmp_path: Path, monkeypatch) -> None:
+    frames = np.zeros((1, 2, 2, 3), dtype=np.uint8)
+    monkeypatch.setattr(
+        "flow_factory.data_utils.dataset._decode_ordered_video",
+        lambda media_path: (frames, None, None, None),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"row 3.*reference 4.*kind='video'.*effective fps.*finite positive.*None",
+    ):
+        _load_ordered_reference(
+            {"kind": "video", "path": "media.mp4"},
+            data_root=str(tmp_path),
+            row_index=3,
+            reference_index=4,
         )
 
 
