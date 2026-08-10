@@ -16,18 +16,26 @@
 
 from .samples import (
     BaseSample,
-    StackedSampleBatch,
-    ImageConditionSample,
-    VideoConditionSample,
-    T2ISample,
-    T2VSample,
-    T2AVSample,
+    I2AVSample,
     I2ISample,
     I2VSample,
-    I2AVSample,
+    ImageConditionSample,
+    StackedSampleBatch,
+    T2AVSample,
+    T2ISample,
+    T2VSample,
     V2VSample,
+    VideoConditionSample,
 )
-
+from .trajectory import (
+    ComponentTimes,
+    ComponentTrajectory,
+    LatentState,
+    MultiModalStepOutput,
+    NoisedState,
+    ReplayStep,
+    StructuredTrajectory,
+)
 
 __all__ = [
     # Sample classes
@@ -42,4 +50,11 @@ __all__ = [
     "I2VSample",
     "I2AVSample",
     "V2VSample",
+    "ComponentTrajectory",
+    "StructuredTrajectory",
+    "LatentState",
+    "ComponentTimes",
+    "ReplayStep",
+    "NoisedState",
+    "MultiModalStepOutput",
 ]

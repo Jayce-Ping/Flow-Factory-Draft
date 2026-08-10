@@ -188,6 +188,9 @@ Details: `topics/adapter_conventions.md`
 ### Sample Dataclass Hierarchy
 Two-layer structure (constraint #14): task-level samples (`T2ISample`, `I2VSample`, `I2AVSample`, ...) live in `samples/samples.py` and inherit from `BaseSample` or condition mixins. Model-specific samples (`LTX2Sample`, `LTX2I2AVSample`, ...) inherit from the matching task-level sample — never from another model-specific sample.
 
+`BaseSample.trajectory` is the opt-in structured path for independently shaped/timed latent
+components; legacy trajectory fields remain unchanged and authoritative when it is `None`.
+
 ### Component Management
 `BaseAdapter` delegates component discovery, canonical access, runtime overrides, lazy
 materialization, and stage-device lifecycle to `models/runtime/`. Runtime overrides include
@@ -201,6 +204,8 @@ non-`None` modular specs but exclude absent classic optional components. The def
 `PseudoPipelineRuntime` manages explicit containers and non-enumerated aliases such as Bagel's
 `transformer -> bagel.language_model`. `adapter.pipeline` remains the backend compatibility alias,
 while `ModelBundle` and `RoutedComponentProxy` remain the sole distributed preparation runtime.
+`SchedulerGroup` separately provides immutable component names and ordered scheduler mode/seed
+dispatch; its primary scheduler remains available through `adapter.scheduler`.
 
 #### Component runtime enumeration boundaries
 - **Date**: 2026-08-10

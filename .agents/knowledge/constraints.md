@@ -31,6 +31,8 @@ enumeration includes only materialized canonical `torch.nn.Module` entries; decl
 optional `None` entries, and pseudo-pipeline aliases are not implicitly loaded or moved.
 `materialize_components(None)` means already-materialized modules, never all declared specs.
 Text-encoder/transformer role groups include non-`None` declarations/specs only.
+The canonical scheduler remains `adapter.scheduler`; `adapter.scheduler_group` owns ordered mode
+and seed dispatch, and its immutable names must equal `trajectory_component_order`.
 
 ---
 
@@ -102,6 +104,10 @@ The `RewardProcessor` dispatches differently based on the model type. Do not cha
 `BaseSample` → `T2ISample`, `ImageConditionSample`, `T2VSample`, `T2AVSample`, etc. The `_shared_fields` class variable determines which fields are NOT stacked across a batch. Incorrect `_shared_fields` causes silent data corruption during collation.
 
 **Two-layer hierarchy**: Task-level samples (`T2ISample`, `I2VSample`, `I2AVSample`, ...) are defined in `samples/samples.py` and inherit from `BaseSample` or its condition mixins (`ImageConditionSample`, `VideoConditionSample`). Model-specific samples (`LTX2Sample`, `LTX2I2AVSample`, ...) MUST inherit from the appropriate task-level sample — never from another model-specific sample across files. This mirrors the flat adapter hierarchy: `LTX2I2AVSample(I2AVSample)`, NOT `LTX2I2AVSample(LTX2Sample)`.
+
+Legacy trajectory fields remain authoritative when `BaseSample.trajectory is None`. Structured
+trajectory collation requires identical ordered component keys and shared state/log-prob index maps;
+component mapping iteration never defines scheduler RNG order.
 
 ---
 

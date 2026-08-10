@@ -49,6 +49,25 @@ class TrackingModule(nn.Module):
         return self
 
 
+class SchedulerFake:
+    """Small scheduler-like object used by adapter construction tests."""
+
+    def step(self) -> None:
+        """Provide the scheduler step surface."""
+
+    def eval(self) -> None:
+        """Provide evaluation mode compatibility."""
+
+    def train(self, mode: bool = True) -> None:
+        """Provide training mode compatibility."""
+
+    def rollout(self, mode: bool = True) -> None:
+        """Provide rollout mode compatibility."""
+
+    def set_seed(self, seed: int) -> None:
+        """Provide trajectory seed compatibility."""
+
+
 class ClassicPipelineFake:
     """Eager pipeline-like container used by classic runtime tests."""
 
@@ -57,7 +76,7 @@ class ClassicPipelineFake:
         self.text_encoder_2 = TrackingModule()
         self.transformer = TrackingModule()
         self.vae = TrackingModule()
-        self.scheduler = object()
+        self.scheduler = SchedulerFake()
 
     @property
     def components(self) -> Dict[str, Any]:
@@ -484,6 +503,8 @@ def test_base_adapter_default_runtime_preserves_existing_subclass_contract(
     assert adapter.pipeline is adapter.component_runtime.pipeline
     assert adapter._components is adapter.component_runtime.prepared_components
     assert adapter.get_component("transformer") is adapter.pipeline.transformer
+    assert adapter.scheduler_group.names == ("latent",)
+    assert adapter.scheduler_group.primary is adapter.scheduler
 
 
 def test_base_adapter_constructs_with_optional_transformer_none(
@@ -503,7 +524,7 @@ def test_base_adapter_constructs_with_optional_transformer_none(
 def test_base_adapter_materializes_declared_modular_scheduler_before_loading(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    scheduler = object()
+    scheduler = SchedulerFake()
 
     def load_components(self: ModularPipelineFake, names: List[str]) -> None:
         self.load_calls.append(list(names))

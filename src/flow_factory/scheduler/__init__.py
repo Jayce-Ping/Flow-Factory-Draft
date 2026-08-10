@@ -14,37 +14,36 @@
 
 # src/flow_factory/scheduler/__init__.py
 from .abc import (
-    SDESchedulerOutput,
     SDESchedulerMixin,
+    SDESchedulerOutput,
 )
 from .flow_match_euler_discrete import (
     FlowMatchEulerDiscreteSDEScheduler,
     FlowMatchEulerDiscreteSDESchedulerOutput,
     set_scheduler_timesteps,
 )
-from .unipc_multistep import (
-    UniPCMultistepSDEScheduler,
-    UniPCMultistepSDESchedulerOutput,
-)
+from .group import SchedulerGroup
 from .loader import load_scheduler
 from .registry import (
     get_sde_scheduler_class,
-    register_scheduler,
     list_registered_schedulers,
+    register_scheduler,
+)
+from .unipc_multistep import (
+    UniPCMultistepSDEScheduler,
+    UniPCMultistepSDESchedulerOutput,
 )
 
 __all__ = [
     "SDESchedulerOutput",
     "SDESchedulerMixin",
-
     "FlowMatchEulerDiscreteSDEScheduler",
     "FlowMatchEulerDiscreteSDESchedulerOutput",
     "set_scheduler_timesteps",
-
     "UniPCMultistepSDEScheduler",
     "UniPCMultistepSDESchedulerOutput",
-
     "load_scheduler",
+    "SchedulerGroup",
     "get_sde_scheduler_class",
     "register_scheduler",
     "list_registered_schedulers",

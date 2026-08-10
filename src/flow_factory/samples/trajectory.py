@@ -1,0 +1,495 @@
+# Copyright 2026 Jayce-Ping
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List, Mapping, Optional, Tuple, Union
+
+import torch
+
+
+def _validate_component_mapping(
+    values: Mapping[str, torch.Tensor], identifier: str
+) -> Dict[str, torch.Tensor]:
+    if not isinstance(values, Mapping):
+        raise TypeError(
+            f"expected Mapping[str, torch.Tensor] for {identifier}, "
+            f"received {type(values).__name__}"
+        )
+    result: Dict[str, torch.Tensor] = {}
+    for name, value in values.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError(
+                f"expected non-empty string component names for {identifier}, " f"received {name!r}"
+            )
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"expected torch.Tensor for {identifier}[{name!r}], "
+                f"received {type(value).__name__}"
+            )
+        result[name] = value
+    if not result:
+        raise ValueError(f"expected at least one component for {identifier}, received no keys")
+    return result
+
+
+def _move_tensor(tensor: torch.Tensor, device: Union[torch.device, str]) -> torch.Tensor:
+    return tensor.to(device)
+
+
+@dataclass
+class ComponentTrajectory:
+    """Store one component's compact latent states and full scheduler trajectory.
+
+    Args:
+        states: Per-sample states or batched states. The stored-state axis is zero
+            for a per-sample trajectory and one after collation.
+        timesteps: Full scheduler timesteps with shape ``(T + 1,)`` per sample or
+            ``(B, T + 1)`` after collation.
+        state_index_map: Shared map from rollout positions to stored-state indices.
+        sigmas: Optional full sigma schedule matching ``timesteps``.
+    """
+
+    states: torch.Tensor
+    timesteps: torch.Tensor
+    state_index_map: torch.Tensor
+    sigmas: Optional[torch.Tensor] = None
+
+    def __post_init__(self) -> None:
+        for name in ("states", "timesteps", "state_index_map"):
+            value = getattr(self, name)
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(
+                    f"expected torch.Tensor for ComponentTrajectory.{name}, "
+                    f"received {type(value).__name__}"
+                )
+        if self.states.ndim < 1:
+            raise ValueError(
+                f"expected ComponentTrajectory.states with at least 1 dimension, "
+                f"received shape {tuple(self.states.shape)}"
+            )
+        if self.timesteps.ndim not in (1, 2):
+            raise ValueError(
+                "expected ComponentTrajectory.timesteps shape (T + 1,) or (B, T + 1), "
+                f"received {tuple(self.timesteps.shape)}"
+            )
+        if self.timesteps.shape[-1] < 2:
+            raise ValueError(
+                "expected ComponentTrajectory.timesteps with at least two rollout positions, "
+                f"received shape {tuple(self.timesteps.shape)}"
+            )
+        if self.state_index_map.ndim != 1:
+            raise ValueError(
+                "expected ComponentTrajectory.state_index_map shape (T + 1,), "
+                f"received {tuple(self.state_index_map.shape)}"
+            )
+        schedule_length = self.timesteps.shape[-1]
+        if self.state_index_map.shape[0] != schedule_length:
+            raise ValueError(
+                "expected ComponentTrajectory.state_index_map length to match timesteps "
+                f"length {schedule_length}, received {self.state_index_map.shape[0]}"
+            )
+        if self.sigmas is not None:
+            if not isinstance(self.sigmas, torch.Tensor):
+                raise TypeError(
+                    "expected torch.Tensor or None for ComponentTrajectory.sigmas, "
+                    f"received {type(self.sigmas).__name__}"
+                )
+            if self.sigmas.shape != self.timesteps.shape:
+                raise ValueError(
+                    f"expected timesteps and sigmas with the same shape/length "
+                    f"{schedule_length}, received timesteps {tuple(self.timesteps.shape)} "
+                    f"and sigmas {tuple(self.sigmas.shape)}"
+                )
+        if self.state_index_map.dtype not in (
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.uint8,
+        ):
+            raise TypeError(
+                "expected integer ComponentTrajectory.state_index_map, "
+                f"received dtype {self.state_index_map.dtype}"
+            )
+        state_axis = 1 if self.timesteps.ndim == 2 else 0
+        if self.states.ndim <= state_axis:
+            raise ValueError(
+                f"expected states with stored-state axis {state_axis}, "
+                f"received shape {tuple(self.states.shape)}"
+            )
+        num_stored_states = self.states.shape[state_axis]
+        if self.state_index_map.numel() and (
+            self.state_index_map.min().item() < 0
+            or self.state_index_map.max().item() >= num_stored_states
+        ):
+            raise ValueError(
+                "ComponentTrajectory.state_index_map expected values for "
+                f"{num_stored_states} stored states in range [0, {num_stored_states - 1}], "
+                f"received {self.state_index_map.tolist()} with maximum "
+                f"{self.state_index_map.max().item()}"
+            )
+        if self.timesteps.ndim == 2 and self.states.shape[0] != self.timesteps.shape[0]:
+            raise ValueError(
+                "expected batched states and timesteps with equal batch size, received "
+                f"states shape {tuple(self.states.shape)} and timesteps shape "
+                f"{tuple(self.timesteps.shape)}"
+            )
+
+    def to(self, device: Union[torch.device, str]) -> "ComponentTrajectory":
+        """Move all trajectory tensors to a device in place.
+
+        Args:
+            device: Target tensor device.
+
+        Returns:
+            This trajectory after moving its tensors.
+        """
+        self.states = _move_tensor(self.states, device)
+        self.timesteps = _move_tensor(self.timesteps, device)
+        self.state_index_map = _move_tensor(self.state_index_map, device)
+        if self.sigmas is not None:
+            self.sigmas = _move_tensor(self.sigmas, device)
+        return self
+
+
+@dataclass
+class StructuredTrajectory:
+    """Store ordered component trajectories and an optional joint log probability.
+
+    Args:
+        components: Component trajectories in authoritative iteration order.
+        log_probs: Optional per-step joint scalar log probabilities.
+        log_prob_index_map: Optional shared rollout-position map for ``log_probs``.
+    """
+
+    components: Mapping[str, ComponentTrajectory]
+    log_probs: Optional[torch.Tensor] = None
+    log_prob_index_map: Optional[torch.Tensor] = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.components, Mapping):
+            raise TypeError(
+                "expected Mapping[str, ComponentTrajectory] for StructuredTrajectory.components, "
+                f"received {type(self.components).__name__}"
+            )
+        copied: Dict[str, ComponentTrajectory] = {}
+        for name, trajectory in self.components.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError(
+                    "expected non-empty string StructuredTrajectory component names, "
+                    f"received {name!r}"
+                )
+            if not isinstance(trajectory, ComponentTrajectory):
+                raise TypeError(
+                    f"expected ComponentTrajectory for component {name!r}, "
+                    f"received {type(trajectory).__name__}"
+                )
+            copied[name] = trajectory
+        if not copied:
+            raise ValueError("expected at least one StructuredTrajectory component, received none")
+        self.components = copied
+        if self.log_probs is not None and not isinstance(self.log_probs, torch.Tensor):
+            raise TypeError(
+                "expected torch.Tensor or None for StructuredTrajectory.log_probs, "
+                f"received {type(self.log_probs).__name__}"
+            )
+        if self.log_probs is not None and self.log_probs.ndim not in (1, 2):
+            raise ValueError(
+                "expected StructuredTrajectory.log_probs shape (T,) or (B, T), "
+                f"received {tuple(self.log_probs.shape)}"
+            )
+        if self.log_prob_index_map is not None:
+            if not isinstance(self.log_prob_index_map, torch.Tensor):
+                raise TypeError(
+                    "expected torch.Tensor or None for StructuredTrajectory.log_prob_index_map, "
+                    f"received {type(self.log_prob_index_map).__name__}"
+                )
+            if self.log_prob_index_map.ndim != 1:
+                raise ValueError(
+                    "expected StructuredTrajectory.log_prob_index_map shape (T,), "
+                    f"received {tuple(self.log_prob_index_map.shape)}"
+                )
+            if self.log_prob_index_map.dtype not in (
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
+                torch.uint8,
+            ):
+                raise TypeError(
+                    "expected integer StructuredTrajectory.log_prob_index_map, "
+                    f"received dtype {self.log_prob_index_map.dtype}"
+                )
+            if self.log_probs is None:
+                raise ValueError(
+                    "expected log_probs when log_prob_index_map is provided, received log_probs=None"
+                )
+            log_prob_length = self.log_probs.shape[-1]
+            if self.log_prob_index_map.numel() and (
+                self.log_prob_index_map.min().item() < 0
+                or self.log_prob_index_map.max().item() >= log_prob_length
+            ):
+                raise ValueError(
+                    "expected StructuredTrajectory.log_prob_index_map values in range "
+                    f"[0, {log_prob_length - 1}], received "
+                    f"{self.log_prob_index_map.tolist()}"
+                )
+
+    @property
+    def component_names(self) -> Tuple[str, ...]:
+        """Return component names in authoritative trajectory order."""
+        return tuple(self.components)
+
+    def to(self, device: Union[torch.device, str]) -> "StructuredTrajectory":
+        """Move all nested trajectory tensors to a device in place.
+
+        Args:
+            device: Target tensor device.
+
+        Returns:
+            This trajectory after moving its tensors.
+        """
+        for trajectory in self.components.values():
+            trajectory.to(device)
+        if self.log_probs is not None:
+            self.log_probs = _move_tensor(self.log_probs, device)
+        if self.log_prob_index_map is not None:
+            self.log_prob_index_map = _move_tensor(self.log_prob_index_map, device)
+        return self
+
+    @classmethod
+    def stack(cls, trajectories: List["StructuredTrajectory"]) -> "StructuredTrajectory":
+        """Stack compatible per-sample trajectories into a batched trajectory.
+
+        Args:
+            trajectories: Non-empty trajectories with identical component order and
+                shared index maps.
+
+        Returns:
+            Batched structured trajectory.
+        """
+        if not trajectories:
+            raise ValueError("expected non-empty trajectories to stack, received 0")
+        first = trajectories[0]
+        expected_names = first.component_names
+        for sample_index, trajectory in enumerate(trajectories[1:], start=1):
+            if trajectory.component_names != expected_names:
+                raise ValueError(
+                    "expected identical trajectory component order "
+                    f"{expected_names}, received {trajectory.component_names} "
+                    f"for sample index {sample_index}"
+                )
+            for name in expected_names:
+                expected_map = first.components[name].state_index_map
+                received_map = trajectory.components[name].state_index_map
+                if not torch.equal(received_map, expected_map):
+                    raise ValueError(
+                        f"component {name!r} state_index_map expected "
+                        f"{expected_map.tolist()}, received {received_map.tolist()} "
+                        f"for sample index {sample_index}"
+                    )
+            if (first.log_prob_index_map is None) != (trajectory.log_prob_index_map is None):
+                raise ValueError(
+                    "expected identical log_prob_index_map presence across samples, "
+                    f"received mismatch at sample index {sample_index}"
+                )
+            if first.log_prob_index_map is not None and not torch.equal(
+                trajectory.log_prob_index_map, first.log_prob_index_map
+            ):
+                raise ValueError(
+                    "expected shared log_prob_index_map "
+                    f"{first.log_prob_index_map.tolist()}, received "
+                    f"{trajectory.log_prob_index_map.tolist()} for sample index {sample_index}"
+                )
+
+        components: Dict[str, ComponentTrajectory] = {}
+        for name in expected_names:
+            component_values = [trajectory.components[name] for trajectory in trajectories]
+            expected_shapes = {
+                "states": tuple(component_values[0].states.shape),
+                "timesteps": tuple(component_values[0].timesteps.shape),
+            }
+            for sample_index, component in enumerate(component_values[1:], start=1):
+                received_shapes = {
+                    "states": tuple(component.states.shape),
+                    "timesteps": tuple(component.timesteps.shape),
+                }
+                if received_shapes != expected_shapes:
+                    raise ValueError(
+                        f"expected component {name!r} shapes {expected_shapes}, received "
+                        f"{received_shapes} for sample index {sample_index}"
+                    )
+            sigma_presence = [component.sigmas is not None for component in component_values]
+            if len(set(sigma_presence)) != 1:
+                raise ValueError(
+                    f"expected identical sigma presence for component {name!r}, "
+                    f"received {sigma_presence}"
+                )
+            if sigma_presence[0]:
+                expected_sigma_shape = tuple(component_values[0].sigmas.shape)
+                for sample_index, component in enumerate(component_values[1:], start=1):
+                    if tuple(component.sigmas.shape) != expected_sigma_shape:
+                        raise ValueError(
+                            f"expected component {name!r} sigma shape "
+                            f"{expected_sigma_shape}, received "
+                            f"{tuple(component.sigmas.shape)} for sample index {sample_index}"
+                        )
+            components[name] = ComponentTrajectory(
+                states=torch.stack([component.states for component in component_values]),
+                timesteps=torch.stack([component.timesteps for component in component_values]),
+                sigmas=(
+                    torch.stack([component.sigmas for component in component_values])
+                    if sigma_presence[0]
+                    else None
+                ),
+                state_index_map=component_values[0].state_index_map,
+            )
+
+        log_prob_presence = [trajectory.log_probs is not None for trajectory in trajectories]
+        if len(set(log_prob_presence)) != 1:
+            raise ValueError(
+                "expected identical log_probs presence across samples, "
+                f"received {log_prob_presence}"
+            )
+        if log_prob_presence[0]:
+            expected_log_prob_shape = tuple(first.log_probs.shape)
+            for sample_index, trajectory in enumerate(trajectories[1:], start=1):
+                if tuple(trajectory.log_probs.shape) != expected_log_prob_shape:
+                    raise ValueError(
+                        f"expected log_probs shape {expected_log_prob_shape}, received "
+                        f"{tuple(trajectory.log_probs.shape)} for sample index {sample_index}"
+                    )
+        return cls(
+            components=components,
+            log_probs=(
+                torch.stack([trajectory.log_probs for trajectory in trajectories])
+                if log_prob_presence[0]
+                else None
+            ),
+            log_prob_index_map=first.log_prob_index_map,
+        )
+
+
+@dataclass
+class LatentState:
+    """Represent a batched latent state keyed by trajectory component.
+
+    Args:
+        components: Ordered component-to-latent mapping.
+    """
+
+    components: Mapping[str, torch.Tensor]
+
+    def __post_init__(self) -> None:
+        self.components = _validate_component_mapping(self.components, "LatentState.components")
+
+    @property
+    def component_names(self) -> Tuple[str, ...]:
+        """Return component names in state order."""
+        return tuple(self.components)
+
+
+@dataclass
+class ComponentTimes:
+    """Represent current and next scheduler coordinates for each component.
+
+    Args:
+        timestep: Current timestep by component.
+        next_timestep: Next timestep by component.
+        sigma: Optional current sigma by component.
+        next_sigma: Optional next sigma by component.
+    """
+
+    timestep: Mapping[str, torch.Tensor]
+    next_timestep: Mapping[str, torch.Tensor]
+    sigma: Optional[Mapping[str, torch.Tensor]] = None
+    next_sigma: Optional[Mapping[str, torch.Tensor]] = None
+
+    def __post_init__(self) -> None:
+        self.timestep = _validate_component_mapping(self.timestep, "ComponentTimes.timestep")
+        self.next_timestep = _validate_component_mapping(
+            self.next_timestep, "ComponentTimes.next_timestep"
+        )
+        expected_names = tuple(self.timestep)
+        if tuple(self.next_timestep) != expected_names:
+            raise ValueError(
+                f"expected next_timestep component order {expected_names}, "
+                f"received {tuple(self.next_timestep)}"
+            )
+        for field_name in ("sigma", "next_sigma"):
+            values = getattr(self, field_name)
+            if values is None:
+                continue
+            validated = _validate_component_mapping(values, f"ComponentTimes.{field_name}")
+            if tuple(validated) != expected_names:
+                raise ValueError(
+                    f"expected {field_name} component order {expected_names}, "
+                    f"received {tuple(validated)}"
+                )
+            setattr(self, field_name, validated)
+
+
+@dataclass
+class ReplayStep:
+    """Bundle one replay transition and its optional stored joint log probability.
+
+    Args:
+        state: Current component latent state.
+        next_state: Stored next component latent state.
+        times: Current and next scheduler coordinates.
+        log_prob: Optional stored joint scalar log probability.
+    """
+
+    state: LatentState
+    next_state: LatentState
+    times: ComponentTimes
+    log_prob: Optional[torch.Tensor] = None
+
+
+@dataclass
+class NoisedState:
+    """Bundle a forward-noised state, velocity target, and sampled noise.
+
+    Args:
+        state: Forward-noised component latent state.
+        target_velocity: Flow-matching target velocity by component.
+        noise: Sampled noise by component.
+    """
+
+    state: LatentState
+    target_velocity: LatentState
+    noise: LatentState
+
+
+@dataclass
+class MultiModalStepOutput:
+    """Represent a scheduler step output over one or more latent components.
+
+    Args:
+        next_state: Optional sampled next latent state.
+        next_state_mean: Optional transition mean latent state.
+        std_dev_t: Optional transition standard deviation.
+        dt: Optional scheduler step size.
+        log_prob: Optional joint scalar transition log probability.
+        velocity: Optional predicted velocity state.
+    """
+
+    next_state: Optional[LatentState] = None
+    next_state_mean: Optional[LatentState] = None
+    std_dev_t: Optional[torch.Tensor] = None
+    dt: Optional[torch.Tensor] = None
+    log_prob: Optional[torch.Tensor] = None
+    velocity: Optional[LatentState] = None
