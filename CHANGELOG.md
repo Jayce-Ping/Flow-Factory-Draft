@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased — `feature/minimax-h3-modular-runtime`
+
+- Added classic/modular/pseudo component runtimes while preserving adapter lifecycle and
+  distributed `ModelBundle` boundaries.
+- Added structured multi-component trajectories and migrated all nine trainer interfaces; LTX2
+  now emits structured audio/video rollouts.
+- Added MiniMax H3 T2VA, FL2VA, and Ref2VA adapters with B=1/no-CFG constraints, separate
+  video/audio schedules, ordered references, and schema/API-validated GRPO LoRA examples.
+- Pinned `diffusers` to exact Git commit `f53d552036a0d1bd5570782a39cd40cfabf112bc`
+  and made PyAV >=18.0.0 a core dependency.
+- Verification covered installed-revision metadata, real pinned public APIs, no-weight
+  component-spec/workflow construction, and automated tests. The 61 GB checkpoint, GPU,
+  real-weight generation/training, memory fit, reward improvement, and numerical parity were not
+  tested.
+
+---
+
 ## Unreleased — `feature/opd-loss-targets`
 
 - Added `train.loss_target` with `xt`, `v`, and `x0` target spaces for

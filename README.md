@@ -9,10 +9,9 @@
 
 # 🔥 News
 
-* **[2026-04-25]** **LTX-2 Audio-Video** support! Generate synchronized audio-video content with RL fine-tuning. LTX-2 requires the bundled `diffusers` submodule (not yet in the official release):
+* **[2026-04-25]** **LTX-2 Audio-Video** support! Generate synchronized audio-video content with RL fine-tuning. The required unreleased APIs are supplied by the exact `diffusers` revision installed from project metadata:
 ```bash
-git submodule update --init
-pip install -e ./diffusers
+pip install -e .
 ```
 
 * **[2026-02-01]** Support for multiple **Attention Backends**! Attention-backend selection now lives in the unified `acceleration:` block (the old `model.attn_backend` knob was removed), where it can be combined with `torch.compile` and feature caching — applied in list order:
@@ -79,9 +78,20 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
   <tr><td><a href="https://huggingface.co/Lightricks/LTX-2.3">LTX-2.3</a></td><td>22B</td><td>ltx2_t2av</td></tr>
   <tr><td rowspan="2">Image-to-Audio-Video</td><td><a href="https://huggingface.co/Lightricks/LTX-2">LTX-2</a></td><td>19B</td><td>ltx2_i2av</td></tr>
   <tr><td><a href="https://huggingface.co/Lightricks/LTX-2.3">LTX-2.3</a></td><td>22B</td><td>ltx2_i2av</td></tr>
+  <tr><td>Text-to-Audio-Video</td><td><a href="https://huggingface.co/MiniMaxAI/MiniMax-H3">MiniMax H3 T2VA</a> (<a href="examples/grpo/lora/minimax_h3_t2va/default.yaml">schema/API-validated example</a>)</td><td>61 GB checkpoint</td><td>minimax-h3-t2va</td></tr>
+  <tr><td>First/Last-Frame-to-Audio-Video</td><td><a href="https://huggingface.co/MiniMaxAI/MiniMax-H3">MiniMax H3 FL2VA</a> (<a href="examples/grpo/lora/minimax_h3_fl2va/default.yaml">schema/API-validated example</a>)</td><td>61 GB checkpoint</td><td>minimax-h3-fl2va</td></tr>
+  <tr><td>Ordered-Reference-to-Audio-Video</td><td><a href="https://huggingface.co/MiniMaxAI/MiniMax-H3">MiniMax H3 Ref2VA</a> (<a href="examples/grpo/lora/minimax_h3_ref2va/default.yaml">schema/API-validated example</a>)</td><td>61 GB checkpoint</td><td>minimax-h3-ref2va</td></tr>
 </table>
 
 > To support new models, see [Guidance/New Model](guidance/new_model.md).
+
+> **MiniMax H3 status and limits:** The three examples are schema/API validated, including a real
+> pinned no-weight component-spec/workflow-build probe; the 61 GB checkpoint was not downloaded.
+> No GPU, real-weight generation/training, memory fit, reward improvement, or numerical parity is
+> claimed. H3 requires B=1 (including preprocessing), has no CFG (neutral guidance `1.0` only),
+> and keeps video/audio states separate. Video uses shift 12, audio uses shift 3, and H3's
+> data-ward velocity is converted only at the scheduler's standard-flow boundary.
+> `num_inference_steps=N` means N transitions and N + 1 states.
 
 # 💻 Supported Algorithms
 
@@ -121,11 +131,12 @@ pip install -e .[deepspeed]
 
 > **Note**: The Bagel adapter requires `flash-attn` (>= 2.5.8) and `opencv-python`. Install them with `pip install -e .[bagel]` (the `[bagel]` extra is intentionally not part of `[all]` because flash-attn is heavy to build).
 
-> **Note**: Some models (e.g., LTX-2) require pipeline code not yet released in the official `diffusers` package. For these models, install the bundled diffusers submodule:
-> ```bash
-> git submodule update --init
-> pip install -e ./diffusers
-> ```
+> **Dependency pin**: Project metadata installs `diffusers` from exact Git commit
+> `f53d552036a0d1bd5570782a39cd40cfabf112bc`; MiniMax H3 depends on unreleased modular APIs at
+> this revision. PyAV >=18.0.0 is a core dependency for reliable ordered video/audio reference
+> decoding. A future stable-release upgrade must rerun the H3 feature probe, real no-weight
+> component-spec/workflow checks, focused tests, and a separately documented real-weight smoke
+> before this pin changes.
 
 A CUDA training image (Python 3.12, **uv**-based install, PyTorch 2.8 + `cu129`, `deepspeed`, `wandb`, bundled `diffusers`) is defined under [`docker/docker-cuda/`](docker/docker-cuda/Dockerfile). See [`docker/README.md`](docker/README.md) for build and run instructions (including `linux/amd64` on Apple Silicon).
 

@@ -16,13 +16,31 @@ examples/{algorithm}/{finetune_type}/{model_type}/{variant}.yaml
 | `variant` | Config variant | `default.yaml`, `nocfg.yaml`, `t2v.yaml` |
 
 **Naming rules**:
-- Model directory names use underscores matching the config's `model_type` field (e.g., `sd3-5` → `sd3_5`, `flux1-kontext` → `flux1_kontext`).
+- Model directory names use the underscore-normalized form of the registered `model_type` key
+  (e.g., `sd3-5` → `sd3_5`, `flux1-kontext` → `flux1_kontext`,
+  `minimax-h3-t2va` → `minimax_h3_t2va`).
 - `default.yaml` is the baseline config for a model. Use descriptive names for variants (`nocfg.yaml`, `rational_rewards_t2i.yaml`, `t2v.yaml`, `i2v.yaml`).
 
 **Quick start**:
 ```bash
 ff-train examples/grpo/lora/flux1/default.yaml
 ```
+
+## Validation Status
+
+**Training verified with hardware/reward evidence** means the contributor reported the hardware,
+runtime, and observed reward trend. **Schema/API validated only** means production config parsing,
+registry resolution, and no-weight API contracts passed, but no checkpoint-backed training claim
+is made.
+
+The MiniMax H3 GRPO LoRA starting points are Schema/API validated only:
+
+- [`minimax-h3-t2va`](../examples/grpo/lora/minimax_h3_t2va/default.yaml)
+- [`minimax-h3-fl2va`](../examples/grpo/lora/minimax_h3_fl2va/default.yaml)
+- [`minimax-h3-ref2va`](../examples/grpo/lora/minimax_h3_ref2va/default.yaml)
+
+The 61 GB checkpoint was not downloaded. These examples have no GPU, memory-fit, generated-media,
+training-quality, reward-improvement, or numerical-parity evidence.
 
 ## Contributing
 

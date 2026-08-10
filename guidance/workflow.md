@@ -209,6 +209,44 @@ BaseSample(
 )
 ```
 
+### Structured Multi-Component Trajectories
+
+The legacy fields above remain authoritative when `trajectory is None`. Adapters with independently
+shaped or timed components publish `StructuredTrajectory` instead. MiniMax H3 and LTX2 publish
+structured trajectories only and leave the legacy trajectory fields unset.
+
+The structured contract is exact:
+
+- `component_order` is authoritative for scheduler and RNG dispatch; mapping iteration is not.
+- MiniMax H3 and LTX2 use video-before-audio order: `("video", "audio")`.
+- Per-component states, schedules, log probabilities, callbacks, and active masks preserve each
+  component's independent shape and timing.
+- A state index map has length T + 1 for T transitions.
+- The log-probability and callback maps have length T.
+- `-1` means that rollout position was not collected.
+- If an entire state, log-probability, or callback category was not collected, its tensor/map
+  container is represented by `None`, not by an all-`-1` synthetic map.
+- Sparse terminal-only state storage is valid.
+- Active masks exclude immutable conditioning positions.
+- Trainers consume both formats through adapter trajectory bridge hooks rather than indexing
+  legacy fields directly.
+
+Algorithm boundaries:
+
+- **GRPO, GRPO-Guard, DPPO** use coupled stochastic replay and require transition statistics plus
+  joint/per-component log probabilities.
+- **DiffusionNFT, AWM, DPO** use the structured terminal state and ordered forward-process noise.
+- **DGPO** derives deterministic per-UID component noise in authoritative component order.
+- **CRD** preserves global two-pass order and rebuilds pass-two noised state from stored component
+  noise.
+- **DiffusionOPD** requires homogeneous scheduler-group dynamics. For MiniMax H3 under
+  DiffusionOPD, teacher and student calls accept only neutral guidance `1.0`; DiffusionOPD has no
+  reward/advantage stage.
+
+Production bridges and tests cover these nine algorithm interfaces with real Flow-Factory adapters
+and faithful no-weight execution fakes. This is framework-interface compatibility, not a
+checkpoint-backed optimizer run or numerical parity result.
+
 ### Algorithm-Specific Differences
 
 | Algorithm | `compute_log_prob` | `trajectory_indices` | Notes |

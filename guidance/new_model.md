@@ -59,6 +59,41 @@ The adapter's `inference()` method corresponds to the pipeline's `__call__()`, w
 
 Your adapter only needs to implement the model-specific logic: **how to encode inputs, how to run inference, and how to perform a single denoising step**.
 
+### Component Runtime Choices
+
+`BaseAdapter` separates the model backend from component lifecycle through `ComponentRuntime`:
+
+| Backend shape | Runtime | Adapter hook |
+|---|---|---|
+| Eager diffusers pipeline | default `ClassicPipelineRuntime` | implement `load_pipeline()` |
+| Lazy modular pipeline | `ModularPipelineRuntime` | implement `load_pipeline()` and override `build_component_runtime()` |
+| Explicit non-diffusers container | `PseudoPipelineRuntime` | implement `load_pipeline()` and override `build_component_runtime()` |
+
+The runtime keeps four boundaries distinct:
+
+- **canonical lookup** addresses backend components and declarations;
+- **prepared/replacement override lookup** returns accelerator proxies, LoRA/checkpoint
+  replacements, or other explicit runtime overrides without changing canonical ownership;
+- **declared specs** describe available lazy components;
+- **materialized modules** are the canonical `torch.nn.Module` instances eligible for device,
+  dtype, and lifecycle enumeration.
+
+Consequently, `materialize_components(None)` means already-materialized modules, not every
+declared lazy spec. Lazy loading requires explicit names. Optional `None` declarations remain
+addressable for compatibility but are excluded from role and lifecycle groups. `adapter.pipeline`
+remains the backend compatibility alias.
+
+`adapter.scheduler` is always the canonical primary scheduler. Multi-component adapters use
+`scheduler_group` for ordered mode/seed dispatch, and its immutable names must equal
+`trajectory_component_order`; mapping iteration never defines RNG order. Public adapter lifecycle
+methods remain override points. `ModelBundle` and `RoutedComponentProxy` remain the only
+distributed preparation runtime—`ComponentRuntime` does not replace them.
+
+MiniMax H3 is the modular case study: each workflow prunes the upstream modular pipeline, discovers
+declared specs without loading all weights, explicitly materializes only required stages, and keeps
+video/audio scheduler order authoritative. This is an API/component-spec design contract, not
+checkpoint-backed validation.
+
 ## Step-by-Step Implementation
 
 ### Step 1: Define Sample Dataclass
