@@ -14,8 +14,11 @@
 
 """Define the three public MiniMax H3 workflow adapters."""
 
-from typing import Any, ClassVar, Dict, List, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Mapping, Optional, Tuple, Union
 
+import torch
+
+from ...samples import ComponentTimes, LatentState, MultiModalStepOutput, StackedSampleBatch
 from ...scheduler import MiniMaxH3SDEScheduler, SchedulerGroup
 from ..abc import BaseAdapter
 from ..runtime import ModularPipelineRuntime
@@ -23,9 +26,15 @@ from .workflow import (
     build_h3_component_runtime,
     build_h3_scheduler,
     build_h3_scheduler_group,
+    decode_h3_adapter_latents,
+    forward_h3_adapter,
+    forward_h3_adapter_state,
     freeze_h3_setup_components,
+    infer_h3_workflow,
     init_h3_target_module_map,
     load_h3_workflow_pipeline,
+    map_h3_training_component_times,
+    preprocess_h3_workflow,
 )
 
 
@@ -69,17 +78,47 @@ class MiniMaxH3T2VAAdapter(BaseAdapter):
     def _freeze_components(self) -> None:
         freeze_h3_setup_components(self)
 
+    def preprocess_func(self, **kwargs: Any) -> Dict[str, Any]:
+        return preprocess_h3_workflow(self, **kwargs)
+
+    def build_training_component_times(
+        self,
+        primary_timesteps: torch.Tensor,
+        *,
+        batch: Optional[StackedSampleBatch] = None,
+    ) -> ComponentTimes:
+        return map_h3_training_component_times(self, primary_timesteps)
+
     def decode_latents(self, latents: Any, **kwargs: Any) -> Any:
-        """Defer target decoding to Task 5C Commit 3."""
-        raise NotImplementedError("MiniMax H3 target decoding is implemented in Task 5C Commit 3")
+        return decode_h3_adapter_latents(self, latents, **kwargs)
 
     def inference(self, **kwargs: Any) -> List[Any]:
-        """Defer workflow rollout to Task 5C Commit 3."""
-        raise NotImplementedError("MiniMax H3 inference is implemented in Task 5C Commit 3")
+        return infer_h3_workflow(self, **kwargs)
 
-    def forward(self, **kwargs: Any) -> Any:
-        """Defer training forward to Task 5C Commit 3."""
-        raise NotImplementedError("MiniMax H3 forward is implemented in Task 5C Commit 3")
+    def _forward_state(
+        self,
+        *,
+        batch: StackedSampleBatch,
+        state: LatentState,
+        times: ComponentTimes,
+        next_state: Optional[LatentState],
+        compute_log_prob: bool,
+        return_fields: Tuple[str, ...],
+        noise_level: Optional[float],
+        forward_kwargs: Mapping[str, Any],
+    ) -> MultiModalStepOutput:
+        return forward_h3_adapter_state(
+            self,
+            state=state,
+            times=times,
+            next_state=next_state,
+            compute_log_prob=compute_log_prob,
+            noise_level=noise_level,
+            forward_kwargs=forward_kwargs,
+        )
+
+    def forward(self, **kwargs: Any) -> MultiModalStepOutput:
+        return forward_h3_adapter(self, **kwargs)
 
 
 class MiniMaxH3FL2VAAdapter(BaseAdapter):
@@ -128,17 +167,47 @@ class MiniMaxH3FL2VAAdapter(BaseAdapter):
     def _freeze_components(self) -> None:
         freeze_h3_setup_components(self)
 
+    def preprocess_func(self, **kwargs: Any) -> Dict[str, Any]:
+        return preprocess_h3_workflow(self, **kwargs)
+
+    def build_training_component_times(
+        self,
+        primary_timesteps: torch.Tensor,
+        *,
+        batch: Optional[StackedSampleBatch] = None,
+    ) -> ComponentTimes:
+        return map_h3_training_component_times(self, primary_timesteps)
+
     def decode_latents(self, latents: Any, **kwargs: Any) -> Any:
-        """Defer target decoding to Task 5C Commit 3."""
-        raise NotImplementedError("MiniMax H3 target decoding is implemented in Task 5C Commit 3")
+        return decode_h3_adapter_latents(self, latents, **kwargs)
 
     def inference(self, **kwargs: Any) -> List[Any]:
-        """Defer workflow rollout to Task 5C Commit 3."""
-        raise NotImplementedError("MiniMax H3 inference is implemented in Task 5C Commit 3")
+        return infer_h3_workflow(self, **kwargs)
 
-    def forward(self, **kwargs: Any) -> Any:
-        """Defer training forward to Task 5C Commit 3."""
-        raise NotImplementedError("MiniMax H3 forward is implemented in Task 5C Commit 3")
+    def _forward_state(
+        self,
+        *,
+        batch: StackedSampleBatch,
+        state: LatentState,
+        times: ComponentTimes,
+        next_state: Optional[LatentState],
+        compute_log_prob: bool,
+        return_fields: Tuple[str, ...],
+        noise_level: Optional[float],
+        forward_kwargs: Mapping[str, Any],
+    ) -> MultiModalStepOutput:
+        return forward_h3_adapter_state(
+            self,
+            state=state,
+            times=times,
+            next_state=next_state,
+            compute_log_prob=compute_log_prob,
+            noise_level=noise_level,
+            forward_kwargs=forward_kwargs,
+        )
+
+    def forward(self, **kwargs: Any) -> MultiModalStepOutput:
+        return forward_h3_adapter(self, **kwargs)
 
 
 class MiniMaxH3Ref2VAAdapter(BaseAdapter):
@@ -188,14 +257,44 @@ class MiniMaxH3Ref2VAAdapter(BaseAdapter):
     def _freeze_components(self) -> None:
         freeze_h3_setup_components(self)
 
+    def preprocess_func(self, **kwargs: Any) -> Dict[str, Any]:
+        return preprocess_h3_workflow(self, **kwargs)
+
+    def build_training_component_times(
+        self,
+        primary_timesteps: torch.Tensor,
+        *,
+        batch: Optional[StackedSampleBatch] = None,
+    ) -> ComponentTimes:
+        return map_h3_training_component_times(self, primary_timesteps)
+
     def decode_latents(self, latents: Any, **kwargs: Any) -> Any:
-        """Defer target decoding to Task 5C Commit 3."""
-        raise NotImplementedError("MiniMax H3 target decoding is implemented in Task 5C Commit 3")
+        return decode_h3_adapter_latents(self, latents, **kwargs)
 
     def inference(self, **kwargs: Any) -> List[Any]:
-        """Defer workflow rollout to Task 5C Commit 3."""
-        raise NotImplementedError("MiniMax H3 inference is implemented in Task 5C Commit 3")
+        return infer_h3_workflow(self, **kwargs)
 
-    def forward(self, **kwargs: Any) -> Any:
-        """Defer training forward to Task 5C Commit 3."""
-        raise NotImplementedError("MiniMax H3 forward is implemented in Task 5C Commit 3")
+    def _forward_state(
+        self,
+        *,
+        batch: StackedSampleBatch,
+        state: LatentState,
+        times: ComponentTimes,
+        next_state: Optional[LatentState],
+        compute_log_prob: bool,
+        return_fields: Tuple[str, ...],
+        noise_level: Optional[float],
+        forward_kwargs: Mapping[str, Any],
+    ) -> MultiModalStepOutput:
+        return forward_h3_adapter_state(
+            self,
+            state=state,
+            times=times,
+            next_state=next_state,
+            compute_log_prob=compute_log_prob,
+            noise_level=noise_level,
+            forward_kwargs=forward_kwargs,
+        )
+
+    def forward(self, **kwargs: Any) -> MultiModalStepOutput:
+        return forward_h3_adapter(self, **kwargs)
