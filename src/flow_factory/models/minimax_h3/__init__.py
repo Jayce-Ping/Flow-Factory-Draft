@@ -31,20 +31,36 @@ from ._common import (
     unpack_video_latents,
     validate_target_state,
 )
+from .blocks import encode_h3_workflow_inputs, prepare_h3_rollout_state, run_h3_blocks
+from .decoding import decode_h3_targets
+from .denoise import forward_h3_state, run_h3_joint_transformer, step_h3_components
+from .dependency import require_minimax_h3_support
+from .layout import H3SchedulePlan, build_h3_schedule_plan, build_row_timesteps
 
 __all__ = [
+    "H3SchedulePlan",
     "MINIMAX_H3_COMPONENT_ORDER",
     "build_component_step_output",
     "build_structured_trajectories",
     "build_training_component_times",
+    "build_h3_schedule_plan",
+    "build_row_timesteps",
     "combine_component_log_probs",
     "draw_forward_process_noise",
+    "decode_h3_targets",
+    "encode_h3_workflow_inputs",
+    "forward_h3_state",
     "framework_sigma_to_model_time",
     "inverse_shift_sigma",
     "model_time_to_framework_sigma",
     "pack_audio_latents",
     "pack_video_latents",
+    "prepare_h3_rollout_state",
+    "require_minimax_h3_support",
+    "run_h3_blocks",
+    "run_h3_joint_transformer",
     "shift_sigma",
+    "step_h3_components",
     "unpack_audio_latents",
     "unpack_video_latents",
     "validate_target_state",
