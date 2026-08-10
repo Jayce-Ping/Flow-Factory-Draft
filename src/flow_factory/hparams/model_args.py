@@ -81,6 +81,7 @@ class ModelArguments(ArgABC):
         "qwen-image", "qwen-image-edit-plus", "z-image",
         "wan2_t2v", "wan2_i2v", "wan2_v2v", "bagel",
         "ltx2_t2av", "ltx2_i2av",
+        "minimax-h3-t2va", "minimax-h3-fl2va", "minimax-h3-ref2va",
     ] = field(
         default="flux1",
         metadata={"help": "Registered model adapter key (see models/registry.py), or a custom 'pkg.module.Adapter' python path."},

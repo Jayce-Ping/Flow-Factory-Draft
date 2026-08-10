@@ -31,6 +31,11 @@ from ._common import (
     unpack_video_latents,
     validate_target_state,
 )
+from .adapters import (
+    MiniMaxH3FL2VAAdapter,
+    MiniMaxH3Ref2VAAdapter,
+    MiniMaxH3T2VAAdapter,
+)
 from .blocks import encode_h3_workflow_inputs, prepare_h3_rollout_state, run_h3_blocks
 from .decoding import decode_h3_targets
 from .denoise import forward_h3_state, run_h3_joint_transformer, step_h3_components
@@ -40,6 +45,9 @@ from .layout import H3SchedulePlan, build_h3_schedule_plan, build_row_timesteps
 __all__ = [
     "H3SchedulePlan",
     "MINIMAX_H3_COMPONENT_ORDER",
+    "MiniMaxH3FL2VAAdapter",
+    "MiniMaxH3Ref2VAAdapter",
+    "MiniMaxH3T2VAAdapter",
     "build_component_step_output",
     "build_structured_trajectories",
     "build_training_component_times",
