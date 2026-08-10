@@ -59,6 +59,22 @@ def test_component_trajectory_validates_schedule_and_state_indices() -> None:
         )
 
 
+def test_index_maps_reject_unsigned_integer_dtype() -> None:
+    with pytest.raises(TypeError, match=r"signed integer.*state_index_map.*uint8"):
+        ComponentTrajectory(
+            states=torch.zeros(3, 2),
+            timesteps=torch.tensor([1000.0, 500.0, 0.0]),
+            state_index_map=torch.tensor([0, 1, 2], dtype=torch.uint8),
+        )
+
+    with pytest.raises(TypeError, match=r"signed integer.*log_prob_index_map.*uint8"):
+        StructuredTrajectory(
+            components={"latent": _component(0.0)},
+            log_probs=torch.zeros(2),
+            log_prob_index_map=torch.tensor([0, 1], dtype=torch.uint8),
+        )
+
+
 def test_structured_trajectory_preserves_component_order_and_moves_tensors() -> None:
     trajectory = _trajectory()
 
@@ -68,6 +84,25 @@ def test_structured_trajectory_preserves_component_order_and_moves_tensors() -> 
     assert moved is trajectory
     assert trajectory.components["video"].states.device.type == "meta"
     assert trajectory.log_probs.device.type == "meta"
+
+
+def test_sample_to_routes_trajectory_tensors_through_standard_move_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    original_to = torch.Tensor.to
+
+    def tracking_to(tensor: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
+        calls.append(kwargs.copy())
+        return original_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", tracking_to)
+    sample = BaseSample(trajectory=_trajectory())
+
+    sample.to("cpu", non_blocking=True)
+
+    assert len(calls) == 10
+    assert all(call.get("non_blocking") is True for call in calls)
 
 
 def test_sample_stack_collates_nested_trajectory_and_keeps_legacy_none() -> None:
@@ -121,3 +156,17 @@ def test_sample_stack_rejects_mismatched_trajectory_metadata(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         BaseSample.stack([BaseSample(trajectory=_trajectory()), BaseSample(trajectory=second)])
+
+
+def test_recursive_dict_key_named_trajectory_stacks_normally() -> None:
+    samples = [
+        BaseSample(extra_kwargs={"nested": {"trajectory": torch.tensor([1.0])}}),
+        BaseSample(extra_kwargs={"nested": {"trajectory": torch.tensor([2.0])}}),
+    ]
+
+    batch = BaseSample.stack(samples)
+
+    assert torch.equal(
+        batch["nested"]["trajectory"],
+        torch.tensor([[1.0], [2.0]]),
+    )

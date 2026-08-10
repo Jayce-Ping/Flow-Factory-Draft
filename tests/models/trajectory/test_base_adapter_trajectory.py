@@ -57,6 +57,12 @@ class AdapterFake(BaseAdapter):
         )
 
 
+class StructuredAdapterFake(AdapterFake):
+    """Adapter fake declaring the structured video/audio component contract."""
+
+    trajectory_component_order = ("video", "audio")
+
+
 class SchedulerFake:
     """Small scheduler-like object for adapter group tests."""
 
@@ -66,6 +72,12 @@ class SchedulerFake:
 
 def _adapter() -> AdapterFake:
     adapter = object.__new__(AdapterFake)
+    adapter.pipeline = SimpleNamespace(scheduler=SchedulerFake())
+    return adapter
+
+
+def _structured_adapter() -> StructuredAdapterFake:
+    adapter = object.__new__(StructuredAdapterFake)
     adapter.pipeline = SimpleNamespace(scheduler=SchedulerFake())
     return adapter
 
@@ -121,6 +133,30 @@ def _structured_batch() -> Any:
     return BaseSample.stack(samples)
 
 
+def _structured_terminal_only_batch() -> Any:
+    samples = []
+    for offset in (0.0, 100.0):
+        samples.append(
+            BaseSample(
+                trajectory=StructuredTrajectory(
+                    components={
+                        "video": ComponentTrajectory(
+                            states=torch.tensor([[5.0, 6.0]]) + offset,
+                            timesteps=torch.tensor([1000.0, 500.0, 0.0]),
+                            state_index_map=torch.tensor([-1, -1, 0]),
+                        ),
+                        "audio": ComponentTrajectory(
+                            states=torch.tensor([[9.0]]) + offset,
+                            timesteps=torch.tensor([800.0, 300.0, 0.0]),
+                            state_index_map=torch.tensor([-1, -1, 0]),
+                        ),
+                    }
+                )
+            )
+        )
+    return BaseSample.stack(samples)
+
+
 def test_default_adapter_scheduler_group_reuses_canonical_scheduler() -> None:
     adapter = _adapter()
 
@@ -146,7 +182,7 @@ def test_legacy_terminal_and_replay_hooks_preserve_existing_indexing() -> None:
 
 
 def test_structured_replay_keeps_component_shapes_and_independent_times() -> None:
-    replay = _adapter().get_replay_step(_structured_batch(), 0)
+    replay = _structured_adapter().get_replay_step(_structured_batch(), 0)
 
     assert replay.state.components["video"].shape == (2, 2)
     assert replay.state.components["audio"].shape == (2, 1)
@@ -154,6 +190,155 @@ def test_structured_replay_keeps_component_shapes_and_independent_times() -> Non
     assert replay.times.timestep["audio"].tolist() == [800.0, 800.0]
     assert replay.times.sigma["video"].tolist() == [1.0, 1.0]
     assert replay.times.sigma["audio"].tolist() == pytest.approx([0.8, 0.8])
+
+
+def test_legacy_terminal_needs_only_latents_and_index_map() -> None:
+    batch = BaseSample.stack(
+        [
+            BaseSample(
+                all_latents=torch.tensor([[1.0], [2.0]]),
+                latent_index_map=torch.tensor([0, 1]),
+            ),
+            BaseSample(
+                all_latents=torch.tensor([[10.0], [20.0]]),
+                latent_index_map=torch.tensor([0, 1]),
+            ),
+        ]
+    )
+
+    terminal = _adapter().get_terminal_state(batch)
+
+    assert torch.equal(terminal.components["latent"], torch.tensor([[2.0], [20.0]]))
+
+
+def test_legacy_replay_allows_missing_log_probability_trajectory() -> None:
+    batch = _legacy_batch()
+    batch["log_probs"] = None
+    batch["log_prob_index_map"] = None
+
+    replay = _adapter().get_replay_step(batch, 0)
+
+    assert replay.log_prob is None
+
+
+def test_legacy_terminal_rejects_uncollected_index_sentinel() -> None:
+    batch = _legacy_batch()
+    batch["latent_index_map"] = torch.tensor([0, 1, -1])
+
+    with pytest.raises(
+        ValueError,
+        match=r"latent_index_map.*rollout position 2.*sentinel -1.*\[0, 1, -1\]",
+    ):
+        _adapter().get_terminal_state(batch)
+
+
+def test_legacy_terminal_only_map_returns_compact_state_zero() -> None:
+    batch = BaseSample.stack(
+        [
+            BaseSample(
+                all_latents=torch.tensor([[3.0]]),
+                latent_index_map=torch.tensor([-1, -1, 0]),
+            ),
+            BaseSample(
+                all_latents=torch.tensor([[30.0]]),
+                latent_index_map=torch.tensor([-1, -1, 0]),
+            ),
+        ]
+    )
+
+    terminal = _adapter().get_terminal_state(batch)
+
+    assert torch.equal(terminal.components["latent"], torch.tensor([[3.0], [30.0]]))
+
+
+@pytest.mark.parametrize(
+    ("map_name", "map_value", "message"),
+    [
+        (
+            "latent_index_map",
+            torch.tensor([-1, 1, 2]),
+            r"latent_index_map.*rollout position 0.*sentinel -1.*\[-1, 1, 2\]",
+        ),
+        (
+            "latent_index_map",
+            torch.tensor([0, -1, 2]),
+            r"latent_index_map.*rollout position 1.*sentinel -1.*\[0, -1, 2\]",
+        ),
+        (
+            "log_prob_index_map",
+            torch.tensor([-1, 1]),
+            r"log_prob_index_map.*rollout position 0.*sentinel -1.*\[-1, 1\]",
+        ),
+    ],
+)
+def test_legacy_replay_rejects_uncollected_index_sentinels(
+    map_name: str, map_value: torch.Tensor, message: str
+) -> None:
+    batch = _legacy_batch()
+    batch[map_name] = map_value
+
+    with pytest.raises(ValueError, match=message):
+        _adapter().get_replay_step(batch, 0)
+
+
+@pytest.mark.parametrize("operation", ["terminal", "replay"])
+def test_structured_hooks_require_declared_component_order(operation: str) -> None:
+    adapter = _adapter()
+    batch = _structured_batch()
+
+    with pytest.raises(
+        ValueError,
+        match=r"trajectory_component_order.*\('latent',\).*\('video', 'audio'\)",
+    ):
+        if operation == "terminal":
+            adapter.get_terminal_state(batch)
+        else:
+            adapter.get_replay_step(batch, 0)
+
+
+@pytest.mark.parametrize("operation", ["terminal", "replay"])
+def test_structured_hooks_reject_unbatched_trajectory(operation: str) -> None:
+    batch = _legacy_batch()
+    batch["trajectory"] = _structured_batch().samples[0].trajectory
+    adapter = _structured_adapter()
+
+    with pytest.raises(
+        ValueError,
+        match=r"batched StructuredTrajectory.*component 'video'.*states.*timesteps",
+    ):
+        if operation == "terminal":
+            adapter.get_terminal_state(batch)
+        else:
+            adapter.get_replay_step(batch, 0)
+
+
+def test_structured_terminal_only_sparse_map_returns_compact_state_zero() -> None:
+    terminal = _structured_adapter().get_terminal_state(_structured_terminal_only_batch())
+
+    assert torch.equal(
+        terminal.components["video"],
+        torch.tensor([[5.0, 6.0], [105.0, 106.0]]),
+    )
+    assert torch.equal(terminal.components["audio"], torch.tensor([[9.0], [109.0]]))
+
+
+def test_structured_replay_rejects_requested_uncollected_state_position() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"component 'video' state_index_map.*rollout position 0.*sentinel -1",
+    ):
+        _structured_adapter().get_replay_step(_structured_terminal_only_batch(), 0)
+
+
+def test_structured_replay_rejects_requested_uncollected_log_prob_position() -> None:
+    batch = _structured_batch()
+    batch.trajectory.log_prob_index_map = torch.tensor([-1, 0])
+
+    with pytest.raises(
+        ValueError,
+        match=r"structured log_prob_index_map.*rollout position 0.*sentinel -1",
+    ):
+        _structured_adapter().get_replay_step(batch, 0)
 
 
 def test_legacy_forward_state_preserves_arguments_and_wraps_output() -> None:
@@ -185,6 +370,22 @@ def test_legacy_forward_state_preserves_arguments_and_wraps_output() -> None:
         output.next_state.components["latent"], replay.state.components["latent"] + 1
     )
     assert torch.equal(output.log_prob, torch.tensor([0.75]))
+
+
+@pytest.mark.parametrize("collision", ["t", "t_next", "latents", "next_latents", "return_kwargs"])
+def test_forward_state_rejects_state_owned_kwarg_collisions(collision: str) -> None:
+    adapter = _adapter()
+    batch = _legacy_batch()
+    replay = adapter.get_replay_step(batch, 0)
+
+    with pytest.raises(ValueError, match=rf"state-owned.*{collision}"):
+        adapter.forward_state(
+            batch=batch,
+            state=replay.state,
+            times=replay.times,
+            next_state=replay.next_state,
+            **{collision: object()},
+        )
 
 
 def test_default_forward_process_noise_is_single_component_and_deterministic() -> None:
@@ -229,7 +430,7 @@ def test_default_heterogeneous_noise_and_axes_require_adapter_override() -> None
 
 
 def test_reduce_latent_values_uses_global_element_weighting() -> None:
-    adapter = _adapter()
+    adapter = _structured_adapter()
     values: Dict[str, torch.Tensor] = {
         "video": torch.tensor([[1.0, 3.0], [2.0, 4.0]]),
         "audio": torch.tensor([[10.0], [20.0]]),
@@ -246,6 +447,56 @@ def test_reduce_latent_values_uses_global_element_weighting() -> None:
 
     with pytest.raises(ValueError, match=r"active_numel.*audio.*positive.*0"):
         adapter.reduce_latent_values(
-            {"audio": torch.tensor([1.0])},
-            active_numel={"audio": 0},
+            {"video": torch.tensor([1.0]), "audio": torch.tensor([1.0])},
+            active_numel={"video": 1, "audio": 0},
         )
+
+
+def test_reduce_latent_values_preserves_single_component_scalar_scale() -> None:
+    values = torch.tensor([2.0, 3.0])
+
+    reduced = _adapter().reduce_latent_values(
+        {"latent": values},
+        active_numel={"latent": 17},
+    )
+
+    assert reduced is values
+
+
+@pytest.mark.parametrize(
+    ("values", "active_numel", "message"),
+    [
+        (
+            {"audio": torch.ones(2), "video": torch.ones(2)},
+            None,
+            r"trajectory_component_order.*video.*audio.*audio.*video",
+        ),
+        (
+            {"video": torch.ones(2), "audio": torch.ones(2, dtype=torch.float64)},
+            None,
+            r"compatible dtype.*video.*float32.*audio.*float64",
+        ),
+        (
+            {"video": torch.ones(2), "audio": torch.ones(2)},
+            {"video": 1},
+            r"active_numel.*exact.*video.*audio.*video",
+        ),
+    ],
+)
+def test_reduce_latent_values_validates_component_contract(
+    values: Dict[str, torch.Tensor],
+    active_numel: Dict[str, int] | None,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _structured_adapter().reduce_latent_values(values, active_numel=active_numel)
+
+
+def test_scheduler_setter_refreshes_group_primary() -> None:
+    adapter = _adapter()
+    adapter.scheduler_group = adapter.build_scheduler_group()
+    replacement = SchedulerFake()
+
+    adapter.scheduler = replacement
+
+    assert adapter.scheduler_group.primary is replacement

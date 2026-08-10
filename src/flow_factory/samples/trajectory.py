@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Mapping, Optional, Tuple, Union
+from typing import Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
 
@@ -118,10 +118,9 @@ class ComponentTrajectory:
             torch.int16,
             torch.int32,
             torch.int64,
-            torch.uint8,
         ):
             raise TypeError(
-                "expected integer ComponentTrajectory.state_index_map, "
+                "expected signed integer ComponentTrajectory.state_index_map, "
                 f"received dtype {self.state_index_map.dtype}"
             )
         state_axis = 1 if self.timesteps.ndim == 2 else 0
@@ -132,12 +131,13 @@ class ComponentTrajectory:
             )
         num_stored_states = self.states.shape[state_axis]
         if self.state_index_map.numel() and (
-            self.state_index_map.min().item() < 0
+            self.state_index_map.min().item() < -1
             or self.state_index_map.max().item() >= num_stored_states
         ):
             raise ValueError(
                 "ComponentTrajectory.state_index_map expected values for "
-                f"{num_stored_states} stored states in range [0, {num_stored_states - 1}], "
+                f"{num_stored_states} stored states in range [0, {num_stored_states - 1}] "
+                "or uncollected sentinel -1, "
                 f"received {self.state_index_map.tolist()} with maximum "
                 f"{self.state_index_map.max().item()}"
             )
@@ -157,11 +157,25 @@ class ComponentTrajectory:
         Returns:
             This trajectory after moving its tensors.
         """
-        self.states = _move_tensor(self.states, device)
-        self.timesteps = _move_tensor(self.timesteps, device)
-        self.state_index_map = _move_tensor(self.state_index_map, device)
+        self.map_tensors(lambda tensor: _move_tensor(tensor, device))
+        return self
+
+    def map_tensors(
+        self, transform: Callable[[torch.Tensor], torch.Tensor]
+    ) -> "ComponentTrajectory":
+        """Transform every trajectory tensor in place.
+
+        Args:
+            transform: Tensor transformation callback.
+
+        Returns:
+            This trajectory after transforming its tensors.
+        """
+        self.states = transform(self.states)
+        self.timesteps = transform(self.timesteps)
+        self.state_index_map = transform(self.state_index_map)
         if self.sigmas is not None:
-            self.sigmas = _move_tensor(self.sigmas, device)
+            self.sigmas = transform(self.sigmas)
         return self
 
 
@@ -227,10 +241,9 @@ class StructuredTrajectory:
                 torch.int16,
                 torch.int32,
                 torch.int64,
-                torch.uint8,
             ):
                 raise TypeError(
-                    "expected integer StructuredTrajectory.log_prob_index_map, "
+                    "expected signed integer StructuredTrajectory.log_prob_index_map, "
                     f"received dtype {self.log_prob_index_map.dtype}"
                 )
             if self.log_probs is None:
@@ -239,12 +252,12 @@ class StructuredTrajectory:
                 )
             log_prob_length = self.log_probs.shape[-1]
             if self.log_prob_index_map.numel() and (
-                self.log_prob_index_map.min().item() < 0
+                self.log_prob_index_map.min().item() < -1
                 or self.log_prob_index_map.max().item() >= log_prob_length
             ):
                 raise ValueError(
                     "expected StructuredTrajectory.log_prob_index_map values in range "
-                    f"[0, {log_prob_length - 1}], received "
+                    f"[0, {log_prob_length - 1}] or uncollected sentinel -1, received "
                     f"{self.log_prob_index_map.tolist()}"
                 )
 
@@ -262,12 +275,26 @@ class StructuredTrajectory:
         Returns:
             This trajectory after moving its tensors.
         """
+        self.map_tensors(lambda tensor: _move_tensor(tensor, device))
+        return self
+
+    def map_tensors(
+        self, transform: Callable[[torch.Tensor], torch.Tensor]
+    ) -> "StructuredTrajectory":
+        """Transform every nested trajectory tensor in place.
+
+        Args:
+            transform: Tensor transformation callback.
+
+        Returns:
+            This trajectory after transforming its tensors.
+        """
         for trajectory in self.components.values():
-            trajectory.to(device)
+            trajectory.map_tensors(transform)
         if self.log_probs is not None:
-            self.log_probs = _move_tensor(self.log_probs, device)
+            self.log_probs = transform(self.log_probs)
         if self.log_prob_index_map is not None:
-            self.log_prob_index_map = _move_tensor(self.log_prob_index_map, device)
+            self.log_prob_index_map = transform(self.log_prob_index_map)
         return self
 
     @classmethod

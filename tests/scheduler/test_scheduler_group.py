@@ -89,6 +89,19 @@ def test_scheduler_group_dispatches_modes_and_seed_in_declared_order() -> None:
     ]
 
 
+def test_scheduler_group_rejects_duplicate_names_from_ordered_pairs() -> None:
+    calls: List[Tuple[Any, ...]] = []
+
+    with pytest.raises(ValueError, match=r"unique.*duplicate.*latent"):
+        SchedulerGroup(
+            [
+                ("latent", SchedulerFake("first", calls)),
+                ("latent", SchedulerFake("second", calls)),
+            ],
+            primary_name="latent",
+        )
+
+
 @pytest.mark.parametrize(
     ("schedulers", "primary_name", "error", "message"),
     [
