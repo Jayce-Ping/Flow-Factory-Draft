@@ -90,15 +90,18 @@ from .model_bundle import RoutedComponentProxy
 from .runtime import ClassicPipelineRuntime, ComponentRuntime
 from .trajectory_bridge import (
     _add_forward_process_noise,
+    _default_reduce_component_latent_values,
+    _default_reduce_latent_values,
     _forward_state,
     _get_replay_callback,
     _get_replay_step,
     _get_state_active_numel,
     _get_terminal_state,
     _get_train_step_indices,
-    _reduce_component_latent_values,
-    _reduce_latent_values,
     _resolve_component_latent_axes,
+    _validate_reduced_component_values,
+    _validate_reduced_latent_values,
+    _validate_reduction_inputs,
 )
 from ..ema import EMAModuleWrapper
 from ..scheduler import (
@@ -2498,9 +2501,9 @@ class BaseAdapter(ABC):
     ) -> Mapping[str, torch.Tensor]:
         """Reduce each component separately to one scalar per sample.
 
-        The default averages every non-batch element. Adapters whose components
-        carry masked or conditioning positions may override this to average only
-        the active positions, which a global element sum cannot recover.
+        Validated wrapper around :meth:`_reduce_component_latent_values`. Override
+        the hook, not this method, so an override cannot bypass input or output
+        validation.
 
         Args:
             values: Raw per-element component tensors in ``trajectory_component_order``.
@@ -2509,35 +2512,86 @@ class BaseAdapter(ABC):
         Returns:
             One ``(B,)`` tensor per component, in ``trajectory_component_order``.
         """
-        return _reduce_component_latent_values(self, values, state=state)
+        batch_size = _validate_reduction_inputs(self, values, state)
+        reduced = self._reduce_component_latent_values(values, state=state)
+        return _validate_reduced_component_values(self, reduced, batch_size)
+
+    def _reduce_component_latent_values(
+        self,
+        values: Mapping[str, torch.Tensor],
+        *,
+        state: Optional[LatentState] = None,
+    ) -> Mapping[str, torch.Tensor]:
+        """Per-component reduction hook; averages every non-batch element.
+
+        Adapters whose components carry masked or conditioning positions override
+        this to average only the active positions, which a global element sum
+        cannot recover. ``state`` carries per-sample context such as a dynamic mask.
+
+        Args:
+            values: Raw per-element component tensors in ``trajectory_component_order``.
+            state: Optional replay state supplying component masks.
+
+        Returns:
+            One ``(B,)`` tensor per component, in ``trajectory_component_order``.
+        """
+        return _default_reduce_component_latent_values(self, values, state=state)
 
     def reduce_latent_values(
         self,
         values: Mapping[str, torch.Tensor],
         *,
         active_numel: Optional[Mapping[str, int]] = None,
+        state: Optional[LatentState] = None,
     ) -> torch.Tensor:
-        """Reduce component values by a global per-sample element-weighted mean.
+        """Reduce component values to one globally element-weighted scalar per sample.
 
-        Prefer passing raw per-element tensors whenever only a global result is
-        needed, so every element is weighted exactly once. ``active_numel`` is for
-        values already reduced per component, which a global sum cannot recover.
-        A single-component ``(B,)`` value is returned unchanged to preserve the
-        legacy scalar scale and tensor identity.
+        Validated wrapper around :meth:`_reduce_latent_values`. Override the hook,
+        not this method, so an override cannot bypass input or output validation.
 
         Args:
             values: Component tensors in ``trajectory_component_order``.
             active_numel: Optional partial mapping of positive weights for
-                already-reduced ``(B,)`` component scalars. Components absent
-                from the mapping derive their weights from raw tensor shapes.
+                already-reduced ``(B,)`` component scalars.
+            state: Optional replay state supplying component masks to an override.
 
         Returns:
             One globally element-weighted scalar per batch item.
         """
-        return _reduce_latent_values(
+        batch_size = _validate_reduction_inputs(self, values, state)
+        reduced = self._reduce_latent_values(values, active_numel=active_numel, state=state)
+        return _validate_reduced_latent_values(self, reduced, batch_size)
+
+    def _reduce_latent_values(
+        self,
+        values: Mapping[str, torch.Tensor],
+        *,
+        active_numel: Optional[Mapping[str, int]] = None,
+        state: Optional[LatentState] = None,
+    ) -> torch.Tensor:
+        """Global reduction hook; weights every element of every component once.
+
+        Prefer passing raw per-element tensors whenever only a global result is
+        needed. ``active_numel`` is for values already reduced per component, which
+        a global sum cannot recover. A single-component ``(B,)`` value is returned
+        unchanged to preserve the legacy scalar scale and tensor identity. The
+        default ignores ``state``; dynamic mask adapters override this to weight
+        only the elements the state marks active.
+
+        Args:
+            values: Component tensors in ``trajectory_component_order``.
+            active_numel: Optional partial mapping of positive weights for
+                already-reduced ``(B,)`` component scalars.
+            state: Optional replay state supplying component masks.
+
+        Returns:
+            One globally element-weighted scalar per batch item.
+        """
+        return _default_reduce_latent_values(
             self,
             values,
             active_numel=active_numel,
+            state=state,
         )
 
     # ======================================= Sampling & Training =======================================

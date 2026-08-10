@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from types import SimpleNamespace
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 import pytest
 import torch
@@ -263,6 +263,106 @@ def test_component_reducer_rejects_unbatched_component_values() -> None:
 
     with pytest.raises(ValueError, match=r"values\['latent'\].*batched.*\(\)"):
         adapter.reduce_component_latent_values({"latent": torch.tensor(1.0)})
+
+
+class ComponentReducerOverrideFake(StructuredAdapterFake):
+    """Adapter whose per-component reduction override is configurable per test."""
+
+    result: Any = None
+
+    def _reduce_component_latent_values(
+        self,
+        values: Mapping[str, torch.Tensor],
+        *,
+        state: Optional[LatentState] = None,
+    ) -> Mapping[str, torch.Tensor]:
+        """Return the preconfigured override result."""
+        return self.result
+
+
+def _override_adapter(result: Any) -> ComponentReducerOverrideFake:
+    adapter = object.__new__(ComponentReducerOverrideFake)
+    adapter.pipeline = SimpleNamespace(scheduler=SchedulerFake())
+    adapter.scheduler_group = adapter.build_scheduler_group()
+    adapter.result = result
+    return adapter
+
+
+def test_component_reducer_passes_state_context_to_the_override() -> None:
+    """A masked adapter averages only the active positions the state marks."""
+    values = {"video": torch.tensor([[1.0, 3.0], [2.0, 4.0]]), "audio": torch.tensor([[10.0]])}
+
+    captured: Dict[str, Any] = {}
+
+    class CapturingFake(ComponentReducerOverrideFake):
+        def _reduce_component_latent_values(
+            self,
+            values: Mapping[str, torch.Tensor],
+            *,
+            state: Optional[LatentState] = None,
+        ) -> Mapping[str, torch.Tensor]:
+            captured["state"] = state
+            return {name: value.reshape(1, -1)[:, :1].mean(dim=1) for name, value in values.items()}
+
+    adapter = object.__new__(CapturingFake)
+    adapter.pipeline = SimpleNamespace(scheduler=SchedulerFake())
+    adapter.scheduler_group = adapter.build_scheduler_group()
+    state = LatentState({"video": torch.zeros(1, 2), "audio": torch.zeros(1, 1)})
+
+    reduced = adapter.reduce_component_latent_values(
+        {"video": torch.tensor([[1.0, 3.0]]), "audio": torch.tensor([[10.0]])}, state=state
+    )
+
+    assert captured["state"] is state
+    assert torch.equal(reduced["video"], torch.tensor([1.0]))
+    assert values["audio"].shape == (1, 1)
+
+
+@pytest.mark.parametrize(
+    ("result", "message"),
+    [
+        (
+            {"audio": torch.zeros(2), "video": torch.zeros(2)},
+            r"reduce_component_latent_values.*ComponentReducerOverrideFake.*component order "
+            r"\('video', 'audio'\).*\('audio', 'video'\)",
+        ),
+        (
+            {"video": torch.zeros(2, 1), "audio": torch.zeros(2)},
+            r"reduce_component_latent_values.*\['video'\].*\(2,\).*\(2, 1\)",
+        ),
+        (
+            {"video": torch.zeros(2), "audio": torch.zeros(3)},
+            r"reduce_component_latent_values.*\['audio'\].*\(2,\).*\(3,\)",
+        ),
+        (
+            {"video": torch.zeros(2), "audio": torch.zeros(2, dtype=torch.float64)},
+            r"reduce_component_latent_values.*\['audio'\].*float32.*float64",
+        ),
+        (
+            torch.zeros(2),
+            r"reduce_component_latent_values.*ComponentReducerOverrideFake.*Mapping.*Tensor",
+        ),
+    ],
+    ids=["order", "rank", "batch", "dtype", "type"],
+)
+def test_component_reducer_validates_an_override_result(result: Any, message: str) -> None:
+    adapter = _override_adapter(result)
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        adapter.reduce_component_latent_values(
+            {"video": torch.ones(2, 3), "audio": torch.ones(2, 5)}
+        )
+
+
+def test_component_reducer_rejects_an_override_result_that_drops_the_input_batch() -> None:
+    adapter = _override_adapter({"video": torch.zeros(3), "audio": torch.zeros(3)})
+
+    with pytest.raises(
+        ValueError, match=r"reduce_component_latent_values.*\['video'\].*\(2,\).*\(3,\)"
+    ):
+        adapter.reduce_component_latent_values(
+            {"video": torch.ones(2, 3), "audio": torch.ones(2, 5)}
+        )
 
 
 def test_default_state_active_numel_counts_non_batch_elements() -> None:

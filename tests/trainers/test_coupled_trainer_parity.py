@@ -122,6 +122,31 @@ def _adapter(dynamics_type: str = "Flow-SDE") -> AdapterFake:
     return adapter
 
 
+class DynamicMaskAdapterFake(AdapterFake):
+    """Adapter reducing only the positions the replay state marks active."""
+
+    def _reduce_latent_values(
+        self,
+        values: Dict[str, torch.Tensor],
+        *,
+        active_numel: Optional[Dict[str, int]] = None,
+        state: Optional[LatentState] = None,
+    ) -> torch.Tensor:
+        """Average the elements the per-sample state mask selects."""
+        if state is None:
+            raise ValueError("expected state context for DynamicMaskAdapterFake reduction")
+        mask = state.components["latent"]
+        values_flat = values["latent"].reshape(mask.shape[0], -1)
+        return (values_flat * mask).sum(dim=1) / mask.sum(dim=1)
+
+
+def _dynamic_mask_adapter() -> DynamicMaskAdapterFake:
+    adapter = object.__new__(DynamicMaskAdapterFake)
+    adapter.pipeline = SimpleNamespace(scheduler=SchedulerFake())
+    adapter.scheduler_group = adapter.build_scheduler_group()
+    return adapter
+
+
 def _masked_adapter() -> MaskedAdapterFake:
     adapter = object.__new__(MaskedAdapterFake)
     adapter.pipeline = SimpleNamespace(scheduler=SchedulerFake())
@@ -151,12 +176,13 @@ def _trainer(cls: type, adapter: BaseAdapter, **training_args: Any) -> Any:
 
 def _replay(state: Dict[str, torch.Tensor], log_prob: Optional[torch.Tensor] = None) -> ReplayStep:
     names = tuple(state)
+    batch_size = state[names[0]].shape[0]
     return ReplayStep(
         state=LatentState(dict(state)),
         next_state=LatentState({name: value + 1 for name, value in state.items()}),
         times=ComponentTimes(
-            timestep={name: torch.tensor([500.0, 500.0]) for name in names},
-            next_timestep={name: torch.tensor([0.0, 0.0]) for name in names},
+            timestep={name: torch.full((batch_size,), 500.0) for name in names},
+            next_timestep={name: torch.zeros(batch_size) for name in names},
         ),
         log_prob=log_prob,
         component_log_probs=None if log_prob is None else {name: log_prob for name in names},
@@ -252,10 +278,12 @@ def test_grpo_reference_kl_matches_legacy_velocity_formula() -> None:
     new_velocity = torch.randn(2, 3, 4)
     ref_velocity = torch.randn(2, 3, 4)
     trainer = _trainer(GRPOTrainer, _adapter(), kl_type="v-based")
+    replay = _replay({"latent": torch.zeros(2, 3, 4)})
 
     kl_div = trainer._reference_kl_divergence(
         MultiModalStepOutput(velocity=LatentState({"latent": new_velocity})),
         MultiModalStepOutput(velocity=LatentState({"latent": ref_velocity})),
+        replay,
     )
 
     assert torch.equal(kl_div, _legacy_squared_error_kl(new_velocity, ref_velocity))
@@ -266,10 +294,12 @@ def test_grpo_reference_kl_matches_legacy_next_state_mean_formula() -> None:
     new_mean = torch.randn(2, 6)
     ref_mean = torch.randn(2, 6)
     trainer = _trainer(GRPOTrainer, _adapter(), kl_type="x-based")
+    replay = _replay({"latent": torch.zeros(2, 6)})
 
     kl_div = trainer._reference_kl_divergence(
         MultiModalStepOutput(next_state_mean=LatentState({"latent": new_mean})),
         MultiModalStepOutput(next_state_mean=LatentState({"latent": ref_mean})),
+        replay,
     )
 
     assert torch.equal(kl_div, _legacy_squared_error_kl(new_mean, ref_mean))
@@ -281,10 +311,12 @@ def test_grpo_reference_kl_reduces_raw_elements_across_components() -> None:
     new_video, ref_video = torch.randn(2, 3, 4), torch.randn(2, 3, 4)
     new_audio, ref_audio = torch.randn(2, 5), torch.randn(2, 5)
     trainer = _trainer(GRPOTrainer, _structured_adapter(), kl_type="v-based")
+    replay = _replay({"video": torch.zeros(2, 3, 4), "audio": torch.zeros(2, 5)})
 
     kl_div = trainer._reference_kl_divergence(
         MultiModalStepOutput(velocity=LatentState({"video": new_video, "audio": new_audio})),
         MultiModalStepOutput(velocity=LatentState({"video": ref_video, "audio": ref_audio})),
+        replay,
     )
 
     video_sum = (new_video - ref_video).flatten(1).pow(2).sum(dim=1)
@@ -299,9 +331,80 @@ def test_grpo_replay_requires_stored_joint_log_probability() -> None:
 
     with pytest.raises(
         ValueError,
-        match=r"joint log probability.*step_index=3.*compute_log_prob",
+        match=r"stored rollout log_prob.*GRPOTrainer.*step_index=3.*batch size 2"
+        r".*NoneType.*compute_log_prob",
     ):
         trainer._require_replay_log_prob(replay, 3)
+
+
+@pytest.mark.parametrize(
+    "trainer_cls", [GRPOTrainer, GRPOGuardTrainer, DPPOTrainer], ids=["grpo", "guard", "dppo"]
+)
+def test_stored_joint_log_probability_must_be_one_scalar_per_sample(trainer_cls: type) -> None:
+    """The replay state, not the stored tensor, defines the expected batch size."""
+    trainer = _trainer(trainer_cls, _adapter())
+    replay = ReplayStep(
+        state=LatentState({"latent": torch.zeros(2, 3)}),
+        next_state=LatentState({"latent": torch.zeros(2, 3)}),
+        times=ComponentTimes(
+            timestep={"latent": torch.zeros(2)}, next_timestep={"latent": torch.zeros(2)}
+        ),
+    )
+    object.__setattr__(replay, "log_prob", torch.zeros(2, 3))
+
+    with pytest.raises(
+        ValueError,
+        match=rf"stored rollout log_prob.*{trainer_cls.__name__}.*step_index=3.*batch size 2"
+        r".*\(2, 3\)",
+    ):
+        trainer._require_replay_log_prob(replay, 3)
+
+
+def test_stored_joint_log_probability_returns_the_validated_tensor() -> None:
+    trainer = _trainer(GRPOTrainer, _adapter())
+    log_prob = torch.tensor([0.25, -0.5])
+    replay = _replay({"latent": torch.zeros(2, 3)}, log_prob=log_prob)
+
+    assert trainer._require_replay_log_prob(replay, 0) is log_prob
+
+
+def test_grpo_reference_kl_passes_replay_state_to_the_global_reducer() -> None:
+    """A dynamic mask adapter needs state context to weight only active elements."""
+    torch.manual_seed(21)
+    new_velocity, ref_velocity = torch.randn(2, 4), torch.randn(2, 4)
+    adapter = _dynamic_mask_adapter()
+    trainer = _trainer(GRPOTrainer, adapter, kl_type="v-based")
+    mask = torch.tensor([[1.0, 1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
+    replay = _replay({"latent": mask})
+
+    kl_div = trainer._reference_kl_divergence(
+        MultiModalStepOutput(velocity=LatentState({"latent": new_velocity})),
+        MultiModalStepOutput(velocity=LatentState({"latent": ref_velocity})),
+        replay,
+    )
+
+    squared = (new_velocity - ref_velocity) ** 2
+    expected = torch.mean((squared * mask).sum(dim=1) / mask.sum(dim=1))
+    assert torch.equal(kl_div, expected)
+
+
+def test_dppo_trust_region_kl_passes_replay_state_to_the_global_reducer() -> None:
+    torch.manual_seed(22)
+    new_velocity, old_velocity = torch.randn(2, 4), torch.randn(2, 4)
+    adapter = _dynamic_mask_adapter()
+    trainer = _trainer(DPPOTrainer, adapter, kl_mask_type="v-based")
+    mask = torch.tensor([[1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 0.0, 0.0]])
+    replay = _replay({"latent": mask})
+
+    kl_new_old = trainer._trust_region_kl(
+        MultiModalStepOutput(velocity=LatentState({"latent": new_velocity})),
+        replay,
+        LatentState({"latent": old_velocity}),
+    )
+
+    squared = (new_velocity - old_velocity) ** 2
+    expected = (squared * mask).sum(dim=1) / mask.sum(dim=1)
+    assert torch.equal(kl_new_old, expected)
 
 
 def test_grpo_replay_forward_kwargs_keep_batch_precedence() -> None:
@@ -437,23 +540,16 @@ def test_guard_ratio_weights_two_components_by_active_degrees_of_freedom() -> No
     assert torch.equal(ratio, expected)
 
 
-def test_guard_ratio_rejects_statistic_with_multiple_non_batch_values() -> None:
-    torch.manual_seed(8)
-    log_prob = torch.zeros(2)
+def test_guard_statistic_normalization_rejects_multiple_non_batch_values() -> None:
     trainer = _trainer(GRPOGuardTrainer, _adapter())
-    replay = _replay({"latent": torch.zeros(2, 3, 4)}, log_prob=log_prob)
-    output = _guard_output(
-        {"latent": torch.zeros(2, 3, 4)},
-        {"latent": log_prob},
-        {"latent": torch.full((2, 3, 1), 0.3)},
-        {"latent": torch.full((2, 1, 1), -0.4)},
-    )
 
     with pytest.raises(
         ValueError,
         match=r"std_dev_t.*component 'latent'.*one value per sample.*\(2, 3, 1\)",
     ):
-        trainer._guard_ratio(output, replay, LatentState({"latent": torch.zeros(2, 3, 4)}))
+        trainer._scalar_component_statistic(
+            {"latent": torch.full((2, 3, 1), 0.3)}, "std_dev_t", "latent", 2
+        )
 
 
 def test_guard_statistic_normalization_rejects_a_mismatched_batch_size() -> None:

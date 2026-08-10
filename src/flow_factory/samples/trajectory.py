@@ -85,6 +85,37 @@ def _require_scalar_per_sample(
             )
 
 
+def _require_scalar_like_per_sample(
+    values: Mapping[str, torch.Tensor], batch_size: int, identifier: str
+) -> None:
+    """Require a broadcast statistic carrying exactly one value per sample."""
+    _require_component_batch_size(values, batch_size, identifier)
+    for name, value in values.items():
+        if value.numel() != batch_size:
+            raise ValueError(
+                f"expected {identifier}[{name!r}] to hold exactly one value per sample, "
+                f"received shape {tuple(value.shape)}"
+            )
+
+
+def _require_scalar_or_batched(
+    values: Mapping[str, torch.Tensor], batch_size: int, identifier: str
+) -> None:
+    """Allow a 0-dim shared coordinate or a leading batch dimension.
+
+    Legacy replay stores the terminal ``t_next`` as a 0-dim scalar shared by the
+    whole batch, so scheduler coordinates cannot require a batch axis.
+    """
+    for name, value in values.items():
+        if value.ndim == 0:
+            continue
+        if value.shape[0] != batch_size:
+            raise ValueError(
+                f"expected {identifier}[{name!r}] to be a 0-dim scalar or use batch size "
+                f"{batch_size}, received shape {tuple(value.shape)}"
+            )
+
+
 def _move_tensor(tensor: torch.Tensor, device: Union[torch.device, str]) -> torch.Tensor:
     return tensor.to(device)
 
@@ -849,15 +880,31 @@ class ReplayStep:
             )
         expected_names = self.state.component_names
         batch_size = _batch_size_of(self.state, "ReplayStep.state")
+        _require_component_batch_size(self.state.components, batch_size, "ReplayStep.state")
         _require_component_order(
             self.next_state.component_names, expected_names, "ReplayStep.next_state"
-        )
-        _require_component_order(
-            tuple(self.times.timestep), expected_names, "ReplayStep.times.timestep"
         )
         _require_component_batch_size(
             self.next_state.components, batch_size, "ReplayStep.next_state"
         )
+        for field_name in ("timestep", "next_timestep", "sigma", "next_sigma"):
+            times = getattr(self.times, field_name)
+            if times is None:
+                continue
+            identifier = f"ReplayStep.times.{field_name}"
+            _require_component_order(tuple(times), expected_names, identifier)
+            _require_scalar_or_batched(times, batch_size, identifier)
+        if self.log_prob is not None:
+            if not isinstance(self.log_prob, torch.Tensor):
+                raise TypeError(
+                    "expected torch.Tensor or None for ReplayStep.log_prob, "
+                    f"received {type(self.log_prob).__name__}"
+                )
+            if self.log_prob.shape != (batch_size,):
+                raise ValueError(
+                    f"expected ReplayStep.log_prob shape {(batch_size,)}, "
+                    f"received {tuple(self.log_prob.shape)}"
+                )
         if self.component_log_probs is not None:
             _require_component_order(
                 tuple(self.component_log_probs), expected_names, "ReplayStep.component_log_probs"
@@ -914,7 +961,7 @@ class MultiModalStepOutput:
                 field_name,
                 _validate_component_mapping(values, f"MultiModalStepOutput.{field_name}"),
             )
-        reference = self._reference_state()
+        reference = self._reference_contract()
         if reference is None:
             return
         expected_names, batch_size = reference
@@ -928,21 +975,29 @@ class MultiModalStepOutput:
             _require_component_batch_size(
                 state.components, batch_size, f"MultiModalStepOutput.{field_name}"
             )
-        for field_name in ("std_dev_t", "dt", "component_log_probs"):
+        for field_name in ("std_dev_t", "dt"):
             values = getattr(self, field_name)
             if values is None:
                 continue
-            _require_component_order(
-                tuple(values), expected_names, f"MultiModalStepOutput.{field_name}"
-            )
-            _require_component_batch_size(values, batch_size, f"MultiModalStepOutput.{field_name}")
+            identifier = f"MultiModalStepOutput.{field_name}"
+            _require_component_order(tuple(values), expected_names, identifier)
+            _require_scalar_like_per_sample(values, batch_size, identifier)
         if self.component_log_probs is not None:
+            _require_component_order(
+                tuple(self.component_log_probs),
+                expected_names,
+                "MultiModalStepOutput.component_log_probs",
+            )
             _require_scalar_per_sample(
                 self.component_log_probs, batch_size, "MultiModalStepOutput.component_log_probs"
             )
 
-    def _reference_state(self) -> Optional[Tuple[Tuple[str, ...], int]]:
-        """Return the component order and batch size the other fields must match."""
+    def _reference_contract(self) -> Optional[Tuple[Tuple[str, ...], int]]:
+        """Return the component order and batch size the other fields must match.
+
+        A statistics-only output carries no latent state, so the first available
+        component mapping becomes authoritative instead.
+        """
         for field_name in ("next_state", "next_state_mean", "velocity"):
             state = getattr(self, field_name)
             if state is not None:
@@ -950,4 +1005,16 @@ class MultiModalStepOutput:
                     state.component_names,
                     _batch_size_of(state, f"MultiModalStepOutput.{field_name}"),
                 )
+        for field_name in ("std_dev_t", "dt", "component_log_probs"):
+            values = getattr(self, field_name)
+            if values is None:
+                continue
+            names = tuple(values)
+            first = values[names[0]]
+            if first.ndim < 1:
+                raise ValueError(
+                    f"expected batched tensor for MultiModalStepOutput.{field_name}"
+                    f"[{names[0]!r}], received shape {tuple(first.shape)}"
+                )
+            return names, first.shape[0]
         return None

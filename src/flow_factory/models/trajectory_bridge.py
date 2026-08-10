@@ -652,12 +652,12 @@ def _resolve_component_latent_axes(
     return adapter.resolve_latent_axes(latents)
 
 
-def _reduce_component_latent_values(
+def _validate_reduction_inputs(
     adapter: Any,
     values: Mapping[str, torch.Tensor],
-    *,
     state: Optional[LatentState],
-) -> Dict[str, torch.Tensor]:
+) -> int:
+    """Validate the shared reduction input contract and return the batch size."""
     if not isinstance(values, Mapping) or not values:
         raise ValueError(
             f"expected non-empty Mapping[str, torch.Tensor] for values, received "
@@ -669,12 +669,108 @@ def _reduce_component_latent_values(
             f"expected values keys/order to match trajectory_component_order "
             f"{expected_names}, received {tuple(values)}"
         )
-    if state is not None and state.component_names != expected_names:
-        raise ValueError(
-            f"expected state component order {expected_names}, received {state.component_names}"
+    first = values[expected_names[0]]
+    if not isinstance(first, torch.Tensor):
+        raise TypeError(
+            f"expected batched torch.Tensor for values[{expected_names[0]!r}], "
+            f"received {type(first).__name__}"
         )
-    reduced: Dict[str, torch.Tensor] = {}
+    if first.ndim < 1:
+        raise ValueError(
+            f"expected values[{expected_names[0]!r}] to be a batched torch.Tensor with a "
+            f"leading batch dimension, received shape {tuple(first.shape)}"
+        )
+    batch_size = first.shape[0]
+    if state is not None:
+        if not isinstance(state, LatentState):
+            raise TypeError(
+                f"expected LatentState or None for state, received {type(state).__name__}"
+            )
+        if state.component_names != expected_names:
+            raise ValueError(
+                f"expected state component order {expected_names}, "
+                f"received {state.component_names}"
+            )
+        for name, component_state in state.components.items():
+            if component_state.ndim < 1 or component_state.shape[0] != batch_size:
+                raise ValueError(
+                    f"expected state[{name!r}] to use the values batch size {batch_size}, "
+                    f"received shape {tuple(component_state.shape)}"
+                )
+    return batch_size
+
+
+def _validate_reduced_component_values(
+    adapter: Any,
+    reduced: Mapping[str, torch.Tensor],
+    batch_size: int,
+) -> Dict[str, torch.Tensor]:
+    """Validate a per-component reduction result before any trainer consumes it."""
+    identifier = f"reduce_component_latent_values on {type(adapter).__name__}"
+    if not isinstance(reduced, Mapping):
+        raise TypeError(
+            f"expected {identifier} to return Mapping[str, torch.Tensor], "
+            f"received {type(reduced).__name__}"
+        )
+    expected_names = adapter.trajectory_component_order
+    if tuple(reduced) != expected_names:
+        raise ValueError(
+            f"expected {identifier} to return component order {expected_names}, "
+            f"received {tuple(reduced)}"
+        )
+    expected_device: Optional[torch.device] = None
+    expected_dtype: Optional[torch.dtype] = None
     for name in expected_names:
+        component_values = reduced[name]
+        if not isinstance(component_values, torch.Tensor):
+            raise TypeError(
+                f"expected {identifier} result [{name!r}] to be a torch.Tensor, "
+                f"received {type(component_values).__name__}"
+            )
+        if component_values.shape != (batch_size,):
+            raise ValueError(
+                f"expected {identifier} result [{name!r}] shape {(batch_size,)}, "
+                f"received {tuple(component_values.shape)}"
+            )
+        if expected_device is None:
+            expected_device = component_values.device
+            expected_dtype = component_values.dtype
+        elif component_values.device != expected_device or component_values.dtype != expected_dtype:
+            raise ValueError(
+                f"expected {identifier} result [{name!r}] to match component "
+                f"{expected_names[0]!r} ({expected_device}, {expected_dtype}), received "
+                f"({component_values.device}, {component_values.dtype})"
+            )
+    return dict(reduced)
+
+
+def _validate_reduced_latent_values(
+    adapter: Any,
+    reduced: torch.Tensor,
+    batch_size: int,
+) -> torch.Tensor:
+    """Validate a global reduction result before any trainer consumes it."""
+    identifier = f"reduce_latent_values on {type(adapter).__name__}"
+    if not isinstance(reduced, torch.Tensor):
+        raise TypeError(
+            f"expected {identifier} to return a torch.Tensor, received {type(reduced).__name__}"
+        )
+    if reduced.shape != (batch_size,):
+        raise ValueError(
+            f"expected {identifier} to return one scalar per sample with shape "
+            f"{(batch_size,)}, received {tuple(reduced.shape)}"
+        )
+    return reduced
+
+
+def _default_reduce_component_latent_values(
+    adapter: Any,
+    values: Mapping[str, torch.Tensor],
+    *,
+    state: Optional[LatentState],
+) -> Dict[str, torch.Tensor]:
+    reduced: Dict[str, torch.Tensor] = {}
+    for name in adapter.trajectory_component_order:
         component_values = values[name]
         if not isinstance(component_values, torch.Tensor) or component_values.ndim < 1:
             raise ValueError(
@@ -687,24 +783,14 @@ def _reduce_component_latent_values(
     return reduced
 
 
-def _reduce_latent_values(
+def _default_reduce_latent_values(
     adapter: Any,
     values: Mapping[str, torch.Tensor],
     *,
     active_numel: Optional[Mapping[str, int]],
+    state: Optional[LatentState],
 ) -> torch.Tensor:
-    if not isinstance(values, Mapping) or not values:
-        raise ValueError(
-            f"expected non-empty Mapping[str, torch.Tensor] for values, received "
-            f"{type(values).__name__}"
-        )
     expected_names = adapter.trajectory_component_order
-    received_names = tuple(values)
-    if received_names != expected_names:
-        raise ValueError(
-            f"expected values keys/order to match trajectory_component_order "
-            f"{expected_names}, received {received_names}"
-        )
     if active_numel is not None:
         if not isinstance(active_numel, Mapping):
             raise TypeError(

@@ -137,13 +137,18 @@ class GRPOTrainer(BaseTrainer):
 
     def _require_replay_log_prob(self, replay: ReplayStep, step_index: int) -> torch.Tensor:
         """Return the stored rollout joint log probability for one transition."""
-        if replay.log_prob is None:
-            raise ValueError(
-                f"expected a stored joint log probability at step_index={step_index} for "
-                f"{type(self).__name__} replay, received None; rerun sampling with "
-                "compute_log_prob=True"
-            )
-        return replay.log_prob
+        batch_size = self._replay_batch_size(replay)
+        log_prob = replay.log_prob
+        if isinstance(log_prob, torch.Tensor) and log_prob.shape == (batch_size,):
+            return log_prob
+        received = (
+            tuple(log_prob.shape) if isinstance(log_prob, torch.Tensor) else type(log_prob).__name__
+        )
+        raise ValueError(
+            f"expected stored rollout log_prob for {type(self).__name__} replay at "
+            f"step_index={step_index} to be a tensor of shape (B,) with batch size "
+            f"{batch_size}, received {received}; rerun sampling with compute_log_prob=True"
+        )
 
     def _require_policy_log_prob(
         self, output: MultiModalStepOutput, step_index: int, batch_size: int
@@ -247,6 +252,7 @@ class GRPOTrainer(BaseTrainer):
         self,
         output: MultiModalStepOutput,
         ref_output: MultiModalStepOutput,
+        replay: ReplayStep,
     ) -> torch.Tensor:
         """Scalar policy-vs-reference squared error in the configured KL space."""
         output_field, _ = self._kl_space_fields(self.training_args.kl_type, "kl_type")
@@ -255,7 +261,7 @@ class GRPOTrainer(BaseTrainer):
             self._require_output_state(ref_output, output_field, "reference"),
             "reference",
         )
-        return torch.mean(self.adapter.reduce_latent_values(errors))
+        return torch.mean(self.adapter.reduce_latent_values(errors, state=replay.state))
 
     def start(self):
         """Main training loop."""
@@ -391,7 +397,7 @@ class GRPOTrainer(BaseTrainer):
                                 )
                                 # kl_div must be computed outside `torch.no_grad()` for correct gradient behavior.
                                 # See: issue #122, PR #123 (https://github.com/X-GenGroup/Flow-Factory/pull/123)
-                                kl_div = self._reference_kl_divergence(output, ref_output)
+                                kl_div = self._reference_kl_divergence(output, ref_output, replay)
                                 kl_loss = self.training_args.kl_beta * kl_div
                                 loss += kl_loss
                                 loss_info['kl_div'].append(kl_div.detach())
@@ -535,6 +541,7 @@ class GRPOGuardTrainer(GRPOTrainer):
             self.adapter.reduce_latent_values(
                 guard_terms,
                 active_numel=self.adapter.get_state_active_numel(replay.state),
+                state=replay.state,
             )
         )
 
@@ -637,7 +644,7 @@ class GRPOGuardTrainer(GRPOTrainer):
                                 )
                                 # kl_div must be computed outside `torch.no_grad()` for correct gradient behavior.
                                 # See: issue #122, PR #123 (https://github.com/X-GenGroup/Flow-Factory/pull/123)
-                                kl_div = self._reference_kl_divergence(output, ref_output)
+                                kl_div = self._reference_kl_divergence(output, ref_output, replay)
                                 kl_loss = self.training_args.kl_beta * kl_div
                                 loss += kl_loss
                                 loss_info['kl_div'].append(kl_div.detach())

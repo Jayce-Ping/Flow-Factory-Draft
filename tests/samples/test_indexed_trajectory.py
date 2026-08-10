@@ -306,6 +306,157 @@ def test_multi_modal_step_output_requires_a_shared_batch_size() -> None:
         )
 
 
+def test_replay_step_validates_every_state_component_batch_size() -> None:
+    with pytest.raises(ValueError, match=r"ReplayStep.state\['audio'\].*batch size 2.*\(3, 4\)"):
+        ReplayStep(
+            state=LatentState({"video": torch.zeros(2, 3), "audio": torch.zeros(3, 4)}),
+            next_state=LatentState({"video": torch.zeros(2, 3), "audio": torch.zeros(2, 4)}),
+            times=_times(("video", "audio")),
+        )
+
+
+@pytest.mark.parametrize("field", ["next_timestep", "sigma", "next_sigma"])
+def test_component_times_validates_every_mapping_order(field: str) -> None:
+    names = ("video", "audio")
+    kwargs = {
+        "timestep": {name: torch.tensor([500.0, 500.0]) for name in names},
+        "next_timestep": {name: torch.tensor([0.0, 0.0]) for name in names},
+        "sigma": {name: torch.tensor([1.0, 1.0]) for name in names},
+        "next_sigma": {name: torch.tensor([0.0, 0.0]) for name in names},
+    }
+    kwargs[field] = {name: kwargs[field][name] for name in reversed(names)}
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{field} component order \('video', 'audio'\).*\('audio', 'video'\)",
+    ):
+        ComponentTimes(**kwargs)
+
+
+def test_replay_step_requires_times_to_match_the_state_component_order() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"ReplayStep.times.timestep component order "
+        r"\('video', 'audio'\).*\('audio', 'video'\)",
+    ):
+        ReplayStep(
+            state=LatentState({"video": torch.zeros(2, 3), "audio": torch.zeros(2, 4)}),
+            next_state=LatentState({"video": torch.zeros(2, 3), "audio": torch.zeros(2, 4)}),
+            times=_times(("audio", "video")),
+        )
+
+
+@pytest.mark.parametrize("field", ["sigma", "next_sigma"])
+def test_replay_step_validates_optional_time_mapping_batch_sizes(field: str) -> None:
+    names = ("latent",)
+    kwargs = {
+        "timestep": {name: torch.tensor([500.0, 500.0]) for name in names},
+        "next_timestep": {name: torch.tensor([0.0, 0.0]) for name in names},
+    }
+    kwargs[field] = {name: torch.zeros(3) for name in names}
+
+    with pytest.raises(
+        ValueError, match=rf"ReplayStep.times.{field}\['latent'\].*batch size 2.*\(3,\)"
+    ):
+        ReplayStep(
+            state=LatentState({"latent": torch.zeros(2, 3)}),
+            next_state=LatentState({"latent": torch.zeros(2, 3)}),
+            times=ComponentTimes(**kwargs),
+        )
+
+
+def test_replay_step_allows_the_legacy_scalar_terminal_timestep() -> None:
+    replay = ReplayStep(
+        state=LatentState({"latent": torch.zeros(2, 3)}),
+        next_state=LatentState({"latent": torch.zeros(2, 3)}),
+        times=ComponentTimes(
+            timestep={"latent": torch.tensor([500.0, 500.0])},
+            next_timestep={"latent": torch.tensor(0)},
+        ),
+    )
+
+    assert replay.times.next_timestep["latent"].ndim == 0
+
+
+def test_replay_step_rejects_a_batched_time_with_a_foreign_batch_size() -> None:
+    with pytest.raises(
+        ValueError, match=r"ReplayStep.times.timestep\['latent'\].*batch size 2.*\(3,\)"
+    ):
+        ReplayStep(
+            state=LatentState({"latent": torch.zeros(2, 3)}),
+            next_state=LatentState({"latent": torch.zeros(2, 3)}),
+            times=ComponentTimes(
+                timestep={"latent": torch.zeros(3)},
+                next_timestep={"latent": torch.tensor(0)},
+            ),
+        )
+
+
+def test_replay_step_requires_a_scalar_joint_log_probability() -> None:
+    with pytest.raises(ValueError, match=r"ReplayStep.log_prob.*\(2,\).*\(2, 3\)"):
+        ReplayStep(
+            state=LatentState({"latent": torch.zeros(2, 3)}),
+            next_state=LatentState({"latent": torch.zeros(2, 3)}),
+            times=_times(("latent",)),
+            log_prob=torch.zeros(2, 3),
+        )
+
+
+def test_replay_step_requires_component_log_probs_in_state_order() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"ReplayStep.component_log_probs component order "
+        r"\('video', 'audio'\).*\('audio', 'video'\)",
+    ):
+        ReplayStep(
+            state=LatentState({"video": torch.zeros(2, 3), "audio": torch.zeros(2, 4)}),
+            next_state=LatentState({"video": torch.zeros(2, 3), "audio": torch.zeros(2, 4)}),
+            times=_times(("video", "audio")),
+            component_log_probs={"audio": torch.zeros(2), "video": torch.zeros(2)},
+        )
+
+
+def test_multi_modal_step_output_validates_a_statistics_only_output() -> None:
+    """No latent state field: the first available mapping is authoritative."""
+    output = MultiModalStepOutput(
+        std_dev_t={"latent": torch.full((2, 1, 1), 0.25)},
+        dt={"latent": torch.full((2, 1, 1), -0.5)},
+        component_log_probs={"latent": torch.tensor([0.75, 0.5])},
+    )
+
+    assert tuple(output.std_dev_t) == ("latent",)
+
+    with pytest.raises(
+        ValueError,
+        match=r"MultiModalStepOutput.dt component order \('latent',\).*\('audio',\)",
+    ):
+        MultiModalStepOutput(
+            std_dev_t={"latent": torch.full((2, 1), 0.25)},
+            dt={"audio": torch.full((2, 1), -0.5)},
+        )
+
+    with pytest.raises(
+        ValueError,
+        match=r"MultiModalStepOutput.component_log_probs\['latent'\].*\(2,\).*\(3,\)",
+    ):
+        MultiModalStepOutput(
+            std_dev_t={"latent": torch.full((2, 1), 0.25)},
+            component_log_probs={"latent": torch.zeros(3)},
+        )
+
+
+@pytest.mark.parametrize("field", ["std_dev_t", "dt"])
+def test_multi_modal_step_output_requires_scalar_like_scheduler_statistics(field: str) -> None:
+    with pytest.raises(
+        ValueError,
+        match=rf"MultiModalStepOutput.{field}\['latent'\].*one value per sample.*\(2, 3, 1\)",
+    ):
+        MultiModalStepOutput(
+            next_state_mean=LatentState({"latent": torch.zeros(2, 3, 4)}),
+            **{field: {"latent": torch.zeros(2, 3, 1)}},
+        )
+
+
 def test_multi_modal_step_output_requires_scalar_component_log_probabilities() -> None:
     with pytest.raises(
         ValueError,

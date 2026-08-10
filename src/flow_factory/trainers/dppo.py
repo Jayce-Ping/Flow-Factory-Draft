@@ -123,7 +123,7 @@ class DPPOTrainer(GRPOTrainer):
                     new_state.components[name], old_state.components[name], sigma_t
                 )
         # Raw per-element values, so one global reduction weights every element once.
-        return self.adapter.reduce_latent_values(component_kl)
+        return self.adapter.reduce_latent_values(component_kl, state=replay.state)
 
     # =========================== Sampling Loop ============================
     def sample(self) -> List[BaseSample]:
@@ -242,7 +242,7 @@ class DPPOTrainer(GRPOTrainer):
                                     batch, replay, (ref_return_field,), **ref_overrides
                                 )
                                 # kl_div must be computed outside `torch.no_grad()` for correct gradients.
-                                kl_div = self._reference_kl_divergence(output, ref_output)
+                                kl_div = self._reference_kl_divergence(output, ref_output, replay)
                                 kl_loss = self.training_args.kl_beta * kl_div
                                 loss += kl_loss
                                 loss_info["kl_div"].append(kl_div.detach())

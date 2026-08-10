@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from types import SimpleNamespace
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping, Optional
 
 import pytest
 import torch
@@ -532,6 +532,108 @@ def test_reduce_latent_values_validates_component_contract(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         _structured_adapter().reduce_latent_values(values, active_numel=active_numel)
+
+
+class DynamicMaskAdapterFake(StructuredAdapterFake):
+    """Adapter reducing only the positions a per-sample state mask marks active."""
+
+    def _reduce_latent_values(
+        self,
+        values: Mapping[str, torch.Tensor],
+        *,
+        active_numel: Optional[Mapping[str, int]] = None,
+        state: Optional[LatentState] = None,
+    ) -> torch.Tensor:
+        """Average the active elements the state mask selects."""
+        if state is None:
+            raise ValueError("expected state context for DynamicMaskAdapterFake reduction")
+        total, weight = None, None
+        for name, component_values in values.items():
+            mask = (state.components[name] > 0).reshape(component_values.shape[0], -1)
+            flat = component_values.reshape(component_values.shape[0], -1)
+            component_sum = (flat * mask).sum(dim=1)
+            component_weight = mask.sum(dim=1)
+            total = component_sum if total is None else total + component_sum
+            weight = component_weight if weight is None else weight + component_weight
+        return total / weight
+
+
+class BrokenGlobalReducerFake(StructuredAdapterFake):
+    """Adapter whose global reduction override returns a malformed result."""
+
+    def _reduce_latent_values(
+        self,
+        values: Mapping[str, torch.Tensor],
+        *,
+        active_numel: Optional[Mapping[str, int]] = None,
+        state: Optional[LatentState] = None,
+    ) -> torch.Tensor:
+        """Return a per-element tensor instead of one scalar per sample."""
+        return values["video"]
+
+
+def _dynamic_mask_adapter() -> DynamicMaskAdapterFake:
+    adapter = object.__new__(DynamicMaskAdapterFake)
+    adapter.pipeline = SimpleNamespace(scheduler=SchedulerFake())
+    adapter.scheduler_group = adapter.build_scheduler_group()
+    return adapter
+
+
+def _broken_global_reducer_adapter() -> BrokenGlobalReducerFake:
+    adapter = object.__new__(BrokenGlobalReducerFake)
+    adapter.pipeline = SimpleNamespace(scheduler=SchedulerFake())
+    adapter.scheduler_group = adapter.build_scheduler_group()
+    return adapter
+
+
+def test_reduce_latent_values_passes_state_context_to_the_override() -> None:
+    """A dynamic mask adapter reduces only the elements the state marks active."""
+    values = {
+        "video": torch.tensor([[1.0, 3.0], [2.0, 4.0]]),
+        "audio": torch.tensor([[10.0], [20.0]]),
+    }
+    state = LatentState(
+        {
+            "video": torch.tensor([[1.0, 0.0], [1.0, 1.0]]),
+            "audio": torch.tensor([[1.0], [0.0]]),
+        }
+    )
+
+    reduced = _dynamic_mask_adapter().reduce_latent_values(values, state=state)
+
+    assert torch.equal(reduced, torch.tensor([(1.0 + 10.0) / 2.0, (2.0 + 4.0) / 2.0]))
+
+
+def test_reduce_latent_values_default_ignores_state_context() -> None:
+    """The default hook stays bitwise identical whether or not state is supplied."""
+    values = {"latent": torch.tensor([[1.0, 3.0], [2.0, 4.0]])}
+    state = LatentState({"latent": torch.zeros(2, 2)})
+    adapter = _adapter()
+
+    assert torch.equal(
+        adapter.reduce_latent_values(values, state=state),
+        adapter.reduce_latent_values(values),
+    )
+
+
+def test_reduce_latent_values_rejects_state_with_a_foreign_component_order() -> None:
+    adapter = _structured_adapter()
+    values = {"video": torch.ones(2, 2), "audio": torch.ones(2, 1)}
+
+    with pytest.raises(ValueError, match=r"state component order.*video.*audio.*audio.*video"):
+        adapter.reduce_latent_values(
+            values, state=LatentState({"audio": torch.ones(2, 1), "video": torch.ones(2, 2)})
+        )
+
+
+def test_reduce_latent_values_validates_an_override_result() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"reduce_latent_values.*BrokenGlobalReducerFake.*\(2,\).*\(2, 2\)",
+    ):
+        _broken_global_reducer_adapter().reduce_latent_values(
+            {"video": torch.ones(2, 2), "audio": torch.ones(2, 1)}
+        )
 
 
 def test_scheduler_setter_refreshes_group_primary() -> None:
