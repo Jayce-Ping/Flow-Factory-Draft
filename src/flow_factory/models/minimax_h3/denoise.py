@@ -195,7 +195,11 @@ def step_h3_components(
             sigma=times.sigma[component],
             sigma_next=times.next_sigma[component],
         )
-    return build_component_step_output(outputs["video"], outputs["audio"])
+    return build_component_step_output(
+        outputs["video"],
+        outputs["audio"],
+        reference_state=state,
+    )
 
 
 def forward_h3_state(

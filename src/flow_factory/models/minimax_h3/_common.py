@@ -441,12 +441,16 @@ def combine_component_log_probs(
 def build_component_step_output(
     video_output: SDESchedulerOutput,
     audio_output: SDESchedulerOutput,
+    *,
+    reference_state: Optional[LatentState] = None,
 ) -> MultiModalStepOutput:
     """Build one heterogeneous step output from real component scheduler outputs.
 
     Args:
         video_output: Video scheduler transition output.
         audio_output: Audio scheduler transition output.
+        reference_state: Current component state used only to weight scalar log probabilities
+            when the requested scheduler fields contain no latent-shaped output.
 
     Returns:
         Component-preserving multimodal transition output.
@@ -476,6 +480,9 @@ def build_component_step_output(
     log_prob = None
     if component_log_probs is not None:
         reference_values = next_state_values or next_mean_values or velocity_values
+        if reference_values is None and reference_state is not None:
+            validate_target_state(reference_state)
+            reference_values = dict(reference_state.components)
         if reference_values is None:
             raise ValueError(
                 "expected next_latents, next_latents_mean, or velocity to determine "
