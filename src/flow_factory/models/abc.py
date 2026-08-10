@@ -90,6 +90,8 @@ from .model_bundle import RoutedComponentProxy
 from .runtime import ClassicPipelineRuntime, ComponentRuntime
 from .trajectory_bridge import (
     _add_forward_process_noise,
+    _apply_forward_process_noise,
+    _build_training_component_times,
     _default_reduce_component_latent_values,
     _default_reduce_latent_values,
     _forward_state,
@@ -2426,6 +2428,28 @@ class BaseAdapter(ABC):
         """
         return _get_train_step_indices(self)
 
+    def build_training_component_times(
+        self,
+        primary_timesteps: torch.Tensor,
+        *,
+        batch: Optional[StackedSampleBatch] = None,
+    ) -> ComponentTimes:
+        """Map one primary scheduler coordinate onto every component's times.
+
+        Trainers sample a single shared coordinate per sample; this hook turns it
+        into component timesteps and sigmas without consuming randomness, so
+        heterogeneous components can run on their own schedules. The default maps
+        the legacy single ``"latent"`` component with a zero next coordinate.
+
+        Args:
+            primary_timesteps: Primary scheduler coordinates of shape ``(B,)``.
+            batch: Optional collated batch supplying per-component geometry.
+
+        Returns:
+            Component times whose sigma follows the flow-matching schedule.
+        """
+        return _build_training_component_times(self, primary_timesteps, batch=batch)
+
     def add_forward_process_noise(
         self,
         clean_state: LatentState,
@@ -2433,7 +2457,13 @@ class BaseAdapter(ABC):
         *,
         generator: Optional[torch.Generator] = None,
     ) -> NoisedState:
-        """Apply the legacy flow-matching forward process to one latent component.
+        """Draw forward-process noise, then apply it to the clean state.
+
+        This is the RNG-owning hook: it draws once per component in
+        ``trajectory_component_order`` and delegates the noise application to
+        :meth:`apply_forward_process_noise`. The default draws the legacy single
+        ``"latent"`` tensor with diffusers ``randn_tensor``; heterogeneous adapters
+        override only the ordered draw.
 
         Args:
             clean_state: Clean latent state containing exactly ``"latent"``.
@@ -2444,10 +2474,33 @@ class BaseAdapter(ABC):
             Noised state, target velocity, and sampled noise.
         """
         return _add_forward_process_noise(
+            self,
             clean_state,
             times,
             generator=generator,
         )
+
+    def apply_forward_process_noise(
+        self,
+        clean_state: LatentState,
+        times: ComponentTimes,
+        noise: LatentState,
+    ) -> NoisedState:
+        """Apply already-drawn noise to every clean component.
+
+        Consumes no randomness, so the same noise can be reused across preference
+        arms, precomputed passes, and reference passes. Each component is
+        interpolated with its own sigma as ``(1 - sigma) * x0 + sigma * noise``.
+
+        Args:
+            clean_state: Clean latent state in ``trajectory_component_order``.
+            times: Component times including each component's current sigma.
+            noise: Noise state matching the clean order, shapes, dtypes, devices.
+
+        Returns:
+            Noised state, target velocity, and the supplied noise state.
+        """
+        return _apply_forward_process_noise(self, clean_state, times, noise)
 
     def forward_state(
         self,

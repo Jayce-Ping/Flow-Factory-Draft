@@ -15,6 +15,7 @@
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 import torch
+from diffusers.utils.torch_utils import randn_tensor
 
 from ..samples import (
     ComponentTimes,
@@ -26,7 +27,8 @@ from ..samples import (
     StructuredTrajectory,
 )
 from ..scheduler import SDESchedulerOutput
-from ..utils.base import filter_kwargs
+from ..utils.base import filter_kwargs, to_broadcast_tensor
+from ..utils.noise_schedule import flow_match_sigma
 from .latent_geometry import LatentAxes
 
 _STORAGE_KEYS = {
@@ -526,13 +528,117 @@ def _get_train_step_indices(adapter: Any) -> torch.Tensor:
     return indices
 
 
+def _build_training_component_times(
+    adapter: Any,
+    primary_timesteps: torch.Tensor,
+    *,
+    batch: Optional[StackedSampleBatch],
+) -> ComponentTimes:
+    if not isinstance(primary_timesteps, torch.Tensor):
+        raise TypeError(
+            "expected torch.Tensor primary_timesteps for build_training_component_times, "
+            f"received {type(primary_timesteps).__name__}: {primary_timesteps!r}"
+        )
+    if primary_timesteps.ndim != 1:
+        raise ValueError(
+            "expected primary_timesteps with one scheduler coordinate per sample, shape "
+            f"(B,), received {tuple(primary_timesteps.shape)}"
+        )
+    expected_names = ("latent",)
+    if adapter.trajectory_component_order != expected_names:
+        raise ValueError(
+            f"expected trajectory_component_order {expected_names} for the default "
+            f"build_training_component_times, received {adapter.trajectory_component_order}; "
+            "override the hook to map the primary coordinate per component"
+        )
+    sigma = flow_match_sigma(primary_timesteps)
+    return ComponentTimes(
+        timestep={"latent": primary_timesteps},
+        next_timestep={"latent": torch.zeros_like(primary_timesteps)},
+        sigma={"latent": sigma},
+        next_sigma={"latent": torch.zeros_like(sigma)},
+    )
+
+
+def _apply_forward_process_noise(
+    adapter: Any,
+    clean_state: LatentState,
+    times: ComponentTimes,
+    noise: LatentState,
+) -> NoisedState:
+    expected_names = adapter.trajectory_component_order
+    for argument, state in (("clean_state", clean_state), ("noise", noise)):
+        if not isinstance(state, LatentState):
+            raise TypeError(
+                f"expected LatentState for apply_forward_process_noise {argument}, "
+                f"received {type(state).__name__}"
+            )
+        if state.component_names != expected_names:
+            raise ValueError(
+                f"expected apply_forward_process_noise {argument} component order "
+                f"{expected_names}, received {state.component_names}"
+            )
+    if times.sigma is None or tuple(times.sigma) != expected_names:
+        received = None if times.sigma is None else tuple(times.sigma)
+        raise ValueError(
+            f"expected sigma component order {expected_names} for "
+            f"apply_forward_process_noise, received {received}"
+        )
+    batch_size = clean_state.components[expected_names[0]].shape[0]
+    noised: Dict[str, torch.Tensor] = {}
+    target_velocity: Dict[str, torch.Tensor] = {}
+    for name in expected_names:
+        clean_latents = clean_state.components[name]
+        component_noise = noise.components[name]
+        if clean_latents.ndim < 2 or clean_latents.shape[0] != batch_size:
+            raise ValueError(
+                f"expected batched clean_state component {name!r} with shape (B, ...) and "
+                f"batch size {batch_size}, received {tuple(clean_latents.shape)}"
+            )
+        if component_noise.shape != clean_latents.shape:
+            raise ValueError(
+                f"expected noise component {name!r} to match the clean shape "
+                f"{tuple(clean_latents.shape)}, received {tuple(component_noise.shape)}"
+            )
+        if (
+            component_noise.dtype != clean_latents.dtype
+            or component_noise.device != clean_latents.device
+        ):
+            raise ValueError(
+                f"expected noise component {name!r} to match the clean dtype/device "
+                f"({clean_latents.dtype}, {clean_latents.device}), received "
+                f"({component_noise.dtype}, {component_noise.device})"
+            )
+        sigma = times.sigma[name]
+        if sigma.ndim > 1 or sigma.numel() not in (1, batch_size):
+            raise ValueError(
+                f"expected sigma for component {name!r} to hold one value per sample with "
+                f"shape ({batch_size},), received {tuple(sigma.shape)}"
+            )
+        sigma = to_broadcast_tensor(sigma, clean_latents)
+        noised[name] = (1 - sigma) * clean_latents + sigma * component_noise
+        target_velocity[name] = component_noise - clean_latents
+    return NoisedState(
+        state=LatentState(noised),
+        target_velocity=LatentState(target_velocity),
+        noise=noise,
+    )
+
+
 def _add_forward_process_noise(
+    adapter: Any,
     clean_state: LatentState,
     times: ComponentTimes,
     *,
     generator: Optional[torch.Generator],
 ) -> NoisedState:
     expected_names = ("latent",)
+    if adapter.trajectory_component_order != expected_names:
+        raise ValueError(
+            f"expected trajectory_component_order {expected_names} for the default "
+            f"add_forward_process_noise, received {adapter.trajectory_component_order}; "
+            "override the hook to draw noise in component order"
+        )
     if clean_state.component_names != expected_names:
         raise ValueError(
             f"expected exactly components {expected_names} for default noising, "
@@ -541,27 +647,22 @@ def _add_forward_process_noise(
     if times.sigma is None or tuple(times.sigma) != expected_names:
         received = None if times.sigma is None else tuple(times.sigma)
         raise ValueError(
-            f"expected sigma components {expected_names} for default noising, "
+            f"expected sigma component order {expected_names} before the default noise draw, "
             f"received {received}"
         )
     clean_latents = clean_state.components["latent"]
-    sigma = times.sigma["latent"]
-    if sigma.ndim > clean_latents.ndim:
-        raise ValueError(
-            f"expected sigma ndim <= latent ndim {clean_latents.ndim}, received sigma "
-            f"shape {tuple(sigma.shape)} for latent shape {tuple(clean_latents.shape)}"
-        )
-    sigma = sigma.reshape(sigma.shape + (1,) * (clean_latents.ndim - sigma.ndim))
-    noise = torch.randn(
+    # The single draw happens here, in component order, so the RNG stream stays
+    # reproducible; the application hook below consumes no randomness.
+    noise = randn_tensor(
         clean_latents.shape,
-        dtype=clean_latents.dtype,
-        device=clean_latents.device,
         generator=generator,
+        device=clean_latents.device,
+        dtype=clean_latents.dtype,
     )
-    return NoisedState(
-        state=LatentState({"latent": (1 - sigma) * clean_latents + sigma * noise}),
-        target_velocity=LatentState({"latent": noise - clean_latents}),
-        noise=LatentState({"latent": noise}),
+    return adapter.apply_forward_process_noise(
+        clean_state,
+        times,
+        LatentState({"latent": noise}),
     )
 
 

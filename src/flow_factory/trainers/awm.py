@@ -20,7 +20,7 @@ References:
     - https://arxiv.org/pdf/2509.25050
 """
 import os
-from typing import List, Dict, Optional, Any, Union, Literal
+from typing import List, Dict, NamedTuple, Optional, Any, Union, Literal
 from functools import partial
 from collections import defaultdict
 import math
@@ -28,21 +28,35 @@ from contextlib import nullcontext, contextmanager
 import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
-from diffusers.utils.torch_utils import randn_tensor
 import tqdm as tqdm_
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 
 from .abc import BaseTrainer
+from .forward_process import (
+    forward_velocity_state,
+    require_component_sigmas,
+    state_batch_size,
+)
 from ..hparams import AWMTrainingArguments
-from ..samples import BaseSample
+from ..samples import BaseSample, ComponentTimes, LatentState, NoisedState, StackedSampleBatch
 from ..rewards import BaseRewardModel, RewardBuffer
-from ..utils.base import filter_kwargs, create_generator_by_prompt, to_broadcast_tensor
+from ..utils.base import create_generator_by_prompt
 from ..utils.noise_schedule import TimeSampler, flow_match_sigma
 from ..utils.logger_utils import setup_logger
 from ..utils.dist import reduce_loss_info
 
 logger = setup_logger(__name__)
+
+WEIGHTING_SCHEMES = ('Uniform', 't', 't**2', 'huber', 'ghuber')
+
+
+class AWMPrecomputedStep(NamedTuple):
+    """Forward-process state for one training time plus the sampling-policy log-prob."""
+
+    times: ComponentTimes
+    noised: NoisedState
+    log_prob: torch.Tensor
 
 
 # ============================ AWM Trainer ============================
@@ -97,7 +111,7 @@ class AWMTrainer(BaseTrainer):
     def start(self):
         """Main training loop."""
         while self.should_continue_training():
-            self.adapter.scheduler.set_seed(self.epoch + self.training_args.seed)
+            self.adapter.set_trajectory_seed(self.epoch + self.training_args.seed)
             
             # Save checkpoint
             if (
@@ -215,6 +229,42 @@ class AWMTrainer(BaseTrainer):
 
     # =========================== Optimization Loop ============================
     @staticmethod
+    def apply_matching_weighting(
+        log_prob: torch.Tensor,
+        sigma: torch.Tensor,
+        weighting: Literal['Uniform', 't', 't**2', 'huber', 'ghuber'] = 'Uniform',
+        ghuber_power: float = 0.25,
+    ) -> torch.Tensor:
+        """
+        Reweight one per-sample matching value with its own noise level.
+
+        Args:
+            log_prob: Per-sample matching value (B,), negative mean squared error.
+            sigma: Per-sample noise level (B,) of the component being matched.
+            weighting: Weighting scheme for the loss.
+            ghuber_power: Power parameter for generalized huber loss.
+
+        Returns:
+            Reweighted per-sample value of shape (B,).
+        """
+        if weighting == 'Uniform':
+            return log_prob
+        if weighting == 't':
+            return log_prob * sigma
+        if weighting == 't**2':
+            return log_prob * sigma ** 2
+        if weighting == 'huber':
+            return -(torch.sqrt(-log_prob + 1e-10) - 1e-5) * sigma
+        if weighting == 'ghuber':
+            eps = torch.tensor(1e-10, device=log_prob.device, dtype=log_prob.dtype)
+            return -(
+                torch.pow(-log_prob + eps, ghuber_power) - torch.pow(eps, ghuber_power)
+            ) * sigma / ghuber_power
+        raise ValueError(
+            f"expected awm_weighting one of {WEIGHTING_SCHEMES}, received {weighting!r}"
+        )
+
+    @staticmethod
     def compute_weighted_log_prob(
         model_output: torch.Tensor,
         target: torch.Tensor,
@@ -223,7 +273,7 @@ class AWMTrainer(BaseTrainer):
         ghuber_power: float = 0.25,
     ) -> torch.Tensor:
         """
-        Compute weighted log probability (matching loss) for AWM.
+        Compute weighted log probability (matching loss) for one tensor.
         
         Args:
             model_output: Model's velocity prediction, shape varies by model.
@@ -235,90 +285,125 @@ class AWMTrainer(BaseTrainer):
         Returns:
             Weighted log probability tensor of shape (B,).
         """
-        model_output = model_output.double()
-        target = target.double()
-        
         # Matching loss (negative MSE as log prob)
         # Mean over all dimensions except batch (dim 0)
-        log_prob = -(model_output - target) ** 2
+        log_prob = -(model_output.double() - target.double()) ** 2
         log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))  # Dynamic: works for any shape
-        
-        t = flow_match_sigma(timestep.view(-1))
-        
-        if weighting == 'Uniform':
-            pass  # No reweighting
-        elif weighting == 't':
-            log_prob = log_prob * t
-        elif weighting == 't**2':
-            log_prob = log_prob * t ** 2
-        elif weighting == 'huber':
-            log_prob = -(torch.sqrt(-log_prob + 1e-10) - 1e-5) * t
-        elif weighting == 'ghuber':
-            eps = torch.tensor(1e-10, device=log_prob.device, dtype=log_prob.dtype)
-            log_prob = -(
-                torch.pow(-log_prob + eps, ghuber_power) - torch.pow(eps, ghuber_power)
-            ) * t / ghuber_power
-        else:
-            raise ValueError(f"Unknown weighting method: {weighting}")
-        
-        return log_prob.float()
 
-    def _compute_awm_output(
+        return AWMTrainer.apply_matching_weighting(
+            log_prob,
+            flow_match_sigma(timestep.view(-1)),
+            weighting,
+            ghuber_power,
+        ).float()
+
+    def _matching_log_prob(
         self,
-        batch: Dict[str, Any],
-        timestep: torch.Tensor,
-        noised_latents: torch.Tensor,
-        clean_latents: torch.Tensor,
-        random_noise: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Compute AWM forward pass for a single timestep.
-        
-        Args:
-            batch: Batch containing prompt embeddings and other inputs.
-            timestep: Timestep tensor of shape (B,) in scheduler scale ``[0, 1000]``.
-            noised_latents: Interpolated latents ``x_t = (1-σ) x_1 + σ noise`` with ``σ = t/1000``.
-            clean_latents: Clean latents x_1 (final denoised).
-            random_noise: Sampled noise.
-        
-        Returns:
-            Dictionary with:
-                - log_prob: (B,)
-                - velocity: same shape as latents
-        """
-        t_b = timestep.view(-1)
+        velocity: LatentState,
+        noised: NoisedState,
+        times: ComponentTimes,
+    ) -> torch.Tensor:
+        """Compute the weighted matching log probability of a velocity prediction.
 
-        forward_kwargs = {
-            **self.training_args,
-            't': t_b,
-            't_next': torch.zeros_like(t_b),
-            'latents': noised_latents,
-            'compute_log_prob': False,  # Compute log prob based on matching loss
-            'return_kwargs': ['velocity'],
-            'noise_level': 0.0,
-            **{k: v for k, v in batch.items() if k not in ['all_latents', 'timesteps', 'advantage']},
+        Each component is matched against its own target velocity in double
+        precision and reweighted by its own sigma before the components are
+        combined by their active degrees of freedom, so a component's noise level
+        never leaks into another's weighting.
+
+        Args:
+            velocity: Predicted velocity per component.
+            noised: Forward-noised state carrying the per-component target velocity.
+            times: Component times supplying each component's sigma.
+
+        Returns:
+            Joint per-sample log probability of shape ``(B,)`` in float32.
+        """
+        sigmas = require_component_sigmas(self, times)
+        errors = {
+            name: -(
+                velocity.components[name].double()
+                - noised.target_velocity.components[name].double()
+            )
+            ** 2
+            for name in self.adapter.trajectory_component_order
         }
-        
-        forward_kwargs = filter_kwargs(self.adapter.forward, **forward_kwargs)
-        
-        output = self.adapter.forward(**forward_kwargs)
-        
-        # Target for matching loss: v_target = noise - x_1
-        target = random_noise - clean_latents
-        
-        # Compute weighted log probability
-        log_prob = self.compute_weighted_log_prob(
-            model_output=output.velocity,
-            target=target,
-            timestep=timestep,
-            weighting=self.weighting,
-            ghuber_power=self.ghuber_power,
+        component_values = self.adapter.reduce_component_latent_values(
+            errors, state=noised.state
         )
-                
-        return {
-            'log_prob': log_prob,             # (B,)
-            'velocity': output.velocity,  # Same shape as latents
+        weighted = {
+            name: self.apply_matching_weighting(
+                value, sigmas[name], self.weighting, self.ghuber_power
+            )
+            for name, value in component_values.items()
         }
+        return self.adapter.reduce_latent_values(
+            weighted,
+            active_numel=self.adapter.get_state_active_numel(noised.state),
+            state=noised.state,
+        ).float()
+
+    def _velocity_kl(
+        self,
+        velocity: LatentState,
+        other_velocity: LatentState,
+        noised: NoisedState,
+    ) -> torch.Tensor:
+        """Compute the per-sample squared velocity gap against another parameter set.
+
+        Args:
+            velocity: Current-policy velocity per component.
+            other_velocity: Reference or EMA velocity per component.
+            noised: Forward-noised state supplying per-sample reduction context.
+
+        Returns:
+            Per-sample KL surrogate of shape ``(B,)``.
+        """
+        errors = {
+            name: (velocity.components[name] - other_velocity.components[name]) ** 2
+            for name in self.adapter.trajectory_component_order
+        }
+        return self.adapter.reduce_latent_values(errors, state=noised.state)
+
+    def _precompute_old_log_probs(
+        self,
+        batch: StackedSampleBatch,
+        clean_state: LatentState,
+        batch_size: int,
+    ) -> List[AWMPrecomputedStep]:
+        """Sample training times, noise the terminal state once per time, record old log-probs.
+
+        The forward-process states are kept so the current-policy and reference
+        passes reuse the exact same noise instead of drawing again, which keeps the
+        PPO ratio comparable and the RNG stream identical to the legacy loop.
+
+        Args:
+            batch: Collated sample batch supplying conditioning arguments.
+            clean_state: Terminal clean state to noise.
+            batch_size: Number of samples in the batch.
+
+        Returns:
+            One precomputed step per training timestep, in sampling order.
+        """
+        self.adapter.rollout()
+        steps: List[AWMPrecomputedStep] = []
+        with torch.no_grad(), self.autocast(), self.sampling_context():
+            all_timesteps = self._sample_timesteps(batch_size)  # (T, B)
+            for t_idx in range(self.num_train_timesteps):
+                times = self.adapter.build_training_component_times(
+                    all_timesteps[t_idx], batch=batch
+                )
+                noised = self.adapter.add_forward_process_noise(clean_state, times)
+                velocity = forward_velocity_state(
+                    self, batch, noised.state, times, source='sampling policy'
+                )
+                steps.append(
+                    AWMPrecomputedStep(
+                        times=times,
+                        noised=noised,
+                        log_prob=self._matching_log_prob(velocity, noised, times).detach(),
+                    )
+                )
+        return steps
 
     def prepare_feedback(self, samples: List[BaseSample]) -> None:
         """Finalize rewards, compute advantages, and log advantage metrics."""
@@ -360,30 +445,11 @@ class AWMTrainer(BaseTrainer):
                 position=0,
                 disable=not self.show_progress_bar,
             ):
-                batch_size = batch['all_latents'].shape[0]
-                clean_latents = batch['all_latents'][:, -1]
+                clean_state = self.adapter.get_terminal_state(batch)
+                batch_size = state_batch_size(self, clean_state)
 
                 # ---------- Per-batch precompute: old log-probs under sampling policy ----------
-                self.adapter.rollout()
-                with torch.no_grad(), self.autocast(), self.sampling_context():
-                    all_timesteps = self._sample_timesteps(batch_size)  # (T, B)
-                    all_random_noise: List[torch.Tensor] = []
-                    old_log_probs_list: List[torch.Tensor] = []
-                    for t_idx in range(self.num_train_timesteps):
-                        t_flat = all_timesteps[t_idx]  # (B,) [0, 1000]
-                        sigma_broadcast = to_broadcast_tensor(flow_match_sigma(t_flat), clean_latents)
-                        noise = randn_tensor(
-                            clean_latents.shape,
-                            device=clean_latents.device,
-                            dtype=clean_latents.dtype,
-                        )
-                        all_random_noise.append(noise)
-                        noised_latents = (1 - sigma_broadcast) * clean_latents + sigma_broadcast * noise
-
-                        old_output = self._compute_awm_output(
-                            batch, t_flat, noised_latents, clean_latents, noise
-                        )
-                        old_log_probs_list.append(old_output['log_prob'].detach())
+                precomputed = self._precompute_old_log_probs(batch, clean_state, batch_size)
 
                 # ---------- Train this batch under current policy ----------
                 self.adapter.train()
@@ -402,21 +468,18 @@ class AWMTrainer(BaseTrainer):
                     disable=not self.show_progress_bar,
                 ):
                     with self.accumulate_gradients():
-                        # 1. Prepare inputs for current timestep
-                        t_flat = all_timesteps[t_idx]  # (B,) [0, 1000]
-                        sigma_broadcast = to_broadcast_tensor(flow_match_sigma(t_flat), clean_latents)
-
-                        noise = all_random_noise[t_idx]
-                        noised_latents = (1 - sigma_broadcast) * clean_latents + sigma_broadcast * noise
-                        old_log_prob = old_log_probs_list[t_idx]  # (B,)
+                        # 1. Reuse the forward-process state drawn for this timestep
+                        step = precomputed[t_idx]
+                        old_log_prob = step.log_prob  # (B,)
 
                         # 2. Forward pass for current policy
                         with self.autocast():
-                            current_output = self._compute_awm_output(
-                                batch, t_flat, noised_latents, clean_latents, noise
+                            velocity = forward_velocity_state(
+                                self, batch, step.noised.state, step.times, source='policy'
                             )
-
-                        log_prob = current_output['log_prob']  # (B,)
+                            log_prob = self._matching_log_prob(
+                                velocity, step.noised, step.times
+                            )  # (B,)
 
                         # 3. Compute PPO-style clipped loss
                         ratio = torch.exp(log_prob - old_log_prob)
@@ -432,15 +495,15 @@ class AWMTrainer(BaseTrainer):
                         if self.enable_kl_loss:
                             with self.autocast():
                                 with torch.no_grad(), self.adapter.use_ref_parameters():
-                                    ref_output = self._compute_awm_output(
-                                        batch, t_flat, noised_latents, clean_latents, noise
+                                    ref_velocity = forward_velocity_state(
+                                        self,
+                                        batch,
+                                        step.noised.state,
+                                        step.times,
+                                        source='reference',
                                     )
                                 # KL-div in velocity space
-                                velocity = current_output['velocity']
-                                ref_velocity = ref_output['velocity']
-
-                                # Uniform across all dimensions except batch
-                                kl_div = ((velocity - ref_velocity) ** 2).mean(dim=tuple(range(1, velocity.ndim)))
+                                kl_div = self._velocity_kl(velocity, ref_velocity, step.noised)
                                 kl_loss = self.kl_beta * kl_div.mean()
                                 loss = loss + kl_loss
                                 loss_info['kl_div'].append(kl_div.detach())
@@ -450,14 +513,11 @@ class AWMTrainer(BaseTrainer):
                         if self.enable_ema_kl_loss:
                             with self.autocast():
                                 with torch.no_grad(), self.adapter.use_ema_parameters():
-                                    ema_output = self._compute_awm_output(
-                                        batch, t_flat, noised_latents, clean_latents, noise
+                                    ema_velocity = forward_velocity_state(
+                                        self, batch, step.noised.state, step.times, source='EMA'
                                     )
                                 # KL-div in velocity space
-                                velocity = current_output['velocity']
-                                ema_velocity = ema_output['velocity']
-
-                                ema_kl = ((velocity - ema_velocity) ** 2).mean(dim=tuple(range(1, velocity.ndim)))
+                                ema_kl = self._velocity_kl(velocity, ema_velocity, step.noised)
                                 ema_kl_loss = self.ema_kl_beta * ema_kl.mean()
                                 loss = loss + ema_kl_loss
                                 loss_info['ema_kl_div'].append(ema_kl.detach())

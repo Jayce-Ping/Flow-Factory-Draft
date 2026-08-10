@@ -36,23 +36,18 @@ import torch.distributed as dist
 from accelerate.utils import broadcast_object_list
 import torch.nn.functional as F
 import tqdm as tqdm_
-from diffusers.utils.torch_utils import randn_tensor
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from .abc import BaseTrainer
+from .forward_process import forward_velocity_state
 from ..hparams import DPOTrainingArguments
-from ..samples import BaseSample
-from ..utils.base import (
-    create_generator,
-    create_generator_by_prompt,
-    filter_kwargs,
-    to_broadcast_tensor,
-)
+from ..samples import BaseSample, LatentState, NoisedState
+from ..utils.base import create_generator, create_generator_by_prompt
 from ..utils.dist import gather_samples
 from ..utils.dist import reduce_loss_info
 from ..utils.logger_utils import setup_logger
-from ..utils.noise_schedule import TimeSampler, flow_match_sigma
+from ..utils.noise_schedule import TimeSampler
 
 
 logger = setup_logger(__name__)
@@ -87,7 +82,7 @@ class DPOTrainer(BaseTrainer):
     def start(self):
         """Main training loop."""
         while self.should_continue_training():
-            self.adapter.scheduler.set_seed(self.epoch + self.training_args.seed)
+            self.adapter.set_trajectory_seed(self.epoch + self.training_args.seed)
 
             # Save checkpoint
             if (
@@ -397,11 +392,112 @@ class DPOTrainer(BaseTrainer):
         return t
 
     # ====================== Forward Helpers ======================
-    def _forward_velocity(self, latents: torch.Tensor, base_kwargs: Dict[str, Any]) -> torch.Tensor:
-        """Run a single forward pass and return the velocity prediction."""
-        fwd_kwargs = {**base_kwargs, 'latents': latents}
-        fwd_kwargs = filter_kwargs(self.adapter.forward, **fwd_kwargs)
-        return self.adapter.forward(**fwd_kwargs).velocity
+    def _require_paired_terminal_states(
+        self,
+        chosen_state: LatentState,
+        rejected_state: LatentState,
+    ) -> int:
+        """Validate that both preference arms describe the same latent geometry.
+
+        The arms are noised with one shared noise tensor per component, so any
+        divergence in component order, shape, dtype or device silently changes the
+        comparison the preference loss makes.
+
+        Args:
+            chosen_state: Terminal clean state of the winner arm.
+            rejected_state: Terminal clean state of the loser arm.
+
+        Returns:
+            Batch size shared by both arms.
+        """
+        expected_names = self.adapter.trajectory_component_order
+        for argument, state in (('chosen', chosen_state), ('rejected', rejected_state)):
+            if state.component_names != expected_names:
+                raise ValueError(
+                    f"expected {argument} terminal state for {type(self).__name__} in component "
+                    f"order {expected_names}, received {state.component_names}"
+                )
+        batch_size = chosen_state.components[expected_names[0]].shape[0]
+        for name in expected_names:
+            chosen = chosen_state.components[name]
+            rejected = rejected_state.components[name]
+            if chosen.ndim < 2 or chosen.shape[0] != batch_size:
+                raise ValueError(
+                    f"expected chosen component {name!r} for {type(self).__name__} with shape "
+                    f"(B, ...) and batch size {batch_size}, received {tuple(chosen.shape)}"
+                )
+            if rejected.shape != chosen.shape:
+                raise ValueError(
+                    f"expected paired component {name!r} for {type(self).__name__} to share the "
+                    f"chosen shape {tuple(chosen.shape)}, received {tuple(rejected.shape)}"
+                )
+            if rejected.dtype != chosen.dtype or rejected.device != chosen.device:
+                raise ValueError(
+                    f"expected paired component {name!r} for {type(self).__name__} to share the "
+                    f"chosen dtype/device ({chosen.dtype}, {chosen.device}), received "
+                    f"({rejected.dtype}, {rejected.device})"
+                )
+        return batch_size
+
+    def _arm_velocity_error(
+        self,
+        velocity: LatentState,
+        noised: NoisedState,
+    ) -> torch.Tensor:
+        """Compute one arm's per-sample squared error against its target velocity.
+
+        Args:
+            velocity: Predicted velocity per component for this arm.
+            noised: This arm's noised state carrying its target velocity.
+
+        Returns:
+            Per-sample error of shape ``(B,)``.
+        """
+        errors = {
+            name: (
+                velocity.components[name].float()
+                - noised.target_velocity.components[name].float()
+            )
+            ** 2
+            for name in self.adapter.trajectory_component_order
+        }
+        return self.adapter.reduce_latent_values(errors, state=noised.state)
+
+    def _preference_loss(
+        self,
+        theta_w_err: torch.Tensor,
+        theta_l_err: torch.Tensor,
+        ref_w_err: torch.Tensor,
+        ref_l_err: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Compute the DPO preference loss and its implicit-reward metrics.
+
+        Args:
+            theta_w_err: Policy error on the winner arm, shape ``(B,)``.
+            theta_l_err: Policy error on the loser arm, shape ``(B,)``.
+            ref_w_err: Reference error on the winner arm, shape ``(B,)``.
+            ref_l_err: Reference error on the loser arm, shape ``(B,)``.
+
+        Returns:
+            Scalar loss and the per-sample implicit reward / accuracy metrics.
+        """
+        beta = self.training_args.beta
+        w_diff = theta_w_err - ref_w_err
+        l_diff = theta_l_err - ref_l_err
+        w_l_diff = w_diff - l_diff
+        inside_term = -0.5 * beta * w_l_diff
+        loss = -F.logsigmoid(inside_term).mean()
+        with torch.no_grad():
+            implicit_reward_chosen = -0.5 * beta * w_diff
+            implicit_reward_rejected = -0.5 * beta * l_diff
+            metrics = {
+                'implicit_reward_chosen': implicit_reward_chosen,
+                'implicit_reward_rejected': implicit_reward_rejected,
+                'implicit_accuracy': (
+                    implicit_reward_chosen > implicit_reward_rejected
+                ).float().mean(),
+            }
+        return loss, metrics
 
     # ====================== Reward / advantage (Stages 4--5) ======================
     def prepare_feedback(self, samples: List[BaseSample]) -> None:
@@ -464,11 +560,13 @@ class DPOTrainer(BaseTrainer):
                 disable=not self.show_progress_bar,
             ):
 
-                # Get clean latents (final step from trajectory, index -1)
-                chosen_latents = chosen_batch['all_latents'][:, -1]
-                rejected_latents = rejected_batch['all_latents'][:, -1]
+                # Get clean terminal states of both arms
+                chosen_state = self.adapter.get_terminal_state(chosen_batch)
+                rejected_state = self.adapter.get_terminal_state(rejected_batch)
 
-                current_batch_size = chosen_latents.shape[0]
+                current_batch_size = self._require_paired_terminal_states(
+                    chosen_state, rejected_state
+                )
 
                 # Pre-sample T×B timesteps for this pair batch
                 all_timesteps = self._sample_timesteps(
@@ -477,82 +575,64 @@ class DPOTrainer(BaseTrainer):
                     timestep_range=self.training_args.timestep_range,
                 )  # (T, B)
 
-                # Build static forward kwargs (shared across timesteps)
-                _excluded_batch_keys = {'all_latents', 'timesteps', 'advantage'}
-                static_kwargs = {
-                    **self.training_args,
-                    'compute_log_prob': False,
-                    'return_kwargs': ['velocity'],
-                    'noise_level': 0.0,
-                    **{k: v for k, v in chosen_batch.items()
-                       if k not in _excluded_batch_keys},
-                }
-
                 for t_idx in range(self.num_train_timesteps):
                     with self.accumulate_gradients():
-                        t = all_timesteps[t_idx]  # (B,), scheduler scale [0, 1000]
-                        sigma = flow_match_sigma(t)  # σ ∈ [0, 1]
-                        noise = randn_tensor(
-                            chosen_latents.shape,
-                            device=chosen_latents.device,
-                            dtype=chosen_latents.dtype,
+                        times = self.adapter.build_training_component_times(
+                            all_timesteps[t_idx], batch=chosen_batch
                         )
 
-                        sigma_broadcast = to_broadcast_tensor(sigma, chosen_latents)
-
-                        # Noise both at same σ: x_t = (1 - σ) * x_0 + σ * noise
-                        noised_chosen = (1 - sigma_broadcast) * chosen_latents + sigma_broadcast * noise
-                        noised_rejected = (1 - sigma_broadcast) * rejected_latents + sigma_broadcast * noise
-
-                        # Per-timestep forward kwargs (adapter expects scheduler scale)
-                        base_kwargs = {
-                            **static_kwargs,
-                            't': t,
-                            't_next': torch.zeros_like(t),
-                        }
+                        # Noise both arms at the same σ with the same noise tensor
+                        chosen_noised = self.adapter.add_forward_process_noise(chosen_state, times)
+                        rejected_noised = self.adapter.apply_forward_process_noise(
+                            rejected_state, times, chosen_noised.noise
+                        )
 
                         # Policy forward
                         with self.autocast():
-                            theta_w_pred = self._forward_velocity(noised_chosen, base_kwargs)
-                            theta_l_pred = self._forward_velocity(noised_rejected, base_kwargs)
+                            theta_w_pred = forward_velocity_state(
+                                self, chosen_batch, chosen_noised.state, times,
+                                source='policy chosen',
+                            )
+                            theta_l_pred = forward_velocity_state(
+                                self, chosen_batch, rejected_noised.state, times,
+                                source='policy rejected',
+                            )
 
                         # Reference forward (frozen)
                         with torch.no_grad(), self.adapter.use_ref_parameters(), self.autocast():
-                            ref_w_pred = self._forward_velocity(noised_chosen, base_kwargs)
-                            ref_l_pred = self._forward_velocity(noised_rejected, base_kwargs)
+                            ref_w_pred = forward_velocity_state(
+                                self, chosen_batch, chosen_noised.state, times,
+                                source='reference chosen',
+                            )
+                            ref_l_pred = forward_velocity_state(
+                                self, chosen_batch, rejected_noised.state, times,
+                                source='reference rejected',
+                            )
 
                         # MSE errors per sample — target is flow-matching velocity (noise - x_0), same as
                         # flow_grpo train_sd3_dpo.py: target = noise - model_input
-                        target_w = noise - chosen_latents
-                        target_l = noise - rejected_latents
-                        spatial_dims = tuple(range(1, theta_w_pred.ndim))
-                        theta_w_err = ((theta_w_pred.float() - target_w.float()) ** 2).mean(dim=spatial_dims)
-                        theta_l_err = ((theta_l_pred.float() - target_l.float()) ** 2).mean(dim=spatial_dims)
-                        ref_w_err = ((ref_w_pred.float() - target_w.float()) ** 2).mean(dim=spatial_dims)
-                        ref_l_err = ((ref_l_pred.float() - target_l.float()) ** 2).mean(dim=spatial_dims)
+                        theta_w_err = self._arm_velocity_error(theta_w_pred, chosen_noised)
+                        theta_l_err = self._arm_velocity_error(theta_l_pred, rejected_noised)
+                        ref_w_err = self._arm_velocity_error(ref_w_pred, chosen_noised)
+                        ref_l_err = self._arm_velocity_error(ref_l_pred, rejected_noised)
 
-                        # DPO loss
-                        beta = self.training_args.beta
-                        w_diff = theta_w_err - ref_w_err
-                        l_diff = theta_l_err - ref_l_err
-                        w_l_diff = w_diff - l_diff
-                        inside_term = -0.5 * beta * w_l_diff
-                        loss = -F.logsigmoid(inside_term).mean()
-
-                        # Logging metrics
-                        with torch.no_grad():
-                            implicit_reward_chosen = -0.5 * beta * w_diff
-                            implicit_reward_rejected = -0.5 * beta * l_diff
-                            implicit_accuracy = (implicit_reward_chosen > implicit_reward_rejected).float().mean()
+                        # DPO loss and logging metrics
+                        loss, metrics = self._preference_loss(
+                            theta_w_err, theta_l_err, ref_w_err, ref_l_err
+                        )
 
                         loss_info['loss'].append(loss.detach())
                         loss_info['theta_w_err'].append(theta_w_err.mean().detach())
                         loss_info['theta_l_err'].append(theta_l_err.mean().detach())
                         loss_info['ref_w_err'].append(ref_w_err.mean().detach())
                         loss_info['ref_l_err'].append(ref_l_err.mean().detach())
-                        loss_info['implicit_accuracy'].append(implicit_accuracy.detach())
-                        loss_info['implicit_reward_chosen'].append(implicit_reward_chosen.mean().detach())
-                        loss_info['implicit_reward_rejected'].append(implicit_reward_rejected.mean().detach())
+                        loss_info['implicit_accuracy'].append(metrics['implicit_accuracy'].detach())
+                        loss_info['implicit_reward_chosen'].append(
+                            metrics['implicit_reward_chosen'].mean().detach()
+                        )
+                        loss_info['implicit_reward_rejected'].append(
+                            metrics['implicit_reward_rejected'].mean().detach()
+                        )
 
                         # Backward + optimizer step
                         self.accelerator.backward(loss)
