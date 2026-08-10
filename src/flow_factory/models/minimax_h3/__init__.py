@@ -16,6 +16,7 @@
 
 from ._common import (
     MINIMAX_H3_COMPONENT_ORDER,
+    apply_forward_process_noise,
     build_component_step_output,
     build_structured_trajectories,
     build_training_component_times,
@@ -48,6 +49,7 @@ __all__ = [
     "MiniMaxH3FL2VAAdapter",
     "MiniMaxH3Ref2VAAdapter",
     "MiniMaxH3T2VAAdapter",
+    "apply_forward_process_noise",
     "build_component_step_output",
     "build_structured_trajectories",
     "build_training_component_times",

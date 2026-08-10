@@ -18,10 +18,17 @@ from typing import Any, ClassVar, Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
 
-from ...samples import ComponentTimes, LatentState, MultiModalStepOutput, StackedSampleBatch
+from ...samples import (
+    ComponentTimes,
+    LatentState,
+    MultiModalStepOutput,
+    NoisedState,
+    StackedSampleBatch,
+)
 from ...scheduler import MiniMaxH3SDEScheduler, SchedulerGroup
 from ..abc import BaseAdapter
 from ..runtime import ModularPipelineRuntime
+from ._common import apply_forward_process_noise, draw_forward_process_noise
 from .workflow import (
     build_h3_component_runtime,
     build_h3_scheduler,
@@ -89,6 +96,23 @@ class MiniMaxH3T2VAAdapter(BaseAdapter):
     ) -> ComponentTimes:
         return map_h3_training_component_times(self, primary_timesteps)
 
+    def add_forward_process_noise(
+        self,
+        clean_state: LatentState,
+        times: ComponentTimes,
+        *,
+        generator: Optional[torch.Generator] = None,
+    ) -> NoisedState:
+        return draw_forward_process_noise(clean_state, times, generator=generator)
+
+    def apply_forward_process_noise(
+        self,
+        clean_state: LatentState,
+        times: ComponentTimes,
+        noise: LatentState,
+    ) -> NoisedState:
+        return apply_forward_process_noise(clean_state, times, noise)
+
     def decode_latents(self, latents: Any, **kwargs: Any) -> Any:
         return decode_h3_adapter_latents(self, latents, **kwargs)
 
@@ -113,6 +137,7 @@ class MiniMaxH3T2VAAdapter(BaseAdapter):
             times=times,
             next_state=next_state,
             compute_log_prob=compute_log_prob,
+            return_fields=return_fields,
             noise_level=noise_level,
             forward_kwargs=forward_kwargs,
         )
@@ -178,6 +203,23 @@ class MiniMaxH3FL2VAAdapter(BaseAdapter):
     ) -> ComponentTimes:
         return map_h3_training_component_times(self, primary_timesteps)
 
+    def add_forward_process_noise(
+        self,
+        clean_state: LatentState,
+        times: ComponentTimes,
+        *,
+        generator: Optional[torch.Generator] = None,
+    ) -> NoisedState:
+        return draw_forward_process_noise(clean_state, times, generator=generator)
+
+    def apply_forward_process_noise(
+        self,
+        clean_state: LatentState,
+        times: ComponentTimes,
+        noise: LatentState,
+    ) -> NoisedState:
+        return apply_forward_process_noise(clean_state, times, noise)
+
     def decode_latents(self, latents: Any, **kwargs: Any) -> Any:
         return decode_h3_adapter_latents(self, latents, **kwargs)
 
@@ -202,6 +244,7 @@ class MiniMaxH3FL2VAAdapter(BaseAdapter):
             times=times,
             next_state=next_state,
             compute_log_prob=compute_log_prob,
+            return_fields=return_fields,
             noise_level=noise_level,
             forward_kwargs=forward_kwargs,
         )
@@ -268,6 +311,23 @@ class MiniMaxH3Ref2VAAdapter(BaseAdapter):
     ) -> ComponentTimes:
         return map_h3_training_component_times(self, primary_timesteps)
 
+    def add_forward_process_noise(
+        self,
+        clean_state: LatentState,
+        times: ComponentTimes,
+        *,
+        generator: Optional[torch.Generator] = None,
+    ) -> NoisedState:
+        return draw_forward_process_noise(clean_state, times, generator=generator)
+
+    def apply_forward_process_noise(
+        self,
+        clean_state: LatentState,
+        times: ComponentTimes,
+        noise: LatentState,
+    ) -> NoisedState:
+        return apply_forward_process_noise(clean_state, times, noise)
+
     def decode_latents(self, latents: Any, **kwargs: Any) -> Any:
         return decode_h3_adapter_latents(self, latents, **kwargs)
 
@@ -292,6 +352,7 @@ class MiniMaxH3Ref2VAAdapter(BaseAdapter):
             times=times,
             next_state=next_state,
             compute_log_prob=compute_log_prob,
+            return_fields=return_fields,
             noise_level=noise_level,
             forward_kwargs=forward_kwargs,
         )

@@ -25,7 +25,7 @@ from flow_factory.models.minimax_h3.adapters import (
 from flow_factory.samples import (
     ComponentTimes,
     LatentState,
-    MiniMaxH3Ref2VASample,
+    MiniMaxH3T2VASample,
     StackedSampleBatch,
     StructuredTrajectory,
 )
@@ -142,8 +142,8 @@ def test_ref_preprocess_builds_ordered_pinned_objects_without_returning_them(mon
 def _state(value: float = 0.0) -> LatentState:
     return LatentState(
         {
-            "video": torch.full((1, 2, 96), value),
-            "audio": torch.full((1, 3, 32), value),
+            "video": torch.full((1, 2, 96), value, dtype=torch.float32),
+            "audio": torch.full((1, 3, 32), value, dtype=torch.float32),
         }
     )
 
@@ -201,6 +201,7 @@ def test_inference_collects_structured_target_only_trajectory(monkeypatch) -> No
         value = float(len(calls))
         return SimpleNamespace(
             next_state=_state(value),
+            next_state_mean=_state(value + 20),
             log_prob=torch.tensor([value]),
             component_log_probs={
                 "video": torch.tensor([value]),
@@ -243,7 +244,7 @@ def test_inference_collects_structured_target_only_trajectory(monkeypatch) -> No
         num_inference_steps=2,
         trajectory_indices=[0, 2],
         compute_log_prob=True,
-        extra_call_back_kwargs=["velocity"],
+        extra_call_back_kwargs=["velocity", "next_latents", "next_latents_mean"],
     )
 
     assert len(calls) == 2
@@ -261,6 +262,14 @@ def test_inference_collects_structured_target_only_trajectory(monkeypatch) -> No
     assert sample.trajectory.components["audio"].states.shape[-1] == 32
     assert sample.trajectory.callbacks["velocity"]["video"].index_map.tolist() == [0, -1]
     assert sample.trajectory.callbacks["velocity"]["audio"].values.shape[-1] == 32
+    assert torch.equal(
+        sample.trajectory.callbacks["next_latents"]["video"].values[0],
+        _state(1).components["video"][0],
+    )
+    assert torch.equal(
+        sample.trajectory.callbacks["next_latents_mean"]["audio"].values[0],
+        _state(21).components["audio"][0],
+    )
 
     final_only = adapter.inference(
         prompt=["describe"],
@@ -315,10 +324,9 @@ def test_forward_state_uses_prepared_component_and_forward_parity(monkeypatch) -
     adapter = _adapter(MiniMaxH3T2VAAdapter, transformer=prepared)
     batch = StackedSampleBatch(
         [
-            MiniMaxH3Ref2VASample(
+            MiniMaxH3T2VASample(
                 prompt="describe",
                 prompt_embeds=torch.zeros(2, 4),
-                reference_manifest='[{"kind":"image","path":"i.png"}]',
                 extra_kwargs={
                     "condition_prefixes": {
                         "video": torch.zeros(1, 96),

@@ -214,6 +214,7 @@ def forward_h3_state(
     compute_log_prob: bool = True,
     velocity_only: bool = False,
     attention_kwargs: Optional[Mapping[str, Any]] = None,
+    return_kwargs: Optional[Sequence[str]] = None,
     workflow: str = "t2va",
 ) -> Union[LatentState, MultiModalStepOutput]:
     """Compose one gradient-bearing transformer call and optional scheduler step.
@@ -233,6 +234,7 @@ def forward_h3_state(
         compute_log_prob: Whether to compute log probability.
         velocity_only: Return velocity without scheduler dispatch.
         attention_kwargs: Optional attention settings.
+        return_kwargs: Optional scheduler output fields.
         workflow: H3 workflow identifier.
 
     Returns:
@@ -260,6 +262,7 @@ def forward_h3_state(
         generator=generator,
         noise_level=noise_level,
         compute_log_prob=compute_log_prob,
+        return_kwargs=return_kwargs,
     )
 
 

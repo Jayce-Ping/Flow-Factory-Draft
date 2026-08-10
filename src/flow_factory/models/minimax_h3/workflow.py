@@ -32,6 +32,9 @@ from ._common import (
     build_structured_trajectories,
 )
 from ._common import build_training_component_times as build_h3_component_times
+from ._common import (
+    validate_target_state,
+)
 from .blocks import encode_h3_workflow_inputs, prepare_h3_rollout_state
 from .decoding import decode_h3_targets
 from .denoise import forward_h3_state
@@ -46,6 +49,33 @@ _COMMON_REQUIRED_COMPONENTS = (
     "vae",
     "audio_vae",
 )
+_COMPONENT_ORDER = ("video", "audio")
+_LAYOUT_MATRIX_FIELDS = ("position_ids",)
+_LAYOUT_INDEX_FIELDS = (
+    "token_tags",
+    "video_indices",
+    "audio_indices",
+    "text_indices",
+)
+_LAYOUT_COUNT_FIELDS = (
+    "num_condition_video_rows",
+    "num_condition_audio_rows",
+)
+_GEOMETRY_FIELDS = (
+    "height",
+    "width",
+    "num_frames",
+    "num_latent_frames",
+    "latent_height",
+    "latent_width",
+    "num_audio_latents",
+)
+_PUBLIC_GUIDANCE_FIELDS = ("negative_prompt", "guidance_scale")
+_CALLBACK_STATE_FIELDS = {
+    "next_latents": "next_state",
+    "next_latents_mean": "next_state_mean",
+    "velocity": "velocity",
+}
 
 
 def load_h3_workflow_pipeline(
@@ -153,6 +183,8 @@ def map_h3_training_component_times(
 
 def preprocess_h3_workflow(adapter: Any, **kwargs: Any) -> Dict[str, Any]:
     """Encode one Arrow-safe B=1 workflow input with pinned blocks."""
+    _reject_public_guidance(adapter.workflow, kwargs, "preprocess")
+    _validate_workflow_media_inputs(adapter.workflow, kwargs, "preprocess")
     prompt = _single_outer_value(kwargs.get("prompt"), "prompt", adapter.workflow)
     values: Dict[str, Any] = {
         "prompt": prompt,
@@ -178,7 +210,8 @@ def preprocess_h3_workflow(adapter: Any, **kwargs: Any) -> Dict[str, Any]:
         references = _single_outer_value(kwargs.get("references"), "references", adapter.workflow)
         values["references"] = _build_pinned_references(references)
 
-    encoded = encode_h3_workflow_inputs(adapter.pipeline, values, workflow=adapter.workflow)
+    with torch.no_grad():
+        encoded = encode_h3_workflow_inputs(adapter.pipeline, values, workflow=adapter.workflow)
     result = dict(encoded)
     if adapter.workflow == "ref2va":
         manifest = kwargs.get("reference_manifest")
@@ -194,44 +227,18 @@ def preprocess_h3_workflow(adapter: Any, **kwargs: Any) -> Dict[str, Any]:
 
 def infer_h3_workflow(adapter: Any, **kwargs: Any) -> List[Any]:
     """Run one B=1 target-only rollout and return a structured sample."""
+    _reject_public_guidance(adapter.workflow, kwargs, "inference")
+    _validate_workflow_media_inputs(adapter.workflow, kwargs, "inference")
     prompt = kwargs.get("prompt")
     prompt_value = _single_outer_value(prompt, "prompt", adapter.workflow)
-    if kwargs.get("negative_prompt") is not None or kwargs.get("guidance_scale", 1.0) != 1.0:
-        raise ValueError(
-            f"MiniMax H3 workflow={adapter.workflow!r} does not support classifier-free guidance"
-        )
     prompt_embeds = kwargs["prompt_embeds"]
     if not isinstance(prompt_embeds, torch.Tensor) or prompt_embeds.shape[0] != 1:
         raise ValueError(
             f"MiniMax H3 workflow={adapter.workflow!r} field='prompt_embeds' requires B=1, "
             f"received {getattr(prompt_embeds, 'shape', None)}"
         )
-    layout = _execution_mapping(
-        kwargs,
-        "layout",
-        (
-            "position_ids",
-            "token_tags",
-            "video_indices",
-            "audio_indices",
-            "text_indices",
-            "num_condition_video_rows",
-            "num_condition_audio_rows",
-        ),
-    )
-    geometry = _execution_mapping(
-        kwargs,
-        "geometry",
-        (
-            "height",
-            "width",
-            "num_frames",
-            "num_latent_frames",
-            "latent_height",
-            "latent_width",
-            "num_audio_latents",
-        ),
-    )
+    layout = _normalize_layout(kwargs)
+    geometry = _normalize_geometry(kwargs)
     generator = kwargs.get("generator")
     transformer = adapter.get_component(adapter.transformer_component_name)
     state, condition_prefixes = prepare_h3_rollout_state(
@@ -250,12 +257,21 @@ def infer_h3_workflow(adapter: Any, **kwargs: Any) -> List[Any]:
     )
     num_transitions = len(plan.schedules["video"][0]) - 1
     trajectory_indices = kwargs.get("trajectory_indices", "all")
-    state_positions = _selected_positions(trajectory_indices, num_transitions + 1)
-    transition_positions = _selected_positions(trajectory_indices, num_transitions)
+    state_positions, transition_positions = _resolve_trajectory_positions(
+        trajectory_indices, num_transitions
+    )
     collected_states: Optional[Dict[str, List[torch.Tensor]]] = None
     collected_log_probs: Optional[List[torch.Tensor]] = None
     collected_component_log_probs: Optional[Dict[str, List[torch.Tensor]]] = None
     callback_fields = tuple(kwargs.get("extra_call_back_kwargs", ()))
+    unknown_callback_fields = tuple(
+        field for field in callback_fields if field not in _CALLBACK_STATE_FIELDS
+    )
+    if unknown_callback_fields:
+        raise ValueError(
+            f"MiniMax H3 workflow={adapter.workflow!r} callback fields expected a subset of "
+            f"{tuple(_CALLBACK_STATE_FIELDS)}, received unknown={unknown_callback_fields}"
+        )
     collected_callbacks: Optional[Dict[str, Dict[str, List[torch.Tensor]]]] = None
     if trajectory_indices is not None and state_positions:
         collected_states = {"video": [], "audio": []}
@@ -269,6 +285,11 @@ def infer_h3_workflow(adapter: Any, **kwargs: Any) -> List[Any]:
 
     for index in range(num_transitions):
         times = _component_times_at(plan.schedules, index)
+        return_fields = ["next_latents"]
+        if kwargs.get("compute_log_prob", True):
+            return_fields.append("log_prob")
+        return_fields.extend(callback_fields)
+        return_fields = list(dict.fromkeys(return_fields))
         output = adapter.forward(
             state=state,
             times=times,
@@ -277,6 +298,7 @@ def infer_h3_workflow(adapter: Any, **kwargs: Any) -> List[Any]:
             layout=layout,
             generator=generator,
             compute_log_prob=kwargs.get("compute_log_prob", True),
+            return_fields=tuple(return_fields),
         )
         if output.next_state is None:
             raise ValueError(
@@ -287,30 +309,30 @@ def infer_h3_workflow(adapter: Any, **kwargs: Any) -> List[Any]:
         if collected_states is not None and index + 1 in state_positions:
             _append_state(collected_states, state)
         if collected_log_probs is not None and index in transition_positions:
+            _validate_rollout_log_output(output, adapter.workflow, index)
             collected_log_probs.append(output.log_prob)
-            for component in ("video", "audio"):
+            for component in _COMPONENT_ORDER:
                 collected_component_log_probs[component].append(
                     output.component_log_probs[component]
                 )
         if collected_callbacks is not None and index in transition_positions:
             for field in callback_fields:
-                value = getattr(output, field, None)
+                value = getattr(output, _CALLBACK_STATE_FIELDS[field], None)
                 if not isinstance(value, LatentState):
                     raise TypeError(
                         f"MiniMax H3 workflow={adapter.workflow!r} callback field={field!r} "
                         f"expected LatentState, received {type(value).__name__}"
                     )
-                for component in ("video", "audio"):
+                for component in _COMPONENT_ORDER:
                     collected_callbacks[field][component].append(
                         value.components[component].detach()
                     )
 
-    video, audio, sample_rate = decode_h3_targets(
-        adapter.pipeline,
+    video, audio, sample_rate = decode_h3_adapter_latents(
+        adapter,
         state,
-        geometry,
+        geometry=geometry,
         output_type=kwargs.get("output_type", "pt"),
-        workflow=adapter.workflow,
     )
     trajectory: Optional[StructuredTrajectory] = None
     if collected_states is not None:
@@ -356,33 +378,42 @@ def infer_h3_workflow(adapter: Any, **kwargs: Any) -> List[Any]:
                 else _index_map(num_transitions, transition_positions)
             ),
         )[0]
-    sample_classes = {
-        "t2va": MiniMaxH3T2VASample,
-        "fl2va": MiniMaxH3FL2VASample,
-        "ref2va": MiniMaxH3Ref2VASample,
-    }
-    sample_kwargs = {
-        "prompt": prompt_value,
-        "prompt_embeds": prompt_embeds[0],
-        "video": _decoded_video_sample(video),
-        "audio": audio[0],
-        "audio_sample_rate": sample_rate,
-        "height": kwargs.get("height"),
-        "width": kwargs.get("width"),
-        "trajectory": trajectory,
-        "extra_kwargs": {
+    condition_images = None
+    if adapter.workflow == "fl2va":
+        condition_images = _single_outer_value(
+            kwargs.get("images", kwargs.get("condition_images")),
+            "images",
+            adapter.workflow,
+        )
+    sample = _build_h3_sample(
+        type(adapter),
+        prompt=prompt_value,
+        prompt_embeds=prompt_embeds[0],
+        video=_decoded_video_sample(video),
+        audio=audio[0],
+        sample_rate=sample_rate,
+        trajectory=trajectory,
+        condition_images=condition_images,
+        reference_manifest=(
+            None
+            if adapter.workflow != "ref2va"
+            else _single_outer_value(
+                kwargs.get("reference_manifest"),
+                "reference_manifest",
+                adapter.workflow,
+            )
+        ),
+        height=geometry.get("height"),
+        width=geometry.get("width"),
+        extra_kwargs={
             "condition_prefixes": {
                 component: values[0] for component, values in condition_prefixes.items()
             },
             "layout": layout,
             "geometry": geometry,
         },
-    }
-    if adapter.workflow == "ref2va":
-        sample_kwargs["reference_manifest"] = _single_outer_value(
-            kwargs.get("reference_manifest"), "reference_manifest", adapter.workflow
-        )
-    return [sample_classes[adapter.workflow](**sample_kwargs)]
+    )
+    return [sample]
 
 
 def forward_h3_adapter_state(
@@ -392,13 +423,30 @@ def forward_h3_adapter_state(
     times: ComponentTimes,
     next_state: Optional[LatentState],
     compute_log_prob: bool,
+    return_fields: Sequence[str],
     noise_level: Optional[float],
     forward_kwargs: Mapping[str, Any],
 ) -> Any:
     """Run the prepared workflow transformer through the common H3 path."""
+    validate_target_state(state)
+    _require_b1_state(state, adapter.workflow, "forward")
+    if next_state is not None:
+        validate_target_state(next_state)
+        _require_b1_state(next_state, adapter.workflow, "forward next_state")
+    _validate_neutral_guidance(adapter.workflow, forward_kwargs)
     prompt_embeds = forward_kwargs["prompt_embeds"]
     condition_prefixes = forward_kwargs["condition_prefixes"]
-    layout = {name: _remove_b1_collation(value) for name, value in forward_kwargs["layout"].items()}
+    if not isinstance(prompt_embeds, torch.Tensor) or prompt_embeds.ndim != 3:
+        raise ValueError(
+            f"MiniMax H3 workflow={adapter.workflow!r} forward prompt_embeds expected "
+            f"shape (B=1,N,C), received {getattr(prompt_embeds, 'shape', None)}"
+        )
+    if prompt_embeds.shape[0] != 1:
+        raise ValueError(
+            f"MiniMax H3 workflow={adapter.workflow!r} forward requires B=1, "
+            f"received prompt B={prompt_embeds.shape[0]}"
+        )
+    layout = _normalize_layout({"layout": forward_kwargs["layout"]})
     return forward_h3_state(
         adapter.get_component(adapter.transformer_component_name),
         state,
@@ -412,6 +460,8 @@ def forward_h3_adapter_state(
         generator=forward_kwargs.get("generator"),
         noise_level=noise_level,
         compute_log_prob=compute_log_prob,
+        attention_kwargs=forward_kwargs.get("attention_kwargs"),
+        return_kwargs=return_fields,
         workflow=adapter.workflow,
     )
 
@@ -420,6 +470,26 @@ def forward_h3_adapter(adapter: Any, **kwargs: Any) -> Any:
     """Route rollout and bridge calls through one adapter forward boundary."""
     if "batch" in kwargs:
         return adapter.forward_state(**kwargs)
+    allowed = {
+        "state",
+        "times",
+        "next_state",
+        "compute_log_prob",
+        "return_fields",
+        "noise_level",
+        "condition_prefixes",
+        "prompt_embeds",
+        "layout",
+        "generator",
+        "attention_kwargs",
+        "guidance_scale",
+    }
+    unknown = tuple(sorted(set(kwargs) - allowed))
+    if unknown:
+        raise ValueError(
+            f"MiniMax H3 workflow={adapter.workflow!r} forward received unsupported "
+            f"arguments={unknown}"
+        )
     state = kwargs.pop("state")
     times = kwargs.pop("times")
     return forward_h3_adapter_state(
@@ -428,6 +498,7 @@ def forward_h3_adapter(adapter: Any, **kwargs: Any) -> Any:
         times=times,
         next_state=kwargs.pop("next_state", None),
         compute_log_prob=kwargs.pop("compute_log_prob", False),
+        return_fields=kwargs.pop("return_fields", ()),
         noise_level=kwargs.pop("noise_level", None),
         forward_kwargs=kwargs,
     )
@@ -440,6 +511,8 @@ def decode_h3_adapter_latents(adapter: Any, latents: Any, **kwargs: Any) -> Any:
             f"MiniMax H3 workflow={adapter.workflow!r} decode expected LatentState, "
             f"received {type(latents).__name__}"
         )
+    _require_b1_state(latents, adapter.workflow, "decode")
+    adapter.on_load_components(["vae", "video_processor", "audio_vae"])
     return decode_h3_targets(
         adapter.pipeline,
         latents,
@@ -495,17 +568,40 @@ def _component_times_at(
     return ComponentTimes(timesteps, next_timesteps, sigmas, next_sigmas)
 
 
-def _selected_positions(indices: Any, length: int) -> List[int]:
+def _resolve_trajectory_positions(
+    indices: Any, num_transitions: int
+) -> tuple[List[int], List[int]]:
+    state_length = num_transitions + 1
     if indices == "all":
-        return list(range(length))
+        return list(range(state_length)), list(range(num_transitions))
     if indices is None:
-        return []
-    selected = set()
-    for raw_index in indices:
-        index = raw_index + length if raw_index < 0 else raw_index
-        if 0 <= index < length:
-            selected.add(index)
-    return sorted(selected)
+        return [], []
+    if not isinstance(indices, list):
+        raise TypeError(
+            "MiniMax H3 trajectory_indices expected 'all', None, or List[int], "
+            f"received {type(indices).__name__}: {indices!r}"
+        )
+    normalized = []
+    for index in indices:
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise TypeError(
+                "MiniMax H3 trajectory_indices expected integer entries, "
+                f"received {type(index).__name__}: {index!r}"
+            )
+        normalized_index = index + state_length if index < 0 else index
+        if not 0 <= normalized_index < state_length:
+            raise ValueError(
+                f"MiniMax H3 trajectory_indices entry {index} normalized to "
+                f"{normalized_index}, expected range [0,{state_length - 1}]"
+            )
+        normalized.append(normalized_index)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(
+            "MiniMax H3 trajectory_indices expected unique normalized positions, "
+            f"received raw={indices!r}, normalized={normalized!r}"
+        )
+    state_positions = sorted(normalized)
+    return state_positions, [position for position in state_positions if position < num_transitions]
 
 
 def _index_map(length: int, positions: Sequence[int]) -> torch.Tensor:
@@ -516,29 +612,223 @@ def _index_map(length: int, positions: Sequence[int]) -> torch.Tensor:
 
 
 def _append_state(storage: Dict[str, List[torch.Tensor]], state: LatentState) -> None:
-    for component in ("video", "audio"):
+    for component in _COMPONENT_ORDER:
         storage[component].append(state.components[component].detach())
 
 
-def _execution_mapping(
-    values: Mapping[str, Any], nested_name: str, fields: Sequence[str]
-) -> Dict[str, Any]:
-    nested = values.get(nested_name)
-    if nested is not None:
-        if not isinstance(nested, Mapping):
-            raise TypeError(
-                f"expected mapping for MiniMax H3 {nested_name}, "
-                f"received {type(nested).__name__}"
+def _reject_public_guidance(workflow: str, values: Mapping[str, Any], boundary: str) -> None:
+    present = tuple(field for field in _PUBLIC_GUIDANCE_FIELDS if field in values)
+    if present:
+        raise ValueError(
+            f"MiniMax H3 workflow={workflow!r} public {boundary} rejects guidance "
+            f"arguments={present}; the model has no CFG"
+        )
+
+
+def _validate_workflow_media_inputs(
+    workflow: str, values: Mapping[str, Any], boundary: str
+) -> None:
+    media_fields = ("images", "condition_images", "videos", "audios", "references")
+    present = {
+        field for field in media_fields if field in values and _media_value_present(values[field])
+    }
+    if workflow == "t2va" and present:
+        raise ValueError(
+            f"MiniMax H3 workflow='t2va' {boundary} rejects media fields={tuple(sorted(present))}"
+        )
+    if workflow == "ref2va":
+        generic = present & {"images", "condition_images", "videos", "audios"}
+        if generic:
+            raise ValueError(
+                f"MiniMax H3 workflow='ref2va' {boundary} rejects generic media "
+                f"fields={tuple(sorted(generic))}"
             )
-        return {name: _remove_b1_collation(value) for name, value in nested.items()}
-    return {field: _remove_b1_collation(values[field]) for field in fields if field in values}
+    if workflow == "fl2va":
+        invalid = present & {"videos", "audios", "references"}
+        if invalid:
+            raise ValueError(
+                f"MiniMax H3 workflow='fl2va' {boundary} rejects fields={tuple(sorted(invalid))}"
+            )
 
 
-def _remove_b1_collation(value: Any) -> Any:
-    if isinstance(value, torch.Tensor) and value.ndim > 1 and value.shape[0] == 1:
-        return value[0]
-    if isinstance(value, list) and len(value) == 1:
-        return value[0]
+def _validate_neutral_guidance(workflow: str, forward_kwargs: Mapping[str, Any]) -> None:
+    if forward_kwargs.get("negative_prompt") is not None:
+        raise ValueError(
+            f"MiniMax H3 workflow={workflow!r} forward rejects negative_prompt; model has no CFG"
+        )
+    if "guidance_scale" not in forward_kwargs:
+        return
+    guidance_scale = forward_kwargs["guidance_scale"]
+    if (
+        isinstance(guidance_scale, bool)
+        or not isinstance(guidance_scale, (int, float))
+        or float(guidance_scale) != 1.0
+    ):
+        raise ValueError(
+            f"MiniMax H3 workflow={workflow!r} forward guidance_scale expected neutral 1.0, "
+            f"received {guidance_scale!r}"
+        )
+
+
+def _require_b1_state(state: LatentState, workflow: str, boundary: str) -> None:
+    batch_sizes = {component: values.shape[0] for component, values in state.components.items()}
+    if any(batch_size != 1 for batch_size in batch_sizes.values()):
+        raise ValueError(
+            f"MiniMax H3 workflow={workflow!r} {boundary} requires B=1, "
+            f"received component batch sizes={batch_sizes}"
+        )
+
+
+def _validate_rollout_log_output(output: Any, workflow: str, index: int) -> None:
+    if not isinstance(output.log_prob, torch.Tensor):
+        raise TypeError(
+            f"MiniMax H3 workflow={workflow!r} transition={index} log_prob expected "
+            f"torch.Tensor, received {type(output.log_prob).__name__}"
+        )
+    component_log_probs = output.component_log_probs
+    if (
+        not isinstance(component_log_probs, Mapping)
+        or tuple(component_log_probs) != _COMPONENT_ORDER
+    ):
+        received = (
+            tuple(component_log_probs)
+            if isinstance(component_log_probs, Mapping)
+            else type(component_log_probs).__name__
+        )
+        raise ValueError(
+            f"MiniMax H3 workflow={workflow!r} transition={index} component_log_probs "
+            f"expected order {_COMPONENT_ORDER}, received {received}"
+        )
+    for component, value in component_log_probs.items():
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"MiniMax H3 workflow={workflow!r} transition={index} "
+                f"component_log_probs[{component!r}] expected torch.Tensor, "
+                f"received {type(value).__name__}"
+            )
+
+
+def _build_h3_sample(
+    adapter_class: type,
+    *,
+    prompt: str,
+    prompt_embeds: torch.Tensor,
+    video: Any,
+    audio: torch.Tensor,
+    sample_rate: int,
+    trajectory: Optional[StructuredTrajectory],
+    condition_images: Optional[Sequence[Any]],
+    extra_kwargs: Mapping[str, Any],
+    reference_manifest: Optional[str] = None,
+    height: Optional[int] = None,
+    width: Optional[int] = None,
+) -> Any:
+    sample_classes = {
+        "t2va": MiniMaxH3T2VASample,
+        "fl2va": MiniMaxH3FL2VASample,
+        "ref2va": MiniMaxH3Ref2VASample,
+    }
+    workflow = getattr(adapter_class, "workflow", None)
+    if workflow not in sample_classes:
+        raise TypeError(f"expected one public MiniMax H3 adapter class, received {adapter_class!r}")
+    sample_kwargs = {
+        "prompt": prompt,
+        "prompt_embeds": prompt_embeds,
+        "video": video,
+        "audio": audio,
+        "audio_sample_rate": sample_rate,
+        "height": height,
+        "width": width,
+        "trajectory": trajectory,
+        "extra_kwargs": dict(extra_kwargs),
+    }
+    if workflow == "fl2va":
+        sample_kwargs["condition_images"] = list(condition_images or ())
+    if workflow == "ref2va":
+        sample_kwargs["reference_manifest"] = reference_manifest
+    return sample_classes[workflow](**sample_kwargs)
+
+
+def _media_value_present(value: Any) -> bool:
+    if value is None:
+        return False
+    return not isinstance(value, (list, tuple)) or len(value) > 0
+
+
+def _normalize_layout(values: Mapping[str, Any]) -> Dict[str, Any]:
+    source = values.get("layout", values)
+    if not isinstance(source, Mapping):
+        raise TypeError(f"MiniMax H3 layout expected Mapping, received {type(source).__name__}")
+    normalized = {}
+    for field in _LAYOUT_MATRIX_FIELDS:
+        if field not in source:
+            continue
+        value = source[field]
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"MiniMax H3 layout field={field!r} expected torch.Tensor, "
+                f"received {type(value).__name__}"
+            )
+        if value.ndim == 3 and value.shape[0] == 1:
+            value = value[0]
+        if value.ndim != 2:
+            raise ValueError(
+                f"MiniMax H3 layout field={field!r} expected shape (N,D) or "
+                f"collated (B=1,N,D), received {tuple(value.shape)}"
+            )
+        normalized[field] = value
+    for field in _LAYOUT_INDEX_FIELDS:
+        if field not in source:
+            continue
+        value = source[field]
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"MiniMax H3 layout field={field!r} expected torch.Tensor, "
+                f"received {type(value).__name__}"
+            )
+        if value.ndim == 2 and value.shape[0] == 1:
+            value = value[0]
+        if value.ndim != 1:
+            raise ValueError(
+                f"MiniMax H3 layout field={field!r} expected shape (N,) or "
+                f"collated (B=1,N), received {tuple(value.shape)}"
+            )
+        normalized[field] = value
+    for field in _LAYOUT_COUNT_FIELDS:
+        if field in source:
+            normalized[field] = _normalize_b1_integer(source[field], f"layout.{field}")
+    return normalized
+
+
+def _normalize_geometry(values: Mapping[str, Any]) -> Dict[str, int]:
+    source = values.get("geometry", values)
+    if not isinstance(source, Mapping):
+        raise TypeError(f"MiniMax H3 geometry expected Mapping, received {type(source).__name__}")
+    return {
+        field: _normalize_b1_integer(source[field], f"geometry.{field}")
+        for field in _GEOMETRY_FIELDS
+        if field in source
+    }
+
+
+def _normalize_b1_integer(value: Any, field: str) -> int:
+    if isinstance(value, list):
+        if len(value) != 1:
+            raise ValueError(
+                f"MiniMax H3 {field} expected collated B=1 list, received length {len(value)}"
+            )
+        value = value[0]
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            raise ValueError(
+                f"MiniMax H3 {field} expected one scalar for B=1, "
+                f"received shape {tuple(value.shape)}"
+            )
+        value = value.item()
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(
+            f"MiniMax H3 {field} expected int, received {type(value).__name__}: {value!r}"
+        )
     return value
 
 

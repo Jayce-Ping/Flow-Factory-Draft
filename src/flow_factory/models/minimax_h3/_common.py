@@ -198,6 +198,63 @@ def validate_target_state(state: LatentState) -> None:
         )
 
 
+def apply_forward_process_noise(
+    clean_state: LatentState,
+    times: ComponentTimes,
+    noise: LatentState,
+) -> NoisedState:
+    """Apply supplied H3 noise deterministically in video/audio order.
+
+    Args:
+        clean_state: Clean target-only video/audio state with outer batch one.
+        times: Per-component forward-process coordinates.
+        noise: Supplied noise matching the clean component shapes, dtypes, and devices.
+
+    Returns:
+        Deterministic noised state, data-ward velocity target, and supplied noise.
+    """
+    validate_target_state(clean_state)
+    validate_target_state(noise)
+    clean_batch_size = clean_state.components["video"].shape[0]
+    noise_batch_size = noise.components["video"].shape[0]
+    if clean_batch_size != 1 or noise_batch_size != 1:
+        raise ValueError(
+            "expected MiniMax H3 forward-process B=1, received "
+            f"clean B={clean_batch_size}, noise B={noise_batch_size}"
+        )
+    _validate_component_times(times, clean_state)
+    noised: Dict[str, torch.Tensor] = {}
+    target_velocity: Dict[str, torch.Tensor] = {}
+    for component in MINIMAX_H3_COMPONENT_ORDER:
+        clean = clean_state.components[component]
+        component_noise = noise.components[component]
+        if component_noise.shape != clean.shape:
+            raise ValueError(
+                f"expected noise component {component!r} shape {tuple(clean.shape)}, "
+                f"received {tuple(component_noise.shape)}"
+            )
+        if component_noise.dtype != clean.dtype:
+            raise ValueError(
+                f"expected noise component {component!r} dtype {clean.dtype}, "
+                f"received {component_noise.dtype}"
+            )
+        if component_noise.device != clean.device:
+            raise ValueError(
+                f"expected noise component {component!r} device {clean.device}, "
+                f"received {component_noise.device}"
+            )
+        sigma = times.sigma[component].to(device=clean.device, dtype=clean.dtype)
+        while sigma.ndim < clean.ndim:
+            sigma = sigma.unsqueeze(-1)
+        noised[component] = (1 - sigma) * clean + sigma * component_noise
+        target_velocity[component] = clean - component_noise
+    return NoisedState(
+        state=LatentState(noised),
+        target_velocity=LatentState(target_velocity),
+        noise=noise,
+    )
+
+
 def draw_forward_process_noise(
     clean_state: LatentState,
     times: ComponentTimes,
@@ -215,10 +272,13 @@ def draw_forward_process_noise(
         Noised state, sampled noise, and H3 data-ward targets.
     """
     validate_target_state(clean_state)
+    if clean_state.components["video"].shape[0] != 1:
+        raise ValueError(
+            "expected MiniMax H3 forward-process B=1 before ordered noise draws, "
+            f"received B={clean_state.components['video'].shape[0]}"
+        )
     _validate_component_times(times, clean_state)
     noise: Dict[str, torch.Tensor] = {}
-    noised: Dict[str, torch.Tensor] = {}
-    target_velocity: Dict[str, torch.Tensor] = {}
     for component in MINIMAX_H3_COMPONENT_ORDER:
         clean = clean_state.components[component]
         component_noise = randn_tensor(
@@ -227,17 +287,8 @@ def draw_forward_process_noise(
             device=clean.device,
             dtype=clean.dtype,
         )
-        sigma = times.sigma[component].to(device=clean.device, dtype=clean.dtype)
-        while sigma.ndim < clean.ndim:
-            sigma = sigma.unsqueeze(-1)
         noise[component] = component_noise
-        noised[component] = (1 - sigma) * clean + sigma * component_noise
-        target_velocity[component] = clean - component_noise
-    return NoisedState(
-        state=LatentState(noised),
-        target_velocity=LatentState(target_velocity),
-        noise=LatentState(noise),
-    )
+    return apply_forward_process_noise(clean_state, times, LatentState(noise))
 
 
 def pack_video_latents(latents: torch.Tensor) -> torch.Tensor:
