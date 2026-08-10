@@ -191,7 +191,14 @@ class FakeModularPipeline:
 
 
 class FakeMiniMaxH3Blocks:
-    _workflow_map = {"t2va": {}, "fl2va": ({}, {}), "ref2va": {}}
+    _workflow_map = {
+        "t2va": {"prompt": True},
+        "fl2va": (
+            {"prompt": True, "image": True},
+            {"prompt": True, "last_image": True},
+        ),
+        "ref2va": {"prompt": True, "references": True},
+    }
 
 
 class FakeReference:
@@ -830,6 +837,30 @@ def test_dependency_probe_validates_complete_pinned_compatible_bundle(monkeypatc
     monkeypatch.setattr(dependency, "_SYMBOLS", bundle)
     monkeypatch.setattr(dependency, "_IMPORT_ERROR", None)
     assert dependency.require_minimax_h3_support() is bundle
+
+
+@pytest.mark.parametrize(
+    ("workflow", "triggers"),
+    [
+        ("t2va", {}),
+        ("fl2va", ({"prompt": True, "image": True},)),
+        ("ref2va", {"prompt": True}),
+    ],
+)
+def test_dependency_probe_rejects_incompatible_workflow_triggers(monkeypatch, workflow, triggers):
+    from flow_factory.models.minimax_h3 import dependency
+
+    workflow_map = dict(FakeMiniMaxH3Blocks._workflow_map)
+    workflow_map[workflow] = triggers
+    blocks_class = type("IncompatibleMiniMaxH3Blocks", (), {"_workflow_map": workflow_map})
+    bundle = dataclasses.replace(FakeSymbols(), MiniMaxH3Blocks=blocks_class)
+    monkeypatch.setattr(dependency, "_SYMBOLS", bundle)
+    monkeypatch.setattr(dependency, "_IMPORT_ERROR", None)
+
+    with pytest.raises(ImportError, match=rf"MiniMaxH3Blocks.*{workflow}") as raised:
+        dependency.require_minimax_h3_support()
+    assert dependency.MINIMAX_H3_DIFFUSERS_COMMIT in str(raised.value)
+    assert dependency.MINIMAX_H3_INSTALL in str(raised.value)
 
 
 def test_dependency_probe_rejects_block_without_pipeline_state_call_contract(monkeypatch):

@@ -26,6 +26,14 @@ MINIMAX_H3_INSTALL = (
     f"{MINIMAX_H3_DIFFUSERS_COMMIT}'"
 )
 _WORKFLOWS = ("t2va", "fl2va", "ref2va")
+_WORKFLOW_TRIGGERS = {
+    "t2va": {"prompt": True},
+    "fl2va": (
+        {"prompt": True, "image": True},
+        {"prompt": True, "last_image": True},
+    ),
+    "ref2va": {"prompt": True, "references": True},
+}
 _BLOCK_FIELDS: Tuple[str, ...] = (
     "ResizeStep",
     "RefSetupStep",
@@ -179,10 +187,16 @@ def _probe_symbol_bundle(symbols: MiniMaxH3Symbols) -> None:
 
     workflow_blocks_class = symbols.MiniMaxH3Blocks
     workflow_map = getattr(workflow_blocks_class, "_workflow_map", None)
-    if not isinstance(workflow_map, dict) or any(
-        workflow not in workflow_map for workflow in _WORKFLOWS
-    ):
+    if not isinstance(workflow_map, dict):
         raise ValueError("MiniMaxH3Blocks._workflow_map must declare t2va, fl2va, and ref2va")
+    for workflow in _WORKFLOWS:
+        actual_triggers = workflow_map.get(workflow)
+        expected_triggers = _WORKFLOW_TRIGGERS[workflow]
+        if actual_triggers != expected_triggers:
+            raise ValueError(
+                "MiniMaxH3Blocks._workflow_map trigger mismatch for "
+                f"{workflow}: expected {expected_triggers!r}, received {actual_triggers!r}"
+            )
 
     for field in _BLOCK_FIELDS:
         block_class = getattr(symbols, field)
