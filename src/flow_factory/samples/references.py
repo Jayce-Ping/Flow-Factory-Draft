@@ -15,6 +15,7 @@
 """Validate and serialize ordered heterogeneous reference manifests."""
 
 import json
+import math
 from typing import Any, Dict, List
 
 _REFERENCE_KEYS = {
@@ -101,10 +102,15 @@ def _validate_reference_entry(entry: Any, row_index: int, reference_index: int) 
     for rate_name in ("fps", "sample_rate"):
         if rate_name in entry:
             rate = entry[rate_name]
-            if isinstance(rate, bool) or not isinstance(rate, (int, float)) or rate <= 0:
+            if (
+                isinstance(rate, bool)
+                or not isinstance(rate, (int, float))
+                or not math.isfinite(rate)
+                or rate <= 0
+            ):
                 raise ValueError(
                     f"at row {row_index}, reference {reference_index}, expected "
-                    f"{rate_name} to be positive numeric, got {rate!r}"
+                    f"{rate_name} to be finite positive numeric, got {rate!r}"
                 )
     if kind == "video":
         audio_path = entry.get("audio_path")

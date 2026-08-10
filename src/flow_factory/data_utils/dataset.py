@@ -910,8 +910,17 @@ def _load_ordered_reference(
             _require_finite_positive_rate(
                 fps, "fps", row_index, reference_index, kind, resolved_path
             )
+            effective_fps = entry.get("fps", fps)
+            _require_finite_positive_rate(
+                effective_fps,
+                "effective fps",
+                row_index,
+                reference_index,
+                kind,
+                resolved_path,
+            )
             loaded["frames"] = frames
-            loaded["fps"] = entry.get("fps", fps)
+            loaded["fps"] = effective_fps
             if "audio_path" in entry:
                 audio_path = _resolve_path(data_root, entry["audio_path"])
                 failing_path = audio_path
@@ -925,8 +934,17 @@ def _load_ordered_reference(
                     kind,
                     failing_path,
                 )
+                effective_sample_rate = entry.get("sample_rate", sample_rate)
+                _require_finite_positive_rate(
+                    effective_sample_rate,
+                    "effective sample_rate",
+                    row_index,
+                    reference_index,
+                    kind,
+                    failing_path,
+                )
                 loaded["audio"] = audio
-                loaded["sample_rate"] = entry.get("sample_rate", sample_rate)
+                loaded["sample_rate"] = effective_sample_rate
         elif kind == "audio":
             audio, sample_rate = _decode_ordered_audio(resolved_path)
             _require_finite_positive_rate(
@@ -937,8 +955,17 @@ def _load_ordered_reference(
                 kind,
                 resolved_path,
             )
+            effective_sample_rate = entry.get("sample_rate", sample_rate)
+            _require_finite_positive_rate(
+                effective_sample_rate,
+                "effective sample_rate",
+                row_index,
+                reference_index,
+                kind,
+                resolved_path,
+            )
             loaded["media"] = audio
-            loaded["sample_rate"] = entry.get("sample_rate", sample_rate)
+            loaded["sample_rate"] = effective_sample_rate
         else:
             raise ValueError(
                 "expected ordered reference kind in ('image', 'video', 'audio'), "

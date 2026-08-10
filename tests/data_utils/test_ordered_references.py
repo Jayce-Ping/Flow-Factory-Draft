@@ -23,7 +23,7 @@ import pytest
 import torch
 from PIL import Image
 
-from flow_factory.data_utils.dataset import GeneralDataset
+from flow_factory.data_utils.dataset import GeneralDataset, _load_ordered_reference
 
 REFERENCES = [
     {"kind": "image", "path": "subject.png"},
@@ -294,6 +294,48 @@ def test_decoded_rates_must_be_finite_positive_with_context(
             preprocess_kwargs={"workflow": "ref2va", "width": 768},
             preprocessing_batch_size=1,
             force_reprocess=True,
+        )
+
+
+@pytest.mark.parametrize("rate", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
+@pytest.mark.parametrize(
+    ("kind", "rate_name", "decode_target", "decode_result"),
+    [
+        (
+            "video",
+            "fps",
+            "flow_factory.data_utils.dataset._decode_ordered_video",
+            (np.zeros((1, 2, 2, 3), dtype=np.uint8), 24.0, None, None),
+        ),
+        (
+            "audio",
+            "sample_rate",
+            "flow_factory.data_utils.dataset._decode_ordered_audio",
+            (torch.zeros(1, 8), 16000),
+        ),
+    ],
+)
+def test_effective_override_rates_must_be_finite_positive(
+    tmp_path: Path,
+    monkeypatch,
+    rate: float,
+    kind: str,
+    rate_name: str,
+    decode_target: str,
+    decode_result: Any,
+) -> None:
+    monkeypatch.setattr(decode_target, lambda media_path: decode_result)
+    entry = {"kind": kind, "path": f"media.{kind}", rate_name: rate}
+
+    with pytest.raises(
+        ValueError,
+        match=rf"row 3.*reference 4.*kind='{kind}'.*effective {rate_name}.*finite positive",
+    ):
+        _load_ordered_reference(
+            entry,
+            data_root=str(tmp_path),
+            row_index=3,
+            reference_index=4,
         )
 
 

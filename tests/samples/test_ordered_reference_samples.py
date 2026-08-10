@@ -82,6 +82,29 @@ def test_manifest_rejects_audio_only_with_row_and_reference_context() -> None:
         )
 
 
+@pytest.mark.parametrize("rate", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    ("entry", "rate_name"),
+    [
+        ({"kind": "video", "path": "motion.mp4"}, "fps"),
+        ({"kind": "audio", "path": "voice.wav"}, "sample_rate"),
+    ],
+)
+def test_manifest_rejects_nonfinite_rates_with_context(
+    entry: dict, rate_name: str, rate: float
+) -> None:
+    references = [
+        {"kind": "image", "path": "subject.png"},
+        {**entry, rate_name: rate},
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match=rf"row 9.*reference 1.*{rate_name}.*finite positive.*{rate!r}",
+    ):
+        canonicalize_reference_manifest(references, row_index=9)
+
+
 def test_model_samples_follow_exact_two_layer_hierarchy() -> None:
     assert MiniMaxH3T2VASample.__bases__ == (T2AVSample,)
     assert MiniMaxH3FL2VASample.__bases__ == (I2AVSample,)
