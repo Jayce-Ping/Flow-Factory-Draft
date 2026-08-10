@@ -30,7 +30,7 @@ import torch
 from diffusers.utils.torch_utils import randn_tensor
 
 from flow_factory.models.abc import BaseAdapter
-from flow_factory.samples import BaseSample, LatentState
+from flow_factory.samples import BaseSample, ComponentTimes, LatentState
 from flow_factory.scheduler import SDESchedulerOutput
 from flow_factory.trainers.crd import CRDTrainer, _CRDStep
 from flow_factory.trainers.dgpo import (
@@ -934,6 +934,83 @@ def test_crd_optimize_runs_pass_one_before_pass_two_with_the_right_scopes() -> N
     ]
 
 
+def test_crd_optimize_finishes_every_pass_one_batch_before_any_pass_two_forward() -> None:
+    """The two-pass design is global: no policy forward may precede the last snapshot one."""
+    adapter = _adapter()
+    events: List[str] = []
+    adapter.events = events
+    trainer = _crd_trainer(
+        adapter,
+        events=events,
+        accelerator=AcceleratorFake(events),
+        num_train_timesteps=2,
+        per_device_batch_size=2,
+    )
+    samples = _samples([4, 4, 9, 9], [1.0, 2.0, 3.0, 4.0])
+
+    trainer.optimize(samples)
+
+    old_scope = CRDTrainer._OLD_PARAMS_NAME
+    steps_per_run = 4  # 2 micro-batches x 2 timesteps
+    pass_one: List[str] = []
+    for _ in range(steps_per_run):
+        pass_one += [f"enter:{old_scope}", f"forward:{old_scope}", f"exit:{old_scope}"]
+    pass_two: List[str] = []
+    for _ in range(steps_per_run):
+        pass_two += [
+            "accumulate:enter",
+            "forward:policy",
+            "enter:ref",
+            "forward:ref",
+            "exit:ref",
+            "backward",
+            "clip_grad_norm",
+            "optimizer:step",
+            "optimizer:zero_grad",
+            "log",
+            "accumulate:exit",
+        ]
+    assert events == ["mode:rollout"] + pass_one + ["mode:train"] + pass_two
+
+    train_switch = events.index("mode:train")
+    assert max(
+        index for index, event in enumerate(events) if event == f"forward:{old_scope}"
+    ) < train_switch
+    assert min(
+        index
+        for index, event in enumerate(events)
+        if event in ("forward:policy", "forward:ref")
+    ) > train_switch
+
+
+def test_crd_optimize_repeats_the_optimizer_cadence_once_per_batch_timestep() -> None:
+    adapter = _adapter()
+    events: List[str] = []
+    adapter.events = events
+    trainer = _crd_trainer(
+        adapter,
+        events=events,
+        accelerator=AcceleratorFake(events),
+        num_train_timesteps=2,
+        per_device_batch_size=2,
+    )
+
+    trainer.optimize(_samples([4, 4, 9, 9], [1.0, 2.0, 3.0, 4.0]))
+
+    for event in ("backward", "clip_grad_norm", "optimizer:step", "optimizer:zero_grad", "log"):
+        assert events.count(event) == 4, event
+    assert len(trainer.accelerator.losses) == 4
+    assert [step for step, _ in trainer.logger.payloads] == [0, 1, 2, 3]
+    assert trainer.step == 4
+    # Each micro-batch keeps its own pass-1 timesteps; the two batches carry
+    # different conditioning, so the recorded policy inputs must differ.
+    policy_latents = [
+        call["latents"] for call in adapter.forward_calls if call["scope"] == "policy"
+    ]
+    assert len(policy_latents) == 4
+    assert not torch.equal(policy_latents[0], policy_latents[2])
+
+
 def test_crd_optimize_gives_the_graph_to_the_current_forward_only() -> None:
     adapter = _adapter()
     trainer = _crd_trainer(adapter)
@@ -1139,3 +1216,82 @@ def test_crd_pass_two_rejects_a_noise_state_that_does_not_match_the_clean_state(
         match=r"CRDTrainer.*timestep_index=1.*component 'latent'.*\(2, 3\).*\(2, 9\)",
     ):
         trainer._rebuild_noised_state(clean_state, step, timestep_index=1)
+
+
+def _crd_rebuild_inputs(
+    trainer: CRDTrainer, adapter: TrainableAdapterFake
+) -> Tuple[LatentState, ComponentTimes]:
+    """Terminal clean state plus component times for a direct pass-2 rebuild."""
+    batch = BaseSample.stack(_samples([4, 4], [1.0, 2.0]))
+    clean_state = adapter.get_terminal_state(batch)
+    times = adapter.build_training_component_times(torch.tensor([700.0, 700.0]), batch=batch)
+    return clean_state, times
+
+
+def test_crd_pass_two_rejects_a_non_latent_state_noise_before_component_lookup() -> None:
+    adapter = _adapter()
+    trainer = _crd_trainer(adapter)
+    clean_state, times = _crd_rebuild_inputs(trainer, adapter)
+    step = _CRDStep(
+        times=times,
+        noise={"latent": torch.zeros(2, 3)},
+        old_velocity=LatentState({"latent": torch.zeros(2, 3)}),
+    )
+
+    with pytest.raises(
+        TypeError,
+        match=r"expected LatentState for .*timestep_index=1.* on CRDTrainer, received dict",
+    ):
+        trainer._rebuild_noised_state(clean_state, step, timestep_index=1)
+
+
+@pytest.mark.parametrize(
+    "components",
+    [
+        {"other": torch.zeros(2, 3)},
+        {"latent": torch.zeros(2, 3), "extra": torch.zeros(2, 3)},
+    ],
+)
+def test_crd_pass_two_rejects_a_mismatched_noise_component_order(
+    components: Dict[str, torch.Tensor],
+) -> None:
+    """Missing or extra noise components must report the order, not raise KeyError."""
+    adapter = _adapter()
+    trainer = _crd_trainer(adapter)
+    clean_state, times = _crd_rebuild_inputs(trainer, adapter)
+    step = _CRDStep(
+        times=times,
+        noise=LatentState(components),
+        old_velocity=LatentState({"latent": torch.zeros(2, 3)}),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"expected .*timestep_index=1.* on CRDTrainer in component order "
+            r"\('latent',\), received "
+        ),
+    ):
+        trainer._rebuild_noised_state(clean_state, step, timestep_index=1)
+
+
+def test_crd_pass_two_rejects_a_mismatched_clean_state_component_order() -> None:
+    adapter = _adapter()
+    trainer = _crd_trainer(adapter)
+    _, times = _crd_rebuild_inputs(trainer, adapter)
+    step = _CRDStep(
+        times=times,
+        noise=LatentState({"latent": torch.zeros(2, 3)}),
+        old_velocity=LatentState({"latent": torch.zeros(2, 3)}),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"expected .*clean state.*timestep_index=1.* on CRDTrainer in component order "
+            r"\('latent',\), received \('other',\)"
+        ),
+    ):
+        trainer._rebuild_noised_state(
+            LatentState({"other": torch.zeros(2, 3)}), step, timestep_index=1
+        )

@@ -33,7 +33,7 @@ import tqdm as tqdm_
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from .abc import BaseTrainer
-from .forward_process import forward_velocity_state, state_batch_size
+from .forward_process import forward_velocity_state, require_latent_state, state_batch_size
 from ..hparams import CRDTrainingArguments
 from ..samples import (
     BaseSample,
@@ -457,8 +457,11 @@ class CRDTrainer(BaseTrainer):
 
         Pass 1 and pass 2 resolve the terminal state independently, so a stored
         noise that no longer matches the reloaded geometry would silently
-        broadcast into a different forward process. Check it before applying and
-        name the timestep the drift belongs to.
+        broadcast into a different forward process. Validate both states against
+        the declared component order first — a missing or extra component must
+        report the timestep it belongs to instead of surfacing a bare
+        ``KeyError`` from the lookup below — then check the per-component
+        geometry.
 
         Args:
             clean_state: Terminal clean state reloaded for pass 2.
@@ -469,9 +472,17 @@ class CRDTrainer(BaseTrainer):
         Returns:
             The same noised state and target velocity pass 1 evaluated.
         """
+        clean_state = require_latent_state(
+            self,
+            clean_state,
+            f'pass-2 terminal clean state at timestep_index={timestep_index}',
+        )
+        stored_noise = require_latent_state(
+            self, step.noise, f'pass-1 stored noise at timestep_index={timestep_index}'
+        )
         for name in self.adapter.trajectory_component_order:
             clean = clean_state.components[name]
-            noise = step.noise.components[name]
+            noise = stored_noise.components[name]
             if (
                 noise.shape != clean.shape
                 or noise.dtype != clean.dtype
@@ -484,7 +495,7 @@ class CRDTrainer(BaseTrainer):
                     f"{clean.device}), received ({tuple(noise.shape)}, {noise.dtype}, "
                     f"{noise.device})"
                 )
-        return self.adapter.apply_forward_process_noise(clean_state, step.times, step.noise)
+        return self.adapter.apply_forward_process_noise(clean_state, step.times, stored_noise)
 
     def _precompute_old_velocities(self, batch: StackedSampleBatch) -> _CRDBatch:
         """Pass 1: sample times, draw one noise state per time, record old velocities.
