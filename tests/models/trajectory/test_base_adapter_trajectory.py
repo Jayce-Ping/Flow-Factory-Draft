@@ -372,6 +372,25 @@ def test_legacy_forward_state_preserves_arguments_and_wraps_output() -> None:
     assert torch.equal(output.log_prob, torch.tensor([0.75]))
 
 
+def test_forward_state_removes_batch_level_state_owned_keys() -> None:
+    adapter = _adapter()
+    batch = _legacy_batch()
+    replay = adapter.get_replay_step(batch, 0)
+    batch["noise_level"] = 99.0
+    batch["next_latents"] = torch.full_like(replay.next_state.components["latent"], -99.0)
+
+    adapter.forward_state(
+        batch=batch,
+        state=replay.state,
+        times=replay.times,
+        next_state=replay.next_state,
+        noise_level=0.7,
+    )
+
+    assert adapter.forward_kwargs["noise_level"] == 0.7
+    assert adapter.forward_kwargs["next_latents"] is replay.next_state.components["latent"]
+
+
 @pytest.mark.parametrize("collision", ["t", "t_next", "latents", "next_latents", "return_kwargs"])
 def test_forward_state_rejects_state_owned_kwarg_collisions(collision: str) -> None:
     adapter = _adapter()
@@ -463,6 +482,18 @@ def test_reduce_latent_values_preserves_single_component_scalar_scale() -> None:
     assert reduced is values
 
 
+def test_reduce_latent_values_supports_partial_active_numel_override() -> None:
+    reduced = _structured_adapter().reduce_latent_values(
+        {
+            "video": torch.tensor([[1.0, 3.0], [2.0, 4.0]]),
+            "audio": torch.tensor([10.0, 20.0]),
+        },
+        active_numel={"audio": 3},
+    )
+
+    assert torch.equal(reduced, torch.tensor([34.0 / 5.0, 66.0 / 5.0]))
+
+
 @pytest.mark.parametrize(
     ("values", "active_numel", "message"),
     [
@@ -478,8 +509,8 @@ def test_reduce_latent_values_preserves_single_component_scalar_scale() -> None:
         ),
         (
             {"video": torch.ones(2), "audio": torch.ones(2)},
-            {"video": 1},
-            r"active_numel.*exact.*video.*audio.*video",
+            {"missing": 1},
+            r"active_numel.*unknown.*missing.*video.*audio",
         ),
     ],
 )
@@ -500,3 +531,28 @@ def test_scheduler_setter_refreshes_group_primary() -> None:
     adapter.scheduler = replacement
 
     assert adapter.scheduler_group.primary is replacement
+
+
+def test_scheduler_setter_before_group_initialization_updates_pipeline_only() -> None:
+    adapter = _adapter()
+    replacement = SchedulerFake()
+
+    adapter.scheduler = replacement
+
+    assert adapter.pipeline.scheduler is replacement
+    assert not hasattr(adapter, "scheduler_group")
+
+
+@pytest.mark.parametrize("operation", ["terminal", "replay"])
+def test_structured_hooks_reject_plain_dict_batch_informatively(operation: str) -> None:
+    batch = dict(_structured_batch())
+    adapter = _structured_adapter()
+
+    with pytest.raises(
+        TypeError,
+        match=r"expected StackedSampleBatch.*received dict",
+    ):
+        if operation == "terminal":
+            adapter.get_terminal_state(batch)
+        else:
+            adapter.get_replay_step(batch, 0)

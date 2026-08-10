@@ -129,6 +129,11 @@ def _validate_structured_trajectory(
     batch: StackedSampleBatch,
     trajectory: StructuredTrajectory,
 ) -> None:
+    if not isinstance(batch, StackedSampleBatch):
+        raise TypeError(
+            "expected StackedSampleBatch for structured trajectory bridge, "
+            f"received {type(batch).__name__}"
+        )
     expected_names = adapter.trajectory_component_order
     if trajectory.component_names != expected_names:
         raise ValueError(
@@ -431,7 +436,11 @@ def _forward_state(
             f"expected exactly component order {expected_names} for default forward_state, "
             f"received {received}"
         )
-    forward_kwargs = {key: value for key, value in batch.items() if key not in _STORAGE_KEYS}
+    forward_kwargs = {
+        key: value
+        for key, value in batch.items()
+        if key not in _STORAGE_KEYS and key not in _STATE_OWNED_FORWARD_KEYS
+    }
     forward_kwargs.update(kwargs)
     forward_kwargs = filter_kwargs(adapter.forward, **forward_kwargs)
     output = adapter.forward(
@@ -494,11 +503,18 @@ def _reduce_latent_values(
             f"expected values keys/order to match trajectory_component_order "
             f"{expected_names}, received {received_names}"
         )
-    if active_numel is not None and tuple(active_numel) != expected_names:
-        raise ValueError(
-            f"expected active_numel exact keys/order {expected_names}, received "
-            f"{tuple(active_numel)}"
-        )
+    if active_numel is not None:
+        if not isinstance(active_numel, Mapping):
+            raise TypeError(
+                f"expected Mapping[str, int] or None for active_numel, "
+                f"received {type(active_numel).__name__}"
+            )
+        unknown_active_names = tuple(name for name in active_numel if name not in expected_names)
+        if unknown_active_names:
+            raise ValueError(
+                f"active_numel received unknown keys {unknown_active_names}; expected a subset "
+                f"of trajectory_component_order {expected_names}"
+            )
 
     first = values[expected_names[0]]
     if not isinstance(first, torch.Tensor) or first.ndim < 1:
@@ -539,7 +555,7 @@ def _reduce_latent_values(
                 f"{expected_names[0]!r} ({expected_device}, {expected_dtype}), received "
                 f"{name!r} ({component_values.device}, {component_values.dtype})"
             )
-        override = None if active_numel is None else active_numel[name]
+        override = None if active_numel is None else active_numel.get(name)
         if override is not None:
             if not isinstance(override, int) or isinstance(override, bool) or override <= 0:
                 raise ValueError(

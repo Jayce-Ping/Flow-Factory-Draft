@@ -234,6 +234,20 @@ dispatch; its primary scheduler remains available through `adapter.scheduler`.
   role membership, and an omitted lazy-materialization selection must never mean "load all."
 - **Related Constraint**: #5.
 
+#### Structured trajectory bridge ownership boundaries
+- **Date**: 2026-08-10
+- **Symptom**: Batch-level state arguments could be forwarded twice, partial active-count
+  overrides were rejected, and a plain mapping with structured trajectory data raised an
+  incidental attribute error.
+- **Root Cause**: The legacy bridge did not separate bridge-owned forward arguments from
+  batch conditioning, and treated optional component metadata as a complete mapping.
+- **Fix**: The bridge now strips state-owned batch keys, accepts ordered partial active-count
+  overrides while rejecting unknown components, and validates the structured batch type before
+  accessing batch metadata.
+- **Lesson**: Bridge-owned values must have one authoritative source; optional component
+  metadata should be consumed in authoritative component order without requiring every key.
+- **Related Constraint**: #5, #26.
+
 ### Reward Processing
 `RewardProcessor` dispatches by model type:
 - **Pointwise**: batch by `batch_size`

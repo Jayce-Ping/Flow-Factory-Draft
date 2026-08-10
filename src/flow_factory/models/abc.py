@@ -313,6 +313,9 @@ class BaseAdapter(ABC):
     def build_scheduler_group(self) -> SchedulerGroup:
         """Build the default single-component scheduler group.
 
+        Initialization calls this only after the canonical scheduler is installed.
+        The scheduler setter therefore updates only the pipeline until this group exists.
+
         Returns:
             Scheduler group exposing the canonical scheduler as ``"latent"``.
         """
@@ -466,6 +469,7 @@ class BaseAdapter(ABC):
 
     @scheduler.setter
     def scheduler(self, scheduler: Union[SDESchedulerMixin, SchedulerMixin]):
+        """Set the canonical scheduler and refresh an initialized scheduler group."""
         self.pipeline.scheduler = scheduler
         if hasattr(self, "scheduler_group"):
             schedulers = dict(self.scheduler_group)
@@ -2448,10 +2452,14 @@ class BaseAdapter(ABC):
     ) -> torch.Tensor:
         """Reduce component values by a global per-sample element-weighted mean.
 
+        A single-component ``(B,)`` value is returned unchanged to preserve the
+        legacy scalar scale and tensor identity.
+
         Args:
             values: Component tensors in ``trajectory_component_order``.
-            active_numel: Optional positive weights for already-reduced ``(B,)``
-                component scalars.
+            active_numel: Optional partial mapping of positive weights for
+                already-reduced ``(B,)`` component scalars. Components absent
+                from the mapping derive their weights from raw tensor shapes.
 
         Returns:
             One globally element-weighted scalar per batch item.
