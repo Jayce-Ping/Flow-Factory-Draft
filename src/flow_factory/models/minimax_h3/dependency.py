@@ -13,8 +13,11 @@
 
 """Provide the single optional-import boundary for pinned MiniMax H3 support."""
 
+import inspect
 from dataclasses import dataclass
-from typing import Any, Type
+from typing import Any, Tuple, Type
+
+import torch
 
 MINIMAX_H3_DIFFUSERS_COMMIT = "f53d552036a0d1bd5570782a39cd40cfabf112bc"
 MINIMAX_H3_INSTALL = (
@@ -22,6 +25,28 @@ MINIMAX_H3_INSTALL = (
     "git+https://github.com/huggingface/diffusers.git@"
     f"{MINIMAX_H3_DIFFUSERS_COMMIT}'"
 )
+_WORKFLOWS = ("t2va", "fl2va", "ref2va")
+_BLOCK_FIELDS: Tuple[str, ...] = (
+    "ResizeStep",
+    "RefSetupStep",
+    "TextEncoderStep",
+    "FL2VATextEncoderStep",
+    "Ref2VATextEncoderStep",
+    "NoKeyframeAnchorsStep",
+    "KeyframeEncoderStep",
+    "ReferenceEncoderStep",
+    "PrepareLayoutStep",
+    "RefPrepareLayoutStep",
+    "PrepareConditionLatentsStep",
+    "PrepareLatentsStep",
+    "FL2VAPrepareLatentsStep",
+    "Ref2VAPrepareLatentsStep",
+    "SetTimestepsStep",
+    "AfterDenoiseStep",
+    "VideoDecodeStep",
+    "AudioDecodeStep",
+)
+_REFERENCE_FIELDS: Tuple[str, ...] = ("ImageReference", "VideoReference", "AudioReference")
 
 
 @dataclass(frozen=True)
@@ -126,8 +151,109 @@ def require_minimax_h3_support() -> MiniMaxH3Symbols:
         Immutable bundle of required upstream symbols.
     """
     if _SYMBOLS is None:
-        raise ImportError(
-            "MiniMax H3 support requires all t2va/fl2va/ref2va modular block APIs from "
-            f"diffusers commit {MINIMAX_H3_DIFFUSERS_COMMIT}. Install with: {MINIMAX_H3_INSTALL}"
+        raise _feature_probe_error(
+            "required symbols could not be imported", _IMPORT_ERROR
         ) from _IMPORT_ERROR
+    try:
+        _probe_symbol_bundle(_SYMBOLS)
+    except (AttributeError, TypeError, ValueError) as probe_error:
+        raise _feature_probe_error(str(probe_error), probe_error) from probe_error
     return _SYMBOLS
+
+
+def _probe_symbol_bundle(symbols: MiniMaxH3Symbols) -> None:
+    state_values = {"probe": object()}
+    try:
+        state = symbols.PipelineState(values=state_values)
+    except TypeError as state_error:
+        raise TypeError(
+            "PipelineState must support construction as PipelineState(values=...)"
+        ) from state_error
+    if not hasattr(state, "values") or state.values != state_values:
+        raise ValueError(
+            "PipelineState must support PipelineState(values=...) and preserve a readable values mapping"
+        )
+
+    pipeline_class = symbols.MiniMaxH3ModularPipeline
+    workflow_map = getattr(pipeline_class, "_workflow_map", None)
+    if not isinstance(workflow_map, dict) or any(
+        workflow not in workflow_map for workflow in _WORKFLOWS
+    ):
+        raise ValueError(
+            "MiniMaxH3ModularPipeline._workflow_map must declare t2va, fl2va, and ref2va"
+        )
+
+    for field in _BLOCK_FIELDS:
+        block_class = getattr(symbols, field)
+        if not callable(block_class):
+            raise TypeError(f"{field} expected a callable block class, received {block_class!r}")
+        block = block_class()
+        if not callable(block):
+            raise TypeError(f"{field} instance must be callable as block(pipeline, state)")
+        _probe_block_call_shape(block, field)
+
+    for field in _REFERENCE_FIELDS:
+        reference_class = getattr(symbols, field)
+        if not callable(reference_class):
+            raise TypeError(
+                f"{field} expected a callable reference class, received {reference_class!r}"
+            )
+
+    build_row_timesteps = getattr(symbols.SetTimestepsStep, "build_row_timesteps", None)
+    if not callable(build_row_timesteps):
+        raise TypeError("SetTimestepsStep.build_row_timesteps expected a callable API")
+    row_plan = build_row_timesteps(
+        torch.tensor([2]),
+        torch.tensor([1]),
+        0,
+        0,
+        1,
+        0.2,
+        0.4,
+        0.999,
+        1.0,
+    )
+    if (
+        not isinstance(row_plan, tuple)
+        or len(row_plan) != 2
+        or not all(isinstance(value, torch.Tensor) for value in row_plan)
+    ):
+        raise ValueError(
+            "SetTimestepsStep.build_row_timesteps expected to return two torch.Tensor values"
+        )
+
+
+def _probe_block_call_shape(block: Any, field: str) -> None:
+    try:
+        signature = inspect.signature(block)
+    except (TypeError, ValueError):
+        return
+    parameters = tuple(signature.parameters.values())
+    if any(parameter.kind == inspect.Parameter.VAR_POSITIONAL for parameter in parameters):
+        return
+    positional = tuple(
+        parameter
+        for parameter in parameters
+        if parameter.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    )
+    required_keyword_only = tuple(
+        parameter
+        for parameter in parameters
+        if parameter.kind == inspect.Parameter.KEYWORD_ONLY
+        and parameter.default is inspect.Parameter.empty
+    )
+    required_positional = tuple(
+        parameter for parameter in positional if parameter.default is inspect.Parameter.empty
+    )
+    if len(positional) < 2 or len(required_positional) > 2 or required_keyword_only:
+        raise TypeError(f"{field} must support the callable API block(pipeline, state)")
+
+
+def _feature_probe_error(detail: str, cause: Any) -> ImportError:
+    cause_text = "" if cause is None else f"; cause={type(cause).__name__}: {cause}"
+    return ImportError(
+        "MiniMax H3 feature probe failed: "
+        f"{detail}{cause_text}. Required exact diffusers commit "
+        f"{MINIMAX_H3_DIFFUSERS_COMMIT}. Install with: {MINIMAX_H3_INSTALL}"
+    )

@@ -192,12 +192,20 @@ def prepare_h3_rollout_state(
     audio_rows = _as_batched_rows(output["audio_latents"], 32, workflow, "audio_latents")
     video_count = _condition_count(cached_values, workflow, "video")
     audio_count = _condition_count(cached_values, workflow, "audio")
-    if video_rows.shape[1] <= video_count or audio_rows.shape[1] <= audio_count:
-        raise ValueError(
-            f"MiniMax H3 workflow={workflow!r} condition row counts video={video_count}, "
-            f"audio={audio_count} leave no generated target rows in shapes "
-            f"{tuple(video_rows.shape)}/{tuple(audio_rows.shape)}"
-        )
+    _validate_rollout_row_counts(
+        cached_values,
+        workflow,
+        "video",
+        full_row_count=video_rows.shape[1],
+        condition_row_count=video_count,
+    )
+    _validate_rollout_row_counts(
+        cached_values,
+        workflow,
+        "audio",
+        full_row_count=audio_rows.shape[1],
+        condition_row_count=audio_count,
+    )
     prefixes = {
         "video": video_rows[:, :video_count],
         "audio": audio_rows[:, :audio_count],
@@ -225,6 +233,38 @@ def _condition_count(values: Mapping[str, Any], workflow: str, component: str) -
             f"received {count!r}"
         )
     return count
+
+
+def _validate_rollout_row_counts(
+    values: Mapping[str, Any],
+    workflow: str,
+    component: str,
+    *,
+    full_row_count: int,
+    condition_row_count: int,
+) -> None:
+    index_field = f"{component}_indices"
+    indices = values.get(index_field)
+    if not isinstance(indices, torch.Tensor) or indices.ndim != 1:
+        raise ValueError(
+            f"MiniMax H3 workflow={workflow!r} component={component!r} field={index_field!r} "
+            f"actual={getattr(indices, 'shape', type(indices).__name__)} "
+            "expected=one-dimensional Tensor"
+        )
+    expected_full_rows = indices.numel()
+    if full_row_count != expected_full_rows:
+        raise ValueError(
+            f"MiniMax H3 workflow={workflow!r} component={component!r} "
+            f"field='full_row_count' actual={full_row_count} expected={expected_full_rows}"
+        )
+    actual_target_rows = max(full_row_count - condition_row_count, 0)
+    expected_target_rows = expected_full_rows - condition_row_count
+    if actual_target_rows != expected_target_rows or expected_target_rows <= 0:
+        raise ValueError(
+            f"MiniMax H3 workflow={workflow!r} component={component!r} "
+            f"field='target_row_count' actual={actual_target_rows} "
+            f"expected={expected_target_rows}"
+        )
 
 
 def _as_batched_rows(rows: torch.Tensor, width: int, workflow: str, field: str) -> torch.Tensor:
