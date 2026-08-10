@@ -22,18 +22,36 @@ class ModularPipelineRuntime(ComponentRuntime):
 
     @property
     def canonical_components(self) -> Mapping[str, Any]:
-        """Return modular component specifications exposed by the pipeline.
+        """Return specs declared through pinned ModularPipeline's public API.
 
         Raises:
-            TypeError: If ``pipeline.components`` is not a mapping.
+            TypeError: If the public spec API has an incompatible shape.
         """
-        components = getattr(self.pipeline, "components", None)
-        if not isinstance(components, Mapping):
+        component_names = getattr(self.pipeline, "component_names", None)
+        config_component_names = getattr(self.pipeline, "config_component_names", None)
+        if not isinstance(component_names, list) or not all(
+            isinstance(name, str) and name for name in component_names
+        ):
             raise TypeError(
-                "Modular pipeline components must be a mapping of lazy specifications, "
-                f"got {type(components).__name__}."
+                "Modular pipeline component_names must be a list of non-empty strings, "
+                f"got {type(component_names).__name__}: {component_names!r}."
             )
-        return components
+        if not isinstance(config_component_names, list) or not all(
+            isinstance(name, str) and name for name in config_component_names
+        ):
+            raise TypeError(
+                "Modular pipeline config_component_names must be a list of non-empty strings, "
+                f"got {type(config_component_names).__name__}: {config_component_names!r}."
+            )
+        get_component_spec = getattr(self.pipeline, "get_component_spec", None)
+        if not callable(get_component_spec):
+            raise TypeError(
+                "Modular pipeline must provide callable get_component_spec(name), "
+                f"got {get_component_spec!r}."
+            )
+
+        declared_names = list(dict.fromkeys([*component_names, *config_component_names]))
+        return {name: get_component_spec(name) for name in declared_names}
 
     def _get_materialized_component(self, name: str) -> Any:
         return getattr(self.pipeline, name, None)

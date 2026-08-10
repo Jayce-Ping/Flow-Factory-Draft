@@ -43,7 +43,7 @@ class TransformerFake(nn.Module):
 
 
 class WorkflowPipelineFake:
-    """Record exact workflow loading and named modular materialization."""
+    """Match pinned ModularPipeline spec and materialized-value separation."""
 
     calls: ClassVar[List[tuple[str, str]]] = []
     component_overrides: ClassVar[Dict[str, Any]] = {}
@@ -51,20 +51,42 @@ class WorkflowPipelineFake:
     def __init__(self, workflow: str) -> None:
         transformer_name = "transformer_ref" if workflow == "ref2va" else "transformer"
         self.workflow = workflow
-        self.components = {
+        self.pretrained_specs = {
             "scheduler": "scheduler spec",
             "text_encoder": "text encoder spec",
             "tokenizer": "tokenizer spec",
-            "processor": "processor spec",
-            "image_processor": "image processor spec",
-            "video_processor": "video processor spec",
             "vae": "video vae spec",
             "audio_vae": "audio vae spec",
             transformer_name: "transformer spec",
             "unrelated": "must stay lazy",
             **self.component_overrides,
         }
+        self.config_specs = {
+            "processor": "processor spec",
+            "image_processor": "image processor spec",
+            "video_processor": "video processor spec",
+        }
+        for name in self.config_specs:
+            setattr(self, name, SimpleNamespace())
         self.load_calls: List[List[str]] = []
+
+    @property
+    def component_names(self) -> List[str]:
+        return list(self.pretrained_specs)
+
+    @property
+    def config_component_names(self) -> List[str]:
+        return list(self.config_specs)
+
+    @property
+    def components(self) -> Dict[str, Any]:
+        names = [*self.component_names, *self.config_component_names]
+        return {
+            name: getattr(self, name) for name in names if getattr(self, name, None) is not None
+        }
+
+    def get_component_spec(self, name: str) -> Any:
+        return {**self.pretrained_specs, **self.config_specs}[name]
 
     @classmethod
     def from_pretrained(cls, model_name_or_path: str, *, workflow: str) -> "WorkflowPipelineFake":
@@ -173,6 +195,13 @@ def test_workflow_adapter_loads_pruned_runtime_and_exact_setup_components(
     assert adapter_class.__bases__ == (BaseAdapter,)
     assert WorkflowPipelineFake.calls == [("MiniMaxAI/MiniMax-H3", workflow)]
     assert isinstance(adapter.component_runtime, ModularPipelineRuntime)
+    assert set(adapter.pipeline.components) == {
+        transformer_name,
+        "scheduler",
+        "processor",
+        "image_processor",
+        "video_processor",
+    }
     assert adapter.pipeline.load_calls == [[transformer_name], ["scheduler"]]
     assert not hasattr(adapter.pipeline, "unrelated")
     assert transformer_name in adapter.component_runtime.materialized_component_names
@@ -182,7 +211,10 @@ def test_workflow_adapter_loads_pruned_runtime_and_exact_setup_components(
     adapter.on_load_components(adapter.preprocessing_modules, device="cpu")
 
     assert adapter.preprocessing_modules == preprocessing_names
-    assert adapter.pipeline.load_calls[-1] == preprocessing_names
+    expected_lazy_names = [
+        name for name in preprocessing_names if name not in adapter.pipeline.config_component_names
+    ]
+    assert adapter.pipeline.load_calls[-1] == expected_lazy_names
     assert not hasattr(adapter.pipeline, "unrelated")
 
 

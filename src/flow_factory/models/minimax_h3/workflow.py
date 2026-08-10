@@ -14,7 +14,6 @@
 
 """Own MiniMax H3 workflow loading and setup contracts."""
 
-from collections.abc import Mapping
 from typing import Any, Dict, List, Union
 
 from ...scheduler import MiniMaxH3SDEScheduler, SchedulerGroup
@@ -43,25 +42,20 @@ def load_h3_workflow_pipeline(
         model_name_or_path,
         workflow=workflow,
     )
-    components = getattr(pipeline, "components", None)
-    if not isinstance(components, Mapping):
-        raise TypeError(
-            f"MiniMax H3 workflow={workflow!r} expected pipeline.components to be a mapping, "
-            f"received {type(components).__name__}: {components!r}"
-        )
+    declared_specs = ModularPipelineRuntime(pipeline).canonical_components
 
     opposite_component_name = (
         "transformer_ref" if transformer_component_name == "transformer" else "transformer"
     )
     required_names = (*_COMMON_REQUIRED_COMPONENTS, transformer_component_name)
-    missing_names = [name for name in required_names if components.get(name) is None]
-    opposite_names = [opposite_component_name] if opposite_component_name in components else []
+    missing_names = [name for name in required_names if declared_specs.get(name) is None]
+    opposite_names = [opposite_component_name] if opposite_component_name in declared_specs else []
     if missing_names or opposite_names:
         raise ValueError(
             f"MiniMax H3 workflow={workflow!r} expected required components "
             f"{required_names!r} and opposite transformer partition {opposite_component_name!r} "
             f"to be absent, received missing={missing_names!r}, "
-            f"opposite_present={opposite_names!r}, declared={tuple(components)!r}"
+            f"opposite_present={opposite_names!r}, declared={tuple(declared_specs)!r}"
         )
     return pipeline
 
