@@ -39,6 +39,11 @@ _STORAGE_KEYS = {
     "log_probs",
     "log_prob_index_map",
 }
+# Trainer-owned batch fields: written by the feedback stage for the loss, never a
+# model conditioning argument. Adapters that accept ``**kwargs`` would otherwise
+# receive them, which legacy trainers never did.
+_TRAINER_METADATA_KEYS = {"advantage"}
+_BRIDGE_OWNED_BATCH_KEYS = _STORAGE_KEYS | _TRAINER_METADATA_KEYS
 _STATE_OWNED_FORWARD_KEYS = {
     "t",
     "t_next",
@@ -584,7 +589,15 @@ def _apply_forward_process_noise(
             f"expected sigma component order {expected_names} for "
             f"apply_forward_process_noise, received {received}"
         )
-    batch_size = clean_state.components[expected_names[0]].shape[0]
+    primary_name = expected_names[0]
+    primary_clean = clean_state.components[primary_name]
+    if primary_clean.ndim < 2:
+        raise ValueError(
+            f"expected apply_forward_process_noise clean_state component {primary_name!r} to be "
+            f"a batched tensor with a leading batch dimension and shape (B, ...), received shape "
+            f"{tuple(primary_clean.shape)}"
+        )
+    batch_size = primary_clean.shape[0]
     noised: Dict[str, torch.Tensor] = {}
     target_velocity: Dict[str, torch.Tensor] = {}
     for name in expected_names:
@@ -683,6 +696,13 @@ def _forward_state(
         raise ValueError(
             f"explicit forward_state kwargs collide with state-owned arguments {collisions}"
         )
+    owned = tuple(sorted(name for name in kwargs if name in _BRIDGE_OWNED_BATCH_KEYS))
+    if owned:
+        raise ValueError(
+            f"explicit forward_state kwargs collide with trainer-owned arguments {owned}; the "
+            "bridge reads trajectory storage and trainer metadata from the batch and never "
+            "forwards them to adapter.forward"
+        )
     expected_names = ("latent",)
     received = {
         "state": state.component_names,
@@ -703,7 +723,7 @@ def _forward_state(
     forward_kwargs = {
         key: value
         for key, value in batch.items()
-        if key not in _STORAGE_KEYS and key not in _STATE_OWNED_FORWARD_KEYS
+        if key not in _BRIDGE_OWNED_BATCH_KEYS and key not in _STATE_OWNED_FORWARD_KEYS
     }
     forward_kwargs.update(kwargs)
     forward_kwargs = filter_kwargs(adapter.forward, **forward_kwargs)

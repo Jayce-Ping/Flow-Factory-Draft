@@ -48,18 +48,51 @@ def require_component_sigmas(trainer: Any, times: ComponentTimes) -> Dict[str, t
     return dict(sigmas)
 
 
-def state_batch_size(trainer: Any, state: LatentState) -> int:
+def require_latent_state(trainer: Any, state: Any, identifier: str) -> LatentState:
+    """Return a latent state validated against the declared component order.
+
+    Args:
+        trainer: Trainer owning the adapter that declares the component order.
+        state: Candidate latent state.
+        identifier: State name reported by validation errors.
+
+    Returns:
+        The validated latent state.
+    """
+    expected_names = trainer.adapter.trajectory_component_order
+    if not isinstance(state, LatentState):
+        raise TypeError(
+            f"expected LatentState for {identifier} on {type(trainer).__name__}, "
+            f"received {type(state).__name__}"
+        )
+    if state.component_names != expected_names:
+        raise ValueError(
+            f"expected {identifier} on {type(trainer).__name__} in component order "
+            f"{expected_names}, received {state.component_names}"
+        )
+    return state
+
+
+def state_batch_size(trainer: Any, state: LatentState, identifier: str = "latent state") -> int:
     """Return the batch size of a latent state's primary component.
 
     Args:
         trainer: Trainer owning the adapter that declares the component order.
         state: Batched latent state in ``trajectory_component_order``.
+        identifier: State name reported by validation errors.
 
     Returns:
         Leading dimension of the primary component.
     """
     primary = trainer.adapter.trajectory_component_order[0]
-    return state.components[primary].shape[0]
+    component = require_latent_state(trainer, state, identifier).components[primary]
+    if component.ndim < 2:
+        raise ValueError(
+            f"expected {identifier} component {primary!r} on {type(trainer).__name__} to be a "
+            f"batched tensor with a leading batch dimension and shape (B, ...), received shape "
+            f"{tuple(component.shape)}"
+        )
+    return component.shape[0]
 
 
 def training_forward_kwargs(trainer: Any, batch: StackedSampleBatch) -> Dict[str, Any]:
@@ -82,20 +115,32 @@ def require_velocity_state(
     trainer: Any,
     output: MultiModalStepOutput,
     source: str,
-    batch_size: int,
+    expected_state: LatentState,
 ) -> LatentState:
-    """Return a required velocity state in authoritative component order.
+    """Return a velocity state validated against the state it was predicted for.
+
+    Every component must carry the exact shape and device of its input state:
+    a ``(B, 1, ...)`` velocity would broadcast silently against a ``(B, C, ...)``
+    state and quietly change every downstream matching loss.
+
+    Dtype is checked for a floating-point type shared by all components rather
+    than for equality with ``expected_state``: ``latent_storage_dtype`` (fp16 by
+    default) deliberately decouples stored latents from the autocast compute
+    dtype, and adapters that predict in fp32 (e.g. Z-Image) legitimately return a
+    velocity in neither. A per-component dtype split, however, breaks the shared
+    reduction contract.
 
     Args:
         trainer: Trainer owning the adapter that declares the component order.
         output: Forward output to read the velocity from.
         source: Pass identifier reported by validation errors.
-        batch_size: Batch size every velocity component must use.
+        expected_state: Latent state the forward pass consumed.
 
     Returns:
         Velocity state keyed by component.
     """
     expected_names = trainer.adapter.trajectory_component_order
+    reference = require_latent_state(trainer, expected_state, f"{source} forward state")
     velocity = output.velocity
     if velocity is None or velocity.component_names != expected_names:
         received = None if velocity is None else velocity.component_names
@@ -103,12 +148,33 @@ def require_velocity_state(
             f"expected {source} velocity for {type(trainer).__name__} in component order "
             f"{expected_names}, received {received}; request 'velocity' through return_fields"
         )
+    primary_name = expected_names[0]
+    primary_dtype = velocity.components[primary_name].dtype
     for name in expected_names:
         component = velocity.components[name]
-        if component.ndim < 2 or component.shape[0] != batch_size:
+        component_reference = reference.components[name]
+        if component.shape != component_reference.shape:
             raise ValueError(
-                f"expected {source} velocity component {name!r} for {type(trainer).__name__} "
-                f"to use batch size {batch_size}, received shape {tuple(component.shape)}"
+                f"expected {source} velocity component {name!r} for {type(trainer).__name__} to "
+                f"match its forward state shape {tuple(component_reference.shape)}, received "
+                f"shape {tuple(component.shape)}"
+            )
+        if component.device != component_reference.device:
+            raise ValueError(
+                f"expected {source} velocity component {name!r} for {type(trainer).__name__} on "
+                f"the forward state device {component_reference.device}, received "
+                f"{component.device}"
+            )
+        if not component.is_floating_point():
+            raise ValueError(
+                f"expected {source} velocity component {name!r} for {type(trainer).__name__} to "
+                f"be a floating point tensor, received {component.dtype}"
+            )
+        if component.dtype != primary_dtype:
+            raise ValueError(
+                f"expected {source} velocity component {name!r} for {type(trainer).__name__} to "
+                f"share the dtype of component {primary_name!r} ({primary_dtype}), received "
+                f"{component.dtype}"
             )
     return velocity
 
@@ -143,6 +209,10 @@ def forward_velocity_state(
     """
     forward_kwargs = training_forward_kwargs(trainer, batch)
     forward_kwargs.update(overrides)
+    # Validate the batch rank before the forward: the velocity check below only
+    # compares shapes, so an unbatched state would pass unnoticed if the adapter
+    # mirrored it.
+    state_batch_size(trainer, state, f"{source} forward state")
     output = trainer.adapter.forward_state(
         batch=batch,
         state=state,
@@ -152,4 +222,4 @@ def forward_velocity_state(
         noise_level=noise_level,
         **forward_kwargs,
     )
-    return require_velocity_state(trainer, output, source, state_batch_size(trainer, state))
+    return require_velocity_state(trainer, output, source, state)

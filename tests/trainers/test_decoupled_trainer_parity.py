@@ -34,6 +34,7 @@ from flow_factory.trainers.dpo import DPOTrainer
 from flow_factory.trainers.forward_process import (
     forward_velocity_state,
     require_velocity_state,
+    state_batch_size,
     training_forward_kwargs,
 )
 from flow_factory.trainers.nft import DiffusionNFTTrainer
@@ -122,6 +123,17 @@ class StructuredAdapterFake(AdapterFake):
     """Adapter fake declaring the structured video/audio component contract."""
 
     trajectory_component_order = ("video", "audio")
+
+
+class BroadcastVelocityAdapterFake(AdapterFake):
+    """Adapter returning a per-sample velocity that broadcasts over the state."""
+
+    def forward(self, **kwargs: Any) -> SDESchedulerOutput:
+        """Return a velocity reduced to one element per sample."""
+        self.forward_kwargs = kwargs
+        self.forward_calls.append(kwargs)
+        latents = kwargs["latents"]
+        return SDESchedulerOutput(velocity=latents.mean(dim=1, keepdim=True))
 
 
 class DynamicMaskAdapterFake(AdapterFake):
@@ -326,18 +338,21 @@ def test_velocity_state_validation_rejects_a_missing_velocity() -> None:
         ValueError,
         match=r"policy velocity.*AWMTrainer.*\('latent',\).*received None.*return_fields",
     ):
-        require_velocity_state(trainer, MultiModalStepOutput(), "policy", 2)
+        require_velocity_state(
+            trainer, MultiModalStepOutput(), "policy", LatentState({"latent": torch.zeros(2, 4)})
+        )
 
 
 def test_velocity_state_validation_requires_the_declared_component_order() -> None:
     trainer = _trainer(AWMTrainer, _structured_adapter())
     output = MultiModalStepOutput(velocity=LatentState({"audio": torch.zeros(2, 5)}))
+    expected = LatentState({"video": torch.zeros(2, 3), "audio": torch.zeros(2, 5)})
 
     with pytest.raises(
         ValueError,
         match=r"reference velocity.*AWMTrainer.*\('video', 'audio'\).*\('audio',\)",
     ):
-        require_velocity_state(trainer, output, "reference", 2)
+        require_velocity_state(trainer, output, "reference", expected)
 
 
 def test_velocity_state_validation_requires_the_state_batch_size() -> None:
@@ -345,9 +360,106 @@ def test_velocity_state_validation_requires_the_state_batch_size() -> None:
     output = MultiModalStepOutput(velocity=LatentState({"latent": torch.zeros(3, 4)}))
 
     with pytest.raises(
-        ValueError, match=r"policy velocity component 'latent'.*batch size 2.*\(3, 4\)"
+        ValueError,
+        match=r"policy velocity component 'latent'.*\(2, 4\).*received shape \(3, 4\)",
     ):
-        require_velocity_state(trainer, output, "policy", 2)
+        require_velocity_state(
+            trainer, output, "policy", LatentState({"latent": torch.zeros(2, 4)})
+        )
+
+
+def test_velocity_state_validation_rejects_a_broadcastable_spatial_shape() -> None:
+    """A (B, 1) velocity broadcasts silently against a (B, 4) state, so reject it."""
+    trainer = _trainer(AWMTrainer, _adapter())
+    output = MultiModalStepOutput(velocity=LatentState({"latent": torch.zeros(2, 1)}))
+
+    with pytest.raises(
+        ValueError,
+        match=r"policy velocity component 'latent'.*\(2, 4\).*received shape \(2, 1\)",
+    ):
+        require_velocity_state(
+            trainer, output, "policy", LatentState({"latent": torch.zeros(2, 4)})
+        )
+
+
+def test_velocity_state_validation_rejects_a_foreign_device() -> None:
+    trainer = _trainer(AWMTrainer, _adapter())
+    output = MultiModalStepOutput(
+        velocity=LatentState({"latent": torch.zeros(2, 4, device="meta")})
+    )
+
+    with pytest.raises(ValueError, match=r"policy velocity component 'latent'.*cpu.*meta"):
+        require_velocity_state(
+            trainer, output, "policy", LatentState({"latent": torch.zeros(2, 4)})
+        )
+
+
+def test_velocity_state_validation_rejects_a_non_floating_point_velocity() -> None:
+    trainer = _trainer(AWMTrainer, _adapter())
+    output = MultiModalStepOutput(
+        velocity=LatentState({"latent": torch.zeros(2, 4, dtype=torch.int64)})
+    )
+
+    with pytest.raises(
+        ValueError, match=r"policy velocity component 'latent'.*floating point.*torch.int64"
+    ):
+        require_velocity_state(
+            trainer, output, "policy", LatentState({"latent": torch.zeros(2, 4)})
+        )
+
+
+def test_velocity_state_validation_rejects_components_with_divergent_dtypes() -> None:
+    """Component reductions require one shared dtype across the whole velocity."""
+    trainer = _trainer(AWMTrainer, _structured_adapter())
+    output = MultiModalStepOutput(
+        velocity=LatentState(
+            {"video": torch.zeros(2, 3), "audio": torch.zeros(2, 5, dtype=torch.float64)}
+        )
+    )
+    expected = LatentState({"video": torch.zeros(2, 3), "audio": torch.zeros(2, 5)})
+
+    with pytest.raises(
+        ValueError,
+        match=r"policy velocity component 'audio'.*'video'.*torch.float32.*torch.float64",
+    ):
+        require_velocity_state(trainer, output, "policy", expected)
+
+
+def test_velocity_state_validation_accepts_the_autocast_compute_dtype() -> None:
+    """``latent_storage_dtype`` (fp16 by default) legitimately differs from bf16 compute."""
+    trainer = _trainer(AWMTrainer, _adapter())
+    stored = LatentState({"latent": torch.zeros(2, 4, dtype=torch.float16)})
+    computed = LatentState({"latent": torch.zeros(2, 4, dtype=torch.bfloat16)})
+
+    velocity = require_velocity_state(
+        trainer, MultiModalStepOutput(velocity=computed), "policy", stored
+    )
+
+    assert velocity is computed
+
+
+def test_forward_velocity_state_validates_against_the_forwarded_state() -> None:
+    adapter = _adapter(BroadcastVelocityAdapterFake)
+    trainer = _trainer(DiffusionNFTTrainer, adapter)
+    batch = _legacy_batch()
+    state = adapter.get_terminal_state(batch)
+    times = _latent_times(torch.tensor([700.0, 300.0]))
+
+    with pytest.raises(
+        ValueError,
+        match=r"policy velocity component 'latent'.*\(2, 2\).*received shape \(2, 1\)",
+    ):
+        forward_velocity_state(trainer, batch, state, times, source="policy")
+
+
+def test_state_batch_size_rejects_an_unbatched_component() -> None:
+    trainer = _trainer(DiffusionNFTTrainer, _adapter())
+
+    with pytest.raises(
+        ValueError,
+        match=r"component 'latent'.*leading batch dimension.*received shape \(\)",
+    ):
+        state_batch_size(trainer, LatentState({"latent": torch.tensor(1.0)}))
 
 
 # ============================ DiffusionNFT ============================
@@ -865,4 +977,16 @@ def test_dpo_paired_terminal_states_reject_a_mismatched_batch_size() -> None:
     with pytest.raises(ValueError, match=r"component 'latent'.*\(2, 4\).*received \(3, 4\)"):
         trainer._require_paired_terminal_states(
             LatentState({"latent": torch.zeros(2, 4)}), LatentState({"latent": torch.zeros(3, 4)})
+        )
+
+
+def test_dpo_paired_terminal_states_reject_an_unbatched_component() -> None:
+    trainer = _dpo_trainer(_adapter())
+
+    with pytest.raises(
+        ValueError,
+        match=r"component 'latent'.*leading batch dimension.*received shape \(\)",
+    ):
+        trainer._require_paired_terminal_states(
+            LatentState({"latent": torch.tensor(1.0)}), LatentState({"latent": torch.tensor(2.0)})
         )

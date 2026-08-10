@@ -389,7 +389,7 @@ class DiffusionNFTTrainer(BaseTrainer):
                 disable=not self.show_progress_bar,
             ):
                 clean_state = self.adapter.get_terminal_state(batch)
-                batch_size = state_batch_size(self, clean_state)
+                batch_size = state_batch_size(self, clean_state, 'terminal clean state')
 
                 # ---------- Per-batch precompute: old v predictions under sampling policy ----------
                 precomputed = self._precompute_sampling_policy_steps(

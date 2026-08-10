@@ -40,7 +40,7 @@ import tqdm as tqdm_
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from .abc import BaseTrainer
-from .forward_process import forward_velocity_state
+from .forward_process import forward_velocity_state, require_latent_state, state_batch_size
 from ..hparams import DPOTrainingArguments
 from ..samples import BaseSample, LatentState, NoisedState
 from ..utils.base import create_generator, create_generator_by_prompt
@@ -411,13 +411,8 @@ class DPOTrainer(BaseTrainer):
             Batch size shared by both arms.
         """
         expected_names = self.adapter.trajectory_component_order
-        for argument, state in (('chosen', chosen_state), ('rejected', rejected_state)):
-            if state.component_names != expected_names:
-                raise ValueError(
-                    f"expected {argument} terminal state for {type(self).__name__} in component "
-                    f"order {expected_names}, received {state.component_names}"
-                )
-        batch_size = chosen_state.components[expected_names[0]].shape[0]
+        batch_size = state_batch_size(self, chosen_state, 'chosen terminal state')
+        require_latent_state(self, rejected_state, 'rejected terminal state')
         for name in expected_names:
             chosen = chosen_state.components[name]
             rejected = rejected_state.components[name]

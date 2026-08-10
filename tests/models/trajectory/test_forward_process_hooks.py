@@ -399,6 +399,21 @@ def test_explicit_noise_application_rejects_a_mismatched_component_batch_size() 
         )
 
 
+def test_explicit_noise_application_rejects_an_unbatched_primary_component() -> None:
+    adapter = _adapter()
+    times = _latent_times(torch.tensor([700.0, 300.0]))
+
+    with pytest.raises(
+        ValueError,
+        match=r"clean_state component 'latent'.*leading batch dimension.*received shape \(\)",
+    ):
+        adapter.apply_forward_process_noise(
+            LatentState({"latent": torch.tensor(1.0)}),
+            times,
+            LatentState({"latent": torch.tensor(2.0)}),
+        )
+
+
 def test_explicit_noise_application_rejects_a_sigma_without_one_value_per_sample() -> None:
     adapter = _adapter()
     primary = torch.tensor([700.0, 300.0])

@@ -453,6 +453,80 @@ def test_legacy_forward_state_omits_absent_component_statistics() -> None:
     assert output.component_log_probs is None
 
 
+def _trainer_metadata_batch() -> Any:
+    # Trainer metadata (advantage) and trajectory storage live in the same batch as
+    # the conditioning arguments an adapter forward actually needs.
+    return BaseSample.stack(
+        [
+            BaseSample(
+                timesteps=torch.tensor([1000.0, 500.0]),
+                all_latents=torch.tensor([[1.0], [2.0], [3.0]]),
+                latent_index_map=torch.tensor([0, 1, 2]),
+                log_probs=torch.tensor([0.1, 0.2]),
+                log_prob_index_map=torch.tensor([0, 1]),
+                prompt_embeds=torch.tensor([4.0]),
+                extra_kwargs={"advantage": torch.tensor(0.5)},
+            ),
+            BaseSample(
+                timesteps=torch.tensor([1000.0, 500.0]),
+                all_latents=torch.tensor([[10.0], [20.0], [30.0]]),
+                latent_index_map=torch.tensor([0, 1, 2]),
+                log_probs=torch.tensor([0.3, 0.4]),
+                log_prob_index_map=torch.tensor([0, 1]),
+                prompt_embeds=torch.tensor([5.0]),
+                extra_kwargs={"advantage": torch.tensor(-1.5)},
+            ),
+        ]
+    )
+
+
+def test_forward_state_never_forwards_trainer_metadata_or_trajectory_storage() -> None:
+    adapter = _adapter()
+    batch = _trainer_metadata_batch()
+    replay = adapter.get_replay_step(batch, 0)
+
+    adapter.forward_state(
+        batch=batch,
+        state=replay.state,
+        times=replay.times,
+        next_state=replay.next_state,
+        compute_log_prob=False,
+        return_fields=("velocity",),
+    )
+
+    assert "advantage" in batch
+    assert torch.equal(adapter.forward_kwargs["prompt_embeds"], batch["prompt_embeds"])
+    assert not set(adapter.forward_kwargs) & {
+        "advantage",
+        "trajectory",
+        "timesteps",
+        "all_latents",
+        "latent_index_map",
+        "log_probs",
+        "log_prob_index_map",
+    }
+
+
+def test_forward_state_rejects_explicit_trainer_metadata_kwargs() -> None:
+    adapter = _adapter()
+    batch = _trainer_metadata_batch()
+    replay = adapter.get_replay_step(batch, 0)
+
+    with pytest.raises(
+        ValueError,
+        match=r"collide with trainer-owned arguments \('advantage',\)",
+    ):
+        adapter.forward_state(
+            batch=batch,
+            state=replay.state,
+            times=replay.times,
+            next_state=replay.next_state,
+            compute_log_prob=False,
+            return_fields=("velocity",),
+            advantage=torch.zeros(2),
+        )
+
+
 def _legacy_terminal_step_batch() -> Any:
     # Adapters store one timestep per denoising step (T), while latents/log-probs
     # keep T + 1 rollout positions, so the final transition has no stored t_next.
