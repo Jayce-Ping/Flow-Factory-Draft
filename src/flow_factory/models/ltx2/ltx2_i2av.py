@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import torch
 from accelerate import Accelerator
@@ -28,10 +28,18 @@ from diffusers.pipelines.ltx2.pipeline_ltx2_image2video import (
 )
 
 from ...hparams import *
-from ...samples import I2AVSample
+from ...samples import (
+    ComponentTimes,
+    I2AVSample,
+    LatentState,
+    MultiModalStepOutput,
+    NoisedState,
+    StackedSampleBatch,
+)
 from ...scheduler import (
     FlowMatchEulerDiscreteSDEScheduler,
     FlowMatchEulerDiscreteSDESchedulerOutput,
+    SchedulerGroup,
     set_scheduler_timesteps,
 )
 from ...scheduler.flow_match_euler_discrete import calculate_shift
@@ -51,7 +59,16 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
-from ._common import combine_modality_log_prob
+from ._common import (
+    LTX2_COMPONENT_ORDER,
+    attach_ltx2_state_masks,
+    build_ltx2_component_step_output,
+    build_ltx2_joint_forward_kwargs,
+    build_ltx2_training_component_times,
+    combine_modality_log_prob,
+    draw_ltx2_forward_process_noise,
+    validate_i2av_component_masks,
+)
 
 logger = setup_logger(__name__)
 
@@ -147,19 +164,23 @@ class LTX2_I2AV_Adapter(BaseAdapter):
 
     Conditions video generation on a first-frame image. Audio is generated
     jointly but is NOT conditioned by the image (pure noise init, scalar timestep).
-    Only the video pathway receives stochastic SDE treatment for RL training.
+    Video and audio are stepped by two twin SDE schedulers, so every transition
+    produces a per-modality log_prob whose element-weighted combination is the
+    joint policy log_prob; the fixed conditioning frame is never stepped and
+    therefore carries no stochastic degrees of freedom.
 
     Per constraint #12, inherits directly from BaseAdapter (flat hierarchy).
     Shared logic with LTX2_T2AV_Adapter is handled via code duplication.
     """
 
     supports_diffusers_cache = True
+    trajectory_component_order: ClassVar[Tuple[str, ...]] = LTX2_COMPONENT_ORDER
 
     def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
         self.pipeline: LTX2ImageToVideoPipeline
         self.scheduler: FlowMatchEulerDiscreteSDEScheduler
-        self.audio_scheduler: FlowMatchEulerDiscreteSDEScheduler = self._create_audio_scheduler()
+        self.audio_scheduler: FlowMatchEulerDiscreteSDEScheduler
         self._has_warned_multi_image = False
 
     def load_pipeline(self) -> LTX2ImageToVideoPipeline:
@@ -168,8 +189,8 @@ class LTX2_I2AV_Adapter(BaseAdapter):
             low_cpu_mem_usage=False,
         )
 
-    def _create_audio_scheduler(self) -> FlowMatchEulerDiscreteSDEScheduler:
-        """Create a twin of the video scheduler for the audio modality.
+    def build_scheduler_group(self) -> SchedulerGroup:
+        """Build the ordered video/audio scheduler group and its audio twin.
 
         Audio is sampled with the same SDE dynamics as video so that both
         modalities form a single joint policy whose per-step log_prob feeds the
@@ -177,10 +198,18 @@ class LTX2_I2AV_Adapter(BaseAdapter):
         scheduler.step() mutates internal state (step_index), which would
         conflict if shared with the video scheduler. ``load_scheduler`` rebuilds
         an independent scheduler from the same pipeline scheduler + scheduler
-        args used for ``self.scheduler`` (which ``super().__init__`` has already
-        built at this point).
+        args used for ``self.scheduler`` (which ``BaseAdapter.__init__`` has
+        already installed when it calls this hook).
+
+        Returns:
+            Scheduler group whose primary ``"video"`` component is the canonical
+            pipeline scheduler.
         """
-        return self.load_scheduler()
+        self.audio_scheduler = self.load_scheduler()
+        return SchedulerGroup(
+            {"video": self.scheduler, "audio": self.audio_scheduler},
+            primary_name="video",
+        )
 
     @property
     def default_target_modules(self) -> List[str]:
@@ -731,8 +760,10 @@ class LTX2_I2AV_Adapter(BaseAdapter):
         compute_log_prob: bool = True,
         return_kwargs: List[str] = ["next_latents", "log_prob", "velocity"],
         use_cross_timestep: bool = False,
+        # Component-return mode, owned by ``_forward_state``
+        _return_components: bool = False,
         **kwargs,
-    ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
+    ) -> Union[FlowMatchEulerDiscreteSDESchedulerOutput, MultiModalStepOutput]:
         """Single denoising step with I2AV conditioning mask and frame-slicing.
 
         Compared to T2AV forward():
@@ -740,6 +771,11 @@ class LTX2_I2AV_Adapter(BaseAdapter):
         - Builds per-token video timestep: ts * (1 - conditioning_mask)
         - Scheduler step runs on generated frames only (1:), preserving frame 0
         - next_latents for training is also sliced to exclude frame 0
+
+        The default return concatenates both modalities into one legacy
+        ``SDESchedulerOutput``. ``_return_components`` is reserved for
+        :meth:`_forward_state`, which needs the per-modality latents, statistics
+        and log-probs captured before that concatenation.
         """
         batch_size = latents.shape[0]
         device = latents.device
@@ -1057,7 +1093,20 @@ class LTX2_I2AV_Adapter(BaseAdapter):
             noise_level=noise_level,
         )
 
-        # --- 9. Concatenate back into unified latents ---
+        # --- 9. Component view, captured before the legacy concatenation mutates it ---
+        if _return_components:
+            return build_ltx2_component_step_output(
+                self,
+                video_output=video_output,
+                audio_output=audio_output,
+                video_velocity=video_pred,
+                audio_velocity=audio_pred,
+                n_video=n_video_stepped,
+                n_audio=audio_latents[0].numel(),
+                compute_log_prob=compute_log_prob,
+            )
+
+        # --- 10. Concatenate back into unified latents ---
         if video_output.next_latents is not None and audio_output.next_latents is not None:
             video_output.next_latents = torch.cat(
                 [video_output.next_latents, audio_output.next_latents],
@@ -1077,7 +1126,7 @@ class LTX2_I2AV_Adapter(BaseAdapter):
                 dim=1,
             )
 
-        # --- 10. Combine per-step log_prob across modalities ---
+        # --- 11. Combine per-step log_prob across modalities ---
         # Joint transition p(v,a|z_t) = p(v|z_t) p(a|z_t); the element-weighted mean
         # reproduces what a single scheduler over the concatenated [video|audio] latent
         # would return. `n_video_stepped` counts only the generated video frames (the
@@ -1095,6 +1144,94 @@ class LTX2_I2AV_Adapter(BaseAdapter):
             )
 
         return video_output
+
+    # ============================== Trajectory Hooks ==============================
+
+    def build_training_component_times(
+        self,
+        primary_timesteps: torch.Tensor,
+        *,
+        batch: Optional[StackedSampleBatch] = None,
+    ) -> ComponentTimes:
+        """Mirror one sampled coordinate onto the twin video/audio schedules.
+
+        Args:
+            primary_timesteps: Primary scheduler coordinates of shape ``(B,)``.
+            batch: Unused; both components share the primary coordinate.
+
+        Returns:
+            Video/audio timesteps and sigmas in authoritative component order.
+        """
+        return build_ltx2_training_component_times(self, primary_timesteps)
+
+    def add_forward_process_noise(
+        self,
+        clean_state: LatentState,
+        times: ComponentTimes,
+        *,
+        generator: Optional[torch.Generator] = None,
+    ) -> NoisedState:
+        """Draw video noise then audio noise, then apply both deterministically.
+
+        The fixed conditioning tokens stay clean because the application hook
+        honours ``clean_state.active_masks``.
+
+        Args:
+            clean_state: Clean latent state in authoritative component order.
+            times: Component times including each component's current sigma.
+            generator: Optional generator shared by both ordered draws.
+
+        Returns:
+            Noised state, target velocity, and the sampled noise.
+        """
+        return draw_ltx2_forward_process_noise(self, clean_state, times, generator=generator)
+
+    def _forward_state(
+        self,
+        *,
+        batch: StackedSampleBatch,
+        state: LatentState,
+        times: ComponentTimes,
+        next_state: Optional[LatentState],
+        compute_log_prob: bool,
+        return_fields: Tuple[str, ...],
+        noise_level: Optional[float],
+        forward_kwargs: Mapping[str, Any],
+    ) -> MultiModalStepOutput:
+        """Pack the ordered video/audio state for ``forward`` and unpack components.
+
+        The state masks are the single source of truth for which video tokens are
+        stochastic, so they are checked against the batch conditioning mask that
+        ``forward`` uses for its first-frame slicing.
+
+        Args:
+            batch: Collated batch supplying conditioning and ``video_seq_len``.
+            state: Current state in authoritative component order.
+            times: Current and next times in authoritative component order.
+            next_state: Optional stored next state in authoritative component order.
+            compute_log_prob: Whether to compute transition log probabilities.
+            return_fields: Scheduler output fields requested from ``forward``.
+            noise_level: Scheduler noise-level override.
+            forward_kwargs: Model-conditioning arguments resolved by the wrapper.
+
+        Returns:
+            Ordered component step output carrying the input active masks.
+        """
+        validate_i2av_component_masks(self, batch=batch, state=state)
+        output = self.forward(
+            **build_ltx2_joint_forward_kwargs(
+                self,
+                batch=batch,
+                state=state,
+                times=times,
+                next_state=next_state,
+                compute_log_prob=compute_log_prob,
+                return_fields=return_fields,
+                noise_level=noise_level,
+                forward_kwargs=forward_kwargs,
+            )
+        )
+        return attach_ltx2_state_masks(state, output)
 
     @torch.no_grad()
     def inference(

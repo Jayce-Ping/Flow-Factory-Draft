@@ -120,6 +120,37 @@ def _move_tensor(tensor: torch.Tensor, device: Union[torch.device, str]) -> torc
     return tensor.to(device)
 
 
+def _broadcasts_to(mask: torch.Tensor, target_shape: Tuple[int, ...]) -> bool:
+    """Return whether a same-rank boolean mask broadcasts onto ``target_shape``.
+
+    Equal rank is required so a per-sample mask can never be silently reinterpreted
+    as a batched one (or the other way round) when the batch axis is missing.
+    """
+    if mask.ndim != len(target_shape):
+        return False
+    return all(
+        mask_dim in (1, target_dim) for mask_dim, target_dim in zip(mask.shape, target_shape)
+    )
+
+
+def _validate_active_mask(
+    mask: torch.Tensor, target_shape: Tuple[int, ...], identifier: str
+) -> torch.Tensor:
+    """Validate one static active mask against the state shape it must cover."""
+    if not isinstance(mask, torch.Tensor):
+        raise TypeError(
+            f"expected torch.Tensor or None for {identifier}, received {type(mask).__name__}"
+        )
+    if mask.dtype is not torch.bool:
+        raise TypeError(f"expected {identifier} dtype torch.bool, received {mask.dtype}")
+    if not _broadcasts_to(mask, target_shape):
+        raise ValueError(
+            f"expected {identifier} broadcastable to the latent state shape "
+            f"{tuple(target_shape)}, received shape {tuple(mask.shape)}"
+        )
+    return mask
+
+
 _SIGNED_INTEGER_DTYPES = (torch.int8, torch.int16, torch.int32, torch.int64)
 
 
@@ -296,12 +327,15 @@ class ComponentTrajectory:
             ``(B, T + 1)`` after collation.
         state_index_map: Shared map from rollout positions to stored-state indices.
         sigmas: Optional full sigma schedule matching ``timesteps``.
+        active_mask: Optional static boolean mask marking the elements that carry
+            stochastic degrees of freedom, broadcastable to one stored state.
     """
 
     states: torch.Tensor
     timesteps: torch.Tensor
     state_index_map: torch.Tensor
     sigmas: Optional[torch.Tensor] = None
+    active_mask: Optional[torch.Tensor] = None
 
     def __post_init__(self) -> None:
         for name in ("states", "timesteps", "state_index_map"):
@@ -383,6 +417,17 @@ class ComponentTrajectory:
                 f"states shape {tuple(self.states.shape)} and timesteps shape "
                 f"{tuple(self.timesteps.shape)}"
             )
+        if self.active_mask is not None:
+            # One state keeps the batch axis once collated, so the mask covers
+            # ``states[:, stored]`` for a batched trajectory and ``states[stored]`` otherwise.
+            state_shape = (
+                self.states.shape[:1] + self.states.shape[2:]
+                if state_axis == 1
+                else self.states.shape[1:]
+            )
+            _validate_active_mask(
+                self.active_mask, tuple(state_shape), "ComponentTrajectory.active_mask"
+            )
 
     def to(self, device: Union[torch.device, str]) -> "ComponentTrajectory":
         """Move all trajectory tensors to a device in place.
@@ -412,6 +457,8 @@ class ComponentTrajectory:
         self.state_index_map = transform(self.state_index_map)
         if self.sigmas is not None:
             self.sigmas = transform(self.sigmas)
+        if self.active_mask is not None:
+            self.active_mask = transform(self.active_mask)
         return self
 
 
@@ -728,6 +775,21 @@ class StructuredTrajectory:
                             f"{expected_sigma_shape}, received "
                             f"{tuple(component.sigmas.shape)} for sample index {sample_index}"
                         )
+            mask_presence = [component.active_mask is not None for component in component_values]
+            if len(set(mask_presence)) != 1:
+                raise ValueError(
+                    f"expected identical active_mask presence for component {name!r}, "
+                    f"received {mask_presence}"
+                )
+            if mask_presence[0]:
+                expected_mask_shape = tuple(component_values[0].active_mask.shape)
+                for sample_index, component in enumerate(component_values[1:], start=1):
+                    if tuple(component.active_mask.shape) != expected_mask_shape:
+                        raise ValueError(
+                            f"expected component {name!r} active_mask shape "
+                            f"{expected_mask_shape}, received "
+                            f"{tuple(component.active_mask.shape)} for sample index {sample_index}"
+                        )
             components[name] = ComponentTrajectory(
                 states=torch.stack([component.states for component in component_values]),
                 timesteps=torch.stack([component.timesteps for component in component_values]),
@@ -737,6 +799,11 @@ class StructuredTrajectory:
                     else None
                 ),
                 state_index_map=component_values[0].state_index_map,
+                active_mask=(
+                    torch.stack([component.active_mask for component in component_values])
+                    if mask_presence[0]
+                    else None
+                ),
             )
 
         log_prob_presence = [trajectory.log_probs is not None for trajectory in trajectories]
@@ -802,12 +869,34 @@ class LatentState:
 
     Args:
         components: Ordered component-to-latent mapping.
+        active_masks: Optional static boolean masks marking each component's
+            stochastic degrees of freedom. When present every component needs one.
     """
 
     components: Mapping[str, torch.Tensor]
+    active_masks: Optional[Mapping[str, torch.Tensor]] = None
 
     def __post_init__(self) -> None:
         self.components = _validate_component_mapping(self.components, "LatentState.components")
+        if self.active_masks is None:
+            return
+        validated = _validate_component_mapping(self.active_masks, "LatentState.active_masks")
+        expected_names = tuple(self.components)
+        if tuple(validated) != expected_names:
+            raise ValueError(
+                f"expected LatentState.active_masks component order {expected_names}, "
+                f"received {tuple(validated)}"
+            )
+        batch_size = _batch_size_of(self, "LatentState.components")
+        for name, mask in validated.items():
+            identifier = f"LatentState.active_masks[{name!r}]"
+            if mask.ndim < 1 or mask.shape[0] != batch_size:
+                raise ValueError(
+                    f"expected {identifier} to use batch size {batch_size}, "
+                    f"received shape {tuple(mask.shape)}"
+                )
+            _validate_active_mask(mask, tuple(self.components[name].shape), identifier)
+        self.active_masks = validated
 
     @property
     def component_names(self) -> Tuple[str, ...]:

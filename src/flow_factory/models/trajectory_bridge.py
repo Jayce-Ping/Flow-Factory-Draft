@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 import torch
 from diffusers.utils.torch_utils import randn_tensor
@@ -194,6 +194,63 @@ def _validate_structured_trajectory(
         )
 
 
+def _structured_active_masks(
+    adapter: Any,
+    trajectory: StructuredTrajectory,
+    *,
+    operation: str,
+) -> Optional[Dict[str, torch.Tensor]]:
+    """Collect every component's static active mask, or none when unmasked."""
+    expected_names = adapter.trajectory_component_order
+    present = tuple(
+        name for name in expected_names if trajectory.components[name].active_mask is not None
+    )
+    if not present:
+        return None
+    missing = tuple(name for name in expected_names if name not in present)
+    if missing:
+        raise ValueError(
+            f"expected an active_mask on all components {expected_names} or on none for "
+            f"{operation}, received masks for {present} with missing components {missing}"
+        )
+    return {name: trajectory.components[name].active_mask for name in expected_names}
+
+
+def _expand_active_mask(
+    mask: torch.Tensor,
+    values: torch.Tensor,
+    *,
+    component: str,
+    operation: str,
+) -> torch.Tensor:
+    """Broadcast one static mask onto the values it selects."""
+    if mask.ndim != values.ndim or any(
+        mask_dim not in (1, value_dim) for mask_dim, value_dim in zip(mask.shape, values.shape)
+    ):
+        raise ValueError(
+            f"expected the {operation} active mask for component {component!r} to broadcast onto "
+            f"the value shape {tuple(values.shape)}, received mask shape {tuple(mask.shape)}"
+        )
+    return mask.expand(values.shape)
+
+
+def _active_element_counts(
+    expanded_mask: torch.Tensor,
+    *,
+    component: str,
+) -> torch.Tensor:
+    """Return one positive active element count per sample."""
+    counts = expanded_mask.reshape(expanded_mask.shape[0], -1).sum(dim=1)
+    minimum = int(counts.min().item())
+    if minimum <= 0:
+        raise ValueError(
+            f"expected component {component!r} active_mask to leave a positive active element "
+            f"count per sample, received {minimum} for at least one sample with counts "
+            f"{counts.tolist()}"
+        )
+    return counts
+
+
 def _get_terminal_state(adapter: Any, batch: StackedSampleBatch) -> LatentState:
     trajectory = batch.get("trajectory")
     if trajectory is not None:
@@ -213,7 +270,12 @@ def _get_terminal_state(adapter: Any, batch: StackedSampleBatch) -> LatentState:
                 upper_bound=component.states.shape[1],
             )
             terminal[name] = component.states[:, terminal_position]
-        return LatentState(terminal)
+        return LatentState(
+            terminal,
+            active_masks=_structured_active_masks(
+                adapter, trajectory, operation="get_terminal_state"
+            ),
+        )
 
     _require_legacy_tensors(
         batch,
@@ -327,9 +389,12 @@ def _get_replay_step(
                     )
                     for name in adapter.trajectory_component_order
                 }
+        active_masks = _structured_active_masks(
+            adapter, trajectory, operation=f"get_replay_step at step_index={step_index}"
+        )
         return ReplayStep(
-            state=LatentState(state),
-            next_state=LatentState(next_state),
+            state=LatentState(state, active_masks=active_masks),
+            next_state=LatentState(next_state, active_masks=active_masks),
             times=ComponentTimes(
                 timestep=timestep,
                 next_timestep=next_timestep,
@@ -462,7 +527,14 @@ def _get_replay_callback(
             components[name] = indexed.at(
                 step_index, identifier=f"callback {field!r} component {name!r}"
             )
-        return LatentState(components)
+        return LatentState(
+            components,
+            active_masks=_structured_active_masks(
+                adapter,
+                trajectory,
+                operation=f"get_replay_callback {field!r} at step_index={step_index}",
+            ),
+        )
 
     _require_legacy_tensors(
         batch,
@@ -499,7 +571,24 @@ def _get_state_active_numel(adapter: Any, state: LatentState) -> Dict[str, int]:
                 f"expected batched state component {name!r} with shape (B, ...) and a positive "
                 f"batch size, received {tuple(values.shape)}"
             )
-        active_numel[name] = int(values.numel() // values.shape[0])
+        if state.active_masks is None:
+            active_numel[name] = int(values.numel() // values.shape[0])
+            continue
+        expanded = _expand_active_mask(
+            state.active_masks[name],
+            values,
+            component=name,
+            operation="get_state_active_numel",
+        )
+        counts = _active_element_counts(expanded, component=name)
+        # The public result is one integer per component, so a per-sample count
+        # would silently pick a single sample's geometry for the whole batch.
+        if int(counts.min().item()) != int(counts.max().item()):
+            raise ValueError(
+                f"expected component {name!r} active_mask to mark a constant active element "
+                f"count per sample, received {counts.tolist()}"
+            )
+        active_numel[name] = int(counts[0].item())
     return active_numel
 
 
@@ -629,11 +718,27 @@ def _apply_forward_process_noise(
                 f"shape ({batch_size},), received {tuple(sigma.shape)}"
             )
         sigma = to_broadcast_tensor(sigma, clean_latents)
-        noised[name] = (1 - sigma) * clean_latents + sigma * component_noise
-        target_velocity[name] = component_noise - clean_latents
+        component_noised = (1 - sigma) * clean_latents + sigma * component_noise
+        component_target = component_noise - clean_latents
+        if clean_state.active_masks is not None:
+            # The draw above already consumed the full-shape RNG stream; masking only
+            # decides which elements move, so inactive conditioning stays clean and
+            # contributes no training signal.
+            mask = _expand_active_mask(
+                clean_state.active_masks[name],
+                clean_latents,
+                component=name,
+                operation="apply_forward_process_noise",
+            )
+            component_noised = torch.where(mask, component_noised, clean_latents)
+            component_target = torch.where(
+                mask, component_target, torch.zeros_like(component_target)
+            )
+        noised[name] = component_noised
+        target_velocity[name] = component_target
     return NoisedState(
-        state=LatentState(noised),
-        target_velocity=LatentState(target_velocity),
+        state=LatentState(noised, active_masks=clean_state.active_masks),
+        target_velocity=LatentState(target_velocity, active_masks=clean_state.active_masks),
         noise=noise,
     )
 
@@ -906,6 +1011,7 @@ def _default_reduce_component_latent_values(
     *,
     state: Optional[LatentState],
 ) -> Dict[str, torch.Tensor]:
+    active_masks = None if state is None else state.active_masks
     reduced: Dict[str, torch.Tensor] = {}
     for name in adapter.trajectory_component_order:
         component_values = values[name]
@@ -916,7 +1022,22 @@ def _default_reduce_component_latent_values(
                 f"{tuple(getattr(component_values, 'shape', ()))}"
             )
         batch_size = component_values.shape[0]
-        reduced[name] = component_values.reshape(batch_size, -1).mean(dim=1)
+        if active_masks is None:
+            reduced[name] = component_values.reshape(batch_size, -1).mean(dim=1)
+            continue
+        mask = _expand_active_mask(
+            active_masks[name],
+            component_values,
+            component=name,
+            operation="reduce_component_latent_values",
+        )
+        counts = _active_element_counts(mask, component=name)
+        active_sum = (
+            torch.where(mask, component_values, torch.zeros_like(component_values))
+            .reshape(batch_size, -1)
+            .sum(dim=1)
+        )
+        reduced[name] = active_sum / counts.to(active_sum.dtype)
     return reduced
 
 
@@ -960,8 +1081,9 @@ def _default_reduce_latent_values(
                 )
         return first
 
+    active_masks = None if state is None else state.active_masks
     weighted_sum: Optional[torch.Tensor] = None
-    total_weight = 0
+    total_weight: Union[int, torch.Tensor] = 0
     for name in expected_names:
         component_values = values[name]
         if not isinstance(component_values, torch.Tensor) or component_values.ndim < 1:
@@ -993,18 +1115,33 @@ def _default_reduce_latent_values(
                     f"active_numel is provided, received {tuple(component_values.shape)}"
                 )
             component_sum = component_values * override
-            component_weight = override
+            component_weight: Union[int, torch.Tensor] = override
+        elif active_masks is not None:
+            mask = _expand_active_mask(
+                active_masks[name],
+                component_values,
+                component=name,
+                operation="reduce_latent_values",
+            )
+            component_weight = _active_element_counts(mask, component=name)
+            component_sum = (
+                torch.where(mask, component_values, torch.zeros_like(component_values))
+                .reshape(batch_size, -1)
+                .sum(dim=1)
+            )
         else:
             flattened = component_values.reshape(batch_size, -1)
             component_sum = flattened.sum(dim=1)
             component_weight = flattened.shape[1]
-        if component_weight <= 0:
+        if not isinstance(component_weight, torch.Tensor) and component_weight <= 0:
             raise ValueError(
                 f"expected positive element weight for component {name!r}, "
                 f"received {component_weight}"
             )
         weighted_sum = component_sum if weighted_sum is None else weighted_sum + component_sum
-        total_weight += component_weight
-    if total_weight <= 0:
+        total_weight = total_weight + component_weight
+    if isinstance(total_weight, torch.Tensor):
+        total_weight = total_weight.to(weighted_sum.dtype)
+    elif total_weight <= 0:
         raise ValueError(f"expected positive total latent weight, received {total_weight}")
     return weighted_sum / total_weight
