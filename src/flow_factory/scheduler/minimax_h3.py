@@ -29,7 +29,16 @@ from .abc import SDESchedulerMixin, SDESchedulerOutput
 
 @dataclass
 class MiniMaxH3SDESchedulerOutput(SDESchedulerOutput):
-    """Store one MiniMax H3 scheduler transition."""
+    """Store one MiniMax H3 scheduler transition.
+
+    Args:
+        next_latents: Sampled next state.
+        next_latents_mean: Transition mean.
+        std_dev_t: Scheduler diffusion coefficient.
+        dt: Sigma step size.
+        log_prob: Per-sample mean transition log probability.
+        velocity: Original H3 data-ward model velocity.
+    """
 
 
 class MiniMaxH3SDEScheduler(SchedulerMixin, ConfigMixin, SDESchedulerMixin):
@@ -47,10 +56,17 @@ class MiniMaxH3SDEScheduler(SchedulerMixin, ConfigMixin, SDESchedulerMixin):
         num_sde_steps: Optional[int] = None,
         seed: int = 42,
         dynamics_type: Literal["Flow-SDE", "Dance-SDE", "CPS", "ODE"] = "Flow-SDE",
-        **kwargs: object,
     ) -> None:
-        """Initialize scheduler configuration and stochastic lifecycle state."""
-        del kwargs
+        """Initialize scheduler configuration and stochastic lifecycle state.
+
+        Args:
+            shift: Positive exponential sigma shift.
+            noise_level: Non-negative stochastic sampling scale.
+            sde_steps: Eligible stochastic transition indices.
+            num_sde_steps: Number of eligible indices selected per rollout.
+            seed: Seed for stochastic transition selection.
+            dynamics_type: Configured ODE or SDE dynamics.
+        """
         self._validate_positive_number(shift, "shift")
         if not isinstance(noise_level, (int, float)) or isinstance(noise_level, bool):
             raise TypeError(
@@ -119,7 +135,14 @@ class MiniMaxH3SDEScheduler(SchedulerMixin, ConfigMixin, SDESchedulerMixin):
         self.train(mode)
 
     def set_seed(self, seed: int) -> None:
-        """Set the seed used to select stochastic transition indices."""
+        """Set the seed used to select stochastic transition indices.
+
+        Args:
+            seed: Integer selection seed.
+
+        Returns:
+            None.
+        """
         if not isinstance(seed, int) or isinstance(seed, bool):
             raise TypeError(
                 f"expected int seed for MiniMaxH3SDEScheduler, received {type(seed).__name__}: {seed!r}"
@@ -127,12 +150,26 @@ class MiniMaxH3SDEScheduler(SchedulerMixin, ConfigMixin, SDESchedulerMixin):
         self.seed = seed
 
     def set_shift(self, shift: float) -> None:
-        """Set the exponential shift used by the next schedule."""
+        """Set the exponential shift used by the next schedule.
+
+        Args:
+            shift: Positive finite exponential shift.
+
+        Returns:
+            None.
+        """
         self._validate_positive_number(shift, "shift")
         self._shift = float(shift)
 
     def set_begin_index(self, begin_index: int = 0) -> None:
-        """Set the first implicit schedule index."""
+        """Set the first implicit schedule index.
+
+        Args:
+            begin_index: First scalar rollout transition index.
+
+        Returns:
+            None.
+        """
         if not isinstance(begin_index, int) or isinstance(begin_index, bool):
             raise TypeError(
                 "expected int begin_index for MiniMaxH3SDEScheduler, "
@@ -146,7 +183,16 @@ class MiniMaxH3SDEScheduler(SchedulerMixin, ConfigMixin, SDESchedulerMixin):
         device: Optional[Union[str, torch.device]] = None,
         sigmas: Optional[Union[List[float], torch.Tensor]] = None,
     ) -> None:
-        """Build an N-transition schedule from N+1 upstream sigma grid points."""
+        """Build an N-transition schedule from N+1 upstream sigma grid points.
+
+        Args:
+            num_inference_steps: Number of denoising transitions.
+            device: Device for exposed schedule tensors.
+            sigmas: Optional explicit shifted schedule including terminal zero.
+
+        Returns:
+            None.
+        """
         if sigmas is None:
             if (
                 not isinstance(num_inference_steps, int)
@@ -234,7 +280,14 @@ class MiniMaxH3SDEScheduler(SchedulerMixin, ConfigMixin, SDESchedulerMixin):
     def get_noise_level_for_timestep(
         self, timestep: Union[float, torch.Tensor]
     ) -> Union[float, torch.Tensor]:
-        """Return stochastic noise levels for exact stored framework times."""
+        """Return stochastic noise levels for exact stored framework times.
+
+        Args:
+            timestep: Scalar or batched stored framework coordinates.
+
+        Returns:
+            Scalar or batched effective noise levels.
+        """
         if isinstance(timestep, torch.Tensor) and timestep.ndim == 1:
             indices = torch.tensor(
                 [self.index_for_timestep(value) for value in timestep],
@@ -252,7 +305,14 @@ class MiniMaxH3SDEScheduler(SchedulerMixin, ConfigMixin, SDESchedulerMixin):
     def get_noise_level_for_sigma(
         self, sigma: Union[float, torch.Tensor]
     ) -> Union[float, torch.Tensor]:
-        """Return stochastic noise levels for exact stored sigma values."""
+        """Return stochastic noise levels for exact stored sigma values.
+
+        Args:
+            sigma: Scalar or batched stored sigma values.
+
+        Returns:
+            Scalar or batched effective noise levels.
+        """
         sigma_tensor = torch.as_tensor(sigma)
         scalar = sigma_tensor.ndim == 0
         flattened = sigma_tensor.reshape(-1)
@@ -264,7 +324,14 @@ class MiniMaxH3SDEScheduler(SchedulerMixin, ConfigMixin, SDESchedulerMixin):
         return result.item() if scalar else result.reshape(sigma_tensor.shape)
 
     def index_for_timestep(self, timestep: Union[float, torch.Tensor]) -> int:
-        """Return the index of an exact stored framework timestep."""
+        """Return the index of an exact stored framework timestep.
+
+        Args:
+            timestep: Scalar value from ``scheduler.timesteps``.
+
+        Returns:
+            Exact schedule index.
+        """
         self._require_schedule()
         value = torch.as_tensor(timestep, device=self.timesteps.device)
         matches = (self.timesteps == value).nonzero()
@@ -280,7 +347,16 @@ class MiniMaxH3SDEScheduler(SchedulerMixin, ConfigMixin, SDESchedulerMixin):
         timestep: Union[float, torch.Tensor],
         noise: torch.Tensor,
     ) -> torch.Tensor:
-        """Apply H3 clean-time condition augmentation."""
+        """Apply H3 clean-time condition augmentation.
+
+        Args:
+            sample: Clean condition sample.
+            timestep: H3 clean-time coordinate in ``[0, 1]``.
+            noise: Noise tensor matching ``sample``.
+
+        Returns:
+            Forward-noised condition sample.
+        """
         if sample.shape != noise.shape:
             raise ValueError(
                 f"expected sample and noise with equal shape, received {tuple(sample.shape)} "
@@ -306,26 +382,95 @@ class MiniMaxH3SDEScheduler(SchedulerMixin, ConfigMixin, SDESchedulerMixin):
         noise_level: Optional[Union[int, float, torch.Tensor]] = None,
         compute_log_prob: bool = True,
         return_dict: bool = True,
-        return_kwargs: List[str] = [
+        return_kwargs: Optional[Tuple[str, ...]] = None,
+        dynamics_type: Optional[Literal["Flow-SDE", "Dance-SDE", "CPS", "ODE"]] = None,
+        sigma_max: Optional[float] = None,
+        sigma: Optional[Union[float, torch.Tensor]] = None,
+        sigma_next: Optional[Union[float, torch.Tensor]] = None,
+    ) -> Union[MiniMaxH3SDESchedulerOutput, Tuple[Optional[torch.Tensor], ...]]:
+        """Take one H3 data-ward ODE or SDE transition.
+
+        Args:
+            velocity: H3 data-ward model velocity.
+            timestep: Scalar or batched framework scheduler coordinate.
+            latents: Current latent state.
+            next_latents: Optional stored next state for replay.
+            timestep_next: Optional explicit next framework coordinate.
+            generator: Generator or per-sample generators for stochastic draws.
+            noise_level: Optional non-negative stochastic scale override.
+            compute_log_prob: Whether to compute transition log probability.
+            return_dict: Whether to return a scheduler output instead of a tuple.
+            return_kwargs: Requested scheduler output fields.
+            dynamics_type: Compatibility argument; must match configured dynamics.
+            sigma_max: Optional Flow-SDE singularity guard.
+            sigma: Optional explicit current sigma.
+            sigma_next: Optional explicit next sigma.
+
+        Returns:
+            Scheduler output or its legacy tuple representation.
+        """
+        self._validate_step_inputs(velocity, latents, next_latents)
+        requested_fields = (
+            (
+                "next_latents",
+                "next_latents_mean",
+                "std_dev_t",
+                "dt",
+                "log_prob",
+                "velocity",
+            )
+            if return_kwargs is None
+            else tuple(return_kwargs)
+        )
+        supported_fields = {
             "next_latents",
             "next_latents_mean",
             "std_dev_t",
             "dt",
             "log_prob",
             "velocity",
-        ],
-        dynamics_type: Optional[Literal["Flow-SDE", "Dance-SDE", "CPS", "ODE"]] = None,
-        sigma_max: Optional[float] = None,
-        sigma: Optional[Union[float, torch.Tensor]] = None,
-        sigma_next: Optional[Union[float, torch.Tensor]] = None,
-    ) -> Union[MiniMaxH3SDESchedulerOutput, Tuple[Optional[torch.Tensor], ...]]:
-        """Take one H3 data-ward ODE or SDE transition."""
-        self._validate_step_inputs(velocity, latents, next_latents)
+        }
+        unknown_fields = tuple(field for field in requested_fields if field not in supported_fields)
+        if unknown_fields:
+            raise ValueError(
+                f"unknown return fields {unknown_fields}; expected a subset of "
+                f"{tuple(sorted(supported_fields))}"
+            )
+        if dynamics_type is not None and dynamics_type != self.dynamics_type:
+            raise ValueError(
+                f"configured dynamics_type={self.dynamics_type!r} conflicts with "
+                f"per-call dynamics_type={dynamics_type!r}"
+            )
         implicit_schedule_step = sigma is None and timestep_next is None
-        resolved_step_index = self.index_for_timestep(timestep) if implicit_schedule_step else None
-        sigma_value, sigma_next_value = self._resolve_sigmas(
-            timestep, timestep_next, sigma, sigma_next
-        )
+        resolved_step_index: Optional[int] = None
+        if implicit_schedule_step and isinstance(timestep, torch.Tensor) and timestep.ndim == 1:
+            indices = torch.tensor(
+                [self.index_for_timestep(value) for value in timestep],
+                dtype=torch.long,
+                device=self.sigmas.device,
+            )
+            sigma_value = self.sigmas[indices]
+            sigma_next_value = self.sigmas[indices + 1]
+        elif implicit_schedule_step:
+            if self._step_index is None:
+                resolved_step_index = (
+                    self.index_for_timestep(timestep)
+                    if self._begin_index is None
+                    else self._begin_index
+                )
+            else:
+                resolved_step_index = self._step_index
+            if resolved_step_index < 0 or resolved_step_index >= len(self.timesteps):
+                raise ValueError(
+                    f"implicit step_index {resolved_step_index} is outside "
+                    f"[0, {len(self.timesteps) - 1}]"
+                )
+            sigma_value = self.sigmas[resolved_step_index]
+            sigma_next_value = self.sigmas[resolved_step_index + 1]
+        else:
+            sigma_value, sigma_next_value = self._resolve_sigmas(
+                timestep, timestep_next, sigma, sigma_next
+            )
         storage_dtype = latents.dtype
         velocity_float = velocity.float()
         latents_float = latents.float()
@@ -333,7 +478,7 @@ class MiniMaxH3SDEScheduler(SchedulerMixin, ConfigMixin, SDESchedulerMixin):
         sigma_broadcast = to_broadcast_tensor(sigma_value.float(), latents_float)
         sigma_next_broadcast = to_broadcast_tensor(sigma_next_value.float(), latents_float)
         dt = sigma_next_broadcast - sigma_broadcast
-        selected_dynamics = dynamics_type or self.dynamics_type
+        selected_dynamics = self.dynamics_type
         if selected_dynamics not in ("Flow-SDE", "Dance-SDE", "CPS", "ODE"):
             raise ValueError(f"expected supported dynamics_type, received {selected_dynamics!r}")
         selected_noise = self._resolve_noise_level(sigma_value, noise_level, selected_dynamics)
@@ -356,6 +501,16 @@ class MiniMaxH3SDEScheduler(SchedulerMixin, ConfigMixin, SDESchedulerMixin):
             noise_broadcast,
             sigma_max,
         )
+        if compute_log_prob and selected_dynamics != "ODE":
+            transition_scale = (
+                std_dev_t if selected_dynamics == "CPS" else std_dev_t * torch.sqrt(-dt)
+            )
+            if bool((transition_scale == 0).any()):
+                raise ValueError(
+                    "zero transition variance cannot define log_prob for "
+                    f"dynamics_type={selected_dynamics!r}, timestep={torch.as_tensor(timestep).tolist()}, "
+                    f"noise_level={torch.as_tensor(selected_noise).tolist()}"
+                )
         sampled = replay_latents
         if sampled is None:
             sampled = self._sample_transition(
@@ -386,16 +541,7 @@ class MiniMaxH3SDEScheduler(SchedulerMixin, ConfigMixin, SDESchedulerMixin):
                     "log_prob": log_prob,
                     "velocity": velocity,
                 }[field]
-                for field in return_kwargs
-                if field
-                in {
-                    "next_latents",
-                    "next_latents_mean",
-                    "std_dev_t",
-                    "dt",
-                    "log_prob",
-                    "velocity",
-                }
+                for field in requested_fields
             }
         )
         if resolved_step_index is not None:
@@ -593,6 +739,10 @@ class MiniMaxH3SDEScheduler(SchedulerMixin, ConfigMixin, SDESchedulerMixin):
         if velocity.shape != latents.shape:
             raise ValueError(
                 f"expected velocity shape {tuple(latents.shape)}, received {tuple(velocity.shape)}"
+            )
+        if latents.ndim < 1 or latents.shape[0] == 0:
+            raise ValueError(
+                f"expected latents with a non-empty batch dimension, received {tuple(latents.shape)}"
             )
         if velocity.device != latents.device or velocity.dtype != latents.dtype:
             raise ValueError(

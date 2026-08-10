@@ -36,25 +36,55 @@ _SIGNED_INTEGER_DTYPES = (torch.int8, torch.int16, torch.int32, torch.int64)
 
 
 def shift_sigma(sigma: torch.Tensor, shift: float) -> torch.Tensor:
-    """Apply the MiniMax H3 exponential sigma shift."""
+    """Apply the MiniMax H3 exponential sigma shift.
+
+    Args:
+        sigma: Unshifted sigma values in ``[0, 1]``.
+        shift: Positive exponential shift.
+
+    Returns:
+        Shifted sigma values.
+    """
     _validate_sigma_transform_inputs(sigma, shift, "shift_sigma")
     return shift * sigma / (1 + (shift - 1) * sigma)
 
 
 def inverse_shift_sigma(shifted_sigma: torch.Tensor, shift: float) -> torch.Tensor:
-    """Recover the unshifted base quantile from a shifted sigma."""
+    """Recover the unshifted base quantile from a shifted sigma.
+
+    Args:
+        shifted_sigma: Shifted sigma values in ``[0, 1]``.
+        shift: Positive exponential shift.
+
+    Returns:
+        Unshifted base quantiles.
+    """
     _validate_sigma_transform_inputs(shifted_sigma, shift, "inverse_shift_sigma")
     return shifted_sigma / (shift - (shift - 1) * shifted_sigma)
 
 
 def framework_sigma_to_model_time(sigma: torch.Tensor) -> torch.Tensor:
-    """Convert Flow-Factory noise sigma to H3 clean time."""
+    """Convert Flow-Factory noise sigma to H3 clean time.
+
+    Args:
+        sigma: Framework sigma values in ``[0, 1]``.
+
+    Returns:
+        H3 clean-time values.
+    """
     _validate_unit_interval_tensor(sigma, "framework sigma")
     return 1 - sigma
 
 
 def model_time_to_framework_sigma(model_time: torch.Tensor) -> torch.Tensor:
-    """Convert H3 clean time to Flow-Factory noise sigma."""
+    """Convert H3 clean time to Flow-Factory noise sigma.
+
+    Args:
+        model_time: H3 clean-time values in ``[0, 1]``.
+
+    Returns:
+        Framework sigma values.
+    """
     _validate_unit_interval_tensor(model_time, "H3 model time")
     return 1 - model_time
 
@@ -65,7 +95,16 @@ def build_training_component_times(
     video_shift: float,
     audio_shift: float,
 ) -> ComponentTimes:
-    """Map primary video coordinates onto aligned video and audio schedules."""
+    """Map primary video coordinates onto aligned video and audio schedules.
+
+    Args:
+        primary_video_timesteps: Batched video scheduler coordinates.
+        video_shift: Video sigma shift.
+        audio_shift: Audio sigma shift.
+
+    Returns:
+        Aligned component coordinates with zero decoupled next times.
+    """
     if not isinstance(primary_video_timesteps, torch.Tensor):
         raise TypeError(
             "expected torch.Tensor primary_video_timesteps, received "
@@ -94,7 +133,14 @@ def build_training_component_times(
 
 
 def validate_target_state(state: LatentState) -> None:
-    """Validate target-only packed video and audio state invariants."""
+    """Validate target-only packed video and audio state invariants.
+
+    Args:
+        state: Heterogeneous video/audio target state.
+
+    Returns:
+        None.
+    """
     if not isinstance(state, LatentState):
         raise TypeError(
             f"expected LatentState target state, received {type(state).__name__}: {state!r}"
@@ -122,6 +168,16 @@ def validate_target_state(state: LatentState) -> None:
             raise TypeError(
                 f"expected floating MiniMax H3 {component} state, received dtype {values.dtype}"
             )
+        if values.shape[0] == 0:
+            raise ValueError(
+                f"expected MiniMax H3 {component} state with a non-empty batch, "
+                f"received {tuple(values.shape)}"
+            )
+        if values.shape[1] == 0:
+            raise ValueError(
+                f"expected MiniMax H3 {component} state with non-empty generated rows, "
+                f"received {tuple(values.shape)}"
+            )
     if video.shape[0] != audio.shape[0]:
         raise ValueError(
             f"expected video/audio batch size {video.shape[0]}, received audio {audio.shape[0]}"
@@ -147,9 +203,18 @@ def draw_forward_process_noise(
     *,
     generator: Optional[Union[torch.Generator, List[torch.Generator]]],
 ) -> NoisedState:
-    """Draw video then audio noise and return H3 data-ward velocity targets."""
+    """Draw video then audio noise and return H3 data-ward velocity targets.
+
+    Args:
+        clean_state: Clean target-only video/audio state.
+        times: Validated per-component current and next coordinates.
+        generator: Generator or per-sample generators for ordered noise draws.
+
+    Returns:
+        Noised state, sampled noise, and H3 data-ward targets.
+    """
     validate_target_state(clean_state)
-    _validate_component_times(times, clean_state.components["video"].shape[0])
+    _validate_component_times(times, clean_state)
     noise: Dict[str, torch.Tensor] = {}
     noised: Dict[str, torch.Tensor] = {}
     target_velocity: Dict[str, torch.Tensor] = {}
@@ -175,7 +240,14 @@ def draw_forward_process_noise(
 
 
 def pack_video_latents(latents: torch.Tensor) -> torch.Tensor:
-    """Pack video latents with the H3 patch size (1, 2, 2)."""
+    """Pack video latents with the H3 patch size ``(1, 2, 2)``.
+
+    Args:
+        latents: Video latents shaped ``(B, 24, F, H, W)``.
+
+    Returns:
+        Packed rows shaped ``(B, F*(H/2)*(W/2), 96)``.
+    """
     if not isinstance(latents, torch.Tensor):
         raise TypeError(f"expected torch.Tensor video latents, received {type(latents).__name__}")
     if latents.ndim != 5 or latents.shape[1] != 24:
@@ -197,7 +269,17 @@ def pack_video_latents(latents: torch.Tensor) -> torch.Tensor:
 def unpack_video_latents(
     packed: torch.Tensor, *, frames: int, height: int, width: int
 ) -> torch.Tensor:
-    """Unpack H3 video rows into channel-first latent geometry."""
+    """Unpack H3 video rows into channel-first latent geometry.
+
+    Args:
+        packed: Packed video rows shaped ``(B, N, 96)``.
+        frames: Output frame count.
+        height: Output latent height.
+        width: Output latent width.
+
+    Returns:
+        Video latents shaped ``(B, 24, F, H, W)``.
+    """
     if not isinstance(packed, torch.Tensor):
         raise TypeError(f"expected torch.Tensor packed video, received {type(packed).__name__}")
     if packed.ndim != 3 or packed.shape[-1] != 96:
@@ -225,7 +307,14 @@ def unpack_video_latents(
 
 
 def pack_audio_latents(latents: torch.Tensor) -> torch.Tensor:
-    """Pack stereo audio latents in channel-major frame order."""
+    """Pack stereo audio latents in channel-major frame order.
+
+    Args:
+        latents: Audio latents shaped ``(B, 2, 32, F)``.
+
+    Returns:
+        Packed audio rows shaped ``(B, 2*F, 32)``.
+    """
     if not isinstance(latents, torch.Tensor):
         raise TypeError(f"expected torch.Tensor audio latents, received {type(latents).__name__}")
     if latents.ndim != 4 or latents.shape[1] != 2 or latents.shape[2] != 32:
@@ -236,7 +325,14 @@ def pack_audio_latents(latents: torch.Tensor) -> torch.Tensor:
 
 
 def unpack_audio_latents(packed: torch.Tensor) -> torch.Tensor:
-    """Unpack channel-major H3 audio rows into stereo latent geometry."""
+    """Unpack channel-major H3 audio rows into stereo latent geometry.
+
+    Args:
+        packed: Packed audio rows shaped ``(B, 2*F, 32)``.
+
+    Returns:
+        Audio latents shaped ``(B, 2, 32, F)``.
+    """
     if not isinstance(packed, torch.Tensor):
         raise TypeError(f"expected torch.Tensor packed audio, received {type(packed).__name__}")
     if packed.ndim != 3 or packed.shape[-1] != 32 or packed.shape[1] % 2:
@@ -254,7 +350,17 @@ def combine_component_log_probs(
     video_dof: int,
     audio_dof: int,
 ) -> torch.Tensor:
-    """Combine component means by generated scalar degrees of freedom."""
+    """Combine component means by generated scalar degrees of freedom.
+
+    Args:
+        video_log_prob: Per-sample video mean log probabilities.
+        audio_log_prob: Per-sample audio mean log probabilities.
+        video_dof: Generated video scalar count.
+        audio_dof: Generated audio scalar count.
+
+    Returns:
+        Per-sample joint weighted mean log probability.
+    """
     for field, value in (("video_dof", video_dof), ("audio_dof", audio_dof)):
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise ValueError(f"expected positive int {field}, received {value!r}")
@@ -284,7 +390,15 @@ def build_component_step_output(
     video_output: SDESchedulerOutput,
     audio_output: SDESchedulerOutput,
 ) -> MultiModalStepOutput:
-    """Build one heterogeneous step output from real component scheduler outputs."""
+    """Build one heterogeneous step output from real component scheduler outputs.
+
+    Args:
+        video_output: Video scheduler transition output.
+        audio_output: Audio scheduler transition output.
+
+    Returns:
+        Component-preserving multimodal transition output.
+    """
     for component, output in (("video", video_output), ("audio", audio_output)):
         if not isinstance(output, SDESchedulerOutput):
             raise TypeError(
@@ -345,7 +459,21 @@ def build_structured_trajectories(
     callbacks: Optional[Mapping[str, Mapping[str, torch.Tensor]]] = None,
     callback_index_map: Optional[Union[torch.Tensor, Mapping[str, torch.Tensor]]] = None,
 ) -> List[StructuredTrajectory]:
-    """Build per-sample trajectories from independent compact component tensors."""
+    """Build per-sample trajectories from independent compact component tensors.
+
+    Args:
+        states: Compact batched states by component.
+        state_index_map: Shared or independent state maps.
+        schedule: Independent full timestep/sigma schedules.
+        log_probs: Optional batched joint log probabilities.
+        component_log_probs: Optional batched component log probabilities.
+        log_prob_index_map: Shared transition map for all log probabilities.
+        callbacks: Optional componentized batched callback tensors.
+        callback_index_map: Shared or independent callback maps.
+
+    Returns:
+        One structured trajectory per batch sample.
+    """
     _require_component_order(states, "states")
     _require_component_order(schedule, "schedule")
     state_maps = _normalize_component_maps(state_index_map, "state_index_map")
@@ -365,6 +493,16 @@ def build_structured_trajectories(
             raise ValueError(
                 f"expected states[{component!r}] shaped (B, stored, N, {expected_width}), "
                 f"received {received}"
+            )
+        if values.shape[0] == 0:
+            raise ValueError(
+                f"expected states[{component!r}] with a non-empty batch, "
+                f"received {tuple(values.shape)}"
+            )
+        if values.shape[2] == 0:
+            raise ValueError(
+                f"expected component {component!r} with non-empty generated rows, "
+                f"received {tuple(values.shape)}"
             )
         batch_size = values.shape[0] if batch_size is None else batch_size
         if values.shape[0] != batch_size:
@@ -473,11 +611,12 @@ def _validate_unit_interval_tensor(values: torch.Tensor, field: str) -> None:
         raise ValueError(f"expected {field} in [0, 1], received {values.tolist()}")
 
 
-def _validate_component_times(times: ComponentTimes, batch_size: int) -> None:
+def _validate_component_times(times: ComponentTimes, state: LatentState) -> None:
     if not isinstance(times, ComponentTimes) or times.sigma is None:
         raise TypeError(
             f"expected ComponentTimes with sigma mapping, received {type(times).__name__}"
         )
+    batch_size = state.components["video"].shape[0]
     for field in ("timestep", "next_timestep", "sigma", "next_sigma"):
         values = getattr(times, field)
         if values is None:
@@ -485,10 +624,57 @@ def _validate_component_times(times: ComponentTimes, batch_size: int) -> None:
         _require_component_order(values, f"ComponentTimes.{field}")
         for component in MINIMAX_H3_COMPONENT_ORDER:
             coordinate = values[component]
+            if not isinstance(coordinate, torch.Tensor):
+                raise TypeError(
+                    f"expected torch.Tensor ComponentTimes.{field}[{component!r}], "
+                    f"received {type(coordinate).__name__}: {coordinate!r}"
+                )
+            if not coordinate.is_floating_point():
+                raise TypeError(
+                    f"expected floating ComponentTimes.{field}[{component!r}], "
+                    f"received dtype {coordinate.dtype}"
+                )
             if coordinate.shape != (batch_size,):
                 raise ValueError(
                     f"expected ComponentTimes.{field}[{component!r}] shape ({batch_size},), "
                     f"received {tuple(coordinate.shape)}"
+                )
+            reference = state.components[component]
+            if coordinate.dtype != reference.dtype or coordinate.device != reference.device:
+                raise ValueError(
+                    f"expected ComponentTimes.{field}[{component!r}] dtype/device to match "
+                    f"state {reference.dtype}/{reference.device}, received "
+                    f"{coordinate.dtype}/{coordinate.device}"
+                )
+            if not bool(torch.isfinite(coordinate).all()):
+                raise ValueError(
+                    f"expected ComponentTimes.{field}[{component!r}] finite in "
+                    f"{'[0, 1]' if 'sigma' in field else '[0, 1000]'}, "
+                    f"received {coordinate.tolist()}"
+                )
+            upper = 1.0 if "sigma" in field else 1000.0
+            if bool((coordinate < 0).any()) or bool((coordinate > upper).any()):
+                raise ValueError(
+                    f"expected ComponentTimes.{field}[{component!r}] in [0, {upper:g}], "
+                    f"received {coordinate.tolist()}"
+                )
+    for component in MINIMAX_H3_COMPONENT_ORDER:
+        if not torch.allclose(
+            times.timestep[component],
+            times.sigma[component] * 1000,
+            rtol=0,
+            atol=1e-5,
+        ):
+            raise ValueError(
+                f"expected ComponentTimes.timestep[{component!r}] == "
+                f"sigma[{component!r}] * 1000, received "
+                f"{times.timestep[component].tolist()} and {times.sigma[component].tolist()}"
+            )
+        for field in ("next_timestep", "next_sigma"):
+            if bool((getattr(times, field)[component] != 0).any()):
+                raise ValueError(
+                    f"expected decoupled ComponentTimes.{field}[{component!r}] to be zero, "
+                    f"received {getattr(times, field)[component].tolist()}"
                 )
 
 
@@ -510,10 +696,23 @@ def _validate_schedule_entry(
             f"expected (timesteps, sigmas) for component {component!r}, received {entry!r}"
         )
     timesteps, sigmas = entry
+    if not isinstance(timesteps, torch.Tensor) or not isinstance(sigmas, torch.Tensor):
+        raise TypeError(
+            f"expected torch.Tensor schedule entries for component {component!r}, "
+            f"received timesteps={type(timesteps).__name__}, sigmas={type(sigmas).__name__}"
+        )
+    for field, values in (("timesteps", timesteps), ("sigmas", sigmas)):
+        if not values.is_floating_point():
+            raise TypeError(
+                f"expected component {component!r} {field} with floating dtype, "
+                f"received {values.dtype}"
+            )
+        if not bool(torch.isfinite(values).all()):
+            raise ValueError(
+                f"expected component {component!r} {field} finite, received {values.tolist()}"
+            )
     if (
-        not isinstance(timesteps, torch.Tensor)
-        or not isinstance(sigmas, torch.Tensor)
-        or timesteps.ndim != 1
+        timesteps.ndim != 1
         or sigmas.ndim != 1
         or timesteps.shape != sigmas.shape
         or len(timesteps) < 2
@@ -522,6 +721,20 @@ def _validate_schedule_entry(
             f"expected component {component!r} schedule tensors shaped (T + 1,), "
             f"received timesteps={getattr(timesteps, 'shape', None)} and "
             f"sigmas={getattr(sigmas, 'shape', None)}"
+        )
+    if (
+        bool((sigmas < 0).any())
+        or bool((sigmas > 1).any())
+        or not bool((sigmas[1:] < sigmas[:-1]).all())
+    ):
+        raise ValueError(
+            f"expected component {component!r} sigmas strictly decreasing in [0, 1], "
+            f"received {sigmas.tolist()}"
+        )
+    if not torch.allclose(timesteps, sigmas * 1000, rtol=0, atol=1e-5):
+        raise ValueError(
+            f"expected component {component!r} timesteps == sigmas * 1000, "
+            f"received timesteps={timesteps.tolist()} and sigmas={sigmas.tolist()}"
         )
     if timesteps[-1].item() != 0.0 or sigmas[-1].item() != 0.0:
         raise ValueError(
