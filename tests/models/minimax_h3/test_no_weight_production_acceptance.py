@@ -24,9 +24,11 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from flow_factory.models.minimax_h3 import workflow
+from flow_factory.models.minimax_h3._common import build_component_step_output
 from flow_factory.models.minimax_h3.adapters import MiniMaxH3T2VAAdapter
 from flow_factory.samples import LatentState, StructuredTrajectory
 from flow_factory.scheduler import MiniMaxH3SDEScheduler, SchedulerGroup
+from flow_factory.scheduler.abc import SDESchedulerOutput
 from flow_factory.trainers.awm import AWMTrainer
 from flow_factory.trainers.crd import CRDTrainer
 from flow_factory.trainers.dgpo import DGPOTrainer
@@ -142,6 +144,36 @@ def _target_state(value: float = 1.0) -> LatentState:
     )
 
 
+def test_logprob_only_reference_state_uses_component_dof_weighted_oracle() -> None:
+    video_log_prob = torch.tensor([2.0])
+    audio_log_prob = torch.tensor([-1.0])
+    reference_state = _target_state()
+    video_dof = reference_state.components["video"][0].numel()
+    audio_dof = reference_state.components["audio"][0].numel()
+
+    output = build_component_step_output(
+        SDESchedulerOutput(log_prob=video_log_prob),
+        SDESchedulerOutput(log_prob=audio_log_prob),
+        reference_state=reference_state,
+    )
+
+    expected = (video_log_prob * video_dof + audio_log_prob * audio_dof) / (video_dof + audio_dof)
+    incorrect_simple_mean = (video_log_prob + audio_log_prob) / 2
+    torch.testing.assert_close(output.log_prob, expected)
+    assert not torch.equal(output.log_prob, incorrect_simple_mean)
+
+
+def test_no_weight_t2va_harness_rejects_non_transformer_component_name() -> None:
+    adapter = _production_adapter()
+
+    assert isinstance(adapter.get_component("transformer"), TinyH3Transformer)
+    with pytest.raises(
+        ValueError,
+        match="T2VA.*expected component name 'transformer'.*'transformer_ref'",
+    ):
+        adapter.get_component("transformer_ref")
+
+
 def _production_adapter() -> MiniMaxH3T2VAAdapter:
     adapter = object.__new__(MiniMaxH3T2VAAdapter)
     adapter.pipeline = SimpleNamespace()
@@ -166,7 +198,16 @@ def _production_adapter() -> MiniMaxH3T2VAAdapter:
         primary_name="video",
     )
     transformer = TinyH3Transformer()
-    adapter.get_component = lambda name: transformer
+
+    def get_component(name: str) -> TinyH3Transformer:
+        if name != "transformer":
+            raise ValueError(
+                "MiniMax H3 T2VA no-weight harness expected component name "
+                f"'transformer', received {name!r}"
+            )
+        return transformer
+
+    adapter.get_component = get_component
     adapter.on_load_components = lambda names, device=None: None
     adapter.target_module_map = {"transformer": ["weight"]}
     adapter.model_args = SimpleNamespace(
