@@ -74,6 +74,33 @@ class ClassicPipelineFake:
         return components
 
 
+class OptionalTransformerPipelineFake(ClassicPipelineFake):
+    """Classic pipeline with a legal absent secondary transformer."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.transformer_2 = None
+
+    @property
+    def components(self) -> Dict[str, Any]:
+        """Expose the absent secondary transformer declaration."""
+        return {**super().components, "transformer_2": self.transformer_2}
+
+
+class CountingClassicPipelineFake(ClassicPipelineFake):
+    """Classic pipeline that counts expensive component-map reconstruction."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.component_map_reads = 0
+
+    @property
+    def components(self) -> Dict[str, Any]:
+        """Count component map access."""
+        self.component_map_reads += 1
+        return super().components
+
+
 class BagelContainerFake(nn.Module):
     """Small parent module with a nested transformer alias."""
 
@@ -172,6 +199,26 @@ def test_pseudo_alias_is_addressable_but_excluded_from_device_enumeration() -> N
     assert vae.moves == ["stage-device", "cpu"]
 
 
+def test_pseudo_runtime_rejects_alias_name_collision() -> None:
+    module = TrackingModule()
+
+    with pytest.raises(ValueError, match=r"aliases.*duplicate.*transformer"):
+        PseudoPipelineRuntime(
+            SimpleNamespace(),
+            {"transformer": module},
+            aliases={"transformer": module},
+        )
+
+
+def test_pseudo_runtime_rejects_non_module_alias() -> None:
+    with pytest.raises(TypeError, match=r"torch\.nn\.Module.*transformer.*str"):
+        PseudoPipelineRuntime(
+            SimpleNamespace(),
+            {"bagel": TrackingModule()},
+            aliases={"transformer": "not a module"},
+        )
+
+
 def test_modular_runtime_materializes_only_selected_names() -> None:
     pipeline = ModularPipelineFake()
     runtime = ModularPipelineRuntime(pipeline)
@@ -192,6 +239,26 @@ def test_modular_runtime_reports_materialization_failure_context() -> None:
         match=r"expected.*transformer.*received.*text_encoder.*vae",
     ):
         runtime.materialize_components(["transformer"])
+
+
+def test_modular_materialize_none_preserves_all_declared_specs_lazily() -> None:
+    pipeline = ModularPipelineFake()
+    pipeline.components.update(
+        {
+            "scheduler": "scheduler spec",
+            "tokenizer": "tokenizer spec",
+            "processor": "processor spec",
+        }
+    )
+    runtime = ModularPipelineRuntime(pipeline)
+
+    runtime.materialize_components()
+
+    assert pipeline.load_calls == []
+    assert runtime.materialized_component_names == []
+    assert not hasattr(pipeline, "scheduler")
+    assert not hasattr(pipeline, "tokenizer")
+    assert not hasattr(pipeline, "processor")
 
 
 def test_modular_none_enumerates_only_materialized_modules_without_loading_specs() -> None:
@@ -255,6 +322,22 @@ def test_runtime_rejects_unknown_unload_and_missing_device() -> None:
         runtime.unload_components(["missing"])
     with pytest.raises(ValueError, match=r"device.*None"):
         runtime.load_components(["vae"], device=None)
+
+
+def test_runtime_uses_unambiguous_private_device_lifecycle_name() -> None:
+    runtime = ClassicPipelineRuntime(ClassicPipelineFake())
+
+    assert runtime._owns_device_lifecycle("vae")
+    assert not hasattr(runtime, "_should_manage_device")
+
+
+def test_classic_materialized_lookup_avoids_component_map_reconstruction() -> None:
+    pipeline = CountingClassicPipelineFake()
+    runtime = ClassicPipelineRuntime(pipeline)
+
+    assert runtime.get_component("transformer") is pipeline.transformer
+    assert runtime.get_canonical_component("vae") is pipeline.vae
+    assert pipeline.component_map_reads == 0
 
 
 def test_stage_load_and_unload_move_only_non_prepared_modules() -> None:
@@ -337,6 +420,19 @@ class ExistingStyleAdapterFake(BaseAdapter):
         return None
 
 
+class OptionalTransformerAdapterFake(ExistingStyleAdapterFake):
+    """Existing-style adapter with an absent optional transformer."""
+
+    def load_pipeline(self) -> OptionalTransformerPipelineFake:
+        """Return a classic pipeline with ``transformer_2=None``."""
+        return OptionalTransformerPipelineFake()
+
+    @property
+    def transformer_2(self) -> Any:
+        """Expose the optional secondary transformer like a real adapter."""
+        return self.get_component("transformer_2")
+
+
 class ModularAdapterFake(ExistingStyleAdapterFake):
     """Adapter fake that selects a lazy modular runtime."""
 
@@ -388,6 +484,20 @@ def test_base_adapter_default_runtime_preserves_existing_subclass_contract(
     assert adapter.pipeline is adapter.component_runtime.pipeline
     assert adapter._components is adapter.component_runtime.prepared_components
     assert adapter.get_component("transformer") is adapter.pipeline.transformer
+
+
+def test_base_adapter_constructs_with_optional_transformer_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "flow_factory.models.abc._load_scheduler",
+        lambda pipeline_scheduler, scheduler_args: pipeline_scheduler,
+    )
+
+    adapter = OptionalTransformerAdapterFake(_adapter_config(), AcceleratorFake())
+
+    assert adapter.pipeline.transformer_2 is None
+    assert adapter.transformer_names == ["transformer"]
 
 
 def test_base_adapter_materializes_declared_modular_scheduler_before_loading(

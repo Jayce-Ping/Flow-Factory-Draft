@@ -193,7 +193,9 @@ Two-layer structure (constraint #14): task-level samples (`T2ISample`, `I2VSampl
 materialization, and stage-device lifecycle to `models/runtime/`. Runtime overrides include
 prepared/proxied modules and LoRA/checkpoint replacements; all are excluded from manual device
 management. Declared lazy specs are separate from materialized module enumeration, so stage-wide
-operations never materialize tokenizers, schedulers, processors, or configs implicitly. The default
+operations and `materialize_components(None)` never materialize tokenizers, schedulers, processors,
+or configs implicitly. Explicit names are required to materialize a lazy spec. Role groups retain
+non-`None` modular specs but exclude absent classic optional components. The default
 `ClassicPipelineRuntime` preserves eager DiffusionPipeline behavior;
 `ModularPipelineRuntime` materializes selected lazy component specs; and
 `PseudoPipelineRuntime` manages explicit containers and non-enumerated aliases such as Bagel's
@@ -211,6 +213,20 @@ while `ModelBundle` and `RoutedComponentProxy` remain the sole distributed prepa
 - **Lesson**: Discovery for explicit lookup and enumeration for lifecycle operations require
   separate contracts; aliases and overrides must remain addressable without becoming lifecycle
   roots.
+- **Related Constraint**: #5.
+
+#### Optional role discovery and lazy default materialization
+- **Date**: 2026-08-10
+- **Symptom**: A declared classic `transformer_2=None` entered the transformer role group and
+  adapter freezing called `requires_grad_` on `None`; separately, `materialize_components(None)`
+  eagerly loaded every modular spec.
+- **Root Cause**: Role discovery filtered names rather than non-`None` values, and the default
+  materialization request expanded declared names instead of materialized modules.
+- **Fix**: Role discovery now excludes `None` values while retaining non-`None` modular specs;
+  default materialization uses already-materialized module names, and normal canonical lookup
+  returns direct materialized attributes before consulting the expensive declared component map.
+- **Lesson**: Optional declarations are valid for explicit compatibility lookup but cannot imply
+  role membership, and an omitted lazy-materialization selection must never mean "load all."
 - **Related Constraint**: #5.
 
 ### Reward Processing

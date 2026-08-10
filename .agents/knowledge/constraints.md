@@ -29,6 +29,8 @@ materialized before scheduler construction. Trainer stage lifecycle must call th
 component methods, preserving model-specific override points. Runtime-wide device and dtype
 enumeration includes only materialized canonical `torch.nn.Module` entries; declared lazy specs,
 optional `None` entries, and pseudo-pipeline aliases are not implicitly loaded or moved.
+`materialize_components(None)` means already-materialized modules, never all declared specs.
+Text-encoder/transformer role groups include non-`None` declarations/specs only.
 
 ---
 

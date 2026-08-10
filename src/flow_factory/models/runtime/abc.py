@@ -174,6 +174,10 @@ class ComponentRuntime(ABC):
             ValueError: If the component name is unknown.
             RuntimeError: If a required component remains unavailable.
         """
+        component = self._get_materialized_component(name)
+        if component is not None:
+            return component
+
         self._validate_declared_names([name])
         self._materialize_components([name])
         component = self._get_materialized_component(name)
@@ -221,19 +225,19 @@ class ComponentRuntime(ABC):
         self,
         components: Optional[Union[str, List[str]]] = None,
     ) -> None:
-        """Materialize requested non-prepared canonical components.
+        """Materialize requested non-overridden canonical components.
 
         Args:
-            components: Component name, names, groups, or ``None`` for all.
+            components: Component name, names, groups, or ``None`` for only the
+                canonical modules that are already materialized.
 
         Raises:
             ValueError: If an explicit component name is unknown.
             RuntimeError: If a required component cannot be materialized.
         """
-        requested = self.declared_component_names if components is None else components
         names = [
             name
-            for name in self.resolve_component_names(requested)
+            for name in self.resolve_component_names(components)
             if not self.has_component_override(name)
         ]
         if not names:
@@ -258,7 +262,7 @@ class ComponentRuntime(ABC):
         names = [
             name
             for name in self.resolve_component_names(components)
-            if self._should_manage_device(name)
+            if self._owns_device_lifecycle(name)
         ]
         if names and device is None:
             raise ValueError(
@@ -292,7 +296,7 @@ class ComponentRuntime(ABC):
         names = [
             name
             for name in self.resolve_component_names(components)
-            if self._should_manage_device(name)
+            if self._owns_device_lifecycle(name)
         ]
         for name in names:
             component = self._get_materialized_component(name)
@@ -349,10 +353,13 @@ class ComponentRuntime(ABC):
         return False
 
     def _role_component_names(self, role: str) -> List[str]:
-        """Return declared names matching a component role."""
-        return [name for name in self.declared_component_names if role in name]
+        """Return non-``None`` declared names matching a component role."""
+        components = self.declared_components
+        return [
+            name for name in sorted(components) if role in name and components[name] is not None
+        ]
 
-    def _should_manage_device(self, name: str) -> bool:
+    def _owns_device_lifecycle(self, name: str) -> bool:
         """Return whether runtime stage lifecycle owns a component's device."""
         return not self.has_component_override(name) and name not in self.alias_components
 
