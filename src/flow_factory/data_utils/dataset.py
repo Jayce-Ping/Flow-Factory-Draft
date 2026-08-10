@@ -17,12 +17,13 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import shutil
-import wave
 from dataclasses import asdict
 from typing import Any, Callable, Dict, List, Optional, Protocol, Union
 
+import av
 import imageio.v3 as iio
 import numpy as np
 import torch
@@ -34,13 +35,8 @@ from datasets.utils.logging import disable_progress_bar
 from PIL import Image
 from torch.utils.data import Dataset
 
-try:
-    import av
-except ImportError:
-    av = None
-
 from ..samples.references import canonicalize_reference_manifest
-from ..utils.audio import _load_audio_backend, load_audio
+from ..utils.audio import load_audio
 from ..utils.base import (
     filter_kwargs,
     pil_image_to_tensor,
@@ -904,22 +900,43 @@ def _load_ordered_reference(
     """Decode one ordered reference with dataset row/reference context."""
     kind = entry["kind"]
     resolved_path = _resolve_path(data_root, entry["path"])
+    failing_path = resolved_path
     loaded = dict(entry)
     try:
         if kind == "image":
             loaded["media"] = Image.open(resolved_path).convert("RGB")
         elif kind == "video":
             frames, fps, audio, sample_rate = _decode_ordered_video(resolved_path)
+            _require_finite_positive_rate(
+                fps, "fps", row_index, reference_index, kind, resolved_path
+            )
             loaded["frames"] = frames
             loaded["fps"] = entry.get("fps", fps)
             if "audio_path" in entry:
                 audio_path = _resolve_path(data_root, entry["audio_path"])
+                failing_path = audio_path
                 audio, sample_rate = _decode_ordered_audio(audio_path)
             if audio is not None:
+                _require_finite_positive_rate(
+                    sample_rate,
+                    "sample_rate",
+                    row_index,
+                    reference_index,
+                    kind,
+                    failing_path,
+                )
                 loaded["audio"] = audio
                 loaded["sample_rate"] = entry.get("sample_rate", sample_rate)
         elif kind == "audio":
             audio, sample_rate = _decode_ordered_audio(resolved_path)
+            _require_finite_positive_rate(
+                sample_rate,
+                "sample_rate",
+                row_index,
+                reference_index,
+                kind,
+                resolved_path,
+            )
             loaded["media"] = audio
             loaded["sample_rate"] = entry.get("sample_rate", sample_rate)
         else:
@@ -930,20 +947,37 @@ def _load_ordered_reference(
     except (FileNotFoundError, ImportError, OSError, RuntimeError, ValueError) as error:
         raise ValueError(
             f"failed to decode ordered reference at row {row_index}, "
-            f"reference {reference_index}, kind={kind!r}, path={resolved_path!r}: {error}"
+            f"reference {reference_index}, kind={kind!r}, path={failing_path!r}: {error}"
         ) from error
     return loaded
 
 
+def _require_finite_positive_rate(
+    value: Any,
+    rate_name: str,
+    row_index: int,
+    reference_index: int,
+    kind: str,
+    media_path: str,
+) -> None:
+    """Validate one decoded media rate before conversion or override."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(
+            f"at row {row_index}, reference {reference_index}, kind={kind!r}, "
+            f"path={media_path!r}, expected decoded {rate_name} to be finite positive, "
+            f"got {value!r}"
+        )
+
+
 def _decode_ordered_video(
     video_path: str,
-) -> tuple[np.ndarray, float, Optional[torch.Tensor], Optional[int]]:
+) -> tuple[np.ndarray, Any, Optional[torch.Tensor], Optional[int]]:
     """Decode frames, FPS, and optional soundtrack using MiniMax H3's PyAV contract."""
-    if av is None:
-        raise ImportError(
-            "PyAV is required to decode an ordered MiniMax H3 video reference; "
-            f"got path={video_path!r}"
-        )
     with av.open(video_path) as container:
         if not container.streams.video:
             raise ValueError(f"expected a video stream in {video_path!r}, got none")
@@ -952,7 +986,8 @@ def _decode_ordered_video(
             frame.to_ndarray(format="rgb24")
             for frame in container.decode(video_stream)
         ]
-        frame_rate = float(video_stream.average_rate or video_stream.guessed_rate)
+        reported_frame_rate = video_stream.average_rate or video_stream.guessed_rate
+        frame_rate = None if reported_frame_rate is None else float(reported_frame_rate)
         audio = None
         sample_rate = None
         if container.streams.audio:
@@ -967,25 +1002,18 @@ def _decode_ordered_video(
 
 def _decode_ordered_audio(audio_path: str) -> tuple[torch.Tensor, int]:
     """Decode an audio file and preserve its source sample rate."""
-    if av is not None:
-        with av.open(audio_path) as container:
-            if not container.streams.audio:
-                raise ValueError(f"expected an audio stream in {audio_path!r}, got none")
-            return _decode_av_audio_stream(container, container.streams.audio[0])
-    try:
-        return _load_audio_backend(audio_path)
-    except ImportError as error:
-        if not audio_path.lower().endswith(".wav"):
-            raise ImportError(
-                "PyAV or a working torchaudio backend is required to decode "
-                f"ordered audio reference {audio_path!r}"
-            ) from error
-        return _decode_pcm_wav(audio_path)
+    with av.open(audio_path) as container:
+        if not container.streams.audio:
+            raise ValueError(f"expected an audio stream in {audio_path!r}, got none")
+        return _decode_av_audio_stream(container, container.streams.audio[0])
 
 
 def _decode_av_audio_stream(container: Any, stream: Any) -> tuple[torch.Tensor, int]:
     """Decode one PyAV audio stream without changing its sample rate."""
-    sample_rate = int(stream.codec_context.sample_rate)
+    reported_sample_rate = stream.codec_context.sample_rate
+    if reported_sample_rate is None:
+        raise ValueError("expected decoded audio sample_rate, got None")
+    sample_rate = int(reported_sample_rate)
     resampler = av.audio.resampler.AudioResampler(
         format="fltp", layout=stream.layout, rate=sample_rate
     )
@@ -1002,23 +1030,6 @@ def _decode_av_audio_stream(container: Any, stream: Any) -> tuple[torch.Tensor, 
     if not chunks:
         raise ValueError("expected decoded audio samples, got none")
     return torch.cat(chunks, dim=-1).to(torch.float32), sample_rate
-
-
-def _decode_pcm_wav(audio_path: str) -> tuple[torch.Tensor, int]:
-    """Decode PCM WAV when optional PyAV/torchcodec backends are unavailable."""
-    with wave.open(audio_path, "rb") as input_file:
-        sample_rate = input_file.getframerate()
-        channels = input_file.getnchannels()
-        sample_width = input_file.getsampwidth()
-        frame_count = input_file.getnframes()
-        raw_samples = input_file.readframes(frame_count)
-    if sample_width != 2:
-        raise ValueError(
-            f"expected 16-bit PCM WAV at {audio_path!r}, got sample_width={sample_width}"
-        )
-    samples = np.frombuffer(raw_samples, dtype=np.int16).astype(np.float32)
-    waveform = torch.from_numpy(samples.reshape(-1, channels).T / 32767.0)
-    return waveform, sample_rate
 
 
 def _validate_arrow_safe_ordered_result(

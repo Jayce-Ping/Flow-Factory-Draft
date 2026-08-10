@@ -17,6 +17,7 @@ import wave
 from pathlib import Path
 from typing import Any, Dict, List
 
+import av
 import numpy as np
 import pytest
 import torch
@@ -53,6 +54,26 @@ class OrderedPreprocessor:
         return {"encoded": torch.tensor([[len(references[0])]], dtype=torch.float32)}
 
 
+class GenericPreprocessor:
+    def __init__(self) -> None:
+        self.received: Dict[str, Any] = {}
+
+    def preprocess(
+        self,
+        prompt: List[str],
+        images: List[List[Image.Image]],
+        videos: List[List[List[Image.Image]]],
+        audios: List[List[torch.Tensor]],
+    ) -> Dict[str, Any]:
+        self.received = {
+            "prompt": prompt,
+            "images": images,
+            "videos": videos,
+            "audios": audios,
+        }
+        return {"encoded": torch.ones(len(prompt), 1)}
+
+
 def _write_jsonl(dataset_dir: Path, references: List[Dict[str, Any]]) -> None:
     dataset_dir.mkdir(parents=True)
     (dataset_dir / "train.jsonl").write_text(
@@ -68,6 +89,33 @@ def _write_wav(path: Path, sample_rate: int) -> None:
         output.setsampwidth(2)
         output.setframerate(sample_rate)
         output.writeframes(samples.tobytes())
+
+
+def _write_video(path: Path, with_audio: bool) -> None:
+    with av.open(str(path), mode="w") as container:
+        video_stream = container.add_stream("mpeg4", rate=12)
+        video_stream.width = 8
+        video_stream.height = 6
+        video_stream.pix_fmt = "yuv420p"
+        audio_stream = container.add_stream("aac", rate=16000) if with_audio else None
+        if audio_stream is not None:
+            audio_stream.layout = "mono"
+        for value in (20, 80, 140):
+            frame = av.VideoFrame.from_ndarray(
+                np.full((6, 8, 3), value, dtype=np.uint8), format="rgb24"
+            )
+            for packet in video_stream.encode(frame):
+                container.mux(packet)
+        if audio_stream is not None:
+            waveform = np.zeros((1, 1600), dtype=np.int16)
+            audio_frame = av.AudioFrame.from_ndarray(waveform, format="s16", layout="mono")
+            audio_frame.sample_rate = 16000
+            for packet in audio_stream.encode(audio_frame):
+                container.mux(packet)
+        for stream in (video_stream, audio_stream):
+            if stream is not None:
+                for packet in stream.encode():
+                    container.mux(packet)
 
 
 def test_ordered_references_round_trip_real_media_and_merged_cache(tmp_path: Path) -> None:
@@ -108,36 +156,11 @@ def test_ordered_references_round_trip_real_media_and_merged_cache(tmp_path: Pat
 
 
 def test_video_reference_preserves_frames_fps_embedded_audio_and_rate(tmp_path: Path) -> None:
-    av = pytest.importorskip("av", reason="PyAV is required by pinned MiniMax H3 video decode")
     dataset_dir = tmp_path / "dataset"
     references = [{"kind": "video", "path": "motion.mp4"}]
     _write_jsonl(dataset_dir, references)
     video_path = dataset_dir / "motion.mp4"
-
-    try:
-        with av.open(str(video_path), mode="w") as container:
-            video_stream = container.add_stream("mpeg4", rate=12)
-            video_stream.width = 8
-            video_stream.height = 6
-            video_stream.pix_fmt = "yuv420p"
-            audio_stream = container.add_stream("aac", rate=16000)
-            audio_stream.layout = "mono"
-            for value in (20, 80, 140):
-                frame = av.VideoFrame.from_ndarray(
-                    np.full((6, 8, 3), value, dtype=np.uint8), format="rgb24"
-                )
-                for packet in video_stream.encode(frame):
-                    container.mux(packet)
-            waveform = np.zeros((1, 1600), dtype=np.int16)
-            audio_frame = av.AudioFrame.from_ndarray(waveform, format="s16", layout="mono")
-            audio_frame.sample_rate = 16000
-            for packet in audio_stream.encode(audio_frame):
-                container.mux(packet)
-            for stream in (video_stream, audio_stream):
-                for packet in stream.encode():
-                    container.mux(packet)
-    except (ValueError, OSError, av.error.FFmpegError) as error:
-        pytest.skip(f"installed PyAV lacks required MP4/AAC fixture codecs: {error}")
+    _write_video(video_path, with_audio=True)
 
     preprocessor = OrderedPreprocessor()
     GeneralDataset(
@@ -184,6 +207,143 @@ def test_reference_decode_error_has_row_reference_and_cause(tmp_path: Path) -> N
         )
 
     assert isinstance(caught.value.__cause__, FileNotFoundError)
+
+
+def test_soundtrack_decode_error_reports_soundtrack_path_and_context(tmp_path: Path) -> None:
+    dataset_dir = tmp_path / "dataset"
+    references = [
+        {
+            "kind": "video",
+            "path": "motion.mp4",
+            "audio_path": "missing-soundtrack.wav",
+        }
+    ]
+    _write_jsonl(dataset_dir, references)
+    _write_video(dataset_dir / "motion.mp4", with_audio=False)
+    preprocessor = OrderedPreprocessor()
+
+    with pytest.raises(
+        ValueError,
+        match=r"row 0.*reference 0.*kind='video'.*missing-soundtrack\.wav",
+    ) as caught:
+        GeneralDataset(
+            dataset_dir=str(dataset_dir),
+            cache_dir=str(tmp_path / "cache"),
+            preprocess_func=preprocessor.preprocess,
+            preprocess_kwargs={"workflow": "ref2va", "width": 768},
+            preprocessing_batch_size=1,
+            force_reprocess=True,
+        )
+
+    assert isinstance(caught.value.__cause__, FileNotFoundError)
+
+
+@pytest.mark.parametrize(
+    ("kind", "decode_target", "decode_result", "rate_name"),
+    [
+        (
+            "video",
+            "flow_factory.data_utils.dataset._decode_ordered_video",
+            (np.zeros((1, 2, 2, 3), dtype=np.uint8), None, None, None),
+            "fps",
+        ),
+        (
+            "video",
+            "flow_factory.data_utils.dataset._decode_ordered_video",
+            (np.zeros((1, 2, 2, 3), dtype=np.uint8), float("nan"), None, None),
+            "fps",
+        ),
+        (
+            "audio",
+            "flow_factory.data_utils.dataset._decode_ordered_audio",
+            (torch.zeros(1, 8), None),
+            "sample_rate",
+        ),
+        (
+            "audio",
+            "flow_factory.data_utils.dataset._decode_ordered_audio",
+            (torch.zeros(1, 8), -1),
+            "sample_rate",
+        ),
+    ],
+)
+def test_decoded_rates_must_be_finite_positive_with_context(
+    tmp_path: Path,
+    monkeypatch,
+    kind: str,
+    decode_target: str,
+    decode_result: Any,
+    rate_name: str,
+) -> None:
+    dataset_dir = tmp_path / f"dataset-{kind}-{rate_name}"
+    path = "media.mp4" if kind == "video" else "media.wav"
+    references = [{"kind": "image", "path": "valid.png"}, {"kind": kind, "path": path}]
+    _write_jsonl(dataset_dir, references)
+    Image.new("RGB", (2, 2)).save(dataset_dir / "valid.png")
+    monkeypatch.setattr(decode_target, lambda media_path: decode_result)
+    preprocessor = OrderedPreprocessor()
+
+    with pytest.raises(
+        ValueError,
+        match=rf"row 0.*reference 1.*kind='{kind}'.*{rate_name}.*finite positive",
+    ):
+        GeneralDataset(
+            dataset_dir=str(dataset_dir),
+            cache_dir=str(tmp_path / "cache"),
+            preprocess_func=preprocessor.preprocess,
+            preprocess_kwargs={"workflow": "ref2va", "width": 768},
+            preprocessing_batch_size=1,
+            force_reprocess=True,
+        )
+
+
+def test_generic_real_media_loaders_preserve_structure_cache_and_collate(
+    tmp_path: Path,
+) -> None:
+    dataset_dir = tmp_path / "dataset"
+    for directory in ("images", "videos", "audios"):
+        (dataset_dir / directory).mkdir(parents=True, exist_ok=True)
+    (dataset_dir / "train.jsonl").write_text(
+        json.dumps(
+            {
+                "prompt": "generic",
+                "images": "subject.png",
+                "videos": "motion.mp4",
+                "audios": "voice.wav",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    Image.new("RGB", (4, 3), color=(1, 2, 3)).save(dataset_dir / "images" / "subject.png")
+    _write_video(dataset_dir / "videos" / "motion.mp4", with_audio=False)
+    _write_wav(dataset_dir / "audios" / "voice.wav", sample_rate=16000)
+    preprocessor = GenericPreprocessor()
+    dataset = GeneralDataset(
+        dataset_dir=str(dataset_dir),
+        cache_dir=str(tmp_path / "cache"),
+        preprocess_func=preprocessor.preprocess,
+        preprocessing_batch_size=1,
+        force_reprocess=True,
+    )
+
+    assert len(preprocessor.received["images"]) == 1
+    assert len(preprocessor.received["images"][0]) == 1
+    assert preprocessor.received["images"][0][0].size == (4, 3)
+    assert len(preprocessor.received["videos"][0][0]) == 3
+    assert preprocessor.received["audios"][0][0].shape[0] == 1
+    row = dataset[0]
+    merged_path = tmp_path / "generic-merged"
+    dataset.processed_dataset.save_to_disk(str(merged_path))
+    reloaded = GeneralDataset.load_merged(str(merged_path))
+    reloaded_row = reloaded[0]
+    collated = GeneralDataset.collate_fn([reloaded_row])
+    assert len(collated["images"][0]) == 1
+    assert len(collated["videos"][0]) == 1
+    assert len(collated["audios"][0]) == 1
+    assert collated["videos"][0][0].shape == row["videos"][0].shape
+    assert collated["audios"][0][0].shape == row["audios"][0].shape
+    assert collated["encoded"].shape == (1, 1)
 
 
 @pytest.mark.parametrize(
