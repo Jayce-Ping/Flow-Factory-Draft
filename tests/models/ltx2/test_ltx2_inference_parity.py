@@ -15,7 +15,7 @@
 """Full T2AV/I2AV rollout parity against the pre-Task-4B legacy loop oracle."""
 
 from types import SimpleNamespace
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 import torch
@@ -55,20 +55,43 @@ def _kwargs(cls: type, **overrides: Any) -> Dict[str, Any]:
     return kwargs
 
 
-def _run_pair(cls: type, **overrides: Any) -> SimpleNamespace:
+def _run_pair(
+    cls: type, *, explicit_generator_seed: Optional[int] = None, **overrides: Any
+) -> SimpleNamespace:
     """Run the legacy oracle and the structured rollout from the same RNG seed."""
     kwargs = _kwargs(cls, **overrides)
     conditioned = cls is LTX2_I2AV_Adapter
 
     torch.manual_seed(SEED)
     oracle_adapter, oracle_log = inference_adapter(cls)
-    oracle = run_legacy_rollout(oracle_adapter, conditioned=conditioned, **kwargs)
+    oracle_generator = (
+        None
+        if explicit_generator_seed is None
+        else torch.Generator().manual_seed(explicit_generator_seed)
+    )
+    oracle = run_legacy_rollout(
+        oracle_adapter,
+        conditioned=conditioned,
+        generator=oracle_generator,
+        **kwargs,
+    )
+    oracle_generator_rng = None if oracle_generator is None else oracle_generator.get_state()
+    oracle_generator_draw = (
+        None if oracle_generator is None else torch.randn(5, generator=oracle_generator)
+    )
     oracle_rng = torch.get_rng_state()
     oracle_draw = torch.randn(5)
 
     torch.manual_seed(SEED)
     adapter, log = inference_adapter(cls)
-    samples = adapter.inference(**kwargs)
+    generator = (
+        None
+        if explicit_generator_seed is None
+        else torch.Generator().manual_seed(explicit_generator_seed)
+    )
+    samples = adapter.inference(generator=generator, **kwargs)
+    generator_rng = None if generator is None else generator.get_state()
+    generator_draw = None if generator is None else torch.randn(5, generator=generator)
     rng = torch.get_rng_state()
     draw = torch.randn(5)
 
@@ -77,11 +100,15 @@ def _run_pair(cls: type, **overrides: Any) -> SimpleNamespace:
         oracle=oracle,
         oracle_adapter=oracle_adapter,
         oracle_log=oracle_log,
+        oracle_generator_rng=oracle_generator_rng,
+        oracle_generator_draw=oracle_generator_draw,
         oracle_rng=oracle_rng,
         oracle_draw=oracle_draw,
         samples=samples,
         adapter=adapter,
         log=log,
+        generator_rng=generator_rng,
+        generator_draw=generator_draw,
         rng=rng,
         draw=draw,
     )
@@ -122,6 +149,35 @@ def test_the_structured_rollout_consumes_the_same_rng_stream(
 ) -> None:
     assert torch.equal(rollout.rng, rollout.oracle_rng)
     assert torch.equal(rollout.draw, rollout.oracle_draw)
+
+
+@pytest.mark.parametrize("cls", ADAPTERS, ids=lambda cls: cls.__name__)
+def test_public_inference_preserves_explicit_generator_and_decode_parity(cls: type) -> None:
+    pair = _run_pair(
+        cls,
+        explicit_generator_seed=SEED + 1,
+        decode_timestep=0.35,
+        decode_noise_scale=0.2,
+    )
+
+    for index, sample in enumerate(pair.samples):
+        assert torch.equal(sample.video, pair.oracle["video"][index])
+        assert torch.equal(sample.audio, pair.oracle["audio"][index].reshape(1, -1))
+    trajectory = _stacked(pair)
+    terminal_index = int(trajectory.components["video"].state_index_map[-1].item())
+    final_latents = torch.cat(
+        [
+            trajectory.components["video"].states[:, terminal_index],
+            trajectory.components["audio"].states[:, terminal_index],
+        ],
+        dim=1,
+    )
+    assert torch.equal(final_latents, pair.oracle["final_latents"])
+    assert torch.equal(pair.generator_rng, pair.oracle_generator_rng)
+    assert torch.equal(pair.generator_draw, pair.oracle_generator_draw)
+    assert torch.equal(pair.rng, pair.oracle_rng)
+    assert torch.equal(pair.draw, pair.oracle_draw)
+    assert pair.log == pair.oracle_log
 
 
 def test_the_structured_rollout_decodes_the_legacy_media(rollout: SimpleNamespace) -> None:
@@ -248,6 +304,8 @@ def test_only_the_latent_callback_fields_become_structured(rollout: SimpleNamesp
 def test_the_non_latent_callbacks_stay_legacy_extra_kwargs(
     rollout: SimpleNamespace,
 ) -> None:
+    # ``noise_level`` is captured through the legacy callback API; this test
+    # intentionally does not define new indexing semantics for custom callbacks.
     legacy_statistic = rollout.oracle["callbacks"][STATISTIC_CALLBACK]
     legacy_captured = rollout.oracle["callbacks"][CAPTURED_CALLBACK]
 

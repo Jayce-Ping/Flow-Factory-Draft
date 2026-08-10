@@ -52,6 +52,7 @@ def run_legacy_rollout(
     compute_log_prob: bool,
     trajectory_indices: Any,
     extra_call_back_kwargs: List[str],
+    generator: Optional[torch.Generator] = None,
     condition_images: Optional[torch.Tensor] = None,
     noise_scale: float = 0.0,
     decode_timestep: float = 0.0,
@@ -93,7 +94,7 @@ def run_legacy_rollout(
         "noise_scale": noise_scale,
         "dtype": torch.float32,
         "device": device,
-        "generator": None,
+        "generator": generator,
     }
     if conditioned:
         video_latents, conditioning_mask = pipeline.prepare_latents(
@@ -110,7 +111,7 @@ def run_legacy_rollout(
         noise_scale=noise_scale,
         dtype=torch.float32,
         device=device,
-        generator=None,
+        generator=generator,
     )
 
     mu = calculate_shift(
@@ -200,7 +201,7 @@ def run_legacy_rollout(
         decode_timestep=decode_timestep,
         decode_noise_scale=decode_noise_scale,
         output_type="pt",
-        generator=None,
+        generator=generator,
     )
 
     return {
