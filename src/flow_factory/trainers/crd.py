@@ -28,38 +28,56 @@ from contextlib import contextmanager
 import numpy as np
 import torch
 import torch.nn.functional as F
-from diffusers.utils.torch_utils import randn_tensor
 import tqdm as tqdm_
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from .abc import BaseTrainer
+from .forward_process import forward_velocity_state, state_batch_size
 from ..hparams import CRDTrainingArguments
-from ..samples import BaseSample, StackedSampleBatch
+from ..samples import (
+    BaseSample,
+    ComponentTimes,
+    LatentState,
+    NoisedState,
+    StackedSampleBatch,
+)
 from ..rewards import RewardBuffer
-from ..utils.base import filter_kwargs, create_generator, create_generator_by_prompt, to_broadcast_tensor
+from ..utils.base import create_generator, create_generator_by_prompt
 from ..utils.logger_utils import setup_logger
-from ..utils.noise_schedule import TimeSampler, flow_match_sigma
+from ..utils.noise_schedule import TimeSampler
 from ..utils.dist import reduce_loss_info
 
 logger = setup_logger(__name__)
 
 
 @dataclass
+class _CRDStep:
+    """Pass-1 state for one training timestep, replayed verbatim by pass 2.
+
+    Only the forward-process *inputs* are kept: pass 2 reapplies ``noise`` to the
+    reloaded terminal state through the adapter's RNG-free application hook, so
+    the noised state and the target velocity are never stored twice.
+    """
+
+    times: ComponentTimes
+    noise: LatentState
+    old_velocity: LatentState
+
+
+@dataclass
 class _CRDBatch:
     """A stacked micro-batch plus its pass-1 pre-computed old-model targets.
 
-    CRD uses a two-pass design: pass 1 pre-computes the old-model V predictions
-    for every micro-batch (against a frozen snapshot), pass 2 trains on them.
-    This bundles the device-resident batch with those per-timestep tensors so
-    pass 2 has typed, named access (``prepared.old_v_pred_list``) instead of
+    CRD uses a two-pass design: pass 1 pre-computes the old-model velocity
+    predictions for every micro-batch (against a frozen snapshot), pass 2 trains
+    on them. This bundles the device-resident batch with those per-timestep
+    values so pass 2 has typed, named access (``prepared.steps``) instead of
     keying scratch onto the shared batch type.
     """
 
     batch: StackedSampleBatch
-    all_timesteps: torch.Tensor  # (T, B), scheduler scale [0, 1000]
-    all_random_noise: List[torch.Tensor]  # per-timestep noise (shape of clean_latents)
-    old_v_pred_list: List[torch.Tensor]  # per-timestep old-model V prediction
+    steps: List[_CRDStep]
 
 
 # ========================= Decay Utilities =========================
@@ -314,7 +332,7 @@ class CRDTrainer(BaseTrainer):
     def start(self):
         """Main training loop."""
         while self.should_continue_training():
-            self.adapter.scheduler.set_seed(self.epoch + self.training_args.seed)
+            self.adapter.set_trajectory_seed(self.epoch + self.training_args.seed)
 
             # Save checkpoint
             if (
@@ -414,51 +432,185 @@ class CRDTrainer(BaseTrainer):
 
     # ========================= Forward Pass Helpers =========================
 
-    def _compute_crd_output(
-        self,
-        batch: StackedSampleBatch,
-        timestep: torch.Tensor,
-        noised_latents: torch.Tensor,
-        guidance_scale: Optional[float] = None,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Compute CRD forward pass for a single timestep.
+    def _reference_cfg_overrides(self) -> Dict[str, Any]:
+        """CFG override for the teacher forward, empty below the CFG threshold.
 
-        Args:
-            batch: Batch dict with prompt embeddings etc.
-            timestep: (B,) tensor in scheduler scale ``[0, 1000]``.
-            noised_latents: Interpolated latents ``x_t = (1-σ) x_1 + σ noise`` with ``σ = t/1000``.
-            guidance_scale: Override CFG scale. If None, uses the value from training_args
-                (typically 1.0 for student training). Pass ``self.kl_cfg`` for teacher
-                CFG inference — the model adapter will automatically do the double forward
-                pass using ``negative_prompt_embeds`` / ``negative_pooled_prompt_embeds``
-                from the batch if ``guidance_scale > 1.0``.
+        With ``kl_cfg > 1.0`` the adapter runs its own double forward using the
+        batch's negative embeddings; otherwise the guidance scale keeps coming
+        from ``training_args``, exactly as before the migration.
 
         Returns:
-            Dict with ``velocity`` (velocity prediction), shape ``(B, C, H, W)``.
+            Forward-argument overrides for the reference pass.
         """
-        t_b = timestep.view(-1)  # Scheduler scale [0, 1000]
-        device = self.accelerator.device
+        if self.kl_cfg > 1.0:
+            return {'guidance_scale': self.kl_cfg}
+        return {}
 
-        forward_kwargs = {
-            **self.training_args,
-            't': t_b,
-            't_next': torch.zeros_like(t_b),
-            'latents': noised_latents,
-            'compute_log_prob': False,
-            'return_kwargs': ['velocity'],
-            'noise_level': 0.0,
-            **{
-                k: (v.to(device) if isinstance(v, torch.Tensor) else v)
-                for k, v in batch.items()
-                if k not in ['all_latents', 'timesteps', 'advantage']
-            },
+    def _rebuild_noised_state(
+        self, clean_state: LatentState, step: _CRDStep
+    ) -> NoisedState:
+        """Reapply a pass-1 noise draw to the terminal state, consuming no RNG.
+
+        Args:
+            clean_state: Terminal clean state reloaded for pass 2.
+            step: Pass-1 state carrying the component times and the drawn noise.
+
+        Returns:
+            The same noised state and target velocity pass 1 evaluated.
+        """
+        return self.adapter.apply_forward_process_noise(clean_state, step.times, step.noise)
+
+    def _precompute_old_velocities(self, batch: StackedSampleBatch) -> _CRDBatch:
+        """Pass 1: sample times, draw one noise state per time, record old velocities.
+
+        The old model is a frozen snapshot, so its predictions are independent of
+        the pass-2 weight updates; only the times, the noise and the detached old
+        velocity survive into pass 2.
+
+        Args:
+            batch: Collated sample batch supplying conditioning arguments.
+
+        Returns:
+            The batch bundled with one precomputed step per training timestep.
+        """
+        clean_state = self.adapter.get_terminal_state(batch)
+        batch_size = state_batch_size(self, clean_state, 'terminal clean state')
+        steps: List[_CRDStep] = []
+        with torch.no_grad(), self.autocast():
+            all_timesteps = self._sample_timesteps(batch_size)  # (T, B)
+            for t_idx in range(self.num_train_timesteps):
+                times = self.adapter.build_training_component_times(
+                    all_timesteps[t_idx], batch=batch
+                )
+                noised = self.adapter.add_forward_process_noise(clean_state, times)
+                old_parameters = (
+                    self.adapter.use_named_parameters(self._OLD_PARAMS_NAME)
+                    if self.use_old_for_loss
+                    else self.adapter.use_ref_parameters()
+                )
+                with old_parameters:
+                    velocity = forward_velocity_state(
+                        self, batch, noised.state, times, source='old policy'
+                    )
+                steps.append(
+                    _CRDStep(
+                        times=times,
+                        noise=noised.noise,
+                        old_velocity=LatentState(
+                            {
+                                name: value.detach()
+                                for name, value in velocity.components.items()
+                            }
+                        ),
+                    )
+                )
+        return _CRDBatch(batch=batch, steps=steps)
+
+    # ========================= Reward and KL Helpers =========================
+
+    def _implicit_reward(
+        self,
+        velocity: LatentState,
+        old_velocity: LatentState,
+        noised: NoisedState,
+    ) -> torch.Tensor:
+        """Estimate the per-sample implicit reward from velocity prediction errors.
+
+        ``r = -((current - target)^2 - (old - target)^2)`` per element. Under
+        ``adaptive_logp`` each component's squared error is divided by that
+        component's own detached mean absolute deviation (clipped at ``1e-5``)
+        *before* the global reduction, which keeps the legacy
+        elementwise-divide-then-average order.
+
+        Args:
+            velocity: Current-policy velocity per component.
+            old_velocity: Old-snapshot velocity per component.
+            noised: Forward-noised state carrying the per-component target velocity.
+
+        Returns:
+            Per-sample implicit reward of shape ``(B,)``.
+        """
+        component_names = self.adapter.trajectory_component_order
+        target = noised.target_velocity
+        rewards: Dict[str, torch.Tensor] = {}
+        if self.adaptive_logp:
+            with torch.no_grad():
+                current_weights = self.adapter.reduce_component_latent_values(
+                    {
+                        name: torch.abs(
+                            velocity.components[name].double()
+                            - target.components[name].double()
+                        )
+                        for name in component_names
+                    },
+                    state=noised.state,
+                )
+                old_weights = self.adapter.reduce_component_latent_values(
+                    {
+                        name: torch.abs(
+                            old_velocity.components[name].double()
+                            - target.components[name].double()
+                        )
+                        for name in component_names
+                    },
+                    state=noised.state,
+                )
+            for name in component_names:
+                component_target = target.components[name]
+                broadcast_shape = (-1,) + (1,) * (component_target.ndim - 1)
+                current_weight = current_weights[name].clip(min=1e-5).reshape(broadcast_shape)
+                old_weight = old_weights[name].clip(min=1e-5).reshape(broadcast_shape)
+                rewards[name] = -(
+                    (velocity.components[name] - component_target) ** 2 / current_weight
+                    - (old_velocity.components[name] - component_target) ** 2 / old_weight
+                )
+        else:
+            for name in component_names:
+                component_target = target.components[name]
+                rewards[name] = -(
+                    (velocity.components[name] - component_target) ** 2
+                    - (old_velocity.components[name] - component_target) ** 2
+                )
+        return self.adapter.reduce_latent_values(rewards, state=noised.state)
+
+    def _velocity_kl(
+        self,
+        velocity: LatentState,
+        ref_velocity: LatentState,
+        noised: NoisedState,
+    ) -> torch.Tensor:
+        """Compute the per-sample squared velocity gap against another parameter set.
+
+        Args:
+            velocity: Current-policy velocity per component.
+            ref_velocity: Reference or old-snapshot velocity per component.
+            noised: Forward-noised state supplying per-sample reduction context.
+
+        Returns:
+            Per-sample KL surrogate of shape ``(B,)``.
+        """
+        errors = {
+            name: (velocity.components[name] - ref_velocity.components[name]) ** 2
+            for name in self.adapter.trajectory_component_order
         }
-        if guidance_scale is not None:
-            forward_kwargs['guidance_scale'] = guidance_scale
-        forward_kwargs = filter_kwargs(self.adapter.forward, **forward_kwargs)
-        output = self.adapter.forward(**forward_kwargs)
-        return {'velocity': output.velocity}
+        return self.adapter.reduce_latent_values(errors, state=noised.state)
+
+    def _kl_loss(self, kl_div: torch.Tensor, reward: torch.Tensor) -> torch.Tensor:
+        """Scale the per-sample KL surrogate into the loss term.
+
+        Args:
+            kl_div: Per-sample KL surrogate of shape ``(B,)``.
+            reward: Per-sample normalized reward in ``[0, 1]``, shape ``(B,)``.
+
+        Returns:
+            Scalar KL loss contribution.
+        """
+        if self.reward_adaptive_kl:
+            # Linearly scale KL based on reward value
+            base_beta = 1e-4
+            min_coef = base_beta / max(self.kl_beta, 1e-8)
+            return self.kl_beta * torch.mean((min_coef + reward * (1 - min_coef)) * kl_div)
+        return self.kl_beta * kl_div.mean()
 
     def prepare_feedback(self, samples: List[BaseSample]) -> None:
         """Finalize rewards, compute advantages, and log advantage metrics."""
@@ -613,54 +765,16 @@ class CRDTrainer(BaseTrainer):
                 len(samples) + self.training_args.per_device_batch_size - 1
             ) // self.training_args.per_device_batch_size
             self.adapter.rollout()
-            with torch.no_grad(), self.autocast():
-                for batch in tqdm(
-                    self._iter_prefetched_batches(
-                        samples, self.training_args.per_device_batch_size
-                    ),
-                    total=num_batches,
-                    desc=f'Epoch {self.epoch} Pre-computing Old V Predictions',
-                    position=0,
-                    disable=not self.show_progress_bar,
-                ):
-                    batch_size = batch['all_latents'].shape[0]
-                    clean_latents = batch['all_latents'][:, -1]
-
-                    # Sample timesteps: (T, B) in scheduler scale [0, 1000]
-                    all_timesteps = self._sample_timesteps(batch_size)
-                    all_random_noise: List[torch.Tensor] = []
-
-                    # Pre-compute old model predictions
-                    old_v_pred_list: List[torch.Tensor] = []
-                    for t_idx in range(self.num_train_timesteps):
-                        t_flat = all_timesteps[t_idx]  # (B,) scheduler scale [0, 1000]
-                        sigma_broadcast = to_broadcast_tensor(flow_match_sigma(t_flat), clean_latents)
-                        noise = randn_tensor(
-                            clean_latents.shape,
-                            device=clean_latents.device,
-                            dtype=clean_latents.dtype,
-                        )
-                        all_random_noise.append(noise)
-                        noised_latents = (1 - sigma_broadcast) * clean_latents + sigma_broadcast * noise
-
-                        if self.use_old_for_loss:
-                            # Use old model snapshot
-                            with self.adapter.use_named_parameters(self._OLD_PARAMS_NAME):
-                                old_output = self._compute_crd_output(batch, t_flat, noised_latents)
-                        else:
-                            # Use reference model (original weights)
-                            with self.adapter.use_ref_parameters():
-                                old_output = self._compute_crd_output(batch, t_flat, noised_latents)
-                        old_v_pred_list.append(old_output['velocity'].detach())
-
-                    sample_batches.append(
-                        _CRDBatch(
-                            batch=batch,
-                            all_timesteps=all_timesteps,
-                            all_random_noise=all_random_noise,
-                            old_v_pred_list=old_v_pred_list,
-                        )
-                    )
+            for batch in tqdm(
+                self._iter_prefetched_batches(
+                    samples, self.training_args.per_device_batch_size
+                ),
+                total=num_batches,
+                desc=f'Epoch {self.epoch} Pre-computing Old V Predictions',
+                position=0,
+                disable=not self.show_progress_bar,
+            ):
+                sample_batches.append(self._precompute_old_velocities(batch))
 
             # ==================== Training Loop ====================
             self.adapter.train()
@@ -675,11 +789,7 @@ class CRDTrainer(BaseTrainer):
             ):
                 # Retrieve pre-computed data
                 batch = prepared.batch
-                batch_size = batch['all_latents'].shape[0]
-                clean_latents = batch['all_latents'][:, -1]
-                all_timesteps = prepared.all_timesteps
-                all_random_noise = prepared.all_random_noise
-                old_v_pred_list = prepared.old_v_pred_list
+                clean_state = self.adapter.get_terminal_state(batch)
                 # Iterate through timesteps
                 for t_idx in tqdm(
                     range(self.num_train_timesteps),
@@ -689,18 +799,16 @@ class CRDTrainer(BaseTrainer):
                     disable=not self.show_progress_bar,
                 ):
                     with self.accumulate_gradients():
-                        # 1. Prepare inputs
-                        t_flat = all_timesteps[t_idx]  # (B,) scheduler scale [0, 1000]
-                        sigma_broadcast = to_broadcast_tensor(flow_match_sigma(t_flat), clean_latents)
-                        noise = all_random_noise[t_idx]
-                        noised_latents = (1 - sigma_broadcast) * clean_latents + sigma_broadcast * noise
-                        old_v_pred = old_v_pred_list[t_idx]
-                        v_target = noise - clean_latents
+                        # 1. Replay the pass-1 forward process without drawing noise
+                        step = prepared.steps[t_idx]
+                        noised = self._rebuild_noised_state(clean_state, step)
+                        old_velocity = step.old_velocity
 
                         # 2. Current model forward pass
                         with self.autocast():
-                            output = self._compute_crd_output(batch, t_flat, noised_latents)
-                        forward_pred = output['velocity']
+                            velocity = forward_velocity_state(
+                                self, batch, noised.state, step.times, source='policy'
+                            )
 
                         # 3. Reference model forward pass (for KL)
                         # If kl_cfg > 1.0, the adapter's forward() will do CFG automatically:
@@ -709,35 +817,17 @@ class CRDTrainer(BaseTrainer):
                         # The negative embeddings come from the batch (negative_prompt_embeds,
                         # negative_pooled_prompt_embeds stored by SD3_5Sample during rollout).
                         with torch.no_grad(), self.adapter.use_ref_parameters(), self.autocast():
-                            cfg = self.kl_cfg if self.kl_cfg > 1.0 else None
-                            ref_output = self._compute_crd_output(batch, t_flat, noised_latents, guidance_scale=cfg)
-                            ref_pred = ref_output['velocity']
+                            ref_velocity = forward_velocity_state(
+                                self,
+                                batch,
+                                noised.state,
+                                step.times,
+                                source='reference',
+                                **self._reference_cfg_overrides(),
+                            )
 
                         # 4. Compute implicit reward: r_theta = -(||pred_theta - v_target||^2 - ||pred_old - v_target||^2)
-                        if self.adaptive_logp:
-                            with torch.no_grad():
-                                weight_theta = (
-                                    torch.abs(forward_pred.double() - v_target.double())
-                                    .mean(dim=tuple(range(1, forward_pred.ndim)), keepdim=True)
-                                    .clip(min=1e-5)
-                                )
-                                weight_old = (
-                                    torch.abs(old_v_pred.double() - v_target.double())
-                                    .mean(dim=tuple(range(1, old_v_pred.ndim)), keepdim=True)
-                                    .clip(min=1e-5)
-                                )
-                            r_theta = -(
-                                (forward_pred - v_target) ** 2 / weight_theta
-                                - (old_v_pred - v_target) ** 2 / weight_old
-                            )
-                        else:
-                            r_theta = -(
-                                (forward_pred - v_target) ** 2
-                                - (old_v_pred - v_target) ** 2
-                            )
-
-                        # Reduce spatial dims to per-sample scalar
-                        r_theta_local = r_theta.mean(dim=tuple(range(1, r_theta.ndim)))
+                        r_theta_local = self._implicit_reward(velocity, old_velocity, noised)
 
                         # Gather r_theta across all GPUs for centering
                         r_theta_gathered = self.accelerator.gather(r_theta_local.detach()).to(
@@ -772,19 +862,8 @@ class CRDTrainer(BaseTrainer):
 
                         # 7. KL regularization against reference model
                         with self.autocast():
-                            kl_div = ((forward_pred - ref_pred) ** 2).mean(
-                                dim=tuple(range(1, forward_pred.ndim))
-                            )
-
-                            if self.reward_adaptive_kl:
-                                # Linearly scale KL based on reward value
-                                raw_reward = adv_cur_rank  # Already in [0, 1]
-                                base_beta = 1e-4
-                                min_coef = base_beta / max(self.kl_beta, 1e-8)
-                                kl_loss = self.kl_beta * torch.mean((min_coef + raw_reward * (1 - min_coef)) * kl_div)
-                            else:
-                                kl_loss = self.kl_beta * kl_div.mean()
-
+                            kl_div = self._velocity_kl(velocity, ref_velocity, noised)
+                            kl_loss = self._kl_loss(kl_div, adv_cur_rank)
                             loss = loss + kl_loss
 
                         # 8. Logging
@@ -796,11 +875,9 @@ class CRDTrainer(BaseTrainer):
                         loss_info['loss'].append(loss.detach())
 
                         if self.use_old_for_loss:
-                            old_kl = ((old_v_pred - ref_pred) ** 2).mean(
-                                dim=tuple(range(1, old_v_pred.ndim))
-                            ).mean()
+                            old_kl = self._velocity_kl(old_velocity, ref_velocity, noised).mean()
                             loss_info['old_kl_div'].append(old_kl.detach())
-                            old_deviate = ((forward_pred - old_v_pred) ** 2).mean()
+                            old_deviate = self._velocity_kl(velocity, old_velocity, noised).mean()
                             loss_info['old_deviate'].append(old_deviate.detach())
 
                         # 9. Backward and optimizer step

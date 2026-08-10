@@ -25,7 +25,18 @@ import os
 from collections import defaultdict
 from contextlib import contextmanager
 from functools import partial
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, TypedDict, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Tuple,
+    TypedDict,
+    Union,
+)
 
 import numpy as np
 import torch
@@ -36,17 +47,13 @@ from diffusers.utils.torch_utils import randn_tensor
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from ..hparams import DGPOTrainingArguments
-from ..samples import BaseSample, StackedSampleBatch
-from ..utils.base import (
-    create_generator,
-    create_generator_by_prompt,
-    filter_kwargs,
-    to_broadcast_tensor,
-)
+from ..samples import BaseSample, ComponentTimes, LatentState, NoisedState, StackedSampleBatch
+from ..utils.base import create_generator, create_generator_by_prompt
 from ..utils.dist import reduce_loss_info
 from ..utils.logger_utils import setup_logger
-from ..utils.noise_schedule import TimeSampler, flow_match_sigma
+from ..utils.noise_schedule import TimeSampler
 from .abc import BaseTrainer
+from .forward_process import forward_velocity_state, require_latent_state, state_batch_size
 
 logger = setup_logger(__name__)
 
@@ -73,8 +80,8 @@ class _PreppedBatch(TypedDict):
     :meth:`DGPOTrainer._optimize_step`.
     """
 
-    batch: Dict[str, Any]
-    clean_latents: torch.Tensor
+    batch: StackedSampleBatch
+    clean_state: LatentState
     adv: torch.Tensor
     group_info: DGPOGroupInfo
     timesteps: torch.Tensor
@@ -82,12 +89,11 @@ class _PreppedBatch(TypedDict):
     inner_epoch: int
 
 
-class _NoisedInputs(TypedDict):
-    """``(t_flat, noised, target_v)`` for a single ``(prepped_batch, t_idx)`` pair."""
+class _NoisedInputs(NamedTuple):
+    """Component times and the forward-noised state for one training timestep."""
 
-    t_flat: torch.Tensor
-    noised: torch.Tensor
-    target_v: torch.Tensor
+    times: ComponentTimes
+    noised: NoisedState
 
 
 class _VelocityPredictions(TypedDict):
@@ -100,10 +106,10 @@ class _VelocityPredictions(TypedDict):
     ``use_ema_ref=True`` and to ``ref_v`` otherwise).
     """
 
-    model_v: torch.Tensor
-    old_v: Optional[torch.Tensor]
-    ref_v: Optional[torch.Tensor]
-    ref_dgpo_v: torch.Tensor
+    model_v: LatentState
+    old_v: Optional[LatentState]
+    ref_v: Optional[LatentState]
+    ref_dgpo_v: LatentState
 
 
 class DGPOTrainer(BaseTrainer):
@@ -330,47 +336,6 @@ class DGPOTrainer(BaseTrainer):
         )
         return self._sample_timesteps(batch_size=1, generator=gen).squeeze(-1)
 
-    # =========================== Forward Pass ============================
-    def _compute_dgpo_output(
-        self,
-        batch: Dict[str, Any],
-        timestep: torch.Tensor,
-        noised_latents: torch.Tensor,
-        guidance_scale: float,
-    ) -> torch.Tensor:
-        """Run the adapter for DGPO at a single timestep.
-
-        Args:
-            batch: Stacked batch dict (must contain at least prompt embeddings).
-            timestep: ``(B,)`` timestep in scheduler scale ``[0, 1000]``.
-            noised_latents: ``x_t`` for the current sample.
-            guidance_scale: CFG scale; use ``1.0`` for the uncond branch.
-
-        Returns:
-            Tensor ``(B, C, ...)``: the velocity prediction ``velocity``.
-        """
-        t = timestep.view(-1)
-        forward_kwargs = {
-            **self.training_args,
-            "t": t,
-            "t_next": torch.zeros_like(t),
-            "latents": noised_latents,
-            "compute_log_prob": False,
-            "return_kwargs": ["velocity"],
-            "noise_level": 0.0,
-            "guidance_scale": guidance_scale,
-            **{
-                k: v for k, v in batch.items() if k not in ("all_latents", "timesteps", "advantage")
-            },
-        }
-        forward_kwargs = filter_kwargs(self.adapter.forward, **forward_kwargs)
-        velocity = self.adapter.forward(**forward_kwargs).velocity
-        assert velocity is not None, (
-            "adapter.forward must return `velocity` for DGPO "
-            "(ensure 'velocity' is in `return_kwargs`)"
-        )
-        return velocity
-
     # =========================== Group Bookkeeping ============================
     def _precompute_group_info(
         self,
@@ -403,57 +368,137 @@ class DGPOTrainer(BaseTrainer):
         }
 
     # =========================== Noise Construction ============================
-    def _make_shared_noise(
+    def _draw_group_component_noise(
         self,
-        x0: torch.Tensor,
-        samples: List[BaseSample],
+        *,
+        unique_id: int,
+        component_name: str,
+        component_index: int,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        device: torch.device,
         inner_epoch: int,
     ) -> torch.Tensor:
-        """Per-``unique_id`` shared noise on the same device as ``x0``.
+        """Draw one group's noise for one component from an explicit seed tuple.
 
-        Uses one ``torch.Generator`` per unique group; because the generator
-        is seeded deterministically from ``(seed, epoch, inner_epoch, uid)``
-        and lives on ``x0.device``, we avoid any CPU→GPU copy and produce
-        byte-identical noise across ranks for the same ``unique_id``.
+        The primary component keeps the legacy
+        ``(seed, epoch, inner_epoch, unique_id, shared-noise tag)`` key so a
+        single-``"latent"`` adapter stays bit-identical; every further component
+        extends that key by its position in ``trajectory_component_order``, which
+        never depends on mapping iteration order.
 
-        The noise is **timestep-invariant** — all training timesteps within
-        an epoch share the same per-group noise, matching the reference
-        DGPO implementation.
+        Args:
+            unique_id: Group identifier shared by every sample of the group.
+            component_name: Component the noise belongs to.
+            component_index: Component position in ``trajectory_component_order``.
+            shape: Per-sample noise shape for this component.
+            dtype: Per-sample noise dtype for this component.
+            device: Device the generator and the noise live on.
+            inner_epoch: Inner epoch index, part of the seed namespace.
+
+        Returns:
+            One group's noise for one component, without a batch dimension.
         """
-        device, dtype = x0.device, x0.dtype
-        per_sample_shape = x0.shape[1:]
+        namespace = () if component_index == 0 else (component_index,)
+        generator = create_generator(
+            self.training_args.seed,
+            self.epoch,
+            inner_epoch,
+            int(unique_id),
+            _SEED_TAG_SHARED_NOISE,
+            *namespace,
+            device=device,
+        )
+        return randn_tensor(shape, generator=generator, device=device, dtype=dtype)
 
-        group_cache: Dict[int, torch.Tensor] = {}
-        noises: List[torch.Tensor] = []
+    def _shared_group_noise(
+        self,
+        clean_state: LatentState,
+        samples: List[BaseSample],
+        inner_epoch: int,
+    ) -> LatentState:
+        """Build per-``unique_id`` shared noise for every trajectory component.
+
+        Every sample of a group receives the same component noise, drawn once per
+        group in ``trajectory_component_order``. Because each draw carries its own
+        deterministically seeded generator, the result is byte-identical across
+        ranks and independent of how many groups a rank happens to hold.
+
+        The noise is **timestep-invariant** — all training timesteps within an
+        inner epoch share one group noise, matching the reference DGPO
+        implementation.
+
+        Args:
+            clean_state: Terminal clean state supplying per-component geometry.
+            samples: Micro-batch samples, aligned with the state batch dimension.
+            inner_epoch: Inner epoch index, part of the seed namespace.
+
+        Returns:
+            Batched noise state in ``trajectory_component_order``.
+        """
+        batch_size = state_batch_size(self, clean_state, "terminal clean state")
+        if len(samples) != batch_size:
+            raise ValueError(
+                f"expected {type(self).__name__} shared noise to receive one sample per "
+                f"terminal state row, i.e. {batch_size} samples, received {len(samples)}"
+            )
+        component_names = self.adapter.trajectory_component_order
+        references: Dict[str, torch.Tensor] = {}
+        for name in component_names:
+            component = clean_state.components[name]
+            if component.ndim < 2 or component.shape[0] != batch_size:
+                raise ValueError(
+                    f"expected {type(self).__name__} terminal clean component {name!r} to be "
+                    f"batched with shape (B, ...) and batch size {batch_size}, received "
+                    f"{tuple(component.shape)}"
+                )
+            references[name] = component
+
+        group_cache: Dict[int, Dict[str, torch.Tensor]] = {}
+        rows: Dict[str, List[torch.Tensor]] = {name: [] for name in component_names}
         for sample in samples:
-            uid = int(sample.unique_id)
-            noise = group_cache.get(uid)
-            if noise is None:
-                gen = create_generator(
-                    self.training_args.seed,
-                    self.epoch,
-                    inner_epoch,
-                    int(uid),
-                    _SEED_TAG_SHARED_NOISE,
-                    device=device,
-                )
-                noise = randn_tensor(
-                    per_sample_shape,
-                    generator=gen,
-                    device=device,
-                    dtype=dtype,
-                )
-                group_cache[uid] = noise
-            noises.append(noise)
-        return torch.stack(noises, dim=0)
+            unique_id = int(sample.unique_id)
+            group_noise = group_cache.get(unique_id)
+            if group_noise is None:
+                group_noise = {
+                    name: self._draw_group_component_noise(
+                        unique_id=unique_id,
+                        component_name=name,
+                        component_index=component_index,
+                        shape=references[name].shape[1:],
+                        dtype=references[name].dtype,
+                        device=references[name].device,
+                        inner_epoch=inner_epoch,
+                    )
+                    for component_index, name in enumerate(component_names)
+                }
+                group_cache[unique_id] = group_noise
+            for name in component_names:
+                noise = group_noise[name]
+                reference = references[name]
+                if (
+                    noise.shape != reference.shape[1:]
+                    or noise.dtype != reference.dtype
+                    or noise.device != reference.device
+                ):
+                    raise ValueError(
+                        f"expected {type(self).__name__} shared noise for unique_id="
+                        f"{unique_id} component {name!r} to match the clean per-sample "
+                        f"shape/dtype/device ({tuple(reference.shape[1:])}, {reference.dtype}, "
+                        f"{reference.device}), received ({tuple(noise.shape)}, {noise.dtype}, "
+                        f"{noise.device})"
+                    )
+                rows[name].append(noise)
+        return LatentState({name: torch.stack(rows[name], dim=0) for name in component_names})
 
     # =========================== Group DGPO Loss ============================
     def _compute_per_sample_preference(
         self,
         dsm_loss: torch.Tensor,
-        ref_dgpo_v: torch.Tensor,
-        target_v: torch.Tensor,
+        ref_dgpo_v: LatentState,
+        target_v: LatentState,
         advantages: torch.Tensor,
+        noised: NoisedState,
     ) -> torch.Tensor:
         """Per-sample contribution to a group's sigmoid argument.
 
@@ -464,9 +509,8 @@ class DGPOTrainer(BaseTrainer):
         reweighting is no longer a DGPO group preference but a
         second-order correction on ``dsm_loss`` itself.
         """
-        batch_size = ref_dgpo_v.shape[0]
         with torch.no_grad():
-            ref_dsm = (target_v - ref_dgpo_v).square().reshape(batch_size, -1).mean(dim=1)
+            ref_dsm = self._compute_dsm_loss(target_v, ref_dgpo_v, noised)
         delta = dsm_loss.detach() - ref_dsm
         return advantages * self.dpo_beta * delta / self.training_args.group_size
 
@@ -492,11 +536,12 @@ class DGPOTrainer(BaseTrainer):
 
     def _compute_group_dgpo_loss(
         self,
-        ref_v: torch.Tensor,
-        target_v: torch.Tensor,
+        ref_v: LatentState,
+        target_v: LatentState,
         advantages: torch.Tensor,
         group_info: DGPOGroupInfo,
         dsm_loss: torch.Tensor,
+        noised: NoisedState,
     ) -> torch.Tensor:
         """Group-level DGPO loss.
 
@@ -522,6 +567,7 @@ class DGPOTrainer(BaseTrainer):
             ref_dgpo_v=ref_v,
             target_v=target_v,
             advantages=advantages,
+            noised=noised,
         )
 
         local_sums = torch.zeros(num_groups, device=device, dtype=per_sample.dtype)
@@ -535,17 +581,18 @@ class DGPOTrainer(BaseTrainer):
         """Unpack one ``training_batches`` entry once.
 
         Avoids repeating the same six-field unpack and the
-        ``adv_clip_range`` + ``clean_latents`` derivation on every
+        ``adv_clip_range`` + terminal-state derivation on every
         timestep of :meth:`_optimize_step`.
         """
         batch = tb["batch"]
-        all_latents: torch.Tensor = batch["all_latents"]
-        clean_latents = all_latents[:, -1]
+        clean_state = require_latent_state(
+            self, self.adapter.get_terminal_state(batch), "terminal clean state"
+        )
         adv_clip_range = self.training_args.adv_clip_range
         adv = torch.clamp(batch["advantage"], adv_clip_range[0], adv_clip_range[1])
         return {
             "batch": batch,
-            "clean_latents": clean_latents,
+            "clean_state": clean_state,
             "adv": adv,
             "group_info": tb["group_info"],
             "timesteps": tb["timesteps"],
@@ -553,34 +600,36 @@ class DGPOTrainer(BaseTrainer):
             "inner_epoch": tb["inner_epoch"],
         }
 
-    def _build_noised_inputs(
-        self, p: _PreppedBatch, t_idx: int,
-    ) -> _NoisedInputs:
-        """Compute ``(t_flat, noised_latents, target_velocity)`` for a
+    def _build_noised_inputs(self, p: _PreppedBatch, t_idx: int) -> _NoisedInputs:
+        """Compute the component times and forward-noised state for a
         ``(prepped_batch, t_idx)`` pair.
+
+        Shared noise is predetermined per ``unique_id`` and only applied here, so
+        the application consumes no randomness; independent noise delegates the
+        draw to the adapter's ordered noising hook.
 
         The per-group shared noise is **timestep-invariant** — all timesteps
         within an epoch receive the same noise for a given ``unique_id``,
         matching the reference DGPO implementation.
         """
-        clean_latents = p["clean_latents"]
-        t_flat = p["timesteps"][t_idx]
-        sigma_bcast = to_broadcast_tensor(flow_match_sigma(t_flat), clean_latents)
+        clean_state = p["clean_state"]
+        times = self.adapter.build_training_component_times(
+            p["timesteps"][t_idx], batch=p["batch"]
+        )
         if self.use_shared_noise:
-            noise = self._make_shared_noise(
-                clean_latents, p["samples_slice"], p["inner_epoch"],
+            noise = self._shared_group_noise(
+                clean_state, p["samples_slice"], p["inner_epoch"]
             )
+            noised = self.adapter.apply_forward_process_noise(clean_state, times, noise)
         else:
-            noise = randn_tensor(clean_latents.shape, device=clean_latents.device, dtype=clean_latents.dtype)
-        noised = (1 - sigma_bcast) * clean_latents + sigma_bcast * noise
-        target_v = noise - clean_latents
-        return {"t_flat": t_flat, "noised": noised, "target_v": target_v}
+            noised = self.adapter.add_forward_process_noise(clean_state, times)
+        return _NoisedInputs(times=times, noised=noised)
 
     def _forward_velocities(
         self,
-        batch: Dict[str, Any],
-        t_flat: torch.Tensor,
-        noised: torch.Tensor,
+        batch: StackedSampleBatch,
+        times: ComponentTimes,
+        noised: NoisedState,
     ) -> _VelocityPredictions:
         """Run the per-optimizer-step velocity forwards.
 
@@ -602,21 +651,38 @@ class DGPOTrainer(BaseTrainer):
         need_old_v_for_dgpo_ref = self._requires_ema_ref and self.use_ema_ref
         compute_old_v = need_old_v_for_clip or need_old_v_for_dgpo_ref
 
-        old_v: Optional[torch.Tensor] = None
+        old_v: Optional[LatentState] = None
         if compute_old_v:
             with torch.no_grad(), self._ema_ref_forward_context(), self.autocast():
-                old_v = self._compute_dgpo_output(
-                    batch, t_flat, noised, guidance_scale=1.0
-                ).detach()
+                old_velocity = forward_velocity_state(
+                    self,
+                    batch,
+                    noised.state,
+                    times,
+                    source="old policy",
+                    guidance_scale=1.0,
+                )
+            old_v = LatentState(
+                {name: value.detach() for name, value in old_velocity.components.items()}
+            )
 
         with self.autocast():
-            model_v = self._compute_dgpo_output(batch, t_flat, noised, guidance_scale=1.0)
+            model_v = forward_velocity_state(
+                self, batch, noised.state, times, source="policy", guidance_scale=1.0
+            )
 
-        ref_v: Optional[torch.Tensor] = None
+        ref_v: Optional[LatentState] = None
         if self.enable_kl_loss or (not self.use_ema_ref):
             ref_cfg = self.kl_cfg if self.kl_cfg > 1.0 else 1.0
             with torch.no_grad(), self.adapter.use_ref_parameters(), self.autocast():
-                ref_v = self._compute_dgpo_output(batch, t_flat, noised, guidance_scale=ref_cfg)
+                ref_v = forward_velocity_state(
+                    self,
+                    batch,
+                    noised.state,
+                    times,
+                    source="reference",
+                    guidance_scale=ref_cfg,
+                )
 
         if self.use_ema_ref:
             # Guaranteed non-None: use_ema_ref → compute_old_v → old_v assigned.
@@ -636,20 +702,56 @@ class DGPOTrainer(BaseTrainer):
 
     def _compute_dsm_loss(
         self,
-        target_v: torch.Tensor,
-        pred_v: torch.Tensor,
+        target_v: LatentState,
+        pred_v: LatentState,
+        noised: NoisedState,
     ) -> torch.Tensor:
-        """Per-sample DSM MSE reduced over non-batch dimensions."""
-        batch_size = target_v.shape[0]
-        return (target_v - pred_v).square().reshape(batch_size, -1).mean(dim=1)
+        """Per-sample DSM error, reduced with the noised state's active elements.
+
+        Args:
+            target_v: Flow-matching target velocity per component.
+            pred_v: Predicted velocity per component.
+            noised: Forward-noised state supplying per-sample reduction context.
+
+        Returns:
+            Per-sample DSM loss of shape ``(B,)``.
+        """
+        errors = {
+            name: (target_v.components[name] - pred_v.components[name]).square()
+            for name in self.adapter.trajectory_component_order
+        }
+        return self.adapter.reduce_latent_values(errors, state=noised.state)
+
+    def _velocity_kl(
+        self,
+        velocity: LatentState,
+        ref_velocity: LatentState,
+        noised: NoisedState,
+    ) -> torch.Tensor:
+        """Per-sample squared velocity gap against the reference policy.
+
+        Args:
+            velocity: Current-policy velocity per component.
+            ref_velocity: Reference-policy velocity per component.
+            noised: Forward-noised state supplying per-sample reduction context.
+
+        Returns:
+            Per-sample KL surrogate of shape ``(B,)``.
+        """
+        errors = {
+            name: (velocity.components[name] - ref_velocity.components[name]).square()
+            for name in self.adapter.trajectory_component_order
+        }
+        return self.adapter.reduce_latent_values(errors, state=noised.state)
 
     def _maybe_clip_dsm(
         self,
         dsm_loss: torch.Tensor,
-        old_v: Optional[torch.Tensor],
-        target_v: torch.Tensor,
+        old_v: Optional[LatentState],
+        target_v: LatentState,
         adv: torch.Tensor,
         loss_info: Dict[str, List[torch.Tensor]],
+        noised: NoisedState,
     ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
         """Return ``(should_clip_mask, possibly_clipped_dsm_loss)``.
 
@@ -660,9 +762,8 @@ class DGPOTrainer(BaseTrainer):
         if not (self.clip_dsm or self.clip_kl) or old_v is None:
             return None, dsm_loss
 
-        batch_size = old_v.shape[0]
         clip_range = self.training_args.clip_range
-        old_dsm = (target_v - old_v).square().reshape(batch_size, -1).mean(dim=1)
+        old_dsm = self._compute_dsm_loss(target_v, old_v, noised)
         ratio = torch.exp(-dsm_loss.detach() + old_dsm)
         should_clip = torch.where(
             adv > 0,
@@ -678,10 +779,11 @@ class DGPOTrainer(BaseTrainer):
         self,
         *,
         dgpo_loss: torch.Tensor,
-        model_v: torch.Tensor,
-        ref_v: Optional[torch.Tensor],
+        model_v: LatentState,
+        ref_v: Optional[LatentState],
         should_clip: Optional[torch.Tensor],
         loss_info: Dict[str, List[torch.Tensor]],
+        noised: NoisedState,
     ) -> Dict[str, List[torch.Tensor]]:
         """Assemble ``dgpo_loss + optional kl``, log components, backward,
         and optionally finalize the optimizer step.
@@ -696,9 +798,8 @@ class DGPOTrainer(BaseTrainer):
                     "DGPOTrainer._apply_total_loss_and_backward expected ref_v when KL is "
                     "enabled, but got None."
                 )
-            batch_size = model_v.shape[0]
             with self.autocast():
-                kl_div = (model_v - ref_v).square().reshape(batch_size, -1).mean(dim=1)
+                kl_div = self._velocity_kl(model_v, ref_v, noised)
                 if self.clip_kl and should_clip is not None:
                     kl_div = torch.where(should_clip, kl_div.detach(), kl_div)
                 kl_loss = self.kl_beta * kl_div.mean()
@@ -769,9 +870,8 @@ class DGPOTrainer(BaseTrainer):
                 batch: StackedSampleBatch = BaseSample.stack(
                     [s.to(device) for s in samples_slice]
                 )
-                all_latents: torch.Tensor = batch["all_latents"]
-                clean_latents = all_latents[:, -1]
-                batch_size = clean_latents.shape[0]
+                clean_state = self.adapter.get_terminal_state(batch)
+                batch_size = state_batch_size(self, clean_state, "terminal clean state")
 
                 group_info = self._precompute_group_info(samples_slice)
                 timesteps = shared_timesteps.unsqueeze(1).expand(-1, batch_size)  # (T, B)
@@ -792,7 +892,7 @@ class DGPOTrainer(BaseTrainer):
     def start(self):
         """Main training loop."""
         while self.should_continue_training():
-            self.adapter.scheduler.set_seed(self.epoch + self.training_args.seed)
+            self.adapter.set_trajectory_seed(self.epoch + self.training_args.seed)
 
             if (
                 self.log_args.save_freq > 0
@@ -906,25 +1006,26 @@ class DGPOTrainer(BaseTrainer):
                 disable=not self.show_progress_bar,
             ):
                 with self.accumulate_gradients():
-                    noised = self._build_noised_inputs(p, t_idx)
-                    vels = self._forward_velocities(
-                        batch, noised["t_flat"], noised["noised"]
-                    )
-                    dsm_loss = self._compute_dsm_loss(noised["target_v"], vels["model_v"])
+                    times, noised = self._build_noised_inputs(p, t_idx)
+                    vels = self._forward_velocities(batch, times, noised)
+                    target_v = noised.target_velocity
+                    dsm_loss = self._compute_dsm_loss(target_v, vels["model_v"], noised)
                     should_clip, dsm_loss = self._maybe_clip_dsm(
                         dsm_loss=dsm_loss,
                         old_v=vels["old_v"],
-                        target_v=noised["target_v"],
+                        target_v=target_v,
                         adv=adv,
                         loss_info=loss_info,
+                        noised=noised,
                     )
                     ref_dgpo_v = vels["ref_dgpo_v"]
                     dgpo_loss = self._compute_group_dgpo_loss(
                         ref_v=ref_dgpo_v,
-                        target_v=noised["target_v"],
+                        target_v=target_v,
                         advantages=adv,
                         group_info=group_info,
                         dsm_loss=dsm_loss,
+                        noised=noised,
                     )
                     loss_info["dsm_loss"].append(dsm_loss.mean().detach())
                     loss_info = self._apply_total_loss_and_backward(
@@ -933,6 +1034,7 @@ class DGPOTrainer(BaseTrainer):
                         ref_v=vels["ref_v"],
                         should_clip=should_clip,
                         loss_info=loss_info,
+                        noised=noised,
                     )
 
     # =========================== Optimizer Step Finalization ============================
