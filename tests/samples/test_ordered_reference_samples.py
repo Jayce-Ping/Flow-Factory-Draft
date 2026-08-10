@@ -71,6 +71,17 @@ def test_manifest_validation_reports_row_and_reference(references: list[dict], m
         canonicalize_reference_manifest(references, row_index=2)
 
 
+def test_manifest_rejects_audio_only_with_row_and_reference_context() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"row 7.*reference 0.*at least one image or video.*audio",
+    ):
+        canonicalize_reference_manifest(
+            [{"kind": "audio", "path": "voice.wav", "sample_rate": 44100}],
+            row_index=7,
+        )
+
+
 def test_model_samples_follow_exact_two_layer_hierarchy() -> None:
     assert MiniMaxH3T2VASample.__bases__ == (T2AVSample,)
     assert MiniMaxH3FL2VASample.__bases__ == (I2AVSample,)

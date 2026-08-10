@@ -45,6 +45,11 @@ def canonicalize_reference_manifest(references: Any, row_index: int) -> str:
     validated: List[Dict[str, Any]] = []
     for reference_index, entry in enumerate(references):
         validated.append(_validate_reference_entry(entry, row_index, reference_index))
+    if not any(entry["kind"] in ("image", "video") for entry in validated):
+        raise ValueError(
+            f"at row {row_index}, reference 0, expected at least one image or video "
+            f"reference, got audio-only kinds={[entry['kind'] for entry in validated]!r}"
+        )
     return json.dumps(validated, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
