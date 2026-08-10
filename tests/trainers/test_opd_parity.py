@@ -529,6 +529,59 @@ def test_structured_projection_rejects_a_non_zero_scalar_next_timestep() -> None
         )
 
 
+@pytest.mark.parametrize("role", ["state", "student target", "teacher target"])
+def test_structured_helpers_reject_a_component_without_a_batch_axis(role: str) -> None:
+    """A 0-D component must raise a named contract error, not ``IndexError``."""
+    adapter = _structured_adapter()
+    batched = {"video": torch.zeros(2, 3), "audio": torch.zeros(2, 5)}
+    malformed = {"video": torch.zeros(2, 3), "audio": torch.tensor(0.0)}
+
+    if role == "state":
+        with pytest.raises(
+            ValueError,
+            match=r"replay state.*component 'audio'.*batched tensor.*received shape \(\)",
+        ):
+            project_distillation_target_state(
+                adapter,
+                loss_target="xt",
+                state=LatentState(dict(malformed)),
+                output=_structured_output(),
+                times=_structured_times(),
+            )
+        return
+
+    targets = {"student target": malformed, "teacher target": batched}
+    if role == "teacher target":
+        targets = {"student target": batched, "teacher target": malformed}
+    with pytest.raises(
+        ValueError,
+        match=rf"{role}.*component 'audio'.*batched tensor.*received shape \(\)",
+    ):
+        compute_structured_distillation_loss(
+            adapter,
+            student_target=LatentState(dict(targets["student target"])),
+            teacher_target=LatentState(dict(targets["teacher target"])),
+            state=LatentState(dict(batched)),
+            self_normalize=False,
+        )
+
+
+def test_structured_helpers_reject_components_with_different_batch_sizes() -> None:
+    adapter = _structured_adapter()
+
+    with pytest.raises(
+        ValueError,
+        match=r"replay state.*component 'audio'.*batch size 2.*received \(3, 5\)",
+    ):
+        project_distillation_target_state(
+            adapter,
+            loss_target="xt",
+            state=LatentState({"video": torch.zeros(2, 3), "audio": torch.zeros(3, 5)}),
+            output=_structured_output(),
+            times=_structured_times(),
+        )
+
+
 def test_structured_projection_errors_carry_the_caller_context() -> None:
     adapter = _adapter()
 
@@ -656,17 +709,20 @@ def test_structured_loss_divides_each_component_by_its_own_denominator() -> None
     assert torch.equal(loss, (video_sum + audio_sum) / 17)
 
 
-def test_structured_loss_divides_raw_elements_before_the_single_masked_reduction() -> None:
-    """A per-sample active count must divide the already-scaled raw elements.
+def test_masked_one_component_stochastic_loss_divides_the_masked_reduction() -> None:
+    """A per-sample denominator divides the masked reduction, not the raw elements.
 
-    Component-meaning before the denominator would make the loss depend on the
-    full element count instead of the mask, so the two samples below (3 and 1
-    active positions) are the discriminating case.
+    The denominator is a per-sample scalar, so dividing the reduced value is
+    mathematically identical to scaling the raw elements while keeping the
+    legacy operation order. The samples below (3 and 2 active positions, with
+    non-binary denominators) pin both halves: the reduction still sees raw
+    latent-shaped values — feeding a pre-reduced ``(B,)`` tensor to a masked
+    reducer produces a different number — and the division happens after it.
     """
     torch.manual_seed(10)
     student, teacher = torch.randn(2, 4), torch.randn(2, 4)
-    denominator = torch.tensor([0.5, 3.0])
-    mask = torch.tensor([[1.0, 1.0, 1.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
+    denominator = torch.tensor([0.7, 3.0])
+    mask = torch.tensor([[1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 0.0, 0.0]])
     adapter = _dynamic_mask_adapter()
 
     loss = compute_structured_distillation_loss(
@@ -678,61 +734,115 @@ def test_structured_loss_divides_raw_elements_before_the_single_masked_reduction
         denominators={"latent": denominator},
     )
 
-    scaled = (student - teacher).float().square() / denominator.reshape(2, 1)
-    assert torch.equal(loss, (scaled * mask).sum(dim=1) / mask.sum(dim=1))
+    squared = (student - teacher).float().square()
+    masked_mean = (squared * mask).sum(dim=1) / mask.sum(dim=1)
+    assert torch.equal(loss, masked_mean / denominator)
 
 
-def test_one_component_stochastic_loss_scales_raw_elements_then_self_normalizes() -> None:
-    """The denominator divides raw elements; the detached scale divides the reduction.
+@pytest.mark.parametrize(
+    "denominator",
+    [
+        pytest.param([0.25, 0.125], id="binary"),
+        pytest.param([0.3, 1.7], id="non-binary"),
+    ],
+)
+@pytest.mark.parametrize("self_normalize", [False, True])
+def test_one_component_stochastic_loss_is_the_legacy_loss_over_the_denominator(
+    denominator: List[float], self_normalize: bool
+) -> None:
+    """One component keeps the legacy float order: reduce, normalize, then divide.
 
-    Self-normalization stays a per-sample scalar applied to the reduced loss —
-    exactly the legacy arithmetic — while the denominator moved inside the
-    reduction so a masked reducer sees the scaled elements.
+    Dividing raw elements instead would only be bit-identical for exactly
+    representable denominators, and the real schedulers produce arbitrary
+    positive transition variances.
     """
     torch.manual_seed(9)
     student, teacher = torch.randn(2, 3, 4), torch.randn(2, 3, 4)
+    denominators = {"latent": torch.tensor(denominator)}
+    adapter = _adapter("Flow-SDE")
+
+    loss = compute_structured_distillation_loss(
+        adapter,
+        student_target=LatentState({"latent": student}),
+        teacher_target=LatentState({"latent": teacher}),
+        state=LatentState({"latent": torch.zeros(2, 3, 4)}),
+        self_normalize=self_normalize,
+        denominators=denominators,
+    )
+
+    legacy = compute_per_sample_distillation_loss(student, teacher, self_normalize=self_normalize)
+    assert torch.equal(loss, legacy / denominators["latent"])
+
+
+@pytest.mark.parametrize("self_normalize", [False, True])
+def test_one_component_stochastic_gradient_matches_the_legacy_formula(
+    self_normalize: bool,
+) -> None:
+    """Loss and gradient stay bit-identical for an arbitrary positive denominator."""
+    torch.manual_seed(12)
+    teacher = torch.randn(2, 3, 4)
     denominator = torch.tensor([0.3, 1.7])
+    latents = torch.randn(2, 3, 4)
     adapter = _adapter("Flow-SDE")
 
+    weight = torch.nn.Parameter(torch.tensor(0.6))
     loss = compute_structured_distillation_loss(
         adapter,
-        student_target=LatentState({"latent": student}),
+        student_target=LatentState({"latent": latents * weight}),
         teacher_target=LatentState({"latent": teacher}),
         state=LatentState({"latent": torch.zeros(2, 3, 4)}),
-        self_normalize=True,
+        self_normalize=self_normalize,
         denominators={"latent": denominator},
-    )
+    ).mean()
+    loss.backward()
 
-    error = (student - teacher).float()
-    scaled = error.square() / denominator.reshape(2, 1, 1)
-    scale = error.abs().flatten(1).mean(dim=1)
-    assert torch.equal(loss, scaled.flatten(1).mean(dim=1) / (scale + 1e-8))
+    legacy_weight = torch.nn.Parameter(torch.tensor(0.6))
+    legacy_loss = (
+        compute_per_sample_distillation_loss(
+            latents * legacy_weight, teacher, self_normalize=self_normalize
+        )
+        / denominator
+    ).mean()
+    legacy_loss.backward()
+
+    assert torch.equal(loss.detach(), legacy_loss.detach())
+    assert torch.equal(weight.grad, legacy_weight.grad)
 
 
-def test_one_component_stochastic_loss_stays_legacy_exact_for_a_binary_denominator() -> None:
-    """Division by an exactly representable denominator commutes with the reduction.
+def test_structured_gradient_matches_the_non_binary_raw_element_oracle() -> None:
+    """Two components with different denominators scale raw elements, loss and grad."""
+    torch.manual_seed(13)
+    teacher = {"video": torch.randn(2, 3, 4), "audio": torch.randn(2, 5)}
+    latents = {"video": torch.randn(2, 3, 4), "audio": torch.randn(2, 5)}
+    denominators = {"video": torch.tensor([0.3, 1.7]), "audio": torch.tensor([2.5, 0.7])}
+    state = LatentState({"video": torch.zeros(2, 3, 4), "audio": torch.zeros(2, 5)})
+    adapter = _structured_adapter("Flow-SDE", "Flow-SDE")
 
-    The legacy trainer divided the reduced per-sample loss by the denominator.
-    Moving that division inside the reduction is mathematically identical and,
-    for a power-of-two denominator, bit-identical — which is what the real SDE
-    schedulers produce for the transition variance in the production oracle.
-    """
-    torch.manual_seed(11)
-    student, teacher = torch.randn(2, 3, 4), torch.randn(2, 3, 4)
-    denominator = torch.tensor([0.25, 0.125])
-    adapter = _adapter("Flow-SDE")
-
+    weight = torch.nn.Parameter(torch.tensor(0.6))
     loss = compute_structured_distillation_loss(
         adapter,
-        student_target=LatentState({"latent": student}),
-        teacher_target=LatentState({"latent": teacher}),
-        state=LatentState({"latent": torch.zeros(2, 3, 4)}),
-        self_normalize=True,
-        denominators={"latent": denominator},
-    )
+        student_target=LatentState({name: latents[name] * weight for name in latents}),
+        teacher_target=LatentState(dict(teacher)),
+        state=state,
+        self_normalize=False,
+        denominators=denominators,
+    ).mean()
+    loss.backward()
 
-    legacy = compute_per_sample_distillation_loss(student, teacher, self_normalize=True)
-    assert torch.equal(loss, legacy / denominator)
+    oracle_weight = torch.nn.Parameter(torch.tensor(0.6))
+    video = (latents["video"] * oracle_weight - teacher["video"]).square()
+    audio = (latents["audio"] * oracle_weight - teacher["audio"]).square()
+    oracle_loss = (
+        (
+            (video / denominators["video"].reshape(2, 1, 1)).flatten(1).sum(dim=1)
+            + (audio / denominators["audio"].reshape(2, 1)).flatten(1).sum(dim=1)
+        )
+        / 17
+    ).mean()
+    oracle_loss.backward()
+
+    assert torch.equal(loss.detach(), oracle_loss.detach())
+    assert torch.equal(weight.grad, oracle_weight.grad)
 
 
 @pytest.mark.parametrize(

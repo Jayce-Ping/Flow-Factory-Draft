@@ -654,5 +654,17 @@ class DiffusionOPDTrainer(BaseTrainer):
                     f"for component {name!r} as a floating tensor on the replay device "
                     f"{reference.device}, received {denominator.dtype} on {denominator.device}"
                 )
+            # The shared loss helper re-checks these values; validating here too
+            # attributes an unusable transition variance to its replay step.
+            if not bool(torch.isfinite(denominator).all()):
+                raise ValueError(
+                    f"expected DiffusionOPDTrainer KL denominator at step_index={step_index} "
+                    f"for component {name!r} to be finite, received {denominator}"
+                )
+            if not bool((denominator > 0).all()):
+                raise ValueError(
+                    f"expected DiffusionOPDTrainer KL denominator at step_index={step_index} "
+                    f"for component {name!r} to be strictly positive, received {denominator}"
+                )
             denominators[name] = denominator.reshape(batch_size)
         return denominators

@@ -1012,9 +1012,10 @@ def test_two_component_stochastic_path_backpropagates_each_component_denominator
     teacher = LatentState({"video": torch.randn(2, 3, 4), "audio": torch.randn(2, 5)})
     output = MultiModalStepOutput(
         next_state_mean=LatentState({"video": video * weight, "audio": audio * weight}),
-        # Distinct per-component statistics: one shared denominator would be wrong.
+        # Distinct per-component statistics, and deliberately not powers of two:
+        # one shared denominator, or dividing after the reduction, would be wrong.
         std_dev_t={"video": torch.full((2, 1, 1), 0.5), "audio": torch.full((2, 1), 0.25)},
-        dt={"video": torch.full((2, 1, 1), -0.5), "audio": torch.full((2, 1), -0.125)},
+        dt={"video": torch.full((2, 1, 1), -0.3), "audio": torch.full((2, 1), -0.7)},
     )
 
     denominators = trainer._component_kl_denominators(output, replay, step_index=1)
@@ -1035,8 +1036,10 @@ def test_two_component_stochastic_path_backpropagates_each_component_denominator
     ).mean()
     loss.backward()
 
-    assert torch.equal(denominators["video"], torch.full((2,), 0.5**2 * 0.5))
-    assert torch.equal(denominators["audio"], torch.full((2,), 0.25**2 * 0.125))
+    assert torch.equal(
+        denominators["video"], torch.full((2, 1, 1), 0.5).square().mul(0.3).flatten()
+    )
+    assert torch.equal(denominators["audio"], torch.full((2, 1), 0.25).square().mul(0.7).flatten())
 
     oracle_weight = torch.nn.Parameter(torch.tensor(0.6))
     video_error = (video * oracle_weight - teacher.components["video"]).square()
@@ -1050,6 +1053,56 @@ def test_two_component_stochastic_path_backpropagates_each_component_denominator
 
     assert torch.equal(loss.detach(), oracle_loss.detach())
     assert torch.equal(weight.grad, oracle_weight.grad)
+
+
+class ConstantDenominatorSchedulerFake(SchedulerFake):
+    """Scheduler returning a fixed per-sample denominator."""
+
+    def __init__(self, dynamics_type: str, values: List[float]) -> None:
+        super().__init__(dynamics_type)
+        self.values = values
+
+    def get_kl_divergence_denominator(
+        self, std_dev_t: torch.Tensor, dt: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the configured denominator, bypassing the variance arithmetic."""
+        return torch.tensor(self.values)
+
+
+@pytest.mark.parametrize(
+    "values, reason",
+    [
+        pytest.param([float("nan"), 0.5], "finite", id="nan"),
+        pytest.param([float("inf"), 0.5], "finite", id="inf"),
+        pytest.param([0.0, 0.5], "strictly positive", id="zero"),
+        pytest.param([-0.25, 0.5], "strictly positive", id="negative"),
+    ],
+)
+def test_two_component_denominators_reject_invalid_values_with_step_context(
+    values: List[float], reason: str
+) -> None:
+    """An unusable transition variance must name the step and the component."""
+    adapter = _two_component_adapter()
+    adapter.scheduler_group = SchedulerGroup(
+        {
+            "video": ConstantDenominatorSchedulerFake("Flow-SDE", values),
+            "audio": SchedulerFake("Flow-SDE"),
+        },
+        primary_name="video",
+    )
+    trainer = _single_teacher_trainer(adapter, is_sde=True)
+    replay = _two_component_replay(torch.zeros(2, 3), torch.zeros(2, 5))
+    output = MultiModalStepOutput(
+        next_state_mean=LatentState({"video": torch.zeros(2, 3), "audio": torch.zeros(2, 5)}),
+        std_dev_t={"video": torch.full((2, 1), 0.5), "audio": torch.full((2, 1), 0.25)},
+        dt={"video": torch.full((2, 1), -0.5), "audio": torch.full((2, 1), -0.125)},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"step_index=1.*component 'video'.*{reason}",
+    ):
+        trainer._component_kl_denominators(output, replay, step_index=1)
 
 
 class ScalarDenominatorSchedulerFake(SchedulerFake):

@@ -309,6 +309,23 @@ def _require_state(
             f"{prefix}expected DiffusionOPD {role} in component order {expected_names}, "
             f"received {value.component_names}"
         )
+    batch_size: Optional[int] = None
+    for name in expected_names:
+        component = value.components[name]
+        if component.ndim < 1:
+            raise ValueError(
+                f"{prefix}expected DiffusionOPD {role} component {name!r} to be a batched "
+                f"tensor with a leading batch dimension, received shape "
+                f"{tuple(component.shape)}"
+            )
+        if batch_size is None:
+            batch_size = component.shape[0]
+        elif component.shape[0] != batch_size:
+            raise ValueError(
+                f"{prefix}expected DiffusionOPD {role} component {name!r} to share the batch "
+                f"size {batch_size} of component {expected_names[0]!r}, received "
+                f"{tuple(component.shape)}"
+            )
     return value
 
 
@@ -537,13 +554,18 @@ def compute_structured_distillation_loss(
 ) -> torch.Tensor:
     """Compute the per-sample structured distillation loss.
 
-    The per-component KL denominators of stochastic dynamics divide the raw
-    squared-error elements of their own component, so exactly one state-aware
-    reduction runs over already-scaled elements and a masked model never sees a
-    pre-reduced value. Self-normalization stays global and is applied to that
-    single reduction: one detached scale per sample shared by every component,
-    which both preserves the relative component weighting and keeps the legacy
-    ``per_sample_loss / (scale + eps)`` arithmetic bit-identical.
+    Exactly one state-aware reduction runs, always over raw latent-shaped
+    values, so a masked model never sees a pre-reduced tensor. Self-normalization
+    stays global: one detached scale per sample shared by every component, which
+    preserves the relative component weighting.
+
+    The per-component KL denominators of stochastic dynamics are applied around
+    that reduction according to how many components share it. A single component
+    divides the reduced ``(B,)`` value, reproducing the legacy floating-point
+    order exactly for an arbitrary positive denominator (this stays correct
+    under a dynamic mask because the denominator is a per-sample scalar).
+    Several components may carry different denominators, so each divides the
+    raw squared-error elements of its own component before the shared reduction.
 
     Args:
         adapter: Adapter owning the reduction and component order.
@@ -594,18 +616,27 @@ def compute_structured_distillation_loss(
         scale = adapter.reduce_latent_values(absolute, state=state).detach()
 
     values = squared
+    reduced_denominator: Optional[torch.Tensor] = None
     if denominators is not None:
         batch_size = student_target.components[expected_names[0]].shape[0]
         _validate_component_denominators(adapter, denominators, batch_size)
-        values = {
-            name: squared[name] / to_broadcast_tensor(denominators[name], squared[name])
-            for name in expected_names
-        }
+        if len(expected_names) == 1:
+            # One component shares one denominator, so dividing the reduced
+            # value reproduces the legacy floating-point order exactly for an
+            # arbitrary positive denominator (not only powers of two).
+            reduced_denominator = denominators[expected_names[0]]
+        else:
+            values = {
+                name: squared[name] / to_broadcast_tensor(denominators[name], squared[name])
+                for name in expected_names
+            }
 
     per_sample_loss = adapter.reduce_latent_values(values, state=state)
-    if scale is None:
-        return per_sample_loss
-    return per_sample_loss / (scale + eps)
+    if scale is not None:
+        per_sample_loss = per_sample_loss / (scale + eps)
+    if reduced_denominator is not None:
+        per_sample_loss = per_sample_loss / reduced_denominator
+    return per_sample_loss
 
 
 def load_teachers(
