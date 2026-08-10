@@ -526,8 +526,8 @@ def _reduce_latent_values(
     expected_device = first.device
     expected_dtype = first.dtype
     if len(expected_names) == 1 and first.ndim == 1:
-        if active_numel is not None:
-            override = active_numel[expected_names[0]]
+        override = None if active_numel is None else active_numel.get(expected_names[0])
+        if override is not None:
             if not isinstance(override, int) or isinstance(override, bool) or override <= 0:
                 raise ValueError(
                     f"expected active_numel[{expected_names[0]!r}] to be a positive int, "

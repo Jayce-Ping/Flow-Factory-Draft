@@ -482,6 +482,14 @@ def test_reduce_latent_values_preserves_single_component_scalar_scale() -> None:
     assert reduced is values
 
 
+def test_reduce_latent_values_treats_empty_active_numel_as_no_override() -> None:
+    values = torch.tensor([2.0, 3.0])
+
+    reduced = _adapter().reduce_latent_values({"latent": values}, active_numel={})
+
+    assert reduced is values
+
+
 def test_reduce_latent_values_supports_partial_active_numel_override() -> None:
     reduced = _structured_adapter().reduce_latent_values(
         {

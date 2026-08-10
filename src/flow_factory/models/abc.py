@@ -2417,7 +2417,9 @@ class BaseAdapter(ABC):
         """Bridge a one-component state into the existing adapter ``forward`` API.
 
         Trainer-owned training arguments remain caller inputs in ``kwargs``. They
-        must not collide with state-owned forward arguments.
+        must not collide with state-owned forward arguments. Batch-level state-owned
+        keys are discarded in favor of the bridge-owned state, times, return fields,
+        and noise level; explicit kwargs with those names raise an error.
 
         Args:
             batch: Collated sample batch supplying conditioning arguments.
