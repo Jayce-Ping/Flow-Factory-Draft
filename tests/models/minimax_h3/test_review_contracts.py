@@ -159,6 +159,25 @@ def test_trajectory_builder_rejects_zero_stored_states_and_callback_row_mismatch
         )
 
 
+def test_trajectory_builder_rejects_empty_callback_storage() -> None:
+    with pytest.raises(ValueError, match=r"callback.*stored dimension.*greater than zero"):
+        minimax_core.build_structured_trajectories(
+            states={
+                "video": torch.zeros(1, 2, 2, 96),
+                "audio": torch.zeros(1, 2, 3, 32),
+            },
+            state_index_map=torch.tensor([0, 1, -1, -1]),
+            schedule=_schedule(),
+            callbacks={
+                "velocity": {
+                    "video": torch.zeros(1, 0, 2, 96),
+                    "audio": torch.zeros(1, 0, 3, 32),
+                }
+            },
+            callback_index_map=torch.full((3,), -1),
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "bad_value", "message"),
     [

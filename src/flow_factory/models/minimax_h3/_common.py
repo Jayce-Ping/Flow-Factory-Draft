@@ -886,6 +886,11 @@ def _validate_callbacks(
                     f"callback {field!r} component {component!r} row geometry expected "
                     f"{component_rows[component]}, received {values.shape[2]}"
                 )
+            if values.shape[1] == 0:
+                raise ValueError(
+                    f"expected callback {field!r}/{component!r} stored dimension "
+                    f"greater than zero, received {tuple(values.shape)}"
+                )
             stored_length = stored_lengths.setdefault(component, values.shape[1])
             if values.shape[1] != stored_length:
                 raise ValueError(

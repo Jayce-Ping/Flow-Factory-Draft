@@ -477,6 +477,10 @@ class MiniMaxH3SDEScheduler(SchedulerMixin, ConfigMixin, SDESchedulerMixin):
             ("sigma_next", sigma_next_value),
         ):
             coordinate_tensor = torch.as_tensor(coordinate)
+            if not bool(torch.isfinite(coordinate_tensor).all()):
+                raise ValueError(
+                    f"expected finite resolved {field}, received {coordinate_tensor.tolist()}"
+                )
             if coordinate_tensor.ndim == 1 and coordinate_tensor.numel() != latents.shape[0]:
                 raise ValueError(
                     f"{field} cardinality must match latents batch size {latents.shape[0]}, "
@@ -512,12 +516,14 @@ class MiniMaxH3SDEScheduler(SchedulerMixin, ConfigMixin, SDESchedulerMixin):
             noise_broadcast,
             sigma_max,
         )
-        deterministic_transition = False
+        deterministic_samples = None
         if compute_log_prob and selected_dynamics != "ODE":
             transition_scale = (
                 std_dev_t if selected_dynamics == "CPS" else std_dev_t * torch.sqrt(-dt)
             )
-            deterministic_transition = bool((transition_scale == 0).all())
+            deterministic_samples = (
+                (transition_scale == 0).reshape(transition_scale.shape[0], -1).all(dim=1)
+            )
         sampled = replay_latents
         if sampled is None:
             sampled = self._sample_transition(
@@ -531,12 +537,12 @@ class MiniMaxH3SDEScheduler(SchedulerMixin, ConfigMixin, SDESchedulerMixin):
             sampled = sampled.to(storage_dtype).float()
         if not compute_log_prob:
             log_prob = None
-        elif deterministic_transition:
-            log_prob = torch.zeros(sampled.shape[0], dtype=torch.float32, device=sampled.device)
         else:
             log_prob = self._transition_log_prob(
                 selected_dynamics, sampled, next_mean, std_dev_t, dt
             )
+            if deterministic_samples is not None:
+                log_prob = torch.where(deterministic_samples, torch.zeros_like(log_prob), log_prob)
         if selected_dynamics == "ODE":
             sampled = sampled.to(storage_dtype)
             next_mean = next_mean.to(storage_dtype)
@@ -660,9 +666,17 @@ class MiniMaxH3SDEScheduler(SchedulerMixin, ConfigMixin, SDESchedulerMixin):
                 f"sigma_next={sigma_next!r}"
             )
         if sigma is not None:
+            for field, value in (("sigma", sigma), ("sigma_next", sigma_next)):
+                value_tensor = torch.as_tensor(value)
+                if not bool(torch.isfinite(value_tensor).all()):
+                    raise ValueError(f"expected finite {field}, received {value_tensor.tolist()}")
             current = torch.as_tensor(sigma, dtype=torch.float32)
             following = torch.as_tensor(sigma_next, dtype=torch.float32)
         elif timestep_next is not None:
+            for field, value in (("timestep", timestep), ("timestep_next", timestep_next)):
+                value_tensor = torch.as_tensor(value)
+                if not bool(torch.isfinite(value_tensor).all()):
+                    raise ValueError(f"expected finite {field}, received {value_tensor.tolist()}")
             current = torch.as_tensor(timestep, dtype=torch.float32) / 1000
             following = torch.as_tensor(timestep_next, dtype=torch.float32) / 1000
         else:

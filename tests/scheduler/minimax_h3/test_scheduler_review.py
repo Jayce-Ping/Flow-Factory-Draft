@@ -193,6 +193,39 @@ def test_eval_sde_step_returns_zero_log_prob_sentinel() -> None:
     assert torch.equal(output.log_prob, torch.zeros(2))
 
 
+def test_mixed_batched_deterministic_and_stochastic_log_probs_are_finite() -> None:
+    scheduler = MiniMaxH3SDEScheduler(dynamics_type="Flow-SDE")
+    scheduler.set_timesteps(3)
+    output = scheduler.step(
+        torch.ones(2, 1),
+        scheduler.timesteps[torch.tensor([0, 2])],
+        torch.zeros(2, 1),
+        generator=torch.Generator().manual_seed(7),
+    )
+    assert output.log_prob[1].item() == 0.0
+    assert torch.isfinite(output.log_prob).all()
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "field"),
+    [
+        ({"sigma": float("nan"), "sigma_next": 0.5}, "sigma"),
+        ({"sigma": 1.0, "sigma_next": float("inf")}, "sigma_next"),
+        ({"timestep_next": float("-inf")}, "timestep_next"),
+    ],
+)
+def test_explicit_coordinates_reject_nonfinite_values(kwargs: dict[str, float], field: str) -> None:
+    scheduler = MiniMaxH3SDEScheduler(dynamics_type="ODE")
+    scheduler.set_timesteps(3)
+    with pytest.raises(ValueError, match=rf"(finite.*{field}|{field}.*finite).*(nan|inf)"):
+        scheduler.step(
+            torch.ones(1, 1),
+            scheduler.timesteps[0],
+            torch.zeros(1, 1),
+            **kwargs,
+        )
+
+
 @pytest.mark.parametrize("dynamics_type", ["Flow-SDE", "Dance-SDE", "CPS"])
 def test_sde_formula_oracle_is_independent_and_complete(dynamics_type: str) -> None:
     noise_level = 0.35
