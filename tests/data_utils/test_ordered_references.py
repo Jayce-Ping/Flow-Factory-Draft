@@ -24,6 +24,7 @@ import torch
 from PIL import Image
 
 from flow_factory.data_utils.dataset import GeneralDataset, _load_ordered_reference
+from flow_factory.models.minimax_h3.adapters import MiniMaxH3Ref2VAAdapter
 
 REFERENCES = [
     {"kind": "image", "path": "subject.png"},
@@ -75,7 +76,7 @@ class GenericPreprocessor:
 
 
 def _write_jsonl(dataset_dir: Path, references: List[Dict[str, Any]]) -> None:
-    dataset_dir.mkdir(parents=True)
+    dataset_dir.mkdir(parents=True, exist_ok=True)
     (dataset_dir / "train.jsonl").write_text(
         json.dumps({"prompt": "animate", "references": references}) + "\n",
         encoding="utf-8",
@@ -502,6 +503,106 @@ def test_manifest_rates_and_order_change_source_fingerprint(
     )
 
     assert first._ordered_reference_source_hash != second._ordered_reference_source_hash
+
+
+def test_ref2va_adapter_enables_ordered_reference_preprocessing() -> None:
+    assert MiniMaxH3Ref2VAAdapter.supports_ordered_references is True
+
+
+def test_source_content_changes_the_merged_cache_path_in_place(tmp_path: Path) -> None:
+    dataset_dir = tmp_path / "dataset"
+    _write_jsonl(dataset_dir, REFERENCES)
+    preprocessor = OrderedPreprocessor()
+
+    def cache_path() -> str:
+        return GeneralDataset.compute_cache_path(
+            dataset_dir=str(dataset_dir),
+            split="train",
+            cache_dir=str(tmp_path / "cache"),
+            max_dataset_size=None,
+            preprocess_func=preprocessor.preprocess,
+            preprocess_kwargs={"workflow": "ref2va", "width": 768},
+        )
+
+    before = cache_path()
+    _write_jsonl(dataset_dir, list(reversed(REFERENCES)))
+    after = cache_path()
+
+    assert before != after
+
+
+def test_dataset_root_participates_in_merged_cache_identity(tmp_path: Path) -> None:
+    first_dir = tmp_path / "first" / "dataset"
+    second_dir = tmp_path / "second" / "dataset"
+    _write_jsonl(first_dir, REFERENCES)
+    _write_jsonl(second_dir, REFERENCES)
+    preprocessor = OrderedPreprocessor()
+
+    def cache_path(dataset_dir: Path) -> str:
+        return GeneralDataset.compute_cache_path(
+            dataset_dir=str(dataset_dir),
+            split="train",
+            cache_dir=str(tmp_path / "cache"),
+            max_dataset_size=None,
+            preprocess_func=preprocessor.preprocess,
+            preprocess_kwargs={"workflow": "ref2va", "width": 768},
+        )
+
+    assert cache_path(first_dir) != cache_path(second_dir)
+
+
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    [
+        ("height", 768),
+        ("width", 1024),
+        ("num_frames", 73),
+    ],
+)
+def test_h3_kwargs_wrapper_declares_cache_relevant_geometry(
+    tmp_path: Path,
+    field: str,
+    changed: int,
+) -> None:
+    dataset_dir = tmp_path / "dataset"
+    _write_jsonl(dataset_dir, REFERENCES)
+    adapter = object.__new__(MiniMaxH3Ref2VAAdapter)
+    kwargs = {"height": 512, "width": 768, "num_frames": 49}
+
+    def cache_path(preprocess_kwargs: Dict[str, Any]) -> str:
+        return GeneralDataset.compute_cache_path(
+            dataset_dir=str(dataset_dir),
+            split="train",
+            cache_dir=str(tmp_path / "cache"),
+            max_dataset_size=None,
+            preprocess_func=adapter.preprocess_func,
+            preprocess_kwargs=preprocess_kwargs,
+        )
+
+    assert cache_path(kwargs) != cache_path({**kwargs, field: changed})
+
+
+def test_adapter_preprocess_cache_version_changes_the_cache_path(tmp_path: Path) -> None:
+    dataset_dir = tmp_path / "dataset"
+    _write_jsonl(dataset_dir, REFERENCES)
+    adapter = object.__new__(MiniMaxH3Ref2VAAdapter)
+
+    def cache_path() -> str:
+        return GeneralDataset.compute_cache_path(
+            dataset_dir=str(dataset_dir),
+            split="train",
+            cache_dir=str(tmp_path / "cache"),
+            max_dataset_size=None,
+            preprocess_func=adapter.preprocess_func,
+            preprocess_kwargs={"height": 512, "width": 768, "num_frames": 49},
+        )
+
+    adapter.preprocess_cache_version = "first"
+    before = cache_path()
+    adapter.preprocess_cache_version = "second"
+    after = cache_path()
+
+    assert before != after
 
 
 def test_generic_media_preprocessing_does_not_enable_ordered_references(tmp_path: Path) -> None:

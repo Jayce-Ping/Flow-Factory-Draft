@@ -50,7 +50,8 @@ data:
 
 Relative paths in the ordinary `image`/`images`, `video`/`videos`, and `audio`/`audios` columns are
 resolved against their corresponding media directory. MiniMax H3 Ref2VA is different:
-`references[*].path` and `references[*].audio_path` are always resolved against `dataset_dir`.
+relative `references[*].path` and `references[*].audio_path` values are resolved against
+`dataset_dir`; absolute paths are accepted unchanged.
 
 ## Common task formats
 
@@ -222,8 +223,12 @@ references array
 ```
 
 Reference media is not stored in the Arrow cache. The decoded PIL/PyAV values and upstream
-reference objects exist only during preprocessing. `reference_manifest` is the canonical JSON
-string used for cache invalidation, reproducibility, and sample identity.
+reference objects exist only during preprocessing. Cache identity includes the configured dataset
+root, TXT/JSONL source bytes, semantic preprocessing fields, adapter preprocessing version, and
+model identity.
+`reference_manifest` is the canonical JSON string retained for reproducibility and sample
+identity. Replacing a media file in place without changing its path or manifest does not change
+the source hash; set `force_reprocess: true` after such a replacement.
 
 ## How Ref2VA references affect training
 

@@ -25,8 +25,8 @@ row-timestep construction, reference constructors, and modular APIs. A no-weight
 - Rollout is structured-only with separate video and audio states.
 - Authoritative scheduler/component order is `("video", "audio")`.
 - Video uses shift 12; audio uses shift 3.
-- Model output is data-ward velocity; conversion occurs only at the scheduler standard-flow
-  boundary.
+- Model output is data-ward velocity. Adapters declare `flow_velocity_direction="data"` so both
+  scheduler conversion and trainer `x0` projection use the correct sign.
 - `num_inference_steps=N` means N transitions and N + 1 state coordinates.
 
 ## Input contracts
@@ -34,6 +34,8 @@ row-timestep construction, reference constructors, and modular APIs. A no-weight
 - T2VA accepts prompt-only workflow input.
 - FL2VA accepts one first image or two images ordered first then last.
 - Ref2VA preserves and hashes ordered image/video/audio manifests.
+- Ref2VA declares `supports_ordered_references=True`; all H3 adapters explicitly declare hidden
+  geometry cache fields and a preprocessing cache version.
 - Reference paths are dataset-relative. Positive finite `fps` and `sample_rate` overrides follow
   `samples/references.py`.
 - PyAV >=18.0.0 decodes video/audio references, including embedded or separate soundtracks.

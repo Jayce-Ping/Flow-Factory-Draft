@@ -207,9 +207,6 @@ class GeneralDataset(Dataset):
             self._ordered_reference_source_hash = hashlib.sha256(
                 "\n".join(canonical_manifests).encode("utf-8")
             ).hexdigest()
-            extra_hash_strs = list(extra_hash_strs or []) + [
-                f"ordered-references:{self._ordered_reference_source_hash}"
-            ]
 
         if max_dataset_size is not None and len(raw_dataset) > max_dataset_size:
             raw_dataset = raw_dataset.select(range(max_dataset_size))
@@ -647,25 +644,35 @@ class GeneralDataset(Dataset):
             Cache path with fingerprint of specified length
         """
         dataset_name = os.path.basename(dataset_dir)
+        dataset_root = os.path.normpath(dataset_dir)
         cutoff_str = str(max_dataset_size) if max_dataset_size else "full"
+        source_hash = _compute_dataset_source_hash(dataset_dir, split)
         funcs_hash = _compute_encode_funcs_hash(preprocess_func, digits=16)
         hashable_kwargs = _select_cache_relevant_kwargs(preprocess_func, preprocess_kwargs)
         kwargs_hash = hashlib.md5(
             str(sorted(hashable_kwargs.items())).encode()
         ).hexdigest()[:16]
         extra_hash = "|".join(extra_hash_strs) if extra_hash_strs else ""
+        owner = getattr(preprocess_func, "__self__", None)
+        cache_version = getattr(owner, "preprocess_cache_version", "") if owner is not None else ""
+        if not isinstance(cache_version, str):
+            raise TypeError(
+                "expected preprocess_cache_version to be a string for "
+                f"{type(owner).__name__}, received {type(cache_version).__name__}: "
+                f"{cache_version!r}"
+            )
 
         combined = (
-            f"{dataset_name}|{split}|{cutoff_str}|{funcs_hash}|{kwargs_hash}"
-            f"|{extra_hash}|fmtv{_PREPROCESS_FORMAT_VERSION}"
+            f"{dataset_name}|{dataset_root}|{split}|{source_hash}|{cutoff_str}|{funcs_hash}"
+            f"|{kwargs_hash}|{extra_hash}|adapterv{cache_version}|fmtv{_PREPROCESS_FORMAT_VERSION}"
         )
         fingerprint = hashlib.md5(combined.encode()).hexdigest()[:min(digits, 32)]
 
         logger.debug(
-            "compute_cache_path: dataset=%s split=%s cutoff=%s funcs=%s kwargs=%s "
-            "extra=%s hashable_keys=%s -> %s",
-            dataset_name, split, cutoff_str, funcs_hash, kwargs_hash, extra_hash,
-            sorted(hashable_kwargs), fingerprint,
+            "compute_cache_path: dataset=%s root=%s split=%s source=%s cutoff=%s "
+            "funcs=%s kwargs=%s extra=%s adapter_version=%s hashable_keys=%s -> %s",
+            dataset_name, dataset_root, split, source_hash[:16], cutoff_str, funcs_hash,
+            kwargs_hash, extra_hash, cache_version, sorted(hashable_kwargs), fingerprint,
         )
         return os.path.join(os.path.expanduser(cache_dir), fingerprint)
 
@@ -1231,6 +1238,23 @@ def _compute_function_hash(func: Optional[Callable], digits: int = 16) -> str:
 _ENCODER_METHOD_NAMES = ("encode_prompt", "encode_image", "encode_video", "encode_audio")
 
 
+def _compute_dataset_source_hash(dataset_dir: str, split: str) -> str:
+    """Hash the selected JSONL/TXT source so in-place edits invalidate merged caches."""
+    data_root = os.path.expanduser(dataset_dir)
+    candidates = (
+        os.path.join(data_root, f"{split}.jsonl"),
+        os.path.join(data_root, f"{split}.txt"),
+    )
+    source_path = next((path for path in candidates if os.path.isfile(path)), None)
+    if source_path is None:
+        return "missing"
+    digest = hashlib.sha256()
+    with open(source_path, "rb") as source_file:
+        for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _collect_named_params(func: Optional[Callable]) -> set[str]:
     """Named (non-VAR_KEYWORD / VAR_POSITIONAL) parameter names, minus ``self``."""
     if func is None:
@@ -1292,6 +1316,15 @@ def _select_cache_relevant_kwargs(
             encoder = getattr(adapter, name, None)
             if callable(encoder):
                 relevant_keys |= _collect_named_params(encoder)
+        declared_fields = getattr(adapter, "preprocess_cache_fields", frozenset())
+        if not isinstance(declared_fields, (set, frozenset, tuple, list)) or not all(
+            isinstance(name, str) for name in declared_fields
+        ):
+            raise TypeError(
+                "expected preprocess_cache_fields to be a collection of strings for "
+                f"{type(adapter).__name__}, received {declared_fields!r}"
+            )
+        relevant_keys |= set(declared_fields)
 
     if not relevant_keys:
         return dict(kwargs)

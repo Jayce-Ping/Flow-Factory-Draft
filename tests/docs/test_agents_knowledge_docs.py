@@ -157,7 +157,7 @@ def test_adapter_gotchas_are_append_only() -> None:
     text = _text(KNOWLEDGE / "topics/adapter_conventions.md")
     gotchas = text.split("## Numbered Gotchas (append-only)", 1)[1].split("## Cross-refs", 1)[0]
     numbers = [int(value) for value in re.findall(r"(?m)^(\d+)\. ", gotchas)]
-    assert numbers == list(range(1, 14))
+    assert numbers == list(range(1, 16))
     assert "12. **LTX2 rollouts publish structured trajectories only**" in gotchas
     assert "13. **Runtime and trajectory ownership stay explicit**" in gotchas
 

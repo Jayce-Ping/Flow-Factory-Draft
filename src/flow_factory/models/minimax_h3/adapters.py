@@ -14,7 +14,7 @@
 
 """Define the three public MiniMax H3 workflow adapters."""
 
-from typing import Any, ClassVar, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import torch
 
@@ -44,6 +44,9 @@ from .workflow import (
     preprocess_h3_workflow,
 )
 
+_H3_PREPROCESS_CACHE_FIELDS = frozenset({"height", "width", "num_frames"})
+_H3_PREPROCESS_CACHE_VERSION = "minimax-h3-v1"
+
 
 class MiniMaxH3T2VAAdapter(BaseAdapter):
     """Load the workflow-pruned MiniMax H3 text-to-video-audio partition."""
@@ -51,6 +54,9 @@ class MiniMaxH3T2VAAdapter(BaseAdapter):
     workflow: ClassVar[str] = "t2va"
     transformer_component_name: ClassVar[str] = "transformer"
     trajectory_component_order: ClassVar[Tuple[str, ...]] = ("video", "audio")
+    flow_velocity_direction: ClassVar[Literal["data"]] = "data"
+    preprocess_cache_fields: ClassVar[frozenset[str]] = _H3_PREPROCESS_CACHE_FIELDS
+    preprocess_cache_version: ClassVar[str] = _H3_PREPROCESS_CACHE_VERSION
     preprocessing_modules: ClassVar[List[str]] = ["text_encoder", "tokenizer", "processor"]
     inference_modules: ClassVar[List[str]] = [
         "transformer",
@@ -152,6 +158,9 @@ class MiniMaxH3FL2VAAdapter(BaseAdapter):
     workflow: ClassVar[str] = "fl2va"
     transformer_component_name: ClassVar[str] = "transformer"
     trajectory_component_order: ClassVar[Tuple[str, ...]] = ("video", "audio")
+    flow_velocity_direction: ClassVar[Literal["data"]] = "data"
+    preprocess_cache_fields: ClassVar[frozenset[str]] = _H3_PREPROCESS_CACHE_FIELDS
+    preprocess_cache_version: ClassVar[str] = _H3_PREPROCESS_CACHE_VERSION
     preprocessing_modules: ClassVar[List[str]] = [
         "image_processor",
         "text_encoder",
@@ -259,6 +268,10 @@ class MiniMaxH3Ref2VAAdapter(BaseAdapter):
     workflow: ClassVar[str] = "ref2va"
     transformer_component_name: ClassVar[str] = "transformer_ref"
     trajectory_component_order: ClassVar[Tuple[str, ...]] = ("video", "audio")
+    flow_velocity_direction: ClassVar[Literal["data"]] = "data"
+    supports_ordered_references: ClassVar[bool] = True
+    preprocess_cache_fields: ClassVar[frozenset[str]] = _H3_PREPROCESS_CACHE_FIELDS
+    preprocess_cache_version: ClassVar[str] = _H3_PREPROCESS_CACHE_VERSION
     preprocessing_modules: ClassVar[List[str]] = [
         "image_processor",
         "text_encoder",

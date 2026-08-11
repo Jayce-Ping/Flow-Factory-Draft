@@ -54,6 +54,38 @@ Based on the fix type, write the fix entry to the appropriate document:
 - **Lesson**: When extending a base contract for a partial-coverage feature (where only some subclasses will participate), no-op default + opt-in override beats forcing every subclass to acknowledge it. Reserve `@abstractmethod` for invariants that ALL subclasses must implement (e.g. `load_pipeline`, `decode_latents`, `forward`, `inference`).
 - **Related Constraint**: #12 (post-update text codifies "Optional encoder overrides (no-op default)").
 
+### Preference-arm conditioning ownership
+- **Date**: 2026-08-11
+- **Symptom**: DPO evaluated the rejected H3 state with the chosen sample's prompt/reference conditioning.
+- **Root Cause**: Shared-noise logic was incorrectly extended to the conditioning batch, even though only the forward-process noise is shared between arms.
+- **Fix**: Rejected policy/reference forwards now receive `rejected_batch`, with a production-path regression using distinct prompt embeddings.
+- **Lesson**: Preference arms may share stochastic coordinates but never model conditioning; replay state and conditioning must come from the same sample.
+- **Related Constraint**: #7
+
+### Dynamics and velocity conventions belong to adapters/schedulers
+- **Date**: 2026-08-11
+- **Symptom**: GRPO-Guard applied Flow-SDE `sqrt(-dt)` scaling to CPS, while NFT and OPD reconstructed H3 `x0` with the standard flow sign.
+- **Root Cause**: Trainer-local formulas assumed one dynamics type and one velocity direction.
+- **Fix**: Coupled trainers share a dynamics-aware transition-scale helper that rejects zero/non-finite variance, and `x0` projection routes through `adapter.project_velocity_to_clean_state()` using model-compute dtype.
+- **Lesson**: Trainers should consume declared process semantics rather than infer them from historical single-model formulas.
+- **Related Constraint**: #7
+
+### Lazy components must re-enter lifecycle policy
+- **Date**: 2026-08-11
+- **Symptom**: Modular preprocessing modules materialized after adapter initialization missed explicit frozen dtype casting and the FSDP synchronization point.
+- **Root Cause**: `_mix_precision()` and frozen synchronization enumerated only modules materialized at construction time.
+- **Fix**: `on_load_components()` applies precision policy to newly materialized modules; preprocessing and inference synchronize explicit module parameters/buffers before use while skipping tokenizers/processors.
+- **Lesson**: Laziness changes timing, not ownership or lifecycle obligations.
+- **Related Constraint**: #19, #20
+
+### Preprocessing cache identity must be explicit
+- **Date**: 2026-08-11
+- **Symptom**: Ref2VA could skip ordered-reference decoding or reuse a merged cache after source/geometry/helper changes.
+- **Root Cause**: The real adapter lacked its capability flag, merged cache paths omitted source bytes, and reflective signature filtering could not see semantic fields hidden by `**kwargs`.
+- **Fix**: Ref2VA opts into ordered references; cache paths hash dataset root, source bytes, and adapter versions; adapters declare hidden semantic fields via `preprocess_cache_fields`.
+- **Lesson**: Reflection is only a default. Dynamic preprocessors need an explicit cache contract.
+- **Related Constraint**: N/A
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

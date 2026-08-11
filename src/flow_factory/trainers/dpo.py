@@ -589,7 +589,7 @@ class DPOTrainer(BaseTrainer):
                                 source='policy chosen',
                             )
                             theta_l_pred = forward_velocity_state(
-                                self, chosen_batch, rejected_noised.state, times,
+                                self, rejected_batch, rejected_noised.state, times,
                                 source='policy rejected',
                             )
 
@@ -600,7 +600,7 @@ class DPOTrainer(BaseTrainer):
                                 source='reference chosen',
                             )
                             ref_l_pred = forward_velocity_state(
-                                self, chosen_batch, rejected_noised.state, times,
+                                self, rejected_batch, rejected_noised.state, times,
                                 source='reference rejected',
                             )
 

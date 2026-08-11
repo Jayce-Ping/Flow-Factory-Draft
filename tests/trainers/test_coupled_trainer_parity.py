@@ -533,11 +533,30 @@ def test_guard_ratio_weights_two_components_by_active_degrees_of_freedom() -> No
         ("video", new_video, old_video),
         ("audio", new_audio, old_audio),
     ):
-        scale = torch.sqrt(-dt[name].reshape(2)) * std[name].reshape(2)
+        scale = std[name].reshape(2)
+        if name == "video":
+            scale = torch.sqrt(-dt[name].reshape(2)) * scale
         mse = (new_value - old_value).flatten(1).pow(2).mean(dim=1)
         terms[name] = (new_log_probs[name] - old_log_probs[name]) * scale + mse / (2 * scale)
     expected = torch.exp((terms["video"] * 12 + terms["audio"] * 5) / 17)
     assert torch.equal(ratio, expected)
+
+
+def test_guard_ratio_rejects_a_zero_stochastic_transition_scale() -> None:
+    trainer = _trainer(GRPOGuardTrainer, _adapter(dynamics_type="CPS"))
+    replay = _replay({"latent": torch.zeros(1, 4)}, log_prob=torch.zeros(1))
+    output = _guard_output(
+        {"latent": torch.zeros(1, 4)},
+        {"latent": torch.zeros(1)},
+        {"latent": torch.zeros(1, 1)},
+        {"latent": torch.full((1, 1), -0.5)},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"GRPO-Guard ratio.*component 'latent'.*strictly positive.*CPS",
+    ):
+        trainer._guard_ratio(output, replay, LatentState({"latent": torch.zeros(1, 4)}))
 
 
 def test_guard_statistic_normalization_rejects_multiple_non_batch_values() -> None:

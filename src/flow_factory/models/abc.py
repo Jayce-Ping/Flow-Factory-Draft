@@ -101,6 +101,7 @@ from .trajectory_bridge import (
     _get_state_active_numel,
     _get_terminal_state,
     _get_train_step_indices,
+    _project_velocity_to_clean_state,
     _resolve_component_latent_axes,
     _validate_reduced_component_values,
     _validate_reduced_latent_values,
@@ -175,7 +176,11 @@ class BaseAdapter(ABC):
     # Opt in only when every transformer forward branch runs inside a diffusers
     # ``cache_context``. The rollout cache accelerator rejects the default.
     supports_diffusers_cache: ClassVar[bool] = False
+    supports_ordered_references: ClassVar[bool] = False
+    preprocess_cache_fields: ClassVar[frozenset[str]] = frozenset()
+    preprocess_cache_version: ClassVar[str] = ""
     trajectory_component_order: ClassVar[Tuple[str, ...]] = ("latent",)
+    flow_velocity_direction: ClassVar[Literal["noise", "data"]] = "noise"
 
     # Resolution-invariant latent axis roles for the model-agnostic latent state
     # API (see `latent_geometry.py`). ``None`` means "infer from latent ndim" via
@@ -981,6 +986,22 @@ class BaseAdapter(ABC):
             if buf.is_floating_point() and frozen_dtype is not None:
                 buf.data = buf.data.to(dtype=frozen_dtype)
         return n_trainable
+
+    def _apply_component_precision_policy(
+        self,
+        name: str,
+        component: torch.nn.Module,
+    ) -> None:
+        """Apply the configured original-dtype policy to one materialized module."""
+        train_dtype = self.model_args.trainable_parameters_dtype
+        frozen_dtype = self.model_args.frozen_parameters_dtype
+        if name in self.model_args.target_components:
+            if self._is_fsdp2() and self.accelerator.mixed_precision != "no":
+                component.to(dtype=torch.float32)
+            else:
+                self._cast_module_mixed_precision(component, train_dtype, frozen_dtype)
+        elif frozen_dtype is not None:
+            component.to(dtype=frozen_dtype)
 
     def _mix_precision(self):
         """Set trainable params to ``trainable_parameters_dtype``; by default leave frozen params
@@ -2130,6 +2151,15 @@ class BaseAdapter(ABC):
                         None loads all components.
             device: Target device. Defaults to accelerator device.
         """
+        names = self._resolve_component_names(components)
+        materialized_before = set(self.component_runtime.materialized_component_names)
+        self.component_runtime.materialize_components(components)
+        materialized_after = set(self.component_runtime.materialized_component_names)
+        for name in names:
+            if name in materialized_after and name not in materialized_before:
+                component = self.component_runtime.get_canonical_component(name)
+                if isinstance(component, torch.nn.Module):
+                    self._apply_component_precision_policy(name, component)
         self.component_runtime.load_stage_components(components, device=device or self.device)
 
     def off_load_components(self, components: Optional[Union[str, List[str]]] = None):
@@ -2518,6 +2548,21 @@ class BaseAdapter(ABC):
             Noised state, target velocity, and the supplied noise state.
         """
         return _apply_forward_process_noise(self, clean_state, times, noise)
+
+    def project_velocity_to_clean_state(
+        self,
+        state: LatentState,
+        times: ComponentTimes,
+        velocity: LatentState,
+    ) -> LatentState:
+        """Project a noised state to ``x0`` under this adapter's flow convention.
+
+        ``flow_velocity_direction="noise"`` is the standard
+        ``velocity = noise - clean`` convention and uses ``x0 = xt - sigma * velocity``.
+        ``"data"`` is the MiniMax H3 convention ``velocity = clean - noise`` and uses
+        ``x0 = xt + sigma * velocity``.
+        """
+        return _project_velocity_to_clean_state(self, state, times, velocity)
 
     def forward_state(
         self,

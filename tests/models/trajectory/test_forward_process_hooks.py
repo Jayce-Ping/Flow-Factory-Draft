@@ -67,6 +67,12 @@ class StructuredAdapterFake(AdapterFake):
     trajectory_component_order = ("video", "audio")
 
 
+class DataWardAdapterFake(StructuredAdapterFake):
+    """Structured adapter whose velocity points from noise toward clean data."""
+
+    flow_velocity_direction = "data"
+
+
 class OrderedDrawAdapterFake(StructuredAdapterFake):
     """Heterogeneous adapter overriding only the ordered noise draw."""
 
@@ -203,6 +209,114 @@ def test_default_noising_matches_the_legacy_interpolation_bit_for_bit() -> None:
     assert torch.equal(noised.noise.components["latent"], legacy_noise)
     assert torch.equal(noised.state.components["latent"], legacy_state)
     assert torch.equal(noised.target_velocity.components["latent"], legacy_noise - clean)
+
+
+def test_velocity_projection_recovers_clean_state_for_both_flow_directions() -> None:
+    clean = LatentState(
+        {
+            "video": torch.tensor([[1.0, 2.0]]),
+            "audio": torch.tensor([[3.0, 4.0, 5.0]]),
+        }
+    )
+    noise = LatentState(
+        {
+            "video": torch.tensor([[5.0, 6.0]]),
+            "audio": torch.tensor([[9.0, 10.0, 11.0]]),
+        }
+    )
+    times = ComponentTimes(
+        timestep={"video": torch.tensor([750.0]), "audio": torch.tensor([250.0])},
+        next_timestep={"video": torch.zeros(1), "audio": torch.zeros(1)},
+        sigma={"video": torch.tensor([0.75]), "audio": torch.tensor([0.25])},
+        next_sigma={"video": torch.zeros(1), "audio": torch.zeros(1)},
+    )
+    noised = {
+        name: (1 - to_broadcast_tensor(times.sigma[name], value)) * value
+        + to_broadcast_tensor(times.sigma[name], value) * noise.components[name]
+        for name, value in clean.components.items()
+    }
+
+    noise_ward = _structured_adapter()
+    noise_ward_velocity = LatentState(
+        {name: noise.components[name] - clean.components[name] for name in clean.component_names}
+    )
+    data_ward = _structured_adapter(DataWardAdapterFake)
+    data_ward_velocity = LatentState(
+        {name: clean.components[name] - noise.components[name] for name in clean.component_names}
+    )
+
+    standard_prediction = noise_ward.project_velocity_to_clean_state(
+        LatentState(noised), times, noise_ward_velocity
+    )
+    data_ward_prediction = data_ward.project_velocity_to_clean_state(
+        LatentState(noised), times, data_ward_velocity
+    )
+
+    for name in clean.component_names:
+        assert torch.equal(standard_prediction.components[name], clean.components[name])
+        assert torch.equal(data_ward_prediction.components[name], clean.components[name])
+
+
+@pytest.mark.parametrize(
+    ("state_dtype", "velocity_dtype", "expected_dtype"),
+    [
+        (torch.float16, torch.float32, torch.float32),
+        (torch.float32, torch.bfloat16, torch.float32),
+        (torch.float16, torch.bfloat16, torch.float32),
+    ],
+)
+def test_velocity_projection_promotes_mixed_storage_and_compute_dtypes(
+    state_dtype: torch.dtype,
+    velocity_dtype: torch.dtype,
+    expected_dtype: torch.dtype,
+) -> None:
+    adapter = _structured_adapter()
+    state = LatentState(
+        {
+            "video": torch.tensor([[0.5, 1.0]], dtype=state_dtype),
+            "audio": torch.tensor([[1.5, 2.0]], dtype=state_dtype),
+        }
+    )
+    velocity = LatentState(
+        {
+            "video": torch.tensor([[0.25, 0.5]], dtype=velocity_dtype),
+            "audio": torch.tensor([[0.75, 1.0]], dtype=velocity_dtype),
+        }
+    )
+    times = ComponentTimes(
+        timestep={"video": torch.tensor([500.0]), "audio": torch.tensor([250.0])},
+        next_timestep={"video": torch.zeros(1), "audio": torch.zeros(1)},
+        sigma={"video": torch.tensor([0.5]), "audio": torch.tensor([0.25])},
+        next_sigma={"video": torch.zeros(1), "audio": torch.zeros(1)},
+    )
+
+    projected = adapter.project_velocity_to_clean_state(state, times, velocity)
+
+    for name in state.component_names:
+        promoted_state = state.components[name].to(expected_dtype)
+        promoted_velocity = velocity.components[name].to(expected_dtype)
+        expected = (
+            promoted_state
+            - to_broadcast_tensor(times.sigma[name], promoted_state) * promoted_velocity
+        )
+        assert projected.components[name].dtype == expected_dtype
+        assert torch.equal(projected.components[name], expected)
+
+
+def test_velocity_projection_rejects_an_unknown_direction() -> None:
+    adapter = _structured_adapter(DataWardAdapterFake)
+    adapter.flow_velocity_direction = "sideways"
+    state = LatentState({"video": torch.zeros(1, 2), "audio": torch.zeros(1, 3)})
+    velocity = LatentState({"video": torch.zeros(1, 2), "audio": torch.zeros(1, 3)})
+    times = ComponentTimes(
+        timestep={"video": torch.zeros(1), "audio": torch.zeros(1)},
+        next_timestep={"video": torch.zeros(1), "audio": torch.zeros(1)},
+        sigma={"video": torch.zeros(1), "audio": torch.zeros(1)},
+        next_sigma={"video": torch.zeros(1), "audio": torch.zeros(1)},
+    )
+
+    with pytest.raises(ValueError, match=r"flow_velocity_direction.*'noise'.*'data'.*'sideways'"):
+        adapter.project_velocity_to_clean_state(state, times, velocity)
 
 
 def test_default_noising_consumes_exactly_one_random_draw() -> None:

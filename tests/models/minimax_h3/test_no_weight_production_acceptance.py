@@ -452,6 +452,7 @@ def test_no_weight_dpo_optimize_reuses_h3_component_noise(
         adapter=adapter,
     )
     rejected = copy.deepcopy(chosen)
+    rejected.prompt_embeds = rejected.prompt_embeds + 10.0
     chosen.extra_kwargs["advantage"] = torch.tensor(1.0)
     rejected.extra_kwargs["advantage"] = torch.tensor(-1.0)
     _assert_production_h3_sample(adapter, chosen)
@@ -470,12 +471,26 @@ def test_no_weight_dpo_optimize_reuses_h3_component_noise(
         ref_param_device="cpu",
     )
     adapter._init_ref_parameters()
+    observed_prompt_markers = []
+    original_forward_state = adapter.forward_state
+
+    def recording_forward_state(**kwargs: Any) -> Any:
+        observed_prompt_markers.append(float(kwargs["batch"].prompt_embeds.flatten()[0]))
+        return original_forward_state(**kwargs)
+
+    adapter.forward_state = recording_forward_state
 
     result = trainer.optimize([chosen, rejected])
 
     assert result is None
     assert accelerator.backward_calls == 1
     assert accelerator.observed_grad
+    assert observed_prompt_markers == [
+        float(chosen.prompt_embeds.flatten()[0]),
+        float(rejected.prompt_embeds.flatten()[0]),
+        float(chosen.prompt_embeds.flatten()[0]),
+        float(rejected.prompt_embeds.flatten()[0]),
+    ]
 
 
 def test_no_weight_dgpo_optimize_uses_h3_group_noising_and_forward(
