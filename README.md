@@ -9,20 +9,15 @@
 
 # 🔥 News
 
-* **[2026-04-25]** **LTX-2 Audio-Video** support! Generate synchronized audio-video content with RL fine-tuning. The required unreleased APIs are supplied by the exact `diffusers` revision installed from project metadata:
-```bash
-pip install -e .
-```
-
-* **[2026-02-01]** Support for multiple **Attention Backends**! Attention-backend selection now lives in the unified `acceleration:` block (the old `model.attn_backend` knob was removed), where it can be combined with `torch.compile` and feature caching — applied in list order:
-```yaml
-  acceleration:
-    shared:
-      - name: attention_backend
-        params: { backend: "flash" } # Options: "native", "xformers", "flash_hub", "_flash_3_hub", "_flash_3_varlen_hub"
-```
-This experimental feature leverages `diffusers`'s `transformer.set_attention_backend`. Check the [official diffusers documentation](https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends#available-backends) for all available options. See [`guidance/acceleration.md`](guidance/acceleration.md) for the full acceleration layer.
-> We recommend installing the `kernels` package (`pip install kernels`) and using `flash_hub`, `flash_varlen_hub`, `_flash_3_hub`, or `_flash_3_varlen_hub` to avoid the complexity and potential incompatibility of installing Flash-Attention directly.
+* **[2026-08-11]** **MiniMax H3 Audio-Video** support is now available for
+  [`minimax-h3-t2va`](examples/grpo/lora/minimax_h3_t2va/default.yaml),
+  [`minimax-h3-fl2va`](examples/grpo/lora/minimax_h3_fl2va/default.yaml), and
+  [`minimax-h3-ref2va`](examples/grpo/lora/minimax_h3_ref2va/default.yaml). The integration adds
+  modular workflow loading, separate video/audio trajectories and schedulers, and ordered
+  heterogeneous reference conditioning. See the [Dataset Guide](guidance/datasets.md) for all
+  three input schemas. These examples are schema/API validated against the pinned `diffusers`
+  revision; real-checkpoint GPU generation, memory fit, training quality, and numerical parity
+  remain to be established.
 
 # 📕 Table of Contents
 
@@ -34,9 +29,6 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
   - [Quick Start Example](#quick-start-example)
 - [Guidance](#-guidance)
 - [Dataset](#-dataset)
-  - [Text-to-Image & Text-to-Video](#text-to-image--text-to-video)
-  - [Image-to-Image & Image-to-Video](#image-to-image--image-to-video)
-  - [Video-to-Video](#video-to-video)
 - [Reward Model](#-reward-model)
 - [Acknowledgements](#-acknowledgements)
 
@@ -179,85 +171,26 @@ We provide a set of guidance documents to help you understand the framework and 
 | [Workflow](guidance/workflow.md) | End-to-end training pipeline: the overall stages from data preprocessing to policy optimization |
 | [Algorithms](guidance/algorithms.md) | Supported RL algorithms (GRPO, GRPO-Guard, DPPO, DiffusionNFT, AWM, DPO, DGPO, CRD, DiffusionOPD) and their configurations |
 | [Rewards](guidance/rewards.md) | Reward model system: built-in models, custom rewards, and remote reward servers |
+| [Datasets](guidance/datasets.md) | Dataset layouts, task-specific JSONL schemas, media preprocessing, caching, and MiniMax H3 inputs |
 | [New Model](guidance/new_model.md) | How to add support for a new Diffusion/Flow-Matching model |
 
 # 📊 Dataset
 
-The unified structure of dataset is:
+Each dataset contains `train.txt` or `train.jsonl` and may provide an optional test split plus
+image, video, or audio assets:
 
 ```plaintext
-|---- dataset
-|----|--- train.txt / train.jsonl
-|----|--- test.txt / test.jsonl (optional)
-|----|--- images (optional)
-|----|---| image1.png
-|----|---| ...
-|----|--- videos (optional)
-|----|---| video1.mp4
-|----|---| ...
+dataset/example/
+├── train.txt or train.jsonl
+├── test.txt or test.jsonl (optional)
+├── images/ (optional)
+├── videos/ (optional)
+└── audios/ (optional)
 ```
 
-## Text-to-Image & Text-to-Video
-
-For text-to-image and text-to-video tasks, the only required input is the **prompt** in plain text format. Use `train.txt` and `test.txt` (optional) with following format:
-
-```
-A hill in a sunset.
-An astronaut riding a horse on Mars.
-```
-> Example: [dataset/pickscore](./dataset/pickscore/train.txt)
-
-Each line represents a single text prompt. Alternatively, you can use `train.jsonl` and `test.jsonl` in the following format:
-
-```jsonl
-{"prompt": "A hill in a sunset."}
-{"prompt": "An astronaut riding a horse on Mars."}
-```
-
-> Example: [dataset/t2is](./dataset/t2is/train.jsonl)
-
-`negative_prompt` is also supported:
-
-```jsonl
-{"prompt": "A hill in a sunset.", "negative_prompt": "low quality, blurry, distorted, poorly drawn"}
-{"prompt": "An astronaut riding a horse on Mars.", "negative_prompt": "low quality, blurry, distorted, poorly drawn"}
-```
-
-> Example: [dataset/t2is_neg](./dataset/t2is_neg/train.jsonl)
-
-## Image-to-Image & Image-to-Video
-
-For tasks involving conditioning images, use `train.jsonl` and `test.jsonl` in the following format:
-
-```jsonl
-{"prompt": "A hill in a sunset.", "image": "path/to/image1.png"}
-{"prompt": "An astronaut riding a horse on Mars.", "image": "path/to/image2/png"}
-```
-
-> Example: [dataset/sharegpt4o_image_mini](./dataset/sharegpt4o_image_mini/train.jsonl)
-
-The default root directory for images is `dataset_dir/images`, and for videos, it is `dataset_dir/videos`. You can override these locations by setting the `image_dir` and `video_dir` variables in the config file:
-
-```yaml
-data:
-    dataset_dir: "path/to/dataset"
-    image_dir: "path/to/image_dir" # (default to "{dataset_dir}/images")
-    video_dir: "path/to/video_dir" # (default to "{dataset_dir}/videos")
-```
-
-For models like [FLUX.2-dev]((https://huggingface.co/black-forest-labs/FLUX.2-dev)) and [Qwen-Image-Edit-2511]((https://huggingface.co/Qwen/Qwen-Image-Edit-2511)) that are able to accept multiple images as conditions, use the `images` key with a list of image paths:
-
-```jsonl
-{"prompt": "A hill in a sunset.", "images": ["path/to/condition_image_1_1.png", "path/to/condition_image_1_2.png"]}
-{"prompt": "An astronaut riding a horse on Mars.", "images": ["path/to/condition_image_2_1.png", "path/to/condition_image_2_2.png"]}
-```
-
-## Video-to-Video
-
-```jsonl
-{"prompt": "A hill in a sunset.", "video": "path/to/video1.mp4"}
-{"prompt": "An astronaut riding a horse on Mars.", "videos": ["path/to/video2.mp4", "path/to/video3.mp4"]}
-```
+See the [Dataset Guide](guidance/datasets.md) for text, image, video, and audio conventions;
+single- and multi-condition schemas; media-root configuration; preprocessing and Arrow caching;
+and the MiniMax H3 T2VA, FL2VA, and ordered Ref2VA formats.
 
 # 💯 Reward Model
 
