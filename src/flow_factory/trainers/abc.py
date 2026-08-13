@@ -56,6 +56,7 @@ from ..hparams import *
 from ..logger import LogFormatter, load_logger
 from ..models.abc import BaseAdapter
 from ..models.model_bundle import ModelBundle, RoutedComponentProxy
+from ..models.variants import DEFAULT_BASE_VARIANT, ComponentVariantRegistry
 from ..rewards import (
     BaseRewardModel,
     MultiRewardLoader,
@@ -433,7 +434,7 @@ class BaseTrainer(ABC):
 
     def _init_optimizer(self) -> torch.optim.Optimizer:
         """Initialize one AdamW with one ordered parameter group per trainable role."""
-        registry = self.adapter.model_role_registry
+        registry = self.adapter.component_variant_registry
         trainable_role_names = tuple(
             role_name for role_name in registry.role_names if registry.get_spec(role_name).trainable
         )
@@ -483,8 +484,11 @@ class BaseTrainer(ABC):
     def _role_optimizer_configs(self) -> Tuple[RoleOptimizerConfig, ...]:
         """Build role configs from nested arguments or legacy flat arguments."""
         required_roles = BaseTrainer._required_trainable_roles(self)
-        if required_roles == ("generator",):
-            return (BaseTrainer._legacy_role_optimizer_config(self, "generator"),)
+        if len(required_roles) == 1:
+            # A single-policy algorithm has one parameter group, so the flat
+            # `train.learning_rate` family describes it and no per-role nesting is
+            # required whatever that single role happens to be called.
+            return (BaseTrainer._legacy_role_optimizer_config(self, required_roles[0]),)
 
         if getattr(self.training_args, "role_update_plan", None) is not None:
             update_plan = BaseTrainer._role_update_plan(self)
@@ -528,10 +532,10 @@ class BaseTrainer(ABC):
         )
 
     def _finish_role_microbatch(self) -> bool:
-        """Finish a role microbatch and advance public step for generator only."""
+        """Finish a role microbatch, advancing the public step for the primary role."""
         role_name = self.role_optimization.active_role_name
         stepped = self.role_optimization.finish_microbatch()
-        if stepped and role_name == "generator":
+        if stepped and role_name == self._primary_role():
             self.step += 1
         return stepped
 
@@ -588,11 +592,11 @@ class BaseTrainer(ABC):
 
     def _multirole_metadata(self) -> Dict[str, Any]:
         """Return deterministic metadata used to validate resume compatibility."""
-        role_metadata = self.adapter.model_role_registry.training_state_dict()
+        role_metadata = self.adapter.component_variant_registry.training_state_dict()
         update_plan = self._role_update_plan()
         return {
             "version": _MULTIROLE_METADATA_VERSION,
-            "roles": role_metadata["roles"],
+            "roles": role_metadata["variants"],
             "optimizer_group_roles": [
                 group.get("role_name") for group in self.optimizer.param_groups
             ],
@@ -646,10 +650,12 @@ class BaseTrainer(ABC):
                 f"{_MULTIROLE_METADATA_VERSION}, received {received_version!r}"
             )
 
-        self.adapter.model_role_registry.load_training_state_dict(
+        # The checkpoint speaks the trainer's word, the registry speaks its own;
+        # translate at the boundary rather than leaking either vocabulary.
+        self.adapter.component_variant_registry.load_training_state_dict(
             {
                 "version": received_version,
-                "roles": state.get("roles"),
+                "variants": state.get("roles"),
             }
         )
         expected = self._multirole_metadata()
@@ -662,21 +668,31 @@ class BaseTrainer(ABC):
                     f"{expected_value!r}, received {received_value!r}"
                 )
 
+    def _primary_role(self) -> str:
+        """Return the role whose optimizer step defines this run's public step.
+
+        The primary role is the first one declared. Which algorithm concept that
+        corresponds to is the algorithm's business; the loop only needs one role to
+        pace the global counter.
+        """
+        return self._required_trainable_roles()[0]
+
     def _multirole_state_dict(self) -> Dict[str, Any]:
         """Return registered custom state without duplicating prepared state."""
         coordinator_state = self.role_optimization.state_dict()
-        generator_step = coordinator_state["role_steps"]["generator"]
-        if self.step != generator_step:
+        primary_role = self._primary_role()
+        primary_step = coordinator_state["role_steps"][primary_role]
+        if self.step != primary_step:
             raise RuntimeError(
                 "multi-role checkpoint counter mismatch: expected trainer step to equal "
-                f"generator role step {generator_step}, received trainer_step={self.step}"
+                f"{primary_role!r} role step {primary_step}, received trainer_step={self.step}"
             )
         return {
             "version": 1,
             "metadata": self._multirole_metadata(),
             "coordinator": coordinator_state,
             "trainer_step": self.step,
-            "parameter_emas": self.adapter.model_role_registry.parameter_ema_state_dict(),
+            "parameter_emas": self.adapter.component_variant_registry.parameter_ema_state_dict(),
         }
 
     def _load_multirole_state_dict(self, state: Mapping[str, Any]) -> None:
@@ -717,19 +733,24 @@ class BaseTrainer(ABC):
                 f"received {type(coordinator_state).__name__}: {coordinator_state!r}"
             )
         role_steps = coordinator_state.get("role_steps")
-        if not isinstance(role_steps, Mapping) or role_steps.get("generator") != trainer_step:
-            received_generator_step = (
-                role_steps.get("generator") if isinstance(role_steps, Mapping) else role_steps
+        primary_role = self._primary_role()
+        if not isinstance(role_steps, Mapping) or role_steps.get(primary_role) != trainer_step:
+            received_primary_step = (
+                role_steps.get(primary_role) if isinstance(role_steps, Mapping) else role_steps
             )
             raise ValueError(
                 "registered multi-role counter mismatch: expected trainer_step "
-                f"{trainer_step} to equal generator role step, "
-                f"received generator step {received_generator_step!r}"
+                f"{trainer_step} to equal {primary_role!r} role step, "
+                f"received {primary_role!r} step {received_primary_step!r}"
             )
         self.role_optimization.load_state_dict(coordinator_state)
-        self.adapter.model_role_registry.load_parameter_ema_state_dict(state["parameter_emas"])
+        self.adapter.component_variant_registry.load_parameter_ema_state_dict(
+            state["parameter_emas"]
+        )
         self.step = trainer_step
-        self.adapter.model_role_registry.activate("generator")
+        self.adapter.component_variant_registry.activate(
+            self.adapter.component_variant_registry.base_variant
+        )
 
     def _register_multirole_checkpointing(self) -> None:
         """Register Accelerate metadata gates and custom state for multi-role runs."""
@@ -761,11 +782,36 @@ class BaseTrainer(ABC):
         self.accelerator.register_for_checkpointing(checkpoint_state)
         self._multirole_checkpoint_registered = True
 
+    def _declare_model_variants(self) -> None:
+        """Declare the component variants this algorithm trains, before ``prepare``.
+
+        Roles are the trainer's vocabulary, not the adapter's: an algorithm that
+        trains a generator against a fake score names its own variants here and
+        keeps the meaning of those names to itself. A single-policy algorithm needs
+        only the base variant, which is what this default declares.
+        """
+        self.adapter.declare_component_variants(self._required_trainable_roles())
+
     def _required_trainable_roles(self) -> Tuple[str, ...]:
-        """Return algorithm-required roles, defaulting legacy trainers to generator-only."""
-        if not hasattr(self.training_args, "required_trainable_roles"):
-            return ("generator",)
-        return self.training_args.required_trainable_roles
+        """Return every role this run trains, the one owning the base weights first.
+
+        Once variants are declared the adapter is the source of truth, so a trainer
+        that declares them directly is described correctly without also restating
+        them in config. Before declaration the algorithm's ``TrainingArguments``
+        answer; a single-policy algorithm names none and gets one base variant.
+        """
+        training_args = getattr(self, "training_args", None)
+        declared = getattr(training_args, "required_trainable_roles", None)
+        if declared:
+            return tuple(declared)
+        registry = getattr(getattr(self, "adapter", None), "component_variant_registry", None)
+        if isinstance(registry, ComponentVariantRegistry):
+            return tuple(
+                variant_name
+                for variant_name in registry.variant_names
+                if registry.get_spec(variant_name).trainable
+            )
+        return (DEFAULT_BASE_VARIANT,)
 
     def _validate_multirole_backend(self) -> None:
         """Validate one-root backend semantics for multi-role trainers."""
@@ -904,11 +950,10 @@ class BaseTrainer(ABC):
             # self.adapter.on_load(self.accelerator.device)
             self._synchronize_frozen_components()
 
-        # Init dataloader, then materialize every live model role before optimizer
-        # and distributed bundle construction.
+        # Init dataloader, then materialize every live component variant before
+        # optimizer and distributed bundle construction.
         self.dataloader, eval_dataloaders = self._init_dataloader()
-        required_trainable_roles = self._required_trainable_roles()
-        self.adapter.configure_model_roles(required_trainable_roles)
+        self._declare_model_variants()
         self.optimizer = self._init_optimizer()
 
         # Bundle ALL target components (trainable + frozen-but-shardable, e.g.
@@ -919,8 +964,8 @@ class BaseTrainer(ABC):
         # requires_grad subset via `get_trainable_parameters()`; frozen members
         # are sharded for memory but never receive gradient.
         canonical_bundle_names = list(self.adapter.target_module_map.keys())
-        role_registry = self.adapter.model_role_registry
-        bundle_members = role_registry.bundle_members()
+        variant_registry = self.adapter.component_variant_registry
+        bundle_members = variant_registry.bundle_members()
         model_bundle = ModelBundle(bundle_members)
         self._unprepared_optimizer_group_roles = tuple(
             group["role_name"] for group in self.optimizer.param_groups

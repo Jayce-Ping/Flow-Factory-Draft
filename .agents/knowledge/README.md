@@ -9,7 +9,7 @@
 | Adding or modifying a model adapter | `topics/adapter_conventions.md` |
 | Changing component discovery, loading, lifecycle, or distributed preparation | `topics/component_runtime.md` |
 | Touching rollout collection, replay bridges, index maps, or multi-component order | `topics/structured_trajectory.md` |
-| Adding a multi-role algorithm, or changing per-role LoRA/full storage or role checkpointing | `topics/model_roles.md` |
+| Adding an algorithm that trains several model copies at once, or changing per-variant LoRA/full storage or variant checkpointing | `topics/component_variants.md` |
 | Adding adapter, upgrading diffusers, debugging output quality | `topics/parity_testing.md` |
 | Touching `TimeSampler`, `adapter.forward(t=...)`, `timestep_range`, `flow_match_sigma` | `topics/timestep_sigma.md` |
 | Editing `data_utils/sampler*`, hparams sampler/batch fields | `topics/samplers.md` |

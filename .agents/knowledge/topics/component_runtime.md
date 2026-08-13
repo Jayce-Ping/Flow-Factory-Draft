@@ -91,4 +91,4 @@ instance attribute.
 ## Cross-refs
 
 - UP: [`constraints.md` #5](../constraints.md#5-adapter-component-runtime-contract), [`architecture.md` Component Management](../architecture.md#component-management)
-- PEER: [Structured Trajectory](structured_trajectory.md), [Model Roles](model_roles.md), [Adapter Conventions](adapter_conventions.md)
+- PEER: [Structured Trajectory](structured_trajectory.md), [Component Variants](component_variants.md), [Adapter Conventions](adapter_conventions.md)

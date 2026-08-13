@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Immutable model-role declarations and parameter ownership."""
+"""Immutable model-variant declarations and parameter ownership."""
 
 import copy
 from collections.abc import Iterable, Sequence
@@ -24,43 +24,51 @@ from typing import Any, Dict, Iterator, List, Literal, Mapping, Optional, Tuple,
 import torch
 from peft import PeftModel
 
-RoleName = Literal["generator", "fake", "surrogate", "reference"]
-RoleStorageMode = Literal["lora", "full", "snapshot"]
+# Variant names are caller-chosen. The model layer holds no opinion about what a
+# variant means; an algorithm that trains a generator against a fake score names
+# its variants accordingly, and this module never reads those names.
+VariantName = str
+VariantStorageMode = Literal["lora", "full", "snapshot"]
 
-_ROLE_ORDER: Tuple[RoleName, ...] = ("generator", "fake", "surrogate", "reference")
-_STORAGE_MODES: Tuple[RoleStorageMode, ...] = ("lora", "full", "snapshot")
+# The base variant is positional, not named: whichever variant is declared first
+# owns the adapter's canonical components and every later variant is layered on
+# it. The model layer therefore never needs to recognise a particular name. This
+# default is only what a single-policy caller passes when it has nothing to say.
+DEFAULT_BASE_VARIANT: VariantName = "base"
+_STORAGE_MODES: Tuple[VariantStorageMode, ...] = ("lora", "full", "snapshot")
 
 
 @dataclass(frozen=True)
-class ModelRoleSpec:
-    """Declare one immutable model role."""
+class ComponentVariantSpec:
+    """Declare one immutable component variant."""
 
-    name: RoleName
+    name: VariantName
     trainable: bool
-    storage_mode: RoleStorageMode
+    storage_mode: VariantStorageMode
     component_routes: Mapping[str, str]
     adapter_name: Optional[str] = None
 
     def __post_init__(self) -> None:
         """Validate and detach declaration values."""
-        if self.name not in _ROLE_ORDER:
-            raise ValueError(
-                f"expected one of {_ROLE_ORDER} for model role name, received {self.name!r}"
+        if not isinstance(self.name, str) or not self.name:
+            raise TypeError(
+                "expected a non-empty string component variant name, received "
+                f"{type(self.name).__name__}: {self.name!r}"
             )
         if not isinstance(self.trainable, bool):
             raise TypeError(
-                "expected bool for model role trainable state "
-                f"of role {self.name!r}, received {type(self.trainable).__name__}: "
+                "expected bool for component variant trainable state "
+                f"of variant {self.name!r}, received {type(self.trainable).__name__}: "
                 f"{self.trainable!r}"
             )
         if self.storage_mode not in _STORAGE_MODES:
             raise ValueError(
-                f"expected storage_mode for role {self.name!r} to be one of "
+                f"expected storage_mode for variant {self.name!r} to be one of "
                 f"{_STORAGE_MODES}, received {self.storage_mode!r}"
             )
         if not isinstance(self.component_routes, Mapping):
             raise TypeError(
-                f"expected component_routes for role {self.name!r} to be a mapping, "
+                f"expected component_routes for variant {self.name!r} to be a mapping, "
                 f"received {type(self.component_routes).__name__}: {self.component_routes!r}"
             )
 
@@ -68,51 +76,51 @@ class ModelRoleSpec:
         for component_name, route_name in self.component_routes.items():
             if not isinstance(component_name, str):
                 raise TypeError(
-                    f"expected string component name for role {self.name!r}, received "
+                    f"expected string component name for variant {self.name!r}, received "
                     f"{type(component_name).__name__}: {component_name!r}"
                 )
             if not component_name:
                 raise ValueError(
-                    f"expected a non-empty string component name for role {self.name!r}, "
+                    f"expected a non-empty string component name for variant {self.name!r}, "
                     f"received {component_name!r}"
                 )
             if not isinstance(route_name, str):
                 raise TypeError(
-                    f"expected string route for role {self.name!r} component "
+                    f"expected string route for variant {self.name!r} component "
                     f"{component_name!r}, received {type(route_name).__name__}: "
                     f"{route_name!r}"
                 )
             if not route_name:
                 raise ValueError(
-                    f"expected a non-empty string route for role {self.name!r} component "
+                    f"expected a non-empty string route for variant {self.name!r} component "
                     f"{component_name!r}, received {route_name!r}"
                 )
             detached_routes[component_name] = route_name
         if self.adapter_name is not None and not isinstance(self.adapter_name, str):
             raise TypeError(
-                f"expected adapter_name for role {self.name!r} to be None or a string, "
+                f"expected adapter_name for variant {self.name!r} to be None or a string, "
                 f"received {type(self.adapter_name).__name__}: {self.adapter_name!r}"
             )
         if self.adapter_name == "":
             raise ValueError(
-                f"expected adapter_name for role {self.name!r} to be None or a non-empty "
+                f"expected adapter_name for variant {self.name!r} to be None or a non-empty "
                 f"string, received {self.adapter_name!r}"
             )
         object.__setattr__(self, "component_routes", MappingProxyType(detached_routes))
 
 
 @dataclass(frozen=True)
-class RoleParameter:
-    """Record one parameter owned by a model role."""
+class VariantParameter:
+    """Record one parameter owned by a component variant."""
 
-    role_name: RoleName
+    variant_name: VariantName
     component_name: str
     parameter_name: str
     parameter: torch.nn.Parameter
 
 
-class ModelRoleRegistry:
-    """Store immutable role declarations and identity-based parameter ownership.
+class ComponentVariantRegistry:
+    """Store immutable variant declarations and identity-based parameter ownership.
 
     Args:
         adapter: Model adapter exposing canonical ``trainable_component_names``.
@@ -145,53 +153,41 @@ class ModelRoleRegistry:
 
         self._adapter = adapter
         self._canonical_components = canonical_components
-        self._specs: Dict[RoleName, ModelRoleSpec] = {}
-        self._parameter_records: Dict[RoleName, List[RoleParameter]] = {}
-        self._parameter_owners: Dict[int, RoleParameter] = {}
-        self._route_owners: Dict[str, Tuple[RoleName, str]] = {}
+        self._specs: Dict[VariantName, ComponentVariantSpec] = {}
+        self._parameter_records: Dict[VariantName, List[VariantParameter]] = {}
+        self._parameter_owners: Dict[int, VariantParameter] = {}
+        self._route_owners: Dict[str, Tuple[VariantName, str]] = {}
         self._bundle_members: Dict[str, torch.nn.Module] = {}
         self._parameter_emas: Dict[str, Dict[str, Any]] = {}
-        self._active_role: Optional[RoleName] = None
+        self._active_variant: Optional[VariantName] = None
         self._active_context: Optional[ExitStack] = None
         self._is_frozen = False
 
-    def declare(self, spec: ModelRoleSpec) -> None:
-        """Declare a model role.
+    def declare(self, spec: ComponentVariantSpec) -> None:
+        """Declare a component variant.
 
         Args:
-            spec: Immutable role declaration.
+            spec: Immutable variant declaration.
         """
-        attempted_role = getattr(spec, "name", "<unknown>")
-        self._require_mutable(attempted_role, "declare role")
-        if not isinstance(spec, ModelRoleSpec):
+        attempted_variant = getattr(spec, "name", "<unknown>")
+        self._require_mutable(attempted_variant, "declare variant")
+        if not isinstance(spec, ComponentVariantSpec):
             raise TypeError(
-                "expected ModelRoleSpec for role declaration, "
+                "expected ComponentVariantSpec for variant declaration, "
                 f"received {type(spec).__name__}: {spec!r}"
             )
         if spec.name in self._specs:
-            raise ValueError(f"model role is already declared: {spec.name!r}")
-        if not self._specs and spec.name != "generator":
+            raise ValueError(f"component variant is already declared: {spec.name!r}")
+
+        if spec.storage_mode == "snapshot" and spec.trainable:
             raise ValueError(
-                "expected the first declared model role to be 'generator', "
-                f"received {spec.name!r}"
+                f"expected snapshot variant {spec.name!r} to be non-trainable, "
+                f"received trainable={spec.trainable!r}; a snapshot holds frozen weights"
             )
-        if self._specs:
-            previous_role = self.role_names[-1]
-            if _ROLE_ORDER.index(spec.name) <= _ROLE_ORDER.index(previous_role):
-                raise ValueError(
-                    f"expected model role {spec.name!r} after {previous_role!r} to follow "
-                    f"canonical order {_ROLE_ORDER}, received declaration order "
-                    f"{self.role_names + (spec.name,)!r}"
-                )
-        if spec.name == "reference" and spec.trainable:
+        if spec.storage_mode != "snapshot" and not spec.trainable:
             raise ValueError(
-                "expected reference role to be non-trainable, "
-                f"received trainable={spec.trainable!r}"
-            )
-        if spec.name != "reference" and not spec.trainable:
-            raise ValueError(
-                f"expected role {spec.name!r} to be trainable, "
-                f"received trainable={spec.trainable!r}"
+                f"expected variant {spec.name!r} with storage_mode={spec.storage_mode!r} to be "
+                "trainable; declare storage_mode='snapshot' for a frozen copy"
             )
 
         declared_components = tuple(spec.component_routes)
@@ -200,48 +196,45 @@ class ModelRoleRegistry:
         )
         if unknown_components:
             raise ValueError(
-                f"expected role {spec.name!r} component routes to use canonical trainable "
+                f"expected variant {spec.name!r} component routes to use canonical trainable "
                 f"components {self._canonical_components!r}, received unknown components "
                 f"{unknown_components!r}"
             )
-        if spec.name == "generator":
+        if not self._specs:
             expected_routes = {name: name for name in self._canonical_components}
             received_routes = dict(spec.component_routes)
             if received_routes != expected_routes:
                 raise ValueError(
-                    "expected generator to map every canonical trainable component to its "
-                    f"canonical route {expected_routes!r}, received {received_routes!r}"
+                    f"expected the base variant {spec.name!r} to map every canonical trainable "
+                    f"component to its canonical route {expected_routes!r}, received "
+                    f"{received_routes!r}"
                 )
 
         pending_routes: Dict[str, str] = {}
         for component_name, route_name in spec.component_routes.items():
             if route_name in pending_routes:
                 raise ValueError(
-                    f"route collision for route {route_name!r} in role {spec.name!r}: "
+                    f"route collision for route {route_name!r} in variant {spec.name!r}: "
                     f"components {pending_routes[route_name]!r} and {component_name!r}"
                 )
             if route_name in self._route_owners:
-                owner_role, owner_component = self._route_owners[route_name]
+                owner_variant, owner_component = self._route_owners[route_name]
                 if owner_component != component_name:
                     raise ValueError(
-                        f"route collision for route {route_name!r}: role {owner_role!r} "
-                        f"component {owner_component!r} already owns it; role {spec.name!r} "
+                        f"route collision for route {route_name!r}: variant {owner_variant!r} "
+                        f"component {owner_component!r} already owns it; variant {spec.name!r} "
                         f"component {component_name!r} attempted to reuse it"
                     )
                 shared_storage_is_valid = (
                     spec.storage_mode == "lora" and spec.adapter_name is not None
-                ) or (
-                    spec.name == "reference"
-                    and not spec.trainable
-                    and spec.storage_mode == "snapshot"
-                )
+                ) or (not spec.trainable and spec.storage_mode == "snapshot")
                 if not shared_storage_is_valid:
                     raise ValueError(
                         f"shared route {route_name!r} for canonical component "
-                        f"{component_name!r} is invalid for role {spec.name!r} with "
-                        f"storage_mode={spec.storage_mode!r}; route is already owned by role "
-                        f"{owner_role!r}. Shared routes require a named LoRA adapter or the "
-                        "frozen reference snapshot context."
+                        f"{component_name!r} is invalid for variant {spec.name!r} with "
+                        f"storage_mode={spec.storage_mode!r}; route is already owned by variant "
+                        f"{owner_variant!r}. Shared routes require a named LoRA adapter or the "
+                        "a frozen snapshot storage mode."
                     )
             pending_routes[route_name] = component_name
 
@@ -252,38 +245,38 @@ class ModelRoleRegistry:
 
     def register_parameter(
         self,
-        role_name: RoleName,
+        variant_name: VariantName,
         component_name: str,
         parameter_name: str,
         parameter: torch.nn.Parameter,
     ) -> None:
-        """Register one optimizer parameter with its owning role.
+        """Register one optimizer parameter with its owning variant.
 
         Args:
-            role_name: Declared trainable role.
+            variant_name: Declared trainable variant.
             component_name: Canonical component containing the parameter.
             parameter_name: Name relative to the component.
             parameter: Parameter object whose identity is being registered.
         """
-        self._require_mutable(role_name, "register parameter ownership")
-        spec = self._get_declared_spec(role_name)
+        self._require_mutable(variant_name, "register parameter ownership")
+        spec = self._get_declared_spec(variant_name)
         if not spec.trainable:
             raise ValueError(
-                f"role {role_name!r} is non-trainable and cannot own optimizer parameters"
+                f"variant {variant_name!r} is non-trainable and cannot own optimizer parameters"
             )
         if component_name not in spec.component_routes:
             raise KeyError(
-                f"role {role_name!r} has no route for component {component_name!r}; "
+                f"variant {variant_name!r} has no route for component {component_name!r}; "
                 f"declared components are {tuple(spec.component_routes)!r}"
             )
         if not isinstance(parameter_name, str) or not parameter_name:
             raise ValueError(
-                f"expected a non-empty parameter_name for role {role_name!r} component "
+                f"expected a non-empty parameter_name for variant {variant_name!r} component "
                 f"{component_name!r}, received {parameter_name!r}"
             )
         if not isinstance(parameter, torch.nn.Parameter):
             raise TypeError(
-                f"expected torch.nn.Parameter for role {role_name!r} component "
+                f"expected torch.nn.Parameter for variant {variant_name!r} component "
                 f"{component_name!r} parameter {parameter_name!r}, received "
                 f"{type(parameter).__name__}: {parameter!r}"
             )
@@ -291,109 +284,94 @@ class ModelRoleRegistry:
         existing_owner = self._parameter_owners.get(id(parameter))
         if existing_owner is not None:
             raise ValueError(
-                f"parameter identity is already owned by role {existing_owner.role_name!r} "
+                f"parameter identity is already owned by variant {existing_owner.variant_name!r} "
                 f"component {existing_owner.component_name!r} parameter "
-                f"{existing_owner.parameter_name!r}; role {role_name!r} component "
+                f"{existing_owner.parameter_name!r}; variant {variant_name!r} component "
                 f"{component_name!r} parameter {parameter_name!r} attempted to register it"
             )
-        record = RoleParameter(
-            role_name=role_name,
+        record = VariantParameter(
+            variant_name=variant_name,
             component_name=component_name,
             parameter_name=parameter_name,
             parameter=parameter,
         )
-        self._parameter_records[role_name].append(record)
+        self._parameter_records[variant_name].append(record)
         self._parameter_owners[id(parameter)] = record
 
-    def materialize(self, required_trainable_roles: Sequence[RoleName]) -> None:
-        """Materialize and register all requested trainable model roles.
+    def materialize(self, required_variants: Sequence[VariantName]) -> None:
+        """Materialize and register all requested trainable component variants.
 
         Args:
-            required_trainable_roles: Trainable roles to materialize, including generator.
+            required_variants: Trainable variants to materialize, base variant first.
         """
-        required_roles = self._validate_required_trainable_roles(required_trainable_roles)
-        self._require_mutable(required_roles, "materialize model roles")
-        declared_trainable_roles = tuple(
-            role_name for role_name, spec in self._specs.items() if spec.trainable
+        required_variants = self._validate_required_variants(required_variants)
+        self._require_mutable(required_variants, "materialize component variants")
+        declared_trainable_variants = tuple(
+            variant_name for variant_name, spec in self._specs.items() if spec.trainable
         )
-        if required_roles != declared_trainable_roles:
+        if required_variants != declared_trainable_variants:
             raise ValueError(
-                "expected required_trainable_roles to exactly match declared trainable roles "
-                f"{declared_trainable_roles!r}, received {required_roles!r}"
+                "expected required_variants to exactly match declared trainable variants "
+                f"{declared_trainable_variants!r}, received {required_variants!r}"
             )
-        if "reference" not in self._specs:
+        snapshot_variants = tuple(
+            variant_name
+            for variant_name, spec in self._specs.items()
+            if spec.storage_mode == "snapshot"
+        )
+        if not snapshot_variants:
             raise ValueError(
-                "expected a declared frozen reference role before materialization, "
-                f"received roles {self.role_names!r}"
+                "expected a declared frozen snapshot variant before materialization, "
+                f"received variants {self.variant_names!r}"
             )
 
         self._bundle_members = self._canonical_bundle_members()
-        generator_spec = self._specs["generator"]
-        if generator_spec.storage_mode == "lora":
-            self._materialize_lora_roles(required_roles)
-        elif generator_spec.storage_mode == "full":
-            self._materialize_full_roles(required_roles)
+        base_spec = self._specs[self.base_variant]
+        if base_spec.storage_mode == "lora":
+            self._materialize_lora_variants(required_variants)
+        elif base_spec.storage_mode == "full":
+            self._materialize_full_variants(required_variants)
         else:
             raise ValueError(
-                "expected generator storage_mode to be 'lora' or 'full', "
-                f"received {generator_spec.storage_mode!r}"
+                f"expected base variant {self.base_variant!r} storage_mode to be "
+                "'lora' or 'full', "
+                f"received {base_spec.storage_mode!r}"
             )
-        self.activate("generator")
+        self.activate(self.base_variant)
         self.freeze()
 
     @staticmethod
-    def _validate_required_trainable_roles(
-        required_trainable_roles: object,
-    ) -> Tuple[RoleName, ...]:
-        """Validate and detach a requested trainable-role sequence."""
-        if isinstance(required_trainable_roles, (str, bytes)) or not isinstance(
-            required_trainable_roles, Sequence
+    def _validate_required_variants(
+        required_variants: object,
+    ) -> Tuple[VariantName, ...]:
+        """Validate and detach a requested trainable-variant sequence."""
+        if isinstance(required_variants, (str, bytes)) or not isinstance(
+            required_variants, Sequence
         ):
             raise TypeError(
-                "expected required_trainable_roles to be a non-string sequence, "
-                f"received {type(required_trainable_roles).__name__}: "
-                f"{required_trainable_roles!r}"
+                "expected required_variants to be a non-string sequence, "
+                f"received {type(required_variants).__name__}: "
+                f"{required_variants!r}"
             )
-        for role_index, role_name in enumerate(required_trainable_roles):
-            if not isinstance(role_name, str):
+        for variant_index, variant_name in enumerate(required_variants):
+            if not isinstance(variant_name, str):
                 raise TypeError(
-                    "expected string role name in required_trainable_roles at "
-                    f"index {role_index}, received {type(role_name).__name__}: {role_name!r}"
+                    "expected string variant name in required_variants at "
+                    f"index {variant_index}, received {type(variant_name).__name__}: {variant_name!r}"
                 )
 
-        required_roles = tuple(required_trainable_roles)
-        if not required_roles or required_roles[0] != "generator":
+        required_variants = tuple(required_variants)
+        if not required_variants:
             raise ValueError(
-                "expected required_trainable_roles to start with 'generator', "
-                f"received {required_roles!r}"
+                "expected at least the base variant in required_variants, received an "
+                "empty sequence"
             )
-        if len(set(required_roles)) != len(required_roles):
+        if len(set(required_variants)) != len(required_variants):
             raise ValueError(
-                "expected unique required_trainable_roles, "
-                f"received duplicates in {required_roles!r}"
+                "expected unique required_variants, "
+                f"received duplicates in {required_variants!r}"
             )
-        invalid_roles = tuple(
-            role_name
-            for role_name in required_roles
-            if role_name not in ("generator", "fake", "surrogate")
-        )
-        if invalid_roles:
-            raise ValueError(
-                "expected required_trainable_roles to contain only "
-                f"('generator', 'fake', 'surrogate'), received {invalid_roles!r} "
-                f"in {required_roles!r}"
-            )
-        canonical_order = tuple(
-            role_name
-            for role_name in ("generator", "fake", "surrogate")
-            if role_name in required_roles
-        )
-        if required_roles != canonical_order:
-            raise ValueError(
-                f"expected required_trainable_roles in canonical order {canonical_order!r}, "
-                f"received {required_roles!r}"
-            )
-        return cast(Tuple[RoleName, ...], required_roles)
+        return cast(Tuple[VariantName, ...], required_variants)
 
     def bundle_members(self) -> Dict[str, torch.nn.Module]:
         """Return detached bundle-route to module mappings.
@@ -403,16 +381,16 @@ class ModelRoleRegistry:
         """
         return dict(self._bundle_members)
 
-    def activate(self, role_name: RoleName) -> None:
-        """Activate a materialized role.
+    def activate(self, variant_name: VariantName) -> None:
+        """Activate a materialized variant.
 
         Args:
-            role_name: Declared role to activate.
+            variant_name: Declared variant to activate.
         """
-        spec = self._get_declared_spec(role_name)
+        spec = self._get_declared_spec(variant_name)
         if not self._bundle_members:
             raise RuntimeError(
-                f"cannot activate role {role_name!r}: model roles are not materialized"
+                f"cannot activate variant {variant_name!r}: component variants are not materialized"
             )
 
         previous_context = self._active_context
@@ -421,55 +399,55 @@ class ModelRoleRegistry:
         self._active_context = None
 
         next_context = ExitStack()
-        generator_storage_mode = self._specs["generator"].storage_mode
-        if generator_storage_mode == "lora":
-            if role_name == "reference":
+        base_storage_mode = self._specs[self.base_variant].storage_mode
+        if base_storage_mode == "lora":
+            if spec.storage_mode == "snapshot":
                 for component_name in self._canonical_components:
                     component = self._get_peft_component(component_name)
                     next_context.enter_context(component.disable_adapter())
             else:
                 if spec.adapter_name is None:
                     raise ValueError(
-                        f"expected named LoRA adapter for role {role_name!r}, "
+                        f"expected named LoRA adapter for variant {variant_name!r}, "
                         f"received adapter_name={spec.adapter_name!r}"
                     )
                 for component_name in self._canonical_components:
                     self._get_peft_component(component_name).set_adapter(spec.adapter_name)
-        elif role_name == "reference":
+        elif spec.storage_mode == "snapshot":
             next_context.enter_context(self._adapter.use_ref_parameters())
 
-        self._restore_trainable_role_parameters()
+        self._restore_trainable_variant_parameters()
         self._active_context = next_context
-        self._active_role = role_name
+        self._active_variant = variant_name
 
     @property
-    def active_role(self) -> RoleName:
-        """Return the currently active materialized role."""
-        if self._active_role is None:
-            raise RuntimeError("model roles are not materialized and no role is active")
-        return self._active_role
+    def active_variant(self) -> VariantName:
+        """Return the currently active materialized variant."""
+        if self._active_variant is None:
+            raise RuntimeError("component variants are not materialized and no variant is active")
+        return self._active_variant
 
     @contextmanager
-    def use(self, role_name: RoleName) -> Iterator[None]:
-        """Temporarily activate a role and restore the exact previous role.
+    def use(self, variant_name: VariantName) -> Iterator[None]:
+        """Temporarily activate a variant and restore the exact previous variant.
 
         Args:
-            role_name: Declared role to use inside the context.
+            variant_name: Declared variant to use inside the context.
 
         Yields:
-            Control while the requested role is active.
+            Control while the requested variant is active.
         """
-        previous_role = self.active_role
-        self.activate(role_name)
+        previous_variant = self.active_variant
+        self.activate(variant_name)
         try:
             yield
         finally:
-            self.activate(previous_role)
+            self.activate(previous_variant)
 
     @contextmanager
-    def use_generator_for_export(self) -> Iterator[None]:
-        """Activate only the canonical generator route for an export."""
-        with self.use("generator"):
+    def use_base_variant(self) -> Iterator[None]:
+        """Activate the canonical base route, which is what an export writes."""
+        with self.use(self.base_variant):
             yield
 
     def freeze(self) -> None:
@@ -477,13 +455,11 @@ class ModelRoleRegistry:
         if self._is_frozen:
             return
         if not self._specs:
-            raise ValueError(
-                "expected a declared generator role before freezing, received no roles"
-            )
-        for role_name, spec in self._specs.items():
-            if spec.trainable and not self._parameter_records[role_name]:
+            raise ValueError("expected a declared base variant before freezing, received none")
+        for variant_name, spec in self._specs.items():
+            if spec.trainable and not self._parameter_records[variant_name]:
                 raise ValueError(
-                    f"trainable role {role_name!r} must own at least one parameter before freeze"
+                    f"trainable variant {variant_name!r} must own at least one parameter before freeze"
                 )
         self._is_frozen = True
 
@@ -493,56 +469,70 @@ class ModelRoleRegistry:
         return self._is_frozen
 
     @property
-    def role_names(self) -> Tuple[RoleName, ...]:
-        """Return declared role names in declaration order."""
+    def variant_names(self) -> Tuple[VariantName, ...]:
+        """Return declared variant names in declaration order."""
         return tuple(self._specs)
 
-    def get_spec(self, role_name: RoleName) -> ModelRoleSpec:
-        """Return an immutable role declaration.
+    @property
+    def base_variant(self) -> VariantName:
+        """Return the variant that owns the canonical components.
+
+        The base is whichever variant was declared first; this registry attaches no
+        meaning to its name.
+
+        Raises:
+            RuntimeError: If no variant has been declared yet.
+        """
+        if not self._specs:
+            raise RuntimeError("no component variant is declared, so there is no base variant yet")
+        return next(iter(self._specs))
+
+    def get_spec(self, variant_name: VariantName) -> ComponentVariantSpec:
+        """Return an immutable variant declaration.
 
         Args:
-            role_name: Declared role name.
+            variant_name: Declared variant name.
 
         Returns:
-            Immutable declaration for the requested role.
+            Immutable declaration for the requested variant.
         """
-        return self._get_declared_spec(role_name)
+        return self._get_declared_spec(variant_name)
 
-    def parameters(self, role_name: RoleName) -> Tuple[torch.nn.Parameter, ...]:
-        """Return parameters owned by a role.
+    def parameters(self, variant_name: VariantName) -> Tuple[torch.nn.Parameter, ...]:
+        """Return parameters owned by a variant.
 
         Args:
-            role_name: Declared role name.
+            variant_name: Declared variant name.
 
         Returns:
             Parameters in registration order.
         """
-        records = self.parameter_records(role_name)
+        records = self.parameter_records(variant_name)
         return tuple(record.parameter for record in records)
 
-    def parameter_records(self, role_name: RoleName) -> Tuple[RoleParameter, ...]:
+    def parameter_records(self, variant_name: VariantName) -> Tuple[VariantParameter, ...]:
         """Return immutable parameter ownership records.
 
         Args:
-            role_name: Declared role name.
+            variant_name: Declared variant name.
 
         Returns:
             Ownership records in registration order.
         """
-        self._get_declared_spec(role_name)
-        return tuple(self._parameter_records[role_name])
+        self._get_declared_spec(variant_name)
+        return tuple(self._parameter_records[variant_name])
 
-    def create_parameter_ema(self, role_name: RoleName, snapshot_name: str) -> None:
-        """Create a detached named parameter snapshot for one trainable role.
+    def create_parameter_ema(self, variant_name: VariantName, snapshot_name: str) -> None:
+        """Create a detached named parameter snapshot for one trainable variant.
 
         Args:
-            role_name: Trainable role whose parameters initialize the snapshot.
+            variant_name: Trainable variant whose parameters initialize the snapshot.
             snapshot_name: Unique non-empty snapshot identifier.
         """
-        spec = self._get_declared_spec(role_name)
+        spec = self._get_declared_spec(variant_name)
         if not spec.trainable:
             raise ValueError(
-                f"expected trainable role for parameter EMA, received role {role_name!r}"
+                f"expected trainable variant for parameter EMA, received variant {variant_name!r}"
             )
         if not isinstance(snapshot_name, str) or not snapshot_name:
             raise ValueError(
@@ -551,9 +541,9 @@ class ModelRoleRegistry:
             )
         if snapshot_name in self._parameter_emas:
             raise ValueError(f"parameter EMA snapshot already exists: {snapshot_name!r}")
-        records = self.parameter_records(role_name)
+        records = self.parameter_records(variant_name)
         self._parameter_emas[snapshot_name] = {
-            "role_name": role_name,
+            "variant_name": variant_name,
             "parameters": {
                 f"{record.component_name}.{record.parameter_name}": record.parameter.detach().clone()
                 for record in records
@@ -563,7 +553,7 @@ class ModelRoleRegistry:
 
     @contextmanager
     def use_parameter_ema(self, snapshot_name: str) -> Iterator[None]:
-        """Temporarily swap one parameter EMA into its existing model role.
+        """Temporarily swap one parameter EMA into its existing component variant.
 
         Args:
             snapshot_name: Existing snapshot identifier.
@@ -572,10 +562,10 @@ class ModelRoleRegistry:
             Control while the snapshot tensors are installed.
         """
         snapshot = self._get_parameter_ema(snapshot_name)
-        role_name = cast(RoleName, snapshot["role_name"])
-        records = self.parameter_records(role_name)
+        variant_name = cast(VariantName, snapshot["variant_name"])
+        records = self.parameter_records(variant_name)
         live_parameters = [record.parameter.detach().clone() for record in records]
-        with self.use(role_name):
+        with self.use(variant_name):
             try:
                 for record in records:
                     key = f"{record.component_name}.{record.parameter_name}"
@@ -586,7 +576,7 @@ class ModelRoleRegistry:
                     record.parameter.data.copy_(live)
 
     def update_parameter_ema(self, snapshot_name: str, decay: float) -> None:
-        """Update one parameter EMA from its live role parameters.
+        """Update one parameter EMA from its live variant parameters.
 
         Args:
             snapshot_name: Existing snapshot identifier.
@@ -601,28 +591,28 @@ class ModelRoleRegistry:
         if not 0 <= decay_value <= 1:
             raise ValueError(f"expected parameter EMA decay in [0, 1], received {decay_value!r}")
         snapshot = self._get_parameter_ema(snapshot_name)
-        role_name = cast(RoleName, snapshot["role_name"])
-        for record in self.parameter_records(role_name):
+        variant_name = cast(VariantName, snapshot["variant_name"])
+        for record in self.parameter_records(variant_name):
             key = f"{record.component_name}.{record.parameter_name}"
             snapshot["parameters"][key].lerp_(record.parameter.detach(), 1 - decay_value)
         snapshot["update_count"] += 1
 
     def parameter_ema_tensors(self, snapshot_name: str) -> Tuple[torch.Tensor, ...]:
-        """Return one snapshot in the owning role's parameter registration order."""
+        """Return one snapshot in the owning variant's parameter registration order."""
         snapshot = self._get_parameter_ema(snapshot_name)
-        role_name = cast(RoleName, snapshot["role_name"])
+        variant_name = cast(VariantName, snapshot["variant_name"])
         return tuple(
             snapshot["parameters"][f"{record.component_name}.{record.parameter_name}"]
             .detach()
             .clone()
-            for record in self.parameter_records(role_name)
+            for record in self.parameter_records(variant_name)
         )
 
     def parameter_ema_state_dict(self) -> Dict[str, Any]:
         """Return exact checkpoint state for parameter EMA snapshots."""
         snapshots = {
             snapshot_name: {
-                "role_name": snapshot["role_name"],
+                "variant_name": snapshot["variant_name"],
                 "parameters": {
                     name: tensor.detach().clone() for name, tensor in snapshot["parameters"].items()
                 },
@@ -671,9 +661,12 @@ class ModelRoleRegistry:
         for snapshot_name in expected_names:
             target = self._parameter_emas[snapshot_name]
             source = snapshots[snapshot_name]
-            if not isinstance(source, Mapping) or source.get("role_name") != target["role_name"]:
+            if (
+                not isinstance(source, Mapping)
+                or source.get("variant_name") != target["variant_name"]
+            ):
                 raise ValueError(
-                    f"expected parameter EMA role {target['role_name']!r} for "
+                    f"expected parameter EMA variant {target['variant_name']!r} for "
                     f"snapshot {snapshot_name!r}, received {source!r}"
                 )
             source_parameters = source.get("parameters")
@@ -723,34 +716,34 @@ class ModelRoleRegistry:
             )
         return self._parameter_emas[snapshot_name]
 
-    def resolve_route(self, role_name: RoleName, component_name: str) -> str:
-        """Resolve a canonical component to its role-specific bundle route.
+    def resolve_route(self, variant_name: VariantName, component_name: str) -> str:
+        """Resolve a canonical component to its variant-specific bundle route.
 
         Args:
-            role_name: Declared role name.
+            variant_name: Declared variant name.
             component_name: Canonical component name.
 
         Returns:
-            Bundle route declared for the role and component.
+            Bundle route declared for the variant and component.
         """
-        spec = self._get_declared_spec(role_name)
+        spec = self._get_declared_spec(variant_name)
         if component_name not in spec.component_routes:
             raise KeyError(
-                f"role {role_name!r} has no route for component {component_name!r}; "
+                f"variant {variant_name!r} has no route for component {component_name!r}; "
                 f"declared components are {tuple(spec.component_routes)!r}"
             )
         return spec.component_routes[component_name]
 
     def metadata(self) -> Dict[str, Any]:
-        """Return detached serializable role metadata.
+        """Return detached serializable variant metadata.
 
         Returns:
-            Role declarations and parameter names without parameter objects.
+            Variant declarations and parameter names without parameter objects.
         """
-        roles = []
-        for role_name, spec in self._specs.items():
-            records = self._parameter_records[role_name]
-            roles.append(
+        variants = []
+        for variant_name, spec in self._specs.items():
+            records = self._parameter_records[variant_name]
+            variants.append(
                 {
                     "name": spec.name,
                     "trainable": spec.trainable,
@@ -766,15 +759,15 @@ class ModelRoleRegistry:
                     ],
                 }
             )
-        return {"is_frozen": self._is_frozen, "roles": roles}
+        return {"is_frozen": self._is_frozen, "variants": variants}
 
     def training_state_dict(self) -> Dict[str, Any]:
-        """Return versioned role metadata for training-state compatibility."""
-        roles = []
-        for role_name, spec in self._specs.items():
-            roles.append(
+        """Return versioned variant metadata for training-state compatibility."""
+        variants = []
+        for variant_name, spec in self._specs.items():
+            variants.append(
                 {
-                    "name": role_name,
+                    "name": variant_name,
                     "trainable": spec.trainable,
                     "storage_mode": spec.storage_mode,
                     "component_routes": dict(spec.component_routes),
@@ -785,28 +778,28 @@ class ModelRoleRegistry:
                             "parameter_name": record.parameter_name,
                             "shape": list(record.parameter.shape),
                         }
-                        for record in self._parameter_records[role_name]
+                        for record in self._parameter_records[variant_name]
                     ],
                 }
             )
-        return {"version": 1, "roles": roles}
+        return {"version": 1, "variants": variants}
 
     def load_training_state_dict(self, state: Mapping[str, Any]) -> None:
-        """Validate checkpoint role metadata without mutating model parameters.
+        """Validate checkpoint variant metadata without mutating model parameters.
 
         Args:
-            state: Versioned role metadata produced by :meth:`training_state_dict`.
+            state: Versioned variant metadata produced by :meth:`training_state_dict`.
         """
         if not isinstance(state, Mapping):
             raise TypeError(
-                "expected multi-role metadata state as a mapping, "
+                "expected multi-variant metadata state as a mapping, "
                 f"received {type(state).__name__}: {state!r}"
             )
-        expected_keys = {"version", "roles"}
+        expected_keys = {"version", "variants"}
         received_keys = set(state)
         if received_keys != expected_keys:
             raise ValueError(
-                "multi-role metadata state keys mismatch: expected "
+                "multi-variant metadata state keys mismatch: expected "
                 f"{tuple(sorted(expected_keys))!r}, "
                 f"received {tuple(sorted(received_keys))!r}"
             )
@@ -817,41 +810,42 @@ class ModelRoleRegistry:
             or received_version != 1
         ):
             raise ValueError(
-                "multi-role metadata version mismatch: expected 1, "
+                "multi-variant metadata version mismatch: expected 1, "
                 f"received {received_version!r}"
             )
-        received_roles = state.get("roles")
-        if not isinstance(received_roles, list):
+        received_variants = state.get("variants")
+        if not isinstance(received_variants, list):
             raise TypeError(
-                "expected multi-role metadata roles as a list, "
-                f"received {type(received_roles).__name__}: {received_roles!r}"
+                "expected multi-variant metadata variants as a list, "
+                f"received {type(received_variants).__name__}: {received_variants!r}"
             )
 
         expected = self.training_state_dict()
-        expected_roles = expected["roles"]
-        expected_role_order = tuple(role["name"] for role in expected_roles)
-        received_role_order = tuple(
-            role.get("name") if isinstance(role, Mapping) else role for role in received_roles
+        expected_variants = expected["variants"]
+        expected_variant_order = tuple(variant["name"] for variant in expected_variants)
+        received_variant_order = tuple(
+            variant.get("name") if isinstance(variant, Mapping) else variant
+            for variant in received_variants
         )
-        if received_role_order != expected_role_order:
+        if received_variant_order != expected_variant_order:
             raise ValueError(
-                "multi-role metadata role order mismatch: expected "
-                f"{expected_role_order!r}, received {received_role_order!r}"
+                "multi-variant metadata variant order mismatch: expected "
+                f"{expected_variant_order!r}, received {received_variant_order!r}"
             )
-        for expected_role, received_role in zip(expected_roles, received_roles):
-            role_name = expected_role["name"]
-            if not isinstance(received_role, Mapping):
+        for expected_variant, received_variant in zip(expected_variants, received_variants):
+            variant_name = expected_variant["name"]
+            if not isinstance(received_variant, Mapping):
                 raise TypeError(
-                    f"expected multi-role metadata for role {role_name!r} as a mapping, "
-                    f"received {type(received_role).__name__}: {received_role!r}"
+                    f"expected multi-variant metadata for variant {variant_name!r} as a mapping, "
+                    f"received {type(received_variant).__name__}: {received_variant!r}"
                 )
-            expected_role_keys = set(expected_role)
-            received_role_keys = set(received_role)
-            if received_role_keys != expected_role_keys:
+            expected_variant_keys = set(expected_variant)
+            received_variant_keys = set(received_variant)
+            if received_variant_keys != expected_variant_keys:
                 raise ValueError(
-                    f"multi-role metadata keys mismatch for role {role_name!r}: "
-                    f"expected {tuple(sorted(expected_role_keys))!r}, "
-                    f"received {tuple(sorted(received_role_keys))!r}"
+                    f"multi-variant metadata keys mismatch for variant {variant_name!r}: "
+                    f"expected {tuple(sorted(expected_variant_keys))!r}, "
+                    f"received {tuple(sorted(received_variant_keys))!r}"
                 )
             for field_name in (
                 "trainable",
@@ -860,12 +854,12 @@ class ModelRoleRegistry:
                 "adapter_name",
                 "parameters",
             ):
-                expected_value = expected_role[field_name]
-                received_value = received_role.get(field_name)
+                expected_value = expected_variant[field_name]
+                received_value = received_variant.get(field_name)
                 if received_value != expected_value:
                     raise ValueError(
-                        f"multi-role metadata {field_name} mismatch for role "
-                        f"{role_name!r}: expected {expected_value!r}, "
+                        f"multi-variant metadata {field_name} mismatch for variant "
+                        f"{variant_name!r}: expected {expected_value!r}, "
                         f"received {received_value!r}"
                     )
 
@@ -888,13 +882,14 @@ class ModelRoleRegistry:
             members[component_name] = component
         return members
 
-    def _materialize_lora_roles(self, required_roles: Tuple[RoleName, ...]) -> None:
+    def _materialize_lora_variants(self, required_variants: Tuple[VariantName, ...]) -> None:
         """Add named PEFT adapters and register exact newly created parameters."""
-        generator_spec = self._specs["generator"]
-        if generator_spec.adapter_name != "default":
+        base_spec = self._specs[self.base_variant]
+        if base_spec.adapter_name != "default":
             raise ValueError(
-                "expected generator LoRA adapter_name to be 'default', "
-                f"received {generator_spec.adapter_name!r}"
+                f"expected base variant {self.base_variant!r} LoRA adapter_name to be "
+                "'default', "
+                f"received {base_spec.adapter_name!r}"
             )
         for component_name in self._canonical_components:
             component = self._get_peft_component(component_name)
@@ -906,13 +901,15 @@ class ModelRoleRegistry:
             component.set_adapter("default")
             for parameter_name, parameter in component.named_parameters():
                 if parameter.requires_grad:
-                    self.register_parameter("generator", component_name, parameter_name, parameter)
+                    self.register_parameter(
+                        self.base_variant, component_name, parameter_name, parameter
+                    )
 
-            for role_name in required_roles[1:]:
-                spec = self._specs[role_name]
-                if spec.adapter_name != role_name:
+            for variant_name in required_variants[1:]:
+                spec = self._specs[variant_name]
+                if spec.adapter_name != variant_name:
                     raise ValueError(
-                        f"expected LoRA adapter_name for role {role_name!r} to equal the role "
+                        f"expected LoRA adapter_name for variant {variant_name!r} to equal the variant "
                         f"name, received {spec.adapter_name!r}"
                     )
                 parameter_ids_before = {id(parameter) for parameter in component.parameters()}
@@ -931,25 +928,25 @@ class ModelRoleRegistry:
                         f"for component {component_name!r}, received none"
                     )
                 for parameter_name, parameter in new_parameters:
-                    self.register_parameter(role_name, component_name, parameter_name, parameter)
+                    self.register_parameter(variant_name, component_name, parameter_name, parameter)
 
-    def _materialize_full_roles(self, required_roles: Tuple[RoleName, ...]) -> None:
-        """Deep-copy full trainable roles and preserve target-module freezing."""
+    def _materialize_full_variants(self, required_variants: Tuple[VariantName, ...]) -> None:
+        """Deep-copy full trainable variants and preserve target-module freezing."""
         for component_name in self._canonical_components:
-            generator = self._bundle_members[component_name]
-            self._apply_full_freezing(component_name, generator)
-            self._register_trainable_parameters("generator", component_name, generator)
-            for role_name in required_roles[1:]:
-                replica = copy.deepcopy(generator)
+            base_module = self._bundle_members[component_name]
+            self._apply_full_freezing(component_name, base_module)
+            self._register_trainable_parameters(self.base_variant, component_name, base_module)
+            for variant_name in required_variants[1:]:
+                replica = copy.deepcopy(base_module)
                 self._apply_full_freezing(component_name, replica)
-                route_name = self.resolve_route(role_name, component_name)
+                route_name = self.resolve_route(variant_name, component_name)
                 if route_name == component_name:
                     raise ValueError(
-                        f"expected distinct full-model route for role {role_name!r} component "
+                        f"expected distinct full-model route for variant {variant_name!r} component "
                         f"{component_name!r}, received shared route {route_name!r}"
                     )
                 self._bundle_members[route_name] = replica
-                self._register_trainable_parameters(role_name, component_name, replica)
+                self._register_trainable_parameters(variant_name, component_name, replica)
 
     def _apply_full_freezing(self, component_name: str, component: torch.nn.Module) -> None:
         """Apply the adapter's configured full-model target-module map."""
@@ -974,20 +971,20 @@ class ModelRoleRegistry:
 
     def _register_trainable_parameters(
         self,
-        role_name: RoleName,
+        variant_name: VariantName,
         component_name: str,
         component: torch.nn.Module,
     ) -> None:
-        """Register every trainable parameter of one full-model role component."""
+        """Register every trainable parameter of one full-component variant component."""
         for parameter_name, parameter in component.named_parameters():
             if parameter.requires_grad:
-                self.register_parameter(role_name, component_name, parameter_name, parameter)
+                self.register_parameter(variant_name, component_name, parameter_name, parameter)
 
-    def _restore_trainable_role_parameters(self) -> None:
-        """Keep every identity-owned trainable-role parameter trainable."""
-        for role_name, spec in self._specs.items():
+    def _restore_trainable_variant_parameters(self) -> None:
+        """Keep every identity-owned trainable-variant parameter trainable."""
+        for variant_name, spec in self._specs.items():
             if spec.trainable:
-                for record in self._parameter_records[role_name]:
+                for record in self._parameter_records[variant_name]:
                     record.parameter.requires_grad = True
 
     def _get_peft_component(self, component_name: str) -> PeftModel:
@@ -1000,17 +997,17 @@ class ModelRoleRegistry:
             )
         return component
 
-    def _get_declared_spec(self, role_name: RoleName) -> ModelRoleSpec:
-        """Return a declaration or fail with available role context."""
-        if role_name not in self._specs:
+    def _get_declared_spec(self, variant_name: VariantName) -> ComponentVariantSpec:
+        """Return a declaration or fail with available variant context."""
+        if variant_name not in self._specs:
             raise KeyError(
-                f"model role {role_name!r} is not declared; available roles are {self.role_names!r}"
+                f"component variant {variant_name!r} is not declared; available variants are {self.variant_names!r}"
             )
-        return self._specs[role_name]
+        return self._specs[variant_name]
 
-    def _require_mutable(self, role_name: object, operation: str) -> None:
-        """Reject an attempted role mutation after freeze."""
+    def _require_mutable(self, variant_name: object, operation: str) -> None:
+        """Reject an attempted variant mutation after freeze."""
         if self._is_frozen:
             raise RuntimeError(
-                f"cannot {operation} for role {role_name!r}: model role registry is frozen"
+                f"cannot {operation} for variant {variant_name!r}: component variant registry is frozen"
             )

@@ -22,9 +22,10 @@ from typing import Any, Dict, Iterator, Mapping, Optional, Tuple, cast
 import torch
 from accelerate import Accelerator
 
-from ..models.roles import RoleName
-
-_TRAINABLE_ROLE_NAMES: Tuple[RoleName, ...] = ("generator", "fake", "surrogate")
+# Roles are the trainer's vocabulary. The model layer only knows component
+# variants under caller-chosen names; the mapping from a role to a variant is
+# made here, by the algorithm that owns the meaning of those names.
+RoleName = str
 _STATE_KEYS = {"version", "role_steps", "optimizer_group_roles", "active_phase"}
 _STATE_VERSION = 3
 
@@ -56,10 +57,9 @@ class RoleOptimizerConfig:
 
     def __post_init__(self) -> None:
         """Validate role-local optimizer configuration."""
-        if self.role_name not in _TRAINABLE_ROLE_NAMES:
+        if not isinstance(self.role_name, str) or not self.role_name:
             raise ValueError(
-                f"expected trainable role name in {_TRAINABLE_ROLE_NAMES!r}, "
-                f"received {self.role_name!r}"
+                "expected a non-empty string role name, " f"received {self.role_name!r}"
             )
         _validate_positive_float(self.learning_rate, "learning_rate", self.role_name)
         if (
@@ -121,10 +121,9 @@ class RolePhase:
 
     def __post_init__(self) -> None:
         """Validate one update-plan phase."""
-        if self.role_name not in _TRAINABLE_ROLE_NAMES:
+        if not isinstance(self.role_name, str) or not self.role_name:
             raise ValueError(
-                f"expected trainable role name in {_TRAINABLE_ROLE_NAMES!r}, "
-                f"received {self.role_name!r}"
+                "expected a non-empty string role name, " f"received {self.role_name!r}"
             )
         if not isinstance(self.repeats, int) or isinstance(self.repeats, bool) or self.repeats < 1:
             raise ValueError(

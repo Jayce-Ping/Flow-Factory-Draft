@@ -162,7 +162,7 @@ Configured via the `acceleration:` block (`hparams/acceleration_args.py`): two o
 
 - **New model adapter**: `guidance/new_model.md`, skill `/ff-new-model`, conventions `topics/adapter_conventions.md`
 - **New reward model**: `guidance/rewards.md`, skill `/ff-new-reward`
-- **New algorithm**: `guidance/algorithms.md`, skill `/ff-new-algorithm`. `BaseTrainer` owns the epoch loop (`start`), timestep sampling, feedback/advantages, the optimizer step and the velocity KL; only `optimize()` is abstract. Vary behavior through `sampling_context`, `_run_training_step`, `_after_gradient_step` and `_after_optimizer_step` rather than by restating the loop. A multi-role algorithm additionally declares `required_trainable_roles` (`topics/model_roles.md`).
+- **New algorithm**: `guidance/algorithms.md`, skill `/ff-new-algorithm`. `BaseTrainer` owns the epoch loop (`start`), timestep sampling, feedback/advantages, the optimizer step and the velocity KL; only `optimize()` is abstract. Vary behavior through `sampling_context`, `_run_training_step`, `_after_gradient_step` and `_after_optimizer_step` rather than by restating the loop. An algorithm that trains several model copies declares them in `_declare_model_variants()` (`topics/component_variants.md`).
 - **New accelerator**: subclass `acceleration/abc.py::BaseAccelerator` (declare `safety`/`stage`), register in `acceleration/registry.py`
 
 ---
@@ -214,16 +214,22 @@ Component membership resolves through the runtime, never through `hasattr(adapte
 `has_component` asks whether a name is declared, and `_require_component` fetches a module a
 lifecycle loop cannot proceed without. Details: `topics/component_runtime.md`.
 
-### Model Roles
-`ModelRoleRegistry` (`models/roles.py`) generalizes parameter ownership from one trainable copy to
-several. A single-policy algorithm uses one implicit `generator` role and is unaffected; a
-distillation algorithm declares `generator`, `fake` and `surrogate`, each with its own optimizer
-group, its own storage (`storage_mode` of `lora`, `full` or `snapshot`) and its own
-`component_routes`. `RoutedComponentProxy` resolves a canonical component name through the active
-role, so adapter code is unchanged. `RoleOptimizationCoordinator`
-(`trainers/role_optimization.py`) drives disjoint role updates through one physical optimizer, and
-`BaseTrainer._validate_multirole_backend` rejects the distributed layouts multi-role cannot
-support. Details: `topics/model_roles.md`.
+### Component Variants
+`BaseAdapter` is infrastructure: it supplies mechanisms and holds no algorithm vocabulary. Two
+mechanisms cover parameter ownership. Named parameter snapshots (`add_named_parameters` /
+`use_named_parameters`) are temporal, one set of weights installed at a time, and cover references,
+EMAs and old snapshots. `ComponentVariantRegistry` (`models/variants.py`) is spatial: several
+trainable copies live at once, each with its own optimizer group, storage (`lora`, `full` or
+`snapshot`) and `component_routes`. Variant names are caller-chosen and the base variant is
+positional, so the model layer never learns what a "generator" is. `RoutedComponentProxy` resolves
+a canonical component name through the active variant, so adapter code is unchanged.
+
+Roles are the trainer's vocabulary. `RoleOptimizationCoordinator`
+(`trainers/role_optimization.py`) is a utility a trainer composes to drive disjoint role updates
+through one physical optimizer, and `BaseTrainer._validate_multirole_backend` rejects the
+distributed layouts multi-role cannot support. Algorithms may duplicate their own small role
+helpers rather than share an abstraction that would push their vocabulary down a layer.
+Details: `topics/component_variants.md`.
 
 #### Component runtime enumeration boundaries
 - **Date**: 2026-08-10

@@ -314,7 +314,7 @@ def test_base_trainer_builds_one_ordered_adamw_with_role_hyperparameters() -> No
             return (getattr(bundle, role_name),)
 
     trainer = object.__new__(MinimalTrainer)
-    trainer.adapter = SimpleNamespace(model_role_registry=Registry())
+    trainer.adapter = SimpleNamespace(component_variant_registry=Registry())
     trainer.training_args = SimpleNamespace(
         learning_rate=0.1,
         adam_betas=(0.7, 0.8),
@@ -352,7 +352,7 @@ def test_base_trainer_default_role_config_preserves_legacy_generator_args() -> N
 
     assert BaseTrainer._role_optimizer_configs(trainer) == (
         RoleOptimizerConfig(
-            role_name="generator",
+            role_name="base",
             learning_rate=0.001,
             adam_betas=(0.9, 0.95),
             adam_weight_decay=0.1,
@@ -370,7 +370,9 @@ def test_rebinds_roles_to_prepared_optimizer_parameter_identities() -> None:
     }
     prepared_bundle, prepared_optimizer = accelerator.prepare(stale_bundle, stale_optimizer)
     trainer = object.__new__(MinimalTrainer)
-    trainer.training_args = SimpleNamespace(trainer_type="dmd2")
+    trainer.training_args = SimpleNamespace(
+        trainer_type="dmd2", required_trainable_roles=("generator", "fake")
+    )
     trainer.optimization_roles = dict(stale_roles)
     trainer.model_bundle = prepared_bundle
     trainer.optimizer = prepared_optimizer
@@ -649,6 +651,8 @@ def test_generator_only_public_step_callback() -> None:
     trainer = object.__new__(MinimalTrainer)
     trainer.step = 0
     trainer.role_optimization = coordinator
+    # The public step is paced by the primary role, which is the first declared.
+    trainer.training_args = SimpleNamespace(required_trainable_roles=("generator", "fake"))
 
     with coordinator.phase("fake"):
         with coordinator.microbatch():
@@ -823,7 +827,7 @@ def test_role_plan_values_are_immutable_and_validate_ranges() -> None:
         RolePhase("fake", repeats=0)
     with pytest.raises(ValueError, match="update_frequency.*>= 1.*received 0"):
         RoleOptimizerConfig(
-            role_name="generator",
+            role_name="base",
             learning_rate=0.1,
             adam_betas=(0.9, 0.999),
             adam_weight_decay=0.0,

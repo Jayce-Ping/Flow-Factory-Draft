@@ -89,4 +89,4 @@ dispatch one replayed step), `score.py` (velocity-to-score projection for distil
 ## Cross-refs
 
 - UP: [`constraints.md` #14](../constraints.md#14-sample-dataclass-hierarchy), [`architecture.md` Sample Dataclass Hierarchy](../architecture.md#sample-dataclass-hierarchy)
-- PEER: [Component Runtime](component_runtime.md), [Model Roles](model_roles.md), [Train/Inference Consistency](train_inference_consistency.md)
+- PEER: [Component Runtime](component_runtime.md), [Component Variants](component_variants.md), [Train/Inference Consistency](train_inference_consistency.md)

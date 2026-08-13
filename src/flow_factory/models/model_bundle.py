@@ -37,7 +37,7 @@ from typing import Any, Dict, Mapping
 import torch
 import torch.nn as nn
 
-from .roles import ModelRoleRegistry
+from .variants import ComponentVariantRegistry
 
 
 class ModelBundle(nn.Module):
@@ -134,7 +134,7 @@ class RoutedComponentProxy:
     Args:
         bundle: Prepared single-root model bundle.
         canonical_name: Canonical adapter component name.
-        role_registry: Registry resolving active role routes. A legacy static inner
+        variant_registry: Registry resolving active role routes. A legacy static inner
             module remains accepted for existing direct proxy construction.
         inner_members: Unwrapped bundle members keyed by route name.
     """
@@ -143,46 +143,46 @@ class RoutedComponentProxy:
         self,
         bundle: nn.Module,
         canonical_name: str,
-        role_registry: ModelRoleRegistry | nn.Module,
+        variant_registry: ComponentVariantRegistry | nn.Module,
         inner_members: Mapping[str, nn.Module] | None = None,
     ) -> None:
         # Bypass __setattr__/__getattr__ for the proxy's own fields.
         object.__setattr__(self, "_bundle", bundle)
         object.__setattr__(self, "_canonical_name", canonical_name)
-        if isinstance(role_registry, ModelRoleRegistry):
+        if isinstance(variant_registry, ComponentVariantRegistry):
             if inner_members is None:
                 raise TypeError(
                     "expected inner_members mapping for role-aware RoutedComponentProxy "
                     f"component {canonical_name!r}, received None"
                 )
-            object.__setattr__(self, "_role_registry", role_registry)
+            object.__setattr__(self, "_variant_registry", variant_registry)
             object.__setattr__(self, "_inner_members", dict(inner_members))
             return
-        if not isinstance(role_registry, nn.Module):
+        if not isinstance(variant_registry, nn.Module):
             raise TypeError(
-                "expected ModelRoleRegistry or legacy torch.nn.Module inner component for "
+                "expected ComponentVariantRegistry or legacy torch.nn.Module inner component for "
                 f"RoutedComponentProxy component {canonical_name!r}, received "
-                f"{type(role_registry).__name__}: {role_registry!r}"
+                f"{type(variant_registry).__name__}: {variant_registry!r}"
             )
         if inner_members is not None:
             raise TypeError(
                 "expected inner_members=None with legacy RoutedComponentProxy inner module "
                 f"for component {canonical_name!r}, received {inner_members!r}"
             )
-        object.__setattr__(self, "_role_registry", None)
-        object.__setattr__(self, "_inner_members", {canonical_name: role_registry})
+        object.__setattr__(self, "_variant_registry", None)
+        object.__setattr__(self, "_inner_members", {canonical_name: variant_registry})
 
     def _active_route(self) -> str:
         """Resolve the active role's bundle route for this canonical component."""
-        registry = object.__getattribute__(self, "_role_registry")
+        registry = object.__getattribute__(self, "_variant_registry")
         canonical_name = object.__getattribute__(self, "_canonical_name")
         if registry is None:
             return canonical_name
-        active_role = registry.active_role
-        role_spec = registry.get_spec(active_role)
-        if canonical_name not in role_spec.component_routes:
+        active_variant = registry.active_variant
+        variant_spec = registry.get_spec(active_variant)
+        if canonical_name not in variant_spec.component_routes:
             return canonical_name
-        return registry.resolve_route(active_role, canonical_name)
+        return registry.resolve_route(active_variant, canonical_name)
 
     @property
     def inner(self) -> nn.Module:

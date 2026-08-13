@@ -23,40 +23,45 @@ from peft import LoraConfig, get_peft_model
 
 from flow_factory.models.abc import BaseAdapter
 from flow_factory.models.model_bundle import ModelBundle, RoutedComponentProxy
-from flow_factory.models.roles import ModelRoleRegistry, ModelRoleSpec, RoleParameter
+from flow_factory.models.variants import DEFAULT_BASE_VARIANT as BASE_VARIANT
+from flow_factory.models.variants import (
+    ComponentVariantRegistry,
+    ComponentVariantSpec,
+    VariantParameter,
+)
 
 
-def _registry() -> ModelRoleRegistry:
-    return ModelRoleRegistry(
+def _registry() -> ComponentVariantRegistry:
+    return ComponentVariantRegistry(
         SimpleNamespace(trainable_component_names=["transformer", "transformer_2"])
     )
 
 
-def _generator_spec() -> ModelRoleSpec:
-    return ModelRoleSpec(
-        name="generator",
+def _base_spec() -> ComponentVariantSpec:
+    return ComponentVariantSpec(
+        name=BASE_VARIANT,
         trainable=True,
         storage_mode="lora",
         component_routes={
             "transformer": "transformer",
             "transformer_2": "transformer_2",
         },
-        adapter_name="generator",
+        adapter_name=BASE_VARIANT,
     )
 
 
-def _declare_generator(registry: ModelRoleRegistry) -> torch.nn.Parameter:
-    registry.declare(_generator_spec())
+def _declare_base(registry: ComponentVariantRegistry) -> torch.nn.Parameter:
+    registry.declare(_base_spec())
     parameter = torch.nn.Parameter(torch.ones(1))
-    registry.register_parameter("generator", "transformer", "weight", parameter)
+    registry.register_parameter(BASE_VARIANT, "transformer", "weight", parameter)
     return parameter
 
 
 def test_declares_roles_in_exact_order_and_resolves_routes() -> None:
     registry = _registry()
-    _declare_generator(registry)
+    _declare_base(registry)
     registry.declare(
-        ModelRoleSpec(
+        ComponentVariantSpec(
             name="fake",
             trainable=True,
             storage_mode="full",
@@ -69,8 +74,8 @@ def test_declares_roles_in_exact_order_and_resolves_routes() -> None:
     fake_parameter = torch.nn.Parameter(torch.zeros(1))
     registry.register_parameter("fake", "transformer", "weight", fake_parameter)
     registry.declare(
-        ModelRoleSpec(
-            name="reference",
+        ComponentVariantSpec(
+            name="snapshot",
             trainable=False,
             storage_mode="snapshot",
             component_routes={
@@ -80,19 +85,20 @@ def test_declares_roles_in_exact_order_and_resolves_routes() -> None:
         )
     )
 
-    assert registry.role_names == ("generator", "fake", "reference")
-    assert registry.resolve_route("generator", "transformer") == "transformer"
+    assert registry.variant_names == (BASE_VARIANT, "fake", "snapshot")
+    assert registry.resolve_route(BASE_VARIANT, "transformer") == "transformer"
     assert registry.resolve_route("fake", "transformer_2") == "fake__transformer_2"
     assert registry.parameters("fake") == (fake_parameter,)
     assert registry.parameter_records("fake")[0].parameter_name == "weight"
 
 
-def test_requires_generator_as_first_declaration() -> None:
+def test_the_first_declared_variant_must_own_the_canonical_routes() -> None:
+    """The base is positional, so whatever is declared first must be the base."""
     registry = _registry()
 
-    with pytest.raises(ValueError, match="first.*generator.*received.*fake"):
+    with pytest.raises(ValueError, match="base variant 'fake'.*canonical route"):
         registry.declare(
-            ModelRoleSpec(
+            ComponentVariantSpec(
                 name="fake",
                 trainable=True,
                 storage_mode="full",
@@ -101,36 +107,44 @@ def test_requires_generator_as_first_declaration() -> None:
         )
 
 
-def test_rejects_duplicate_and_illegal_role_names_with_details() -> None:
+def test_rejects_duplicate_and_illegal_variant_names_with_details() -> None:
     registry = _registry()
-    registry.declare(_generator_spec())
+    registry.declare(_base_spec())
 
-    with pytest.raises(ValueError, match="already declared.*generator"):
-        registry.declare(_generator_spec())
-    with pytest.raises(
-        ValueError,
-        match="expected one of.*generator.*fake.*surrogate.*reference.*received.*critic",
-    ):
-        registry.declare(
-            ModelRoleSpec(
-                name="critic",  # type: ignore[arg-type]
-                trainable=True,
-                storage_mode="full",
-                component_routes={"transformer": "critic__transformer"},
-            )
+    with pytest.raises(ValueError, match="already declared.*base"):
+        registry.declare(_base_spec())
+
+    # Variant names are the caller's. The model layer knows nothing about what an
+    # algorithm calls its copies, so an unfamiliar name is simply accepted.
+    registry.declare(
+        ComponentVariantSpec(
+            name="critic",
+            trainable=True,
+            storage_mode="full",
+            component_routes={"transformer": "critic__transformer"},
+        )
+    )
+    assert "critic" in registry.variant_names
+
+    with pytest.raises(TypeError, match="non-empty string component variant name"):
+        ComponentVariantSpec(
+            name="",
+            trainable=True,
+            storage_mode="full",
+            component_routes={"transformer": "empty__transformer"},
         )
 
 
-def test_generator_maps_every_trainable_component_to_canonical_route() -> None:
+def test_base_maps_every_trainable_component_to_canonical_route() -> None:
     registry = _registry()
 
     with pytest.raises(
         ValueError,
-        match="generator.*canonical.*transformer_2.*received",
+        match="base.*canonical.*transformer_2.*received",
     ):
         registry.declare(
-            ModelRoleSpec(
-                name="generator",
+            ComponentVariantSpec(
+                name=BASE_VARIANT,
                 trainable=True,
                 storage_mode="lora",
                 component_routes={"transformer": "renamed_transformer"},
@@ -140,14 +154,14 @@ def test_generator_maps_every_trainable_component_to_canonical_route() -> None:
 
 def test_rejects_route_collisions_with_role_and_component_details() -> None:
     registry = _registry()
-    registry.declare(_generator_spec())
+    registry.declare(_base_spec())
 
     with pytest.raises(
         ValueError,
-        match="route collision.*transformer.*generator.*transformer.*fake.*transformer_2",
+        match="route collision.*transformer.*base.*transformer.*fake.*transformer_2",
     ):
         registry.declare(
-            ModelRoleSpec(
+            ComponentVariantSpec(
                 name="fake",
                 trainable=True,
                 storage_mode="full",
@@ -158,10 +172,10 @@ def test_rejects_route_collisions_with_role_and_component_details() -> None:
 
 def test_lora_roles_can_share_a_route_for_the_same_canonical_component() -> None:
     registry = _registry()
-    registry.declare(_generator_spec())
+    registry.declare(_base_spec())
 
     registry.declare(
-        ModelRoleSpec(
+        ComponentVariantSpec(
             name="fake",
             trainable=True,
             storage_mode="lora",
@@ -170,22 +184,22 @@ def test_lora_roles_can_share_a_route_for_the_same_canonical_component() -> None
         )
     )
 
-    assert registry.resolve_route("generator", "transformer") == "transformer"
+    assert registry.resolve_route(BASE_VARIANT, "transformer") == "transformer"
     assert registry.resolve_route("fake", "transformer") == "transformer"
 
 
-@pytest.mark.parametrize("role_name", ["fake", "surrogate"])
-def test_full_trainable_roles_cannot_alias_the_generator_route(role_name: str) -> None:
+@pytest.mark.parametrize("variant_name", ["fake", "surrogate"])
+def test_full_trainable_roles_cannot_alias_the_base_route(variant_name: str) -> None:
     registry = _registry()
-    registry.declare(_generator_spec())
+    registry.declare(_base_spec())
 
     with pytest.raises(
         ValueError,
-        match=f"shared route.*transformer.*{role_name}.*storage_mode.*full.*generator",
+        match=f"shared route.*transformer.*{variant_name}.*storage_mode.*full.*base",
     ):
         registry.declare(
-            ModelRoleSpec(
-                name=role_name,  # type: ignore[arg-type]
+            ComponentVariantSpec(
+                name=variant_name,  # type: ignore[arg-type]
                 trainable=True,
                 storage_mode="full",
                 component_routes={"transformer": "transformer"},
@@ -193,27 +207,27 @@ def test_full_trainable_roles_cannot_alias_the_generator_route(role_name: str) -
         )
 
 
-def test_reference_snapshot_can_share_the_generator_route() -> None:
+def test_reference_snapshot_can_share_the_base_route() -> None:
     registry = _registry()
-    registry.declare(_generator_spec())
+    registry.declare(_base_spec())
 
     registry.declare(
-        ModelRoleSpec(
-            name="reference",
+        ComponentVariantSpec(
+            name="snapshot",
             trainable=False,
             storage_mode="snapshot",
             component_routes={"transformer": "transformer"},
         )
     )
 
-    assert registry.resolve_route("reference", "transformer") == "transformer"
+    assert registry.resolve_route("snapshot", "transformer") == "transformer"
 
 
 def test_parameter_identity_belongs_to_only_one_trainable_role() -> None:
     registry = _registry()
-    generator_parameter = _declare_generator(registry)
+    base_parameter = _declare_base(registry)
     registry.declare(
-        ModelRoleSpec(
+        ComponentVariantSpec(
             name="fake",
             trainable=True,
             storage_mode="full",
@@ -223,19 +237,19 @@ def test_parameter_identity_belongs_to_only_one_trainable_role() -> None:
 
     with pytest.raises(
         ValueError,
-        match="parameter identity.*generator.*fake.*transformer.*weight",
+        match="parameter identity.*base.*fake.*transformer.*weight",
     ):
-        registry.register_parameter("fake", "transformer", "weight", generator_parameter)
+        registry.register_parameter("fake", "transformer", "weight", base_parameter)
 
 
-def test_reference_is_non_trainable_and_cannot_own_parameters() -> None:
+def test_snapshot_variant_is_non_trainable_and_cannot_own_parameters() -> None:
     registry = _registry()
-    _declare_generator(registry)
+    _declare_base(registry)
 
-    with pytest.raises(ValueError, match="reference.*non-trainable.*received.*True"):
+    with pytest.raises(ValueError, match="snapshot.*non-trainable.*received.*True"):
         registry.declare(
-            ModelRoleSpec(
-                name="reference",
+            ComponentVariantSpec(
+                name="snapshot",
                 trainable=True,
                 storage_mode="snapshot",
                 component_routes={"transformer": "reference__transformer"},
@@ -243,48 +257,48 @@ def test_reference_is_non_trainable_and_cannot_own_parameters() -> None:
         )
 
     registry.declare(
-        ModelRoleSpec(
-            name="reference",
+        ComponentVariantSpec(
+            name="snapshot",
             trainable=False,
             storage_mode="snapshot",
             component_routes={"transformer": "reference__transformer"},
         )
     )
-    with pytest.raises(ValueError, match="reference.*non-trainable.*parameter"):
+    with pytest.raises(ValueError, match="snapshot.*non-trainable.*parameter"):
         registry.register_parameter(
-            "reference",
+            "snapshot",
             "transformer",
             "weight",
             torch.nn.Parameter(torch.ones(1)),
         )
 
 
-def test_freeze_rejects_empty_trainable_role_with_role_name() -> None:
+def test_freeze_rejects_empty_trainable_role_with_variant_name() -> None:
     registry = _registry()
-    registry.declare(_generator_spec())
+    registry.declare(_base_spec())
 
-    with pytest.raises(ValueError, match="trainable role.*generator.*at least one parameter"):
+    with pytest.raises(ValueError, match="trainable variant.*base.*at least one parameter"):
         registry.freeze()
 
 
 def test_freeze_blocks_declaration_and_ownership_mutation_with_details() -> None:
     registry = _registry()
-    _declare_generator(registry)
+    _declare_base(registry)
     registry.freeze()
 
     assert registry.is_frozen
     with pytest.raises(RuntimeError, match="declare.*fake.*frozen"):
         registry.declare(
-            ModelRoleSpec(
+            ComponentVariantSpec(
                 name="fake",
                 trainable=True,
                 storage_mode="full",
                 component_routes={"transformer": "fake__transformer"},
             )
         )
-    with pytest.raises(RuntimeError, match="register parameter.*generator.*frozen"):
+    with pytest.raises(RuntimeError, match="register parameter.*base.*frozen"):
         registry.register_parameter(
-            "generator",
+            BASE_VARIANT,
             "transformer",
             "bias",
             torch.nn.Parameter(torch.zeros(1)),
@@ -296,12 +310,12 @@ def test_spec_routes_and_metadata_are_immutable_snapshots() -> None:
         "transformer": "transformer",
         "transformer_2": "transformer_2",
     }
-    spec = ModelRoleSpec(
-        name="generator",
+    spec = ComponentVariantSpec(
+        name=BASE_VARIANT,
         trainable=True,
         storage_mode="lora",
         component_routes=component_routes,
-        adapter_name="generator",
+        adapter_name=BASE_VARIANT,
     )
     component_routes["transformer"] = "mutated"
     with pytest.raises(TypeError):
@@ -310,26 +324,26 @@ def test_spec_routes_and_metadata_are_immutable_snapshots() -> None:
     registry = _registry()
     registry.declare(spec)
     _declare_parameter = torch.nn.Parameter(torch.ones(1))
-    registry.register_parameter("generator", "transformer", "weight", _declare_parameter)
+    registry.register_parameter(BASE_VARIANT, "transformer", "weight", _declare_parameter)
     metadata = registry.metadata()
-    metadata["roles"][0]["component_routes"]["transformer"] = "mutated"
-    metadata["roles"].append({"name": "fake"})
+    metadata["variants"][0]["component_routes"]["transformer"] = "mutated"
+    metadata["variants"].append({"name": "fake"})
 
     assert spec.component_routes["transformer"] == "transformer"
-    assert registry.resolve_route("generator", "transformer") == "transformer"
-    assert registry.role_names == ("generator",)
-    assert registry.metadata()["roles"][0]["component_routes"]["transformer"] == "transformer"
+    assert registry.resolve_route(BASE_VARIANT, "transformer") == "transformer"
+    assert registry.variant_names == (BASE_VARIANT,)
+    assert registry.metadata()["variants"][0]["component_routes"]["transformer"] == "transformer"
 
 
 def test_registration_validates_declared_route_and_parameter_type() -> None:
     registry = _registry()
-    registry.declare(_generator_spec())
+    registry.declare(_base_spec())
 
-    with pytest.raises(KeyError, match="generator.*vae.*declared components"):
-        registry.register_parameter("generator", "vae", "weight", torch.nn.Parameter(torch.ones(1)))
-    with pytest.raises(TypeError, match="torch.nn.Parameter.*generator.*weight.*Tensor"):
+    with pytest.raises(KeyError, match="base.*vae.*declared components"):
+        registry.register_parameter(BASE_VARIANT, "vae", "weight", torch.nn.Parameter(torch.ones(1)))
+    with pytest.raises(TypeError, match="torch.nn.Parameter.*base.*weight.*Tensor"):
         registry.register_parameter(
-            "generator",
+            BASE_VARIANT,
             "transformer",
             "weight",
             torch.ones(1),  # type: ignore[arg-type]
@@ -344,7 +358,7 @@ def test_registry_rejects_malformed_adapter_component_collections(component_name
         TypeError,
         match=f"non-string iterable.*{type(component_names).__name__}.*{component_names!r}",
     ):
-        ModelRoleRegistry(adapter)
+        ComponentVariantRegistry(adapter)
 
 
 @pytest.mark.parametrize(
@@ -376,14 +390,14 @@ def test_spec_rejects_wrong_value_types(
     }
 
     with pytest.raises(TypeError, match=expected_detail):
-        ModelRoleSpec(**kwargs)  # type: ignore[arg-type]
+        ComponentVariantSpec(**kwargs)  # type: ignore[arg-type]
 
 
-def test_rejects_out_of_order_roles_and_same_spec_route_collisions() -> None:
+def test_declaration_order_is_the_callers_and_route_collisions_are_rejected() -> None:
     registry = _registry()
-    registry.declare(_generator_spec())
+    registry.declare(_base_spec())
     registry.declare(
-        ModelRoleSpec(
+        ComponentVariantSpec(
             name="surrogate",
             trainable=True,
             storage_mode="full",
@@ -391,21 +405,23 @@ def test_rejects_out_of_order_roles_and_same_spec_route_collisions() -> None:
         )
     )
 
-    with pytest.raises(ValueError, match="fake.*surrogate.*canonical order"):
-        registry.declare(
-            ModelRoleSpec(
-                name="fake",
-                trainable=True,
-                storage_mode="full",
-                component_routes={"transformer": "fake__transformer"},
-            )
+    # Declaration order after the base is the caller's; the model layer imposes no
+    # canonical sequence over names it does not understand.
+    registry.declare(
+        ComponentVariantSpec(
+            name="fake",
+            trainable=True,
+            storage_mode="full",
+            component_routes={"transformer": "fake__transformer"},
         )
+    )
+    assert registry.variant_names == (BASE_VARIANT, "surrogate", "fake")
 
     collision_registry = _registry()
-    collision_registry.declare(_generator_spec())
+    collision_registry.declare(_base_spec())
     with pytest.raises(ValueError, match="route collision.*shared.*transformer.*transformer_2"):
         collision_registry.declare(
-            ModelRoleSpec(
+            ComponentVariantSpec(
                 name="fake",
                 trainable=True,
                 storage_mode="full",
@@ -419,8 +435,8 @@ def test_rejects_out_of_order_roles_and_same_spec_route_collisions() -> None:
 
 def test_parameter_records_are_frozen_and_metadata_excludes_parameter_objects() -> None:
     parameter = torch.nn.Parameter(torch.ones(1))
-    record = RoleParameter(
-        role_name="generator",
+    record = VariantParameter(
+        variant_name=BASE_VARIANT,
         component_name="transformer",
         parameter_name="weight",
         parameter=parameter,
@@ -430,8 +446,8 @@ def test_parameter_records_are_frozen_and_metadata_excludes_parameter_objects() 
         record.parameter_name = "bias"  # type: ignore[misc]
 
     registry = _registry()
-    registry.declare(_generator_spec())
-    registry.register_parameter("generator", "transformer", "weight", parameter)
+    registry.declare(_base_spec())
+    registry.register_parameter(BASE_VARIANT, "transformer", "weight", parameter)
     metadata_text = repr(registry.metadata())
 
     assert "Parameter containing" not in metadata_text
@@ -503,66 +519,66 @@ def _adapter_parameter_ids(adapter: _TinyRoleAdapter) -> set[int]:
     return {id(parameter) for parameter in adapter.get_component("transformer").parameters()}
 
 
-def _assert_all_owned_role_parameters_trainable(registry: ModelRoleRegistry) -> None:
-    for role_name in registry.role_names:
-        if registry.get_spec(role_name).trainable:
-            assert registry.parameters(role_name)
-            assert all(parameter.requires_grad for parameter in registry.parameters(role_name))
+def _assert_all_owned_role_parameters_trainable(registry: ComponentVariantRegistry) -> None:
+    for variant_name in registry.variant_names:
+        if registry.get_spec(variant_name).trainable:
+            assert registry.parameters(variant_name)
+            assert all(parameter.requires_grad for parameter in registry.parameters(variant_name))
 
 
 def test_lora_materialization_uses_named_adapters_and_exact_new_parameter_identity() -> None:
     adapter = _TinyRoleAdapter("lora")
     ids_before_materialization = _adapter_parameter_ids(adapter)
 
-    adapter.configure_model_roles(["generator", "fake", "surrogate"])
+    adapter.declare_component_variants([BASE_VARIANT, "fake", "surrogate"])
 
-    registry = adapter.model_role_registry
+    registry = adapter.component_variant_registry
     component = adapter.get_component("transformer")
     assert set(component.peft_config) == {"default", "fake", "surrogate"}
-    assert registry.role_names == ("generator", "fake", "surrogate", "reference")
-    assert registry.get_spec("generator").adapter_name == "default"
+    assert registry.variant_names == (BASE_VARIANT, "fake", "surrogate", "snapshot")
+    assert registry.get_spec(BASE_VARIANT).adapter_name == "default"
     assert registry.get_spec("fake").adapter_name == "fake"
     assert registry.get_spec("surrogate").adapter_name == "surrogate"
     assert registry.bundle_members() == {"transformer": component}
 
-    generator_ids = {id(parameter) for parameter in registry.parameters("generator")}
+    base_ids = {id(parameter) for parameter in registry.parameters(BASE_VARIANT)}
     fake_ids = {id(parameter) for parameter in registry.parameters("fake")}
     surrogate_ids = {id(parameter) for parameter in registry.parameters("surrogate")}
     ids_after_materialization = _adapter_parameter_ids(adapter)
-    assert generator_ids <= ids_before_materialization
+    assert base_ids <= ids_before_materialization
     assert fake_ids | surrogate_ids == ids_after_materialization - ids_before_materialization
-    assert generator_ids
+    assert base_ids
     assert fake_ids
     assert surrogate_ids
-    assert generator_ids.isdisjoint(fake_ids)
-    assert generator_ids.isdisjoint(surrogate_ids)
+    assert base_ids.isdisjoint(fake_ids)
+    assert base_ids.isdisjoint(surrogate_ids)
     assert fake_ids.isdisjoint(surrogate_ids)
     _assert_all_owned_role_parameters_trainable(registry)
 
 
 def test_lora_role_contexts_activate_named_adapters_and_restore_after_exception() -> None:
     adapter = _TinyRoleAdapter("lora")
-    adapter.configure_model_roles(["generator", "fake"])
-    registry = adapter.model_role_registry
+    adapter.declare_component_variants([BASE_VARIANT, "fake"])
+    registry = adapter.component_variant_registry
     component = adapter.get_component("transformer")
 
-    assert registry.active_role == "generator"
+    assert registry.active_variant == BASE_VARIANT
     assert component.active_adapter == "default"
     _assert_all_owned_role_parameters_trainable(registry)
-    with adapter.use_model_role("fake"):
-        assert registry.active_role == "fake"
+    with adapter.use_component_variant("fake"):
+        assert registry.active_variant == "fake"
         assert component.active_adapter == "fake"
         _assert_all_owned_role_parameters_trainable(registry)
         with pytest.raises(RuntimeError, match="inner failure"):
-            with adapter.use_model_role("reference"):
-                assert registry.active_role == "reference"
+            with adapter.use_component_variant("snapshot"):
+                assert registry.active_variant == "snapshot"
                 _assert_all_owned_role_parameters_trainable(registry)
                 assert all(
                     module.disable_adapters
                     for module in component.modules()
                     if hasattr(module, "disable_adapters")
                 )
-                with adapter.use_model_role("reference"):
+                with adapter.use_component_variant("snapshot"):
                     assert all(
                         module.disable_adapters
                         for module in component.modules()
@@ -571,97 +587,97 @@ def test_lora_role_contexts_activate_named_adapters_and_restore_after_exception(
                     _assert_all_owned_role_parameters_trainable(registry)
                 _assert_all_owned_role_parameters_trainable(registry)
                 raise RuntimeError("inner failure")
-        assert registry.active_role == "fake"
+        assert registry.active_variant == "fake"
         assert component.active_adapter == "fake"
         _assert_all_owned_role_parameters_trainable(registry)
-    assert registry.active_role == "generator"
+    assert registry.active_variant == BASE_VARIANT
     assert component.active_adapter == "default"
     _assert_all_owned_role_parameters_trainable(registry)
 
 
-@pytest.mark.parametrize("required_roles", [None, "generator", b"generator", 7, {"generator"}])
-def test_configure_model_roles_rejects_non_sequence_inputs(required_roles: object) -> None:
+@pytest.mark.parametrize("required_roles", [None, BASE_VARIANT, b"base", 7, {BASE_VARIANT}])
+def test_declare_component_variants_rejects_non_sequence_inputs(required_roles: object) -> None:
     adapter = _TinyRoleAdapter("full")
 
     with pytest.raises(
         TypeError,
         match=(
-            "expected required_trainable_roles to be a non-string sequence.*"
+            "expected required_variants to be a non-string sequence.*"
             f"received {type(required_roles).__name__}: {required_roles!r}"
         ),
     ):
-        adapter.configure_model_roles(required_roles)  # type: ignore[arg-type]
+        adapter.declare_component_variants(required_roles)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("required_roles", [None, "generator", b"generator", 7, {"generator"}])
+@pytest.mark.parametrize("required_roles", [None, BASE_VARIANT, b"base", 7, {BASE_VARIANT}])
 def test_registry_materialize_rejects_non_sequence_inputs(required_roles: object) -> None:
     registry = _registry()
 
     with pytest.raises(
         TypeError,
         match=(
-            "expected required_trainable_roles to be a non-string sequence.*"
+            "expected required_variants to be a non-string sequence.*"
             f"received {type(required_roles).__name__}: {required_roles!r}"
         ),
     ):
         registry.materialize(required_roles)  # type: ignore[arg-type]
 
 
-def test_configure_model_roles_rejects_non_string_unhashable_entries() -> None:
+def test_declare_component_variants_rejects_non_string_unhashable_entries() -> None:
     adapter = _TinyRoleAdapter("full")
-    required_roles = ["generator", ["fake"]]
+    required_roles = [BASE_VARIANT, ["fake"]]
 
     with pytest.raises(
         TypeError,
-        match="expected string role name.*index 1.*received list.*fake",
+        match="expected string variant name.*index 1.*received list.*fake",
     ):
-        adapter.configure_model_roles(required_roles)  # type: ignore[arg-type]
+        adapter.declare_component_variants(required_roles)  # type: ignore[arg-type]
 
 
 def test_registry_materialize_rejects_non_string_unhashable_entries() -> None:
     registry = _registry()
-    required_roles = ["generator", ["fake"]]
+    required_roles = [BASE_VARIANT, ["fake"]]
 
     with pytest.raises(
         TypeError,
-        match="expected string role name.*index 1.*received list.*fake",
+        match="expected string variant name.*index 1.*received list.*fake",
     ):
         registry.materialize(required_roles)  # type: ignore[arg-type]
 
 
 def test_full_materialization_copies_routes_and_preserves_target_module_freezing() -> None:
     adapter = _TinyRoleAdapter("full")
-    generator = adapter.get_component("transformer")
-    generator_state = {
+    base = adapter.get_component("transformer")
+    base_state = {
         parameter_name: parameter.detach().clone()
-        for parameter_name, parameter in generator.named_parameters()
+        for parameter_name, parameter in base.named_parameters()
     }
 
-    adapter.configure_model_roles(["generator", "fake", "surrogate"])
+    adapter.declare_component_variants([BASE_VARIANT, "fake", "surrogate"])
 
-    registry = adapter.model_role_registry
+    registry = adapter.component_variant_registry
     members = registry.bundle_members()
     assert tuple(members) == (
         "transformer",
         "fake__transformer",
         "surrogate__transformer",
     )
-    for role_name in ("fake", "surrogate"):
-        route_name = f"{role_name}__transformer"
+    for variant_name in ("fake", "surrogate"):
+        route_name = f"{variant_name}__transformer"
         replica = members[route_name]
-        assert replica is not generator
-        assert registry.resolve_route(role_name, "transformer") == route_name
+        assert replica is not base
+        assert registry.resolve_route(variant_name, "transformer") == route_name
         assert {
             parameter_name: parameter.detach()
             for parameter_name, parameter in replica.named_parameters()
-        }.keys() == generator_state.keys()
+        }.keys() == base_state.keys()
         for parameter_name, parameter in replica.named_parameters():
-            assert torch.equal(parameter, generator_state[parameter_name])
+            assert torch.equal(parameter, base_state[parameter_name])
             assert parameter.requires_grad is ("target" in parameter_name)
 
     role_parameter_ids = [
-        {id(parameter) for parameter in registry.parameters(role_name)}
-        for role_name in ("generator", "fake", "surrogate")
+        {id(parameter) for parameter in registry.parameters(variant_name)}
+        for variant_name in (BASE_VARIANT, "fake", "surrogate")
     ]
     assert all(role_parameter_ids)
     assert role_parameter_ids[0].isdisjoint(role_parameter_ids[1])
@@ -671,27 +687,27 @@ def test_full_materialization_copies_routes_and_preserves_target_module_freezing
 
 def test_full_reference_uses_snapshot_context_and_nested_roles_restore_exactly() -> None:
     adapter = _TinyRoleAdapter("full")
-    adapter.configure_model_roles(["generator", "fake"])
-    registry = adapter.model_role_registry
+    adapter.declare_component_variants([BASE_VARIANT, "fake"])
+    registry = adapter.component_variant_registry
 
     with registry.use("fake"):
-        with registry.use("reference"):
-            assert registry.active_role == "reference"
+        with registry.use("snapshot"):
+            assert registry.active_variant == "snapshot"
             assert adapter.reference_is_active
-        assert registry.active_role == "fake"
+        assert registry.active_variant == "fake"
         assert not adapter.reference_is_active
-    assert registry.active_role == "generator"
+    assert registry.active_variant == BASE_VARIANT
 
 
 def test_role_materialization_is_one_shot_and_rejected_after_registry_freeze() -> None:
     adapter = _TinyRoleAdapter("full")
-    adapter.configure_model_roles(["generator", "fake"])
+    adapter.declare_component_variants([BASE_VARIANT, "fake"])
 
-    assert adapter.model_role_registry.is_frozen
+    assert adapter.component_variant_registry.is_frozen
     with pytest.raises(RuntimeError, match="materialize.*frozen"):
-        adapter.model_role_registry.materialize(["generator"])
-    with pytest.raises(RuntimeError, match="configure.*frozen"):
-        adapter.configure_model_roles(["generator"])
+        adapter.component_variant_registry.materialize([BASE_VARIANT])
+    with pytest.raises(RuntimeError, match="declare.*frozen"):
+        adapter.declare_component_variants([BASE_VARIANT])
 
 
 def _fill_role_module(component: _TinyRoleModule, target: float, frozen: float = 0.0) -> None:
@@ -701,8 +717,8 @@ def _fill_role_module(component: _TinyRoleModule, target: float, frozen: float =
 
 def test_routed_proxy_dispatches_full_roles_and_attributes_through_one_bundle() -> None:
     adapter = _TinyRoleAdapter("full")
-    adapter.configure_model_roles(["generator", "fake", "surrogate"])
-    registry = adapter.model_role_registry
+    adapter.declare_component_variants([BASE_VARIANT, "fake", "surrogate"])
+    registry = adapter.component_variant_registry
     members = registry.bundle_members()
     _fill_role_module(members["transformer"], 1.0)
     _fill_role_module(members["fake__transformer"], 2.0)
@@ -715,11 +731,11 @@ def test_routed_proxy_dispatches_full_roles_and_attributes_through_one_bundle() 
     assert proxy.inner is members["transformer"]
     assert torch.equal(proxy(inputs), torch.full((1, 2), 2.0))
     assert proxy.target is members["transformer"].target
-    with adapter.use_model_role("fake"):
+    with adapter.use_component_variant("fake"):
         assert proxy.inner is members["fake__transformer"]
         assert proxy.target is members["fake__transformer"].target
         assert torch.equal(proxy(inputs), torch.full((1, 2), 4.0))
-        with adapter.use_model_role("surrogate"):
+        with adapter.use_component_variant("surrogate"):
             assert proxy.inner is members["surrogate__transformer"]
             assert torch.equal(proxy(inputs), torch.full((1, 2), 6.0))
         assert proxy.inner is members["fake__transformer"]
@@ -729,42 +745,42 @@ def test_routed_proxy_dispatches_full_roles_and_attributes_through_one_bundle() 
 
 def test_routed_proxy_uses_active_lora_adapter_on_canonical_bundle_route() -> None:
     adapter = _TinyRoleAdapter("lora")
-    adapter.configure_model_roles(["generator", "fake"])
-    registry = adapter.model_role_registry
+    adapter.declare_component_variants([BASE_VARIANT, "fake"])
+    registry = adapter.component_variant_registry
     members = registry.bundle_members()
     bundle = ModelBundle(members)
     proxy = RoutedComponentProxy(bundle, "transformer", registry, bundle.members)
     inputs = torch.ones(1, 2)
-    for parameter in registry.parameters("generator"):
+    for parameter in registry.parameters(BASE_VARIANT):
         parameter.data.fill_(1.0)
     for parameter in registry.parameters("fake"):
         parameter.data.fill_(2.0)
 
     assert proxy.active_adapter == "default"
-    assert registry.resolve_route("generator", "transformer") == "transformer"
-    generator_output = proxy(inputs)
-    with adapter.use_model_role("fake"):
+    assert registry.resolve_route(BASE_VARIANT, "transformer") == "transformer"
+    base_output = proxy(inputs)
+    with adapter.use_component_variant("fake"):
         assert proxy.active_adapter == "fake"
         assert registry.resolve_route("fake", "transformer") == "transformer"
         assert proxy.inner is members["transformer"]
         fake_output = proxy(inputs)
-        assert not torch.equal(fake_output, generator_output)
+        assert not torch.equal(fake_output, base_output)
     assert proxy.active_adapter == "default"
-    assert torch.equal(proxy(inputs), generator_output)
+    assert torch.equal(proxy(inputs), base_output)
 
 
 def test_routed_proxy_preserves_default_role_after_unknown_role_error() -> None:
     adapter = _TinyRoleAdapter("full")
-    adapter.configure_model_roles(["generator", "fake"])
-    registry = adapter.model_role_registry
+    adapter.declare_component_variants([BASE_VARIANT, "fake"])
+    registry = adapter.component_variant_registry
     bundle = ModelBundle(registry.bundle_members())
     proxy = RoutedComponentProxy(bundle, "transformer", registry, bundle.members)
 
-    with pytest.raises(KeyError, match="critic.*available roles"):
-        with adapter.use_model_role("critic"):  # type: ignore[arg-type]
+    with pytest.raises(KeyError, match="critic.*available variants"):
+        with adapter.use_component_variant("critic"):  # type: ignore[arg-type]
             pass
 
-    assert registry.active_role == "generator"
+    assert registry.active_variant == BASE_VARIANT
     assert proxy.inner is bundle.members["transformer"]
 
 

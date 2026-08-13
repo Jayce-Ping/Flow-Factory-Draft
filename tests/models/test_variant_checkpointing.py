@@ -26,7 +26,10 @@ from safetensors.torch import load_file, save_file
 
 from flow_factory.models.abc import BaseAdapter
 from flow_factory.models.model_bundle import ModelBundle, RoutedComponentProxy
-from flow_factory.models.roles import ModelRoleRegistry
+from flow_factory.models.variants import DEFAULT_BASE_VARIANT as BASE_VARIANT
+from flow_factory.models.variants import (
+    ComponentVariantRegistry,
+)
 from flow_factory.trainers.abc import BaseTrainer
 from flow_factory.trainers.role_optimization import (
     OptimizationRole,
@@ -99,15 +102,15 @@ class TinyRoleAdapter(BaseAdapter):
         return ["transformer"]
 
     def has_component(self, name: str) -> bool:
-        """Declare the tiny role components without a real component runtime."""
+        """Declare the tiny variant components without a real component runtime."""
         return name in self._role_components
 
     def get_component(self, name: str) -> torch.nn.Module:
-        """Return a tiny role component."""
+        """Return a tiny variant component."""
         return self._role_components[name]
 
     def set_component(self, name: str, module: torch.nn.Module) -> None:
-        """Replace a tiny role component."""
+        """Replace a tiny variant component."""
         self._role_components[name] = module
 
     @contextmanager
@@ -176,9 +179,9 @@ class MutatingStateAccelerator:
         """Provide the adapter checkpoint synchronization surface."""
 
 
-def _role_config(role_name: str, update_frequency: int = 1) -> RoleOptimizerConfig:
+def _role_config(variant_name: str, update_frequency: int = 1) -> RoleOptimizerConfig:
     return RoleOptimizerConfig(
-        role_name=role_name,  # type: ignore[arg-type]
+        role_name=variant_name,  # type: ignore[arg-type]
         learning_rate=0.01,
         adam_betas=(0.9, 0.99),
         adam_weight_decay=0.0,
@@ -191,38 +194,38 @@ def _role_config(role_name: str, update_frequency: int = 1) -> RoleOptimizerConf
 def _trainer_runtime(
     finetune_type: str,
     *,
-    role_names: Tuple[str, ...] = ("generator", "fake"),
+    variant_names: Tuple[str, ...] = (BASE_VARIANT, "fake"),
 ) -> TinyTrainer:
     accelerator = Accelerator(cpu=True)
     adapter = TinyRoleAdapter(accelerator, finetune_type)
-    adapter.configure_model_roles(role_names)
-    registry = adapter.model_role_registry
+    adapter.declare_component_variants(variant_names)
+    registry = adapter.component_variant_registry
     bundle = ModelBundle(registry.bundle_members())
     role_configs = {
-        role_name: _role_config(role_name, update_frequency=2 if role_name == "fake" else 1)
-        for role_name in role_names
+        variant_name: _role_config(variant_name, update_frequency=2 if variant_name == "fake" else 1)
+        for variant_name in variant_names
     }
     optimizer = torch.optim.AdamW(
         [
             {
-                "params": list(registry.parameters(role_name)),
-                "role_name": role_name,
-                "lr": role_configs[role_name].learning_rate,
-                "betas": role_configs[role_name].adam_betas,
-                "weight_decay": role_configs[role_name].adam_weight_decay,
-                "eps": role_configs[role_name].adam_epsilon,
+                "params": list(registry.parameters(variant_name)),
+                "role_name": variant_name,
+                "lr": role_configs[variant_name].learning_rate,
+                "betas": role_configs[variant_name].adam_betas,
+                "weight_decay": role_configs[variant_name].adam_weight_decay,
+                "eps": role_configs[variant_name].adam_epsilon,
             }
-            for role_name in role_names
+            for variant_name in variant_names
         ]
     )
     prepared_bundle, prepared_optimizer = accelerator.prepare(bundle, optimizer)
     optimization_roles = {
-        role_name: OptimizationRole(
-            config=role_configs[role_name],
+        variant_name: OptimizationRole(
+            config=role_configs[variant_name],
             parameters=tuple(prepared_optimizer.param_groups[group_id]["params"]),
             optimizer_group_ids=(group_id,),
         )
-        for group_id, role_name in enumerate(role_names)
+        for group_id, variant_name in enumerate(variant_names)
     }
     trainer = object.__new__(TinyTrainer)
     trainer.accelerator = accelerator
@@ -238,7 +241,7 @@ def _trainer_runtime(
     )
     trainer.training_args = SimpleNamespace(
         trainer_type="dmd2",
-        required_trainable_roles=role_names,
+        required_trainable_roles=variant_names,
     )
     trainer.step = 0
     return trainer
@@ -261,7 +264,7 @@ def test_accelerate_round_trip_restores_all_roles_one_optimizer_and_counters(
     trainer = _trainer_runtime(finetune_type)
     trainer._register_multirole_checkpointing()
     _step_fake_role(trainer)
-    trainer.optimization_roles["generator"].step = 7
+    trainer.optimization_roles[BASE_VARIANT].step = 7
     trainer.step = 7
     expected_parameters = {
         name: parameter.detach().clone()
@@ -277,7 +280,7 @@ def test_accelerate_round_trip_restores_all_roles_one_optimizer_and_counters(
         parameter.data.add_(100)
     trainer.optimizer.state.clear()
     trainer.optimization_roles["fake"].step = 0
-    trainer.optimization_roles["generator"].step = 0
+    trainer.optimization_roles[BASE_VARIANT].step = 0
     trainer.step = 0
     trainer.accelerator.load_state(str(tmp_path))
 
@@ -285,9 +288,9 @@ def test_accelerate_round_trip_restores_all_roles_one_optimizer_and_counters(
         torch.testing.assert_close(parameter, expected_parameters[name])
     assert len(trainer.optimizer.state) == expected_optimizer_state_count == 1
     assert trainer.optimization_roles["fake"].step == 1
-    assert trainer.optimization_roles["generator"].step == 7
+    assert trainer.optimization_roles[BASE_VARIANT].step == 7
     assert trainer.step == 7
-    assert trainer.adapter.model_role_registry.active_role == "generator"
+    assert trainer.adapter.component_variant_registry.active_variant == BASE_VARIANT
 
 
 def test_metadata_pre_hook_rejects_incompatible_state_before_model_mutation(
@@ -308,7 +311,7 @@ def test_metadata_pre_hook_rejects_incompatible_state_before_model_mutation(
     ]
     with pytest.raises(
         ValueError,
-        match="multi-role metadata.*component_routes.*expected.*fake__transformer.*received.*changed",
+        match="multi-variant metadata.*component_routes.*expected.*fake__transformer.*received.*changed",
     ):
         target.accelerator.load_state(str(tmp_path))
 
@@ -340,7 +343,7 @@ def test_multirole_resume_requires_dedicated_metadata_before_mutation(tmp_path: 
         (lambda state: state.update(version=99), "version.*expected 1.*received 99"),
         (
             lambda state: state["roles"].reverse(),
-            "role order.*expected.*generator.*fake.*reference.*received.*reference.*fake.*generator",
+            "variant order.*expected.*base.*fake.*snapshot.*received.*snapshot.*fake.*base",
         ),
         (
             lambda state: state["roles"][1].update(storage_mode="lora"),
@@ -351,8 +354,8 @@ def test_multirole_resume_requires_dedicated_metadata_before_mutation(tmp_path: 
             "parameters.*fake.*expected.*received.*999",
         ),
         (
-            lambda state: state.update(optimizer_group_roles=["fake", "generator"]),
-            "optimizer_group_roles.*expected.*generator.*fake.*received.*fake.*generator",
+            lambda state: state.update(optimizer_group_roles=["fake", BASE_VARIANT]),
+            "optimizer_group_roles.*expected.*base.*fake.*received.*fake.*base",
         ),
         (
             lambda state: state["update_plan"][0].update(repeats=99),
@@ -375,7 +378,7 @@ def test_metadata_validation_reports_expected_and_received_contract(
 def test_registered_custom_state_defensively_revalidates_metadata() -> None:
     trainer = _trainer_runtime("full")
     state = trainer._multirole_state_dict()
-    state["metadata"]["optimizer_group_roles"] = ["fake", "generator"]
+    state["metadata"]["optimizer_group_roles"] = ["fake", BASE_VARIANT]
 
     with pytest.raises(ValueError, match="optimizer_group_roles.*expected.*received"):
         trainer._load_multirole_state_dict(state)
@@ -402,9 +405,9 @@ def test_canonical_save_rejects_open_phase_before_accelerate_mutation(tmp_path: 
     fake_accelerator = MutatingStateAccelerator()
     trainer.accelerator = fake_accelerator  # type: ignore[assignment]
     trainer.adapter.accelerator = fake_accelerator  # type: ignore[assignment]
-    trainer.role_optimization._active_role_name = "generator"
+    trainer.role_optimization._active_role_name = BASE_VARIANT
     try:
-        with pytest.raises(RuntimeError, match="checkpoint.*closed phase.*active_phase.*generator"):
+        with pytest.raises(RuntimeError, match="checkpoint.*closed phase.*active_phase.*base"):
             trainer.adapter.save_checkpoint(str(tmp_path), model_only=False)
     finally:
         trainer.role_optimization._active_role_name = None
@@ -421,7 +424,7 @@ def test_canonical_load_rejects_metadata_before_accelerate_mutation(tmp_path: Pa
     trainer._multirole_checkpoint_state.prepare_save(str(tmp_path))
     metadata_path = tmp_path / _METADATA_FILENAME
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    metadata["optimizer_group_roles"] = ["fake", "generator"]
+    metadata["optimizer_group_roles"] = ["fake", BASE_VARIANT]
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
     fake_accelerator = MutatingStateAccelerator()
     trainer.accelerator = fake_accelerator  # type: ignore[assignment]
@@ -438,7 +441,7 @@ def test_canonical_load_rejects_metadata_before_accelerate_mutation(tmp_path: Pa
 def test_legacy_single_role_does_not_register_multirole_checkpoint_contract(
     tmp_path: Path,
 ) -> None:
-    trainer = _trainer_runtime("full", role_names=("generator",))
+    trainer = _trainer_runtime("full", variant_names=(BASE_VARIANT,))
     trainer._register_multirole_checkpointing()
 
     assert trainer.accelerator._custom_objects == []
@@ -450,7 +453,7 @@ def test_legacy_single_role_does_not_register_multirole_checkpoint_contract(
 
 
 def _install_role_proxy(adapter: TinyRoleAdapter) -> None:
-    registry = adapter.model_role_registry
+    registry = adapter.component_variant_registry
     bundle = ModelBundle(registry.bundle_members())
     adapter.set_component(
         "transformer",
@@ -458,37 +461,37 @@ def _install_role_proxy(adapter: TinyRoleAdapter) -> None:
     )
 
 
-def test_generator_export_context_restores_prior_role_even_on_error(tmp_path: Path) -> None:
+def test_base_export_context_restores_prior_role_even_on_error(tmp_path: Path) -> None:
     accelerator = Accelerator(cpu=True)
     adapter = TinyRoleAdapter(accelerator, "full")
-    adapter.configure_model_roles(("generator", "fake"))
+    adapter.declare_component_variants((BASE_VARIANT, "fake"))
     _install_role_proxy(adapter)
-    registry = adapter.model_role_registry
+    registry = adapter.component_variant_registry
     registry.activate("fake")
 
     def fail_save(*args: Any, **kwargs: Any) -> None:
-        assert registry.active_role == "generator"
+        assert registry.active_variant == BASE_VARIANT
         raise RuntimeError("export failed")
 
     adapter._save_full_model = fail_save  # type: ignore[method-assign]
     with pytest.raises(RuntimeError, match="export failed"):
         adapter.save_checkpoint(str(tmp_path), save_ema=False)
 
-    assert registry.active_role == "fake"
+    assert registry.active_variant == "fake"
 
 
 @pytest.mark.parametrize("finetune_type", ["lora", "full"])
-def test_export_contains_only_canonical_generator_weights(
+def test_export_contains_only_canonical_base_weights(
     tmp_path: Path,
     finetune_type: str,
 ) -> None:
     accelerator = Accelerator(cpu=True)
     adapter = TinyRoleAdapter(accelerator, finetune_type)
-    adapter.configure_model_roles(("generator", "fake", "surrogate"))
-    registry = adapter.model_role_registry
+    adapter.declare_component_variants((BASE_VARIANT, "fake", "surrogate"))
+    registry = adapter.component_variant_registry
     for parameter in registry.bundle_members()["transformer"].parameters():
         parameter.data.fill_(1)
-    for parameter in registry.parameters("generator"):
+    for parameter in registry.parameters(BASE_VARIANT):
         parameter.data.fill_(1)
     for parameter in registry.parameters("fake"):
         parameter.data.fill_(2)
@@ -509,7 +512,7 @@ def test_export_contains_only_canonical_generator_weights(
     assert exported_state
     assert not any("fake" in name or "surrogate" in name for name in exported_state)
     assert all(torch.equal(value, torch.ones_like(value)) for value in exported_state.values())
-    assert registry.active_role == "fake"
+    assert registry.active_variant == "fake"
 
 
 @pytest.mark.parametrize("finetune_type", ["lora", "full"])
@@ -518,8 +521,8 @@ def test_parameter_ema_swaps_surrogate_snapshot_and_restores_live_parameters(
 ) -> None:
     accelerator = Accelerator(cpu=True)
     adapter = TinyRoleAdapter(accelerator, finetune_type)
-    adapter.configure_model_roles(("generator", "fake", "surrogate"))
-    registry = adapter.model_role_registry
+    adapter.declare_component_variants((BASE_VARIANT, "fake", "surrogate"))
+    registry = adapter.component_variant_registry
     registry.create_parameter_ema("surrogate", "old_surrogate")
     initial = [parameter.detach().clone() for parameter in registry.parameters("surrogate")]
     for parameter in registry.parameters("surrogate"):
@@ -541,8 +544,8 @@ def test_parameter_ema_swaps_surrogate_snapshot_and_restores_live_parameters(
 def test_parameter_ema_state_round_trip_is_exact_and_not_export_metadata() -> None:
     accelerator = Accelerator(cpu=True)
     adapter = TinyRoleAdapter(accelerator, "full")
-    adapter.configure_model_roles(("generator", "fake", "surrogate"))
-    registry = adapter.model_role_registry
+    adapter.declare_component_variants((BASE_VARIANT, "fake", "surrogate"))
+    registry = adapter.component_variant_registry
     registry.create_parameter_ema("surrogate", "old_surrogate")
     for parameter in registry.parameters("surrogate"):
         parameter.data.add_(3)
@@ -567,8 +570,8 @@ def test_parameter_ema_state_round_trip_is_exact_and_not_export_metadata() -> No
 
 
 def test_accelerate_round_trip_restores_old_surrogate_parameter_ema(tmp_path: Path) -> None:
-    trainer = _trainer_runtime("full", role_names=("generator", "fake", "surrogate"))
-    registry = trainer.adapter.model_role_registry
+    trainer = _trainer_runtime("full", variant_names=(BASE_VARIANT, "fake", "surrogate"))
+    registry = trainer.adapter.component_variant_registry
     registry.create_parameter_ema("surrogate", "old_surrogate")
     for parameter in registry.parameters("surrogate"):
         parameter.data.add_(2)
@@ -594,35 +597,44 @@ def test_accelerate_round_trip_restores_old_surrogate_parameter_ema(tmp_path: Pa
 
 
 @pytest.mark.parametrize("finetune_type", ["lora", "full"])
-def test_official_generator_ema_export_is_ordered_and_restores_live_weights(
+def test_a_caller_composes_a_scoped_ema_export_from_adapter_primitives(
     tmp_path: Path,
     finetune_type: str,
 ) -> None:
+    """An algorithm exports one variant's EMA without the adapter knowing why.
+
+    This is the composition a distillation trainer performs when it ships only the
+    variant it trained as a generator: read the snapshot tensors, install the
+    snapshot, and save scoped to that variant. The adapter supplies each step and
+    attaches no meaning to the variant's name.
+    """
     accelerator = Accelerator(cpu=True)
     adapter = TinyRoleAdapter(accelerator, finetune_type)
-    adapter.configure_model_roles(("generator", "fake", "surrogate"))
-    registry = adapter.model_role_registry
-    registry.create_parameter_ema("generator", "generator_ema")
-    expected_ema = registry.parameter_ema_tensors("generator_ema")
-    for parameter in registry.parameters("generator"):
+    adapter.declare_component_variants((BASE_VARIANT, "fake", "surrogate"))
+    registry = adapter.component_variant_registry
+    registry.create_parameter_ema(BASE_VARIANT, "base_ema")
+    expected_ema = adapter.variant_parameter_ema_tensors("base_ema")
+    for parameter in registry.parameters(BASE_VARIANT):
         parameter.data.add_(5)
-    live = [parameter.detach().clone() for parameter in registry.parameters("generator")]
+    live = [parameter.detach().clone() for parameter in registry.parameters(BASE_VARIANT)]
     _install_role_proxy(adapter)
     registry.activate("fake")
 
-    adapter.save_official_generator_ema(
-        str(tmp_path),
-        emit_ema_parameters=True,
+    torch.save(
+        {"ema_parameters": [tensor.cpu() for tensor in expected_ema]},
+        tmp_path / "ema.ckpt",
     )
+    with adapter.use_variant_parameter_ema("base_ema"):
+        adapter.save_checkpoint(str(tmp_path), save_ema=False, model_only=True)
 
     artifact = torch.load(tmp_path / "ema.ckpt", weights_only=True)
     assert tuple(artifact) == ("ema_parameters",)
     assert len(artifact["ema_parameters"]) == len(expected_ema)
     for actual, expected in zip(artifact["ema_parameters"], expected_ema):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    for parameter, expected in zip(registry.parameters("generator"), live):
+    for parameter, expected in zip(registry.parameters(BASE_VARIANT), live):
         torch.testing.assert_close(parameter, expected, rtol=0, atol=0)
-    assert registry.active_role == "fake"
+    assert registry.active_variant == "fake"
     exported = str(tuple(path.relative_to(tmp_path) for path in tmp_path.rglob("*")))
     assert "old_surrogate" not in exported
     assert "fake" not in exported
