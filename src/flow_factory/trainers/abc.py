@@ -29,7 +29,7 @@ from tqdm import tqdm
 from PIL import Image
 from diffusers.utils.outputs import BaseOutput
 from accelerate import Accelerator
-from accelerate.utils import set_seed, ProjectConfiguration
+from accelerate.utils import set_seed, DistributedType, ProjectConfiguration
 
 from ..hparams import *
 from ..models.abc import BaseAdapter
@@ -48,6 +48,32 @@ from ..utils.logger_utils import setup_logger
 from ..utils.base import create_generator, create_generator_by_prompt, filter_kwargs, json_default, visit_tensor_leaves
 
 logger = setup_logger(__name__)
+
+
+def validate_supported_distributed_plan(accelerator: Accelerator) -> None:
+    """Reject distributed plans this framework cannot train correctly.
+
+    DeepSpeed ZeRO-3 shards parameters across ranks, which breaks reward-model
+    loading and the frozen-component synchronization this framework relies on.
+    Rejecting it here fails at startup instead of during a training step.
+
+    Args:
+        accelerator: Configured Accelerate accelerator.
+
+    Raises:
+        ValueError: If DeepSpeed ZeRO-3 is configured.
+    """
+    if accelerator.distributed_type != DistributedType.DEEPSPEED:
+        return
+    deepspeed_plugin = accelerator.state.deepspeed_plugin
+    if deepspeed_plugin is None:
+        return
+    if deepspeed_plugin.zero_stage == 3:
+        raise ValueError(
+            "DeepSpeed ZeRO-3 is not supported by Flow-Factory: parameter sharding breaks "
+            "reward-model loading and frozen-component synchronization. Expected ZeRO-1/2, "
+            "FSDP, or DDP; received DeepSpeed stage 3."
+        )
 
 
 def _record_stream_on_batch(value: Any, stream: "torch.cuda.Stream") -> None:
@@ -76,6 +102,7 @@ class BaseTrainer(ABC):
             config : Arguments,
             adapter : BaseAdapter,
         ):
+        validate_supported_distributed_plan(accelerator)
         self.accelerator = accelerator
         self.config = config
         self.log_args = config.log_args
@@ -163,10 +190,8 @@ class BaseTrainer(ABC):
     def _init_reward_model(self) -> Tuple[Dict[str, BaseRewardModel], Dict[str, BaseRewardModel]]:
         """Initialize reward model from configuration."""
 
-        # If DeepSpeed ZeRO-3 is enabled, the reward model will be somehow sharded.
-        # We need to disable ZeRO-3 init context when loading the model to avoid issues
-        # NOTE: This bug persists even with this context manager. DONOT USE ZeRO-3.
-        # A possible solution: use DeepSpeed GatherParamter manually in the reward_model's `forward`.
+        # ZeRO-3 would shard the reward model; it is rejected in ``__init__`` because no
+        # init-context workaround kept the reward forward correct.
 
         # Collect training dataset names so MultiRewardLoader can pre-compute
         # the per-source reward routing used by the runtime reward gate
