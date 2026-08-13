@@ -370,7 +370,12 @@ x0̂ = x_t - σ v
 
 `σ` is drawn uniformly from `perturbation_timestep_range` (default `(0.02, 0.98)`).
 Fake minimizes velocity MSE on detached generated `x0`. Generator uses the
-stop-grad x0 DMD direction against frozen `reference` and `fake` scores.
+stop-grad x0 DMD direction against the frozen reference and `fake` scores.
+
+The reference score is not a third role. It is the pre-finetune teacher, i.e. the
+same components at an earlier point in time, so it is reached through
+`adapter.use_ref_parameters()` rather than a declared component variant: it holds
+no gradients and no optimizer state and must not cost a bundle member.
 
 ```yaml
 train:
@@ -433,7 +438,8 @@ Runnable YAML examples are not published yet.
 
 ## TDM-R1
 
-`tdm-r1` adds a learned `surrogate` role and a frozen pretrained `reference`.
+`tdm-r1` adds a learned `surrogate` role on top of TDM's `generator` and `fake`,
+and queries the same frozen pretrained reference through `use_ref_parameters()`.
 Each `optimize()` call is sequential: fake × `R`, one surrogate step, then one
 generator step, over `gradient_accumulation_steps` rank-local microbatches.
 TDM-R1 does not auto-align `unique_sample_num_per_epoch`; it fail-fasts unless
