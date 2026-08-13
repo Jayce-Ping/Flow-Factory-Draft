@@ -42,6 +42,7 @@ from .trajectory import (
     NoisedState,
     ReplayStep,
     StructuredTrajectory,
+    unstack_structured_trajectories,
 )
 
 __all__ = [
@@ -72,4 +73,5 @@ __all__ = [
     "ReplayStep",
     "NoisedState",
     "MultiModalStepOutput",
+    "unstack_structured_trajectories",
 ]

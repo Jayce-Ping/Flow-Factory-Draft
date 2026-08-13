@@ -23,16 +23,16 @@ from diffusers.utils.torch_utils import randn_tensor
 
 from ...samples import (
     ComponentTimes,
-    ComponentTrajectory,
-    IndexedTrajectoryTensor,
     LatentState,
     MultiModalStepOutput,
     NoisedState,
     StackedSampleBatch,
     StructuredTrajectory,
+    unstack_structured_trajectories,
 )
 from ...scheduler import SDESchedulerOutput
 from ...utils.base import filter_kwargs
+from ..component_reduction import reduce_component_log_probs
 from ...utils.noise_schedule import flow_match_sigma
 
 # Both LTX2 adapters expose one joint video+audio policy, so the authoritative
@@ -76,8 +76,10 @@ def combine_modality_log_prob(
     Returns:
         Per-sample joint log_prob, shape ``(B,)``.
     """
-    total = n_video + n_audio
-    return (video_log_prob * n_video + audio_log_prob * n_audio) / total
+    return reduce_component_log_probs(
+        {"video": video_log_prob, "audio": audio_log_prob},
+        {"video": n_video, "audio": n_audio},
+    )
 
 
 def build_ltx2_training_component_times(
@@ -538,50 +540,25 @@ def build_ltx2_structured_trajectories(
             else values[..., video_seq_len:, :]
         )
 
-    trajectories: List[StructuredTrajectory] = []
-    for sample_index in range(batch_size):
-        components: Dict[str, ComponentTrajectory] = {}
-        for component in LTX2_COMPONENT_ORDER:
-            timesteps, sigmas = schedule[component]
-            components[component] = ComponentTrajectory(
-                states=split(states[sample_index], component),
-                timesteps=timesteps,
-                sigmas=sigmas,
-                state_index_map=state_index_map,
-                active_mask=(
-                    None if component_masks is None else component_masks[component][sample_index]
-                ),
-            )
-        trajectories.append(
-            StructuredTrajectory(
-                components=components,
-                log_probs=None if log_probs is None else log_probs[sample_index],
-                log_prob_index_map=None if log_probs is None else log_prob_index_map,
-                component_log_probs=(
-                    None
-                    if component_log_probs is None
-                    else {
-                        component: component_log_probs[component][sample_index]
-                        for component in LTX2_COMPONENT_ORDER
-                    }
-                ),
-                callbacks=(
-                    None
-                    if not structured_callbacks
-                    else {
-                        field: {
-                            component: IndexedTrajectoryTensor(
-                                values=split(values[sample_index], component),
-                                index_map=callback_index_map,
-                            )
-                            for component in LTX2_COMPONENT_ORDER
-                        }
-                        for field, values in structured_callbacks.items()
-                    }
-                ),
-            )
-        )
-    return trajectories
+    return unstack_structured_trajectories(
+        component_order=LTX2_COMPONENT_ORDER,
+        states={component: split(states, component) for component in LTX2_COMPONENT_ORDER},
+        schedule=schedule,
+        state_index_maps={component: state_index_map for component in LTX2_COMPONENT_ORDER},
+        active_masks=component_masks,
+        log_probs=log_probs,
+        log_prob_index_map=log_prob_index_map,
+        component_log_probs=component_log_probs,
+        callbacks=(
+            None
+            if not structured_callbacks
+            else {
+                field: {component: split(values, component) for component in LTX2_COMPONENT_ORDER}
+                for field, values in structured_callbacks.items()
+            }
+        ),
+        callback_index_maps={component: callback_index_map for component in LTX2_COMPONENT_ORDER},
+    )
 
 
 def _validate_ltx2_component_schedule(

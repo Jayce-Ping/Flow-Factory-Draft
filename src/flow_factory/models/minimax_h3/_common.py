@@ -22,14 +22,14 @@ from diffusers.utils.torch_utils import randn_tensor
 
 from ...samples import (
     ComponentTimes,
-    ComponentTrajectory,
-    IndexedTrajectoryTensor,
     LatentState,
     MultiModalStepOutput,
     NoisedState,
     StructuredTrajectory,
+    unstack_structured_trajectories,
 )
 from ...scheduler import SDESchedulerOutput
+from ..component_reduction import reduce_component_log_probs
 
 MINIMAX_H3_COMPONENT_ORDER: Tuple[str, ...] = ("video", "audio")
 MINIMAX_H3_COMPONENT_WIDTHS = {"video": 96, "audio": 32}
@@ -426,16 +426,10 @@ def combine_component_log_probs(
             "expected matching per-sample component log_probs shaped (B,), received "
             f"video {tuple(video_log_prob.shape)} and audio {tuple(audio_log_prob.shape)}"
         )
-    if (
-        video_log_prob.dtype != audio_log_prob.dtype
-        or video_log_prob.device != audio_log_prob.device
-    ):
-        raise ValueError(
-            "expected video/audio log_probs with matching dtype/device, received "
-            f"{video_log_prob.dtype}/{video_log_prob.device} and "
-            f"{audio_log_prob.dtype}/{audio_log_prob.device}"
-        )
-    return (video_log_prob * video_dof + audio_log_prob * audio_dof) / (video_dof + audio_dof)
+    return reduce_component_log_probs(
+        {"video": video_log_prob, "audio": audio_log_prob},
+        {"video": video_dof, "audio": audio_dof},
+    )
 
 
 def build_component_step_output(
@@ -611,47 +605,17 @@ def build_structured_trajectories(
         },
     )
 
-    trajectories: List[StructuredTrajectory] = []
-    for sample_index in range(batch_size):
-        components = {
-            component: ComponentTrajectory(
-                states=states[component][sample_index],
-                timesteps=schedule[component][0],
-                sigmas=schedule[component][1],
-                state_index_map=state_maps[component],
-            )
-            for component in MINIMAX_H3_COMPONENT_ORDER
-        }
-        trajectories.append(
-            StructuredTrajectory(
-                components=components,
-                log_probs=None if log_probs is None else log_probs[sample_index],
-                log_prob_index_map=log_prob_index_map,
-                component_log_probs=(
-                    None
-                    if component_log_probs is None
-                    else {
-                        component: component_log_probs[component][sample_index]
-                        for component in MINIMAX_H3_COMPONENT_ORDER
-                    }
-                ),
-                callbacks=(
-                    None
-                    if not validated_callbacks
-                    else {
-                        field: {
-                            component: IndexedTrajectoryTensor(
-                                values=component_values[component][sample_index],
-                                index_map=validated_callback_maps[component],
-                            )
-                            for component in MINIMAX_H3_COMPONENT_ORDER
-                        }
-                        for field, component_values in validated_callbacks.items()
-                    }
-                ),
-            )
-        )
-    return trajectories
+    return unstack_structured_trajectories(
+        component_order=MINIMAX_H3_COMPONENT_ORDER,
+        states=states,
+        schedule=schedule,
+        state_index_maps=state_maps,
+        log_probs=log_probs,
+        log_prob_index_map=log_prob_index_map,
+        component_log_probs=component_log_probs,
+        callbacks=validated_callbacks or None,
+        callback_index_maps=validated_callback_maps,
+    )
 
 
 def _validate_sigma_transform_inputs(sigma: torch.Tensor, shift: float, function: str) -> None:

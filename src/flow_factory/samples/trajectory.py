@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -861,6 +861,119 @@ class StructuredTrajectory:
             component_log_probs=component_log_probs,
             callbacks=callbacks,
         )
+
+
+def unstack_structured_trajectories(
+    *,
+    component_order: Sequence[str],
+    states: Mapping[str, torch.Tensor],
+    schedule: Mapping[str, Tuple[torch.Tensor, torch.Tensor]],
+    state_index_maps: Mapping[str, torch.Tensor],
+    active_masks: Optional[Mapping[str, torch.Tensor]] = None,
+    log_probs: Optional[torch.Tensor] = None,
+    log_prob_index_map: Optional[torch.Tensor] = None,
+    component_log_probs: Optional[Mapping[str, torch.Tensor]] = None,
+    callbacks: Optional[Mapping[str, Mapping[str, torch.Tensor]]] = None,
+    callback_index_maps: Optional[Mapping[str, torch.Tensor]] = None,
+) -> List["StructuredTrajectory"]:
+    """Split batched component rollout results into one trajectory per sample.
+
+    This is the inverse of ``StructuredTrajectory.stack``: every model family that
+    collects componentized rollout tensors shares this assembly, so only the
+    family-specific validation and any concatenated-tensor splitting stay local.
+
+    Args:
+        component_order: Authoritative component order for every mapping.
+        states: Batched states by component, each shaped ``(B, stored, ...)``.
+        schedule: Full timestep/sigma schedules by component.
+        state_index_maps: Rollout-position map by component.
+        active_masks: Optional batched stochastic-degree-of-freedom masks by component.
+        log_probs: Optional joint log probabilities shaped ``(B, stored)``.
+        log_prob_index_map: Rollout-transition map shared by all log probabilities.
+        component_log_probs: Optional per-component log probabilities shaped like ``log_probs``.
+        callbacks: Optional batched callback tensors keyed by field then component.
+        callback_index_maps: Rollout-transition map by component for the callbacks.
+
+    Returns:
+        One structured trajectory per batch sample, in batch order.
+
+    Raises:
+        ValueError: If any mapping does not follow ``component_order`` or the
+            component batch sizes disagree.
+    """
+    expected = tuple(component_order)
+    named_mappings = {
+        "states": states,
+        "schedule": schedule,
+        "state_index_maps": state_index_maps,
+        "active_masks": active_masks,
+        "component_log_probs": component_log_probs,
+        "callback_index_maps": callback_index_maps,
+    }
+    for field_name, values in named_mappings.items():
+        if values is None:
+            continue
+        if tuple(values) != expected:
+            raise ValueError(
+                f"expected {field_name} component order {expected}, received {tuple(values)}"
+            )
+    if callbacks is not None:
+        for field_name, component_values in callbacks.items():
+            if tuple(component_values) != expected:
+                raise ValueError(
+                    f"expected callbacks[{field_name!r}] component order {expected}, "
+                    f"received {tuple(component_values)}"
+                )
+
+    batch_size = states[expected[0]].shape[0]
+    for name in expected:
+        if states[name].shape[0] != batch_size:
+            raise ValueError(
+                f"expected states[{name!r}] batch size {batch_size}, "
+                f"received {states[name].shape[0]}"
+            )
+
+    resolved_log_prob_map = None if log_probs is None else log_prob_index_map
+    trajectories: List[StructuredTrajectory] = []
+    for sample_index in range(batch_size):
+        trajectories.append(
+            StructuredTrajectory(
+                components={
+                    name: ComponentTrajectory(
+                        states=states[name][sample_index],
+                        timesteps=schedule[name][0],
+                        sigmas=schedule[name][1],
+                        state_index_map=state_index_maps[name],
+                        active_mask=(
+                            None if active_masks is None else active_masks[name][sample_index]
+                        ),
+                    )
+                    for name in expected
+                },
+                log_probs=None if log_probs is None else log_probs[sample_index],
+                log_prob_index_map=resolved_log_prob_map,
+                component_log_probs=(
+                    None
+                    if component_log_probs is None
+                    else {name: component_log_probs[name][sample_index] for name in expected}
+                ),
+                callbacks=(
+                    None
+                    if not callbacks
+                    else {
+                        field_name: {
+                            name: IndexedTrajectoryTensor(
+                                values=component_values[name][sample_index],
+                                index_map=callback_index_maps[name],
+                            )
+                            for name in expected
+                        }
+                        for field_name, component_values in callbacks.items()
+                    }
+                ),
+            )
+        )
+    return trajectories
 
 
 @dataclass
