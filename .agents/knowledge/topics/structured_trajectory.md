@@ -52,8 +52,20 @@ per sample while averaging only active degrees of freedom, preventing sequence l
 conditioning tokens from changing objective scale. H3 under DiffusionOPD accepts neutral
 guidance `1.0` only for teacher and student calls.
 
-Implementation: `src/flow_factory/samples/structured_trajectory.py`,
-`src/flow_factory/models/trajectory_bridge.py`, and trainer `optimize()` paths.
+Implementation: `src/flow_factory/samples/trajectory.py`,
+`src/flow_factory/models/trajectory_bridge/`, and trainer `optimize()` paths.
+
+Shared assembly, rather than per-family copies:
+
+| Helper | Location | Owns |
+|---|---|---|
+| `unstack_structured_trajectories()` | `samples/trajectory.py` | Inverse of `StructuredTrajectory.stack`: batched component tensors -> one trajectory per sample. Families keep only their own validation and any concatenated-tensor splitting. |
+| `reduce_component_log_probs()` | `models/component_reduction.py` | Degrees-of-freedom-weighted joint log probability. Shape-agnostic, so a per-step `(B,)` and a stored `(B, T)` both reduce identically. |
+
+`trajectory_bridge/` is split by responsibility: `replay.py` (read stored trajectories out of a
+collated batch), `noising.py` (forward-process noise), `dispatch.py` (resolve conditioning and
+dispatch one replayed step), `masks.py` (active-mask geometry), `reduction.py` (component
+reduction entry points). `__init__.py` re-exports the public surface, so importers are unchanged.
 
 ## Review checklist
 

@@ -23,6 +23,7 @@ Boundaries are set in `BaseAdapter._mix_precision()` (`models/abc.py`) and `Base
 - **float16 overflow protection**: clamps values exceeding 65504.0 with a warning.
 - **Identity when no target**: returns latents unchanged if `latent_storage_dtype` is unset and no default provided.
 - **Must be applied identically** in both rollout and training paths — inconsistency breaks train-inference consistency (-> `train_inference_consistency.md` item #3).
+- **Multi-component states**: `BaseAdapter.cast_latent_state()` maps `cast_latents()` over every component of a `LatentState` and carries the boolean `active_masks` through unchanged. MiniMax H3 casts the live rollout state at both boundaries (initial state and each `next_state`), so what is stored is what the next transition consumed. Because the H3 scheduler requires `velocity.dtype == latents.dtype`, `step_h3_components()` aligns the model velocity to the state dtype; the scheduler still upcasts internally for the transition math.
 
 ```python
 def cast_latents(self, latents, default_dtype=None):

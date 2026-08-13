@@ -18,6 +18,20 @@ The feature probe must validate pinned public symbols, workflow maps, block call
 row-timestep construction, reference constructors, and modular APIs. A no-weight
 `from_config`/component-spec/workflow build proves API compatibility only.
 
+## Adapter structure
+
+The three adapters differ only in workflow identity, canonical transformer name, and component
+lists. Everything workflow-invariant lives on the `_MiniMaxH3WorkflowAdapter` mixin, so each
+method has exactly one implementation (`test_workflow_adapters_share_one_implementation_per_method`
+enforces this). Each adapter is still a direct `BaseAdapter` subclass and the mixin is not one, so
+the registry's single-base contract holds; tests assert `BaseAdapter in cls.__bases__` plus no
+second `BaseAdapter` subclass in the MRO, rather than an exact `__bases__` tuple.
+
+`_forward_state` replays a stored transition through the public `forward()` instead of a private
+path, which keeps rollout and replay on one entry point. Replay receives every collated batch
+field, so `build_h3_replay_forward_kwargs()` selects the conditioning arguments `forward()` accepts
+and lets that boundary stay strict.
+
 ## Hard execution contract
 
 - Batch size is B=1 for preprocessing, rollout, and evaluation.

@@ -29,6 +29,19 @@ All adapters implement `load_pipeline()`. Non-classic adapters also override
 Implementation: `src/flow_factory/models/runtime/` and
 `src/flow_factory/models/abc.py::BaseAdapter`.
 
+## Canonical identity
+
+The runtime is the only authority on which components exist. Never test membership with
+`hasattr(adapter, name)`: a component whose canonical name is not also an adapter attribute — H3
+Ref2VA's `transformer_ref` is the live case — silently drops out of every `hasattr`-gated loop,
+which previously produced an empty optimizer parameter list rather than an error. Resolve through
+`get_component(name)` and let a missing name raise. Aliasing the component onto `self.transformer`
+does not fix this: it registers an extra override named `transformer` while the real component
+stays invisible to the gated loops.
+
+Overrides must name a declared component, and `_load_full_model` writes through `set_component()`
+so a replacement stays visible to the runtime instead of shadowing it with a bare attribute.
+
 ## Scheduler and distributed boundaries
 
 - `adapter.scheduler` is the canonical primary scheduler.
@@ -49,6 +62,7 @@ Implementation: `src/flow_factory/models/runtime/` and
 ## Review checklist
 
 - [ ] Canonical, override, declared, and materialized paths remain distinct.
+- [ ] Membership resolves through the runtime, never `hasattr` on the adapter.
 - [ ] Lazy loading names every required component explicitly.
 - [ ] Lifecycle enumeration contains canonical modules only.
 - [ ] `adapter.pipeline`, `adapter.scheduler`, and public lifecycle hooks remain compatible.
