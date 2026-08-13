@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/trainers/opd/trainer.py
+# src/flow_factory/trainers/distillation/opd/trainer.py
 """DiffusionOPD on-policy distillation trainer.
 
 Distills several task-specialized LoRA teachers into a single student along
@@ -57,18 +57,18 @@ import tqdm as tqdm_
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
-from ...hparams import DiffusionOPDTrainingArguments
-from ...hparams.training_args.opd import resolve_distill_step_band
-from ...samples import (
+from ....hparams import DiffusionOPDTrainingArguments
+from ....hparams.training_args.opd import resolve_distill_step_band
+from ....samples import (
     BaseSample,
     LatentState,
     MultiModalStepOutput,
     ReplayStep,
     StackedSampleBatch,
 )
-from ...utils.logger_utils import setup_logger
-from ...utils.trajectory_collector import compute_trajectory_indices
-from ..abc import BaseTrainer
+from ....utils.logger_utils import setup_logger
+from ....utils.trajectory_collector import compute_trajectory_indices
+from ...abc import BaseTrainer
 from .common import (
     TARGET_REQUEST_FIELDS,
     compute_structured_distillation_loss,

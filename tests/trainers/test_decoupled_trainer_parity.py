@@ -29,15 +29,15 @@ from flow_factory.samples import (
     NoisedState,
 )
 from flow_factory.scheduler import SchedulerGroup, SDESchedulerOutput
-from flow_factory.trainers.awm import AWMTrainer
-from flow_factory.trainers.dpo import DPOTrainer
 from flow_factory.trainers.forward_process import (
     forward_velocity_state,
     require_velocity_state,
     state_batch_size,
     training_forward_kwargs,
 )
-from flow_factory.trainers.nft import DiffusionNFTTrainer
+from flow_factory.trainers.rl.awm import AWMTrainer
+from flow_factory.trainers.rl.dpo import DPOTrainer
+from flow_factory.trainers.rl.nft import DiffusionNFTTrainer
 from flow_factory.utils.base import to_broadcast_tensor
 from flow_factory.utils.noise_schedule import flow_match_sigma
 

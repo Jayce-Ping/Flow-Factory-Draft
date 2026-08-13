@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/trainers/crd.py
+# src/flow_factory/trainers/rl/crd.py
 """
 Centered Reward Distillation (CRD) Trainer.
 Reference:
@@ -34,19 +34,19 @@ import tqdm as tqdm_
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
-from ..hparams import CRDTrainingArguments
-from ..rewards import RewardBuffer
-from ..samples import (
+from ...hparams import CRDTrainingArguments
+from ...rewards import RewardBuffer
+from ...samples import (
     BaseSample,
     ComponentTimes,
     LatentState,
     NoisedState,
     StackedSampleBatch,
 )
-from ..utils.base import create_generator, create_generator_by_prompt
-from ..utils.logger_utils import setup_logger
-from .abc import BaseTrainer
-from .forward_process import forward_velocity_state, require_latent_state, state_batch_size
+from ...utils.base import create_generator, create_generator_by_prompt
+from ...utils.logger_utils import setup_logger
+from ..abc import BaseTrainer
+from ..forward_process import forward_velocity_state, require_latent_state, state_batch_size
 
 logger = setup_logger(__name__)
 

@@ -37,8 +37,8 @@ from flow_factory.samples import (
     ReplayStep,
 )
 from flow_factory.scheduler import SchedulerGroup, SDESchedulerMixin, SDESchedulerOutput
-from flow_factory.trainers.opd import DiffusionOPDTrainer
-from flow_factory.trainers.opd.common import (
+from flow_factory.trainers.distillation.opd import DiffusionOPDTrainer
+from flow_factory.trainers.distillation.opd.common import (
     compute_structured_distillation_loss,
     project_distillation_target_state,
 )

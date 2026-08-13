@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/trainers/grpo.py
+# src/flow_factory/trainers/rl/grpo.py
 """
 Group Relative Policy Optimization (GRPO) Trainer.
 Implements GRPO algorithm for flow matching models.
@@ -29,18 +29,18 @@ import tqdm as tqdm_
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
-from ..hparams import GRPOTrainingArguments
-from ..samples import (
+from ...hparams import GRPOTrainingArguments
+from ...samples import (
     BaseSample,
     LatentState,
     MultiModalStepOutput,
     ReplayStep,
     StackedSampleBatch,
 )
-from ..utils.base import create_generator_by_prompt
-from ..utils.logger_utils import setup_logger
-from ..utils.trajectory_collector import TrajectoryCollector, compute_trajectory_indices
-from .abc import BaseTrainer
+from ...utils.base import create_generator_by_prompt
+from ...utils.logger_utils import setup_logger
+from ...utils.trajectory_collector import TrajectoryCollector, compute_trajectory_indices
+from ..abc import BaseTrainer
 
 logger = setup_logger(__name__)
 

@@ -33,7 +33,7 @@ from flow_factory.samples import (
     MultiModalStepOutput,
 )
 from flow_factory.scheduler import SchedulerGroup, SDESchedulerMixin, SDESchedulerOutput
-from flow_factory.trainers.opd.common import (
+from flow_factory.trainers.distillation.opd.common import (
     compute_per_sample_distillation_loss,
     compute_structured_distillation_loss,
     project_distillation_target,

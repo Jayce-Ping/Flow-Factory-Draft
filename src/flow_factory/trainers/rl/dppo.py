@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/trainers/dppo.py
+# src/flow_factory/trainers/rl/dppo.py
 """
 Flow-DPPO Trainer.
 
@@ -30,12 +30,12 @@ from typing import Dict, List
 import torch
 import tqdm as tqdm_
 
-from ..hparams import DPPOTrainingArguments
-from ..samples import BaseSample, LatentState, MultiModalStepOutput, ReplayStep
-from ..utils.logger_utils import setup_logger
-from ..utils.trajectory_collector import compute_trajectory_indices
+from ...hparams import DPPOTrainingArguments
+from ...samples import BaseSample, LatentState, MultiModalStepOutput, ReplayStep
+from ...utils.logger_utils import setup_logger
+from ...utils.trajectory_collector import compute_trajectory_indices
+from ..registry import register_trainer
 from .grpo import GRPOTrainer
-from .registry import register_trainer
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 logger = setup_logger(__name__)

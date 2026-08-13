@@ -32,20 +32,29 @@ Flow-Factory follows an **online RL** training paradigm for diffusion/flow-match
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The high-level training loop (shared by all algorithms) is defined in each trainer's `start()` method:
+The high-level training loop lives once in `BaseTrainer.start()`; no algorithm restates it:
 
 ```python
-# src/flow_factory/trainers/grpo.py — GRPOTrainer.start()
+# src/flow_factory/trainers/abc.py — BaseTrainer.start()
 def start(self):
     while self.should_continue_training():
-        # Checkpoint & Evaluation (omitted for brevity)
-        samples = self.sample()            # Stages 2 + 3
-        self.prepare_feedback(samples)     # Stages 4 + 5 (rewards + advantages)
-        self.optimize(samples)             # Stage 6 (DPO: pair formation + loss here)
+        # Reseed, checkpoint on save_freq, evaluate on eval_freq (omitted for brevity)
+        self._run_training_step()      # Stages 2-6, the algorithm-specific middle
+        self.adapter.ema_step(step=self.epoch)
+        self._after_optimizer_step()
         self.epoch += 1
 ```
 
-> **Note**: Stage 1 (preprocessing) runs *once* before training begins and is cached to disk. Stages 2–6 repeat every epoch. The three methods above map directly to those stages: `sample` → trajectory rollouts; `prepare_feedback` → finalize rewards from the buffer and compute advantages; `optimize` → policy update (DPO additionally forms chosen/rejected pairs at the start of `optimize` before the loss).
+The default `_run_training_step` is the familiar three-stage sequence, so a reward-based
+algorithm only implements `optimize()`:
+
+```python
+samples = self.sample()            # Stages 2 + 3
+self.prepare_feedback(samples)     # Stages 4 + 5 (rewards + advantages)
+self.optimize(samples)             # Stage 6 (DPO: pair formation + loss here)
+```
+
+> **Note**: Stage 1 (preprocessing) runs *once* before training begins and is cached to disk. Stages 2–6 repeat every epoch. The three methods above map directly to those stages: `sample` → trajectory rollouts; `prepare_feedback` → finalize rewards from the buffer and compute advantages; `optimize` → policy update (DPO additionally forms chosen/rejected pairs at the start of `optimize` before the loss). `optimize()` is the only abstract one; vary the rest through `sampling_context`, `_run_training_step` and `_after_optimizer_step`.
 
 
 ## Stage 1: Data Preprocessing
@@ -136,10 +145,14 @@ def __iter__(self):
         indices = torch.randperm(len(self.dataset), generator=g)[:self.m].tolist()
         # 2. Repeat each prompt K times → M*K total samples
         repeated = [idx for idx in indices for _ in range(self.k)]
-        # 3. Distribute evenly across all GPUs
-        per_rank = chunk(repeated, self.num_replicas)[self.rank]
-        # 4. Yield batches of size `per_device_batch_size`
-        yield from chunk(per_rank, self.batch_size)
+        # 3. Shuffle, so a group's K copies spread across ranks instead of
+        #    landing contiguously on one
+        order = torch.randperm(len(repeated), generator=g).tolist()
+        shuffled = [repeated[i] for i in order]
+        # 4. Each iteration hands every rank one contiguous slice of the shuffle
+        for i in range(self.num_batches_per_epoch):
+            start = i * self.sample_num_per_iteration + self.rank * self.batch_size
+            yield shuffled[start : start + self.batch_size]
 ```
 
 ### Key Points
@@ -176,10 +189,10 @@ train:
 The trainer's `sample()` method switches the adapter to rollout mode and runs inference:
 
 ```python
-# src/flow_factory/trainers/grpo.py — GRPOTrainer.sample()
+# src/flow_factory/trainers/rl/grpo.py — GRPOTrainer.sample()
 def sample(self) -> List[BaseSample]:
     trajectory_indices = compute_trajectory_indices(
-        train_timestep_indices=self.adapter.scheduler.train_timesteps,
+        train_timestep_indices=self.adapter.get_train_step_indices(),
         num_inference_steps=self.training_args.num_inference_steps,
     )
     # generate_samples() (BaseTrainer) switches the adapter to rollout mode,
@@ -296,7 +309,7 @@ rewards:
 ### How It Works
 
 ```python
-# src/flow_factory/trainers/grpo.py — GRPOTrainer.compute_advantages()
+# src/flow_factory/trainers/abc.py — BaseTrainer.compute_advantages()
 def compute_advantages(self, samples, rewards, store_to_samples=True, aggregation_func=None):
     # Thin wrapper: resolve the aggregation strategy, then delegate to
     # AdvantageProcessor (advantage/advantage_processor.py). The processor is
@@ -351,7 +364,8 @@ train:
 Stages 4–5 run in `prepare_feedback()` (reward buffer finalize, then `AdvantageProcessor`). Stage 6 is `optimize()` only:
 
 ```python
-# Stages 4–5 — src/flow_factory/trainers/grpo.py — GRPOTrainer.prepare_feedback()
+# Stages 4-5 - src/flow_factory/trainers/abc.py - BaseTrainer.prepare_feedback()
+# (concrete; a distillation trainer such as diffusion-opd overrides it to a no-op)
 def prepare_feedback(self, samples):
     rewards = self.reward_buffer.finalize(store_to_samples=True, split='all')
     self.compute_advantages(samples, rewards, store_to_samples=True)

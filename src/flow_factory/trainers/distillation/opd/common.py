@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/trainers/opd/common.py
+# src/flow_factory/trainers/distillation/opd/common.py
 """Shared target-space math and teacher loading for DiffusionOPD.
 
 Target projection is shared by the teacher and student passes; the per-sample
@@ -30,10 +30,10 @@ from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple
 
 import torch
 
-from ...samples import ComponentTimes, LatentState, MultiModalStepOutput
-from ...utils.base import to_broadcast_tensor
-from ...utils.logger_utils import setup_logger
-from ...utils.noise_schedule import flow_match_sigma
+from ....samples import ComponentTimes, LatentState, MultiModalStepOutput
+from ....utils.base import to_broadcast_tensor
+from ....utils.logger_utils import setup_logger
+from ....utils.noise_schedule import flow_match_sigma
 
 if TYPE_CHECKING:
     from ...models.abc import BaseAdapter

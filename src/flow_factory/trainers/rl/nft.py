@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/trainers/nft.py
+# src/flow_factory/trainers/rl/nft.py
 """
 DiffusionNFT Trainer.
 Reference:
@@ -32,13 +32,13 @@ import tqdm as tqdm_
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
-from ..hparams import NFTTrainingArguments
-from ..rewards import RewardBuffer
-from ..samples import BaseSample, ComponentTimes, LatentState, NoisedState, StackedSampleBatch
-from ..utils.base import create_generator_by_prompt
-from ..utils.logger_utils import setup_logger
-from .abc import BaseTrainer
-from .forward_process import (
+from ...hparams import NFTTrainingArguments
+from ...rewards import RewardBuffer
+from ...samples import BaseSample, ComponentTimes, LatentState, NoisedState, StackedSampleBatch
+from ...utils.base import create_generator_by_prompt
+from ...utils.logger_utils import setup_logger
+from ..abc import BaseTrainer
+from ..forward_process import (
     forward_velocity_state,
     state_batch_size,
 )

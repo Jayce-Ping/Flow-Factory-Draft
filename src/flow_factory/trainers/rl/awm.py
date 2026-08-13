@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/trainers/awm.py
+# src/flow_factory/trainers/rl/awm.py
 """
 Advantage Weighted Matching (AWM) Trainer.
 References:
@@ -35,14 +35,14 @@ from torch.nn.utils.rnn import pad_sequence
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 
-from ..hparams import AWMTrainingArguments
-from ..rewards import BaseRewardModel, RewardBuffer
-from ..samples import BaseSample, ComponentTimes, LatentState, NoisedState, StackedSampleBatch
-from ..utils.base import create_generator_by_prompt
-from ..utils.logger_utils import setup_logger
-from ..utils.noise_schedule import TimeSampler, flow_match_sigma
-from .abc import BaseTrainer
-from .forward_process import (
+from ...hparams import AWMTrainingArguments
+from ...rewards import BaseRewardModel, RewardBuffer
+from ...samples import BaseSample, ComponentTimes, LatentState, NoisedState, StackedSampleBatch
+from ...utils.base import create_generator_by_prompt
+from ...utils.logger_utils import setup_logger
+from ...utils.noise_schedule import TimeSampler, flow_match_sigma
+from ..abc import BaseTrainer
+from ..forward_process import (
     forward_velocity_state,
     require_component_sigmas,
     state_batch_size,

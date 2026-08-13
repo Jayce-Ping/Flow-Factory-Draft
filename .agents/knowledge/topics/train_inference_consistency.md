@@ -53,9 +53,9 @@ If rollout and training `forward()` diverge, `ratio` deviates from 1.0 at epoch 
 
 - Rollout: `adapter.inference()` -> `forward()` -> `scheduler.step()` -> `sample.log_probs[i]`
 - Training: `Trainer.optimize()` -> `adapter.forward()` -> `output.log_prob`
-- Ratio: `trainers/grpo.py` (`GRPOTrainer.optimize`): `ratio = torch.exp(output.log_prob - old_log_prob)`
+- Ratio: `trainers/rl/grpo.py` (`GRPOTrainer.optimize`): `ratio = torch.exp(output.log_prob - old_log_prob)`
 - PPO clip: `max(-adv * ratio, -adv * clamp(ratio, 1-eps, 1+eps))`
-- Dtype round-trip guard: `scheduler/*.py` — `next_latents = next_latents.to(_input_dtype).float()` ensures stored trajectory matches training replay (e.g., `scheduler/flow_match_euler_discrete.py` L362, `scheduler/unipc_multistep.py` L345)
+- Dtype round-trip guard: `scheduler/*.py` — `next_latents = next_latents.to(_input_dtype).float()` ensures stored trajectory matches training replay (grep the expression in `scheduler/flow_match_euler_discrete.py` and `scheduler/unipc_multistep.py`; it appears once per dynamics branch)
 - `cast_latents()`: `BaseAdapter.cast_latents()` (`models/abc.py`) — applied identically in `inference()` before/after each `forward()` call
 
 ## Cross-refs

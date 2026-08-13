@@ -55,7 +55,7 @@ reduction, and losses.
 
 Single-component adapters retain legacy bit-parity: generalizing a reduction to N components
 changes floating-point association order, so the one-component case keeps its original arithmetic
-rather than routing through the general path (see `trainers/opd/common.py`). Multi-component
+rather than routing through the general path (see `trainers/distillation/opd/common.py`). Multi-component
 reductions preserve one scalar per sample while averaging only active degrees of freedom, so
 sequence length or conditioning tokens cannot change objective scale.
 

@@ -31,8 +31,8 @@ from flow_factory.samples import (
     StackedSampleBatch,
 )
 from flow_factory.scheduler import SchedulerGroup, SDESchedulerOutput
-from flow_factory.trainers.crd import CRDTrainer
-from flow_factory.trainers.dgpo import _SEED_TAG_SHARED_NOISE, DGPOTrainer
+from flow_factory.trainers.rl.crd import CRDTrainer
+from flow_factory.trainers.rl.dgpo import _SEED_TAG_SHARED_NOISE, DGPOTrainer
 from flow_factory.utils.base import create_generator, to_broadcast_tensor
 from flow_factory.utils.noise_schedule import flow_match_sigma
 

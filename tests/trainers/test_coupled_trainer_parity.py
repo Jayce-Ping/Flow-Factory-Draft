@@ -28,8 +28,8 @@ from flow_factory.samples import (
     ReplayStep,
 )
 from flow_factory.scheduler import SchedulerGroup, SDESchedulerOutput
-from flow_factory.trainers.dppo import DPPOTrainer, gaussian_kl_div
-from flow_factory.trainers.grpo import GRPOGuardTrainer, GRPOTrainer
+from flow_factory.trainers.rl.dppo import DPPOTrainer, gaussian_kl_div
+from flow_factory.trainers.rl.grpo import GRPOGuardTrainer, GRPOTrainer
 
 
 class TrainingArgsFake(dict):

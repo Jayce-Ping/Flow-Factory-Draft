@@ -40,18 +40,18 @@ from ltx2_inference_fakes import SEED, condition_images, inference_adapter, infe
 from flow_factory.models.ltx2.ltx2_i2av import LTX2_I2AV_Adapter, LTX2I2AVSample
 from flow_factory.models.ltx2.ltx2_t2av import LTX2_T2AV_Adapter, LTX2Sample
 from flow_factory.samples import LatentState, MultiModalStepOutput, NoisedState
-from flow_factory.trainers.awm import AWMTrainer
-from flow_factory.trainers.crd import CRDTrainer
-from flow_factory.trainers.dgpo import DGPOTrainer
-from flow_factory.trainers.dpo import DPOTrainer
-from flow_factory.trainers.dppo import DPPOTrainer
-from flow_factory.trainers.grpo import GRPOGuardTrainer, GRPOTrainer
-from flow_factory.trainers.nft import DiffusionNFTTrainer
-from flow_factory.trainers.opd.common import (
+from flow_factory.trainers.distillation.opd.common import (
     compute_structured_distillation_loss,
     project_distillation_target_state,
 )
-from flow_factory.trainers.opd.trainer import DiffusionOPDTrainer
+from flow_factory.trainers.distillation.opd.trainer import DiffusionOPDTrainer
+from flow_factory.trainers.rl.awm import AWMTrainer
+from flow_factory.trainers.rl.crd import CRDTrainer
+from flow_factory.trainers.rl.dgpo import DGPOTrainer
+from flow_factory.trainers.rl.dpo import DPOTrainer
+from flow_factory.trainers.rl.dppo import DPPOTrainer
+from flow_factory.trainers.rl.grpo import GRPOGuardTrainer, GRPOTrainer
+from flow_factory.trainers.rl.nft import DiffusionNFTTrainer
 
 COMPONENTS = ("video", "audio")
 AUDIO_NUMEL = AUDIO_SEQ_LEN * CHANNELS

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/trainers/dpo.py
+# src/flow_factory/trainers/rl/dpo.py
 """
 Diffusion-DPO (Direct Preference Optimization) Trainer.
 Implements online DPO for flow matching models using velocity MSE (target = noise - x_0).
@@ -39,14 +39,14 @@ from accelerate.utils import broadcast_object_list
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
-from ..hparams import DPOTrainingArguments
-from ..samples import BaseSample, LatentState, NoisedState
-from ..utils.base import create_generator, create_generator_by_prompt
-from ..utils.dist import gather_samples
-from ..utils.logger_utils import setup_logger
-from ..utils.noise_schedule import TimeSampler
-from .abc import BaseTrainer
-from .forward_process import forward_velocity_state, require_latent_state, state_batch_size
+from ...hparams import DPOTrainingArguments
+from ...samples import BaseSample, LatentState, NoisedState
+from ...utils.base import create_generator, create_generator_by_prompt
+from ...utils.dist import gather_samples
+from ...utils.logger_utils import setup_logger
+from ...utils.noise_schedule import TimeSampler
+from ..abc import BaseTrainer
+from ..forward_process import forward_velocity_state, require_latent_state, state_batch_size
 
 logger = setup_logger(__name__)
 
