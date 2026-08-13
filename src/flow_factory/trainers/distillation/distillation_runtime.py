@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import inspect
-import os
 from contextlib import contextmanager
 from typing import (
     TYPE_CHECKING,
@@ -419,43 +418,36 @@ def run_role_phase(
                 trainer._finish_role_microbatch()
 
 
-def run_distillation_training_loop(trainer: Any, *, evaluate: bool) -> None:
-    """Run fake-first distillation epochs, each consuming ``GAS`` dataloader batches.
+def run_distillation_training_step(trainer: Any) -> None:
+    """Run one distillation epoch: accumulate ``GAS`` rollouts, then optimize once.
+
+    This is the only way a distillation epoch differs from any other. Everything
+    around it - reseeding, checkpointing, evaluation, the EMA step - is the shared
+    loop in :meth:`BaseTrainer.start`, so a distillation trainer overrides
+    :meth:`BaseTrainer._run_training_step` with this and inherits the rest. That is
+    what gives these algorithms the same eval-time reward monitoring every other
+    trainer has.
 
     Args:
         trainer: DMD2, TDM, or TDM-R1 trainer.
-        evaluate: Whether to run ``trainer.evaluate()`` on ``eval_freq``.
-    """
-    while trainer.should_continue_training():
-        trainer.adapter.set_trajectory_seed(trainer.epoch + trainer.training_args.seed)
-        log_args = trainer.log_args
-        if log_args.save_freq > 0 and trainer.epoch % log_args.save_freq == 0 and log_args.save_dir:
-            save_dir = os.path.join(
-                log_args.save_dir,
-                str(log_args.run_name),
-                "checkpoints",
-            )
-            trainer.save_checkpoint(save_dir, epoch=trainer.epoch)
-        if evaluate:
-            eval_freq = trainer.eval_args.eval_freq
-            if eval_freq > 0 and trainer.epoch % eval_freq == 0:
-                trainer.evaluate()
 
-        accumulation_steps = trainer.training_args.gradient_accumulation_steps
-        if (
-            not isinstance(accumulation_steps, int)
-            or isinstance(accumulation_steps, bool)
-            or accumulation_steps < 1
-        ):
-            raise ValueError(
-                "expected gradient_accumulation_steps >= 1 as an int, received "
-                f"{type(accumulation_steps).__name__}: {accumulation_steps!r}"
-            )
-        microbatches: List[List[BaseSample]] = []
-        for _ in range(accumulation_steps):
+    Raises:
+        ValueError: If the configured accumulation step count is not a positive int.
+    """
+    accumulation_steps = trainer.training_args.gradient_accumulation_steps
+    if (
+        not isinstance(accumulation_steps, int)
+        or isinstance(accumulation_steps, bool)
+        or accumulation_steps < 1
+    ):
+        raise ValueError(
+            "expected gradient_accumulation_steps >= 1 as an int, received "
+            f"{type(accumulation_steps).__name__}: {accumulation_steps!r}"
+        )
+    microbatches: List[List[BaseSample]] = []
+    for _ in range(accumulation_steps):
+        with trainer.sampling_context():
             samples = trainer.sample()
-            trainer.prepare_feedback(samples)
-            microbatches.append(samples)
-        trainer.optimize(microbatches)
-        trainer.adapter.ema_step(step=trainer.epoch)
-        trainer.epoch += 1
+        trainer.prepare_feedback(samples)
+        microbatches.append(samples)
+    trainer.optimize(microbatches)
