@@ -18,9 +18,9 @@ from typing import Any, List
 import pytest
 
 from flow_factory.hparams import Arguments
-from flow_factory.trainers.dmd2 import DMD2Trainer
-from flow_factory.trainers.tdm import TDMTrainer
-from flow_factory.trainers.tdm_r1 import TDMR1Trainer
+from flow_factory.trainers.distillation.dmd2 import DMD2Trainer
+from flow_factory.trainers.distillation.tdm import TDMTrainer
+from flow_factory.trainers.distillation.tdm_r1 import TDMR1Trainer
 
 DISTILLATION_TRAINERS = (DMD2Trainer, TDMTrainer, TDMR1Trainer)
 

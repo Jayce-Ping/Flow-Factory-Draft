@@ -29,13 +29,13 @@ from accelerate import Accelerator, DistributedDataParallelKwargs
 from flow_factory.samples import LatentState
 from flow_factory.trainers.abc import BaseTrainer
 from flow_factory.trainers.distillation.dmd2 import DMD2Trainer
+from flow_factory.trainers.distillation.tdm import TDMTrainer
+from flow_factory.trainers.distillation.tdm_r1 import TDMR1Trainer
 from flow_factory.trainers.role_optimization import (
     OptimizationRole,
     RoleOptimizationCoordinator,
     RoleOptimizerConfig,
 )
-from flow_factory.trainers.distillation.tdm import TDMTrainer
-from flow_factory.trainers.distillation.tdm_r1 import TDMR1Trainer
 
 
 class TinyRoleLayer(torch.nn.Module):
