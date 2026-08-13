@@ -57,6 +57,7 @@ def _config(
             required_trainable_roles=required_trainable_roles,
             gradient_accumulation_steps=1,
             seed=7,
+            max_grad_norm=1.0,
         ),
         log_args=SimpleNamespace(save_dir="/tmp", run_name="multirole-loader"),
     )

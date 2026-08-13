@@ -42,9 +42,7 @@ def _loop_trainer(trainer_cls: type, *, eval_freq: int, epochs: int = 2) -> Any:
     trainer.evaluate = lambda: trainer.events.append(f"evaluate:{trainer.epoch}")
     trainer.sample = lambda: trainer.events.append("sample") or []
     trainer.prepare_feedback = lambda samples: None
-    trainer.optimize = lambda microbatches: trainer.events.append(
-        f"optimize:{len(microbatches)}"
-    )
+    trainer.optimize = lambda microbatches: trainer.events.append(f"optimize:{len(microbatches)}")
     return trainer
 
 
