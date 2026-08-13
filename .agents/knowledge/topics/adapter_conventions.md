@@ -35,6 +35,26 @@ All adapters that support CFG must follow a consistent two-stage pattern. Guidan
 | LTX2 | x0-space multi-guidance (CFG + STG + Modality Isolation) | CFG delta computed in x0-space, not velocity-space |
 | SD3.5 | Requires `negative_pooled_prompt_embeds` in addition to `negative_prompt_embeds` | Two embedding checks in forward |
 
+### If an algorithm ever needs the separate CFG branches
+
+Some distillation objectives want the conditional and unconditional velocities on
+their own rather than only the combined one. There is no such consumer today, so no
+API exists; add one when the objective lands, and build it this way:
+
+- **Derive the guided branch arithmetically.** `guided == uncond + scale * (cond - uncond)`
+  by definition, so it costs no forward. An earlier attempt queried all three through
+  `forward()`, and because the third call ran its own batched CFG internally it spent
+  four transformer evaluations to produce two evaluations' worth of information.
+- **Keep the default implementation shared.** Two `forward(..., guidance_scale=1.0)`
+  calls, one per conditioning set, need nothing model-specific except which kwarg
+  holds the negative counterpart of which. Declare that as a small ClassVar mapping
+  (`prompt_embeds -> negative_prompt_embeds`, and so on) and no adapter needs a
+  method: the earlier attempt cost SD3.5 and Z-Image a few hundred lines each.
+- **Make the batched variant an opt-in override.** Concatenating conditioning along
+  the batch axis halves the pass count and doubles activations, but which kwargs may
+  be concatenated and which must be repeated is genuinely model knowledge, so it
+  belongs in an adapter hook rather than in a generic batcher.
+
 ## `forward()` as the Consistency Boundary
 
 `adapter.forward()` is the atomic unit for train-inference consistency (-> `train_inference_consistency.md`).
