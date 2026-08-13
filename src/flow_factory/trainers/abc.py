@@ -16,6 +16,7 @@
 import json
 import os
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from functools import partial
@@ -70,6 +71,7 @@ from ..utils.base import (
     json_default,
     visit_tensor_leaves,
 )
+from ..utils.dist import reduce_loss_info
 from ..utils.logger_utils import setup_logger
 from ..utils.noise_schedule import TimeSampler
 from .role_optimization import (
@@ -1272,6 +1274,44 @@ class BaseTrainer(ABC):
             )
 
         raise ValueError(f"Unknown time_sampling_strategy: {strategy!r}. Available: {available}")
+
+    def _apply_optimizer_step(
+        self,
+        loss_info: Dict[str, List[torch.Tensor]],
+    ) -> Dict[str, List[torch.Tensor]]:
+        """Clip, step, log the accumulated losses and start a fresh accumulation.
+
+        Call this once ``accelerator.sync_gradients`` is true. Only the loss that
+        reached ``backward`` is algorithm-specific; clipping, stepping and metric
+        reduction are the same for every algorithm.
+
+        Args:
+            loss_info: Per-metric values accumulated since the last optimizer step.
+
+        Returns:
+            An empty accumulator for the next optimizer step.
+        """
+        grad_norm = self.accelerator.clip_grad_norm_(
+            self.adapter.get_trainable_parameters(),
+            self.training_args.max_grad_norm,
+        )
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+        self._after_gradient_step()
+
+        reduced = reduce_loss_info(self.accelerator, loss_info)
+        reduced["grad_norm"] = grad_norm
+        self.log_data({f"train/{k}": v for k, v in reduced.items()}, step=self.step)
+        self.step += 1
+        return defaultdict(list)
+
+    def _after_gradient_step(self) -> None:
+        """Update per-optimizer-step auxiliary weights before metrics are logged.
+
+        Distinct from :meth:`_after_optimizer_step`, which runs once per epoch;
+        this runs on every optimizer step, which is the cadence DGPO's fast
+        reference EMA needs.
+        """
 
     def _velocity_kl(
         self,

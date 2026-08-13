@@ -44,7 +44,6 @@ from ..rewards import BaseRewardModel, RewardBuffer
 from ..utils.base import create_generator_by_prompt
 from ..utils.noise_schedule import TimeSampler, flow_match_sigma
 from ..utils.logger_utils import setup_logger
-from ..utils.dist import reduce_loss_info
 
 logger = setup_logger(__name__)
 
@@ -399,15 +398,4 @@ class AWMTrainer(BaseTrainer):
                         # 6. Backward pass and optimizer step
                         self.accelerator.backward(loss)
                         if self.accelerator.sync_gradients:
-                            grad_norm = self.accelerator.clip_grad_norm_(
-                                self.adapter.get_trainable_parameters(),
-                                self.training_args.max_grad_norm,
-                            )
-                            self.optimizer.step()
-                            self.optimizer.zero_grad()
-                            # Log loss info
-                            loss_info = reduce_loss_info(self.accelerator, loss_info)
-                            loss_info['grad_norm'] = grad_norm
-                            self.log_data({f'train/{k}': v for k, v in loss_info.items()}, step=self.step)
-                            self.step += 1
-                            loss_info = defaultdict(list)
+                            loss_info = self._apply_optimizer_step(loss_info)

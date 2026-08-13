@@ -32,7 +32,6 @@ import tqdm as tqdm_
 
 from ..hparams import DPPOTrainingArguments
 from ..samples import BaseSample, LatentState, MultiModalStepOutput, ReplayStep
-from ..utils.dist import reduce_loss_info
 from ..utils.logger_utils import setup_logger
 from ..utils.trajectory_collector import compute_trajectory_indices
 from .grpo import GRPOTrainer
@@ -257,17 +256,4 @@ class DPPOTrainer(GRPOTrainer):
                         # 6. Backward and optimizer step
                         self.accelerator.backward(loss)
                         if self.accelerator.sync_gradients:
-                            grad_norm = self.accelerator.clip_grad_norm_(
-                                self.adapter.get_trainable_parameters(),
-                                self.training_args.max_grad_norm,
-                            )
-                            self.optimizer.step()
-                            self.optimizer.zero_grad()
-                            loss_info = reduce_loss_info(self.accelerator, loss_info)
-                            loss_info["grad_norm"] = grad_norm
-                            self.log_data(
-                                {f"train/{k}": v for k, v in loss_info.items()},
-                                step=self.step,
-                            )
-                            self.step += 1
-                            loss_info = defaultdict(list)
+                            loss_info = self._apply_optimizer_step(loss_info)

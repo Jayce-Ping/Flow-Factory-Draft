@@ -49,9 +49,7 @@ tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 from ..hparams import DGPOTrainingArguments
 from ..samples import BaseSample, ComponentTimes, LatentState, NoisedState, StackedSampleBatch
 from ..utils.base import create_generator, create_generator_by_prompt
-from ..utils.dist import reduce_loss_info
 from ..utils.logger_utils import setup_logger
-from ..utils.noise_schedule import TimeSampler
 from .abc import BaseTrainer
 from .forward_process import forward_velocity_state, require_latent_state, state_batch_size
 
@@ -771,7 +769,7 @@ class DGPOTrainer(BaseTrainer):
 
         self.accelerator.backward(loss)
         if self.accelerator.sync_gradients:
-            loss_info = self._finalize_step(loss_info)
+            loss_info = self._apply_optimizer_step(loss_info)
         return loss_info
 
     # =========================== Advantage Processor Dispatch ============================
@@ -944,29 +942,11 @@ class DGPOTrainer(BaseTrainer):
                         noised=noised,
                     )
 
-    # =========================== Optimizer Step Finalization ============================
-    def _finalize_step(
-        self,
-        loss_info: Dict[str, List[torch.Tensor]],
-    ) -> Dict[str, List[torch.Tensor]]:
-        """Optimizer step + ema_ref update + loss reduction/logging."""
-        grad_norm = self.accelerator.clip_grad_norm_(
-            self.adapter.get_trainable_parameters(),
-            self.training_args.max_grad_norm,
-        )
-        self.optimizer.step()
-        self.optimizer.zero_grad()
+    def _after_gradient_step(self) -> None:
+        """Advance the fast reference EMA once per optimizer step.
 
-        # ema_ref advances once per optimiser step (reference DGPO);
-        # sampling EMA advances once per epoch in ``start()``.
+        Matches the reference DGPO cadence; the slow sampling EMA advances once
+        per epoch through the shared training loop instead.
+        """
         self._update_ema_ref(step=self.step)
-
-        reduced = reduce_loss_info(self.accelerator, loss_info)
-        reduced["grad_norm"] = grad_norm
-        self.log_data(
-            {f"train/{k}": v for k, v in reduced.items()},
-            step=self.step,
-        )
-        self.step += 1
-        return defaultdict(list)
 
