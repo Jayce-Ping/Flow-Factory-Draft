@@ -42,7 +42,10 @@ from .reward_args import MultiRewardArguments, RewardArguments
 from .scheduler_args import SchedulerArguments
 from .training_args import (
     DiffusionOPDTrainingArguments,
+    DMD2TrainingArguments,
     EvaluationArguments,
+    TDMR1TrainingArguments,
+    TDMTrainingArguments,
     TrainingArguments,
     get_training_args_class,
 )
@@ -195,6 +198,92 @@ class Arguments(ArgABC):
             ]
         )
 
+    def _validate_multirole_training_contract(self) -> None:
+        """Validate reward and dynamics contracts before batch geometry."""
+        training_args = self.training_args
+        if isinstance(training_args, TDMR1TrainingArguments):
+            if not self.reward_args:
+                raise ValueError(
+                    "trainer_type='tdm-r1' requires at least one training reward, "
+                    "but rewards is empty."
+                )
+            if training_args.group_size < 2:
+                raise ValueError(
+                    "trainer_type='tdm-r1' requires complete reward groups with "
+                    f"group_size >= 2, received group_size={training_args.group_size}."
+                )
+        elif isinstance(training_args, DMD2TrainingArguments) and self.reward_args:
+            raise ValueError(
+                f"trainer_type={training_args.trainer_type!r} does not accept training "
+                f"rewards, but received {len(self.reward_args)} reward configuration(s)."
+            )
+
+        if (
+            isinstance(training_args, TDMTrainingArguments)
+            and self.scheduler_args.dynamics_type != "ODE"
+        ):
+            raise ValueError(
+                f"trainer_type={training_args.trainer_type!r} requires "
+                "scheduler.dynamics_type='ODE', received "
+                f"dynamics_type={self.scheduler_args.dynamics_type!r}."
+            )
+
+    def _validate_dmd2_batch_geometry(self) -> None:
+        """Require one generator step per distillation outer iteration."""
+        training_args = self.training_args
+        if not isinstance(training_args, DMD2TrainingArguments):
+            return
+
+        if training_args.gradient_step_per_epoch != 1:
+            raise ValueError(
+                f"{training_args.trainer_type} requires gradient_step_per_epoch=1; "
+                f"received gradient_step_per_epoch={training_args.gradient_step_per_epoch}, "
+                f"num_batches_per_epoch={training_args.num_batches_per_epoch}"
+            )
+        accumulation_steps = training_args.gradient_accumulation_steps
+        if (
+            not isinstance(accumulation_steps, int)
+            or isinstance(accumulation_steps, bool)
+            or accumulation_steps < 1
+        ):
+            raise ValueError(
+                f"{training_args.trainer_type} expected gradient_accumulation_steps >= 1 "
+                "as an int; "
+                f"received gradient_accumulation_steps={accumulation_steps!r}"
+            )
+
+    def _validate_distillation_manual_geometry(self) -> None:
+        """Reject distillation configs that do not tile, without auto-aligning them."""
+        ta = self.training_args
+        world_size = get_world_size()
+        sample_num_per_iteration = world_size * ta.per_device_batch_size
+        total = ta.unique_sample_num_per_epoch * ta.group_size
+        if total % sample_num_per_iteration != 0:
+            raise ValueError(
+                f"{ta.trainer_type} does not auto-align unique_sample_num_per_epoch or "
+                "group_size; expected unique_sample_num_per_epoch"
+                f"({ta.unique_sample_num_per_epoch}) * group_size({ta.group_size}) % "
+                f"(num_replicas({world_size}) * per_device_batch_size"
+                f"({ta.per_device_batch_size})) == 0, received remainder "
+                f"{total % sample_num_per_iteration}"
+            )
+        if not isinstance(ta, TDMR1TrainingArguments):
+            return
+        if ta.per_device_batch_size % ta.group_size != 0:
+            raise ValueError(
+                "tdm-r1 requires per_device_batch_size % group_size == 0 so each "
+                "microbatch contains complete rank-local reward groups; received "
+                f"per_device_batch_size={ta.per_device_batch_size} and "
+                f"group_size={ta.group_size}"
+            )
+        if ta.unique_sample_num_per_epoch % world_size != 0:
+            raise ValueError(
+                "tdm-r1 requires unique_sample_num_per_epoch % num_replicas == 0 for "
+                "group_contiguous sampling and does not auto-align it; received "
+                f"unique_sample_num_per_epoch={ta.unique_sample_num_per_epoch} and "
+                f"num_replicas={world_size}"
+            )
+
     def __post_init__(self):
         if self.log_args.run_name is None:
             time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -231,9 +320,11 @@ class Arguments(ArgABC):
         # (the config schema stays permissive for a future multi-teacher trainer).
         self._validate_teacher_sources()
         self._resolve_scheduler_sde_defaults()
+        self._validate_multirole_training_contract()
         self._resolve_sampler_type()
         self._align_batch_geometry()
         self._adjust_gradient_accumulation()
+        self._validate_dmd2_batch_geometry()
 
     def _assign_source_ids(self) -> None:
         """Stamp each ``data.datasets[*]`` entry with a stable monotonic id.
@@ -577,6 +668,14 @@ class Arguments(ArgABC):
 
         trainer_type = str(ta.trainer_type).lower()
 
+        if trainer_type == "tdm-r1" and self.data_args.sampler_type != "group_contiguous":
+            logger.warning(
+                "TDM-R1 requires sampler_type='group_contiguous' so complete reward groups "
+                f"remain rank-local. Overriding '{self.data_args.sampler_type}' -> "
+                "'group_contiguous'."
+            )
+            self.data_args.sampler_type = "group_contiguous"
+
         if (
             user_choice in {"distributed_k_repeat", "group_distributed"}
             and self._has_async_rewards
@@ -636,6 +735,11 @@ class Arguments(ArgABC):
         one and then updates derived quantities (``num_batches_per_epoch`` +
         ``gradient_accumulation_steps``).
         """
+
+        if isinstance(self.training_args, DMD2TrainingArguments):
+            self._validate_distillation_manual_geometry()
+            self._recompute_derived_batch_quantities()
+            return
         sampler_type = self.data_args.sampler_type
         if sampler_type == "distributed_k_repeat":
             self._align_for_distributed_k_repeat()
@@ -934,8 +1038,11 @@ class Arguments(ArgABC):
         value is treated as final.
         """
         if not self.training_args._manual_gradient_accumulation_steps:
-            num_train_timesteps = self.training_args.get_num_train_timesteps(self)
-            self.training_args.gradient_accumulation_steps *= num_train_timesteps
+            if isinstance(self.training_args, DMD2TrainingArguments):
+                self.training_args.gradient_accumulation_steps = 1
+            else:
+                num_train_timesteps = self.training_args.get_num_train_timesteps(self)
+                self.training_args.gradient_accumulation_steps *= num_train_timesteps
         else:
             logger.info(
                 f"`gradient_accumulation_steps` manually set to "
