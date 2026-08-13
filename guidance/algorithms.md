@@ -377,11 +377,35 @@ train:
     trainer_type: 'dmd2'
     ttur_fake_updates: 5
     perturbation_timestep_range: [0.02, 0.98]
-    fake_optimizer:
-        learning_rate: 1.0e-5
-    generator_optimizer:
-        learning_rate: 1.0e-5
+optimizers:
+  - name: generator
+    learning_rate: 1.0e-5
+  - name: fake
+    learning_rate: 1.0e-5
 ```
+
+Optimizer hyperparameters come from the top-level `optimizers` list, one entry per
+role. Omitting it uses the algorithm's published defaults. A role may select `muon`
+there without the algorithm knowing the optimizer exists.
+
+### Reward monitoring
+
+The distillation loss is reward-free, but image quality is still worth watching.
+Configure `eval_rewards` against an eval dataset and the shared epoch loop scores
+samples on `eval.eval_freq`, exactly as it does for GRPO:
+
+```yaml
+eval:
+  eval_freq: 50
+
+eval_rewards:
+  - name: quality
+    reward_model: pickscore
+```
+
+Training rewards remain rejected for `dmd2` and `tdm`: an eval-only signal must not
+become a training signal by accident. `tdm-r1` is the exception, since its generator
+objective is reward-driven and it requires training rewards.
 
 Runnable YAML examples are not published yet. Do not infer adapter support from
 the trainer implementation alone.
