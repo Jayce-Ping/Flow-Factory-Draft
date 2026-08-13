@@ -79,38 +79,6 @@ class DPOTrainer(BaseTrainer):
         self.num_train_timesteps = self.training_args.num_train_timesteps
 
     # ====================== Main Loop ======================
-    def start(self):
-        """Main training loop."""
-        while self.should_continue_training():
-            self.adapter.set_trajectory_seed(self.epoch + self.training_args.seed)
-
-            # Save checkpoint
-            if (
-                self.log_args.save_freq > 0
-                and self.epoch % self.log_args.save_freq == 0
-                and self.log_args.save_dir
-            ):
-                save_dir = os.path.join(
-                    self.log_args.save_dir,
-                    str(self.log_args.run_name),
-                    'checkpoints',
-                )
-                self.save_checkpoint(save_dir, epoch=self.epoch)
-
-            # Evaluation
-            if (
-                self.eval_args.eval_freq > 0
-                and self.epoch % self.eval_args.eval_freq == 0
-            ):
-                self.evaluate()
-
-            samples = self.sample()
-            self.prepare_feedback(samples)
-            self.optimize(samples)
-
-            self.adapter.ema_step(step=self.epoch)
-            self.epoch += 1
-
     # ====================== Sampling ======================
     def sample(self) -> List[BaseSample]:
         """Generate rollouts for DPO (final latents only, no log-probs)."""

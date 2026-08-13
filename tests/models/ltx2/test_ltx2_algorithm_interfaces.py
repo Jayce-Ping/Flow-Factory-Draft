@@ -390,7 +390,7 @@ def test_the_nft_reference_kl_reduces_the_active_elements(rollout: SimpleNamespa
     velocity = _velocity(rollout, 1.0)
     reference = _velocity(rollout, 0.5)
 
-    kl = trainer._velocity_reference_kl(velocity, reference, noised)
+    kl = trainer._velocity_kl(velocity, reference, noised)
 
     errors = {
         name: (velocity.components[name] - reference.components[name]) ** 2 for name in COMPONENTS

@@ -1411,8 +1411,13 @@ class BaseAdapter(ABC):
         """Check if FSDP2 is enabled."""
         return getattr(self.accelerator, 'is_fsdp2', False)
 
-    def _is_fsdp_cpu_efficient_loading(self) -> bool:
-        """Check if FSDP efficient loading is enabled."""
+    def uses_fsdp_cpu_efficient_loading(self) -> bool:
+        """Return whether FSDP defers weight materialization to rank zero.
+
+        Public because the trainer must know it: under this mode only rank zero
+        holds real weights before ``prepare``, so frozen-component broadcasts and
+        preprocessing loads are ordered around it.
+        """
         if not self._is_fsdp():
             return False
         fsdp_plugin = self.accelerator.state.fsdp_plugin

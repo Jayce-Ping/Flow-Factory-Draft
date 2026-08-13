@@ -163,33 +163,6 @@ class DiffusionOPDTrainer(BaseTrainer):
         )
 
     # =============================== Lifecycle ===============================
-    def start(self) -> None:
-        """Main training loop (mirrors GRPO/NFT: save -> eval -> sample -> optimize)."""
-        while self.should_continue_training():
-            self.adapter.set_trajectory_seed(self.epoch + self.training_args.seed)
-
-            if (
-                self.log_args.save_freq > 0
-                and self.epoch % self.log_args.save_freq == 0
-                and self.log_args.save_dir
-            ):
-                save_dir = os.path.join(
-                    self.log_args.save_dir,
-                    str(self.log_args.run_name),
-                    "checkpoints",
-                )
-                self.save_checkpoint(save_dir, epoch=self.epoch)
-
-            if self.eval_args.eval_freq > 0 and self.epoch % self.eval_args.eval_freq == 0:
-                self.evaluate()
-
-            samples = self.sample()
-            self.prepare_feedback(samples)
-            self.optimize(samples)
-
-            self.adapter.ema_step(step=self.epoch)
-            self.epoch += 1
-
     def sample(self) -> List[BaseSample]:
         """Roll out on-policy student trajectories over the multi-source dataloader.
 

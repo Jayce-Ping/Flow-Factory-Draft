@@ -248,74 +248,6 @@ class DGPOTrainer(BaseTrainer):
                 ema_p.mul_(decay).add_(cur_p.detach().to(ema_p.device), alpha=one_minus_decay)
 
     # =========================== Timestep Sampling ============================
-    def _sample_timesteps(
-        self,
-        batch_size: int,
-        generator: Optional[torch.Generator] = None,
-    ) -> torch.Tensor:
-        """Sample scheduler-scale training timesteps ``[0, 1000]``.
-
-        Args:
-            batch_size: Size of the broadcast batch dimension.
-            generator: Optional ``torch.Generator``. When supplied, the draw is
-                deterministic and cross-rank-reproducible for any strategy;
-                threaded straight through to :class:`TimeSampler`.
-
-        Returns:
-            Tensor of shape ``(num_train_timesteps, batch_size)``.
-        """
-        device = self.accelerator.device
-        strategy = self.time_sampling_strategy.lower()
-        available = [
-            "logit_normal",
-            "uniform",
-            "discrete",
-            "discrete_with_init",
-            "discrete_wo_init",
-        ]
-
-        if strategy == "logit_normal":
-            return TimeSampler.logit_normal_shifted(
-                batch_size=batch_size,
-                num_timesteps=self.num_train_timesteps,
-                timestep_range=self.timestep_range,
-                time_shift=self.time_shift,
-                device=device,
-                stratified=True,
-                generator=generator,
-            )
-        if strategy == "uniform":
-            return TimeSampler.uniform(
-                batch_size=batch_size,
-                num_timesteps=self.num_train_timesteps,
-                timestep_range=self.timestep_range,
-                time_shift=self.time_shift,
-                device=device,
-                generator=generator,
-            )
-        if strategy.startswith("discrete"):
-            discrete_config = {
-                "discrete": (True, False),
-                "discrete_with_init": (True, True),
-                "discrete_wo_init": (False, False),
-            }
-            if strategy not in discrete_config:
-                raise ValueError(
-                    f"Unknown time_sampling_strategy: {strategy!r}. Available: {available}"
-                )
-            include_init, force_init = discrete_config[strategy]
-            return TimeSampler.discrete(
-                batch_size=batch_size,
-                num_train_timesteps=self.num_train_timesteps,
-                scheduler_timesteps=self.adapter.scheduler.timesteps,
-                timestep_range=self.timestep_range,
-                include_init=include_init,
-                force_init=force_init,
-                generator=generator,
-            )
-
-        raise ValueError(f"Unknown time_sampling_strategy: {strategy!r}. Available: {available}")
-
     def _sample_shared_timesteps(self, inner_epoch: int) -> torch.Tensor:
         """Sample ``num_train_timesteps`` scheduler-scale timesteps, identical on all ranks.
 
@@ -771,28 +703,6 @@ class DGPOTrainer(BaseTrainer):
         }
         return self.adapter.reduce_latent_values(errors, state=noised.state)
 
-    def _velocity_kl(
-        self,
-        velocity: LatentState,
-        ref_velocity: LatentState,
-        noised: NoisedState,
-    ) -> torch.Tensor:
-        """Per-sample squared velocity gap against the reference policy.
-
-        Args:
-            velocity: Current-policy velocity per component.
-            ref_velocity: Reference-policy velocity per component.
-            noised: Forward-noised state supplying per-sample reduction context.
-
-        Returns:
-            Per-sample KL surrogate of shape ``(B,)``.
-        """
-        errors = {
-            name: (velocity.components[name] - ref_velocity.components[name]).square()
-            for name in self.adapter.trajectory_component_order
-        }
-        return self.adapter.reduce_latent_values(errors, state=noised.state)
-
     def _maybe_clip_dsm(
         self,
         dsm_loss: torch.Tensor,
@@ -865,22 +775,6 @@ class DGPOTrainer(BaseTrainer):
         return loss_info
 
     # =========================== Advantage Processor Dispatch ============================
-    def compute_advantages(
-        self,
-        samples: List[BaseSample],
-        rewards: Dict[str, torch.Tensor],
-        store_to_samples: bool = True,
-        aggregation_func: Optional[Union[Literal["sum", "gdpo"], Callable]] = None,
-    ) -> torch.Tensor:
-        """Compute advantages via the shared ``AdvantageProcessor``."""
-        aggregation_func = aggregation_func or self.training_args.advantage_aggregation
-        return self.advantage_processor.compute_advantages(
-            samples=samples,
-            rewards=rewards,
-            store_to_samples=store_to_samples,
-            aggregation_func=aggregation_func,
-        )
-
     # =========================== Training Batch Builder ============================
     def _build_training_batches(
         self,
@@ -938,34 +832,6 @@ class DGPOTrainer(BaseTrainer):
         return training_batches
 
     # =========================== Main Loop ============================
-    def start(self):
-        """Main training loop."""
-        while self.should_continue_training():
-            self.adapter.set_trajectory_seed(self.epoch + self.training_args.seed)
-
-            if (
-                self.log_args.save_freq > 0
-                and self.epoch % self.log_args.save_freq == 0
-                and self.log_args.save_dir
-            ):
-                save_dir = os.path.join(
-                    self.log_args.save_dir,
-                    str(self.log_args.run_name),
-                    "checkpoints",
-                )
-                self.save_checkpoint(save_dir, epoch=self.epoch)
-
-            if self.eval_args.eval_freq > 0 and self.epoch % self.eval_args.eval_freq == 0:
-                self.evaluate()
-
-            with self.sampling_context():
-                samples = self.sample()
-
-            self.prepare_feedback(samples)
-            self.optimize(samples)
-            self.adapter.ema_step(step=self.epoch)
-            self.epoch += 1
-
     # =========================== Sampling (Stages 2-3) ============================
     def sample(self) -> List[BaseSample]:
         """Generate rollouts for DGPO (final latents only)."""
@@ -976,14 +842,6 @@ class DGPOTrainer(BaseTrainer):
         )
 
     # =========================== Reward / Advantage (Stages 4-5) ============================
-    def prepare_feedback(self, samples: List[BaseSample]) -> None:
-        """Finalise rewards, compute advantages, and log advantage metrics."""
-        rewards = self.reward_buffer.finalize(store_to_samples=True, split="all")
-        self.compute_advantages(samples, rewards, store_to_samples=True)
-        adv_metrics = self.advantage_processor.pop_advantage_metrics()
-        if adv_metrics:
-            self.log_data(adv_metrics, step=self.step)
-
     # =========================== Optimization (Stage 6) ============================
     def optimize(self, samples: List[BaseSample]) -> None:
         """Policy optimisation (Stage 6): group DGPO loss + optional PPO clip + KL.

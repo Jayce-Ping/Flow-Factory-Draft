@@ -250,123 +250,14 @@ class CRDTrainer(BaseTrainer):
 
     # ========================= Timestep Sampling =========================
 
-    def _sample_timesteps(self, batch_size: int) -> torch.Tensor:
-        """
-        Sample continuous or discrete timesteps based on configured `time_sampling_strategy`.
-
-        Returns:
-            Tensor of shape ``(num_train_timesteps, batch_size)`` with scheduler-scale ``t`` in ``[0, 1000]``.
-        """
-        device = self.accelerator.device
-        time_sampling_strategy = self.time_sampling_strategy.lower()
-        available = ['logit_normal', 'uniform', 'discrete', 'discrete_with_init', 'discrete_wo_init']
-
-        if time_sampling_strategy == 'logit_normal':
-            return TimeSampler.logit_normal_shifted(
-                batch_size=batch_size,
-                num_timesteps=self.num_train_timesteps,
-                timestep_range=self.timestep_range,
-                time_shift=self.time_shift,
-                device=device,
-                stratified=True,
-            )
-        elif time_sampling_strategy == 'uniform':
-            return TimeSampler.uniform(
-                batch_size=batch_size,
-                num_timesteps=self.num_train_timesteps,
-                timestep_range=self.timestep_range,
-                time_shift=self.time_shift,
-                device=device,
-            )
-        elif time_sampling_strategy.startswith('discrete'):
-            # Map time_sampling_strategy to (include_init, force_init)
-            discrete_config = {
-                'discrete':           (True, False),
-                'discrete_with_init': (True, True),
-                'discrete_wo_init':   (False, False),
-            }
-            if time_sampling_strategy not in discrete_config:
-                raise ValueError(f"Unknown time_sampling_strategy: {time_sampling_strategy}. Available: {available}")
-            include_init, force_init = discrete_config[time_sampling_strategy]
-            return TimeSampler.discrete(
-                batch_size=batch_size,
-                num_train_timesteps=self.num_train_timesteps,
-                scheduler_timesteps=self.adapter.scheduler.timesteps,
-                timestep_range=self.timestep_range,
-                include_init=include_init,
-                force_init=force_init,
-            )
-        else:
-            raise ValueError(f"Unknown time_sampling_strategy: {time_sampling_strategy}. Available: {available}")
-
     # ========================= Advantage Computation =========================
-
-    def compute_advantages(
-        self,
-        samples: List[BaseSample],
-        rewards: Dict[str, torch.Tensor],
-        store_to_samples: bool = True,
-        aggregation_func=None,
-    ) -> torch.Tensor:
-        """Compute advantages — delegates to AdvantageProcessor.
-
-        Args:
-            samples: List of BaseSample instances
-            rewards: Dict of reward_name to reward tensors aligned with samples
-            store_to_samples: Whether to store computed advantages back to samples' extra_kwargs
-            aggregation_func: Method to aggregate advantages within each group.
-                Options: 'sum' (default GRPO), 'gdpo' (GDPO-style), or a custom callable.
-        Returns:
-            advantages: Tensor of shape (num_samples, ) with computed advantages
-        """
-        aggregation_func = aggregation_func or self.training_args.advantage_aggregation
-        return self.advantage_processor.compute_advantages(
-            samples=samples,
-            rewards=rewards,
-            store_to_samples=store_to_samples,
-            aggregation_func=aggregation_func,
-        )
 
     # ========================= Main Training Loop =========================
 
-    def start(self):
-        """Main training loop."""
-        while self.should_continue_training():
-            self.adapter.set_trajectory_seed(self.epoch + self.training_args.seed)
-
-            # Save checkpoint
-            if (
-                self.log_args.save_freq > 0
-                and self.epoch % self.log_args.save_freq == 0
-                and self.log_args.save_dir
-            ):
-                save_dir = os.path.join(
-                    self.log_args.save_dir,
-                    str(self.log_args.run_name),
-                    'checkpoints',
-                )
-                self.save_checkpoint(save_dir, epoch=self.epoch)
-
-            # Evaluation
-            if (
-                self.eval_args.eval_freq > 0
-                and self.epoch % self.eval_args.eval_freq == 0
-            ):
-                self.evaluate()
-
-            # Sampling: always use the "sampling" model snapshot
-            with self.sampling_context():
-                samples = self.sample()
-
-            self.prepare_feedback(samples)
-            self.optimize(samples)
-
-            # Update EMA (if enabled), old model, and sampling model
-            self.adapter.ema_step(step=self.epoch)
-            self._update_old_model()
-            self._update_sampling_model()
-
-            self.epoch += 1
+    def _after_optimizer_step(self) -> None:
+        """Advance CRD's two auxiliary snapshots alongside the optimizer EMA."""
+        self._update_old_model()
+        self._update_sampling_model()
 
     def _blend_named_params(self, name: str, decay: float):
         """
@@ -610,28 +501,6 @@ class CRDTrainer(BaseTrainer):
                 )
         return self.adapter.reduce_latent_values(rewards, state=noised.state)
 
-    def _velocity_kl(
-        self,
-        velocity: LatentState,
-        ref_velocity: LatentState,
-        noised: NoisedState,
-    ) -> torch.Tensor:
-        """Compute the per-sample squared velocity gap against another parameter set.
-
-        Args:
-            velocity: Current-policy velocity per component.
-            ref_velocity: Reference or old-snapshot velocity per component.
-            noised: Forward-noised state supplying per-sample reduction context.
-
-        Returns:
-            Per-sample KL surrogate of shape ``(B,)``.
-        """
-        errors = {
-            name: (velocity.components[name] - ref_velocity.components[name]) ** 2
-            for name in self.adapter.trajectory_component_order
-        }
-        return self.adapter.reduce_latent_values(errors, state=noised.state)
-
     def _kl_loss(self, kl_div: torch.Tensor, reward: torch.Tensor) -> torch.Tensor:
         """Scale the per-sample KL surrogate into the loss term.
 
@@ -648,14 +517,6 @@ class CRDTrainer(BaseTrainer):
             min_coef = base_beta / max(self.kl_beta, 1e-8)
             return self.kl_beta * torch.mean((min_coef + reward * (1 - min_coef)) * kl_div)
         return self.kl_beta * kl_div.mean()
-
-    def prepare_feedback(self, samples: List[BaseSample]) -> None:
-        """Finalize rewards, compute advantages, and log advantage metrics."""
-        rewards = self.reward_buffer.finalize(store_to_samples=True, split='all')
-        self.compute_advantages(samples, rewards, store_to_samples=True)
-        adv_metrics = self.advantage_processor.pop_advantage_metrics()
-        if adv_metrics:
-            self.log_data(adv_metrics, step=self.step)
 
     # ========================= CRD Centering Loss =========================
 

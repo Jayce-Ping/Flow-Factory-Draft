@@ -291,39 +291,6 @@ class GRPOTrainer(BaseTrainer):
         )
         return torch.mean(self.adapter.reduce_latent_values(errors, state=replay.state))
 
-    def start(self):
-        """Main training loop."""
-        while self.should_continue_training():
-            self.adapter.set_trajectory_seed(self.epoch + self.training_args.seed)
-            
-            # Save checkpoint
-            if (
-                self.log_args.save_freq > 0 and 
-                self.epoch % self.log_args.save_freq == 0 and 
-                self.log_args.save_dir
-            ):
-                save_dir = os.path.join(
-                    self.log_args.save_dir,
-                    str(self.log_args.run_name),
-                    'checkpoints',
-                )
-                self.save_checkpoint(save_dir, epoch=self.epoch)
-
-            # Evaluation
-            if (
-                self.eval_args.eval_freq > 0 and
-                self.epoch % self.eval_args.eval_freq == 0
-            ):
-                self.evaluate()
-
-            samples = self.sample()
-            self.prepare_feedback(samples)
-            self.optimize(samples)
-
-            self.adapter.ema_step(step=self.epoch)
-
-            self.epoch += 1
-
     # =========================== Sampling Loop ============================
     def sample(self) -> List[BaseSample]:
         """Generate rollouts for GRPO (stores full trajectory + log-probs)."""
@@ -338,14 +305,6 @@ class GRPOTrainer(BaseTrainer):
         )
 
     # =========================== Reward / advantage (Stages 4--5) ============================
-    def prepare_feedback(self, samples: List[BaseSample]) -> None:
-        """Finalize rewards from the buffer, compute advantages, and log advantage metrics."""
-        rewards = self.reward_buffer.finalize(store_to_samples=True, split='all')
-        self.compute_advantages(samples, rewards, store_to_samples=True)
-        adv_metrics = self.advantage_processor.pop_advantage_metrics()
-        if adv_metrics:
-            self.log_data(adv_metrics, step=self.step)
-
     # =========================== Optimization Loop ============================
     def optimize(self, samples: List[BaseSample]) -> None:
         """Policy optimization (Stage 6): PPO-style clipped loss and optional KL."""
@@ -463,33 +422,6 @@ class GRPOTrainer(BaseTrainer):
                             loss_info = defaultdict(list)
 
     # =========================== Advantage Computation ============================
-    def compute_advantages(
-        self,
-        samples: List[BaseSample],
-        rewards: Dict[str, torch.Tensor],
-        store_to_samples: bool = True,
-        aggregation_func: Optional[Union[Literal['sum', 'gdpo'], Callable]] = None,
-    ) -> torch.Tensor:
-        """Compute advantages — delegates to AdvantageProcessor.
-
-        Args:
-            samples: List of BaseSample instances
-            rewards: Dict of reward_name to reward tensors aligned with samples
-            store_to_samples: Whether to store computed advantages back to samples' extra_kwargs
-            aggregation_func: Method to aggregate advantages within each group.
-                Options: 'sum' (default GRPO), 'gdpo' (GDPO-style), or a custom callable.
-        Returns:
-            advantages: Tensor of shape (num_samples, ) with computed advantages
-        """
-        aggregation_func = aggregation_func or self.training_args.advantage_aggregation
-        return self.advantage_processor.compute_advantages(
-            samples=samples,
-            rewards=rewards,
-            store_to_samples=store_to_samples,
-            aggregation_func=aggregation_func,
-        )
-
-
 # ============================ GRPO-Guard Trainer ============================
 class GRPOGuardTrainer(GRPOTrainer):
     """

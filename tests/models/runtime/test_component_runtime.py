@@ -768,7 +768,7 @@ class LifecycleAdapterFake:
         self.calls.append(("resolve", components))
         return ["transformer", "vae"]
 
-    def _is_fsdp_cpu_efficient_loading(self) -> bool:
+    def uses_fsdp_cpu_efficient_loading(self) -> bool:
         """Return whether frozen components require rank-zero synchronization."""
         return self.fsdp_cpu_efficient_loading
 

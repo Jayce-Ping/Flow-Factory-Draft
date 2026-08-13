@@ -19,7 +19,19 @@ from abc import ABC, abstractmethod
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, ClassVar, Dict, Iterator, List, Literal, Mapping, Optional, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    Iterator,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 import torch
@@ -50,7 +62,7 @@ from ..rewards import (
     RewardProcessor,
     load_reward_model,
 )
-from ..samples import BaseSample, StackedSampleBatch
+from ..samples import BaseSample, LatentState, NoisedState, StackedSampleBatch
 from ..utils.base import (
     create_generator,
     create_generator_by_prompt,
@@ -59,6 +71,7 @@ from ..utils.base import (
     visit_tensor_leaves,
 )
 from ..utils.logger_utils import setup_logger
+from ..utils.noise_schedule import TimeSampler
 from .role_optimization import (
     OptimizationRole,
     RoleOptimizationCoordinator,
@@ -361,7 +374,7 @@ class BaseTrainer(ABC):
         self.adapter.on_load_components(
             components=self.adapter.preprocessing_modules, device=self.accelerator.device
         )
-        if self.adapter._is_fsdp_cpu_efficient_loading():
+        if self.adapter.uses_fsdp_cpu_efficient_loading():
             self._synchronize_frozen_components(self.adapter.preprocessing_modules)
 
         dataloader, train_dataloaders_by_source = get_train_dataloader(
@@ -821,13 +834,40 @@ class BaseTrainer(ABC):
                 components=resolved,
                 device=self.accelerator.device,
             )
-            if self.adapter._is_fsdp_cpu_efficient_loading():
+            if self.adapter.uses_fsdp_cpu_efficient_loading():
                 self._synchronize_frozen_components(resolved)
 
+    def _validate_paradigm_dynamics(self) -> None:
+        """Reject a scheduler whose dynamics the declared paradigm cannot use.
+
+        A coupled algorithm differentiates a stochastic transition, so an ODE
+        scheduler leaves it with no transition density and silently wrong policy
+        gradients (``constraints.md`` #7). Only the coupled path was guarded, and
+        only lazily at the point a transition scale was first needed, which is
+        after a run has already started.
+        """
+        if type(self).paradigm != "coupled":
+            return
+        scheduler_group = getattr(self.adapter, "scheduler_group", None)
+        if scheduler_group is None:
+            return
+        stochastic = ("Flow-SDE", "Dance-SDE", "CPS")
+        for component in scheduler_group.names:
+            dynamics_type = scheduler_group[component].dynamics_type
+            if dynamics_type not in stochastic:
+                raise ValueError(
+                    f"coupled algorithm {type(self).__name__} requires stochastic dynamics, "
+                    f"received dynamics_type={dynamics_type!r} for component {component!r}; "
+                    f"expected one of {stochastic}. Either configure an SDE scheduler or use a "
+                    "decoupled algorithm (see constraints #7)."
+                )
+
     def _initialization(self):
+        self._validate_paradigm_dynamics()
+
         # Fix for FSDP, synchronize frozen components like text encoder & VAE.
         # Otherwise they may be uninitialized on Rank > 0.
-        if self.adapter._is_fsdp_cpu_efficient_loading():
+        if self.adapter.uses_fsdp_cpu_efficient_loading():
             logger.info("FSDP CPU Efficient Loading detected. Synchronizing frozen components...")
             # self.adapter.on_load(self.accelerator.device)
             self._synchronize_frozen_components()
@@ -1047,24 +1087,219 @@ class BaseTrainer(ABC):
 
         DeepSpeedEngine._ff_autocast_patched = True
 
-    @abstractmethod
-    def start(self, *args, **kwargs):
-        """Start training process."""
-        pass
+    def start(self) -> None:
+        """Run the training loop until the configured budget is exhausted.
 
-    @abstractmethod
-    def prepare_feedback(self, samples: List[BaseSample]) -> None:
-        """Stages 4--5: finalize rewards, compute advantages, and log metrics (no policy gradients).
-
-        Algorithms that need extra batching before the loss (e.g. DPO chosen/rejected pairs) may
-        perform that work in :meth:`optimize` after advantages are on each sample.
+        Every algorithm drives the same epoch: reseed, save on ``save_freq``,
+        evaluate on ``eval_freq``, then sample, score, optimize, and step EMA.
+        Only the middle of that sequence is algorithm-specific, so the loop lives
+        here and the variation is expressed through
+        :meth:`sampling_context`, :meth:`_run_training_step` and
+        :meth:`_after_optimizer_step` rather than by restating the loop.
         """
-        pass
+        while self.should_continue_training():
+            self.adapter.set_trajectory_seed(self.epoch + self.training_args.seed)
+
+            if (
+                self.log_args.save_freq > 0
+                and self.epoch % self.log_args.save_freq == 0
+                and self.log_args.save_dir
+            ):
+                save_dir = os.path.join(
+                    self.log_args.save_dir,
+                    str(self.log_args.run_name),
+                    "checkpoints",
+                )
+                self.save_checkpoint(save_dir, epoch=self.epoch)
+
+            if self.eval_args.eval_freq > 0 and self.epoch % self.eval_args.eval_freq == 0:
+                self.evaluate()
+
+            self._run_training_step()
+
+            self.adapter.ema_step(step=self.epoch)
+            self._after_optimizer_step()
+            self.epoch += 1
+
+    def _run_training_step(self) -> None:
+        """Run one epoch's rollout, feedback and optimization.
+
+        Every trainer supplies ``sample()``; what it stores follows from the
+        paradigm, since a coupled algorithm needs the full trajectory and its log
+        probabilities while a decoupled one needs only the terminal state.
+        Distillation accumulates several dataloader batches before a single
+        optimizer step, so the grouping is a hook rather than a fixed sequence.
+        """
+        with self.sampling_context():
+            samples = self.sample()
+        self.prepare_feedback(samples)
+        self.optimize(samples)
+
+    @contextmanager
+    def sampling_context(self) -> Iterator[None]:
+        """Parameter scope for rollout generation.
+
+        On-policy sampling needs no swap; algorithms that roll out under EMA, a
+        reference snapshot, or a separate sampling model override this.
+        """
+        yield
+
+    def _after_optimizer_step(self) -> None:
+        """Update algorithm-owned auxiliary weights after the optimizer step.
+
+        EMA is handled by the loop; this is for extra snapshots an algorithm keeps
+        alongside it, such as CRD's old model and sampling model.
+        """
+
+    def prepare_feedback(self, samples: List[BaseSample]) -> None:
+        """Stages 4--5: finalize rewards, compute advantages, and log metrics.
+
+        No policy gradients here. Distillation has no reward signal and overrides
+        this with a no-op; algorithms that need extra batching before the loss
+        (DPO's chosen/rejected pairing) do that work in :meth:`optimize`, after
+        advantages are on each sample.
+        """
+        rewards = self.reward_buffer.finalize(store_to_samples=True, split="all")
+        self.compute_advantages(samples, rewards, store_to_samples=True)
+        adv_metrics = self.advantage_processor.pop_advantage_metrics()
+        if adv_metrics:
+            self.log_data(adv_metrics, step=self.step)
+
+    def compute_advantages(
+        self,
+        samples: List[BaseSample],
+        rewards: Dict[str, torch.Tensor],
+        store_to_samples: bool = True,
+        aggregation_func: Optional[Union[Literal["sum", "gdpo"], Callable]] = None,
+    ) -> torch.Tensor:
+        """Turn per-sample rewards into advantages via the advantage processor.
+
+        Args:
+            samples: Samples this epoch's rewards belong to.
+            rewards: Reward tensors by reward name, aligned with ``samples``.
+            store_to_samples: Whether to write advantages back onto each sample.
+            aggregation_func: Within-group aggregation, defaulting to the
+                configured ``advantage_aggregation``.
+
+        Returns:
+            One advantage per sample.
+        """
+        aggregation_func = aggregation_func or self.training_args.advantage_aggregation
+        return self.advantage_processor.compute_advantages(
+            samples=samples,
+            rewards=rewards,
+            store_to_samples=store_to_samples,
+            aggregation_func=aggregation_func,
+        )
 
     @abstractmethod
     def optimize(self, *args, **kwargs):
         """Update policy model"""
         pass
+
+    def _sample_timesteps(
+        self,
+        batch_size: int,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        """Sample scheduler-scale training timesteps in ``[0, 1000]``.
+
+        Decoupled algorithms draw a training coordinate rather than replaying a
+        stored one, and the strategy is a configuration choice rather than an
+        algorithmic one, so it lives here. An algorithm whose draw is part of its
+        objective (DPO shares one draw across preference arms) overrides this.
+
+        Args:
+            batch_size: Size of the broadcast batch dimension.
+            generator: Optional ``torch.Generator``. When supplied, the draw is
+                deterministic and cross-rank-reproducible for any strategy, which
+                is how a group-based algorithm shares one coordinate across ranks.
+
+        Returns:
+            Tensor of shape ``(num_train_timesteps, batch_size)``.
+
+        Raises:
+            ValueError: If the configured strategy is not recognized.
+        """
+        device = self.accelerator.device
+        strategy = self.time_sampling_strategy.lower()
+        available = [
+            "logit_normal",
+            "uniform",
+            "discrete",
+            "discrete_with_init",
+            "discrete_wo_init",
+        ]
+
+        if strategy == "logit_normal":
+            return TimeSampler.logit_normal_shifted(
+                batch_size=batch_size,
+                num_timesteps=self.num_train_timesteps,
+                timestep_range=self.timestep_range,
+                time_shift=self.time_shift,
+                device=device,
+                stratified=True,
+                generator=generator,
+            )
+        if strategy == "uniform":
+            return TimeSampler.uniform(
+                batch_size=batch_size,
+                num_timesteps=self.num_train_timesteps,
+                timestep_range=self.timestep_range,
+                time_shift=self.time_shift,
+                device=device,
+                generator=generator,
+            )
+        if strategy.startswith("discrete"):
+            discrete_config = {
+                "discrete": (True, False),
+                "discrete_with_init": (True, True),
+                "discrete_wo_init": (False, False),
+            }
+            if strategy not in discrete_config:
+                raise ValueError(
+                    f"Unknown time_sampling_strategy: {strategy!r}. Available: {available}"
+                )
+            include_init, force_init = discrete_config[strategy]
+            return TimeSampler.discrete(
+                batch_size=batch_size,
+                num_train_timesteps=self.num_train_timesteps,
+                scheduler_timesteps=self.adapter.scheduler.timesteps,
+                timestep_range=self.timestep_range,
+                include_init=include_init,
+                force_init=force_init,
+                generator=generator,
+            )
+
+        raise ValueError(f"Unknown time_sampling_strategy: {strategy!r}. Available: {available}")
+
+    def _velocity_kl(
+        self,
+        velocity: LatentState,
+        other_velocity: LatentState,
+        noised: NoisedState,
+    ) -> torch.Tensor:
+        """Compute the per-sample squared velocity gap against another policy.
+
+        Under a fixed forward process the KL between two Gaussian transition
+        kernels reduces to the squared gap between their velocity predictions, so
+        every decoupled algorithm that regularizes towards a reference, an EMA, or
+        an older snapshot needs exactly this quantity. Which policy supplies
+        ``other_velocity`` is the algorithm's choice; the reduction is not.
+
+        Args:
+            velocity: Current-policy velocity per component.
+            other_velocity: Reference, EMA or old-snapshot velocity per component.
+            noised: Forward-noised state supplying per-sample reduction context.
+
+        Returns:
+            Per-sample KL surrogate of shape ``(B,)``.
+        """
+        errors = {
+            name: (velocity.components[name] - other_velocity.components[name]) ** 2
+            for name in self.adapter.trajectory_component_order
+        }
+        return self.adapter.reduce_latent_values(errors, state=noised.state)
 
     def _order_samples_for_optimize(
         self, samples: List[BaseSample], inner_epoch: int

@@ -675,7 +675,7 @@ def test_nft_reference_kl_matches_the_legacy_velocity_formula() -> None:
     )
     trainer = _nft_trainer(_adapter())
 
-    kl_div = trainer._velocity_reference_kl(
+    kl_div = trainer._velocity_kl(
         LatentState({"latent": new_velocity}), LatentState({"latent": ref_velocity}), noised
     )
 
@@ -689,7 +689,7 @@ def test_nft_reference_kl_passes_the_noised_state_to_the_global_reducer() -> Non
     mask = torch.tensor([[1.0, 1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
     trainer = _nft_trainer(_adapter(DynamicMaskAdapterFake))
 
-    kl_div = trainer._velocity_reference_kl(
+    kl_div = trainer._velocity_kl(
         LatentState({"latent": new_velocity}),
         LatentState({"latent": ref_velocity}),
         _masked_noised(mask),
