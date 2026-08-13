@@ -36,8 +36,19 @@ from .replay import (
     get_replay_callback,
     get_replay_step,
     get_state_active_numel,
+    get_state_active_numel_per_sample,
     get_terminal_state,
     get_train_step_indices,
+    replay_generator_boundary,
+    validate_state_active_numel_per_sample,
+    validate_state_active_numel_per_sample_input,
+)
+from .score import (
+    project_clean_to_score_state,
+    project_flow_match_clean_to_score_state,
+    validate_projected_score_state,
+    validate_score_projection_inputs,
+    validate_score_projection_state,
 )
 
 __all__ = [
@@ -51,11 +62,20 @@ __all__ = [
     "get_replay_callback",
     "get_replay_step",
     "get_state_active_numel",
+    "get_state_active_numel_per_sample",
     "get_terminal_state",
     "get_train_step_indices",
+    "project_clean_to_score_state",
+    "project_flow_match_clean_to_score_state",
     "project_velocity_to_clean_state",
+    "replay_generator_boundary",
     "resolve_component_latent_axes",
+    "validate_projected_score_state",
     "validate_reduced_component_values",
     "validate_reduced_latent_values",
     "validate_reduction_inputs",
+    "validate_score_projection_inputs",
+    "validate_score_projection_state",
+    "validate_state_active_numel_per_sample",
+    "validate_state_active_numel_per_sample_input",
 ]

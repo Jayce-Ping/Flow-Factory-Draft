@@ -27,6 +27,8 @@ from typing import (
     Union,
     Literal,
     Iterable,
+    Iterator,
+    Sequence,
     Set,
     Mapping,
     cast,
@@ -87,6 +89,7 @@ from ..samples import (
 )
 from .latent_geometry import LatentAxes, infer_latent_axes
 from .model_bundle import RoutedComponentProxy
+from .roles import ModelRoleRegistry, ModelRoleSpec, RoleName
 from .runtime import ClassicPipelineRuntime, ComponentRuntime
 from . import trajectory_bridge as bridge
 from ..ema import EMAModuleWrapper
@@ -637,6 +640,115 @@ class BaseAdapter(ABC):
         """Prepared model objects with trainable parameters."""
         return [self.get_component(name) for name in self.trainable_component_names]
 
+    # ============================== Model Roles ==============================
+    """
+        A single-policy algorithm trains one copy of the trainable components, so
+        `target_module_map` alone describes parameter ownership. Distillation trains
+        several copies at once - a generator, a fake score, a surrogate critic - and
+        each needs its own optimizer group, its own storage (a LoRA adapter on a
+        shared base, or separate full weights), and its own routing to the components
+        it owns. `ModelRoleRegistry` carries that per-role ownership; the two methods
+        below are how an algorithm declares it and how any caller scopes a forward
+        to one role.
+    """
+
+    def configure_model_roles(
+        self,
+        required_trainable_roles: Sequence[RoleName],
+    ) -> None:
+        """Declare and materialize trainable model roles before preparation.
+
+        Under ``lora`` every role is an adapter name on one shared base; under
+        ``full`` every non-generator role gets its own component copy. Roles must be
+        configured before ``accelerator.prepare`` so the bundle can see every
+        member, hence the refusal to reconfigure an existing registry.
+
+        Args:
+            required_trainable_roles: Trainable roles required by the algorithm.
+
+        Raises:
+            RuntimeError: If roles are already configured or frozen.
+            ValueError: If the finetune type has no role storage mode.
+        """
+        existing_registry = getattr(self, "model_role_registry", None)
+        if existing_registry is not None:
+            state = "frozen" if existing_registry.is_frozen else "already configured"
+            raise RuntimeError(
+                f"cannot configure model roles: registry is {state}; "
+                f"existing roles are {existing_registry.role_names!r}"
+            )
+
+        required_roles = ModelRoleRegistry._validate_required_trainable_roles(
+            required_trainable_roles
+        )
+        finetune_type = self.model_args.finetune_type
+        if finetune_type not in ("lora", "full"):
+            raise ValueError(
+                "expected model finetune_type to be 'lora' or 'full' for model roles, "
+                f"received {finetune_type!r}"
+            )
+        registry = ModelRoleRegistry(self)
+        for role_name in required_roles:
+            if finetune_type == "lora":
+                component_routes = {
+                    component_name: component_name
+                    for component_name in self.trainable_component_names
+                }
+                adapter_name = "default" if role_name == "generator" else role_name
+            else:
+                component_routes = {
+                    component_name: (
+                        component_name
+                        if role_name == "generator"
+                        else f"{role_name}__{component_name}"
+                    )
+                    for component_name in self.trainable_component_names
+                }
+                adapter_name = None
+            registry.declare(
+                ModelRoleSpec(
+                    name=role_name,
+                    trainable=True,
+                    storage_mode=finetune_type,
+                    component_routes=component_routes,
+                    adapter_name=adapter_name,
+                )
+            )
+        registry.declare(
+            ModelRoleSpec(
+                name="reference",
+                trainable=False,
+                storage_mode="snapshot",
+                component_routes={
+                    component_name: component_name
+                    for component_name in self.trainable_component_names
+                },
+            )
+        )
+        registry.materialize(required_roles)
+        self.model_role_registry = registry
+
+    @contextmanager
+    def use_model_role(self, role_name: RoleName) -> Iterator[None]:
+        """Temporarily use a configured model role.
+
+        Args:
+            role_name: Declared model role to activate.
+
+        Yields:
+            Control while the requested model role is active.
+
+        Raises:
+            RuntimeError: If model roles were never configured.
+        """
+        registry = getattr(self, "model_role_registry", None)
+        if registry is None:
+            raise RuntimeError(
+                f"cannot use model role {role_name!r}: model roles are not configured"
+            )
+        with registry.use(role_name):
+            yield
+
     def _merge_module_pattern(
         self,
         current_pattern: Union[str, List[str], Set[str]],
@@ -762,6 +874,70 @@ class BaseAdapter(ABC):
                 yield
         else:
             yield
+
+    @contextmanager
+    def use_generator_ema_for_export(self) -> Iterator[None]:
+        """Temporarily install the role-local generator EMA for evaluation or export.
+
+        Yields:
+            Control while the generator role's EMA parameters are installed.
+
+        Raises:
+            RuntimeError: If model roles were never configured.
+        """
+        registry = getattr(self, "model_role_registry", None)
+        if registry is None:
+            raise RuntimeError(
+                f"adapter={type(self).__name__!r} has no model role registry for generator EMA"
+            )
+        with registry.use_parameter_ema("generator_ema"):
+            yield
+
+    def save_official_generator_ema(
+        self,
+        save_directory: str,
+        *,
+        emit_ema_parameters: bool,
+    ) -> None:
+        """Save generator-only EMA weights and optional official ``ema.ckpt`` artifact.
+
+        Distillation ships the generator alone, so the export scopes the checkpoint
+        to that role rather than to every trained role.
+
+        Args:
+            save_directory: Destination directory for the exported generator.
+            emit_ema_parameters: Whether to also write the raw ``ema.ckpt`` tensors.
+
+        Raises:
+            TypeError: If ``emit_ema_parameters`` is not a bool.
+            RuntimeError: If model roles were never configured.
+        """
+        if not isinstance(emit_ema_parameters, bool):
+            raise TypeError(
+                "expected bool emit_ema_parameters, received "
+                f"{type(emit_ema_parameters).__name__}: {emit_ema_parameters!r}"
+            )
+        registry = getattr(self, "model_role_registry", None)
+        if registry is None:
+            raise RuntimeError(
+                f"adapter={type(self).__name__!r} has no model role registry for generator export"
+            )
+        os.makedirs(save_directory, exist_ok=True)
+        if emit_ema_parameters and self.accelerator.is_main_process:
+            torch.save(
+                {
+                    "ema_parameters": [
+                        tensor.cpu() for tensor in registry.parameter_ema_tensors("generator_ema")
+                    ]
+                },
+                os.path.join(save_directory, "ema.ckpt"),
+            )
+        with self.use_generator_ema_for_export():
+            self.save_checkpoint(
+                save_directory=save_directory,
+                save_ema=False,
+                model_only=True,
+            )
 
     # ============================== Reference Parameters ==============================
     def _init_ref_parameters(self):
@@ -1456,6 +1632,19 @@ class BaseAdapter(ABC):
             )
             return
 
+        # With roles configured, several adapters live on one shared base and
+        # save_pretrained would write every one of them; the exported artifact is
+        # the generator's adapter alone.
+        registry = getattr(self, "model_role_registry", None)
+        selected_adapters = None
+        if registry is not None:
+            generator_adapter_name = registry.get_spec("generator").adapter_name
+            if generator_adapter_name is None:
+                raise ValueError(
+                    "expected generator LoRA role to declare an adapter_name, received None"
+                )
+            selected_adapters = [generator_adapter_name]
+
         # If not sharded save, use standard save_pretrained
         if self._requires_collective_state_dict():
             # Handle sharded save
@@ -1470,10 +1659,14 @@ class BaseAdapter(ABC):
                 unwrapped.save_pretrained(
                     save_directory,
                     state_dict=state_dict,
+                    selected_adapters=selected_adapters,
                 )
         else:
             if self.accelerator.is_main_process:
-                unwrapped.save_pretrained(save_directory)
+                unwrapped.save_pretrained(
+                    save_directory,
+                    selected_adapters=selected_adapters,
+                )
 
         self.accelerator.wait_for_everyone()
 
@@ -1651,18 +1844,28 @@ class BaseAdapter(ABC):
         if not model_only:
             if self.accelerator.is_main_process:
                 logger.info(f"Saving training state (resume-ready) to {save_directory}...")
-            
+
+            # Role metadata must be written before accelerate mutates optimizer state,
+            # or a resumed run cannot tell which optimizer group belongs to which role.
+            multirole_checkpoint_state = getattr(self, "_multirole_checkpoint_state", None)
+            if multirole_checkpoint_state is not None:
+                multirole_checkpoint_state.prepare_save(save_directory)
             self.accelerator.save_state(save_directory, safe_serialization=safe_serialization, **kwargs)
             
             if self.accelerator.is_main_process:
                 logger.info(f"Training state saved.")
             return
 
-        # 2. Save only model
-        # Setup EMA context
+        # 2. Save only the canonical generator model. With roles configured, the
+        # exported artifact is the generator alone; the fake-score and surrogate
+        # roles are training scaffolding and never ship.
         save_context = self.use_ema_parameters if save_ema else nullcontext
-        
-        with save_context():
+        registry = getattr(self, "model_role_registry", None)
+        generator_context = (
+            registry.use_generator_for_export if registry is not None else nullcontext
+        )
+
+        with generator_context(), save_context():
             for comp_name, target_modules in self.target_module_map.items():
                 if not self.has_component(comp_name):
                     logger.warning(f"Component {comp_name} not found, skipping save")
@@ -1964,7 +2167,12 @@ class BaseAdapter(ABC):
         """Load full training state for resuming training."""
         if self.accelerator.is_main_process:
             logger.info(f"Loading training state from {path}...")
-        
+
+        # Reject a role layout that disagrees with this run before accelerate
+        # restores optimizer state onto the wrong groups.
+        multirole_checkpoint_state = getattr(self, "_multirole_checkpoint_state", None)
+        if multirole_checkpoint_state is not None:
+            multirole_checkpoint_state.validate_load(path)
         self.accelerator.load_state(path)
         
         if self.accelerator.is_main_process:
@@ -2627,6 +2835,52 @@ class BaseAdapter(ABC):
         ``x0 = xt + sigma * velocity``.
         """
         return bridge.project_velocity_to_clean_state(self, state, times, velocity)
+
+    def project_velocity_to_score_state(
+        self,
+        state: LatentState,
+        times: ComponentTimes,
+        velocity: LatentState,
+    ) -> LatentState:
+        """Project adapter-directed velocity through clean state to diffusion score.
+
+        Distillation objectives are written against the score function, while every
+        adapter predicts a velocity under its own direction convention. This
+        non-overridable wrapper first applies that convention, then delegates the
+        schedule-specific clean-to-score conversion to
+        :meth:`_project_clean_to_score_state`.
+
+        Args:
+            state: Current noised state in ``trajectory_component_order``.
+            times: Component times including each current sigma.
+            velocity: Adapter-directed velocity prediction matching ``state``.
+
+        Returns:
+            Score state in component order with the input active masks preserved.
+        """
+        bridge.validate_score_projection_inputs(self, state, times, velocity)
+        clean_state = self.project_velocity_to_clean_state(state, times, velocity)
+        bridge.validate_score_projection_state(self, clean_state, field="clean_state")
+        score_state = self._project_clean_to_score_state(state, times, clean_state)
+        return bridge.validate_projected_score_state(self, state, score_state)
+
+    def _project_clean_to_score_state(
+        self,
+        state: LatentState,
+        times: ComponentTimes,
+        clean_state: LatentState,
+    ) -> LatentState:
+        """Convert clean prediction to score under the single-latent flow schedule."""
+        return bridge.project_clean_to_score_state(self, state, times, clean_state)
+
+    def _project_flow_match_clean_to_score_state(
+        self,
+        state: LatentState,
+        times: ComponentTimes,
+        clean_state: LatentState,
+    ) -> LatentState:
+        """Convert clean prediction with each declared flow-match component schedule."""
+        return bridge.project_flow_match_clean_to_score_state(self, state, times, clean_state)
 
     def forward_state(
         self,

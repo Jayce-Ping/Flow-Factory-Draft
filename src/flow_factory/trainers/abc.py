@@ -17,37 +17,67 @@ import json
 import os
 from abc import ABC, abstractmethod
 from contextlib import ExitStack, contextmanager
-from typing import Dict, Any, ClassVar, Optional, Tuple, List, Union, Literal, Iterator
+from dataclasses import dataclass
 from functools import partial
+from typing import Any, ClassVar, Dict, Iterator, List, Literal, Mapping, Optional, Tuple, Union
+
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.distributed as dist
-from torch.utils.data import DataLoader
-from dataclasses import dataclass
-from tqdm import tqdm
-from PIL import Image
-from diffusers.utils.outputs import BaseOutput
+import torch.nn as nn
 from accelerate import Accelerator
-from accelerate.utils import set_seed, ProjectConfiguration
+from accelerate.utils import ProjectConfiguration, set_seed
+from diffusers.utils.outputs import BaseOutput
+from PIL import Image
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-from ..hparams import *
-from ..models.abc import BaseAdapter
-from ..models.model_bundle import ModelBundle, RoutedComponentProxy
+from ..acceleration import BaseAccelerator, build_accelerator, validate_accelerator
+from ..advantage import AdvantageProcessor
 from ..data_utils.dataset import METADATA_COLUMN
 from ..data_utils.loader import (
-    get_train_dataloader,
     get_eval_dataloaders,
+    get_train_dataloader,
 )
-from ..rewards import load_reward_model, BaseRewardModel, MultiRewardLoader, RewardProcessor, RewardBuffer
-from ..advantage import AdvantageProcessor
-from ..acceleration import BaseAccelerator, build_accelerator, validate_accelerator
-from ..logger import load_logger, LogFormatter
+from ..hparams import *
+from ..logger import LogFormatter, load_logger
+from ..models.abc import BaseAdapter
+from ..models.model_bundle import ModelBundle, RoutedComponentProxy
+from ..rewards import (
+    BaseRewardModel,
+    MultiRewardLoader,
+    RewardBuffer,
+    RewardProcessor,
+    load_reward_model,
+)
 from ..samples import BaseSample, StackedSampleBatch
+from ..utils.base import (
+    create_generator,
+    create_generator_by_prompt,
+    filter_kwargs,
+    json_default,
+    visit_tensor_leaves,
+)
 from ..utils.logger_utils import setup_logger
-from ..utils.base import create_generator, create_generator_by_prompt, filter_kwargs, json_default, visit_tensor_leaves
+from .role_optimization import (
+    OptimizationRole,
+    RoleOptimizationCoordinator,
+    RoleOptimizerConfig,
+    RolePhase,
+    RoleUpdatePlan,
+)
 
 logger = setup_logger(__name__)
+
+_MULTIROLE_METADATA_FILENAME = "flow_factory_multirole_metadata.json"
+_MULTIROLE_METADATA_VERSION = 1
+_MULTIROLE_STATE_KEYS = {
+    "version",
+    "metadata",
+    "coordinator",
+    "trainer_step",
+    "parameter_emas",
+}
 
 
 def _record_stream_on_batch(value: Any, stream: "torch.cuda.Stream") -> None:
@@ -57,6 +87,54 @@ def _record_stream_on_batch(value: Any, stream: "torch.cuda.Stream") -> None:
     reusing copy-stream-produced tensors until the consuming stream is done.
     """
     visit_tensor_leaves(value, lambda t: t.record_stream(stream) if t.is_cuda else None)
+
+
+class _MultiRoleCheckpointState:
+    """Delegate Accelerate custom checkpoint state to one trainer."""
+
+    def __init__(self, trainer: "BaseTrainer") -> None:
+        self._trainer = trainer
+
+    def state_dict(self) -> Dict[str, Any]:
+        """Return multi-role counters and defensive compatibility metadata."""
+        return self._trainer._multirole_state_dict()
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Restore multi-role counters after Accelerate restores prepared state."""
+        self._trainer._load_multirole_state_dict(state)
+
+    def prepare_save(self, output_dir: str) -> None:
+        """Validate a closed boundary and write metadata before Accelerate saves."""
+        try:
+            custom_state = self.state_dict()
+        except RuntimeError as error:
+            raise RuntimeError(
+                "cannot checkpoint invalid multi-role training state before "
+                f"model/optimizer save; validation reported: {error}"
+            ) from error
+        accelerator = self._trainer.accelerator
+        save_on_each_node = accelerator.project_configuration.save_on_each_node
+        should_write_metadata = accelerator.is_main_process or (
+            save_on_each_node and accelerator.is_local_main_process
+        )
+        if should_write_metadata:
+            os.makedirs(output_dir, exist_ok=True)
+            metadata_path = os.path.join(output_dir, _MULTIROLE_METADATA_FILENAME)
+            with open(metadata_path, "w", encoding="utf-8") as metadata_file:
+                json.dump(custom_state["metadata"], metadata_file, indent=2, sort_keys=True)
+                metadata_file.write("\n")
+
+    def validate_load(self, input_dir: str) -> None:
+        """Validate metadata before Accelerate can mutate prepared state."""
+        metadata_path = os.path.join(input_dir, _MULTIROLE_METADATA_FILENAME)
+        if not os.path.isfile(metadata_path):
+            raise FileNotFoundError(
+                "multi-role metadata compatibility gate expected file "
+                f"{metadata_path!r}, received missing file"
+            )
+        with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+            metadata = json.load(metadata_file)
+        self._trainer._validate_multirole_metadata(metadata)
 
 
 class BaseTrainer(ABC):
@@ -71,11 +149,11 @@ class BaseTrainer(ABC):
     paradigm: ClassVar[Optional[Literal["coupled", "decoupled", "distillation"]]] = None
 
     def __init__(
-            self,
-            accelerator: Accelerator,
-            config : Arguments,
-            adapter : BaseAdapter,
-        ):
+        self,
+        accelerator: Accelerator,
+        config: Arguments,
+        adapter: BaseAdapter,
+    ):
         self.accelerator = accelerator
         self.config = config
         self.log_args = config.log_args
@@ -85,13 +163,17 @@ class BaseTrainer(ABC):
         self.eval_args = config.eval_args
 
         self.reward_args = config.reward_args
-        self.eval_reward_args = config.eval_reward_args or config.reward_args # If `eval_reward_args` is not given, use `reward_args`
+        self.eval_reward_args = (
+            config.eval_reward_args or config.reward_args
+        )  # If `eval_reward_args` is not given, use `reward_args`
 
         self.adapter = adapter
         self.epoch = 0
         self.step = 0
 
         self._initialization()
+        self._initialize_parameter_emas()
+        self._register_multirole_checkpointing()
         self.adapter.post_init()
         # Apply persistent stage='both' accelerators last: after prepare, state-resume,
         # EMA, and reference-parameter setup, so e.g. torch.compile wraps the final
@@ -103,7 +185,7 @@ class BaseTrainer(ABC):
         self.autocast = partial(
             torch.autocast,
             device_type=accelerator.device.type,
-            dtype=torch.float16 if accelerator.mixed_precision == "fp16" else torch.bfloat16
+            dtype=torch.float16 if accelerator.mixed_precision == "fp16" else torch.bfloat16,
         )
 
         if self.accelerator.is_local_main_process:
@@ -113,6 +195,9 @@ class BaseTrainer(ABC):
     def show_progress_bar(self) -> bool:
         """Whether to show tqdm progress bars."""
         return self.log_args.verbose and self.accelerator.is_local_main_process
+
+    def _initialize_parameter_emas(self) -> None:
+        """Initialize optional trainer-owned parameter snapshots before state resume."""
 
     def should_continue_training(self) -> bool:
         """Outer epoch loop: continue unless a finite ``max_epochs`` has been reached."""
@@ -139,19 +224,26 @@ class BaseTrainer(ABC):
         """Log data using the initialized logger."""
         if self.logger is not None:
             self.logger.log_data(data, step=step)
-        
+
         # Print summary to console
         if self.accelerator.is_local_main_process:
-            metrics = {k: v for k, v in ((k, LogFormatter.to_scalar(v)) for k, v in data.items()) if v is not None}
+            metrics = {
+                k: v
+                for k, v in ((k, LogFormatter.to_scalar(v)) for k, v in data.items())
+                if v is not None
+            }
             if metrics:
                 parts = [f"[Step {step:04d} | Epoch {self.epoch:03d}]"]
                 parts.extend(
-                    f"{k}={int(v)}" if isinstance(v, int) or (isinstance(v, float) and v.is_integer())
-                    else f"{k}={v:.4f}"
+                    (
+                        f"{k}={int(v)}"
+                        if isinstance(v, int) or (isinstance(v, float) and v.is_integer())
+                        else f"{k}={v:.4f}"
+                    )
                     for k, v in metrics.items()
                 )
                 logger.info(" ".join(parts))
-    
+
     def _init_logging_backend(self):
         """Initialize logging backend if specified."""
         if self.accelerator.is_main_process:
@@ -196,7 +288,7 @@ class BaseTrainer(ABC):
         # Get training & eval reward models
         self.reward_models = self.reward_loader.get_training_reward_models()
         self.eval_reward_models = self.reward_loader.get_eval_reward_models()
-        train_reward_configs = self.reward_loader.get_reward_configs('train')
+        train_reward_configs = self.reward_loader.get_reward_configs("train")
         # Initialize reward processor (training side only — eval-side
         # processors are per-dataset, built below).
         group_on_same_rank = self.config.data_args.sampler_type == "group_contiguous"
@@ -204,13 +296,14 @@ class BaseTrainer(ABC):
             accelerator=self.accelerator,
             reward_models=self.reward_models,
             reward_configs=train_reward_configs,
-            tokenizer=self.adapter.tokenizer, # For prompt encoding/decoding,
+            tokenizer=self.adapter.tokenizer,  # For prompt encoding/decoding,
             group_on_same_rank=group_on_same_rank,
             verbose=self.log_args.verbose,
         )
         # Initialize the training-side reward buffer.
         self.reward_buffer = RewardBuffer(
-            self.reward_processor, self.training_args.group_size,
+            self.reward_processor,
+            self.training_args.group_size,
         )
 
         # Per-eval-dataset reward processors and buffers.  Eval is now
@@ -238,7 +331,8 @@ class BaseTrainer(ABC):
                     )
                     self.eval_dataset_reward_processors[ed.name] = ds_processor
                     self.eval_dataset_reward_buffers[ed.name] = RewardBuffer(
-                        ds_processor, self.training_args.group_size,
+                        ds_processor,
+                        self.training_args.group_size,
                     )
 
         # Initialize advantage processor.
@@ -246,12 +340,9 @@ class BaseTrainer(ABC):
         # so reward_weights is Dict[reward_name, Dict[dataset_name, float]].
         self.advantage_processor = AdvantageProcessor(
             accelerator=self.accelerator,
-            reward_weights={
-                name: cfg.weight
-                for name, cfg in train_reward_configs.items()
-            },
+            reward_weights={name: cfg.weight for name, cfg in train_reward_configs.items()},
             group_size=self.training_args.group_size,
-            global_std=getattr(self.training_args, 'global_std', True),
+            global_std=getattr(self.training_args, "global_std", True),
             sampler_type=self.config.data_args.sampler_type,
             verbose=self.log_args.verbose,
             source_id_to_name=self.config.data_args.source_id_to_name,
@@ -259,15 +350,16 @@ class BaseTrainer(ABC):
 
         return self.reward_models, self.eval_reward_models
 
-    def _init_dataloader(self) -> Tuple[Optional[Union[DataLoader, "MultiSourceTrainDataLoader"]], Dict[str, DataLoader]]:
+    def _init_dataloader(
+        self,
+    ) -> Tuple[Optional[Union[DataLoader, "MultiSourceTrainDataLoader"]], Dict[str, DataLoader]]:
         """Build train and eval dataloaders.
 
         Returns:
             Tuple of (train_dataloader, eval_dataloaders_by_name).
         """
         self.adapter.on_load_components(
-            components=self.adapter.preprocessing_modules,
-            device=self.accelerator.device
+            components=self.adapter.preprocessing_modules, device=self.accelerator.device
         )
         if self.adapter._is_fsdp_cpu_efficient_loading():
             self._synchronize_frozen_components(self.adapter.preprocessing_modules)
@@ -293,38 +385,437 @@ class BaseTrainer(ABC):
         self.accelerator.wait_for_everyone()
 
         return dataloader, eval_dataloaders
-    
+
     def _init_optimizer(self) -> torch.optim.Optimizer:
-        """Initialize optimizer."""
-        self.optimizer = torch.optim.AdamW(
-            self.adapter.get_trainable_parameters(),
-            lr=self.training_args.learning_rate,
-            betas=self.training_args.adam_betas,
-            weight_decay=self.training_args.adam_weight_decay,
-            eps=self.training_args.adam_epsilon,
+        """Initialize one AdamW with one ordered parameter group per trainable role."""
+        registry = self.adapter.model_role_registry
+        trainable_role_names = tuple(
+            role_name for role_name in registry.role_names if registry.get_spec(role_name).trainable
         )
+        role_config_builder = getattr(self, "_role_optimizer_configs", None)
+        if role_config_builder is None:
+            role_configs = tuple(
+                BaseTrainer._legacy_role_optimizer_config(self, role_name)
+                for role_name in trainable_role_names
+            )
+        else:
+            role_configs = role_config_builder()
+        configured_role_names = tuple(config.role_name for config in role_configs)
+        if configured_role_names != trainable_role_names:
+            raise ValueError(
+                "expected role optimizer configs to exactly match declared trainable roles "
+                f"{trainable_role_names!r}, received {configured_role_names!r}"
+            )
+
+        parameter_groups = []
+        self.optimization_roles = {}
+        for group_id, config in enumerate(role_configs):
+            parameters = registry.parameters(config.role_name)
+            if not parameters:
+                raise ValueError(
+                    f"expected trainable role {config.role_name!r} to own optimizer "
+                    "parameters, received none"
+                )
+            parameter_groups.append(
+                {
+                    "params": list(parameters),
+                    "role_name": config.role_name,
+                    "lr": config.learning_rate,
+                    "betas": config.adam_betas,
+                    "weight_decay": config.adam_weight_decay,
+                    "eps": config.adam_epsilon,
+                }
+            )
+            self.optimization_roles[config.role_name] = OptimizationRole(
+                config=config,
+                parameters=parameters,
+                optimizer_group_ids=(group_id,),
+            )
+
+        self.optimizer = torch.optim.AdamW(parameter_groups)
         return self.optimizer
+
+    def _role_optimizer_configs(self) -> Tuple[RoleOptimizerConfig, ...]:
+        """Build role configs from nested arguments or legacy flat arguments."""
+        required_roles = BaseTrainer._required_trainable_roles(self)
+        if required_roles == ("generator",):
+            return (BaseTrainer._legacy_role_optimizer_config(self, "generator"),)
+
+        if getattr(self.training_args, "role_update_plan", None) is not None:
+            update_plan = BaseTrainer._role_update_plan(self)
+            plan_roles = {phase.role_name for phase in update_plan.phases}
+            if plan_roles != set(required_roles):
+                raise ValueError(
+                    "expected role update plan roles to exactly match required trainable roles "
+                    f"{required_roles!r}, received {tuple(plan_roles)!r}"
+                )
+
+        role_configs = []
+        for role_name in required_roles:
+            field_name = f"{role_name}_optimizer"
+            if not hasattr(self.training_args, field_name):
+                raise ValueError(
+                    f"expected nested optimizer arguments train.{field_name} for "
+                    f"required role {role_name!r}, received no such field"
+                )
+            optimizer_args = getattr(self.training_args, field_name)
+            role_configs.append(
+                RoleOptimizerConfig(
+                    role_name=role_name,
+                    learning_rate=optimizer_args.learning_rate,
+                    adam_betas=optimizer_args.adam_betas,
+                    adam_weight_decay=optimizer_args.adam_weight_decay,
+                    adam_epsilon=optimizer_args.adam_epsilon,
+                    max_grad_norm=optimizer_args.max_grad_norm,
+                )
+            )
+        return tuple(role_configs)
+
+    def _legacy_role_optimizer_config(self, role_name: str) -> RoleOptimizerConfig:
+        """Build one role config from the existing flat training arguments."""
+        return RoleOptimizerConfig(
+            role_name=role_name,
+            learning_rate=self.training_args.learning_rate,
+            adam_betas=self.training_args.adam_betas,
+            adam_weight_decay=self.training_args.adam_weight_decay,
+            adam_epsilon=self.training_args.adam_epsilon,
+            max_grad_norm=getattr(self.training_args, "max_grad_norm", 1.0),
+        )
+
+    def _finish_role_microbatch(self) -> bool:
+        """Finish a role microbatch and advance public step for generator only."""
+        role_name = self.role_optimization.active_role_name
+        stepped = self.role_optimization.finish_microbatch()
+        if stepped and role_name == "generator":
+            self.step += 1
+        return stepped
+
+    def _rebind_prepared_optimization_roles(self) -> None:
+        """Rebuild role ownership from prepared optimizer parameter identities."""
+        optimizer_groups = self.optimizer.param_groups
+        expected_group_ids = tuple(
+            group_id
+            for role in self.optimization_roles.values()
+            for group_id in role.optimizer_group_ids
+        )
+        if tuple(sorted(expected_group_ids)) != tuple(range(len(optimizer_groups))):
+            raise ValueError(
+                "expected optimization roles to exhaust prepared optimizer groups "
+                f"{tuple(range(len(optimizer_groups)))!r}, received {expected_group_ids!r}"
+            )
+
+        rebound_roles = {}
+        for role_name, role in self.optimization_roles.items():
+            prepared_parameters = []
+            for group_id in role.optimizer_group_ids:
+                group = optimizer_groups[group_id]
+                prepared_role_name = group.get("role_name")
+                if prepared_role_name != role_name:
+                    raise ValueError(
+                        f"prepared optimizer group {group_id} expected role_name "
+                        f"{role_name!r}, received {prepared_role_name!r}"
+                    )
+                group_parameters = tuple(group["params"])
+                if not group_parameters:
+                    raise ValueError(
+                        f"prepared optimizer group {group_id} for role {role_name!r} "
+                        "expected at least one parameter, received none"
+                    )
+                prepared_parameters.extend(group_parameters)
+            rebound_roles[role_name] = OptimizationRole(
+                config=role.config,
+                parameters=tuple(prepared_parameters),
+                optimizer_group_ids=role.optimizer_group_ids,
+                step=role.step,
+                scheduler=role.scheduler,
+            )
+        self.optimization_roles = rebound_roles
+
+    def _init_prepared_role_optimization(self) -> None:
+        """Bind prepared identities and construct the role coordinator."""
+        BaseTrainer._rebind_prepared_optimization_roles(self)
+        self.role_optimization = RoleOptimizationCoordinator(
+            accelerator=self.accelerator,
+            model_bundle=self.model_bundle,
+            optimizer=self.optimizer,
+            roles=self.optimization_roles,
+        )
+
+    def _multirole_metadata(self) -> Dict[str, Any]:
+        """Return deterministic metadata used to validate resume compatibility."""
+        role_metadata = self.adapter.model_role_registry.training_state_dict()
+        update_plan = self._role_update_plan()
+        return {
+            "version": _MULTIROLE_METADATA_VERSION,
+            "roles": role_metadata["roles"],
+            "optimizer_group_roles": [
+                group.get("role_name") for group in self.optimizer.param_groups
+            ],
+            "update_plan": [
+                {
+                    "role_name": phase.role_name,
+                    "repeats": phase.repeats,
+                }
+                for phase in update_plan.phases
+            ],
+        }
+
+    def _role_update_plan(self) -> RoleUpdatePlan:
+        """Return the ordered role plan used for checkpoint compatibility."""
+        configured_plan_builder = getattr(self.training_args, "role_update_plan", None)
+        if configured_plan_builder is not None:
+            configured_plan = configured_plan_builder()
+            if not isinstance(configured_plan, RoleUpdatePlan):
+                raise TypeError(
+                    "expected training_args.role_update_plan() to return RoleUpdatePlan, "
+                    f"received {type(configured_plan).__name__}: {configured_plan!r}"
+                )
+            return configured_plan
+        return RoleUpdatePlan(
+            phases=tuple(RolePhase(role_name) for role_name in self.optimization_roles)
+        )
+
+    def _validate_multirole_metadata(self, state: Mapping[str, Any]) -> None:
+        """Validate all metadata that must match before prepared-state mutation."""
+        if not isinstance(state, Mapping):
+            raise TypeError(
+                "expected multi-role metadata as a mapping, "
+                f"received {type(state).__name__}: {state!r}"
+            )
+        expected_keys = {"version", "roles", "optimizer_group_roles", "update_plan"}
+        received_keys = set(state)
+        if received_keys != expected_keys:
+            raise ValueError(
+                "multi-role metadata keys mismatch: expected "
+                f"{tuple(sorted(expected_keys))!r}, "
+                f"received {tuple(sorted(received_keys))!r}"
+            )
+        received_version = state.get("version")
+        if (
+            not isinstance(received_version, int)
+            or isinstance(received_version, bool)
+            or received_version != _MULTIROLE_METADATA_VERSION
+        ):
+            raise ValueError(
+                "multi-role metadata version mismatch: expected "
+                f"{_MULTIROLE_METADATA_VERSION}, received {received_version!r}"
+            )
+
+        self.adapter.model_role_registry.load_training_state_dict(
+            {
+                "version": received_version,
+                "roles": state.get("roles"),
+            }
+        )
+        expected = self._multirole_metadata()
+        for field_name in ("optimizer_group_roles", "update_plan"):
+            expected_value = expected[field_name]
+            received_value = state.get(field_name)
+            if received_value != expected_value:
+                raise ValueError(
+                    f"multi-role metadata {field_name} mismatch: expected "
+                    f"{expected_value!r}, received {received_value!r}"
+                )
+
+    def _multirole_state_dict(self) -> Dict[str, Any]:
+        """Return registered custom state without duplicating prepared state."""
+        coordinator_state = self.role_optimization.state_dict()
+        generator_step = coordinator_state["role_steps"]["generator"]
+        if self.step != generator_step:
+            raise RuntimeError(
+                "multi-role checkpoint counter mismatch: expected trainer step to equal "
+                f"generator role step {generator_step}, received trainer_step={self.step}"
+            )
+        return {
+            "version": 1,
+            "metadata": self._multirole_metadata(),
+            "coordinator": coordinator_state,
+            "trainer_step": self.step,
+            "parameter_emas": self.adapter.model_role_registry.parameter_ema_state_dict(),
+        }
+
+    def _load_multirole_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Restore custom multi-role counters after complete validation."""
+        if not isinstance(state, Mapping):
+            raise TypeError(
+                "expected registered multi-role state as a mapping, "
+                f"received {type(state).__name__}: {state!r}"
+            )
+        received_keys = set(state)
+        if received_keys != _MULTIROLE_STATE_KEYS:
+            raise ValueError(
+                "registered multi-role state keys mismatch: expected "
+                f"{tuple(sorted(_MULTIROLE_STATE_KEYS))!r}, "
+                f"received {tuple(sorted(received_keys))!r}"
+            )
+        state_version = state["version"]
+        if (
+            not isinstance(state_version, int)
+            or isinstance(state_version, bool)
+            or state_version != 1
+        ):
+            raise ValueError(
+                f"registered multi-role state version mismatch: expected 1, "
+                f"received {state_version!r}"
+            )
+        self._validate_multirole_metadata(state["metadata"])
+        trainer_step = state["trainer_step"]
+        if not isinstance(trainer_step, int) or isinstance(trainer_step, bool) or trainer_step < 0:
+            raise ValueError(
+                "expected non-negative int trainer_step in registered multi-role state, "
+                f"received {trainer_step!r}"
+            )
+        coordinator_state = state["coordinator"]
+        if not isinstance(coordinator_state, Mapping):
+            raise TypeError(
+                "expected coordinator in registered multi-role state as a mapping, "
+                f"received {type(coordinator_state).__name__}: {coordinator_state!r}"
+            )
+        role_steps = coordinator_state.get("role_steps")
+        if not isinstance(role_steps, Mapping) or role_steps.get("generator") != trainer_step:
+            received_generator_step = (
+                role_steps.get("generator") if isinstance(role_steps, Mapping) else role_steps
+            )
+            raise ValueError(
+                "registered multi-role counter mismatch: expected trainer_step "
+                f"{trainer_step} to equal generator role step, "
+                f"received generator step {received_generator_step!r}"
+            )
+        self.role_optimization.load_state_dict(coordinator_state)
+        self.adapter.model_role_registry.load_parameter_ema_state_dict(state["parameter_emas"])
+        self.step = trainer_step
+        self.adapter.model_role_registry.activate("generator")
+
+    def _register_multirole_checkpointing(self) -> None:
+        """Register Accelerate metadata gates and custom state for multi-role runs."""
+        if len(self._required_trainable_roles()) <= 1:
+            return
+        if getattr(self, "_multirole_checkpoint_registered", False):
+            raise RuntimeError(
+                "cannot register multi-role checkpointing twice for trainer "
+                f"{type(self).__name__}"
+            )
+
+        def save_metadata_hook(
+            models: List[torch.nn.Module],
+            weights: List[Dict[str, torch.Tensor]],
+            output_dir: str,
+        ) -> None:
+            del models, weights
+            checkpoint_state.prepare_save(output_dir)
+
+        def load_metadata_hook(models: List[torch.nn.Module], input_dir: str) -> None:
+            del models
+            checkpoint_state.validate_load(input_dir)
+
+        checkpoint_state = _MultiRoleCheckpointState(self)
+        self._multirole_checkpoint_state = checkpoint_state
+        self.adapter._multirole_checkpoint_state = checkpoint_state
+        self.accelerator.register_save_state_pre_hook(save_metadata_hook)
+        self.accelerator.register_load_state_pre_hook(load_metadata_hook)
+        self.accelerator.register_for_checkpointing(checkpoint_state)
+        self._multirole_checkpoint_registered = True
+
+    def _required_trainable_roles(self) -> Tuple[str, ...]:
+        """Return algorithm-required roles, defaulting legacy trainers to generator-only."""
+        if not hasattr(self.training_args, "required_trainable_roles"):
+            return ("generator",)
+        return self.training_args.required_trainable_roles
+
+    def _validate_multirole_backend(self) -> None:
+        """Validate one-root backend semantics for multi-role trainers."""
+        required_roles = self._required_trainable_roles()
+        if len(required_roles) <= 1:
+            return
+
+        algorithm = self.training_args.trainer_type
+        prepared_models = tuple(self.accelerator._models)
+        if len(prepared_models) != 1:
+            raise RuntimeError(
+                f"algorithm {algorithm!r} with roles {required_roles!r} expected exactly "
+                f"one prepared model root, received {len(prepared_models)}"
+            )
+        if prepared_models[0] is not self.model_bundle:
+            raise RuntimeError(
+                f"algorithm {algorithm!r} with roles {required_roles!r} expected the tracked "
+                "prepared model root to be self.model_bundle, received different identities"
+            )
+
+        prepared_optimizers = tuple(self.accelerator._optimizers)
+        if len(prepared_optimizers) != 1:
+            raise RuntimeError(
+                f"algorithm {algorithm!r} with roles {required_roles!r} expected exactly "
+                f"one prepared optimizer, received {len(prepared_optimizers)}"
+            )
+        if prepared_optimizers[0] is not self.optimizer:
+            raise RuntimeError(
+                f"algorithm {algorithm!r} with roles {required_roles!r} expected the tracked "
+                "prepared optimizer to be self.optimizer, received different identities"
+            )
+
+        prepared_group_roles = tuple(
+            group.get("role_name") for group in self.optimizer.param_groups
+        )
+        if prepared_group_roles != self._unprepared_optimizer_group_roles:
+            raise RuntimeError(
+                f"algorithm {algorithm!r} optimizer group role mapping expected "
+                f"{self._unprepared_optimizer_group_roles!r}, received {prepared_group_roles!r}"
+            )
+
+        deepspeed_plugin = getattr(self.accelerator.state, "deepspeed_plugin", None)
+        if deepspeed_plugin is not None and deepspeed_plugin.zero_stage not in (1, 2):
+            raise ValueError(
+                f"DeepSpeed multi-role algorithm {algorithm!r} with roles "
+                f"{required_roles!r} requires zero_stage in (1, 2), received "
+                f"zero_stage={deepspeed_plugin.zero_stage!r}"
+            )
+
+        fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
+        if fsdp_plugin is None or fsdp_plugin.fsdp_version != 2:
+            return
+        if fsdp_plugin.use_orig_params is False:
+            raise ValueError(
+                f"FSDP2 multi-role algorithm {algorithm!r} with roles {required_roles!r} "
+                "requires use_orig_params=True, received False"
+            )
+        prepared_root_parameter_ids = {
+            id(parameter)
+            for parameter in self.accelerator.unwrap_model(self.model_bundle).parameters()
+        }
+        foreign_parameters = tuple(
+            (group_id, group["role_name"], parameter_index, id(parameter))
+            for group_id, group in enumerate(self.optimizer.param_groups)
+            for parameter_index, parameter in enumerate(group["params"])
+            if id(parameter) not in prepared_root_parameter_ids
+        )
+        if foreign_parameters:
+            raise RuntimeError(
+                "FSDP2 optimizer parameter identity must reference the prepared model root "
+                f"for algorithm {algorithm!r} with roles {required_roles!r}; received foreign "
+                f"(group_id, role_name, parameter_index, parameter_id) entries "
+                f"{foreign_parameters!r}"
+            )
 
     def _load_inference_components(self, trainable_module_names: List[str]):
         """
         Load non-trainable components needed at runtime to the accelerator device.
-        
+
         Trainable modules are already on-device via `accelerator.prepare()`.
         This loads the remaining modules required for inference and,
         when preprocessing is disabled, also loads encoding components
         that would otherwise stay offloaded.
         """
         prepared_names = set(trainable_module_names)
-        
+
         modules_to_load = list(self.adapter.inference_modules)
-        
+
         if not self.config.data_args.enable_preprocess:
             modules_to_load.extend(self.adapter.preprocessing_modules)
-        
+
         # Resolve group names → concrete names, then deduplicate & exclude prepared
         resolved = self.adapter._resolve_component_names(modules_to_load)
         resolved = [m for m in resolved if m not in prepared_names]
-        
+
         if resolved:
             self.adapter.on_load_components(
                 components=resolved,
@@ -341,8 +832,11 @@ class BaseTrainer(ABC):
             # self.adapter.on_load(self.accelerator.device)
             self._synchronize_frozen_components()
 
-        # Init dataloader and optimizer
+        # Init dataloader, then materialize every live model role before optimizer
+        # and distributed bundle construction.
         self.dataloader, eval_dataloaders = self._init_dataloader()
+        required_trainable_roles = self._required_trainable_roles()
+        self.adapter.configure_model_roles(required_trainable_roles)
         self.optimizer = self._init_optimizer()
 
         # Bundle ALL target components (trainable + frozen-but-shardable, e.g.
@@ -352,12 +846,13 @@ class BaseTrainer(ABC):
         # one) require this. The optimizer/EMA/ref still operate on the
         # requires_grad subset via `get_trainable_parameters()`; frozen members
         # are sharded for memory but never receive gradient.
-        bundle_names = list(self.adapter.target_module_map.keys())
-        # Bundle the resolved trainable/frozen components. get_component returns the
-        # LoRA PeftModel for LoRA training (apply_lora stores it via set_component,
-        # NOT in-place on the pipeline), matching the pre-refactor membership.
-        bundle_members = {name: self.adapter.get_component(name) for name in bundle_names}
+        canonical_bundle_names = list(self.adapter.target_module_map.keys())
+        role_registry = self.adapter.model_role_registry
+        bundle_members = role_registry.bundle_members()
         model_bundle = ModelBundle(bundle_members)
+        self._unprepared_optimizer_group_roles = tuple(
+            group["role_name"] for group in self.optimizer.param_groups
+        )
 
         eval_dataloader_names = list(eval_dataloaders.keys())
         eval_dataloader_list = [eval_dataloaders[n] for n in eval_dataloader_names]
@@ -368,6 +863,8 @@ class BaseTrainer(ABC):
         prepared = self.accelerator.prepare(model_bundle, self.optimizer, *eval_dataloader_list)
         self.model_bundle = prepared[0]
         self.optimizer = prepared[1]
+        BaseTrainer._init_prepared_role_optimization(self)
+        BaseTrainer._validate_multirole_backend(self)
         prepared_eval_dataloaders = prepared[2:]
         self.eval_dataloaders: Dict[str, DataLoader] = dict(
             zip(eval_dataloader_names, prepared_eval_dataloaders)
@@ -378,13 +875,19 @@ class BaseTrainer(ABC):
         # required for DDP's reducer / FSDP's gather / the DeepSpeed engine --
         # while attribute access delegates to the inner member.
         inner_bundle = self.accelerator.unwrap_model(self.model_bundle)
-        for name in bundle_names:
+        for name in canonical_bundle_names:
             self.adapter.set_component(
-                name, RoutedComponentProxy(self.model_bundle, name, inner_bundle.members[name])
+                name,
+                RoutedComponentProxy(
+                    self.model_bundle,
+                    name,
+                    role_registry,
+                    inner_bundle.members,
+                ),
             )
 
         # Load inference modules, excluding all bundle members (already prepared).
-        self._load_inference_components(bundle_names)
+        self._load_inference_components(canonical_bundle_names)
 
         # Build + validate acceleration plugins. Persistent stage='both' accelerators
         # are *applied* later via _apply_shared_acceleration(), after post_init()
@@ -478,7 +981,7 @@ class BaseTrainer(ABC):
     ):
         if self.accelerator.num_processes <= 1:
             return
-        
+
         # Synchronize all non-prepared components
         all_names = self.adapter._resolve_component_names(components)
         for name in all_names:
@@ -512,7 +1015,7 @@ class BaseTrainer(ABC):
         torch_autocast_dtype fall through to the active torch.autocast state so
         the engine re-enables (rather than disables) autocast during forward.
         """
-        if getattr(accelerator.state, 'deepspeed_plugin', None) is None:
+        if getattr(accelerator.state, "deepspeed_plugin", None) is None:
             return
 
         try:
@@ -521,13 +1024,13 @@ class BaseTrainer(ABC):
         except ImportError:
             return
 
-        if getattr(DeepSpeedEngine, '_ff_autocast_patched', False):
+        if getattr(DeepSpeedEngine, "_ff_autocast_patched", False):
             return
 
-        if hasattr(_ds_ac, 'validate_nested_autocast'):
+        if hasattr(_ds_ac, "validate_nested_autocast"):
             _ds_ac.validate_nested_autocast = lambda engine: None
 
-        if hasattr(DeepSpeedEngine, 'torch_autocast_enabled'):
+        if hasattr(DeepSpeedEngine, "torch_autocast_enabled"):
             _orig_enabled = DeepSpeedEngine.torch_autocast_enabled
             _orig_dtype = DeepSpeedEngine.torch_autocast_dtype
 
@@ -593,7 +1096,7 @@ class BaseTrainer(ABC):
         if not self.training_args.offload_samples_to_cpu:
             return
         for sample in samples:
-            sample.to('cpu', pin_memory=True)
+            sample.to("cpu", pin_memory=True)
 
     def _iter_prefetched_batches(
         self,
@@ -629,8 +1132,7 @@ class BaseTrainer(ABC):
         if not use_prefetch:
             for start in starts:
                 batch_samples = [
-                    sample.to(device)
-                    for sample in samples[start:start + per_device_batch_size]
+                    sample.to(device) for sample in samples[start : start + per_device_batch_size]
                 ]
                 yield BaseSample.stack(batch_samples)
             return
@@ -642,7 +1144,7 @@ class BaseTrainer(ABC):
             with torch.cuda.stream(copy_stream):
                 moved = [
                     sample.to(device, non_blocking=True)
-                    for sample in samples[start:start + per_device_batch_size]
+                    for sample in samples[start : start + per_device_batch_size]
                 ]
                 return BaseSample.stack(moved)
 
@@ -767,8 +1269,8 @@ class BaseTrainer(ABC):
         # Per-prompt ratio used for both metadata and __source__ broadcasting.
         # Some adapters generate K replicates per prompt (group_size > 1) so
         # one batch row maps to several samples.
-        sources = batch.get('__source__')
-        source_ids = batch.get('__source_id__')
+        sources = batch.get("__source__")
+        source_ids = batch.get("__source_id__")
         metadata_list = batch.get(METADATA_COLUMN)
         if not metadata_list and not sources and not source_ids:
             return
@@ -873,7 +1375,7 @@ class BaseTrainer(ABC):
         with self._rollout_acceleration(), torch.no_grad(), self.autocast():
             for _ in tqdm(
                 range(self.training_args.num_batches_per_epoch),
-                desc=f'Epoch {self.epoch} Sampling',
+                desc=f"Epoch {self.epoch} Sampling",
                 disable=not self.show_progress_bar,
             ):
                 batch = next(data_iter)
@@ -894,10 +1396,7 @@ class BaseTrainer(ABC):
         # fire there. This catches a trainer that overrode generate_samples
         # but bypassed sample_batch / _inject_batch_metadata.
         if len(self.train_dataloaders_by_source) > 1 and samples:
-            missing = [
-                i for i, s in enumerate(samples)
-                if s.source is None
-            ]
+            missing = [i for i, s in enumerate(samples) if s.source is None]
             if missing:
                 raise RuntimeError(
                     f"Multi-source training: {len(missing)} sample(s) at indices "
@@ -937,28 +1436,28 @@ class BaseTrainer(ABC):
             for dataset_name, dataloader in self.eval_dataloaders.items():
                 buffer = self.eval_dataset_reward_buffers.get(dataset_name)
                 if buffer is None:
-                    logger.warning(
-                        f"No reward buffer for eval dataset '{dataset_name}', skipping."
-                    )
+                    logger.warning(f"No reward buffer for eval dataset '{dataset_name}', skipping.")
                     continue
                 buffer.clear()
                 all_samples: List[BaseSample] = []
 
                 # Merge per-dataset eval overrides with shared eval_args
                 ed_config = self._eval_dataset_configs[dataset_name]
-                eval_kwargs = ed_config.eval.get_merged_eval_kwargs(self.eval_args) if ed_config.eval else dict(self.eval_args)
+                eval_kwargs = (
+                    ed_config.eval.get_merged_eval_kwargs(self.eval_args)
+                    if ed_config.eval
+                    else dict(self.eval_args)
+                )
 
                 for batch in tqdm(
                     dataloader,
-                    desc=f'Eval/{dataset_name}',
+                    desc=f"Eval/{dataset_name}",
                     disable=not self.show_progress_bar,
                 ):
                     batch = self._augment_batch_with_source(
                         batch, dataset_name, ed_config.source_id
                     )
-                    generator = create_generator_by_prompt(
-                        batch['prompt'], self.training_args.seed
-                    )
+                    generator = create_generator_by_prompt(batch["prompt"], self.training_args.seed)
                     samples = self.sample_batch(
                         batch,
                         reward_buffer=buffer,
@@ -969,25 +1468,23 @@ class BaseTrainer(ABC):
                     )
                     all_samples.extend(samples)
 
-                rewards = buffer.finalize(store_to_samples=True, split='pointwise')
+                rewards = buffer.finalize(store_to_samples=True, split="pointwise")
 
                 # Gather across ranks
                 rewards_tensors = {
-                    k: torch.as_tensor(v).to(self.accelerator.device)
-                    for k, v in rewards.items()
+                    k: torch.as_tensor(v).to(self.accelerator.device) for k, v in rewards.items()
                 }
                 gathered_rewards = {
-                    k: self.accelerator.gather(v).cpu().numpy()
-                    for k, v in rewards_tensors.items()
+                    k: self.accelerator.gather(v).cpu().numpy() for k, v in rewards_tensors.items()
                 }
 
                 # Log per-dataset immediately to avoid accumulating all samples in memory
                 if self.accelerator.is_main_process:
                     log_data: Dict[str, Any] = {}
                     for k, v in gathered_rewards.items():
-                        log_data[f'eval/{dataset_name}/reward_{k}_mean'] = np.mean(v)
-                        log_data[f'eval/{dataset_name}/reward_{k}_std'] = np.std(v)
-                    log_data[f'eval/{dataset_name}/samples'] = all_samples
+                        log_data[f"eval/{dataset_name}/reward_{k}_mean"] = np.mean(v)
+                        log_data[f"eval/{dataset_name}/reward_{k}_std"] = np.std(v)
+                    log_data[f"eval/{dataset_name}/samples"] = all_samples
                     self.log_data(log_data, step=self.step)
 
         self.accelerator.wait_for_everyone()
@@ -1005,10 +1502,10 @@ class BaseTrainer(ABC):
         self.accelerator.wait_for_everyone()
 
     def load_checkpoint(
-            self,
-            path: str,
-            resume_type: Optional[Literal['lora', 'full', 'state']] = None,
-        ):
+        self,
+        path: str,
+        resume_type: Optional[Literal["lora", "full", "state"]] = None,
+    ):
         """Load trainer state from a specific path."""
         self.adapter.load_checkpoint(
             path=path,
@@ -1026,11 +1523,11 @@ class BaseTrainer(ABC):
         reclaim all resources including GPU memory.
         """
         # Training-side reward buffer.
-        train_buf = getattr(self, 'reward_buffer', None)
+        train_buf = getattr(self, "reward_buffer", None)
         if train_buf is not None:
             train_buf.shutdown(wait=False, cancel_futures=True)
 
         # Per-eval-dataset reward buffers.
-        for buf in getattr(self, 'eval_dataset_reward_buffers', {}).values():
+        for buf in getattr(self, "eval_dataset_reward_buffers", {}).values():
             if buf is not None:
                 buf.shutdown(wait=False, cancel_futures=True)

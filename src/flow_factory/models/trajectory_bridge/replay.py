@@ -12,13 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, Optional, Tuple
+import math
+from numbers import Real
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import torch
 
 from ...samples import (
     ComponentTimes,
     LatentState,
+    MultiModalStepOutput,
     ReplayStep,
     StackedSampleBatch,
     StructuredTrajectory,
@@ -233,6 +236,8 @@ def get_replay_step(
     adapter: Any,
     batch: StackedSampleBatch,
     step_index: int,
+    *,
+    include_transition_statistics: bool = True,
 ) -> ReplayStep:
     if not isinstance(step_index, int):
         raise TypeError(
@@ -303,7 +308,7 @@ def get_replay_step(
             )
         log_prob = None
         component_log_probs: Optional[Dict[str, torch.Tensor]] = None
-        if trajectory.log_probs is not None:
+        if include_transition_statistics and trajectory.log_probs is not None:
             if trajectory.log_prob_index_map is None:
                 log_prob_position = step_index
             else:
@@ -362,7 +367,7 @@ def get_replay_step(
         upper_bound=batch["all_latents"].shape[1],
     )
     log_prob = None
-    if batch.get("log_probs") is not None:
+    if include_transition_statistics and batch.get("log_probs") is not None:
         _require_legacy_tensors(
             batch,
             ("log_probs", "log_prob_index_map"),
@@ -528,6 +533,254 @@ def get_state_active_numel(adapter: Any, state: LatentState) -> Dict[str, int]:
             )
         active_numel[name] = int(counts[0].item())
     return active_numel
+
+
+def get_state_active_numel_per_sample(
+    adapter: Any,
+    state: LatentState,
+) -> Dict[str, torch.Tensor]:
+    """Return default per-sample active counts from the reduction masks."""
+    validate_state_active_numel_per_sample_input(adapter, state)
+    expected_names = adapter.trajectory_component_order
+    active_numel: Dict[str, torch.Tensor] = {}
+    for name in expected_names:
+        values = state.components[name]
+        if state.active_masks is None:
+            count = int(values.numel() // values.shape[0])
+            active_numel[name] = torch.full(
+                (values.shape[0],),
+                count,
+                dtype=torch.int64,
+                device=values.device,
+            )
+            continue
+        expanded = _expand_active_mask(
+            state.active_masks[name],
+            values,
+            component=name,
+            operation="get_state_active_numel_per_sample",
+        )
+        active_numel[name] = _active_element_counts(expanded, component=name)
+    return active_numel
+
+
+def validate_state_active_numel_per_sample_input(
+    adapter: Any,
+    state: LatentState,
+) -> None:
+    """Validate state geometry before an adapter-owned count hook runs."""
+    if not isinstance(state, LatentState):
+        raise TypeError(
+            "expected LatentState for get_state_active_numel_per_sample, "
+            f"received {type(state).__name__}"
+        )
+    expected_names = adapter.trajectory_component_order
+    if state.component_names != expected_names:
+        raise ValueError(
+            "expected state component keys/order to match trajectory_component_order "
+            f"{expected_names}, received {state.component_names}"
+        )
+    batch_size: Optional[int] = None
+    for name in expected_names:
+        values = state.components[name]
+        if values.ndim < 1 or values.shape[0] <= 0:
+            raise ValueError(
+                f"expected batched state component {name!r} with shape (B, ...) and a positive "
+                f"batch size, received {tuple(values.shape)}"
+            )
+        if batch_size is None:
+            batch_size = values.shape[0]
+        elif values.shape[0] != batch_size:
+            raise ValueError(
+                f"expected state component {name!r} to use batch size {batch_size}, "
+                f"received shape {tuple(values.shape)}"
+            )
+        if state.active_masks is not None and state.active_masks[name].device != values.device:
+            raise ValueError(
+                f"expected component {name!r} active mask device {values.device}, "
+                f"received {state.active_masks[name].device}"
+            )
+
+
+def validate_state_active_numel_per_sample(
+    adapter: Any,
+    state: LatentState,
+    active_numel: Mapping[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Validate adapter-owned per-sample active counts."""
+    if not isinstance(state, LatentState):
+        raise TypeError(
+            "expected LatentState for get_state_active_numel_per_sample, "
+            f"received {type(state).__name__}"
+        )
+    expected_names = adapter.trajectory_component_order
+    if state.component_names != expected_names:
+        raise ValueError(
+            "expected state component keys/order to match trajectory_component_order "
+            f"{expected_names}, received {state.component_names}"
+        )
+    if not isinstance(active_numel, Mapping):
+        raise TypeError(
+            "expected get_state_active_numel_per_sample to return "
+            f"Mapping[str, torch.Tensor], received {type(active_numel).__name__}"
+        )
+    if tuple(active_numel) != expected_names:
+        raise ValueError(
+            "expected get_state_active_numel_per_sample component order "
+            f"{expected_names}, received {tuple(active_numel)}"
+        )
+
+    validated: Dict[str, torch.Tensor] = {}
+    for name in expected_names:
+        counts = active_numel[name]
+        component = state.components[name]
+        batch_size = component.shape[0] if component.ndim >= 1 else 0
+        if not isinstance(counts, torch.Tensor):
+            raise TypeError(
+                f"expected active count for component {name!r} to be a torch.Tensor, "
+                f"received {type(counts).__name__}"
+            )
+        if counts.shape != (batch_size,):
+            raise ValueError(
+                f"expected active count for component {name!r} shape {(batch_size,)}, "
+                f"received {tuple(counts.shape)}"
+            )
+        if counts.dtype not in _SIGNED_INTEGER_DTYPES:
+            raise TypeError(
+                f"expected active count for component {name!r} to use a signed integer dtype, "
+                f"received {counts.dtype}"
+            )
+        if counts.device != component.device:
+            raise ValueError(
+                f"expected active count for component {name!r} device {component.device}, "
+                f"received {counts.device}"
+            )
+        minimum = int(counts.min().item())
+        if minimum <= 0:
+            raise ValueError(
+                f"expected active count for component {name!r} to be strictly positive, "
+                f"received {counts.tolist()}"
+            )
+        validated[name] = counts
+    return validated
+
+def _validate_replay_tolerance(value: Real, name: str) -> float:
+    if not isinstance(value, Real) or isinstance(value, bool):
+        raise TypeError(
+            f"expected real {name} for replay_generator_boundary, received "
+            f"{type(value).__name__}: {value!r}"
+        )
+    converted = float(value)
+    if not math.isfinite(converted) or converted < 0:
+        raise ValueError(
+            f"expected finite non-negative {name} for replay_generator_boundary, "
+            f"received {value!r}"
+        )
+    return converted
+
+
+def _detach_replay_state(state: LatentState) -> LatentState:
+    """Detach stored trajectory tensors while preserving static active masks."""
+    return LatentState(
+        {name: component.detach() for name, component in state.components.items()},
+        active_masks=state.active_masks,
+    )
+
+
+def replay_generator_boundary(
+    adapter: Any,
+    batch: StackedSampleBatch,
+    boundary_index: int,
+    *,
+    return_fields: Tuple[str, ...],
+    rtol: Real,
+    atol: Real,
+    forward_kwargs: Mapping[str, Any],
+) -> MultiModalStepOutput:
+    """Recompute and validate the transition preceding one stored boundary."""
+    if not isinstance(boundary_index, int) or isinstance(boundary_index, bool):
+        raise TypeError(
+            "expected int boundary_index for replay_generator_boundary, received "
+            f"{type(boundary_index).__name__}: {boundary_index!r}"
+        )
+    if boundary_index < 1:
+        raise ValueError(
+            "expected boundary_index of at least 1 for replay_generator_boundary, "
+            f"received {boundary_index}"
+        )
+    validated_rtol = _validate_replay_tolerance(rtol, "rtol")
+    validated_atol = _validate_replay_tolerance(atol, "atol")
+    if not isinstance(return_fields, tuple) or not all(
+        isinstance(field, str) for field in return_fields
+    ):
+        raise TypeError(
+            "expected tuple[str, ...] return_fields for replay_generator_boundary, "
+            f"received {type(return_fields).__name__}: {return_fields!r}"
+        )
+
+    replay = get_replay_step(
+        adapter,
+        batch,
+        boundary_index - 1,
+        include_transition_statistics=False,
+    )
+    replay_state = _detach_replay_state(replay.state)
+    stored_next_state = _detach_replay_state(replay.next_state)
+    required_fields = tuple(dict.fromkeys((*return_fields, "next_latents", "next_latents_mean")))
+    output = adapter.forward_state(
+        batch=batch,
+        state=replay_state,
+        times=replay.times,
+        next_state=stored_next_state,
+        compute_log_prob=False,
+        return_fields=required_fields,
+        **forward_kwargs,
+    )
+    if not isinstance(output, MultiModalStepOutput):
+        raise TypeError(
+            "expected forward_state to return MultiModalStepOutput for "
+            f"replay_generator_boundary, received {type(output).__name__} from "
+            f"{type(adapter).__name__}"
+        )
+    if output.next_state_mean is None:
+        raise ValueError(
+            "expected replay_generator_boundary forward_state to return next_state_mean for "
+            f"boundary_index={boundary_index}, received None from {type(adapter).__name__}"
+        )
+    recomputed_state = output.next_state_mean
+    if recomputed_state.component_names != stored_next_state.component_names:
+        raise ValueError(
+            f"expected replayed boundary component order {stored_next_state.component_names} "
+            f"at boundary_index={boundary_index}, received {recomputed_state.component_names}"
+        )
+    for name in stored_next_state.component_names:
+        stored = stored_next_state.components[name]
+        recomputed = recomputed_state.components[name]
+        if stored.shape != recomputed.shape or stored.device != recomputed.device:
+            raise ValueError(
+                f"replay_generator_boundary mismatch at boundary_index={boundary_index} for "
+                f"component {name!r}: expected stored shape/device "
+                f"({tuple(stored.shape)}, {stored.device}), received recomputed "
+                f"({tuple(recomputed.shape)}, {recomputed.device})"
+            )
+        comparison_dtype = torch.promote_types(recomputed.dtype, stored.dtype)
+        comparison_recomputed = recomputed.to(comparison_dtype)
+        comparison_stored = stored.to(comparison_dtype)
+        if not torch.allclose(
+            comparison_recomputed,
+            comparison_stored,
+            rtol=validated_rtol,
+            atol=validated_atol,
+            equal_nan=False,
+        ):
+            max_abs = (comparison_recomputed - comparison_stored).abs().max()
+            raise ValueError(
+                f"replay_generator_boundary mismatch at boundary_index={boundary_index} for "
+                f"component {name!r} with rtol={validated_rtol} and atol={validated_atol}: "
+                f"max_abs={max_abs.item()}"
+            )
+    output.next_state = recomputed_state
+    return output
 
 
 def get_train_step_indices(adapter: Any) -> torch.Tensor:
