@@ -36,6 +36,7 @@ from .trajectory import (
     NoisedState,
     ReplayStep,
     StructuredTrajectory,
+    unstack_structured_trajectories,
 )
 
 
@@ -55,6 +56,7 @@ __all__ = [
     "ComponentTrajectory",
     "IndexedTrajectoryTensor",
     "StructuredTrajectory",
+    "unstack_structured_trajectories",
     "LatentState",
     "ComponentTimes",
     "ReplayStep",

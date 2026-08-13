@@ -88,25 +88,7 @@ from ..samples import (
 from .latent_geometry import LatentAxes, infer_latent_axes
 from .model_bundle import RoutedComponentProxy
 from .runtime import ClassicPipelineRuntime, ComponentRuntime
-from .trajectory_bridge import (
-    _add_forward_process_noise,
-    _apply_forward_process_noise,
-    _build_forward_state_kwargs,
-    _build_training_component_times,
-    _default_forward_state,
-    _default_reduce_component_latent_values,
-    _default_reduce_latent_values,
-    _get_replay_callback,
-    _get_replay_step,
-    _get_state_active_numel,
-    _get_terminal_state,
-    _get_train_step_indices,
-    _project_velocity_to_clean_state,
-    _resolve_component_latent_axes,
-    _validate_reduced_component_values,
-    _validate_reduced_latent_values,
-    _validate_reduction_inputs,
-)
+from . import trajectory_bridge as bridge
 from ..ema import EMAModuleWrapper
 from ..scheduler import (
     load_scheduler as _load_scheduler,
@@ -323,6 +305,40 @@ class BaseAdapter(ABC):
                 logger.warning(f"float16 overflow: abs_max={abs_max:.1f} > 65504, clamping.")
                 latents = latents.clamp(-65504.0, 65504.0)
         return latents.to(target)
+
+    def cast_latent_state(
+        self, state: LatentState, default_dtype: Optional[torch.dtype] = None
+    ) -> LatentState:
+        """Cast every component latent of a state to the storage dtype.
+
+        Multi-component adapters store and replay a whole ``LatentState`` rather than
+        one tensor, and the storage dtype has to reach every component or the stored
+        trajectory and the replayed one disagree on precision. Active masks are
+        boolean selectors rather than latents, so they are carried over unchanged.
+
+        Args:
+            state: Structured multi-component latent state.
+            default_dtype: Fallback dtype when no storage dtype is configured.
+
+        Returns:
+            State whose component latents use the storage dtype.
+
+        Raises:
+            TypeError: If ``state`` is not a ``LatentState``.
+        """
+        if not isinstance(state, LatentState):
+            raise TypeError(
+                f"expected LatentState for cast_latent_state, got {type(state).__name__}: {state!r}"
+            )
+        if self.latent_storage_dtype is None and default_dtype is None:
+            return state
+        components = {
+            name: self.cast_latents(latents, default_dtype=default_dtype)
+            for name, latents in state.components.items()
+        }
+        if all(components[name] is latents for name, latents in state.components.items()):
+            return state
+        return LatentState(components, active_masks=state.active_masks)
 
     # ============================== Loading Components ==============================
     @abstractmethod
@@ -2456,7 +2472,7 @@ class BaseAdapter(ABC):
         Returns:
             Latent axes resolved by the legacy single-latent adapter API.
         """
-        return _resolve_component_latent_axes(self, component, latents)
+        return bridge.resolve_component_latent_axes(self, component, latents)
 
     def get_terminal_state(self, batch: StackedSampleBatch) -> LatentState:
         """Read each trajectory component's terminal stored state.
@@ -2467,7 +2483,7 @@ class BaseAdapter(ABC):
         Returns:
             Terminal latent state keyed by component.
         """
-        return _get_terminal_state(self, batch)
+        return bridge.get_terminal_state(self, batch)
 
     def get_replay_step(
         self, batch: StackedSampleBatch, step_index: int
@@ -2481,7 +2497,7 @@ class BaseAdapter(ABC):
         Returns:
             Current/next states, component times, and optional stored log probability.
         """
-        return _get_replay_step(self, batch, step_index)
+        return bridge.get_replay_step(self, batch, step_index)
 
     def get_replay_callback(
         self, batch: StackedSampleBatch, step_index: int, field: str
@@ -2496,7 +2512,7 @@ class BaseAdapter(ABC):
         Returns:
             Stored callback state keyed by component.
         """
-        return _get_replay_callback(self, batch, step_index, field)
+        return bridge.get_replay_callback(self, batch, step_index, field)
 
     def get_state_active_numel(self, state: LatentState) -> Mapping[str, int]:
         """Count each component's active stochastic degrees of freedom.
@@ -2510,7 +2526,7 @@ class BaseAdapter(ABC):
         Returns:
             Positive per-component element counts in component order.
         """
-        return _get_state_active_numel(self, state)
+        return bridge.get_state_active_numel(self, state)
 
     def get_train_step_indices(self) -> torch.Tensor:
         """Return the primary scheduler's positional training step indices.
@@ -2521,7 +2537,7 @@ class BaseAdapter(ABC):
         Returns:
             One-dimensional tensor of rollout positions to train on.
         """
-        return _get_train_step_indices(self)
+        return bridge.get_train_step_indices(self)
 
     def build_training_component_times(
         self,
@@ -2543,7 +2559,7 @@ class BaseAdapter(ABC):
         Returns:
             Component times whose sigma follows the flow-matching schedule.
         """
-        return _build_training_component_times(self, primary_timesteps, batch=batch)
+        return bridge.build_training_component_times(self, primary_timesteps, batch=batch)
 
     def add_forward_process_noise(
         self,
@@ -2568,7 +2584,7 @@ class BaseAdapter(ABC):
         Returns:
             Noised state, target velocity, and sampled noise.
         """
-        return _add_forward_process_noise(
+        return bridge.add_forward_process_noise(
             self,
             clean_state,
             times,
@@ -2595,7 +2611,7 @@ class BaseAdapter(ABC):
         Returns:
             Noised state, target velocity, and the supplied noise state.
         """
-        return _apply_forward_process_noise(self, clean_state, times, noise)
+        return bridge.apply_forward_process_noise(self, clean_state, times, noise)
 
     def project_velocity_to_clean_state(
         self,
@@ -2610,7 +2626,7 @@ class BaseAdapter(ABC):
         ``"data"`` is the MiniMax H3 convention ``velocity = clean - noise`` and uses
         ``x0 = xt + sigma * velocity``.
         """
-        return _project_velocity_to_clean_state(self, state, times, velocity)
+        return bridge.project_velocity_to_clean_state(self, state, times, velocity)
 
     def forward_state(
         self,
@@ -2658,7 +2674,7 @@ class BaseAdapter(ABC):
             compute_log_prob=compute_log_prob,
             return_fields=return_fields,
             noise_level=noise_level,
-            forward_kwargs=_build_forward_state_kwargs(self, batch, kwargs),
+            forward_kwargs=bridge.build_forward_state_kwargs(self, batch, kwargs),
         )
 
     def _forward_state(
@@ -2696,7 +2712,7 @@ class BaseAdapter(ABC):
         Returns:
             Multi-modal wrapper around this adapter's scheduler output.
         """
-        return _default_forward_state(
+        return bridge.default_forward_state(
             self,
             batch=batch,
             state=state,
@@ -2727,9 +2743,9 @@ class BaseAdapter(ABC):
         Returns:
             One ``(B,)`` tensor per component, in ``trajectory_component_order``.
         """
-        batch_size = _validate_reduction_inputs(self, values, state)
+        batch_size = bridge.validate_reduction_inputs(self, values, state)
         reduced = self._reduce_component_latent_values(values, state=state)
-        return _validate_reduced_component_values(self, reduced, batch_size)
+        return bridge.validate_reduced_component_values(self, reduced, batch_size)
 
     def _reduce_component_latent_values(
         self,
@@ -2750,7 +2766,7 @@ class BaseAdapter(ABC):
         Returns:
             One ``(B,)`` tensor per component, in ``trajectory_component_order``.
         """
-        return _default_reduce_component_latent_values(self, values, state=state)
+        return bridge.default_reduce_component_latent_values(self, values, state=state)
 
     def reduce_latent_values(
         self,
@@ -2773,9 +2789,9 @@ class BaseAdapter(ABC):
         Returns:
             One globally element-weighted scalar per batch item.
         """
-        batch_size = _validate_reduction_inputs(self, values, state)
+        batch_size = bridge.validate_reduction_inputs(self, values, state)
         reduced = self._reduce_latent_values(values, active_numel=active_numel, state=state)
-        return _validate_reduced_latent_values(self, reduced, batch_size)
+        return bridge.validate_reduced_latent_values(self, reduced, batch_size)
 
     def _reduce_latent_values(
         self,
@@ -2802,7 +2818,7 @@ class BaseAdapter(ABC):
         Returns:
             One globally element-weighted scalar per batch item.
         """
-        return _default_reduce_latent_values(
+        return bridge.default_reduce_latent_values(
             self,
             values,
             active_numel=active_numel,
