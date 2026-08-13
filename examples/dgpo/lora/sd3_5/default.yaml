@@ -120,7 +120,6 @@ train:
   num_inner_epochs: 1               # base: train.num_inner_epochs = 1
 
   # ---------- Optimization (base config) ----------
-  max_grad_norm: 1.0         # base: train.max_grad_norm = 1.0
 
   # ---------- Gradient Checkpointing ----------
   enable_gradient_checkpointing: false
@@ -167,3 +166,4 @@ optimizers:
     weight_decay: 1.0e-4  # base: train.adam_weight_decay = 1e-4
     betas: [0.9, 0.999]  # base: train.adam_beta1/2
     eps: 1.0e-8  # base: train.adam_epsilon = 1e-8
+    max_grad_norm: 1.0  # base: train.max_grad_norm = 1.0

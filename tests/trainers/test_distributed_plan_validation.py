@@ -82,3 +82,19 @@ def test_no_zero_three_profile_is_shipped() -> None:
 
     assert config_dir.is_dir()
     assert not (config_dir / "deepspeed_zero3.yaml").exists()
+
+
+def test_deepspeed_gradient_clipping_is_wired_from_the_configured_norm() -> None:
+    """DeepSpeed clips inside its engine and ignores the value passed at the call site.
+
+    accelerate reads the threshold from this environment variable when building the
+    plugin, so leaving it unset ships an unresolved "auto" and max_grad_norm never
+    takes effect on that backend.
+    """
+    import inspect
+
+    from flow_factory.trainers import loader
+
+    source = inspect.getsource(loader.load_trainer)
+    assert "ACCELERATE_GRADIENT_CLIPPING" in source
+    assert source.index("ACCELERATE_GRADIENT_CLIPPING") < source.index("accelerator = Accelerator(")

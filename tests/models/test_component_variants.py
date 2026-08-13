@@ -340,7 +340,9 @@ def test_registration_validates_declared_route_and_parameter_type() -> None:
     registry.declare(_base_spec())
 
     with pytest.raises(KeyError, match="base.*vae.*declared components"):
-        registry.register_parameter(BASE_VARIANT, "vae", "weight", torch.nn.Parameter(torch.ones(1)))
+        registry.register_parameter(
+            BASE_VARIANT, "vae", "weight", torch.nn.Parameter(torch.ones(1))
+        )
     with pytest.raises(TypeError, match="torch.nn.Parameter.*base.*weight.*Tensor"):
         registry.register_parameter(
             BASE_VARIANT,

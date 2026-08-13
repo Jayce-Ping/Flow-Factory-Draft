@@ -449,11 +449,7 @@ def _legacy_dgpo_step(
     model_v = velocity("policy")
     with torch.no_grad():
         old_v = velocity("ema_ref") if trainer._requires_ema_ref else None
-        ref_v = (
-            velocity("ref")
-            if (trainer.enable_kl_loss or not trainer.use_ema_ref)
-            else None
-        )
+        ref_v = velocity("ref") if (trainer.enable_kl_loss or not trainer.use_ema_ref) else None
     ref_dgpo_v = old_v if trainer.use_ema_ref else ref_v
 
     dsm_loss = dsm(model_v)
@@ -461,9 +457,7 @@ def _legacy_dgpo_step(
     if (trainer.clip_dsm or trainer.clip_kl) and old_v is not None:
         clip_range = trainer.training_args.clip_range
         ratio = torch.exp(-dsm_loss.detach() + dsm(old_v))
-        should_clip = torch.where(
-            adv > 0, ratio > 1.0 + clip_range[1], ratio < 1.0 + clip_range[0]
-        )
+        should_clip = torch.where(adv > 0, ratio > 1.0 + clip_range[1], ratio < 1.0 + clip_range[0])
         if trainer.clip_dsm:
             dsm_loss = torch.where(should_clip, dsm_loss.detach(), dsm_loss)
 
@@ -591,12 +585,8 @@ def test_dgpo_optimize_matches_the_legacy_single_step_loss_and_gradient() -> Non
     trainer.optimize(samples)
 
     oracle_adapter = _adapter()
-    oracle_trainer = _dgpo_trainer(
-        oracle_adapter, clip_dsm=True, clip_kl=True, kl_beta=0.05
-    )
-    legacy = _legacy_dgpo_step(
-        oracle_trainer, oracle_adapter, oracle_adapter.weight, samples
-    )
+    oracle_trainer = _dgpo_trainer(oracle_adapter, clip_dsm=True, clip_kl=True, kl_beta=0.05)
+    legacy = _legacy_dgpo_step(oracle_trainer, oracle_adapter, oracle_adapter.weight, samples)
     legacy["loss"].backward()
 
     assert torch.equal(trainer.accelerator.losses[0], legacy["loss"].detach())
@@ -684,12 +674,8 @@ def test_dgpo_shared_noise_is_row_order_invariant_across_components() -> None:
     )
 
     for name in ("video", "audio"):
-        assert torch.equal(
-            forward_order.components[name][0], reversed_order.components[name][1]
-        )
-        assert torch.equal(
-            forward_order.components[name][1], reversed_order.components[name][0]
-        )
+        assert torch.equal(forward_order.components[name][0], reversed_order.components[name][1])
+        assert torch.equal(forward_order.components[name][1], reversed_order.components[name][0])
 
 
 def test_dgpo_missing_old_velocity_raises_with_the_active_flags() -> None:
@@ -737,9 +723,7 @@ def test_dgpo_shared_noise_error_context_names_the_epoch_and_timestep() -> None:
         ValueError,
         match=r"inner_epoch=5.*timestep_index=2.*component order \('latent',\)",
     ):
-        trainer._shared_group_noise(
-            clean_state, _samples([1, 1], [1.0, 2.0]), 5, timestep_index=2
-        )
+        trainer._shared_group_noise(clean_state, _samples([1, 1], [1.0, 2.0]), 5, timestep_index=2)
 
 
 def test_dgpo_build_noised_inputs_threads_the_timestep_index_into_errors() -> None:
@@ -851,9 +835,7 @@ def _legacy_crd_step(
     noised = (1 - sigma) * clean + sigma * noise
     v_target = noise - clean
 
-    old_scope = (
-        CRDTrainer._OLD_PARAMS_NAME if trainer.use_old_for_loss else "ref"
-    )
+    old_scope = CRDTrainer._OLD_PARAMS_NAME if trainer.use_old_for_loss else "ref"
     with torch.no_grad():
         old_v = noised * weight + _SCOPE_BIAS[old_scope]
     forward_pred = noised * weight + _SCOPE_BIAS["policy"]
@@ -873,8 +855,7 @@ def _legacy_crd_step(
                 .clip(min=1e-5)
             )
         r_theta = -(
-            (forward_pred - v_target) ** 2 / weight_theta
-            - (old_v - v_target) ** 2 / weight_old
+            (forward_pred - v_target) ** 2 / weight_theta - (old_v - v_target) ** 2 / weight_old
         )
     else:
         r_theta = -((forward_pred - v_target) ** 2 - (old_v - v_target) ** 2)
@@ -898,9 +879,7 @@ def _legacy_crd_step(
     kl_div = ((forward_pred - ref_pred) ** 2).mean(dim=tuple(range(1, forward_pred.ndim)))
     if trainer.reward_adaptive_kl:
         min_coef = 1e-4 / max(trainer.kl_beta, 1e-8)
-        kl_loss = trainer.kl_beta * torch.mean(
-            (min_coef + adv_cur_rank * (1 - min_coef)) * kl_div
-        )
+        kl_loss = trainer.kl_beta * torch.mean((min_coef + adv_cur_rank * (1 - min_coef)) * kl_div)
     else:
         kl_loss = trainer.kl_beta * kl_div.mean()
     return {"loss": policy_loss + kl_loss, "r_theta": r_theta_local}
@@ -973,14 +952,18 @@ def test_crd_optimize_finishes_every_pass_one_batch_before_any_pass_two_forward(
     assert events == ["mode:rollout"] + pass_one + ["mode:train"] + pass_two
 
     train_switch = events.index("mode:train")
-    assert max(
-        index for index, event in enumerate(events) if event == f"forward:{old_scope}"
-    ) < train_switch
-    assert min(
-        index
-        for index, event in enumerate(events)
-        if event in ("forward:policy", "forward:ref")
-    ) > train_switch
+    assert (
+        max(index for index, event in enumerate(events) if event == f"forward:{old_scope}")
+        < train_switch
+    )
+    assert (
+        min(
+            index
+            for index, event in enumerate(events)
+            if event in ("forward:policy", "forward:ref")
+        )
+        > train_switch
+    )
 
 
 def test_crd_optimize_repeats_the_optimizer_cadence_once_per_batch_timestep() -> None:
@@ -1017,9 +1000,7 @@ def test_crd_optimize_gives_the_graph_to_the_current_forward_only() -> None:
 
     trainer.optimize(_samples([4, 4], [1.0, 2.0]))
 
-    graph_owners = {
-        call["scope"]: call["velocity_requires_grad"] for call in adapter.forward_calls
-    }
+    graph_owners = {call["scope"]: call["velocity_requires_grad"] for call in adapter.forward_calls}
     assert graph_owners == {
         CRDTrainer._OLD_PARAMS_NAME: False,
         "policy": True,

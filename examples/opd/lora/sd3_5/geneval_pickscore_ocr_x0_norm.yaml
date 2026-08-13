@@ -140,7 +140,6 @@ train:
   gradient_step_per_epoch: 1  # Number of gradient updates per epoch
   gradient_accumulation_steps: auto  # Options: auto, or positive integer
 
-  max_grad_norm: 1.0  # Max gradient norm for gradient clipping
   max_epochs: 500  # Stop after this many epochs (-1 / null = unbounded)
 
   ema_decay: 0.9  # EMA decay rate for model weights (0 to disable)
@@ -223,3 +222,4 @@ optimizers:
     weight_decay: 1.0e-4  # AdamW weight decay regularization
     betas: [0.9, 0.999]  # AdamW momentum coefficients (beta1, beta2)
     eps: 1.0e-8  # AdamW epsilon for numerical stability
+    max_grad_norm: 1.0  # Max gradient norm for gradient clipping

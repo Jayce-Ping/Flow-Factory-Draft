@@ -81,7 +81,6 @@ train:
   gradient_accumulation_steps: auto  # Options: auto, or positive integer. When set, `gradient_step_per_epoch` is ignored.
     
   # Optimization
-  max_grad_norm: 1.0  # Max gradient norm for clipping
   
   # Gradient checkpointing
   enable_gradient_checkpointing: false  # Enable gradient checkpointing to save memory with extra compute
@@ -127,3 +126,4 @@ optimizers:
     weight_decay: 1.0e-4  # AdamW weight decay
     betas: [0.9, 0.999]  # AdamW betas
     eps: 1.0e-8  # AdamW epsilon
+    max_grad_norm: 1.0  # Max gradient norm for clipping

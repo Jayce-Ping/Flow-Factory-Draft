@@ -66,7 +66,6 @@ train:
   gradient_step_per_epoch: 2  # Gradient steps per epoch. The first step is on-policy, the rest are off-policy.
   
   # Optimizer
-  max_grad_norm: 1.0  # Max gradient norm for clipping
 
   # EMA
   ema_decay: 0.9  # EMA decay rate (0 to disable)
@@ -135,3 +134,4 @@ optimizers:
     weight_decay: 1.0e-4  # AdamW weight decay
     betas: [0.9, 0.999]  # AdamW betas
     eps: 1.0e-8  # AdamW epsilon
+    max_grad_norm: 1.0  # Max gradient norm for clipping

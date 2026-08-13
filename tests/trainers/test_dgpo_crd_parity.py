@@ -394,9 +394,7 @@ def _legacy_shared_noise(
                 _SEED_TAG_SHARED_NOISE,
                 device=device,
             )
-            noise = randn_tensor(
-                per_sample_shape, generator=generator, device=device, dtype=dtype
-            )
+            noise = randn_tensor(per_sample_shape, generator=generator, device=device, dtype=dtype)
             group_cache[unique_id] = noise
         noises.append(noise)
     return torch.stack(noises, dim=0)
@@ -435,9 +433,7 @@ def test_dgpo_shared_noise_keeps_the_legacy_namespace_for_the_primary_component(
     """A heterogeneous adapter must not shift the single-latent seed namespace."""
     adapter = _structured_adapter()
     trainer = _dgpo_trainer(adapter)
-    clean_state = LatentState(
-        {"video": torch.zeros(2, 3, 4), "audio": torch.zeros(2, 5)}
-    )
+    clean_state = LatentState({"video": torch.zeros(2, 3, 4), "audio": torch.zeros(2, 5)})
     samples = _samples([6, 6], [1.0, 2.0])
 
     noise = trainer._shared_group_noise(clean_state, samples, inner_epoch=2)
@@ -446,9 +442,7 @@ def test_dgpo_shared_noise_keeps_the_legacy_namespace_for_the_primary_component(
     audio_generator = create_generator(
         trainer.training_args.seed, trainer.epoch, 2, 6, _SEED_TAG_SHARED_NOISE, 1
     )
-    expected_audio = randn_tensor(
-        torch.Size([5]), generator=audio_generator, dtype=torch.float32
-    )
+    expected_audio = randn_tensor(torch.Size([5]), generator=audio_generator, dtype=torch.float32)
     assert torch.equal(noise.components["video"], expected_video)
     assert torch.equal(noise.components["audio"][0], expected_audio)
     assert torch.equal(noise.components["audio"][0], noise.components["audio"][1])
@@ -508,12 +502,8 @@ def test_dgpo_shared_noising_applies_predetermined_noise_without_drawing() -> No
     assert torch.equal(after_shared, torch.randn(4))
     assert adapter.noise_calls == 0
     assert adapter.apply_calls == 1
-    expected = trainer._shared_group_noise(
-        prepped["clean_state"], prepped["samples_slice"], 0
-    )
-    assert torch.equal(
-        inputs.noised.noise.components["latent"], expected.components["latent"]
-    )
+    expected = trainer._shared_group_noise(prepped["clean_state"], prepped["samples_slice"], 0)
+    assert torch.equal(inputs.noised.noise.components["latent"], expected.components["latent"])
 
 
 def test_dgpo_independent_noising_delegates_to_the_adapter_draw_hook() -> None:
@@ -725,16 +715,16 @@ def _dgpo_forward_inputs(
     clean_state = adapter.get_terminal_state(batch)
     times = adapter.build_training_component_times(torch.tensor([700.0, 300.0]), batch=batch)
     noised = adapter.apply_forward_process_noise(
-        clean_state, times, LatentState({"latent": torch.zeros_like(clean_state.components["latent"])})
+        clean_state,
+        times,
+        LatentState({"latent": torch.zeros_like(clean_state.components["latent"])}),
     )
     return batch, times, noised
 
 
 def test_dgpo_forward_velocities_route_parameter_contexts_and_cfg() -> None:
     adapter = _adapter()
-    trainer = _dgpo_trainer(
-        adapter, clip_dsm=True, use_ema_ref=False, kl_beta=0.1, kl_cfg=4.5
-    )
+    trainer = _dgpo_trainer(adapter, clip_dsm=True, use_ema_ref=False, kl_beta=0.1, kl_cfg=4.5)
     batch, times, noised = _dgpo_forward_inputs(trainer, adapter)
 
     velocities = trainer._forward_velocities(batch, times, noised)
@@ -909,9 +899,7 @@ def test_crd_adaptive_reward_keeps_the_normalization_out_of_the_gradient_graph()
 def test_crd_adaptive_reward_clamps_the_normalization_floor() -> None:
     """A perfect prediction divides by a zero deviation without the ``1e-5`` clamp."""
     clean = torch.zeros(2, 4)
-    noised, _ = _noised(
-        {"latent": clean}, {"latent": clean}, {"latent": torch.tensor([0.5, 0.5])}
-    )
+    noised, _ = _noised({"latent": clean}, {"latent": clean}, {"latent": torch.tensor([0.5, 0.5])})
     trainer = _crd_trainer(_adapter(), adaptive_logp=True)
 
     reward = trainer._implicit_reward(
@@ -934,9 +922,7 @@ def test_crd_adaptive_reward_normalizes_each_component_before_the_global_reducti
     )
     trainer = _crd_trainer(_structured_adapter(), adaptive_logp=True)
 
-    reward = trainer._implicit_reward(
-        LatentState(velocity), LatentState(old_velocity), noised
-    )
+    reward = trainer._implicit_reward(LatentState(velocity), LatentState(old_velocity), noised)
 
     total = torch.zeros(2, dtype=torch.float64)
     for name in ("video", "audio"):
@@ -999,9 +985,7 @@ def test_crd_kl_loss_matches_the_legacy_scaling(reward_adaptive_kl: bool) -> Non
     torch.manual_seed(96)
     kl_div = torch.rand(2)
     reward = torch.rand(2)
-    trainer = _crd_trainer(
-        _adapter(), kl_beta=0.02, reward_adaptive_kl=reward_adaptive_kl
-    )
+    trainer = _crd_trainer(_adapter(), kl_beta=0.02, reward_adaptive_kl=reward_adaptive_kl)
 
     kl_loss = trainer._kl_loss(kl_div, reward)
 
@@ -1044,9 +1028,7 @@ def _legacy_crd_loss(
     def _hard(mask: torch.Tensor) -> torch.Tensor:
         if mask.sum() == 0:
             return torch.ones_like(adv_cur) / adv_cur.shape[0]
-        return torch.softmax(
-            adv_cur.where(mask, torch.tensor(float("-inf"), device=device)), dim=0
-        )
+        return torch.softmax(adv_cur.where(mask, torch.tensor(float("-inf"), device=device)), dim=0)
 
     if weight_temp == 0:
         positive = _hard(adv_cur > 0.0)
@@ -1067,9 +1049,7 @@ def test_crd_centering_loss_matches_every_weight_temp_branch(
     adv_cur_rank = adv_cur[:2]
     r_theta_gathered = torch.rand(4)
     r_theta_local = r_theta_gathered[:2]
-    trainer = _crd_trainer(
-        _adapter(), weight_temp=weight_temp, crd_loss_type=crd_loss_type
-    )
+    trainer = _crd_trainer(_adapter(), weight_temp=weight_temp, crd_loss_type=crd_loss_type)
 
     loss = trainer._compute_crd_loss(
         adv_cur=adv_cur,

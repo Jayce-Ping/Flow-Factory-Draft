@@ -178,6 +178,10 @@ class Arguments(ArgABC):
         configuration a multi-variant run writes out explicitly.
         """
         if len(self.optimizer_args) > 0:
+            # `optimizers:` owns the clip norm. Mirror the primary entry's value onto
+            # training_args so the shared gradient step reads one resolved number
+            # instead of re-deriving it, and so the two can never disagree.
+            self.training_args.max_grad_norm = self.optimizer_args[0].max_grad_norm
             return
         self.optimizer_args = MultiOptimizerArguments(
             optimizer_configs=[

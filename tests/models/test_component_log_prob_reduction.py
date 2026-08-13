@@ -49,9 +49,7 @@ def test_reduction_supports_stored_per_transition_log_probs() -> None:
     video = torch.zeros(2, 3)
     audio = torch.ones(2, 3)
 
-    reduced = reduce_component_log_probs(
-        {"video": video, "audio": audio}, {"video": 1, "audio": 1}
-    )
+    reduced = reduce_component_log_probs({"video": video, "audio": audio}, {"video": 1, "audio": 1})
 
     assert reduced.shape == (2, 3)
     assert torch.allclose(reduced, torch.full((2, 3), 0.5))

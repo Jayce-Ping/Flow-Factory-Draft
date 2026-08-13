@@ -423,9 +423,19 @@ Omitting the section entirely still works: the flat `train.learning_rate`,
 `Arguments.__post_init__`, into the same single default entry. That shorthand is kept
 for backward compatibility, but new configs should be explicit.
 
-`train.max_grad_norm` stays under `train:` because it clips every trainable parameter
-at the shared gradient step, which is a run-level policy. The per-entry
-`max_grad_norm` is the per-role clip that multi-role coordination applies.
+`max_grad_norm` belongs to the optimizer entry, not to `train:`. It is a property of
+one optimization problem: roles already take different learning rates, and nothing
+requires their clip budgets to match. A single-policy run is the N=1 case where the
+two spellings coincide. When `optimizers:` is declared the entry owns the value and
+it is mirrored onto `training_args.max_grad_norm`, so the shared gradient step reads
+one resolved number and the two can never disagree.
+
+Backends honor it differently, which is worth knowing when a clip appears to have no
+effect. DDP applies it per call. FSDP2 applies it through DTensor-aware clipping.
+DeepSpeed clips inside its own engine and ignores the value handed to
+`accelerator.clip_grad_norm_`, which only reports the resulting norm, so the
+threshold is published to the plugin through `ACCELERATE_GRADIENT_CLIPPING` before
+the Accelerator is built.
 
 `optimizer` selects both the
 implementation and the argument schema (`hparams/optimizer_args/`), so AdamW and Muon

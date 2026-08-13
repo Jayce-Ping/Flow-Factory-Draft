@@ -202,7 +202,9 @@ def _trainer_runtime(
     registry = adapter.component_variant_registry
     bundle = ModelBundle(registry.bundle_members())
     role_configs = {
-        variant_name: _role_config(variant_name, update_frequency=2 if variant_name == "fake" else 1)
+        variant_name: _role_config(
+            variant_name, update_frequency=2 if variant_name == "fake" else 1
+        )
         for variant_name in variant_names
     }
     optimizer = torch.optim.AdamW(

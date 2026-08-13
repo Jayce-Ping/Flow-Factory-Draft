@@ -146,3 +146,30 @@ def test_a_composite_refuses_to_have_its_groups_reassigned() -> None:
 
     with pytest.raises(AttributeError, match="cannot be reassigned"):
         optimizer.param_groups = []
+
+
+def test_the_optimizer_entry_owns_the_clip_norm_and_mirrors_it_for_the_shared_step() -> None:
+    """One authoring location: the shared gradient step must not disagree with it."""
+    from flow_factory.hparams import Arguments
+
+    config = Arguments.from_dict(
+        {
+            "train": {"trainer_type": "grpo", "max_grad_norm": 9.0},
+            "optimizers": [{"name": "default", "learning_rate": 2e-5, "max_grad_norm": 0.5}],
+        }
+    )
+
+    assert config.optimizer_args[0].max_grad_norm == 0.5
+    assert config.training_args.max_grad_norm == 0.5
+
+
+def test_the_flat_clip_norm_still_feeds_the_synthesized_entry() -> None:
+    """A config without an `optimizers` list keeps configuring the clip under train."""
+    from flow_factory.hparams import Arguments
+
+    config = Arguments.from_dict(
+        {"train": {"trainer_type": "grpo", "learning_rate": 1e-5, "max_grad_norm": 0.25}}
+    )
+
+    assert config.optimizer_args[0].max_grad_norm == 0.25
+    assert config.training_args.max_grad_norm == 0.25

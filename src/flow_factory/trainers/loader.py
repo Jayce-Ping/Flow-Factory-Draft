@@ -70,6 +70,13 @@ def load_trainer(config: Arguments) -> BaseTrainer:
     find_unused = getattr(adapter_cls, "ddp_find_unused_parameters", False)
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=find_unused)
 
+    # DeepSpeed clips inside its engine: `accelerator.clip_grad_norm_` ignores the
+    # value it is handed and only reports the resulting norm. The threshold therefore
+    # has to reach the DeepSpeed plugin before the Accelerator is built, and accelerate
+    # reads it from this environment variable. Without it the generated DeepSpeed
+    # config carries an unresolved "auto" and `max_grad_norm` never takes effect.
+    os.environ.setdefault("ACCELERATE_GRADIENT_CLIPPING", str(config.training_args.max_grad_norm))
+
     # Initialize Accelerator
     accelerator_config = ProjectConfiguration(
         project_dir=os.path.join(config.log_args.save_dir, config.log_args.run_name),

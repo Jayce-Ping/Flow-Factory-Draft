@@ -71,7 +71,6 @@ train:
   global_std: false
   unique_sample_num_per_epoch: 32
   gradient_step_per_epoch: 1
-  max_grad_norm: 1.0
   enable_gradient_checkpointing: false
   seed: 42
 
@@ -117,3 +116,4 @@ optimizers:
     weight_decay: 1.0e-4
     betas: [0.9, 0.999]
     eps: 1.0e-8
+    max_grad_norm: 1.0  # Gradient-norm clip
