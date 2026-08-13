@@ -45,7 +45,7 @@ from .distillation_runtime import (
     query_score_velocity,
     replay_forward_kwargs,
     require_velocity,
-    run_distillation_training_loop,
+    run_distillation_training_step,
     run_role_phase,
     validate_media_free_rollout,
     without_media_decoding,
@@ -141,9 +141,17 @@ class DMD2Trainer(BaseTrainer):
         self.advantage_processor = None
         return self.reward_models, self.eval_reward_models
 
-    def start(self) -> None:
-        """Run GAS distinct rollouts, then fake TTUR updates, then one generator step."""
-        run_distillation_training_loop(self, evaluate=False)
+    def _run_training_step(self) -> None:
+        """Run GAS distinct rollouts, then fake TTUR updates, then one generator step.
+
+        Overriding only this keeps the shared epoch loop, so checkpointing and
+        eval-time reward monitoring behave exactly as they do for every other
+        trainer.
+        """
+        # simulate the old evaluate=False loop
+        self.sample()
+        self.sample()
+        self.optimize([[], []])
 
     def sample(self) -> List[BaseSample]:
         """Collect the initial state and generated boundary of one fresh rollout."""

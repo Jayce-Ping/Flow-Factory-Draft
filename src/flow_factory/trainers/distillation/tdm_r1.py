@@ -33,7 +33,7 @@ from .distillation_runtime import (
     generate_one_rollout_batch,
     query_score_velocity,
     require_velocity,
-    run_distillation_training_loop,
+    run_distillation_training_step,
     run_role_phase,
 )
 from .group_preference import GroupPreferenceBatch, group_preference_loss
@@ -121,9 +121,14 @@ class TDMR1Trainer(BaseTrainer):
     def _mean_boundary_loss(self, units: Sequence[TDMBoundaryUnit], loss_fn: Any) -> torch.Tensor:
         return TDMTrainer._mean_boundary_loss(self, units, loss_fn)
 
-    def start(self) -> None:
-        """Run reward feedback followed by fake, surrogate, and generator updates."""
-        run_distillation_training_loop(self, evaluate=True)
+    def _run_training_step(self) -> None:
+        """Run reward feedback followed by fake, surrogate, and generator updates.
+
+        Overriding only this keeps the shared epoch loop, so checkpointing and
+        eval-time reward monitoring behave exactly as they do for every other
+        trainer.
+        """
+        run_distillation_training_step(self)
 
     def sample(self) -> List[BaseSample]:
         """Generate complete reward groups with every deterministic boundary stored."""
