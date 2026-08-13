@@ -61,7 +61,7 @@ All target components (trainable **and** frozen-but-shardable) are bundled into 
 Checkpoints are written and read for **trainable members only** — components whose `target_module_map[name]` is non-empty (`adapter.trainable_component_names`). Frozen-but-shardable bundle members (e.g. Wan2.2's `transformer_2`, kept in `target_components` only to be FSDP-sharded for memory; see #9) map to `None` and are skipped by both `save_checkpoint` and `_load_lora`/`_load_full_model`. Loaders MUST iterate `trainable_component_names`, not `target_components`, or resume logs a spurious error for a per-component subdir that was never written. `resume_type='state'` restores via `accelerator.load_state` into the prepared bundle root and is therefore keyed to bundle membership — resuming into a different `target_components` / bundle composition will mismatch.
 
 ### 10. DeepSpeed ZeRO-3 Is Unsupported
-Reward model sharding under ZeRO-3 is broken even with `GatherParameter` context manager (see the ZeRO-3 guard comment in `trainers/abc.py`). Only ZeRO-1 and ZeRO-2 are safe. Document this if users ask.
+Supported distributed plans are DDP, FSDP, and DeepSpeed ZeRO-1/2. Reward model sharding under ZeRO-3 is broken even with the `GatherParameter` context manager, and parameter sharding also breaks frozen-component synchronization. `validate_supported_distributed_plan` (`trainers/abc.py`) rejects it at `BaseTrainer.__init__`, before any weights load, and `config/deepspeed/` ships no ZeRO-3 profile. Multi-role training narrows this further: `_validate_multirole_backend` requires ZeRO-1/2 and, under FSDP2, `use_orig_params=True`.
 
 ---
 

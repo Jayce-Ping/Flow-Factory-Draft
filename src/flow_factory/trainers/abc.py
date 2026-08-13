@@ -39,7 +39,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from accelerate import Accelerator
-from accelerate.utils import ProjectConfiguration, set_seed
+from accelerate.utils import DistributedType, ProjectConfiguration, set_seed
 from diffusers.utils.outputs import BaseOutput
 from PIL import Image
 from torch.utils.data import DataLoader
@@ -83,6 +83,33 @@ from .role_optimization import (
 )
 
 logger = setup_logger(__name__)
+
+
+def validate_supported_distributed_plan(accelerator: Accelerator) -> None:
+    """Reject distributed plans this framework cannot train correctly.
+
+    Supported plans are DDP, FSDP, and DeepSpeed ZeRO-1/2. ZeRO-3 shards
+    parameters across ranks, which breaks reward-model loading and the
+    frozen-component synchronization this framework relies on. Rejecting it here
+    fails at startup rather than partway through a training step.
+
+    Args:
+        accelerator: Configured Accelerate accelerator.
+
+    Raises:
+        ValueError: If DeepSpeed ZeRO-3 is configured.
+    """
+    if accelerator.distributed_type != DistributedType.DEEPSPEED:
+        return
+    deepspeed_plugin = accelerator.state.deepspeed_plugin
+    if deepspeed_plugin is None:
+        return
+    if deepspeed_plugin.zero_stage == 3:
+        raise ValueError(
+            "DeepSpeed ZeRO-3 is not supported by Flow-Factory: parameter sharding breaks "
+            "reward-model loading and frozen-component synchronization. Expected ZeRO-1/2, "
+            "FSDP, or DDP; received DeepSpeed stage 3."
+        )
 
 _MULTIROLE_METADATA_FILENAME = "flow_factory_multirole_metadata.json"
 _MULTIROLE_METADATA_VERSION = 1
@@ -169,6 +196,8 @@ class BaseTrainer(ABC):
         config: Arguments,
         adapter: BaseAdapter,
     ):
+        validate_supported_distributed_plan(accelerator)
+
         self.accelerator = accelerator
         self.config = config
         self.log_args = config.log_args
