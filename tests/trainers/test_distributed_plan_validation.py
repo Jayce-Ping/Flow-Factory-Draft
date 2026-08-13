@@ -57,6 +57,25 @@ def test_deepspeed_without_a_plugin_is_not_rejected() -> None:
     validate_supported_distributed_plan(_accelerator(DistributedType.DEEPSPEED))
 
 
+def test_muon_with_deepspeed_is_rejected_as_unverified() -> None:
+    """Muon runs inside a composite; DeepSpeed rebuilds its own optimizer wrapper."""
+    from flow_factory.hparams.optimizer_args import (
+        AdamWOptimizerArguments,
+        MuonOptimizerArguments,
+    )
+    from flow_factory.trainers.abc import BaseTrainer
+
+    trainer = SimpleNamespace(accelerator=_accelerator(DistributedType.DEEPSPEED, zero_stage=2))
+
+    with pytest.raises(ValueError, match="Muon with DeepSpeed is not verified"):
+        BaseTrainer._validate_optimizer_backend(trainer, (MuonOptimizerArguments(name="base"),))
+
+    # AdamW is unaffected, and Muon is fine on the backends that only read groups.
+    BaseTrainer._validate_optimizer_backend(trainer, (AdamWOptimizerArguments(name="base"),))
+    fsdp_trainer = SimpleNamespace(accelerator=_accelerator(DistributedType.FSDP))
+    BaseTrainer._validate_optimizer_backend(fsdp_trainer, (MuonOptimizerArguments(name="base"),))
+
+
 def test_no_zero_three_profile_is_shipped() -> None:
     """A shipped profile would invite a configuration the trainer refuses."""
     config_dir = Path(__file__).resolve().parents[2] / "config" / "deepspeed"

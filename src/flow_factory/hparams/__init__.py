@@ -20,6 +20,12 @@ from .data_args import DataArguments
 from .dataset_args import DatasetArguments, DatasetEvalSpec, DatasetTrainSpec
 from .log_args import LogArguments
 from .model_args import ModelArguments
+from .optimizer_args import (
+    AdamWOptimizerArguments,
+    MultiOptimizerArguments,
+    MuonOptimizerArguments,
+    OptimizerArguments,
+)
 from .reward_args import MultiRewardArguments, RewardArguments
 from .scheduler_args import SchedulerArguments
 from .training_args import (
@@ -53,6 +59,10 @@ __all__ = [
     "TeacherConfig",
     "get_training_args_class",
     "RewardArguments",
+    "AdamWOptimizerArguments",
+    "MultiOptimizerArguments",
+    "MuonOptimizerArguments",
+    "OptimizerArguments",
     "MultiRewardArguments",
     "AccelerationArguments",
     "AccelerationSpec",

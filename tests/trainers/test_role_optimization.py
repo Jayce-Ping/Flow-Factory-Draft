@@ -19,7 +19,12 @@ from typing import Any, Iterator, List, Mapping, Optional, Tuple
 import pytest
 import torch
 from accelerate import Accelerator
+from accelerate.utils import DistributedType
 
+from flow_factory.hparams.optimizer_args import (
+    AdamWOptimizerArguments,
+    MultiOptimizerArguments,
+)
 from flow_factory.trainers.abc import BaseTrainer
 from flow_factory.trainers.role_optimization import (
     OptimizationRole,
@@ -326,6 +331,19 @@ def test_base_trainer_builds_one_ordered_adamw_with_role_hyperparameters() -> No
         _config("generator", learning_rate=0.1, max_grad_norm=3.0),
         _config("fake", learning_rate=0.2, max_grad_norm=4.0),
     )
+    trainer.config = SimpleNamespace(
+        optimizer_args=MultiOptimizerArguments(
+            optimizer_configs=[
+                AdamWOptimizerArguments(
+                    name="generator", learning_rate=0.1, betas=(0.8, 0.9), weight_decay=0.02
+                ),
+                AdamWOptimizerArguments(
+                    name="fake", learning_rate=0.2, betas=(0.8, 0.9), weight_decay=0.02
+                ),
+            ]
+        )
+    )
+    trainer.accelerator = SimpleNamespace(distributed_type=DistributedType.NO)
 
     optimizer = BaseTrainer._init_optimizer(trainer)
 

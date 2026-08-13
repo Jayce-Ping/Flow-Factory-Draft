@@ -99,6 +99,41 @@ resume that discovers a changed layout afterwards has already restored state ont
 The on-disk key stays `roles` because the checkpoint is the trainer's artifact; the registry's own
 key is `variants`, and the two are translated at the boundary.
 
+## Optimizer configuration
+
+Optimizer hyperparameters live in a top-level `optimizers:` list, one entry per
+trainable variant, resolved by name. `optimizer:` selects both the implementation and
+the arguments subclass (`hparams/optimizer_args/_registry.py`), so AdamW and Muon
+hyperparameters never share a class:
+
+```yaml
+optimizers:
+  - name: generator
+    optimizer: muon
+    learning_rate: 2.0e-5
+  - name: fake
+    optimizer: adamw
+    learning_rate: 1.0e-5
+    update_frequency: 5
+```
+
+Omitting `optimizers:` keeps the flat `train.learning_rate` family working: one default
+AdamW configuration is synthesized in `Arguments.__post_init__`, which is the single
+place that knows the legacy spelling.
+
+`torch.optim.Muon` orthogonalizes matrices and **rejects any parameter that is not
+2D**, so a Muon variant is really optimized by two algorithms: Muon for its matrices
+and AdamW for its biases, normalization scales and embeddings (`fallback_betas` /
+`fallback_eps` configure that half). Since the framework prepares exactly one optimizer
+root, `optimizer/loader.py` returns a `CompositeOptimizer` in that case, which exposes
+its children's groups as one list. An all-AdamW run still gets a plain
+`torch.optim.AdamW`, unchanged.
+
+Muon therefore gives one variant **two** parameter groups, which is why
+`OptimizationRole.optimizer_group_ids` is a tuple. Muon combined with DeepSpeed is
+rejected at startup as unverified: DDP and FSDP only read `param_groups` and call
+`step`, but DeepSpeed rebuilds its own optimizer wrapper around the object it receives.
+
 ## Optimizer and backend contract
 
 `trainers/role_optimization.py` is a utility a trainer composes, not something `BaseTrainer` wires

@@ -53,10 +53,12 @@ from ..data_utils.loader import (
     get_train_dataloader,
 )
 from ..hparams import *
+from ..hparams.optimizer_args import OptimizerArguments
 from ..logger import LogFormatter, load_logger
 from ..models.abc import BaseAdapter
 from ..models.model_bundle import ModelBundle, RoutedComponentProxy
 from ..models.variants import DEFAULT_BASE_VARIANT, ComponentVariantRegistry
+from ..optimizer import build_optimizer, uses_muon
 from ..rewards import (
     BaseRewardModel,
     MultiRewardLoader,
@@ -455,33 +457,87 @@ class BaseTrainer(ABC):
                 f"{trainable_role_names!r}, received {configured_role_names!r}"
             )
 
-        parameter_groups = []
-        self.optimization_roles = {}
-        for group_id, config in enumerate(role_configs):
+        optimizer_args = tuple(
+            self._optimizer_args_for_role(config.role_name) for config in role_configs
+        )
+        self._validate_optimizer_backend(optimizer_args)
+        parameters_by_name = {}
+        for config in role_configs:
             parameters = registry.parameters(config.role_name)
             if not parameters:
                 raise ValueError(
                     f"expected trainable role {config.role_name!r} to own optimizer "
                     "parameters, received none"
                 )
-            parameter_groups.append(
-                {
-                    "params": list(parameters),
-                    "role_name": config.role_name,
-                    "lr": config.learning_rate,
-                    "betas": config.adam_betas,
-                    "weight_decay": config.adam_weight_decay,
-                    "eps": config.adam_epsilon,
-                }
-            )
+            parameters_by_name[config.role_name] = parameters
+
+        self.optimizer = build_optimizer(optimizer_args, parameters_by_name)
+
+        # Muon splits one role across two groups (its matrices and the AdamW
+        # remainder), so ownership is recorded per role rather than per group.
+        self.optimization_roles = {}
+        group_ids_by_role: Dict[str, List[int]] = {}
+        for group_id, group in enumerate(self.optimizer.param_groups):
+            group_ids_by_role.setdefault(group["role_name"], []).append(group_id)
+        for config in role_configs:
             self.optimization_roles[config.role_name] = OptimizationRole(
                 config=config,
-                parameters=parameters,
-                optimizer_group_ids=(group_id,),
+                parameters=parameters_by_name[config.role_name],
+                optimizer_group_ids=tuple(group_ids_by_role[config.role_name]),
             )
-
-        self.optimizer = torch.optim.AdamW(parameter_groups)
         return self.optimizer
+
+    def _optimizer_args_for_role(self, role_name: str) -> OptimizerArguments:
+        """Return the optimizer configuration for one trainable role.
+
+        A single-policy run has one configuration and need not name it, which is
+        what every existing config file relies on.
+
+        Args:
+            role_name: Trainable role to configure.
+
+        Returns:
+            The matching optimizer arguments.
+
+        Raises:
+            ValueError: If no configuration matches and none can be defaulted.
+        """
+        configured = self.config.optimizer_args.get_by_name(role_name)
+        if configured is not None:
+            return configured
+        if len(self.config.optimizer_args) == 1:
+            return self.config.optimizer_args[0]
+        available = tuple(config.name for config in self.config.optimizer_args)
+        raise ValueError(
+            f"expected an optimizer configuration named {role_name!r} under `optimizers`, "
+            f"received {available!r}"
+        )
+
+    def _validate_optimizer_backend(self, optimizer_args: Tuple[OptimizerArguments, ...]) -> None:
+        """Reject optimizer and distributed-backend pairings that are not verified.
+
+        Muon rejects non-matrix parameters, so a Muon variant is driven by a
+        CompositeOptimizer holding both Muon and AdamW. DDP and FSDP only read
+        ``param_groups`` and call ``step``, which the composite provides. DeepSpeed
+        instead rebuilds its own optimizer wrapper around the object it is given,
+        and that combination has not been verified here.
+
+        Args:
+            optimizer_args: Optimizer configurations for this run.
+
+        Raises:
+            ValueError: If Muon is combined with DeepSpeed.
+        """
+        if not uses_muon(optimizer_args):
+            return
+        if self.accelerator.distributed_type != DistributedType.DEEPSPEED:
+            return
+        raise ValueError(
+            "Muon with DeepSpeed is not verified in this framework: Muon rejects "
+            "non-matrix parameters, so it runs inside a CompositeOptimizer, and "
+            "DeepSpeed rebuilds its own optimizer wrapper around the object it "
+            "receives. Use DDP or FSDP with Muon, or select the adamw optimizer."
+        )
 
     def _role_optimizer_configs(self) -> Tuple[RoleOptimizerConfig, ...]:
         """Build role configs from nested arguments or legacy flat arguments."""

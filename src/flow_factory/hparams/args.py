@@ -37,6 +37,7 @@ from .acceleration_args import AccelerationArguments
 from .data_args import DataArguments
 from .log_args import LogArguments
 from .model_args import ModelArguments
+from .optimizer_args import AdamWOptimizerArguments, MultiOptimizerArguments
 from .reward_args import MultiRewardArguments, RewardArguments
 from .scheduler_args import SchedulerArguments
 from .training_args import (
@@ -163,12 +164,39 @@ class Arguments(ArgABC):
         default=None,
         metadata={"help": "Arguments for multiple evaluation reward configurations."},
     )
+    optimizer_args: MultiOptimizerArguments = field(
+        default_factory=MultiOptimizerArguments,
+        metadata={"help": "Arguments for one optimizer per trainable variant."},
+    )
+
+    def _synthesize_default_optimizer_args(self) -> None:
+        """Derive one optimizer configuration from the flat training arguments.
+
+        A single-policy run configures its optimizer with `train.learning_rate` and
+        friends, and every shipped example does. Rather than teach each reader both
+        spellings, the flat fields are translated here, once, into the same
+        configuration a multi-variant run writes out explicitly.
+        """
+        if len(self.optimizer_args) > 0:
+            return
+        self.optimizer_args = MultiOptimizerArguments(
+            optimizer_configs=[
+                AdamWOptimizerArguments(
+                    learning_rate=self.training_args.learning_rate,
+                    weight_decay=self.training_args.adam_weight_decay,
+                    max_grad_norm=self.training_args.max_grad_norm,
+                    betas=self.training_args.adam_betas,
+                    eps=self.training_args.adam_epsilon,
+                )
+            ]
+        )
 
     def __post_init__(self):
         if self.log_args.run_name is None:
             time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.log_args.run_name = f"{self.model_args.model_type}_{self.model_args.finetune_type}_{self.training_args.trainer_type}_{time_stamp}"
 
+        self._synthesize_default_optimizer_args()
         self._validate_dataset_routing()
         # Resolve `RewardArguments.applicable_datasets is None` -> concrete
         # list of applicable dataset names. Must run AFTER validation (so the
@@ -1001,6 +1029,7 @@ class Arguments(ArgABC):
             "eval": ("eval_args", EvaluationArguments),
             "log": ("log_args", LogArguments),
             "acceleration": ("acceleration_args", AccelerationArguments),
+            "optimizers": ("optimizer_args", MultiOptimizerArguments),
             "rewards": ("reward_args", MultiRewardArguments),
             "eval_rewards": ("eval_reward_args", MultiRewardArguments),
         }
