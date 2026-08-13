@@ -2782,6 +2782,71 @@ class BaseAdapter(ABC):
         """
         return bridge.get_train_step_indices(self)
 
+    def get_state_active_numel_per_sample(
+        self,
+        state: LatentState,
+    ) -> Mapping[str, torch.Tensor]:
+        """Count each sample's active stochastic degrees of freedom by component.
+
+        This validated wrapper supports variable geometry across a batch. Adapters
+        with custom packing or reduction semantics override
+        :meth:`_get_state_active_numel_per_sample`, not this method.
+
+        Args:
+            state: Batched latent state in ``trajectory_component_order``.
+
+        Returns:
+            One positive signed-integer ``(B,)`` tensor per component, on that
+            component's device and in component order.
+        """
+        bridge.validate_state_active_numel_per_sample_input(self, state)
+        active_numel = self._get_state_active_numel_per_sample(state)
+        return bridge.validate_state_active_numel_per_sample(self, state, active_numel)
+
+    def _get_state_active_numel_per_sample(
+        self,
+        state: LatentState,
+    ) -> Mapping[str, torch.Tensor]:
+        """Return adapter-owned per-sample active counts before validation.
+
+        A custom packing adapter must override this hook together with its latent
+        reduction hook so both describe exactly the same active elements.
+        """
+        return bridge.get_state_active_numel_per_sample(self, state)
+
+    def replay_generator_boundary(
+        self,
+        batch: StackedSampleBatch,
+        boundary_index: int,
+        *,
+        return_fields: Tuple[str, ...] = ("velocity", "next_latents"),
+        rtol: float,
+        atol: float,
+        **forward_kwargs: Any,
+    ) -> MultiModalStepOutput:
+        """Recompute and validate the transition preceding a generated boundary.
+
+        Args:
+            batch: Collated batch owning trajectory states and conditioning.
+            boundary_index: Generated state boundary to recompute; at least one.
+            return_fields: Scheduler output fields requested from ``forward_state``.
+            rtol: Explicit relative tolerance for stored-transition validation.
+            atol: Explicit absolute tolerance for stored-transition validation.
+            **forward_kwargs: Explicit conditioning not already owned by ``batch``.
+
+        Returns:
+            Recomputed one-step output after validating its next state.
+        """
+        return bridge.replay_generator_boundary(
+            self,
+            batch,
+            boundary_index,
+            return_fields=return_fields,
+            rtol=rtol,
+            atol=atol,
+            forward_kwargs=forward_kwargs,
+        )
+
     def build_training_component_times(
         self,
         primary_timesteps: torch.Tensor,
