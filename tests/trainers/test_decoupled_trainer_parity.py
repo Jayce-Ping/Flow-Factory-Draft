@@ -125,6 +125,12 @@ class StructuredAdapterFake(AdapterFake):
     trajectory_component_order = ("video", "audio")
 
 
+class DataWardStructuredAdapterFake(StructuredAdapterFake):
+    """Structured adapter using MiniMax H3's data-ward velocity convention."""
+
+    flow_velocity_direction = "data"
+
+
 class BroadcastVelocityAdapterFake(AdapterFake):
     """Adapter returning a per-sample velocity that broadcasts over the state."""
 
@@ -168,8 +174,8 @@ def _adapter(cls: type = AdapterFake) -> AdapterFake:
     return _prepare(adapter)
 
 
-def _structured_adapter() -> StructuredAdapterFake:
-    adapter = object.__new__(StructuredAdapterFake)
+def _structured_adapter(cls: type = StructuredAdapterFake) -> StructuredAdapterFake:
+    adapter = object.__new__(cls)
     video = SchedulerFake()
     adapter.pipeline = SimpleNamespace(scheduler=video)
     adapter.scheduler_group = SchedulerGroup(
@@ -628,6 +634,35 @@ def test_nft_matching_losses_use_each_component_sigma_and_normalization() -> Non
         negative_sum = negative_sum + negative_elements.flatten(1).sum(dim=1)
     assert torch.equal(positive_loss, positive_sum / 17)
     assert torch.equal(negative_loss, negative_sum / 17)
+
+
+def test_nft_matching_losses_recover_clean_state_for_data_ward_velocity() -> None:
+    clean = {
+        "video": torch.tensor([[1.0, 2.0]]),
+        "audio": torch.tensor([[3.0, 4.0, 5.0]]),
+    }
+    noise = {
+        "video": torch.tensor([[5.0, 6.0]]),
+        "audio": torch.tensor([[9.0, 10.0, 11.0]]),
+    }
+    sigmas = {"video": torch.tensor([0.75]), "audio": torch.tensor([0.25])}
+    noised, times = _noised(clean, noise, sigmas)
+    data_ward_velocity = {name: clean[name] - noise[name] for name in ("video", "audio")}
+    trainer = _nft_trainer(
+        _structured_adapter(DataWardStructuredAdapterFake),
+        nft_beta=0.5,
+    )
+
+    positive_loss, negative_loss = trainer._matching_losses(
+        LatentState(clean),
+        noised,
+        times,
+        LatentState(data_ward_velocity),
+        LatentState(data_ward_velocity),
+    )
+
+    assert torch.equal(positive_loss, torch.zeros(1, dtype=torch.float64))
+    assert torch.equal(negative_loss, torch.zeros(1, dtype=torch.float64))
 
 
 def test_nft_reference_kl_matches_the_legacy_velocity_formula() -> None:

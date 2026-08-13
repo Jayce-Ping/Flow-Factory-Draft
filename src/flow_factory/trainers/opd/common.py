@@ -493,12 +493,23 @@ def project_distillation_target_state(
         return LatentState({name: predicted.components[name] for name in expected_names})
 
     sigmas = _resolve_component_sigmas(adapter, times, context=context)
-    projected: Dict[str, torch.Tensor] = {}
-    for name in expected_names:
-        latents = state.components[name].float()
-        sigma = to_broadcast_tensor(sigmas[name].float(), latents)
-        projected[name] = latents - sigma * predicted.components[name].float()
-    return LatentState(projected)
+    projection_times = ComponentTimes(
+        timestep=times.timestep,
+        next_timestep=times.next_timestep,
+        sigma={name: sigmas[name].float() for name in expected_names},
+        next_sigma=times.next_sigma,
+    )
+    return adapter.project_velocity_to_clean_state(
+        LatentState(
+            {name: state.components[name].float() for name in expected_names},
+            active_masks=state.active_masks,
+        ),
+        projection_times,
+        LatentState(
+            {name: predicted.components[name].float() for name in expected_names},
+            active_masks=predicted.active_masks,
+        ),
+    )
 
 
 def _validate_component_denominators(

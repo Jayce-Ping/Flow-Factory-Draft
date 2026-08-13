@@ -101,6 +101,12 @@ class StructuredAdapterFake(AdapterFake):
     trajectory_component_order = ("video", "audio")
 
 
+class DataWardStructuredAdapterFake(StructuredAdapterFake):
+    """Structured adapter using MiniMax H3's data-ward velocity convention."""
+
+    flow_velocity_direction = "data"
+
+
 class DynamicMaskAdapterFake(AdapterFake):
     """Adapter reducing only the positions the current state marks active."""
 
@@ -134,9 +140,11 @@ def _dynamic_mask_adapter() -> DynamicMaskAdapterFake:
 
 
 def _structured_adapter(
-    video_dynamics: str = "ODE", audio_dynamics: str = "ODE"
+    video_dynamics: str = "ODE",
+    audio_dynamics: str = "ODE",
+    cls: type = StructuredAdapterFake,
 ) -> StructuredAdapterFake:
-    adapter = object.__new__(StructuredAdapterFake)
+    adapter = object.__new__(cls)
     video = SchedulerFake(video_dynamics)
     adapter.pipeline = SimpleNamespace(scheduler=video)
     adapter.scheduler_group = SchedulerGroup(
@@ -238,6 +246,41 @@ def test_structured_x0_projection_uses_each_component_stored_sigma() -> None:
         projected.components["audio"],
         audio.float() - to_broadcast_tensor(audio_sigma, audio.float()) * audio_v.float(),
     )
+
+
+def test_structured_x0_projection_uses_data_ward_velocity_direction() -> None:
+    clean = {
+        "video": torch.tensor([[1.0, 2.0]]),
+        "audio": torch.tensor([[3.0, 4.0, 5.0]]),
+    }
+    noise = {
+        "video": torch.tensor([[5.0, 6.0]]),
+        "audio": torch.tensor([[9.0, 10.0, 11.0]]),
+    }
+    sigmas = {"video": torch.tensor([0.75]), "audio": torch.tensor([0.25])}
+    state = {
+        name: (1 - to_broadcast_tensor(sigmas[name], clean[name])) * clean[name]
+        + to_broadcast_tensor(sigmas[name], clean[name]) * noise[name]
+        for name in ("video", "audio")
+    }
+    velocity = {name: clean[name] - noise[name] for name in ("video", "audio")}
+    adapter = _structured_adapter(cls=DataWardStructuredAdapterFake)
+
+    projected = project_distillation_target_state(
+        adapter,
+        loss_target="x0",
+        state=LatentState(state),
+        output=MultiModalStepOutput(velocity=LatentState(velocity)),
+        times=ComponentTimes(
+            timestep={"video": torch.tensor([750.0]), "audio": torch.tensor([250.0])},
+            next_timestep={"video": torch.zeros(1), "audio": torch.zeros(1)},
+            sigma=sigmas,
+            next_sigma={"video": torch.zeros(1), "audio": torch.zeros(1)},
+        ),
+    )
+
+    for name in ("video", "audio"):
+        assert torch.equal(projected.components[name], clean[name])
 
 
 def test_structured_xt_projection_reads_the_per_component_transition_mean() -> None:

@@ -654,6 +654,73 @@ def _build_training_component_times(
     )
 
 
+def _project_velocity_to_clean_state(
+    adapter: Any,
+    state: LatentState,
+    times: ComponentTimes,
+    velocity: LatentState,
+) -> LatentState:
+    """Project a noised state to clean data using the adapter's velocity direction."""
+    expected_names = adapter.trajectory_component_order
+    for argument, value in (("state", state), ("velocity", velocity)):
+        if not isinstance(value, LatentState):
+            raise TypeError(
+                f"expected LatentState for project_velocity_to_clean_state {argument}, "
+                f"received {type(value).__name__}"
+            )
+        if value.component_names != expected_names:
+            raise ValueError(
+                f"expected project_velocity_to_clean_state {argument} component order "
+                f"{expected_names}, received {value.component_names}"
+            )
+    if times.sigma is None or tuple(times.sigma) != expected_names:
+        received = None if times.sigma is None else tuple(times.sigma)
+        raise ValueError(
+            f"expected sigma component order {expected_names} for "
+            f"project_velocity_to_clean_state, received {received}"
+        )
+    direction = adapter.flow_velocity_direction
+    if direction not in ("noise", "data"):
+        raise ValueError(
+            "expected flow_velocity_direction to be 'noise' or 'data' for "
+            f"project_velocity_to_clean_state, received {direction!r}"
+        )
+
+    projected: Dict[str, torch.Tensor] = {}
+    for name in expected_names:
+        component_state = state.components[name]
+        component_velocity = velocity.components[name]
+        if component_state.ndim < 2:
+            raise ValueError(
+                f"expected project_velocity_to_clean_state component {name!r} to be batched "
+                f"with shape (B, ...), received {tuple(component_state.shape)}"
+            )
+        if component_velocity.shape != component_state.shape:
+            raise ValueError(
+                f"expected velocity component {name!r} to match state shape "
+                f"{tuple(component_state.shape)}, received {tuple(component_velocity.shape)}"
+            )
+        if component_velocity.device != component_state.device:
+            raise ValueError(
+                f"expected velocity component {name!r} on state device "
+                f"{component_state.device}, received {component_velocity.device}"
+            )
+        sigma = times.sigma[name]
+        batch_size = component_state.shape[0]
+        if sigma.ndim > 1 or sigma.numel() not in (1, batch_size):
+            raise ValueError(
+                f"expected sigma for component {name!r} to hold one value per sample with "
+                f"shape ({batch_size},), received {tuple(sigma.shape)}"
+            )
+        compute_dtype = torch.promote_types(component_state.dtype, component_velocity.dtype)
+        compute_state = component_state.to(dtype=compute_dtype)
+        compute_velocity = component_velocity.to(dtype=compute_dtype)
+        sigma = to_broadcast_tensor(sigma, compute_state)
+        sign = -1.0 if direction == "noise" else 1.0
+        projected[name] = compute_state + sign * sigma * compute_velocity
+    return LatentState(projected, active_masks=state.active_masks)
+
+
 def _apply_forward_process_noise(
     adapter: Any,
     clean_state: LatentState,

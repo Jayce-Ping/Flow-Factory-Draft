@@ -133,10 +133,10 @@ Config keys must exactly match Pydantic field names. Typos fail silently with de
 `accelerator.wait_for_everyone()` must be called at critical synchronization points (after preprocessing, before/after evaluation, checkpoint saving). Missing barriers cause deadlocks or race conditions.
 
 ### 19. FSDP CPU Efficient Loading
-When using FSDP with CPU offloading, frozen components (text encoder, VAE) may be uninitialized on Rank > 0. The `_synchronize_frozen_components()` method handles this. Do not remove or bypass it.
+When using FSDP with CPU offloading, frozen components (text encoder, VAE) may be uninitialized on Rank > 0. The `_synchronize_frozen_components()` method handles this. Do not remove or bypass it. Lazy components must be materialized before synchronization: both preprocessing and inference stages load and synchronize their explicit component sets before first use. Synchronize module parameters and buffers; skip non-module declarations such as tokenizers and processors.
 
 ### 20. Mixed Precision Consistency
-The adapter sets inference dtype for frozen components and training dtype for trainable parameters in `_mix_precision()`. Autocast context is configured in `BaseTrainer.__init__`. Do not manually cast tensors unless you understand the precision boundary. Details: `topics/dtype_precision.md`.
+The adapter sets inference dtype for frozen components and training dtype for trainable parameters in `_mix_precision()`. Components materialized later must receive the same policy through `on_load_components()`; laziness must not bypass an explicit `frozen_parameters_dtype`. Autocast context is configured in `BaseTrainer.__init__`. Do not manually cast tensors unless you understand the precision boundary. Details: `topics/dtype_precision.md`.
 
 ### 20a. Autocast Weight Cache Must Not Span a Forward
 `torch.autocast`'s weight cache (keyed by tensor `data_ptr`) serves **stale** casts after any in-place weight change — `optimizer.step()` or a `use_ref/ema/named_parameters` swap (`param.data.copy_`). So wrap **each** forward (and its KL) in its own `with self.autocast():`; never one autocast around the optimize loop. Active for fp32 trainable weights (`trainable_parameters_dtype: fp32`), dormant for the bf16 default, LoRA `disable_adapter()` safe. Details + DDP/DeepSpeed caveat: `topics/autocast_param_swap.md`.

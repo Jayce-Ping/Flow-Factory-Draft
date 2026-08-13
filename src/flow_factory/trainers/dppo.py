@@ -74,15 +74,11 @@ class DPPOTrainer(GRPOTrainer):
         Returns:
             Effective sigma tensor broadcastable to the component latent shape.
         """
-        dynamics_type = self.adapter.scheduler_group[component].dynamics_type
-        if dynamics_type in ("Flow-SDE", "Dance-SDE"):
-            return std_dev_t * torch.sqrt(-dt)
-        if dynamics_type == "CPS":
-            return std_dev_t
-        raise ValueError(
-            f"DPPO x-based KL received component {component!r} dynamics_type "
-            f"{dynamics_type!r}; expected one of ('Flow-SDE', 'Dance-SDE', 'CPS'). "
-            "Coupled algorithms must not use ODE dynamics (see constraints #7)."
+        return self._effective_transition_std(
+            component,
+            std_dev_t,
+            dt,
+            context="DPPO x-based KL",
         )
 
     def _trust_region_kl(

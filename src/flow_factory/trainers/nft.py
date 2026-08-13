@@ -33,13 +33,12 @@ tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 from .abc import BaseTrainer
 from .forward_process import (
     forward_velocity_state,
-    require_component_sigmas,
     state_batch_size,
 )
 from ..hparams import NFTTrainingArguments
 from ..samples import BaseSample, ComponentTimes, LatentState, NoisedState, StackedSampleBatch
 from ..rewards import RewardBuffer
-from ..utils.base import create_generator_by_prompt, to_broadcast_tensor
+from ..utils.base import create_generator_by_prompt
 from ..utils.logger_utils import setup_logger
 from ..utils.noise_schedule import TimeSampler
 from ..utils.dist import reduce_loss_info
@@ -310,19 +309,24 @@ class DiffusionNFTTrainer(BaseTrainer):
         Returns:
             Positive and negative per-sample losses, both of shape ``(B,)``.
         """
-        sigmas = require_component_sigmas(self, times)
         beta = self.nft_beta
-        positive_x0: Dict[str, torch.Tensor] = {}
-        negative_x0: Dict[str, torch.Tensor] = {}
+        positive_velocity: Dict[str, torch.Tensor] = {}
+        negative_velocity: Dict[str, torch.Tensor] = {}
         for name in self.adapter.trajectory_component_order:
             new_v = new_velocity.components[name]
             old_v = old_velocity.components[name]
-            state = noised.state.components[name]
-            sigma = to_broadcast_tensor(sigmas[name], state)
-            positive_pred = beta * new_v + (1 - beta) * old_v
-            negative_pred = (1.0 + beta) * old_v - beta * new_v
-            positive_x0[name] = state - sigma * positive_pred
-            negative_x0[name] = state - sigma * negative_pred
+            positive_velocity[name] = beta * new_v + (1 - beta) * old_v
+            negative_velocity[name] = (1.0 + beta) * old_v - beta * new_v
+        positive_x0 = self.adapter.project_velocity_to_clean_state(
+            noised.state,
+            times,
+            LatentState(positive_velocity, active_masks=noised.state.active_masks),
+        ).components
+        negative_x0 = self.adapter.project_velocity_to_clean_state(
+            noised.state,
+            times,
+            LatentState(negative_velocity, active_masks=noised.state.active_masks),
+        ).components
         positive_errors = self._normalized_squared_errors(positive_x0, clean_state, noised)
         negative_errors = self._normalized_squared_errors(negative_x0, clean_state, noised)
         return (

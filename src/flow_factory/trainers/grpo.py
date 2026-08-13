@@ -91,6 +91,34 @@ class GRPOTrainer(BaseTrainer):
         """
         return {key: value for key, value in {**self.training_args}.items() if key not in batch}
 
+    def _effective_transition_std(
+        self,
+        component: str,
+        std_dev_t: torch.Tensor,
+        dt: torch.Tensor,
+        *,
+        context: str,
+    ) -> torch.Tensor:
+        """Return the x-space Gaussian standard deviation for one component."""
+        dynamics_type = self.adapter.scheduler_group[component].dynamics_type
+        if dynamics_type in ("Flow-SDE", "Dance-SDE"):
+            scale = std_dev_t * torch.sqrt(-dt)
+        elif dynamics_type == "CPS":
+            scale = std_dev_t
+        else:
+            raise ValueError(
+                f"{context} received component {component!r} dynamics_type "
+                f"{dynamics_type!r}; expected one of ('Flow-SDE', 'Dance-SDE', 'CPS'). "
+                "Coupled algorithms must not use ODE dynamics (see constraints #7)."
+            )
+        if not bool(torch.isfinite(scale).all()) or bool((scale <= 0).any()):
+            raise ValueError(
+                f"{context} expected component {component!r} to have a finite strictly positive "
+                f"stochastic transition scale for dynamics_type={dynamics_type!r}, received "
+                f"{scale.detach().cpu().tolist()}"
+            )
+        return scale
+
     def _replay_forward(
         self,
         batch: StackedSampleBatch,
@@ -531,9 +559,12 @@ class GRPOGuardTrainer(GRPOTrainer):
         )
         guard_terms = {}
         for name in expected_names:
-            scale_factor = torch.sqrt(
-                -self._scalar_component_statistic(dt, "dt", name, batch_size)
-            ) * self._scalar_component_statistic(std_dev_t, "std_dev_t", name, batch_size)
+            scale_factor = self._effective_transition_std(
+                name,
+                self._scalar_component_statistic(std_dev_t, "std_dev_t", name, batch_size),
+                self._scalar_component_statistic(dt, "dt", name, batch_size),
+                context="GRPO-Guard ratio",
+            )
             guard_terms[name] = (
                 new_log_probs[name] - old_log_probs[name]
             ) * scale_factor + component_mse[name] / (2 * scale_factor)

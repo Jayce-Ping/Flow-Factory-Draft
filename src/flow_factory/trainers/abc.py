@@ -269,6 +269,8 @@ class BaseTrainer(ABC):
             components=self.adapter.preprocessing_modules,
             device=self.accelerator.device
         )
+        if self.adapter._is_fsdp_cpu_efficient_loading():
+            self._synchronize_frozen_components(self.adapter.preprocessing_modules)
 
         dataloader, train_dataloaders_by_source = get_train_dataloader(
             config=self.config,
@@ -328,6 +330,8 @@ class BaseTrainer(ABC):
                 components=resolved,
                 device=self.accelerator.device,
             )
+            if self.adapter._is_fsdp_cpu_efficient_loading():
+                self._synchronize_frozen_components(resolved)
 
     def _initialization(self):
         # Fix for FSDP, synchronize frozen components like text encoder & VAE.
@@ -468,19 +472,25 @@ class BaseTrainer(ABC):
                 stack.enter_context(accelerator.rollout_context(self.adapter))
             yield
 
-    def _synchronize_frozen_components(self):
+    def _synchronize_frozen_components(
+        self,
+        components: Optional[Union[str, List[str]]] = None,
+    ):
         if self.accelerator.num_processes <= 1:
             return
         
         # Synchronize all non-prepared components
-        all_names = self.adapter._resolve_component_names()
+        all_names = self.adapter._resolve_component_names(components)
         for name in all_names:
             if self.adapter._should_manage_device(name):
                 comp = self.adapter.get_component(name)
-                if comp is not None:
+                if isinstance(comp, nn.Module):
                     for param in comp.parameters():
                         param.data = param.data.to(self.accelerator.device)
                         dist.broadcast(param.data, src=0)
+                    for buffer in comp.buffers():
+                        buffer.data = buffer.data.to(self.accelerator.device)
+                        dist.broadcast(buffer.data, src=0)
 
         # Barrier to ensure everyone is done
         self.accelerator.wait_for_everyone()
