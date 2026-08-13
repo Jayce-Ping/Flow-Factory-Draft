@@ -57,6 +57,8 @@ class TinyDMD2Adapter(BaseAdapter):
 
     trajectory_component_order = ("latent",)
 
+    declared_variants: tuple[str, ...] = ("generator", "fake")
+
     def __init__(self, bundle: TinyBundle) -> None:
         self.bundle = bundle
         self.active_role = "generator"
@@ -66,8 +68,25 @@ class TinyDMD2Adapter(BaseAdapter):
 
     @contextmanager
     def use_component_variant(self, role_name: str) -> Iterator[None]:
+        # Mirror the real registry, which only knows the declared trainable
+        # variants. A permissive fake here hid a production KeyError: the frozen
+        # reference is a parameter snapshot, so it is never a declared variant.
+        if role_name not in self.declared_variants:
+            raise KeyError(
+                f"component variant {role_name!r} is not declared; declared variants "
+                f"are {self.declared_variants!r}"
+            )
         previous = self.active_role
         self.active_role = role_name
+        try:
+            yield
+        finally:
+            self.active_role = previous
+
+    @contextmanager
+    def use_ref_parameters(self) -> Iterator[None]:
+        previous = self.active_role
+        self.active_role = "reference"
         try:
             yield
         finally:
