@@ -303,7 +303,7 @@ def test_base_trainer_builds_one_ordered_adamw_with_role_hyperparameters() -> No
     bundle = TinyBundle()
 
     class Registry:
-        role_names = ("generator", "fake", "reference")
+        variant_names = ("generator", "fake", "reference")
 
         @staticmethod
         def get_spec(role_name: str) -> Any:

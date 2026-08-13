@@ -220,7 +220,7 @@ mechanisms cover parameter ownership. Named parameter snapshots (`add_named_para
 `use_named_parameters`) are temporal, one set of weights installed at a time, and cover references,
 EMAs and old snapshots. `ComponentVariantRegistry` (`models/variants.py`) is spatial: several
 trainable copies live at once, each with its own optimizer group, storage (`lora`, `full` or
-`snapshot`) and `component_routes`. Variant names are caller-chosen and the base variant is
+`frozen`) and `component_routes`. Variant names are caller-chosen and the base variant is
 positional, so the model layer never learns what a "generator" is. `RoutedComponentProxy` resolves
 a canonical component name through the active variant, so adapter code is unchanged.
 

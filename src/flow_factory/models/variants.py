@@ -28,14 +28,14 @@ from peft import PeftModel
 # variant means; an algorithm that trains a generator against a fake score names
 # its variants accordingly, and this module never reads those names.
 VariantName = str
-VariantStorageMode = Literal["lora", "full", "snapshot"]
+VariantStorageMode = Literal["lora", "full", "frozen"]
 
 # The base variant is positional, not named: whichever variant is declared first
 # owns the adapter's canonical components and every later variant is layered on
 # it. The model layer therefore never needs to recognise a particular name. This
 # default is only what a single-policy caller passes when it has nothing to say.
 DEFAULT_BASE_VARIANT: VariantName = "base"
-_STORAGE_MODES: Tuple[VariantStorageMode, ...] = ("lora", "full", "snapshot")
+_STORAGE_MODES: Tuple[VariantStorageMode, ...] = ("lora", "full", "frozen")
 
 
 @dataclass(frozen=True)
@@ -158,7 +158,7 @@ class ComponentVariantRegistry:
         self._parameter_owners: Dict[int, VariantParameter] = {}
         self._route_owners: Dict[str, Tuple[VariantName, str]] = {}
         self._bundle_members: Dict[str, torch.nn.Module] = {}
-        self._parameter_emas: Dict[str, Dict[str, Any]] = {}
+        self._snapshots: Dict[str, Dict[str, Any]] = {}
         self._active_variant: Optional[VariantName] = None
         self._active_context: Optional[ExitStack] = None
         self._is_frozen = False
@@ -179,15 +179,15 @@ class ComponentVariantRegistry:
         if spec.name in self._specs:
             raise ValueError(f"component variant is already declared: {spec.name!r}")
 
-        if spec.storage_mode == "snapshot" and spec.trainable:
+        if spec.storage_mode == "frozen" and spec.trainable:
             raise ValueError(
                 f"expected snapshot variant {spec.name!r} to be non-trainable, "
                 f"received trainable={spec.trainable!r}; a snapshot holds frozen weights"
             )
-        if spec.storage_mode != "snapshot" and not spec.trainable:
+        if spec.storage_mode != "frozen" and not spec.trainable:
             raise ValueError(
                 f"expected variant {spec.name!r} with storage_mode={spec.storage_mode!r} to be "
-                "trainable; declare storage_mode='snapshot' for a frozen copy"
+                "trainable; declare storage_mode='frozen' for a frozen copy"
             )
 
         declared_components = tuple(spec.component_routes)
@@ -227,7 +227,7 @@ class ComponentVariantRegistry:
                     )
                 shared_storage_is_valid = (
                     spec.storage_mode == "lora" and spec.adapter_name is not None
-                ) or (not spec.trainable and spec.storage_mode == "snapshot")
+                ) or (not spec.trainable and spec.storage_mode == "frozen")
                 if not shared_storage_is_valid:
                     raise ValueError(
                         f"shared route {route_name!r} for canonical component "
@@ -317,7 +317,7 @@ class ComponentVariantRegistry:
         snapshot_variants = tuple(
             variant_name
             for variant_name, spec in self._specs.items()
-            if spec.storage_mode == "snapshot"
+            if spec.storage_mode == "frozen"
         )
         if not snapshot_variants:
             raise ValueError(
@@ -401,7 +401,7 @@ class ComponentVariantRegistry:
         next_context = ExitStack()
         base_storage_mode = self._specs[self.base_variant].storage_mode
         if base_storage_mode == "lora":
-            if spec.storage_mode == "snapshot":
+            if spec.storage_mode == "frozen":
                 for component_name in self._canonical_components:
                     component = self._get_peft_component(component_name)
                     next_context.enter_context(component.disable_adapter())
@@ -413,7 +413,7 @@ class ComponentVariantRegistry:
                     )
                 for component_name in self._canonical_components:
                     self._get_peft_component(component_name).set_adapter(spec.adapter_name)
-        elif spec.storage_mode == "snapshot":
+        elif spec.storage_mode == "frozen":
             next_context.enter_context(self._adapter.use_ref_parameters())
 
         self._restore_trainable_variant_parameters()
@@ -522,7 +522,7 @@ class ComponentVariantRegistry:
         self._get_declared_spec(variant_name)
         return tuple(self._parameter_records[variant_name])
 
-    def create_parameter_ema(self, variant_name: VariantName, snapshot_name: str) -> None:
+    def add_snapshot(self, variant_name: VariantName, snapshot_name: str) -> None:
         """Create a detached named parameter snapshot for one trainable variant.
 
         Args:
@@ -539,10 +539,10 @@ class ComponentVariantRegistry:
                 "expected non-empty string snapshot_name for parameter EMA, "
                 f"received {snapshot_name!r}"
             )
-        if snapshot_name in self._parameter_emas:
+        if snapshot_name in self._snapshots:
             raise ValueError(f"parameter EMA snapshot already exists: {snapshot_name!r}")
         records = self.parameter_records(variant_name)
-        self._parameter_emas[snapshot_name] = {
+        self._snapshots[snapshot_name] = {
             "variant_name": variant_name,
             "parameters": {
                 f"{record.component_name}.{record.parameter_name}": record.parameter.detach().clone()
@@ -552,7 +552,7 @@ class ComponentVariantRegistry:
         }
 
     @contextmanager
-    def use_parameter_ema(self, snapshot_name: str) -> Iterator[None]:
+    def use_snapshot(self, snapshot_name: str) -> Iterator[None]:
         """Temporarily swap one parameter EMA into its existing component variant.
 
         Args:
@@ -561,7 +561,7 @@ class ComponentVariantRegistry:
         Yields:
             Control while the snapshot tensors are installed.
         """
-        snapshot = self._get_parameter_ema(snapshot_name)
+        snapshot = self._get_snapshot(snapshot_name)
         variant_name = cast(VariantName, snapshot["variant_name"])
         records = self.parameter_records(variant_name)
         live_parameters = [record.parameter.detach().clone() for record in records]
@@ -575,7 +575,7 @@ class ComponentVariantRegistry:
                 for record, live in zip(records, live_parameters):
                     record.parameter.data.copy_(live)
 
-    def update_parameter_ema(self, snapshot_name: str, decay: float) -> None:
+    def update_snapshot(self, snapshot_name: str, decay: float) -> None:
         """Update one parameter EMA from its live variant parameters.
 
         Args:
@@ -590,16 +590,16 @@ class ComponentVariantRegistry:
         decay_value = float(decay)
         if not 0 <= decay_value <= 1:
             raise ValueError(f"expected parameter EMA decay in [0, 1], received {decay_value!r}")
-        snapshot = self._get_parameter_ema(snapshot_name)
+        snapshot = self._get_snapshot(snapshot_name)
         variant_name = cast(VariantName, snapshot["variant_name"])
         for record in self.parameter_records(variant_name):
             key = f"{record.component_name}.{record.parameter_name}"
             snapshot["parameters"][key].lerp_(record.parameter.detach(), 1 - decay_value)
         snapshot["update_count"] += 1
 
-    def parameter_ema_tensors(self, snapshot_name: str) -> Tuple[torch.Tensor, ...]:
+    def snapshot_tensors(self, snapshot_name: str) -> Tuple[torch.Tensor, ...]:
         """Return one snapshot in the owning variant's parameter registration order."""
-        snapshot = self._get_parameter_ema(snapshot_name)
+        snapshot = self._get_snapshot(snapshot_name)
         variant_name = cast(VariantName, snapshot["variant_name"])
         return tuple(
             snapshot["parameters"][f"{record.component_name}.{record.parameter_name}"]
@@ -608,7 +608,7 @@ class ComponentVariantRegistry:
             for record in self.parameter_records(variant_name)
         )
 
-    def parameter_ema_state_dict(self) -> Dict[str, Any]:
+    def snapshot_state_dict(self) -> Dict[str, Any]:
         """Return exact checkpoint state for parameter EMA snapshots."""
         snapshots = {
             snapshot_name: {
@@ -617,22 +617,22 @@ class ComponentVariantRegistry:
                     name: tensor.detach().clone() for name, tensor in snapshot["parameters"].items()
                 },
             }
-            for snapshot_name, snapshot in self._parameter_emas.items()
+            for snapshot_name, snapshot in self._snapshots.items()
         }
         return {
             "version": 1,
             "snapshots": snapshots,
             "update_counts": {
                 snapshot_name: snapshot["update_count"]
-                for snapshot_name, snapshot in self._parameter_emas.items()
+                for snapshot_name, snapshot in self._snapshots.items()
             },
         }
 
-    def load_parameter_ema_state_dict(self, state: Mapping[str, Any]) -> None:
+    def load_snapshot_state_dict(self, state: Mapping[str, Any]) -> None:
         """Restore exact checkpoint state for declared parameter EMA snapshots.
 
         Args:
-            state: State produced by :meth:`parameter_ema_state_dict`.
+            state: State produced by :meth:`snapshot_state_dict`.
         """
         if not isinstance(state, Mapping):
             raise TypeError(
@@ -652,14 +652,14 @@ class ComponentVariantRegistry:
                 "expected parameter EMA snapshots and update_counts as mappings, received "
                 f"{type(snapshots).__name__} and {type(update_counts).__name__}"
             )
-        expected_names = tuple(self._parameter_emas)
+        expected_names = tuple(self._snapshots)
         if tuple(snapshots) != expected_names or tuple(update_counts) != expected_names:
             raise ValueError(
                 f"expected parameter EMA snapshots {expected_names!r}, received "
                 f"snapshots={tuple(snapshots)!r}, update_counts={tuple(update_counts)!r}"
             )
         for snapshot_name in expected_names:
-            target = self._parameter_emas[snapshot_name]
+            target = self._snapshots[snapshot_name]
             source = snapshots[snapshot_name]
             if (
                 not isinstance(source, Mapping)
@@ -707,14 +707,14 @@ class ComponentVariantRegistry:
                 )
             target["update_count"] = update_count
 
-    def _get_parameter_ema(self, snapshot_name: str) -> Dict[str, Any]:
+    def _get_snapshot(self, snapshot_name: str) -> Dict[str, Any]:
         """Return one parameter EMA snapshot or fail with available names."""
-        if snapshot_name not in self._parameter_emas:
+        if snapshot_name not in self._snapshots:
             raise KeyError(
                 f"parameter EMA snapshot {snapshot_name!r} is not declared; "
-                f"available snapshots are {tuple(self._parameter_emas)!r}"
+                f"available snapshots are {tuple(self._snapshots)!r}"
             )
-        return self._parameter_emas[snapshot_name]
+        return self._snapshots[snapshot_name]
 
     def resolve_route(self, variant_name: VariantName, component_name: str) -> str:
         """Resolve a canonical component to its variant-specific bundle route.

@@ -120,7 +120,7 @@ _MULTIROLE_STATE_KEYS = {
     "metadata",
     "coordinator",
     "trainer_step",
-    "parameter_emas",
+    "variant_snapshots",
 }
 
 
@@ -218,7 +218,7 @@ class BaseTrainer(ABC):
         self.step = 0
 
         self._initialization()
-        self._initialize_parameter_emas()
+        self._initialize_snapshots()
         self._register_multirole_checkpointing()
         self.adapter.post_init()
         # Apply persistent stage='both' accelerators last: after prepare, state-resume,
@@ -242,7 +242,7 @@ class BaseTrainer(ABC):
         """Whether to show tqdm progress bars."""
         return self.log_args.verbose and self.accelerator.is_local_main_process
 
-    def _initialize_parameter_emas(self) -> None:
+    def _initialize_snapshots(self) -> None:
         """Initialize optional trainer-owned parameter snapshots before state resume."""
 
     def should_continue_training(self) -> bool:
@@ -436,7 +436,9 @@ class BaseTrainer(ABC):
         """Initialize one AdamW with one ordered parameter group per trainable role."""
         registry = self.adapter.component_variant_registry
         trainable_role_names = tuple(
-            role_name for role_name in registry.role_names if registry.get_spec(role_name).trainable
+            variant_name
+            for variant_name in registry.variant_names
+            if registry.get_spec(variant_name).trainable
         )
         role_config_builder = getattr(self, "_role_optimizer_configs", None)
         if role_config_builder is None:
@@ -692,7 +694,7 @@ class BaseTrainer(ABC):
             "metadata": self._multirole_metadata(),
             "coordinator": coordinator_state,
             "trainer_step": self.step,
-            "parameter_emas": self.adapter.component_variant_registry.parameter_ema_state_dict(),
+            "variant_snapshots": self.adapter.component_variant_registry.snapshot_state_dict(),
         }
 
     def _load_multirole_state_dict(self, state: Mapping[str, Any]) -> None:
@@ -744,9 +746,7 @@ class BaseTrainer(ABC):
                 f"received {primary_role!r} step {received_primary_step!r}"
             )
         self.role_optimization.load_state_dict(coordinator_state)
-        self.adapter.component_variant_registry.load_parameter_ema_state_dict(
-            state["parameter_emas"]
-        )
+        self.adapter.component_variant_registry.load_snapshot_state_dict(state["variant_snapshots"])
         self.step = trainer_step
         self.adapter.component_variant_registry.activate(
             self.adapter.component_variant_registry.base_variant

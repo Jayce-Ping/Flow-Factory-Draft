@@ -75,9 +75,9 @@ def test_declares_roles_in_exact_order_and_resolves_routes() -> None:
     registry.register_parameter("fake", "transformer", "weight", fake_parameter)
     registry.declare(
         ComponentVariantSpec(
-            name="snapshot",
+            name="frozen",
             trainable=False,
-            storage_mode="snapshot",
+            storage_mode="frozen",
             component_routes={
                 "transformer": "reference__transformer",
                 "transformer_2": "reference__transformer_2",
@@ -85,7 +85,7 @@ def test_declares_roles_in_exact_order_and_resolves_routes() -> None:
         )
     )
 
-    assert registry.variant_names == (BASE_VARIANT, "fake", "snapshot")
+    assert registry.variant_names == (BASE_VARIANT, "fake", "frozen")
     assert registry.resolve_route(BASE_VARIANT, "transformer") == "transformer"
     assert registry.resolve_route("fake", "transformer_2") == "fake__transformer_2"
     assert registry.parameters("fake") == (fake_parameter,)
@@ -213,14 +213,14 @@ def test_reference_snapshot_can_share_the_base_route() -> None:
 
     registry.declare(
         ComponentVariantSpec(
-            name="snapshot",
+            name="frozen",
             trainable=False,
-            storage_mode="snapshot",
+            storage_mode="frozen",
             component_routes={"transformer": "transformer"},
         )
     )
 
-    assert registry.resolve_route("snapshot", "transformer") == "transformer"
+    assert registry.resolve_route("frozen", "transformer") == "transformer"
 
 
 def test_parameter_identity_belongs_to_only_one_trainable_role() -> None:
@@ -242,31 +242,31 @@ def test_parameter_identity_belongs_to_only_one_trainable_role() -> None:
         registry.register_parameter("fake", "transformer", "weight", base_parameter)
 
 
-def test_snapshot_variant_is_non_trainable_and_cannot_own_parameters() -> None:
+def test_frozen_variant_is_non_trainable_and_cannot_own_parameters() -> None:
     registry = _registry()
     _declare_base(registry)
 
     with pytest.raises(ValueError, match="snapshot.*non-trainable.*received.*True"):
         registry.declare(
             ComponentVariantSpec(
-                name="snapshot",
+                name="frozen",
                 trainable=True,
-                storage_mode="snapshot",
+                storage_mode="frozen",
                 component_routes={"transformer": "reference__transformer"},
             )
         )
 
     registry.declare(
         ComponentVariantSpec(
-            name="snapshot",
+            name="frozen",
             trainable=False,
-            storage_mode="snapshot",
+            storage_mode="frozen",
             component_routes={"transformer": "reference__transformer"},
         )
     )
-    with pytest.raises(ValueError, match="snapshot.*non-trainable.*parameter"):
+    with pytest.raises(ValueError, match="frozen.*non-trainable.*parameter"):
         registry.register_parameter(
-            "snapshot",
+            "frozen",
             "transformer",
             "weight",
             torch.nn.Parameter(torch.ones(1)),
@@ -535,7 +535,7 @@ def test_lora_materialization_uses_named_adapters_and_exact_new_parameter_identi
     registry = adapter.component_variant_registry
     component = adapter.get_component("transformer")
     assert set(component.peft_config) == {"default", "fake", "surrogate"}
-    assert registry.variant_names == (BASE_VARIANT, "fake", "surrogate", "snapshot")
+    assert registry.variant_names == (BASE_VARIANT, "fake", "surrogate", "frozen")
     assert registry.get_spec(BASE_VARIANT).adapter_name == "default"
     assert registry.get_spec("fake").adapter_name == "fake"
     assert registry.get_spec("surrogate").adapter_name == "surrogate"
@@ -570,15 +570,15 @@ def test_lora_role_contexts_activate_named_adapters_and_restore_after_exception(
         assert component.active_adapter == "fake"
         _assert_all_owned_role_parameters_trainable(registry)
         with pytest.raises(RuntimeError, match="inner failure"):
-            with adapter.use_component_variant("snapshot"):
-                assert registry.active_variant == "snapshot"
+            with adapter.use_component_variant("frozen"):
+                assert registry.active_variant == "frozen"
                 _assert_all_owned_role_parameters_trainable(registry)
                 assert all(
                     module.disable_adapters
                     for module in component.modules()
                     if hasattr(module, "disable_adapters")
                 )
-                with adapter.use_component_variant("snapshot"):
+                with adapter.use_component_variant("frozen"):
                     assert all(
                         module.disable_adapters
                         for module in component.modules()
@@ -691,8 +691,8 @@ def test_full_reference_uses_snapshot_context_and_nested_roles_restore_exactly()
     registry = adapter.component_variant_registry
 
     with registry.use("fake"):
-        with registry.use("snapshot"):
-            assert registry.active_variant == "snapshot"
+        with registry.use("frozen"):
+            assert registry.active_variant == "frozen"
             assert adapter.reference_is_active
         assert registry.active_variant == "fake"
         assert not adapter.reference_is_active

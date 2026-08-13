@@ -664,7 +664,7 @@ class BaseAdapter(ABC):
         self,
         trainable_variants: Sequence[str],
         *,
-        snapshot_variant: str = "snapshot",
+        frozen_variant: str = "frozen",
     ) -> None:
         """Create live copies of the trainable components, one per named variant.
 
@@ -675,7 +675,7 @@ class BaseAdapter(ABC):
             trainable_variants: Every trainable variant name, base variant first.
                 The base owns the canonical components and every later variant is
                 layered on it; a single-policy algorithm passes one name.
-            snapshot_variant: Name for the frozen snapshot variant every registry
+            frozen_variant: Name for the frozen variant every registry
                 needs as its reference point.
 
         Raises:
@@ -728,9 +728,9 @@ class BaseAdapter(ABC):
             )
         registry.declare(
             ComponentVariantSpec(
-                name=snapshot_variant,
+                name=frozen_variant,
                 trainable=False,
-                storage_mode="snapshot",
+                storage_mode="frozen",
                 component_routes={
                     component_name: component_name
                     for component_name in self.trainable_component_names
@@ -905,7 +905,7 @@ class BaseAdapter(ABC):
             yield
 
     @contextmanager
-    def use_variant_parameter_ema(self, snapshot_name: str) -> Iterator[None]:
+    def use_variant_snapshot(self, snapshot_name: str) -> Iterator[None]:
         """Temporarily install a variant-local parameter EMA snapshot.
 
         The caller names the snapshot; this adapter attaches no meaning to the
@@ -922,10 +922,10 @@ class BaseAdapter(ABC):
             RuntimeError: If no component variants were declared.
         """
         registry = self._require_variant_registry("parameter EMA")
-        with registry.use_parameter_ema(snapshot_name):
+        with registry.use_snapshot(snapshot_name):
             yield
 
-    def variant_parameter_ema_tensors(self, snapshot_name: str) -> Tuple[torch.Tensor, ...]:
+    def get_variant_snapshot(self, snapshot_name: str) -> Tuple[torch.Tensor, ...]:
         """Return the raw tensors of a variant-local parameter EMA snapshot.
 
         Args:
@@ -938,7 +938,7 @@ class BaseAdapter(ABC):
             RuntimeError: If no component variants were declared.
         """
         registry = self._require_variant_registry("parameter EMA")
-        return registry.parameter_ema_tensors(snapshot_name)
+        return registry.snapshot_tensors(snapshot_name)
 
     # ============================== Reference Parameters ==============================
     def _init_ref_parameters(self):

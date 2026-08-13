@@ -65,7 +65,7 @@ name, so an algorithm may call its base `generator` and the model layer stays ig
 
 | `ComponentVariantSpec` field | Meaning |
 |---|---|
-| `storage_mode` | `lora`, `full`, or `snapshot` |
+| `storage_mode` | `lora`, `full`, or `frozen` |
 | `adapter_name` | PEFT adapter under `lora`; `None` under `full` |
 | `component_routes` | canonical component name -> the module this variant uses |
 | `trainable` | whether the variant contributes optimizer parameters |
@@ -88,8 +88,8 @@ There is no rule inside the adapter about which variant ships. An algorithm that
 variant's EMA composes it from primitives, which is the whole point of the split:
 
 ```python
-tensors = adapter.variant_parameter_ema_tensors("generator_ema")
-with adapter.use_variant_parameter_ema("generator_ema"):
+tensors = adapter.get_variant_snapshot("generator_ema")
+with adapter.use_variant_snapshot("generator_ema"):
     adapter.save_checkpoint(path, variant=None, model_only=True)
 ```
 

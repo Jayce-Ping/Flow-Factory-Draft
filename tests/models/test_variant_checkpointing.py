@@ -343,7 +343,7 @@ def test_multirole_resume_requires_dedicated_metadata_before_mutation(tmp_path: 
         (lambda state: state.update(version=99), "version.*expected 1.*received 99"),
         (
             lambda state: state["roles"].reverse(),
-            "variant order.*expected.*base.*fake.*snapshot.*received.*snapshot.*fake.*base",
+            "variant order.*expected.*base.*fake.*frozen.*received.*frozen.*fake.*base",
         ),
         (
             lambda state: state["roles"][1].update(storage_mode="lora"),
@@ -516,48 +516,48 @@ def test_export_contains_only_canonical_base_weights(
 
 
 @pytest.mark.parametrize("finetune_type", ["lora", "full"])
-def test_parameter_ema_swaps_surrogate_snapshot_and_restores_live_parameters(
+def test_snapshot_swaps_surrogate_weights_and_restores_live_parameters(
     finetune_type: str,
 ) -> None:
     accelerator = Accelerator(cpu=True)
     adapter = TinyRoleAdapter(accelerator, finetune_type)
     adapter.declare_component_variants((BASE_VARIANT, "fake", "surrogate"))
     registry = adapter.component_variant_registry
-    registry.create_parameter_ema("surrogate", "old_surrogate")
+    registry.add_snapshot("surrogate", "old_surrogate")
     initial = [parameter.detach().clone() for parameter in registry.parameters("surrogate")]
     for parameter in registry.parameters("surrogate"):
         parameter.data.add_(2)
     live = [parameter.detach().clone() for parameter in registry.parameters("surrogate")]
 
-    with registry.use_parameter_ema("old_surrogate"):
+    with registry.use_snapshot("old_surrogate"):
         for parameter, expected in zip(registry.parameters("surrogate"), initial):
             torch.testing.assert_close(parameter, expected)
 
     for parameter, expected in zip(registry.parameters("surrogate"), live):
         torch.testing.assert_close(parameter, expected)
-    registry.update_parameter_ema("old_surrogate", decay=0.25)
-    with registry.use_parameter_ema("old_surrogate"):
+    registry.update_snapshot("old_surrogate", decay=0.25)
+    with registry.use_snapshot("old_surrogate"):
         for parameter, old, current in zip(registry.parameters("surrogate"), initial, live):
             torch.testing.assert_close(parameter, old * 0.25 + current * 0.75)
 
 
-def test_parameter_ema_state_round_trip_is_exact_and_not_export_metadata() -> None:
+def test_snapshot_state_round_trip_is_exact_and_not_export_metadata() -> None:
     accelerator = Accelerator(cpu=True)
     adapter = TinyRoleAdapter(accelerator, "full")
     adapter.declare_component_variants((BASE_VARIANT, "fake", "surrogate"))
     registry = adapter.component_variant_registry
-    registry.create_parameter_ema("surrogate", "old_surrogate")
+    registry.add_snapshot("surrogate", "old_surrogate")
     for parameter in registry.parameters("surrogate"):
         parameter.data.add_(3)
-    registry.update_parameter_ema("old_surrogate", decay=0.4)
-    expected = registry.parameter_ema_state_dict()
+    registry.update_snapshot("old_surrogate", decay=0.4)
+    expected = registry.snapshot_state_dict()
 
     for parameter in registry.parameters("surrogate"):
         parameter.data.add_(10)
-    registry.update_parameter_ema("old_surrogate", decay=0.1)
-    registry.load_parameter_ema_state_dict(expected)
+    registry.update_snapshot("old_surrogate", decay=0.1)
+    registry.load_snapshot_state_dict(expected)
 
-    actual = registry.parameter_ema_state_dict()
+    actual = registry.snapshot_state_dict()
     assert actual["update_counts"] == {"old_surrogate": 1}
     for name, tensor in expected["snapshots"]["old_surrogate"]["parameters"].items():
         torch.testing.assert_close(
@@ -569,23 +569,23 @@ def test_parameter_ema_state_round_trip_is_exact_and_not_export_metadata() -> No
     assert "old_surrogate" not in str(registry.metadata())
 
 
-def test_accelerate_round_trip_restores_old_surrogate_parameter_ema(tmp_path: Path) -> None:
+def test_accelerate_round_trip_restores_the_old_surrogate_snapshot(tmp_path: Path) -> None:
     trainer = _trainer_runtime("full", variant_names=(BASE_VARIANT, "fake", "surrogate"))
     registry = trainer.adapter.component_variant_registry
-    registry.create_parameter_ema("surrogate", "old_surrogate")
+    registry.add_snapshot("surrogate", "old_surrogate")
     for parameter in registry.parameters("surrogate"):
         parameter.data.add_(2)
-    registry.update_parameter_ema("old_surrogate", decay=0.3)
-    expected = registry.parameter_ema_state_dict()
+    registry.update_snapshot("old_surrogate", decay=0.3)
+    expected = registry.snapshot_state_dict()
     trainer._register_multirole_checkpointing()
     trainer.accelerator.save_state(str(tmp_path))
 
     for parameter in registry.parameters("surrogate"):
         parameter.data.add_(10)
-    registry.update_parameter_ema("old_surrogate", decay=0.1)
+    registry.update_snapshot("old_surrogate", decay=0.1)
     trainer.accelerator.load_state(str(tmp_path))
 
-    actual = registry.parameter_ema_state_dict()
+    actual = registry.snapshot_state_dict()
     assert actual["update_counts"] == expected["update_counts"]
     for name, tensor in expected["snapshots"]["old_surrogate"]["parameters"].items():
         torch.testing.assert_close(
@@ -612,8 +612,8 @@ def test_a_caller_composes_a_scoped_ema_export_from_adapter_primitives(
     adapter = TinyRoleAdapter(accelerator, finetune_type)
     adapter.declare_component_variants((BASE_VARIANT, "fake", "surrogate"))
     registry = adapter.component_variant_registry
-    registry.create_parameter_ema(BASE_VARIANT, "base_ema")
-    expected_ema = adapter.variant_parameter_ema_tensors("base_ema")
+    registry.add_snapshot(BASE_VARIANT, "base_ema")
+    expected_ema = adapter.get_variant_snapshot("base_ema")
     for parameter in registry.parameters(BASE_VARIANT):
         parameter.data.add_(5)
     live = [parameter.detach().clone() for parameter in registry.parameters(BASE_VARIANT)]
@@ -624,7 +624,7 @@ def test_a_caller_composes_a_scoped_ema_export_from_adapter_primitives(
         {"ema_parameters": [tensor.cpu() for tensor in expected_ema]},
         tmp_path / "ema.ckpt",
     )
-    with adapter.use_variant_parameter_ema("base_ema"):
+    with adapter.use_variant_snapshot("base_ema"):
         adapter.save_checkpoint(str(tmp_path), save_ema=False, model_only=True)
 
     artifact = torch.load(tmp_path / "ema.ckpt", weights_only=True)
