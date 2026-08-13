@@ -1,0 +1,94 @@
+# Component Runtime
+
+**Read when**: Changing component discovery, loading, lifecycle, scheduler groups, or distributed
+preparation.
+
+## Runtime matrix
+
+| Backend | Runtime | Loading contract |
+|---|---|---|
+| Eager diffusers pipeline | `ClassicPipelineRuntime` | `load_pipeline()` returns materialized components |
+| Lazy modular pipeline | `ModularPipelineRuntime` | specs are declared first; explicit names materialize modules |
+| Explicit non-diffusers container | `PseudoPipelineRuntime` | canonical roots and non-enumerated aliases are declared explicitly |
+
+All adapters implement `load_pipeline()`. Non-classic adapters also override
+`build_component_runtime()`. `adapter.pipeline` remains the backend compatibility alias.
+
+## Lookup and enumeration
+
+- **Canonical lookup** returns the backend-owned component or declaration.
+- **Override lookup** returns a prepared proxy or LoRA/checkpoint replacement without changing
+  canonical ownership.
+- **Declared names/specs** are available for explicit lookup and role discovery.
+- **Materialized names** include canonical `torch.nn.Module` instances only.
+- Device/dtype lifecycle enumeration excludes declared-only specs, optional `None` entries,
+  pseudo aliases, and prepared/replacement overrides.
+- `materialize_components(None)` means already-materialized modules. Lazy specs require explicit
+  names.
+
+Implementation: `src/flow_factory/models/runtime/` and
+`src/flow_factory/models/abc.py::BaseAdapter`.
+
+## Canonical identity
+
+The runtime is the only authority on which components exist. Never test membership with
+`hasattr(adapter, name)`. That only agrees with the runtime for backends whose components happen
+to be adapter properties; a lazy or modular runtime declares components that are never attributes,
+and those silently drop out of every `hasattr`-gated loop. A declared training target that never
+reaches the optimizer produces an empty parameter list rather than an error, which looks like a
+training bug rather than a configuration one. Aliasing such a component onto `self.transformer`
+does not fix it: that registers an extra override named `transformer` while the real component
+stays invisible to the gated loops.
+
+Use the three-way distinction:
+
+| Question | Call |
+|---|---|
+| Does the runtime declare this name? | `adapter.has_component(name)` |
+| Give me the module, tolerating a declared-optional absence | `adapter.get_component(name)` |
+| Give me the module, this loop cannot proceed without it | `adapter._require_component(name)` |
+
+`get_component` returns `None` for a component the backend declares but leaves unset — a Wan 2.1
+checkpoint has no `transformer_2`, an image-only pipeline has no `audio_vae`. Dereferencing that
+yields a bare `AttributeError` naming neither the component nor the loop, so lifecycle loops that
+need a real module go through `_require_component`, which names the component and the declared set.
+
+Overrides must name a declared component: one installed under an unknown name is unreachable,
+because every reader resolves through the declared set. `_load_full_model` writes through
+`set_component()` so a replacement stays visible to the runtime instead of shadowing it with a bare
+instance attribute.
+
+## Scheduler and distributed boundaries
+
+- `adapter.scheduler` is the canonical primary scheduler.
+- `SchedulerGroup.names` is immutable and equals `trajectory_component_order`.
+- `SchedulerGroup` owns ordered mode and seed dispatch; mapping iteration never defines RNG order.
+- `ModelBundle` plus `RoutedComponentProxy` is the sole distributed preparation runtime.
+- Trainer stages call public adapter lifecycle methods so model-specific overrides remain active.
+  `uses_fsdp_cpu_efficient_loading()` is public for exactly this reason: under that mode only rank
+  zero holds real weights before `prepare`, and the trainer orders broadcasts around it.
+
+## Failure modes
+
+- Expanding omitted materialization to all declarations loads tokenizers, configs, and weights
+  unexpectedly.
+- Enumerating aliases or overrides as lifecycle roots moves or wraps the same parameters twice.
+- Including optional `None` declarations in role groups fails during freeze/device operations.
+- Preparing components outside `ModelBundle` breaks FSDP/DeepSpeed root ownership.
+- Building scheduler order from mappings breaks deterministic multi-component RNG dispatch.
+
+## Review checklist
+
+- [ ] Canonical, override, declared, and materialized paths remain distinct.
+- [ ] Membership resolves through the runtime, never `hasattr` on the adapter.
+- [ ] A loop that dereferences a component uses `_require_component`.
+- [ ] Lazy loading names every required component explicitly.
+- [ ] Lifecycle enumeration contains canonical modules only.
+- [ ] `adapter.pipeline`, `adapter.scheduler`, and public lifecycle hooks remain compatible.
+- [ ] Scheduler names equal `trajectory_component_order`.
+- [ ] Distributed preparation still routes through `ModelBundle`/`RoutedComponentProxy`.
+
+## Cross-refs
+
+- UP: [`constraints.md` #5](../constraints.md#5-adapter-component-runtime-contract), [`architecture.md` Component Management](../architecture.md#component-management)
+- PEER: [Structured Trajectory](structured_trajectory.md), [Model Roles](model_roles.md), [Adapter Conventions](adapter_conventions.md)

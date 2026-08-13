@@ -162,7 +162,7 @@ Configured via the `acceleration:` block (`hparams/acceleration_args.py`): two o
 
 - **New model adapter**: `guidance/new_model.md`, skill `/ff-new-model`, conventions `topics/adapter_conventions.md`
 - **New reward model**: `guidance/rewards.md`, skill `/ff-new-reward`
-- **New algorithm**: `guidance/algorithms.md`, skill `/ff-new-algorithm`
+- **New algorithm**: `guidance/algorithms.md`, skill `/ff-new-algorithm`. `BaseTrainer` owns the epoch loop (`start`), timestep sampling, feedback/advantages, the optimizer step and the velocity KL; only `optimize()` is abstract. Vary behavior through `sampling_context`, `_run_training_step`, `_after_gradient_step` and `_after_optimizer_step` rather than by restating the loop. A multi-role algorithm additionally declares `required_trainable_roles` (`topics/model_roles.md`).
 - **New accelerator**: subclass `acceleration/abc.py::BaseAccelerator` (declare `safety`/`stage`), register in `acceleration/registry.py`
 
 ---
@@ -209,6 +209,21 @@ non-`None` modular specs but exclude absent classic optional components. The def
 while `ModelBundle` and `RoutedComponentProxy` remain the sole distributed preparation runtime.
 `SchedulerGroup` separately provides immutable component names and ordered scheduler mode/seed
 dispatch; its primary scheduler remains available through `adapter.scheduler`.
+
+Component membership resolves through the runtime, never through `hasattr(adapter, name)`:
+`has_component` asks whether a name is declared, and `_require_component` fetches a module a
+lifecycle loop cannot proceed without. Details: `topics/component_runtime.md`.
+
+### Model Roles
+`ModelRoleRegistry` (`models/roles.py`) generalizes parameter ownership from one trainable copy to
+several. A single-policy algorithm uses one implicit `generator` role and is unaffected; a
+distillation algorithm declares `generator`, `fake` and `surrogate`, each with its own optimizer
+group, its own storage (`storage_mode` of `lora`, `full` or `snapshot`) and its own
+`component_routes`. `RoutedComponentProxy` resolves a canonical component name through the active
+role, so adapter code is unchanged. `RoleOptimizationCoordinator`
+(`trainers/role_optimization.py`) drives disjoint role updates through one physical optimizer, and
+`BaseTrainer._validate_multirole_backend` rejects the distributed layouts multi-role cannot
+support. Details: `topics/model_roles.md`.
 
 #### Component runtime enumeration boundaries
 - **Date**: 2026-08-10
