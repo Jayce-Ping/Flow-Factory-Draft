@@ -39,21 +39,59 @@ All adapters that support CFG must follow a consistent two-stage pattern. Guidan
 
 Some distillation objectives want the conditional and unconditional velocities on
 their own rather than only the combined one. There is no such consumer today, so no
-API exists; add one when the objective lands, and build it this way:
+API exists. An earlier attempt shipped one anyway, with overrides in SD3.5 and
+Z-Image and no caller, and it is not being ported. Build it this way when the
+objective lands.
 
-- **Derive the guided branch arithmetically.** `guided == uncond + scale * (cond - uncond)`
-  by definition, so it costs no forward. An earlier attempt queried all three through
-  `forward()`, and because the third call ran its own batched CFG internally it spent
-  four transformer evaluations to produce two evaluations' worth of information.
-- **Keep the default implementation shared.** Two `forward(..., guidance_scale=1.0)`
-  calls, one per conditioning set, need nothing model-specific except which kwarg
-  holds the negative counterpart of which. Declare that as a small ClassVar mapping
-  (`prompt_embeds -> negative_prompt_embeds`, and so on) and no adapter needs a
-  method: the earlier attempt cost SD3.5 and Z-Image a few hundred lines each.
-- **Make the batched variant an opt-in override.** Concatenating conditioning along
-  the batch axis halves the pass count and doubles activations, but which kwargs may
-  be concatenated and which must be repeated is genuinely model knowledge, so it
-  belongs in an adapter hook rather than in a generic batcher.
+**Derive the guided branch arithmetically.** `guided == uncond + scale * (cond - uncond)`
+by definition, so it costs no forward. The earlier attempt queried all three through
+`forward()`, and because the third call ran its own batched CFG internally it spent
+four transformer evaluations to produce two evaluations' worth of information.
+
+**Declare branches as substitutions, not as a conditioning list.** A flat
+"positive kwarg to negative kwarg" map only covers prompts. Real conditioning also
+carries masks, and editing models carry image latents that may or may not differ
+between branches. Declaring each branch as the set of kwargs that *change* relative
+to the conditional one handles all three cases: named kwargs are substituted,
+unnamed ones pass through unchanged, and a model with more than two branches simply
+declares more entries.
+
+```python
+class SD3_5Adapter(BaseAdapter):
+    guidance_branches = {
+        "unconditional": {
+            "prompt_embeds": "negative_prompt_embeds",
+            "pooled_prompt_embeds": "negative_pooled_prompt_embeds",
+        },
+    }
+
+class QwenImageEditPlusAdapter(BaseAdapter):
+    guidance_branches = {
+        "unconditional": {
+            "prompt_embeds": "negative_prompt_embeds",
+            "prompt_embeds_mask": "negative_prompt_embeds_mask",
+            # Name image latents only when the branches genuinely differ; an editing
+            # model that conditions both branches on the same reference omits them
+            # and they pass through.
+            "image_latents": "negative_image_latents",
+        },
+    }
+```
+
+**Keep resolution and the separate strategy shared; keep combination per adapter.**
+Substituting kwargs and issuing one `forward(..., guidance_scale=1.0)` per branch
+needs nothing model-specific beyond the declaration above, so SD3.5 and Z-Image need
+no method at all; the earlier attempt cost them a few hundred lines each. Combining
+the branches is model-specific and stays a hook: the default is the CFG formula,
+LTX2 combines in x0-space, Z-Image applies truncation and normalization afterwards,
+and Qwen-Image rescales the norm.
+
+**Make the batched variant an opt-in override.** Concatenating along the batch axis
+turns N passes into one at N times the activations. Which kwargs may be concatenated
+and which must be repeated is genuinely model knowledge - a scalar, a list of image
+shapes and a latent tensor each behave differently - so it belongs in an adapter
+hook rather than in a generic batcher. Select between the two with a parameter,
+defaulting to separate.
 
 ## `forward()` as the Consistency Boundary
 
