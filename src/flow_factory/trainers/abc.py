@@ -557,26 +557,38 @@ class BaseTrainer(ABC):
                     f"{required_roles!r}, received {tuple(plan_roles)!r}"
                 )
 
-        role_configs = []
-        for role_name in required_roles:
-            field_name = f"{role_name}_optimizer"
-            if not hasattr(self.training_args, field_name):
-                raise ValueError(
-                    f"expected nested optimizer arguments train.{field_name} for "
-                    f"required role {role_name!r}, received no such field"
-                )
-            optimizer_args = getattr(self.training_args, field_name)
-            role_configs.append(
-                RoleOptimizerConfig(
-                    role_name=role_name,
-                    learning_rate=optimizer_args.learning_rate,
-                    adam_betas=optimizer_args.adam_betas,
-                    adam_weight_decay=optimizer_args.adam_weight_decay,
-                    adam_epsilon=optimizer_args.adam_epsilon,
-                    max_grad_norm=optimizer_args.max_grad_norm,
-                )
+        return tuple(
+            BaseTrainer._role_optimizer_config_from_args(
+                role_name, self._optimizer_args_for_role(role_name)
             )
-        return tuple(role_configs)
+            for role_name in required_roles
+        )
+
+    @staticmethod
+    def _role_optimizer_config_from_args(
+        role_name: str, optimizer_args: OptimizerArguments
+    ) -> RoleOptimizerConfig:
+        """Project one optimizer configuration onto the coordinator's view of a role.
+
+        The coordinator only needs the clip norm and the update cadence; the moment
+        parameters are carried along so a role's configuration stays inspectable in
+        one place. A Muon role reports its AdamW-half moments, which is what its
+        non-matrix parameters actually use.
+        """
+        betas = getattr(optimizer_args, "betas", None)
+        eps = getattr(optimizer_args, "eps", None)
+        if betas is None:
+            betas = getattr(optimizer_args, "fallback_betas")
+            eps = getattr(optimizer_args, "fallback_eps")
+        return RoleOptimizerConfig(
+            role_name=role_name,
+            learning_rate=optimizer_args.learning_rate,
+            adam_betas=betas,
+            adam_weight_decay=optimizer_args.weight_decay,
+            adam_epsilon=eps,
+            max_grad_norm=optimizer_args.max_grad_norm,
+            update_frequency=optimizer_args.update_frequency,
+        )
 
     def _legacy_role_optimizer_config(self, role_name: str) -> RoleOptimizerConfig:
         """Build one role config from the existing flat training arguments."""
