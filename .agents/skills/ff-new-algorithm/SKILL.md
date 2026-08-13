@@ -174,7 +174,7 @@ model:
 train:
   trainer_type: "my_algo"
   my_specific_param: 0.1
-  learning_rate: 1e-6
+  learning_rate: 1e-6          # Flat fields configure a single-optimizer run
   group_size: 4
 
   num_inference_steps: 28
@@ -193,6 +193,17 @@ data:
 
 rewards:
   - name: "pickscore"
+
+# An algorithm that trains several variants at once declares one optimizer per
+# variant instead of the flat fields above, and is the only way to select Muon:
+#
+# optimizers:
+#   - name: generator
+#     optimizer: muon
+#     learning_rate: 2e-5
+#   - name: fake
+#     learning_rate: 1e-5
+#     update_frequency: 5
     reward_model: "pickscore"
     weight: 1.0
     batch_size: 16

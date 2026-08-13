@@ -400,6 +400,54 @@ def optimize(self, samples):
 | **CRD** | Samples fresh timesteps; reward distillation against CFG-guided teacher with adaptive KL; old/sampling model snapshots and centered advantages |
 | **DPO** | Preference loss on chosen/rejected pairs; pairs formed at the start of `optimize` after advantages |
 
+### Optimizer Configuration
+
+One optimizer root is built for the whole run, with one parameter group per trainable
+variant. A single-policy algorithm has exactly one, and configures it with the flat
+fields under `train:`:
+
+```yaml
+train:
+  learning_rate: 1.0e-5
+  adam_betas: [0.9, 0.999]
+  adam_weight_decay: 1.0e-4
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+```
+
+Those are translated once, in `Arguments.__post_init__`, into a single default AdamW
+entry; everything downstream reads only the resolved list. The explicit form is a
+top-level `optimizers:` section, one entry per variant, resolved by name:
+
+```yaml
+optimizers:
+  - name: generator
+    optimizer: muon
+    learning_rate: 2.0e-5
+  - name: fake
+    optimizer: adamw
+    learning_rate: 1.0e-5
+    update_frequency: 5
+```
+
+Declaring it is required to give several trainable variants their own optimizer, and
+is the only way to select an optimizer other than AdamW. `optimizer` selects both the
+implementation and the argument schema (`hparams/optimizer_args/`), so AdamW and Muon
+hyperparameters never share a class:
+
+| Optimizer | Own fields |
+|---|---|
+| `adamw` | `betas`, `eps` |
+| `muon` | `momentum`, `nesterov`, `ns_coefficients`, `ns_steps`, `adjust_lr_fn`, `fallback_betas`, `fallback_eps` |
+
+`torch.optim.Muon` orthogonalizes matrices and rejects any parameter that is not 2D,
+so a Muon variant is driven by two algorithms at once: Muon for its matrices and
+AdamW for its biases, normalization scales and embeddings, which the `fallback_`
+fields configure. `optimizer/loader.py` wraps that pair in a `CompositeOptimizer` so
+the framework still prepares exactly one root. An all-AdamW run gets a plain
+`torch.optim.AdamW`, unchanged. Muon combined with DeepSpeed is refused at startup as
+unverified; use DDP or FSDP.
+
 ### Key Points
 
 - **Inner epochs**: Samples can be reused for multiple optimization passes (`num_inner_epochs`), amortizing the cost of sampling.
