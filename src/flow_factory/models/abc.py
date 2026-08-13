@@ -2137,8 +2137,12 @@ class BaseAdapter(ABC):
 
     def _resolve_component_names(self, components: Optional[Union[str, List[str]]] = None) -> List[str]:
         """
-        Resolve component specifiers into concrete pipeline attribute names. `None` means all components.
-        
+        Resolve component specifiers into concrete pipeline attribute names.
+
+        `None` means every canonical name the runtime declares, which for a lazy
+        modular backend is not the same as every materialized module: lifecycle
+        callers must still skip declared-only specs rather than force them to load.
+
         Handles group names ('text_encoders', 'transformers') by expanding them,
         and passes through concrete names ('text_encoder', 'vae', 'transformer_2') as-is.
         """
@@ -2154,7 +2158,8 @@ class BaseAdapter(ABC):
         
         Args:
             components: Component name(s) or group names ('text_encoders', 'transformers').
-                        None loads all components.
+                        None means the already-materialized modules, not every
+                        declaration; a lazy spec must be named explicitly to load.
             device: Target device. Defaults to accelerator device.
         """
         names = self._resolve_component_names(components)

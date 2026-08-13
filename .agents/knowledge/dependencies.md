@@ -42,7 +42,7 @@ The authoritative list is `pyproject.toml` `[project.dependencies]` (20+ package
 | `torchvision` | >= 0.19.0 | Vision utilities |
 | `torchaudio` | >= 2.4.0 | Audio I/O (audio / audio-video models, CLAP) |
 | `transformers` | >= 4.57.1 | Text encoders, tokenizers |
-| `diffusers` | >= 0.36.0 | Diffusion pipelines, schedulers |
+| `diffusers` | exact git pin (`pyproject.toml`) | Diffusion pipelines, schedulers |
 | `accelerate` | >= 1.11.0 | Distributed training, mixed precision |
 | `peft` | >= 0.17.0 | LoRA, parameter-efficient fine-tuning |
 | `datasets` | >= 3.3.2 | Dataset loading |
@@ -57,6 +57,7 @@ The authoritative list is `pyproject.toml` `[project.dependencies]` (20+ package
 - DeepSpeed is optional — Accelerate alone handles most distributed scenarios.
 
 ### diffusers
+- Pinned to an exact commit, not a version range: MiniMax H3 relies on modular-pipeline APIs that are not in any released version. `tests/dependencies/test_diffusers_pin.py` asserts the installed revision matches the pin, so bumping it means bumping the pin, the H3 dependency constant, and rerunning the pinned-API probes together.
 - Model adapters depend on specific pipeline classes from diffusers. Major version bumps may rename or remove pipeline classes.
 - `load_pipeline()` in each adapter returns a `DiffusionPipeline`-compatible object; breaking changes in diffusers' pipeline API require adapter updates.
 

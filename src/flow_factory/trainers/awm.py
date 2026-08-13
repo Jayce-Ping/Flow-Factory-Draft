@@ -274,10 +274,18 @@ class AWMTrainer(BaseTrainer):
     ) -> torch.Tensor:
         """
         Compute weighted log probability (matching loss) for one tensor.
-        
+
+        The caller owns the velocity convention: this only matches the two tensors
+        it is given, so ``target`` must already follow the adapter's declared
+        ``flow_velocity_direction``. The production path is ``_matching_log_prob``,
+        which takes its target from the bridge-supplied ``NoisedState`` and is
+        therefore direction-correct for both noise-ward and data-ward models.
+
         Args:
             model_output: Model's velocity prediction, shape varies by model.
-            target: Target velocity = noise - clean_latents, same shape as model_output.
+            target: Target velocity in the adapter's declared direction
+                (``noise - clean`` when noise-ward, ``clean - noise`` when
+                data-ward), same shape as model_output.
             timestep: Scheduler-scale timesteps (B,) in ``[0, 1000]``; weighting uses ``σ = t/1000``.
             weighting: Weighting scheme for the loss.
             ghuber_power: Power parameter for generalized huber loss.

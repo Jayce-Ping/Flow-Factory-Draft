@@ -129,6 +129,9 @@ All four registries map string keys → lazy import paths. Resolution: registry 
 | `ltx2_t2av` | `LTX2_T2AV_Adapter` | Text-to-Audio-Video |
 | `ltx2_i2av` | `LTX2_I2AV_Adapter` | Image-to-Audio-Video |
 | `bagel` | `BagelAdapter` | Text-to-Image & Image(s)-to-Image (T2I & I2I both batched via NaViT packing; subset-round packing handles variable I2I reference-image count, no per-sample fallback — see `topics/adapter_conventions.md`) |
+| `minimax-h3-t2va` | `MiniMaxH3T2VAAdapter` | Text-to-Video-Audio |
+| `minimax-h3-fl2va` | `MiniMaxH3FL2VAAdapter` | First/Last-Frame-to-Video-Audio |
+| `minimax-h3-ref2va` | `MiniMaxH3Ref2VAAdapter` | Ordered-References-to-Video-Audio (trainable component is `transformer_ref`, not `transformer`) |
 
 **Reward Models** (`rewards/registry.py`):
 | Key | Class | Type |

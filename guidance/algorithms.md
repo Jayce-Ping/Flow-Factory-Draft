@@ -340,7 +340,9 @@ DGPO's group-level sigmoid reweighting is only meaningful if every optimizer ste
 
 **How it works**: `GroupDistributedSampler` yields the same prompt-index sequence on every rank; each prompt appears `K / W` times per rank (`W` = `num_replicas`). Since all ranks see the same prompts, local `torch.unique` produces a cross-rank-consistent dense group-id space — no `gather_samples` or cross-rank id coordination is needed. The single `accelerator.reduce` inside `_compute_group_dgpo_loss` sums partial per-rank contributions to recover the full-group sigmoid weight.
 
-**Geometric constraint**: `(num_replicas × per_device_batch_size) % group_size == 0` must hold so that every global micro-batch packs an integer number of complete groups. `Arguments._align_for_group_distributed` auto-adjusts `group_size` (and then `unique_sample_num_per_epoch`) at init time to satisfy this, so no manual tuning is needed.
+**Geometric constraint**: two conditions must hold together — `(num_replicas × per_device_batch_size) % group_size == 0`, so every global micro-batch packs an integer number of complete groups, and `group_size % num_replicas == 0`, so each rank receives a whole number of copies (`K / W`). `Arguments._align_for_group_distributed` auto-adjusts `group_size` (and then `unique_sample_num_per_epoch`) at init time to satisfy both, so no manual tuning is needed.
+
+Note the special case: with `per_device_batch_size = 1` the two conditions force `group_size == num_replicas` exactly, because `W | K` and `K | W` together leave no other positive solution. Models pinned to B=1 (MiniMax H3) therefore run DGPO with one group copy per rank, and `group_size` is not independently tunable there.
 
 For a complete runnable setup, see `examples/dgpo/lora/sd3_5/default.yaml`.
 
