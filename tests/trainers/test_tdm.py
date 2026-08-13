@@ -33,12 +33,12 @@ from flow_factory.samples import (
 )
 from flow_factory.scheduler import SDESchedulerOutput
 from flow_factory.trainers.abc import BaseTrainer
+from flow_factory.trainers.distillation.tdm import TDMBoundaryUnit, TDMTrainer
 from flow_factory.trainers.role_optimization import (
     OptimizationRole,
     RoleOptimizationCoordinator,
     RoleOptimizerConfig,
 )
-from flow_factory.trainers.distillation.tdm import TDMBoundaryUnit, TDMTrainer
 
 
 class TinyTDMAdapter(BaseAdapter):
