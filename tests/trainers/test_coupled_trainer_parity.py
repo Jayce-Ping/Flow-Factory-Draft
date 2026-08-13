@@ -106,7 +106,7 @@ class MaskedAdapterFake(AdapterFake):
         """Count only the active latent prefix."""
         return {"latent": self.active_numel}
 
-    def reduce_component_latent_values(
+    def _reduce_component_latent_values(
         self, values: Dict[str, torch.Tensor], *, state: Optional[LatentState] = None
     ) -> Dict[str, torch.Tensor]:
         """Average each component over its active prefix only."""

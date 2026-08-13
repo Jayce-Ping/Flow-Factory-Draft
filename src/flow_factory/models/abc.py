@@ -201,16 +201,21 @@ class BaseAdapter(ABC):
     # and delegate the component-specific part to the protected hook of the same
     # name. Overriding one would silently bypass that contract, so subclasses are
     # rejected at class creation instead of at training time.
-    _BOUNDARY_OWNING_METHODS: ClassVar[Tuple[str, ...]] = ("forward_state",)
+    _BOUNDARY_OWNING_METHODS: ClassVar[Tuple[str, ...]] = (
+        "forward_state",
+        "reduce_component_latent_values",
+        "reduce_latent_values",
+    )
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
         for name in BaseAdapter._BOUNDARY_OWNING_METHODS:
             if name in cls.__dict__:
                 raise TypeError(
-                    f"adapter {cls.__name__} must not override BaseAdapter.{name}: it owns the "
-                    f"shared forward-argument boundary (state-owned, trajectory-storage and "
-                    f"trainer-metadata keys). Override the protected hook _{name} instead."
+                    f"adapter {cls.__name__} must not override BaseAdapter.{name}: it owns a "
+                    f"shared contract that an override would bypass ({name} validates its "
+                    f"arguments and its result on behalf of every caller). Override the "
+                    f"protected hook _{name} instead."
                 )
 
     def __init__(self, config: Arguments, accelerator : Accelerator):
@@ -386,6 +391,36 @@ class BaseAdapter(ABC):
         through the prepared root; use ``_unwrap`` to recover the real module.
         """
         return cast(torch.nn.Module, self.component_runtime.get_component(name))
+
+    def has_component(self, name: str) -> bool:
+        """Return whether the runtime declares a component under this canonical name.
+
+        Component membership is owned by ``component_runtime``, not by Python
+        attribute existence. ``hasattr(self, name)`` only agrees for backends whose
+        components happen to be adapter properties; a modular or lazy runtime
+        declares components that are never attributes, and probing with ``hasattr``
+        silently drops them from lifecycle loops.
+        """
+        return name in self.component_runtime.declared_component_names
+
+    def _require_component(self, name: str) -> torch.nn.Module:
+        """Return a declared component, rejecting one the runtime cannot provide.
+
+        ``get_component`` returns ``None`` for a declared-optional component that the
+        backend left unset (a Wan 2.1 checkpoint has no ``transformer_2``, an
+        image-only pipeline has no ``audio_vae``). Dereferencing that yields a bare
+        ``AttributeError`` naming neither the component nor the loop, so callers that
+        need a real module ask for it here instead.
+        """
+        component = self.get_component(name)
+        if component is None:
+            raise ValueError(
+                f"expected component {name!r} of {type(self).__name__} to be available, "
+                f"received None from {type(self.component_runtime).__name__}; it is "
+                f"declared but unset on this checkpoint. Declared components: "
+                f"{self.component_runtime.declared_component_names}"
+            )
+        return component
 
     def get_component_unwrapped(self, name: str) -> torch.nn.Module:
         """Get the original unwrapped component."""
@@ -744,8 +779,12 @@ class BaseAdapter(ABC):
             with ExitStack() as stack:
                 enabled_any = False
                 for comp_name in self.target_module_map.keys():
-                    if hasattr(self, comp_name):
-                        component = self.get_component(comp_name)
+                    component = (
+                        self.get_component(comp_name)
+                        if self.has_component(comp_name)
+                        else None
+                    )
+                    if component is not None:
                         unwrapped = self._unwrap(component)
 
                         # Handle Compiled Models (torch.compile)
@@ -786,8 +825,8 @@ class BaseAdapter(ABC):
         """Get trainable parameters from specified components."""
         params = []
         for comp_name in target_modules:
-            if hasattr(self, comp_name):
-                component = self.get_component(comp_name)
+            if self.has_component(comp_name):
+                component = self._require_component(comp_name)
                 params.extend(p for p in component.parameters() if p.requires_grad)
             else:
                 logger.warning(f"Component '{comp_name}' not found in the model. Skipping.")
@@ -953,7 +992,7 @@ class BaseAdapter(ABC):
     def enable_gradient_checkpointing(self):
         """Enable gradient checkpointing for target components."""
         for comp_name in self.model_args.target_components:
-            if hasattr(self, comp_name):
+            if self.has_component(comp_name):
                 component = self.get_component(comp_name)
                 if hasattr(component, 'enable_gradient_checkpointing'):
                     component.enable_gradient_checkpointing()
@@ -1609,7 +1648,7 @@ class BaseAdapter(ABC):
         
         with save_context():
             for comp_name, target_modules in self.target_module_map.items():
-                if not hasattr(self, comp_name):
+                if not self.has_component(comp_name):
                     logger.warning(f"Component {comp_name} not found, skipping save")
                     continue
                 
@@ -1621,7 +1660,7 @@ class BaseAdapter(ABC):
                 # path operates on the real diffusers/PeftModel (the prepared root
                 # is the ModelBundle; FSDP/DeepSpeed gathering happens inside
                 # get_state_dict on this member's params).
-                component = self._unwrap(self.get_component(comp_name))
+                component = self._unwrap(self._require_component(comp_name))
                 
                 # Determine save path
                 comp_path = (
@@ -1750,11 +1789,11 @@ class BaseAdapter(ABC):
         # `target_components` here would instead look for a `.../transformer_2/`
         # subdir that was never written and log a spurious error on every resume.
         for comp_name in self.trainable_component_names:
-            if not hasattr(self, comp_name):
+            if not self.has_component(comp_name):
                 logger.warning(f"Component {comp_name} not found, skipping")
                 continue
             
-            component = self.get_component(comp_name)
+            component = self._require_component(comp_name)
             comp_path = (
                 os.path.join(path, comp_name) 
                 if len(self.model_args.target_components) > 1 
@@ -1852,11 +1891,11 @@ class BaseAdapter(ABC):
         # written, so frozen bundled members (`target_module_map[name] is None`)
         # must be skipped here rather than iterating all `target_components`.
         for comp_name in self.trainable_component_names:
-            if not hasattr(self, comp_name):
+            if not self.has_component(comp_name):
                 logger.warning(f"Component {comp_name} not found, skipping")
                 continue
             
-            component = self.get_component(comp_name)
+            component = self._require_component(comp_name)
             comp_path = (
                 os.path.join(path, comp_name) 
                 if len(self.model_args.target_components) > 1 
@@ -1866,16 +1905,22 @@ class BaseAdapter(ABC):
             unwrapped = self._unwrap(component)
             component_class = unwrapped.__class__
         
-            # Try from_pretrained first
+            # `from_pretrained` is the fast path; a checkpoint written by the manual
+            # saver has no model index, so only that lookup is guarded. Installing the
+            # result must stay outside the guard, or a rejected component name would be
+            # downgraded to a debug line and the loaded weights silently discarded.
+            new_component = None
             try:
                 new_component = component_class.from_pretrained(comp_path)
-                setattr(self, comp_name, new_component)
+            except (OSError, ValueError) as e:
+                if self.accelerator.is_main_process:
+                    logger.debug(f"from_pretrained failed for {comp_name}: {e}, trying manual load...")
+
+            if new_component is not None:
+                self.set_component(comp_name, new_component)
                 if self.accelerator.is_main_process:
                     logger.info(f"Loaded {comp_name} via from_pretrained from {comp_path}")
                 continue
-            except Exception as e:
-                if self.accelerator.is_main_process:
-                    logger.debug(f"from_pretrained failed for {comp_name}: {e}, trying manual load...")
 
             # Detect the checkpoint type
             index_file = os.path.join(comp_path, SAFE_DIFFUSION_WEIGHTS_INDEX_NAME)
@@ -2010,10 +2055,11 @@ class BaseAdapter(ABC):
     def _freeze_transformers(self):
         """Freeze transformer components (e.g., UNet, ControlNets)."""
         for name in self.transformer_names:
-            if hasattr(self, name):
-                comp = self.get_component(name)
-                comp.requires_grad_(False)
-                comp.eval()
+            comp = self.get_component(name)
+            if comp is None:
+                continue
+            comp.requires_grad_(False)
+            comp.eval()
 
     def _freeze_components(self):
         """Freeze strategy using cached target_module_map."""
@@ -2024,7 +2070,7 @@ class BaseAdapter(ABC):
 
         # Selectively unfreeze target components
         for comp_name in self.model_args.target_components:
-            if not hasattr(self, comp_name):
+            if not self.has_component(comp_name):
                 logger.warning(f"Component {comp_name} not found, skipping freeze")
                 continue
             
@@ -2037,12 +2083,12 @@ class BaseAdapter(ABC):
             
             # Restore train mode for components that have trainable parameters
             if trainable_modules:
-                component = self.get_component(comp_name)
+                component = self._require_component(comp_name)
                 component.train()
 
     def _freeze_component(self, component_name: str, trainable_modules: Optional[Union[str, List[str]]] = None):
         """Freeze a specific component with optional selective unfreezing."""
-        component = self.get_component(component_name)
+        component = self._require_component(component_name)
         
         if trainable_modules == 'all':
             logger.info(f"Unfreezing ALL {component_name} parameters")
@@ -2080,18 +2126,20 @@ class BaseAdapter(ABC):
         """Get trainable parameters from all target components."""
         params = []
         for comp_name in self.model_args.target_components:
-            if hasattr(self, comp_name):
-                component = self.get_component(comp_name)
+            if self.has_component(comp_name):
+                component = self._require_component(comp_name)
                 params.extend(filter(lambda p: p.requires_grad, component.parameters()))
         return params
 
     def log_trainable_parameters(self):
         """Log trainable parameter statistics for all target components."""
         for comp_name in self.model_args.target_components:
-            if not hasattr(self, comp_name):
+            if not self.has_component(comp_name):
                 continue
             
             component = self.get_component(comp_name)
+            if component is None:
+                continue
             total_params = 0
             trainable_params = 0
             total_size_bytes = 0

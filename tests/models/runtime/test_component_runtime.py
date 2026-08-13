@@ -584,6 +584,35 @@ class ModularAdapterFake(ExistingStyleAdapterFake):
         return ModularPipelineRuntime(self.load_pipeline())
 
 
+class SecondaryTransformerPipelineFake(ModularPipelineFake):
+    """Lazy pipeline declaring a transformer the adapter never exposes as an attribute."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pretrained_specs["transformer_ref"] = "reference transformer spec"
+        self.config_specs["scheduler"] = "scheduler spec"
+
+    def load_components(self, names: List[str]) -> None:
+        """Materialize the scheduler and every requested transformer."""
+        self.load_calls.append(list(names))
+        for name in names:
+            if name in self.unavailable:
+                continue
+            setattr(self, name, SchedulerFake() if name == "scheduler" else TrackingModule())
+
+
+class SecondaryTransformerAdapterFake(ExistingStyleAdapterFake):
+    """Lazy adapter whose second transformer exists only in the runtime declaration."""
+
+    def load_pipeline(self) -> SecondaryTransformerPipelineFake:
+        """Return a lazy pipeline declaring a reference transformer."""
+        return SecondaryTransformerPipelineFake()
+
+    def build_component_runtime(self) -> ModularPipelineRuntime:
+        """Build the lazy runtime used by this adapter."""
+        return ModularPipelineRuntime(self.load_pipeline())
+
+
 class DtypeModularAdapterFake(ModularAdapterFake):
     """Lazy adapter used to verify post-init component dtype policy."""
 
@@ -876,3 +905,68 @@ def test_frozen_component_sync_skips_non_modules_and_broadcasts_buffers(
         value.shape == module.running_value.shape and torch.equal(value, module.running_value)
         for value in broadcast_tensors
     )
+
+
+def test_declared_component_owns_parameters_without_being_an_adapter_attribute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lazy target component must reach the optimizer even with no matching attribute."""
+    monkeypatch.setattr(
+        "flow_factory.models.abc._load_scheduler",
+        lambda pipeline_scheduler, scheduler_args: pipeline_scheduler,
+    )
+    config = _adapter_config()
+    config.model_args.target_components = ["transformer_ref"]
+
+    adapter = SecondaryTransformerAdapterFake(config, AcceleratorFake())
+
+    assert not hasattr(adapter, "transformer_ref")
+    assert adapter.has_component("transformer_ref")
+    assert len(adapter.get_trainable_parameters()) == 1
+
+
+def test_require_component_names_the_declared_component_the_runtime_cannot_provide(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A declared-but-unset optional component fails with its name, not an AttributeError."""
+    monkeypatch.setattr(
+        "flow_factory.models.abc._load_scheduler",
+        lambda pipeline_scheduler, scheduler_args: pipeline_scheduler,
+    )
+    adapter = OptionalTransformerAdapterFake(_adapter_config(), AcceleratorFake())
+
+    assert adapter.has_component("transformer_2")
+    assert adapter.get_component("transformer_2") is None
+    with pytest.raises(ValueError, match="transformer_2"):
+        adapter._require_component("transformer_2")
+
+
+def test_component_override_rejects_an_undeclared_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An override under an undeclared name is unreachable, so it is refused."""
+    monkeypatch.setattr(
+        "flow_factory.models.abc._load_scheduler",
+        lambda pipeline_scheduler, scheduler_args: pipeline_scheduler,
+    )
+    adapter = ExistingStyleAdapterFake(_adapter_config(), AcceleratorFake())
+
+    with pytest.raises(ValueError, match="transformer_ref"):
+        adapter.set_component("transformer_ref", TrackingModule())
+
+
+def test_reduction_wrappers_reject_subclass_overrides() -> None:
+    """The validated reduction wrappers own their contract; only the hooks are overridable."""
+    with pytest.raises(TypeError, match="reduce_latent_values"):
+
+        class OverridingReductionAdapterFake(ExistingStyleAdapterFake):
+            def reduce_latent_values(self, values: Any, **kwargs: Any) -> Any:
+                """Bypass the validated wrapper."""
+                return values
+
+    with pytest.raises(TypeError, match="reduce_component_latent_values"):
+
+        class OverridingComponentReductionAdapterFake(ExistingStyleAdapterFake):
+            def reduce_component_latent_values(self, values: Any, **kwargs: Any) -> Any:
+                """Bypass the validated per-component wrapper."""
+                return values

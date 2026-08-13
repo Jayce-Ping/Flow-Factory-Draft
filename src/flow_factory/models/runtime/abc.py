@@ -100,7 +100,7 @@ class ComponentRuntime(ABC):
             module: Replacement module or routed proxy.
 
         Raises:
-            ValueError: If the name is empty or the replacement is ``None``.
+            ValueError: If the name is empty, undeclared, or the replacement is ``None``.
         """
         if not name:
             raise ValueError("Component override name must be non-empty.")
@@ -108,6 +108,9 @@ class ComponentRuntime(ABC):
             raise ValueError(
                 f"Component override '{name}' must be a module or routed proxy, got None."
             )
+        # An override under an undeclared name is unreachable: every reader resolves
+        # through the declared set, so the module would be installed and never used.
+        self._validate_declared_names([name])
         self.override_components[name] = module
 
     def has_component_override(self, name: str) -> bool:

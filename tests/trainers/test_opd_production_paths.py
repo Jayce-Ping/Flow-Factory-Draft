@@ -194,6 +194,10 @@ class SnapshotAdapterFake(TrainableAdapterFake):
         """Expose the live component parameter."""
         return self.snapshot_module.weight
 
+    def has_component(self, name: str) -> bool:
+        """Declare the single snapshot-backed component without a real runtime."""
+        return name == "snapshot_module"
+
     def get_component(self, name: str) -> torch.nn.Module:
         """Resolve the single snapshot-backed component."""
         if name != "snapshot_module":
