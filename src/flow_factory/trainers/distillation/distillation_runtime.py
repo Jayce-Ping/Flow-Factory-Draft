@@ -234,7 +234,16 @@ def query_score_velocity(
     Returns:
         Detached structured velocity prediction.
     """
-    with adapter.use_component_variant(role_name):
+    # The reference score is the pre-finetune teacher, i.e. the same components at
+    # an earlier point in time. That is a parameter snapshot, not a variant: it
+    # holds no gradients and no optimizer state, so it must not cost a bundle
+    # member. Only the trainable roles are declared variants.
+    weights = (
+        adapter.use_ref_parameters()
+        if role_name == "reference"
+        else adapter.use_component_variant(role_name)
+    )
+    with weights:
         with torch.no_grad():
             with autocast():
                 output = adapter.forward_state(

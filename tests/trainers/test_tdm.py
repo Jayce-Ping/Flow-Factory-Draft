@@ -178,8 +178,21 @@ class ObjectiveTDMAdapter(BaseAdapter):
 
     @contextmanager
     def use_component_variant(self, role_name: str) -> Iterator[None]:
+        # Mirror the real registry: only declared trainable variants resolve. The
+        # frozen reference is a parameter snapshot and never a declared variant.
+        if role_name not in ("generator", "fake"):
+            raise KeyError(f"component variant {role_name!r} is not declared")
         previous = self.active_role
         self.active_role = role_name
+        try:
+            yield
+        finally:
+            self.active_role = previous
+
+    @contextmanager
+    def use_ref_parameters(self) -> Iterator[None]:
+        previous = self.active_role
+        self.active_role = "reference"
         try:
             yield
         finally:
