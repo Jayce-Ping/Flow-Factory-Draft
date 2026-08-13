@@ -660,23 +660,21 @@ class BaseAdapter(ABC):
         adapter on one shared base; under `full` each gets its own component copy.
     """
 
-    def declare_component_variants(
-        self,
-        trainable_variants: Sequence[str],
-        *,
-        frozen_variant: str = "frozen",
-    ) -> None:
+    def declare_component_variants(self, trainable_variants: Sequence[str]) -> None:
         """Create live copies of the trainable components, one per named variant.
 
         Must run before ``accelerator.prepare`` so the bundle sees every member,
         hence the refusal to reconfigure an existing registry.
 
+        A frozen reference is not a variant: it is the same weights at another
+        point in time, so an algorithm that needs one asks for
+        ``use_ref_parameters()`` (the pre-finetune weights) or its own named
+        snapshot instead of declaring a copy that would cost a bundle member.
+
         Args:
             trainable_variants: Every trainable variant name, base variant first.
                 The base owns the canonical components and every later variant is
                 layered on it; a single-policy algorithm passes one name.
-            frozen_variant: Name for the frozen variant every registry
-                needs as its reference point.
 
         Raises:
             RuntimeError: If variants are already declared or frozen.
@@ -720,23 +718,11 @@ class BaseAdapter(ABC):
             registry.declare(
                 ComponentVariantSpec(
                     name=variant_name,
-                    trainable=True,
                     storage_mode=finetune_type,
                     component_routes=component_routes,
                     adapter_name=adapter_name,
                 )
             )
-        registry.declare(
-            ComponentVariantSpec(
-                name=frozen_variant,
-                trainable=False,
-                storage_mode="frozen",
-                component_routes={
-                    component_name: component_name
-                    for component_name in self.trainable_component_names
-                },
-            )
-        )
         registry.materialize(trainable_variants)
         self.component_variant_registry = registry
 

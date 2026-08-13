@@ -40,7 +40,6 @@ def _registry() -> ComponentVariantRegistry:
 def _base_spec() -> ComponentVariantSpec:
     return ComponentVariantSpec(
         name=BASE_VARIANT,
-        trainable=True,
         storage_mode="lora",
         component_routes={
             "transformer": "transformer",
@@ -63,7 +62,6 @@ def test_declares_roles_in_exact_order_and_resolves_routes() -> None:
     registry.declare(
         ComponentVariantSpec(
             name="fake",
-            trainable=True,
             storage_mode="full",
             component_routes={
                 "transformer": "fake__transformer",
@@ -73,19 +71,8 @@ def test_declares_roles_in_exact_order_and_resolves_routes() -> None:
     )
     fake_parameter = torch.nn.Parameter(torch.zeros(1))
     registry.register_parameter("fake", "transformer", "weight", fake_parameter)
-    registry.declare(
-        ComponentVariantSpec(
-            name="frozen",
-            trainable=False,
-            storage_mode="frozen",
-            component_routes={
-                "transformer": "reference__transformer",
-                "transformer_2": "reference__transformer_2",
-            },
-        )
-    )
 
-    assert registry.variant_names == (BASE_VARIANT, "fake", "frozen")
+    assert registry.variant_names == (BASE_VARIANT, "fake")
     assert registry.resolve_route(BASE_VARIANT, "transformer") == "transformer"
     assert registry.resolve_route("fake", "transformer_2") == "fake__transformer_2"
     assert registry.parameters("fake") == (fake_parameter,)
@@ -100,7 +87,6 @@ def test_the_first_declared_variant_must_own_the_canonical_routes() -> None:
         registry.declare(
             ComponentVariantSpec(
                 name="fake",
-                trainable=True,
                 storage_mode="full",
                 component_routes={"transformer": "fake__transformer"},
             )
@@ -119,7 +105,6 @@ def test_rejects_duplicate_and_illegal_variant_names_with_details() -> None:
     registry.declare(
         ComponentVariantSpec(
             name="critic",
-            trainable=True,
             storage_mode="full",
             component_routes={"transformer": "critic__transformer"},
         )
@@ -129,7 +114,6 @@ def test_rejects_duplicate_and_illegal_variant_names_with_details() -> None:
     with pytest.raises(TypeError, match="non-empty string component variant name"):
         ComponentVariantSpec(
             name="",
-            trainable=True,
             storage_mode="full",
             component_routes={"transformer": "empty__transformer"},
         )
@@ -145,7 +129,6 @@ def test_base_maps_every_trainable_component_to_canonical_route() -> None:
         registry.declare(
             ComponentVariantSpec(
                 name=BASE_VARIANT,
-                trainable=True,
                 storage_mode="lora",
                 component_routes={"transformer": "renamed_transformer"},
             )
@@ -163,7 +146,6 @@ def test_rejects_route_collisions_with_role_and_component_details() -> None:
         registry.declare(
             ComponentVariantSpec(
                 name="fake",
-                trainable=True,
                 storage_mode="full",
                 component_routes={"transformer_2": "transformer"},
             )
@@ -177,7 +159,6 @@ def test_lora_roles_can_share_a_route_for_the_same_canonical_component() -> None
     registry.declare(
         ComponentVariantSpec(
             name="fake",
-            trainable=True,
             storage_mode="lora",
             component_routes={"transformer": "transformer"},
             adapter_name="fake",
@@ -200,27 +181,45 @@ def test_full_trainable_roles_cannot_alias_the_base_route(variant_name: str) -> 
         registry.declare(
             ComponentVariantSpec(
                 name=variant_name,  # type: ignore[arg-type]
-                trainable=True,
                 storage_mode="full",
                 component_routes={"transformer": "transformer"},
             )
         )
 
 
-def test_reference_snapshot_can_share_the_base_route() -> None:
+def test_only_a_named_lora_adapter_may_share_the_base_route() -> None:
+    """A full copy sharing a route would silently alias the base weights."""
     registry = _registry()
     registry.declare(_base_spec())
 
-    registry.declare(
+    with pytest.raises(ValueError, match="shared route.*Only a named LoRA adapter"):
+        registry.declare(
+            ComponentVariantSpec(
+                name="fake",
+                storage_mode="full",
+                component_routes={"transformer": "transformer"},
+            )
+        )
+
+    lora_registry = _registry()
+    lora_registry.declare(
         ComponentVariantSpec(
-            name="frozen",
-            trainable=False,
-            storage_mode="frozen",
+            name=BASE_VARIANT,
+            storage_mode="lora",
+            component_routes={"transformer": "transformer", "transformer_2": "transformer_2"},
+            adapter_name="default",
+        )
+    )
+    lora_registry.declare(
+        ComponentVariantSpec(
+            name="fake",
+            storage_mode="lora",
             component_routes={"transformer": "transformer"},
+            adapter_name="fake",
         )
     )
 
-    assert registry.resolve_route("frozen", "transformer") == "transformer"
+    assert lora_registry.resolve_route("fake", "transformer") == "transformer"
 
 
 def test_parameter_identity_belongs_to_only_one_trainable_role() -> None:
@@ -229,7 +228,6 @@ def test_parameter_identity_belongs_to_only_one_trainable_role() -> None:
     registry.declare(
         ComponentVariantSpec(
             name="fake",
-            trainable=True,
             storage_mode="full",
             component_routes={"transformer": "fake__transformer"},
         )
@@ -242,34 +240,13 @@ def test_parameter_identity_belongs_to_only_one_trainable_role() -> None:
         registry.register_parameter("fake", "transformer", "weight", base_parameter)
 
 
-def test_frozen_variant_is_non_trainable_and_cannot_own_parameters() -> None:
-    registry = _registry()
-    _declare_base(registry)
-
-    with pytest.raises(ValueError, match="snapshot.*non-trainable.*received.*True"):
-        registry.declare(
-            ComponentVariantSpec(
-                name="frozen",
-                trainable=True,
-                storage_mode="frozen",
-                component_routes={"transformer": "reference__transformer"},
-            )
-        )
-
-    registry.declare(
+def test_a_variant_is_always_a_live_trainable_copy() -> None:
+    """A frozen reference is a snapshot on the adapter, never a declared variant."""
+    with pytest.raises(ValueError, match="storage_mode.*'lora', 'full'.*received 'frozen'"):
         ComponentVariantSpec(
-            name="frozen",
-            trainable=False,
-            storage_mode="frozen",
+            name="reference",
+            storage_mode="frozen",  # type: ignore[arg-type]
             component_routes={"transformer": "reference__transformer"},
-        )
-    )
-    with pytest.raises(ValueError, match="frozen.*non-trainable.*parameter"):
-        registry.register_parameter(
-            "frozen",
-            "transformer",
-            "weight",
-            torch.nn.Parameter(torch.ones(1)),
         )
 
 
@@ -277,7 +254,7 @@ def test_freeze_rejects_empty_trainable_role_with_variant_name() -> None:
     registry = _registry()
     registry.declare(_base_spec())
 
-    with pytest.raises(ValueError, match="trainable variant.*base.*at least one parameter"):
+    with pytest.raises(ValueError, match="variant.*base.*at least one parameter"):
         registry.freeze()
 
 
@@ -291,7 +268,6 @@ def test_freeze_blocks_declaration_and_ownership_mutation_with_details() -> None
         registry.declare(
             ComponentVariantSpec(
                 name="fake",
-                trainable=True,
                 storage_mode="full",
                 component_routes={"transformer": "fake__transformer"},
             )
@@ -312,7 +288,6 @@ def test_spec_routes_and_metadata_are_immutable_snapshots() -> None:
     }
     spec = ComponentVariantSpec(
         name=BASE_VARIANT,
-        trainable=True,
         storage_mode="lora",
         component_routes=component_routes,
         adapter_name=BASE_VARIANT,
@@ -385,7 +360,6 @@ def test_spec_rejects_wrong_value_types(
 ) -> None:
     kwargs = {
         "name": "fake",
-        "trainable": True,
         "storage_mode": "full",
         "component_routes": {"transformer": "fake__transformer"},
         **spec_kwargs,
@@ -401,7 +375,6 @@ def test_declaration_order_is_the_callers_and_route_collisions_are_rejected() ->
     registry.declare(
         ComponentVariantSpec(
             name="surrogate",
-            trainable=True,
             storage_mode="full",
             component_routes={"transformer": "surrogate__transformer"},
         )
@@ -412,7 +385,6 @@ def test_declaration_order_is_the_callers_and_route_collisions_are_rejected() ->
     registry.declare(
         ComponentVariantSpec(
             name="fake",
-            trainable=True,
             storage_mode="full",
             component_routes={"transformer": "fake__transformer"},
         )
@@ -425,7 +397,6 @@ def test_declaration_order_is_the_callers_and_route_collisions_are_rejected() ->
         collision_registry.declare(
             ComponentVariantSpec(
                 name="fake",
-                trainable=True,
                 storage_mode="full",
                 component_routes={
                     "transformer": "shared",
@@ -487,6 +458,7 @@ class _TinyRoleAdapter(BaseAdapter):
                 parameter.requires_grad = "target" in parameter_name
         self._role_components = {"transformer": component}
         self.reference_is_active = False
+        self.accelerator = SimpleNamespace(unwrap_model=lambda module: module)
 
     @property
     def trainable_component_names(self) -> list[str]:
@@ -494,6 +466,9 @@ class _TinyRoleAdapter(BaseAdapter):
 
     def get_component(self, name: str) -> torch.nn.Module:
         return self._role_components[name]
+
+    def has_component(self, name: str) -> bool:
+        return name in self._role_components
 
     @contextmanager
     def use_ref_parameters(self) -> Iterator[None]:
@@ -523,9 +498,8 @@ def _adapter_parameter_ids(adapter: _TinyRoleAdapter) -> set[int]:
 
 def _assert_all_owned_role_parameters_trainable(registry: ComponentVariantRegistry) -> None:
     for variant_name in registry.variant_names:
-        if registry.get_spec(variant_name).trainable:
-            assert registry.parameters(variant_name)
-            assert all(parameter.requires_grad for parameter in registry.parameters(variant_name))
+        assert registry.parameters(variant_name)
+        assert all(parameter.requires_grad for parameter in registry.parameters(variant_name))
 
 
 def test_lora_materialization_uses_named_adapters_and_exact_new_parameter_identity() -> None:
@@ -537,7 +511,7 @@ def test_lora_materialization_uses_named_adapters_and_exact_new_parameter_identi
     registry = adapter.component_variant_registry
     component = adapter.get_component("transformer")
     assert set(component.peft_config) == {"default", "fake", "surrogate"}
-    assert registry.variant_names == (BASE_VARIANT, "fake", "surrogate", "frozen")
+    assert registry.variant_names == (BASE_VARIANT, "fake", "surrogate")
     assert registry.get_spec(BASE_VARIANT).adapter_name == "default"
     assert registry.get_spec("fake").adapter_name == "fake"
     assert registry.get_spec("surrogate").adapter_name == "surrogate"
@@ -560,7 +534,7 @@ def test_lora_materialization_uses_named_adapters_and_exact_new_parameter_identi
 
 def test_lora_role_contexts_activate_named_adapters_and_restore_after_exception() -> None:
     adapter = _TinyRoleAdapter("lora")
-    adapter.declare_component_variants([BASE_VARIANT, "fake"])
+    adapter.declare_component_variants([BASE_VARIANT, "fake", "surrogate"])
     registry = adapter.component_variant_registry
     component = adapter.get_component("transformer")
 
@@ -572,20 +546,12 @@ def test_lora_role_contexts_activate_named_adapters_and_restore_after_exception(
         assert component.active_adapter == "fake"
         _assert_all_owned_role_parameters_trainable(registry)
         with pytest.raises(RuntimeError, match="inner failure"):
-            with adapter.use_component_variant("frozen"):
-                assert registry.active_variant == "frozen"
+            with adapter.use_component_variant("surrogate"):
+                assert registry.active_variant == "surrogate"
+                assert component.active_adapter == "surrogate"
                 _assert_all_owned_role_parameters_trainable(registry)
-                assert all(
-                    module.disable_adapters
-                    for module in component.modules()
-                    if hasattr(module, "disable_adapters")
-                )
-                with adapter.use_component_variant("frozen"):
-                    assert all(
-                        module.disable_adapters
-                        for module in component.modules()
-                        if hasattr(module, "disable_adapters")
-                    )
+                with adapter.use_component_variant("surrogate"):
+                    assert component.active_adapter == "surrogate"
                     _assert_all_owned_role_parameters_trainable(registry)
                 _assert_all_owned_role_parameters_trainable(registry)
                 raise RuntimeError("inner failure")
@@ -595,6 +561,29 @@ def test_lora_role_contexts_activate_named_adapters_and_restore_after_exception(
     assert registry.active_variant == BASE_VARIANT
     assert component.active_adapter == "default"
     _assert_all_owned_role_parameters_trainable(registry)
+
+
+def test_a_frozen_reference_comes_from_the_adapter_snapshot_not_a_variant() -> None:
+    """Under LoRA the pre-finetune weights are reached by disabling adapters.
+
+    Calls the real ``BaseAdapter`` implementation rather than the fake's stub, so
+    the assertion covers the path a trainer actually takes.
+    """
+    adapter = _TinyRoleAdapter("lora")
+    adapter.declare_component_variants([BASE_VARIANT, "fake"])
+    component = adapter.get_component("transformer")
+
+    with BaseAdapter.use_ref_parameters(adapter):
+        assert all(
+            module.disable_adapters
+            for module in component.modules()
+            if hasattr(module, "disable_adapters")
+        )
+    assert not any(
+        module.disable_adapters
+        for module in component.modules()
+        if hasattr(module, "disable_adapters")
+    )
 
 
 @pytest.mark.parametrize("required_roles", [None, BASE_VARIANT, b"base", 7, {BASE_VARIANT}])
@@ -687,14 +676,15 @@ def test_full_materialization_copies_routes_and_preserves_target_module_freezing
     assert role_parameter_ids[1].isdisjoint(role_parameter_ids[2])
 
 
-def test_full_reference_uses_snapshot_context_and_nested_roles_restore_exactly() -> None:
+def test_full_reference_is_a_snapshot_that_composes_with_variant_routing() -> None:
+    """The snapshot swaps values in place, so it nests inside any active variant."""
     adapter = _TinyRoleAdapter("full")
     adapter.declare_component_variants([BASE_VARIANT, "fake"])
     registry = adapter.component_variant_registry
 
     with registry.use("fake"):
-        with registry.use("frozen"):
-            assert registry.active_variant == "frozen"
+        with adapter.use_ref_parameters():
+            assert registry.active_variant == "fake"
             assert adapter.reference_is_active
         assert registry.active_variant == "fake"
         assert not adapter.reference_is_active

@@ -53,6 +53,26 @@ Use this only when copies must coexist and hold gradients simultaneously. That i
 trainer cannot build for itself, because it needs PEFT adapters on a shared base, one prepared
 `ModelBundle` root, and forward routing.
 
+**A variant is always a live trainable copy.** A frozen reference is not one: ask for
+`use_ref_parameters()` (the pre-finetune weights) or a named snapshot instead. DMD2's reference
+score goes through `use_ref_parameters()` for exactly this reason, so only `generator` and `fake`
+are declared variants.
+
+The distinction is not about the weights, which are the cheap part; it is about what has to sit
+next to them. A trainable variant carries gradients and optimizer state (roughly 3x the parameters
+for Adam), both of which must be co-located with the parameters during backward and step. A
+snapshot carries neither, stores values only, and its shadow can live on CPU (`EMAModuleWrapper`
+has a cross-device copy path). Activating a snapshot copies values into the *existing* live
+parameters, so it allocates no second module and composes with whichever variant is active.
+
+This is also why "just offload the idle variant to CPU" does not collapse the two mechanisms. For a
+read-only copy it would, which is why no frozen storage mode exists. For a trainable one it does
+not: you could move only the weights, the gradients and optimizer state would have to follow, and
+in DMD2 the fake score is touched twice per step, so there is no idle window. Offload belongs to
+the distributed backend (FSDP `cpu_offload`, ZeRO-2 offload), which reaches variants automatically
+because they are bundle members. Moving a wrapped module's parameters behind FSDP's back would
+break its flat-parameter invariants.
+
 ## Declaring variants
 
 `declare_component_variants(trainable_variants)` runs before `accelerator.prepare` so the bundle
@@ -65,15 +85,18 @@ name, so an algorithm may call its base `generator` and the model layer stays ig
 
 | `ComponentVariantSpec` field | Meaning |
 |---|---|
-| `storage_mode` | `lora`, `full`, or `frozen` |
+| `storage_mode` | `lora` or `full` |
 | `adapter_name` | PEFT adapter under `lora`; `None` under `full` |
 | `component_routes` | canonical component name -> the module this variant uses |
-| `trainable` | whether the variant contributes optimizer parameters |
 
 The storage modes give the memory trade-off directly. Under `lora`, N variants cost one base plus
 N adapters and the base takes the `default` adapter. Under `full`, N variants cost N copies routed
 as `{variant}__{component}`. `RoutedComponentProxy` resolves a canonical name through the active
 variant, so adapter code keeps saying `self.transformer`.
+
+Two variants may share a route only under `lora` with a named adapter, because a LoRA adapter
+layers on the base weights rather than copying them. A `full` variant sharing a route would
+silently alias the base, so the registry rejects it.
 
 ## Checkpointing
 
@@ -156,6 +179,8 @@ family describes it.
 
 - [ ] No algorithm word (`generator`, `fake`, `surrogate`) appears under `src/flow_factory/models/`.
 - [ ] A time-shifted copy uses named parameter snapshots, not a variant.
+- [ ] A frozen reference goes through `use_ref_parameters()`, never a declared variant.
+- [ ] Test fakes reject undeclared variant names, so they cannot hide a production `KeyError`.
 - [ ] Variants are declared once, before `accelerator.prepare`.
 - [ ] `lora` variants declare an `adapter_name`; `full` variants do not.
 - [ ] Forwards that depend on a variant run inside `use_component_variant`.

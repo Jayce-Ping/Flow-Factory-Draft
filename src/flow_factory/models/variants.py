@@ -24,18 +24,25 @@ from typing import Any, Dict, Iterator, List, Literal, Mapping, Optional, Tuple,
 import torch
 from peft import PeftModel
 
+# A variant is a live trainable copy of the canonical components that coexists
+# with the other variants: it owns parameters, gradients and an optimizer group
+# at the same time as its siblings. Weights of the *same* copy at another point
+# in time (a frozen reference, an EMA, a rollout snapshot) are not variants;
+# those belong to the named-parameter snapshots on `BaseAdapter`, which store
+# values only and install them into the live parameters on demand.
+#
 # Variant names are caller-chosen. The model layer holds no opinion about what a
 # variant means; an algorithm that trains a generator against a fake score names
 # its variants accordingly, and this module never reads those names.
 VariantName = str
-VariantStorageMode = Literal["lora", "full", "frozen"]
+VariantStorageMode = Literal["lora", "full"]
 
 # The base variant is positional, not named: whichever variant is declared first
 # owns the adapter's canonical components and every later variant is layered on
 # it. The model layer therefore never needs to recognise a particular name. This
 # default is only what a single-policy caller passes when it has nothing to say.
 DEFAULT_BASE_VARIANT: VariantName = "base"
-_STORAGE_MODES: Tuple[VariantStorageMode, ...] = ("lora", "full", "frozen")
+_STORAGE_MODES: Tuple[VariantStorageMode, ...] = ("lora", "full")
 
 
 @dataclass(frozen=True)
@@ -43,7 +50,6 @@ class ComponentVariantSpec:
     """Declare one immutable component variant."""
 
     name: VariantName
-    trainable: bool
     storage_mode: VariantStorageMode
     component_routes: Mapping[str, str]
     adapter_name: Optional[str] = None
@@ -54,12 +60,6 @@ class ComponentVariantSpec:
             raise TypeError(
                 "expected a non-empty string component variant name, received "
                 f"{type(self.name).__name__}: {self.name!r}"
-            )
-        if not isinstance(self.trainable, bool):
-            raise TypeError(
-                "expected bool for component variant trainable state "
-                f"of variant {self.name!r}, received {type(self.trainable).__name__}: "
-                f"{self.trainable!r}"
             )
         if self.storage_mode not in _STORAGE_MODES:
             raise ValueError(
@@ -179,17 +179,6 @@ class ComponentVariantRegistry:
         if spec.name in self._specs:
             raise ValueError(f"component variant is already declared: {spec.name!r}")
 
-        if spec.storage_mode == "frozen" and spec.trainable:
-            raise ValueError(
-                f"expected snapshot variant {spec.name!r} to be non-trainable, "
-                f"received trainable={spec.trainable!r}; a snapshot holds frozen weights"
-            )
-        if spec.storage_mode != "frozen" and not spec.trainable:
-            raise ValueError(
-                f"expected variant {spec.name!r} with storage_mode={spec.storage_mode!r} to be "
-                "trainable; declare storage_mode='frozen' for a frozen copy"
-            )
-
         declared_components = tuple(spec.component_routes)
         unknown_components = tuple(
             name for name in declared_components if name not in self._canonical_components
@@ -225,16 +214,13 @@ class ComponentVariantRegistry:
                         f"component {owner_component!r} already owns it; variant {spec.name!r} "
                         f"component {component_name!r} attempted to reuse it"
                     )
-                shared_storage_is_valid = (
-                    spec.storage_mode == "lora" and spec.adapter_name is not None
-                ) or (not spec.trainable and spec.storage_mode == "frozen")
-                if not shared_storage_is_valid:
+                if not (spec.storage_mode == "lora" and spec.adapter_name is not None):
                     raise ValueError(
                         f"shared route {route_name!r} for canonical component "
                         f"{component_name!r} is invalid for variant {spec.name!r} with "
                         f"storage_mode={spec.storage_mode!r}; route is already owned by variant "
-                        f"{owner_variant!r}. Shared routes require a named LoRA adapter or the "
-                        "a frozen snapshot storage mode."
+                        f"{owner_variant!r}. Only a named LoRA adapter may share a route, "
+                        "because it layers on the base weights instead of copying them."
                     )
             pending_routes[route_name] = component_name
 
@@ -260,10 +246,6 @@ class ComponentVariantRegistry:
         """
         self._require_mutable(variant_name, "register parameter ownership")
         spec = self._get_declared_spec(variant_name)
-        if not spec.trainable:
-            raise ValueError(
-                f"variant {variant_name!r} is non-trainable and cannot own optimizer parameters"
-            )
         if component_name not in spec.component_routes:
             raise KeyError(
                 f"variant {variant_name!r} has no route for component {component_name!r}; "
@@ -306,23 +288,11 @@ class ComponentVariantRegistry:
         """
         required_variants = self._validate_required_variants(required_variants)
         self._require_mutable(required_variants, "materialize component variants")
-        declared_trainable_variants = tuple(
-            variant_name for variant_name, spec in self._specs.items() if spec.trainable
-        )
-        if required_variants != declared_trainable_variants:
+        declared_variants = tuple(self._specs)
+        if required_variants != declared_variants:
             raise ValueError(
-                "expected required_variants to exactly match declared trainable variants "
-                f"{declared_trainable_variants!r}, received {required_variants!r}"
-            )
-        snapshot_variants = tuple(
-            variant_name
-            for variant_name, spec in self._specs.items()
-            if spec.storage_mode == "frozen"
-        )
-        if not snapshot_variants:
-            raise ValueError(
-                "expected a declared frozen snapshot variant before materialization, "
-                f"received variants {self.variant_names!r}"
+                "expected required_variants to exactly match declared variants "
+                f"{declared_variants!r}, received {required_variants!r}"
             )
 
         self._bundle_members = self._canonical_bundle_members()
@@ -399,22 +369,14 @@ class ComponentVariantRegistry:
         self._active_context = None
 
         next_context = ExitStack()
-        base_storage_mode = self._specs[self.base_variant].storage_mode
-        if base_storage_mode == "lora":
-            if spec.storage_mode == "frozen":
-                for component_name in self._canonical_components:
-                    component = self._get_peft_component(component_name)
-                    next_context.enter_context(component.disable_adapter())
-            else:
-                if spec.adapter_name is None:
-                    raise ValueError(
-                        f"expected named LoRA adapter for variant {variant_name!r}, "
-                        f"received adapter_name={spec.adapter_name!r}"
-                    )
-                for component_name in self._canonical_components:
-                    self._get_peft_component(component_name).set_adapter(spec.adapter_name)
-        elif spec.storage_mode == "frozen":
-            next_context.enter_context(self._adapter.use_ref_parameters())
+        if self._specs[self.base_variant].storage_mode == "lora":
+            if spec.adapter_name is None:
+                raise ValueError(
+                    f"expected named LoRA adapter for variant {variant_name!r}, "
+                    f"received adapter_name={spec.adapter_name!r}"
+                )
+            for component_name in self._canonical_components:
+                self._get_peft_component(component_name).set_adapter(spec.adapter_name)
 
         self._restore_trainable_variant_parameters()
         self._active_context = next_context
@@ -456,10 +418,10 @@ class ComponentVariantRegistry:
             return
         if not self._specs:
             raise ValueError("expected a declared base variant before freezing, received none")
-        for variant_name, spec in self._specs.items():
-            if spec.trainable and not self._parameter_records[variant_name]:
+        for variant_name in self._specs:
+            if not self._parameter_records[variant_name]:
                 raise ValueError(
-                    f"trainable variant {variant_name!r} must own at least one parameter before freeze"
+                    f"variant {variant_name!r} must own at least one parameter before freeze"
                 )
         self._is_frozen = True
 
@@ -529,11 +491,7 @@ class ComponentVariantRegistry:
             variant_name: Trainable variant whose parameters initialize the snapshot.
             snapshot_name: Unique non-empty snapshot identifier.
         """
-        spec = self._get_declared_spec(variant_name)
-        if not spec.trainable:
-            raise ValueError(
-                f"expected trainable variant for parameter EMA, received variant {variant_name!r}"
-            )
+        self._get_declared_spec(variant_name)
         if not isinstance(snapshot_name, str) or not snapshot_name:
             raise ValueError(
                 "expected non-empty string snapshot_name for parameter EMA, "
@@ -746,7 +704,6 @@ class ComponentVariantRegistry:
             variants.append(
                 {
                     "name": spec.name,
-                    "trainable": spec.trainable,
                     "storage_mode": spec.storage_mode,
                     "component_routes": dict(spec.component_routes),
                     "adapter_name": spec.adapter_name,
@@ -768,7 +725,6 @@ class ComponentVariantRegistry:
             variants.append(
                 {
                     "name": variant_name,
-                    "trainable": spec.trainable,
                     "storage_mode": spec.storage_mode,
                     "component_routes": dict(spec.component_routes),
                     "adapter_name": spec.adapter_name,
@@ -848,7 +804,6 @@ class ComponentVariantRegistry:
                     f"received {tuple(sorted(received_variant_keys))!r}"
                 )
             for field_name in (
-                "trainable",
                 "storage_mode",
                 "component_routes",
                 "adapter_name",
@@ -981,11 +936,10 @@ class ComponentVariantRegistry:
                 self.register_parameter(variant_name, component_name, parameter_name, parameter)
 
     def _restore_trainable_variant_parameters(self) -> None:
-        """Keep every identity-owned trainable-variant parameter trainable."""
-        for variant_name, spec in self._specs.items():
-            if spec.trainable:
-                for record in self._parameter_records[variant_name]:
-                    record.parameter.requires_grad = True
+        """Keep every identity-owned variant parameter trainable."""
+        for variant_name in self._specs:
+            for record in self._parameter_records[variant_name]:
+                record.parameter.requires_grad = True
 
     def _get_peft_component(self, component_name: str) -> PeftModel:
         """Return one canonical PEFT component with detailed validation."""

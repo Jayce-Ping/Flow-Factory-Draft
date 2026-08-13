@@ -345,7 +345,7 @@ def test_multirole_resume_requires_dedicated_metadata_before_mutation(tmp_path: 
         (lambda state: state.update(version=99), "version.*expected 1.*received 99"),
         (
             lambda state: state["roles"].reverse(),
-            "variant order.*expected.*base.*fake.*frozen.*received.*frozen.*fake.*base",
+            "variant order.*expected.*base.*fake.*received.*fake.*base",
         ),
         (
             lambda state: state["roles"][1].update(storage_mode="lora"),
