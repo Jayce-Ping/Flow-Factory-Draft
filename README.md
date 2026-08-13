@@ -99,6 +99,9 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
 | DPPO           | dppo           | [Flow-DPPO](https://arxiv.org/abs/2606.11025) |
 | CRD            | crd            | [Centered Reward Distillation](https://arxiv.org/abs/2603.14128) ([Blog (Chinese)](https://mp.weixin.qq.com/s/fpTi7PPi3APSNJQ2kXN3Dw))|
 | DiffusionOPD   | diffusion-opd  | [DiffusionOPD](https://arxiv.org/abs/2605.15055) |
+| DMD2           | dmd2           | [DMD2](https://arxiv.org/abs/2405.14867) |
+| TDM            | tdm            | Trajectory distribution matching |
+| TDM-R1         | tdm-r1         | [TDM-R1](https://arxiv.org/abs/2603.07700) |
 
 See [`Algorithm Guidance`](guidance/algorithms.md) for more information.
 
@@ -165,7 +168,7 @@ We provide a set of guidance documents to help you understand the framework and 
 | Document | Description |
 |---|---|
 | [Workflow](guidance/workflow.md) | End-to-end training pipeline: the overall stages from data preprocessing to policy optimization |
-| [Algorithms](guidance/algorithms.md) | Supported RL algorithms (GRPO, GRPO-Guard, DPPO, DiffusionNFT, AWM, DPO, DGPO, CRD, DiffusionOPD) and their configurations |
+| [Algorithms](guidance/algorithms.md) | Supported algorithms (GRPO, GRPO-Guard, DPPO, DiffusionNFT, AWM, DPO, DGPO, CRD, DiffusionOPD, DMD2, TDM, TDM-R1) and their configurations |
 | [Rewards](guidance/rewards.md) | Reward model system: built-in models, custom rewards, and remote reward servers |
 | [New Model](guidance/new_model.md) | How to add support for a new Diffusion/Flow-Matching model |
 

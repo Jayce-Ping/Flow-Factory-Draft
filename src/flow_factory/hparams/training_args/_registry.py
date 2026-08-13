@@ -23,11 +23,14 @@ from ._base import TrainingArguments
 from .awm import AWMTrainingArguments
 from .crd import CRDTrainingArguments
 from .dgpo import DGPOTrainingArguments
+from .dmd2 import DMD2TrainingArguments
 from .dpo import DPOTrainingArguments
 from .dppo import DPPOTrainingArguments
 from .grpo import GRPOTrainingArguments
 from .nft import NFTTrainingArguments
 from .opd import DiffusionOPDTrainingArguments
+from .tdm import TDMTrainingArguments
+from .tdm_r1 import TDMR1TrainingArguments
 
 # ============================================================================
 # Training Arguments Registry
@@ -42,6 +45,9 @@ _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
     "dgpo": DGPOTrainingArguments,
     "dpo": DPOTrainingArguments,
     "crd": CRDTrainingArguments,
+    "dmd2": DMD2TrainingArguments,
+    "tdm": TDMTrainingArguments,
+    "tdm-r1": TDMR1TrainingArguments,
     "diffusion-opd": DiffusionOPDTrainingArguments,
 }
 

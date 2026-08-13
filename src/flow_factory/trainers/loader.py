@@ -24,7 +24,7 @@ import os
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import ProjectConfiguration, set_seed
 
-from ..hparams import Arguments
+from ..hparams import Arguments, get_training_args_class
 from ..models.loader import load_model
 from ..models.registry import get_model_adapter_class
 from ..utils.env_utils import reconcile_config
@@ -33,6 +33,23 @@ from .abc import BaseTrainer, validate_supported_distributed_plan
 from .registry import get_trainer_class, list_registered_trainers
 
 logger = setup_logger(__name__)
+
+
+def _requires_ddp_unused_parameter_detection(
+    config: Arguments,
+    adapter_cls: type,
+) -> bool:
+    """Resolve DDP unused-parameter detection before Accelerator construction.
+
+    A run that trains several variants leaves some of them ungraded on any given
+    backward, which DDP's static buckets cannot express. The decision has to be made
+    here because it is a constructor argument to the Accelerator.
+    """
+    training_args_cls = get_training_args_class(config.training_args.trainer_type)
+    required_roles = getattr(config.training_args, "required_trainable_roles", None)
+    if required_roles is None:
+        required_roles = getattr(training_args_cls, "required_trainable_roles", ())
+    return len(tuple(required_roles)) > 1 or adapter_cls.ddp_find_unused_parameters
 
 
 def load_trainer(config: Arguments) -> BaseTrainer:
@@ -67,7 +84,7 @@ def load_trainer(config: Arguments) -> BaseTrainer:
     # all-reduce with backward; adapters that leave trainable params ungraded in
     # some iterations (e.g. Qwen-Image) opt in via ddp_find_unused_parameters.
     adapter_cls = get_model_adapter_class(config.model_args.model_type)
-    find_unused = getattr(adapter_cls, "ddp_find_unused_parameters", False)
+    find_unused = _requires_ddp_unused_parameter_detection(config, adapter_cls)
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=find_unused)
 
     # DeepSpeed clips inside its engine: `accelerator.clip_grad_norm_` ignores the
