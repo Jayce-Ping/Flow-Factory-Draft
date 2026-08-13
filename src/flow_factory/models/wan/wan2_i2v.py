@@ -15,55 +15,60 @@
 # src/flow_factory/models/wan/wan2_i2v.py
 from __future__ import annotations
 
-import os
-from typing import Union, List, Dict, Any, Optional, Tuple, Literal, Iterable, ClassVar
 import logging
-from dataclasses import dataclass
+import os
 from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, ClassVar, Dict, Iterable, List, Literal, Optional, Tuple, Union
+
 import numpy as np
-from PIL import Image
 import torch
 from accelerate import Accelerator
 from diffusers.pipelines.wan.pipeline_wan_i2v import WanImageToVideoPipeline, prompt_clean
 from diffusers.utils.torch_utils import randn_tensor
 from peft import PeftModel
+from PIL import Image
 
-from ..abc import BaseAdapter
-from ...samples import I2VSample
 from ...hparams import *
-from ...scheduler import UniPCMultistepSDESchedulerOutput, UniPCMultistepSDEScheduler
+from ...samples import I2VSample
+from ...scheduler import UniPCMultistepSDEScheduler, UniPCMultistepSDESchedulerOutput
 from ...utils.base import filter_kwargs
 from ...utils.image import (
-    ImageSingle,
     ImageBatch,
+    ImageSingle,
     MultiImageBatch,
     is_image,
     is_image_batch,
     is_multi_image_batch,
     standardize_image_batch,
 )
-from ...utils.trajectory_collector import (
-    TrajectoryCollector, 
-    CallbackCollector,
-    TrajectoryIndicesType, 
-    create_trajectory_collector,
-    create_callback_collector,
-)
 from ...utils.logger_utils import setup_logger
+from ...utils.trajectory_collector import (
+    CallbackCollector,
+    TrajectoryCollector,
+    TrajectoryIndicesType,
+    create_callback_collector,
+    create_trajectory_collector,
+)
+from ..abc import BaseAdapter
 
 logger = setup_logger(__name__)
+
 
 @dataclass
 class WanI2VSample(I2VSample):
     # Class var
-    _shared_fields: ClassVar[frozenset[str]] = frozenset({'first_frame_mask'})
+    _shared_fields: ClassVar[frozenset[str]] = frozenset({"first_frame_mask"})
     # Obj var
-    image_embeds : Optional[torch.FloatTensor] = None
-    condition : Optional[torch.FloatTensor] = None
-    first_frame_mask : Optional[torch.FloatTensor] = None
+    image_embeds: Optional[torch.FloatTensor] = None
+    condition: Optional[torch.FloatTensor] = None
+    first_frame_mask: Optional[torch.FloatTensor] = None
+
 
 def retrieve_latents(
-    encoder_output: torch.Tensor, generator: Optional[torch.Generator] = None, sample_mode: str = "sample"
+    encoder_output: torch.Tensor,
+    generator: Optional[torch.Generator] = None,
+    sample_mode: str = "sample",
 ):
     if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
         return encoder_output.latent_dist.sample(generator)
@@ -74,6 +79,7 @@ def retrieve_latents(
     else:
         raise AttributeError("Could not access latents of provided encoder_output")
 
+
 class Wan2_I2V_Adapter(BaseAdapter):
     # Wan2.2 trains both transformer and transformer_2 but uses only one per
     # timestep (boundary_ratio), so under DDP the other's trainable params get no
@@ -81,74 +87,76 @@ class Wan2_I2V_Adapter(BaseAdapter):
     ddp_find_unused_parameters = True
     supports_diffusers_cache = True
 
-    def __init__(self, config: Arguments, accelerator : Accelerator):
+    def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
         self.pipeline: WanImageToVideoPipeline
         self.scheduler: UniPCMultistepSDEScheduler
         self._has_warned_multi_image = False
-    
+
     def load_pipeline(self) -> WanImageToVideoPipeline:
         return WanImageToVideoPipeline.from_pretrained(
             self.model_args.model_name_or_path,
         )
-    
+
     @property
     def default_target_modules(self) -> List[str]:
         """Default LoRA target modules for Wan transformer."""
         return [
             # --- Self Attention ---
-            "attn1.to_q", "attn1.to_k", "attn1.to_v", "attn1.to_out.0",
-            
+            "attn1.to_q",
+            "attn1.to_k",
+            "attn1.to_v",
+            "attn1.to_out.0",
             # --- Cross Attention ---
-            "attn2.to_q", "attn2.to_k", "attn2.to_v", "attn2.to_out.0",
-
+            "attn2.to_q",
+            "attn2.to_k",
+            "attn2.to_v",
+            "attn2.to_out.0",
             # --- Feed Forward Network ---
-            "ffn.net.0.proj", "ffn.net.2"
+            "ffn.net.0.proj",
+            "ffn.net.2",
         ]
-    
+
     @property
     def inference_modules(self) -> List[str]:
         """Modules that are required for inference and forward"""
         if self.pipeline.config.boundary_ratio is None or self.pipeline.config.boundary_ratio <= 0:
-            return ['transformer', 'vae']
+            return ["transformer", "vae"]
 
         if self.pipeline.config.boundary_ratio >= 1:
-            return ['transformer_2', 'vae']
+            return ["transformer_2", "vae"]
 
-        return ['transformer', 'transformer_2', 'vae']
-
+        return ["transformer", "transformer_2", "vae"]
 
     @property
     def preprocessing_modules(self) -> List[str]:
         """Modules that are requires for preprocessing"""
-        return ['text_encoders', 'vae', 'image_encoder']
-
+        return ["text_encoders", "vae", "image_encoder"]
 
     def apply_lora(
         self,
         target_modules: Union[str, List[str]],
-        components: Union[str, List[str]] = ['transformer', 'transformer_2'],
+        components: Union[str, List[str]] = ["transformer", "transformer_2"],
         **kwargs,
     ) -> Union[PeftModel, Dict[str, PeftModel]]:
         return super().apply_lora(target_modules=target_modules, components=components, **kwargs)
-    
 
     # ======================= Components Getters & Setters =======================
     @property
     def image_encoder(self) -> torch.nn.Module:
-        return self.get_component('image_encoder')
+        return self.get_component("image_encoder")
 
     @image_encoder.setter
     def image_encoder(self, module: torch.nn.Module):
-        self.set_component('image_encoder', module)
+        self.set_component("image_encoder", module)
 
     @property
     def transformer_2(self) -> torch.nn.Module:
-        return self.get_component('transformer_2')
+        return self.get_component("transformer_2")
 
     @transformer_2.setter
     def transformer_2(self, module: torch.nn.Module):
-        self.set_component('transformer_2', module)
+        self.set_component("transformer_2", module)
 
     # ======================== Encoding & Decoding ========================
     # ------------------------ Prompt Encoding ------------------------
@@ -178,15 +186,21 @@ class Wan2_I2V_Adapter(BaseAdapter):
         text_input_ids, mask = text_inputs.input_ids, text_inputs.attention_mask
         seq_lens = mask.gt(0).sum(dim=1).long()
 
-        prompt_embeds = self.pipeline.text_encoder(text_input_ids.to(device), mask.to(device)).last_hidden_state
+        prompt_embeds = self.pipeline.text_encoder(
+            text_input_ids.to(device), mask.to(device)
+        ).last_hidden_state
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
         prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
         prompt_embeds = torch.stack(
-            [torch.cat([u, u.new_zeros(max_sequence_length - u.size(0), u.size(1))]) for u in prompt_embeds], dim=0
+            [
+                torch.cat([u, u.new_zeros(max_sequence_length - u.size(0), u.size(1))])
+                for u in prompt_embeds
+            ],
+            dim=0,
         )
 
         return text_input_ids, prompt_embeds
-    
+
     def encode_prompt(
         self,
         prompt: Union[str, List[str]],
@@ -228,13 +242,17 @@ class Wan2_I2V_Adapter(BaseAdapter):
         )
 
         results = {
-            'prompt_ids': prompt_ids,
-            'prompt_embeds': prompt_embeds,
+            "prompt_ids": prompt_ids,
+            "prompt_embeds": prompt_embeds,
         }
 
         if do_classifier_free_guidance:
             negative_prompt = negative_prompt or ""
-            negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+            negative_prompt = (
+                batch_size * [negative_prompt]
+                if isinstance(negative_prompt, str)
+                else negative_prompt
+            )
 
             if prompt is not None and type(prompt) is not type(negative_prompt):
                 raise TypeError(
@@ -254,13 +272,15 @@ class Wan2_I2V_Adapter(BaseAdapter):
                 device=device,
                 dtype=dtype,
             )
-            results.update({
-                "negative_prompt_ids": negative_prompt_ids,
-                "negative_prompt_embeds": negative_prompt_embeds
-            })
+            results.update(
+                {
+                    "negative_prompt_ids": negative_prompt_ids,
+                    "negative_prompt_embeds": negative_prompt_embeds,
+                }
+            )
 
         return results
-    
+
     # ------------------------ Image Encoding ------------------------
     def encode_image(
         self,
@@ -269,9 +289,9 @@ class Wan2_I2V_Adapter(BaseAdapter):
     ) -> Union[None, Dict[str, torch.Tensor]]:
         images = self._standardize_image_input(
             images,
-            output_type='pil',
+            output_type="pil",
         )
-        
+
         if not is_image_batch(images):
             raise ValueError(
                 f"Invalid image input type: {type(images)}. "
@@ -279,21 +299,24 @@ class Wan2_I2V_Adapter(BaseAdapter):
             )
 
         # only Wan 2.1 I2V transformer accepts image_embeds, else None directly
-        if self.pipeline.transformer is not None and self.pipeline.transformer.config.image_dim is not None:
+        if (
+            self.pipeline.transformer is not None
+            and self.pipeline.transformer.config.image_dim is not None
+        ):
             batch_size = len(images)
             device = device or self.image_encoder.device
             images = self.pipeline.image_processor(images=images, return_tensors="pt").to(device)
             image_embeds = self.pipeline.image_encoder(**images, output_hidden_states=True)
             return {
-                'image_embeds': image_embeds.hidden_states[-2],
+                "image_embeds": image_embeds.hidden_states[-2],
             }
         else:
             return None
-    
+
     def _standardize_image_input(
         self,
         images: Union[ImageSingle, ImageBatch, MultiImageBatch],
-        output_type: Literal['pil', 'pt', 'np'] = 'pil',
+        output_type: Literal["pil", "pt", "np"] = "pil",
     ):
         """
         Standardize image input to desired output type.
@@ -307,13 +330,10 @@ class Wan2_I2V_Adapter(BaseAdapter):
                 logger.warning(
                     "Multiple condition images are not supported for Wan2_I2V. Only the first image of each batch will be used."
                 )
-            
+
             images = [batch[0] for batch in images]
 
-        images = standardize_image_batch(
-            images,
-            output_type=output_type
-        )
+        images = standardize_image_batch(images, output_type=output_type)
         return images
 
     # ------------------------ Video Encoding ------------------------
@@ -321,7 +341,9 @@ class Wan2_I2V_Adapter(BaseAdapter):
         pass
 
     # ------------------------ Latent Decoding ------------------------
-    def decode_latents(self, latents: torch.Tensor, output_type: Literal['pt', 'pil', 'np'] = 'pil') -> torch.Tensor:
+    def decode_latents(
+        self, latents: torch.Tensor, output_type: Literal["pt", "pil", "np"] = "pil"
+    ) -> torch.Tensor:
         """Decode the latents using the VAE decoder."""
         latents = latents.float()
         latents_mean = (
@@ -329,15 +351,15 @@ class Wan2_I2V_Adapter(BaseAdapter):
             .view(1, self.pipeline.vae.config.z_dim, 1, 1, 1)
             .to(latents.device, latents.dtype)
         )
-        latents_std = 1.0 / torch.tensor(self.pipeline.vae.config.latents_std).view(1, self.pipeline.vae.config.z_dim, 1, 1, 1).to(
-            latents.device, latents.dtype
-        )
+        latents_std = 1.0 / torch.tensor(self.pipeline.vae.config.latents_std).view(
+            1, self.pipeline.vae.config.z_dim, 1, 1, 1
+        ).to(latents.device, latents.dtype)
         latents = latents / latents_std + latents_mean
         video = self.pipeline.vae.decode(latents, return_dict=False)[0]
 
         video = self.pipeline.video_processor.postprocess_video(video, output_type=output_type)
         return video
-    
+
     # ======================== Latent Preparation ========================
     def prepare_latents(
         self,
@@ -354,7 +376,7 @@ class Wan2_I2V_Adapter(BaseAdapter):
         last_image: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-            Modified from `diffusers: WanImageToVideoPipeline` with batch_size bug fixed
+        Modified from `diffusers: WanImageToVideoPipeline` with batch_size bug fixed
         """
         num_latent_frames = (num_frames - 1) // self.pipeline.vae_scale_factor_temporal + 1
         latent_height = height // self.pipeline.vae_scale_factor_spatial
@@ -379,12 +401,20 @@ class Wan2_I2V_Adapter(BaseAdapter):
 
         elif last_image is None:
             video_condition = torch.cat(
-                [image, image.new_zeros(image.shape[0], image.shape[1], num_frames - 1, height, width)], dim=2
+                [
+                    image,
+                    image.new_zeros(image.shape[0], image.shape[1], num_frames - 1, height, width),
+                ],
+                dim=2,
             )
         else:
             last_image = last_image.unsqueeze(2)
             video_condition = torch.cat(
-                [image, image.new_zeros(image.shape[0], image.shape[1], num_frames - 2, height, width), last_image],
+                [
+                    image,
+                    image.new_zeros(image.shape[0], image.shape[1], num_frames - 2, height, width),
+                    last_image,
+                ],
                 dim=2,
             )
         video_condition = video_condition.to(device=device, dtype=self.pipeline.vae.dtype)
@@ -394,11 +424,13 @@ class Wan2_I2V_Adapter(BaseAdapter):
             .view(1, self.pipeline.vae.config.z_dim, 1, 1, 1)
             .to(latents.device, latents.dtype)
         )
-        latents_std = 1.0 / torch.tensor(self.pipeline.vae.config.latents_std).view(1, self.pipeline.vae.config.z_dim, 1, 1, 1).to(
-            latents.device, latents.dtype
-        )
+        latents_std = 1.0 / torch.tensor(self.pipeline.vae.config.latents_std).view(
+            1, self.pipeline.vae.config.z_dim, 1, 1, 1
+        ).to(latents.device, latents.dtype)
 
-        latent_condition = retrieve_latents(self.pipeline.vae.encode(video_condition), sample_mode="argmax")
+        latent_condition = retrieve_latents(
+            self.pipeline.vae.encode(video_condition), sample_mode="argmax"
+        )
         if latent_condition.shape[0] == 1 and batch_size > 1:
             latent_condition = latent_condition.repeat(batch_size, 1, 1, 1, 1)
 
@@ -419,9 +451,13 @@ class Wan2_I2V_Adapter(BaseAdapter):
         else:
             mask_lat_size[:, :, 1:-1] = 0
         first_frame_mask = mask_lat_size[:, :, 0:1]
-        first_frame_mask = torch.repeat_interleave(first_frame_mask, dim=2, repeats=self.pipeline.vae_scale_factor_temporal)
+        first_frame_mask = torch.repeat_interleave(
+            first_frame_mask, dim=2, repeats=self.pipeline.vae_scale_factor_temporal
+        )
         mask_lat_size = torch.concat([first_frame_mask, mask_lat_size[:, :, 1:, :]], dim=2)
-        mask_lat_size = mask_lat_size.view(batch_size, -1, self.pipeline.vae_scale_factor_temporal, latent_height, latent_width)
+        mask_lat_size = mask_lat_size.view(
+            batch_size, -1, self.pipeline.vae_scale_factor_temporal, latent_height, latent_width
+        )
         mask_lat_size = mask_lat_size.transpose(1, 2)
         mask_lat_size = mask_lat_size.to(latent_condition.device)
 
@@ -451,14 +487,14 @@ class Wan2_I2V_Adapter(BaseAdapter):
         # Encoded Image
         image_embeds: Optional[torch.Tensor] = None,
         condition_images: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-        last_image: Optional[torch.Tensor] = None, # Not supported yet
+        last_image: Optional[torch.Tensor] = None,  # Not supported yet
         # Other args
         compute_log_prob: bool = False,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         max_sequence_length: int = 512,
         # Extra callback arguments
         extra_call_back_kwargs: List[str] = [],
-        trajectory_indices: TrajectoryIndicesType = 'all',
+        trajectory_indices: TrajectoryIndicesType = "all",
     ) -> List[WanI2VSample]:
         # 1. Setup args
         device = self.device
@@ -468,8 +504,15 @@ class Wan2_I2V_Adapter(BaseAdapter):
             guidance_scale_2 = guidance_scale
         # Check `num_frames`
         if (num_frames - 1) % self.pipeline.vae_scale_factor_temporal != 0:
-            logger.warning(f"`num_frames - 1` has to be divisible by {self.pipeline.vae_scale_factor_temporal}. Rounding to the nearest number.")
-            num_frames = num_frames // self.pipeline.vae_scale_factor_temporal * self.pipeline.vae_scale_factor_temporal + 1
+            logger.warning(
+                f"`num_frames - 1` has to be divisible by {self.pipeline.vae_scale_factor_temporal}. Rounding to the nearest number."
+            )
+            num_frames = (
+                num_frames
+                // self.pipeline.vae_scale_factor_temporal
+                * self.pipeline.vae_scale_factor_temporal
+                + 1
+            )
         num_frames = max(num_frames, 1)
         # Check `height` and `width`
         patch_size = (
@@ -488,7 +531,7 @@ class Wan2_I2V_Adapter(BaseAdapter):
             )
             height, width = calc_height, calc_width
 
-        images = self._standardize_image_input(images, output_type='pil')
+        images = self._standardize_image_input(images, output_type="pil")
 
         # 2. Encode prompt
         if prompt_embeds is None:
@@ -509,7 +552,11 @@ class Wan2_I2V_Adapter(BaseAdapter):
                 negative_prompt_embeds = negative_prompt_embeds.to(device)
 
         batch_size = prompt_embeds.shape[0]
-        transformer_dtype = self.pipeline.transformer.dtype if self.pipeline.transformer is not None else self.pipeline.transformer_2.dtype
+        transformer_dtype = (
+            self.pipeline.transformer.dtype
+            if self.pipeline.transformer is not None
+            else self.pipeline.transformer_2.dtype
+        )
         prompt_embeds = prompt_embeds.to(transformer_dtype)
         if negative_prompt_embeds is not None:
             negative_prompt_embeds = negative_prompt_embeds.to(transformer_dtype)
@@ -520,21 +567,30 @@ class Wan2_I2V_Adapter(BaseAdapter):
 
         # 4. Encode image
         # Only wan 2.1 i2v transformer accepts image_embeds
-        if self.pipeline.transformer is not None and self.pipeline.transformer.config.image_dim is not None:
+        if (
+            self.pipeline.transformer is not None
+            and self.pipeline.transformer.config.image_dim is not None
+        ):
             if image_embeds is None:
                 image_to_encode = images if last_image is None else [images, last_image]
                 image_encoded = self.encode_image(image_to_encode, device)
-                image_embeds = image_encoded['image_embeds']
+                image_embeds = image_encoded["image_embeds"]
 
-        image_embeds = image_embeds.to(device=device, dtype=transformer_dtype) if image_embeds is not None else None
+        image_embeds = (
+            image_embeds.to(device=device, dtype=transformer_dtype)
+            if image_embeds is not None
+            else None
+        )
 
         # 5. Prepare latent variables
         num_channels_latents = self.pipeline.vae.config.z_dim
-        images = self.pipeline.video_processor.preprocess(images, height=height, width=width).to(device, dtype=torch.float32)
+        images = self.pipeline.video_processor.preprocess(images, height=height, width=width).to(
+            device, dtype=torch.float32
+        )
         if last_image is not None:
-            last_image = self.pipeline.video_processor.preprocess(last_image, height=height, width=width).to(
-                device, dtype=torch.float32
-            )
+            last_image = self.pipeline.video_processor.preprocess(
+                last_image, height=height, width=width
+            ).to(device, dtype=torch.float32)
 
         # Inside the following function, preparing `latents_condition` requires `latents_mean` and `latents_std`,
         # which depend on `latents` initialized at runtime. Therefore, this part is kept inside inference function and not moved to preprocess_func.
@@ -561,19 +617,23 @@ class Wan2_I2V_Adapter(BaseAdapter):
         # 6. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self.pipeline._num_timesteps = len(timesteps)
-        
+
         latent_collector = create_trajectory_collector(trajectory_indices, num_inference_steps)
         latents = self.cast_latents(latents)
         latent_collector.collect(latents, step_idx=0)
         if compute_log_prob:
-            log_prob_collector = create_trajectory_collector(trajectory_indices, num_inference_steps)
+            log_prob_collector = create_trajectory_collector(
+                trajectory_indices, num_inference_steps
+            )
         callback_collector = create_callback_collector(trajectory_indices, num_inference_steps)
 
         for i, t in enumerate(timesteps):
             self.pipeline._current_timestep = t
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
             t_next = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
-            return_kwargs = list(set(['next_latents', 'log_prob', 'velocity'] + extra_call_back_kwargs))
+            return_kwargs = list(
+                set(["next_latents", "log_prob", "velocity"] + extra_call_back_kwargs)
+            )
             current_compute_log_prob = compute_log_prob and current_noise_level > 0
 
             output = self.forward(
@@ -602,30 +662,37 @@ class Wan2_I2V_Adapter(BaseAdapter):
                 step_idx=i,
                 output=output,
                 keys=extra_call_back_kwargs,
-                capturable={'noise_level': current_noise_level},
+                capturable={"noise_level": current_noise_level},
             )
-
 
         self.pipeline._current_timestep = None
 
         # 7. Decode latents to videos (list of pil images)
         if self.pipeline.config.expand_timesteps:
             latents = (1 - first_frame_mask) * condition + first_frame_mask * latents
-        decoded_videos = self.decode_latents(latents, output_type='pt')
+        decoded_videos = self.decode_latents(latents, output_type="pt")
 
         # 8. Prepare output samples
-        extra_call_back_res = callback_collector.get_result()          # (B, len(trajectory_indices), ...)
-        callback_index_map = callback_collector.get_index_map()        # (T,) LongTensor
-        all_latents = latent_collector.get_result()                    # List[torch.Tensor(B, ...)]
-        latent_index_map = latent_collector.get_index_map()            # (T+1,) LongTensor
+        extra_call_back_res = callback_collector.get_result()  # (B, len(trajectory_indices), ...)
+        callback_index_map = callback_collector.get_index_map()  # (T,) LongTensor
+        all_latents = latent_collector.get_result()  # List[torch.Tensor(B, ...)]
+        latent_index_map = latent_collector.get_index_map()  # (T+1,) LongTensor
         all_log_probs = log_prob_collector.get_result() if compute_log_prob else None
         log_prob_index_map = log_prob_collector.get_index_map() if compute_log_prob else None
         samples = [
             WanI2VSample(
                 # Denoising trajectory
                 timesteps=timesteps,
-                all_latents=torch.stack([lat[b] for lat in all_latents], dim=0) if all_latents is not None else None,
-                log_probs=torch.stack([lp[b] for lp in all_log_probs], dim=0) if all_log_probs is not None else None,
+                all_latents=(
+                    torch.stack([lat[b] for lat in all_latents], dim=0)
+                    if all_latents is not None
+                    else None
+                ),
+                log_probs=(
+                    torch.stack([lp[b] for lp in all_log_probs], dim=0)
+                    if all_log_probs is not None
+                    else None
+                ),
                 latent_index_map=latent_index_map,
                 log_prob_index_map=log_prob_index_map,
                 # Generated video & metadata
@@ -635,20 +702,26 @@ class Wan2_I2V_Adapter(BaseAdapter):
                 # Conditions
                 condition_images=images[b],
                 condition=condition[b],
-                first_frame_mask=first_frame_mask, # Possibly None
+                first_frame_mask=first_frame_mask,  # Possibly None
                 image_embeds=image_embeds[b] if image_embeds is not None else None,
                 # Prompt info
                 prompt=prompt[b] if isinstance(prompt, list) else prompt,
                 prompt_ids=prompt_ids[b] if prompt_ids is not None else None,
                 prompt_embeds=prompt_embeds[b] if prompt_embeds is not None else None,
                 # Negative prompt info
-                negative_prompt=negative_prompt[b] if isinstance(negative_prompt, list) else negative_prompt,
-                negative_prompt_ids=negative_prompt_ids[b] if negative_prompt_ids is not None else None,
-                negative_prompt_embeds=negative_prompt_embeds[b] if negative_prompt_embeds is not None else None,
+                negative_prompt=(
+                    negative_prompt[b] if isinstance(negative_prompt, list) else negative_prompt
+                ),
+                negative_prompt_ids=(
+                    negative_prompt_ids[b] if negative_prompt_ids is not None else None
+                ),
+                negative_prompt_embeds=(
+                    negative_prompt_embeds[b] if negative_prompt_embeds is not None else None
+                ),
                 # Extra kwargs
                 extra_kwargs={
                     **{k: v[b] for k, v in extra_call_back_res.items()},
-                    'callback_index_map': callback_index_map,
+                    "callback_index_map": callback_index_map,
                 },
             )
             for b in range(batch_size)
@@ -657,7 +730,6 @@ class Wan2_I2V_Adapter(BaseAdapter):
         self.pipeline.maybe_free_model_hooks()
 
         return samples
-    
 
     # ======================== Forward ========================
     def forward(
@@ -681,7 +753,14 @@ class Wan2_I2V_Adapter(BaseAdapter):
         noise_level: Optional[float] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
-        return_kwargs: List[str] = ['velocity', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
+        return_kwargs: List[str] = [
+            "velocity",
+            "next_latents",
+            "next_latents_mean",
+            "std_dev_t",
+            "dt",
+            "log_prob",
+        ],
     ) -> UniPCMultistepSDESchedulerOutput:
         """
         Core forward pass for a single denoising step.
@@ -707,17 +786,23 @@ class Wan2_I2V_Adapter(BaseAdapter):
             UniPCMultistepSDESchedulerOutput containing requested outputs.
         """
         # 1. Preprare variables
-        t = t[0] if t.ndim == 1 else t # A scalar
+        t = t[0] if t.ndim == 1 else t  # A scalar
         if t_next is not None:
             t_next = t_next[0] if t_next.ndim == 1 else t_next
 
         batch_size = latents.shape[0]
-        dtype = self.pipeline.transformer.dtype if self.pipeline.transformer is not None else self.pipeline.transformer_2.dtype
+        dtype = (
+            self.pipeline.transformer.dtype
+            if self.pipeline.transformer is not None
+            else self.pipeline.transformer_2.dtype
+        )
         device = latents.device
 
         # Determine boundary timestep
         if boundary_timestep is None and self.pipeline.config.boundary_ratio is not None:
-            boundary_timestep = self.pipeline.config.boundary_ratio * self.scheduler.config.num_train_timesteps
+            boundary_timestep = (
+                self.pipeline.config.boundary_ratio * self.scheduler.config.num_train_timesteps
+            )
         # Determine which transformer to use
         if boundary_timestep is None or t >= boundary_timestep:
             pipeline_transformer = self.pipeline.transformer
@@ -726,7 +811,9 @@ class Wan2_I2V_Adapter(BaseAdapter):
         else:
             pipeline_transformer = self.pipeline.transformer_2
             transformer = self.transformer_2
-            current_guidance_scale = guidance_scale_2 if guidance_scale_2 is not None else guidance_scale
+            current_guidance_scale = (
+                guidance_scale_2 if guidance_scale_2 is not None else guidance_scale
+            )
 
         # Auto-detect CFG
         if current_guidance_scale > 1.0 and negative_prompt_embeds is None:
@@ -735,8 +822,7 @@ class Wan2_I2V_Adapter(BaseAdapter):
                 "Classifier-free guidance will be disabled."
             )
         do_classifier_free_guidance = (
-            negative_prompt_embeds is not None
-            and current_guidance_scale > 1.0
+            negative_prompt_embeds is not None and current_guidance_scale > 1.0
         )
 
         # Prepare latent model input based on wan version

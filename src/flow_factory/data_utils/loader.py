@@ -32,7 +32,7 @@ from .sampler_loader import get_data_sampler
 
 logger = setup_logger(__name__, rank_zero_only=False)
 
-os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 def _get_local_process_info(accelerator: Accelerator):
@@ -169,9 +169,7 @@ def _create_or_load_dataset(
     #    name; the rank_*_of_N subdir prevents cross-config collisions if a stale
     #    .tmp directory survives a launch-config change between runs. Layout is
     #    owned by GeneralDataset so the writer and the consolidator cannot drift.
-    part_arrow_path = GeneralDataset.build_part_arrow_path(
-        merged_cache_path, shard_idx, num_shards
-    )
+    part_arrow_path = GeneralDataset.build_part_arrow_path(merged_cache_path, shard_idx, num_shards)
     kwargs["target_arrow_path"] = part_arrow_path
 
     logger.info(
@@ -237,26 +235,30 @@ def get_train_dataloader(
     training_args = config.training_args
 
     enable_distributed = accelerator.num_processes > 1 and data_args.enable_preprocess
-    preprocess_parallelism = getattr(data_args, 'preprocess_parallelism', 'local')
+    preprocess_parallelism = getattr(data_args, "preprocess_parallelism", "local")
 
     # Common dataset kwargs (shared across legacy / multi-source paths).
     base_kwargs = {
         "preprocess_func": preprocess_func,
-        "preprocess_kwargs": filter_kwargs(preprocess_func, **data_args) if preprocess_func else None,
-        'extra_hash_strs': [
+        "preprocess_kwargs": (
+            filter_kwargs(preprocess_func, **data_args) if preprocess_func else None
+        ),
+        "extra_hash_strs": [
             config.model_args.model_type,
             config.model_args.model_name_or_path,
         ],
     }
     base_kwargs.update(filter_kwargs(GeneralDataset.__init__, **data_args))
-    base_kwargs['force_reprocess'] = data_args.force_reprocess
+    base_kwargs["force_reprocess"] = data_args.force_reprocess
 
     # Train preprocess kwargs (algorithm-aware guidance scale, etc.).
-    train_preprocess_kwargs = (base_kwargs.get('preprocess_kwargs') or {}).copy()
-    train_preprocess_kwargs.update({'is_train': True, **training_args})
-    train_preprocess_kwargs['guidance_scale'] = training_args.get_preprocess_guidance_scale()
+    train_preprocess_kwargs = (base_kwargs.get("preprocess_kwargs") or {}).copy()
+    train_preprocess_kwargs.update({"is_train": True, **training_args})
+    train_preprocess_kwargs["guidance_scale"] = training_args.get_preprocess_guidance_scale()
     train_preprocess_kwargs = (
-        filter_kwargs(preprocess_func, **train_preprocess_kwargs) if preprocess_func else train_preprocess_kwargs
+        filter_kwargs(preprocess_func, **train_preprocess_kwargs)
+        if preprocess_func
+        else train_preprocess_kwargs
     )
 
     # ------------------------------------------------------------------
@@ -382,7 +384,7 @@ def _load_per_source_train_dataloaders(
         dataset = _create_or_load_dataset(
             split=spec.split,
             accelerator=accelerator,
-            base_kwargs={**per_kwargs, 'preprocess_kwargs': train_preprocess_kwargs},
+            base_kwargs={**per_kwargs, "preprocess_kwargs": train_preprocess_kwargs},
             enable_distributed=enable_distributed,
             preprocess_parallelism=preprocess_parallelism,
         )
@@ -462,7 +464,7 @@ def get_eval_dataloaders(
     eval_args = config.eval_args
 
     enable_distributed = accelerator.num_processes > 1 and data_args.enable_preprocess
-    preprocess_parallelism = getattr(data_args, 'preprocess_parallelism', 'local')
+    preprocess_parallelism = getattr(data_args, "preprocess_parallelism", "local")
 
     eval_dataloaders: Dict[str, DataLoader] = {}
 
@@ -485,7 +487,7 @@ def get_eval_dataloaders(
         if preprocess_func:
             merged_eval = spec.get_merged_eval_kwargs(eval_args)
             per_preprocess_kwargs = filter_kwargs(preprocess_func, **data_args).copy()
-            per_preprocess_kwargs.update({'is_train': False, **merged_eval})
+            per_preprocess_kwargs.update({"is_train": False, **merged_eval})
             per_preprocess_kwargs = filter_kwargs(preprocess_func, **per_preprocess_kwargs)
 
         # Check that the split file exists

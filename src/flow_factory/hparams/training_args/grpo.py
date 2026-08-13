@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """Training arguments for GRPO / GRPO-Guard."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -30,9 +31,11 @@ class GRPOTrainingArguments(TrainingArguments):
         default=True,
         metadata={"help": "Whether to use global std for advantage normalization."},
     )
-    advantage_aggregation: Literal['sum', 'gdpo'] = field(
-        default='gdpo',
-        metadata={"help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo']."},
+    advantage_aggregation: Literal["sum", "gdpo"] = field(
+        default="gdpo",
+        metadata={
+            "help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo']."
+        },
     )
     # Clipping / KL
     clip_range: tuple[float, float] = field(
@@ -43,9 +46,11 @@ class GRPOTrainingArguments(TrainingArguments):
         default=(-5.0, 5.0),
         metadata={"help": "Clipping range for advantages."},
     )
-    kl_type: Literal['v-based', 'x-based'] = field(
-        default='x-based',
-        metadata={"help": "Type of KL divergence. 'v-based': velocity space, 'x-based': latent space."},
+    kl_type: Literal["v-based", "x-based"] = field(
+        default="x-based",
+        metadata={
+            "help": "Type of KL divergence. 'v-based': velocity space, 'x-based': latent space."
+        },
     )
     kl_beta: float = field(
         default=0,
@@ -60,10 +65,12 @@ class GRPOTrainingArguments(TrainingArguments):
         super().__post_init__()
         # Guard kl_beta against scientific-notation strings (e.g. "1e-3" from CLI overrides).
         self.kl_beta = float(self.kl_beta)
-        self.clip_range = _standardize_clip_range(self.clip_range, 'clip_range')
-        self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, 'adv_clip_range')
-        if self.kl_type not in ['v-based', 'x-based']:
-            raise ValueError(f"Invalid KL type: {self.kl_type}. Valid options are: ['v-based', 'x-based'].")
+        self.clip_range = _standardize_clip_range(self.clip_range, "clip_range")
+        self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, "adv_clip_range")
+        if self.kl_type not in ["v-based", "x-based"]:
+            raise ValueError(
+                f"Invalid KL type: {self.kl_type}. Valid options are: ['v-based', 'x-based']."
+            )
 
     def get_num_train_timesteps(self, args: Any) -> int:
         return args.scheduler_args.num_sde_steps

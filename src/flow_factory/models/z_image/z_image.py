@@ -15,35 +15,35 @@
 # src/flow_factory/models/z_image/z_image.py
 from __future__ import annotations
 
-import os
-from typing import Union, List, Dict, Any, Optional, Tuple, ClassVar, Literal
-from dataclasses import dataclass
-from PIL import Image
-from collections import defaultdict
 import logging
+import os
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 from accelerate import Accelerator
 from diffusers.pipelines.z_image.pipeline_z_image import ZImagePipeline
+from PIL import Image
 
-from ..abc import BaseAdapter
-from ...samples import T2ISample
 from ...hparams import *
+from ...samples import T2ISample
 from ...scheduler import (
     FlowMatchEulerDiscreteSDEScheduler,
     FlowMatchEulerDiscreteSDESchedulerOutput,
     SDESchedulerOutput,
-    set_scheduler_timesteps
-)
-from ...utils.trajectory_collector import (
-    TrajectoryCollector,
-    CallbackCollector,
-    TrajectoryIndicesType,
-    create_trajectory_collector,
-    create_callback_collector,
+    set_scheduler_timesteps,
 )
 from ...utils.base import filter_kwargs
 from ...utils.logger_utils import setup_logger
+from ...utils.trajectory_collector import (
+    CallbackCollector,
+    TrajectoryCollector,
+    TrajectoryIndicesType,
+    create_callback_collector,
+    create_trajectory_collector,
+)
+from ..abc import BaseAdapter
 
 logger = setup_logger(__name__)
 
@@ -54,28 +54,33 @@ class ZImageSample(T2ISample):
     _shared_fields: ClassVar[frozenset[str]] = frozenset({})
     # Obj var - no extra
 
+
 class ZImageAdapter(BaseAdapter):
-    def __init__(self, config: Arguments, accelerator : Accelerator):
+    def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
         self.pipeline: ZImagePipeline
         self.scheduler: FlowMatchEulerDiscreteSDEScheduler
 
     def load_pipeline(self) -> ZImagePipeline:
         return ZImagePipeline.from_pretrained(
-            self.model_args.model_name_or_path,
-            low_cpu_mem_usage=False
+            self.model_args.model_name_or_path, low_cpu_mem_usage=False
         )
-    
+
     @property
     def default_target_modules(self) -> List[str]:
         """Default LoRA target modules for Z-Image transformer."""
         return [
-            "attention.to_k", "attention.to_q", "attention.to_v", "attention.to_out.0",
-            "feed_forward.w1", "feed_forward.w2", "feed_forward.w3",
+            "attention.to_k",
+            "attention.to_q",
+            "attention.to_v",
+            "attention.to_out.0",
+            "feed_forward.w1",
+            "feed_forward.w2",
+            "feed_forward.w3",
         ]
 
-    # ======================== Encoding / Decoding ======================== 
-    # ----------------------- Prompt Encoding -----------------------   
+    # ======================== Encoding / Decoding ========================
+    # ----------------------- Prompt Encoding -----------------------
     def _encode_prompt(
         self,
         prompt: Union[str, List[str]],
@@ -146,21 +151,29 @@ class ZImageAdapter(BaseAdapter):
 
         if do_classifier_free_guidance:
             negative_prompt = negative_prompt or ""
-            negative_prompt = [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
-            negative_prompt = negative_prompt * (len(prompt) // len(negative_prompt)) # Expand to match batch size
-            assert len(negative_prompt) == len(prompt), "The number of negative prompts must match the number of prompts."
+            negative_prompt = (
+                [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+            )
+            negative_prompt = negative_prompt * (
+                len(prompt) // len(negative_prompt)
+            )  # Expand to match batch size
+            assert len(negative_prompt) == len(
+                prompt
+            ), "The number of negative prompts must match the number of prompts."
             negative_prompt_embeds, negative_prompt_ids = self._encode_prompt(
                 prompt=negative_prompt,
                 device=device,
                 max_sequence_length=max_sequence_length,
             )
-            results.update({
-                "negative_prompt_embeds": negative_prompt_embeds,
-                "negative_prompt_ids": negative_prompt_ids,
-            })
+            results.update(
+                {
+                    "negative_prompt_embeds": negative_prompt_embeds,
+                    "negative_prompt_ids": negative_prompt_ids,
+                }
+            )
 
         return results
-    
+
     # ----------------------- Image / Video Encoding & Decoding -----------------------
     def encode_image(
         self,
@@ -179,16 +192,18 @@ class ZImageAdapter(BaseAdapter):
     def decode_latents(
         self,
         latents: torch.Tensor,
-        output_type: Literal['pil', 'pt', 'np'] = 'pil',
+        output_type: Literal["pil", "pt", "np"] = "pil",
     ) -> torch.Tensor:
         latents = latents.to(self.pipeline.vae.dtype)
-        latents = (latents / self.pipeline.vae.config.scaling_factor) + self.pipeline.vae.config.shift_factor
+        latents = (
+            latents / self.pipeline.vae.config.scaling_factor
+        ) + self.pipeline.vae.config.shift_factor
 
         images = self.pipeline.vae.decode(latents, return_dict=False)[0]
         images = self.pipeline.image_processor.postprocess(images, output_type=output_type)
 
         return images
-    
+
     # ======================== Inference ========================
 
     @torch.no_grad()
@@ -201,7 +216,7 @@ class ZImageAdapter(BaseAdapter):
         width: int = 1024,
         # Prompt
         prompt: Union[str, List[str]] = None,
-        prompt_ids : Optional[torch.Tensor] = None,
+        prompt_ids: Optional[torch.Tensor] = None,
         prompt_embeds: Optional[List[torch.FloatTensor]] = None,
         # Negative prompt
         negative_prompt: Optional[Union[str, List[str]]] = None,
@@ -216,7 +231,7 @@ class ZImageAdapter(BaseAdapter):
         compute_log_prob: bool = True,
         # Extra callback arguments
         extra_call_back_kwargs: List[str] = [],
-        trajectory_indices: TrajectoryIndicesType = 'all',
+        trajectory_indices: TrajectoryIndicesType = "all",
     ):
         """Generate images from text prompts using the Z-Image model."""
 
@@ -228,16 +243,20 @@ class ZImageAdapter(BaseAdapter):
         # 2. Encode prompts if not provided
         if prompt_embeds is None:
             encoded = self.encode_prompt(
-                prompt=prompt, 
+                prompt=prompt,
                 negative_prompt=negative_prompt,
                 max_sequence_length=max_sequence_length,
                 guidance_scale=guidance_scale,
-                device=device
+                device=device,
             )
-            prompt_ids = encoded['prompt_ids']
-            prompt_embeds = encoded['prompt_embeds']
-            negative_prompt_ids = encoded['negative_prompt_ids'] if do_classifier_free_guidance else None
-            negative_prompt_embeds = encoded['negative_prompt_embeds'] if do_classifier_free_guidance else None
+            prompt_ids = encoded["prompt_ids"]
+            prompt_embeds = encoded["prompt_embeds"]
+            negative_prompt_ids = (
+                encoded["negative_prompt_ids"] if do_classifier_free_guidance else None
+            )
+            negative_prompt_embeds = (
+                encoded["negative_prompt_embeds"] if do_classifier_free_guidance else None
+            )
         else:
             prompt_embeds = [pe.to(device) for pe in prompt_embeds]
             if negative_prompt_embeds is not None:
@@ -271,13 +290,17 @@ class ZImageAdapter(BaseAdapter):
         latents = self.cast_latents(latents, default_dtype=dtype)
         latent_collector.collect(latents, step_idx=0)
         if compute_log_prob:
-            log_prob_collector = create_trajectory_collector(trajectory_indices, num_inference_steps)
+            log_prob_collector = create_trajectory_collector(
+                trajectory_indices, num_inference_steps
+            )
         callback_collector = create_callback_collector(trajectory_indices, num_inference_steps)
-        
+
         for i, t in enumerate(timesteps):
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
             t_next = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
-            return_kwargs = list(set(['next_latents', 'log_prob', 'velocity'] + extra_call_back_kwargs))
+            return_kwargs = list(
+                set(["next_latents", "log_prob", "velocity"] + extra_call_back_kwargs)
+            )
             current_compute_log_prob = compute_log_prob and current_noise_level > 0
 
             output = self.forward(
@@ -303,25 +326,33 @@ class ZImageAdapter(BaseAdapter):
                 step_idx=i,
                 output=output,
                 keys=extra_call_back_kwargs,
-                capturable={'noise_level': current_noise_level},
+                capturable={"noise_level": current_noise_level},
             )
 
         # 6. Decode latents to images
-        images = self.decode_latents(latents, output_type='pt')
+        images = self.decode_latents(latents, output_type="pt")
 
         # 7. Create samples
-        extra_call_back_res = callback_collector.get_result()          # (B, len(trajectory_indices), ...)
-        callback_index_map = callback_collector.get_index_map()        # (T,) LongTensor
-        all_latents = latent_collector.get_result()                    # List[torch.Tensor(B, ...)]
-        latent_index_map = latent_collector.get_index_map()            # (T+1,) LongTensor
+        extra_call_back_res = callback_collector.get_result()  # (B, len(trajectory_indices), ...)
+        callback_index_map = callback_collector.get_index_map()  # (T,) LongTensor
+        all_latents = latent_collector.get_result()  # List[torch.Tensor(B, ...)]
+        latent_index_map = latent_collector.get_index_map()  # (T+1,) LongTensor
         all_log_probs = log_prob_collector.get_result() if compute_log_prob else None
         log_prob_index_map = log_prob_collector.get_index_map() if compute_log_prob else None
         samples = [
             ZImageSample(
                 # Denoising trajectory
                 timesteps=timesteps,
-                all_latents=torch.stack([lat[b] for lat in all_latents], dim=0) if all_latents is not None else None,
-                log_probs=torch.stack([lp[b] for lp in all_log_probs], dim=0) if all_log_probs is not None else None,
+                all_latents=(
+                    torch.stack([lat[b] for lat in all_latents], dim=0)
+                    if all_latents is not None
+                    else None
+                ),
+                log_probs=(
+                    torch.stack([lp[b] for lp in all_log_probs], dim=0)
+                    if all_log_probs is not None
+                    else None
+                ),
                 latent_index_map=latent_index_map,
                 log_prob_index_map=log_prob_index_map,
                 # Generated image & metadata
@@ -334,21 +365,25 @@ class ZImageAdapter(BaseAdapter):
                 prompt_embeds=prompt_embeds[b] if prompt_embeds is not None else None,
                 # Encoded negative prompt
                 negative_prompt=negative_prompt[b] if negative_prompt is not None else None,
-                negative_prompt_ids=negative_prompt_ids[b] if negative_prompt_ids is not None else None,
-                negative_prompt_embeds=negative_prompt_embeds[b] if negative_prompt_embeds is not None else None,
+                negative_prompt_ids=(
+                    negative_prompt_ids[b] if negative_prompt_ids is not None else None
+                ),
+                negative_prompt_embeds=(
+                    negative_prompt_embeds[b] if negative_prompt_embeds is not None else None
+                ),
                 # Extra kwargs
                 extra_kwargs={
                     **{k: v[b] for k, v in extra_call_back_res.items()},
-                    'callback_index_map': callback_index_map,
+                    "callback_index_map": callback_index_map,
                 },
             )
             for b in range(batch_size)
         ]
-        
+
         self.pipeline.maybe_free_model_hooks()
 
         return samples
-    
+
     # ======================== Forward (Training) ========================
     def forward(
         self,
@@ -366,7 +401,14 @@ class ZImageAdapter(BaseAdapter):
         # Other
         noise_level: Optional[float] = None,
         compute_log_prob: bool = True,
-        return_kwargs: List[str] = ['velocity', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
+        return_kwargs: List[str] = [
+            "velocity",
+            "next_latents",
+            "next_latents_mean",
+            "std_dev_t",
+            "dt",
+            "log_prob",
+        ],
     ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
         """
         Core forward pass for T2I generation.
@@ -397,7 +439,7 @@ class ZImageAdapter(BaseAdapter):
         prompt_embeds = [pe.to(device) for pe in prompt_embeds]
         if negative_prompt_embeds is not None:
             negative_prompt_embeds = [npe.to(device) for npe in negative_prompt_embeds]
-        
+
         # Z-Image uses reversed timesteps
         timestep = t.expand(batch_size).to(latents.dtype)
         t_reversed = (1000 - timestep) / 1000
@@ -409,10 +451,7 @@ class ZImageAdapter(BaseAdapter):
                 "Passed `guidance_scale` > 0.0, but no `negative_prompt_embeds` provided. "
                 "Classifier-free guidance will be disabled."
             )
-        do_classifier_free_guidance = (
-            negative_prompt_embeds is not None
-            and guidance_scale > 0.0
-        )
+        do_classifier_free_guidance = negative_prompt_embeds is not None and guidance_scale > 0.0
 
         # 2. Determine if CFG should be applied at this timestep
         if (
@@ -454,12 +493,12 @@ class ZImageAdapter(BaseAdapter):
             pos_out = model_out_list[:batch_size]
             neg_out = model_out_list[batch_size:]
             velocity = []
-            
+
             for j in range(batch_size):
                 pos = pos_out[j].float()
                 neg = neg_out[j].float()
                 pred = pos + current_guidance_scale * (pos - neg)
-                
+
                 # CFG normalization
                 if cfg_normalization and float(cfg_normalization) > 0.0:
                     ori_pos_norm = torch.linalg.vector_norm(pos)
@@ -467,9 +506,9 @@ class ZImageAdapter(BaseAdapter):
                     max_new_norm = ori_pos_norm * float(cfg_normalization)
                     if new_pos_norm > max_new_norm:
                         pred = pred * (max_new_norm / new_pos_norm)
-                
+
                 velocity.append(pred)
-            
+
             velocity = torch.stack(velocity, dim=0)
         else:
             velocity = torch.stack([out.float() for out in model_out_list], dim=0)
@@ -489,5 +528,5 @@ class ZImageAdapter(BaseAdapter):
             return_kwargs=return_kwargs,
             noise_level=noise_level,
         )
-        
+
         return output

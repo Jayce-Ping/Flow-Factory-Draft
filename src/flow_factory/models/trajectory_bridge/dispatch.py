@@ -22,9 +22,8 @@ from ...samples import (
     MultiModalStepOutput,
     StackedSampleBatch,
 )
-from ...utils.base import filter_kwargs
 from ...scheduler import SDESchedulerOutput
-
+from ...utils.base import filter_kwargs
 
 _STORAGE_KEYS = {
     "trajectory",

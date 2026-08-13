@@ -37,8 +37,10 @@ cross-rank-deterministic draws:
   guaranteeing that two ranks with the same seed produce byte-identical
   timesteps regardless of their device placement.
 """
-import torch
+
 from typing import Optional, Tuple, Union
+
+import torch
 
 TIMESTEP_MAX = 1000.0
 

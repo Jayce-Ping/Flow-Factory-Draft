@@ -17,14 +17,15 @@
 EMA Module Wrapper with functional decay scheduling.
 """
 
-from typing import Optional, Literal
 from collections.abc import Iterable
 from contextlib import contextmanager
+from typing import Literal, Optional
+
 import torch
 
 from ..utils.base import filter_kwargs
-from .ema_utils import DecayFn, create_decay_fn
 from ..utils.logger_utils import setup_logger
+from .ema_utils import DecayFn, create_decay_fn
 
 logger = setup_logger(__name__)
 
@@ -32,16 +33,16 @@ logger = setup_logger(__name__)
 class EMAModuleWrapper:
     """
     Exponential Moving Average wrapper with configurable decay function.
-    
+
     Example:
         >>> # Simple usage with schedule type
         >>> ema = EMAModuleWrapper(model.parameters(), decay=0.999, decay_schedule="power")
-        >>> 
+        >>>
         >>> # Custom decay function
         >>> from ema_utils import piecewise_linear_decay
         >>> ema = EMAModuleWrapper(model.parameters(), decay_fn=piecewise_linear_decay(0, 0.001, 0.5))
     """
-    
+
     def __init__(
         self,
         parameters: Iterable[torch.nn.Parameter],
@@ -50,9 +51,11 @@ class EMAModuleWrapper:
         device: Optional[torch.device] = None,
         # Decay function (direct or via config)
         decay_fn: Optional[DecayFn] = None,
-        decay_schedule: Literal["constant", "power", "linear", "piecewise_linear", "cosine", "warmup_cosine"] = "power",
+        decay_schedule: Literal[
+            "constant", "power", "linear", "piecewise_linear", "cosine", "warmup_cosine"
+        ] = "power",
         # Schedule params passed to create_decay_fn
-        **schedule_params
+        **schedule_params,
     ):
         """
         Args:
@@ -72,28 +75,28 @@ class EMAModuleWrapper:
         parameters = list(parameters)
         self.ema_parameters = [p.clone().detach().to(device) for p in parameters]
         self.temp_stored_parameters = None
-        
+
         self.decay = decay
         self.update_step_interval = update_step_interval
         self.device = device
         self.num_updates = 0
         self._schedule_params = filter_kwargs(create_decay_fn, **schedule_params)
-        
+
         # Set decay function
         if decay_fn is not None:
             self.decay_fn = decay_fn
             self._decay_schedule = "custom"
         else:
             self.decay_fn = create_decay_fn(
-                schedule_type=decay_schedule,
-                decay=decay,
-                **self._schedule_params
+                schedule_type=decay_schedule, decay=decay, **self._schedule_params
             )
             self._decay_schedule = decay_schedule
-        
+
         # Validation
         assert 0.0 <= decay <= 1.0, f"Decay must be in [0, 1], got {decay}"
-        assert update_step_interval >= 0, f"update_step_interval must be >= 0, got {update_step_interval}"
+        assert (
+            update_step_interval >= 0
+        ), f"update_step_interval must be >= 0, got {update_step_interval}"
 
     def get_current_decay(self, step: int) -> float:
         """Get decay value at given step."""
@@ -106,17 +109,17 @@ class EMAModuleWrapper:
             return
         if (optimization_step + 1) % self.update_step_interval != 0:
             return
-            
+
         parameters = list(parameters)
         assert len(parameters) == len(self.ema_parameters), "Parameter count mismatch"
-        
+
         current_decay = self.decay_fn(optimization_step)
         one_minus_decay = 1 - current_decay
-        
+
         for ema_param, param in zip(self.ema_parameters, parameters, strict=True):
             if not param.requires_grad:
                 continue
-            
+
             if ema_param.device == param.device:
                 # In-place update: ema = ema * decay + param * (1 - decay)
                 ema_param.mul_(current_decay).add_(param, alpha=one_minus_decay)
@@ -125,10 +128,12 @@ class EMAModuleWrapper:
                 param_copy = param.detach().to(ema_param.device)
                 ema_param.mul_(current_decay).add_(param_copy, alpha=one_minus_decay)
                 del param_copy
-        
+
         self.num_updates += 1
 
-    def to(self, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> "EMAModuleWrapper":
+    def to(
+        self, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None
+    ) -> "EMAModuleWrapper":
         """Move EMA parameters to device/dtype."""
         if device is not None:
             self.device = device
@@ -138,7 +143,9 @@ class EMAModuleWrapper:
         ]
         return self
 
-    def copy_ema_to(self, parameters: Iterable[torch.nn.Parameter], store_temp: bool = True) -> None:
+    def copy_ema_to(
+        self, parameters: Iterable[torch.nn.Parameter], store_temp: bool = True
+    ) -> None:
         """Copy EMA parameters to model (optionally storing originals)."""
         parameters = list(parameters)
         if store_temp:
@@ -158,7 +165,7 @@ class EMAModuleWrapper:
     def use_ema_parameters(self, parameters: Iterable[torch.nn.Parameter]):
         """
         Context manager for temporary EMA swap.
-        
+
         Usage:
             with ema.use_ema_parameters(model.parameters()):
                 evaluate(model)  # Uses EMA weights
@@ -198,6 +205,7 @@ class EMAModuleWrapper:
         """Calculate steps needed to achieve specific impact."""
         assert 0 < impact < 1 and 0 < decay < 1
         import math
+
         return int(math.log(1 - impact) / math.log(decay))
 
     def __repr__(self) -> str:

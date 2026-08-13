@@ -12,16 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/rewards/my_reward.py
-from accelerate import Accelerator
-from transformers import CLIPProcessor, CLIPModel
-from typing import Optional, List, Union
-from PIL import Image
 from contextlib import nullcontext
+from typing import List, Optional, Union
+
 import torch
 
-from .abc import PointwiseRewardModel, GroupwiseRewardModel, RewardModelOutput
+# src/flow_factory/rewards/my_reward.py
+from accelerate import Accelerator
+from PIL import Image
+from transformers import CLIPModel, CLIPProcessor
+
 from ..hparams import *
+from .abc import GroupwiseRewardModel, PointwiseRewardModel, RewardModelOutput
+
 
 class MyPointwiseRewardModel(PointwiseRewardModel):
     def __init__(self, config: RewardArguments, accelerator: Accelerator):
@@ -38,9 +41,9 @@ class MyPointwiseRewardModel(PointwiseRewardModel):
     @torch.no_grad()
     def __call__(
         self,
-        prompt : List[str],
-        image : Optional[List[Image.Image]] = None,
-        video : Optional[List[List[Image.Image]]] = None,
+        prompt: List[str],
+        image: Optional[List[Image.Image]] = None,
+        video: Optional[List[List[Image.Image]]] = None,
         condition_images: Optional[List[Union[List[Image.Image], torch.Tensor]]] = None,
         condition_videos: Optional[List[Union[List[List[Image.Image]], torch.Tensor]]] = None,
     ) -> RewardModelOutput:
@@ -72,11 +75,10 @@ class MyPointwiseRewardModel(PointwiseRewardModel):
         # Implement your custom reward computation here
         rewards = torch.zeros(len(prompt), device=self.device)
 
-
         # Wrap rewards in RewardModelOutput
         return RewardModelOutput(
             rewards=rewards,
-            extra_info={}, # Add any extra info if needed
+            extra_info={},  # Add any extra info if needed
         )
 
 
@@ -95,9 +97,9 @@ class MyGroupwiseRewardModel(GroupwiseRewardModel):
     @torch.no_grad()
     def __call__(
         self,
-        prompt : List[str],
-        image : Optional[List[Image.Image]] = None,
-        video : Optional[List[List[Image.Image]]] = None,
+        prompt: List[str],
+        image: Optional[List[Image.Image]] = None,
+        video: Optional[List[List[Image.Image]]] = None,
         condition_images: Optional[List[Union[List[Image.Image], torch.Tensor]]] = None,
         condition_videos: Optional[List[Union[List[List[Image.Image]], torch.Tensor]]] = None,
     ) -> RewardModelOutput:
@@ -126,11 +128,12 @@ class MyGroupwiseRewardModel(GroupwiseRewardModel):
 
         # Ensure inputs are lists, each of length `group_size`
         # Implement your custom reward computation here.
-        rewards = torch.arange(len(prompt)) # A trivia reward assignment (0, 1, 2, .... group_size - 1)
-
+        rewards = torch.arange(
+            len(prompt)
+        )  # A trivia reward assignment (0, 1, 2, .... group_size - 1)
 
         # Wrap rewards in RewardModelOutput, make sure the order of `rewards` align the original prompt
         return RewardModelOutput(
             rewards=rewards,
-            extra_info={}, # Add any extra info if needed
+            extra_info={},  # Add any extra info if needed
         )

@@ -15,32 +15,32 @@
 # src/flow_factory/models/wan/wan2_t2v.py
 from __future__ import annotations
 
-import os
-from typing import Union, List, Dict, Any, Optional, Tuple, Literal, ClassVar
 import logging
-from dataclasses import dataclass
+import os
 from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
-from PIL import Image
 import torch
 from accelerate import Accelerator
 from diffusers.pipelines.wan.pipeline_wan import WanPipeline, prompt_clean
 from peft import PeftModel
+from PIL import Image
 
-from ..abc import BaseAdapter
-from ...samples import T2VSample
 from ...hparams import *
-from ...scheduler import UniPCMultistepSDESchedulerOutput, UniPCMultistepSDEScheduler
-from ...utils.trajectory_collector import (
-    TrajectoryCollector,
-    CallbackCollector,
-    TrajectoryIndicesType, 
-    create_trajectory_collector,
-    create_callback_collector,
-)
+from ...samples import T2VSample
+from ...scheduler import UniPCMultistepSDEScheduler, UniPCMultistepSDESchedulerOutput
 from ...utils.base import filter_kwargs
 from ...utils.logger_utils import setup_logger
+from ...utils.trajectory_collector import (
+    CallbackCollector,
+    TrajectoryCollector,
+    TrajectoryIndicesType,
+    create_callback_collector,
+    create_trajectory_collector,
+)
+from ..abc import BaseAdapter
 
 logger = setup_logger(__name__)
 
@@ -50,6 +50,7 @@ class WanT2VSample(T2VSample):
     #  Class var
     _shared_fields: ClassVar[frozenset[str]] = frozenset({})
 
+
 class Wan2_T2V_Adapter(BaseAdapter):
     # Wan2.2 trains both transformer and transformer_2 but uses only one per
     # timestep (boundary_ratio), so under DDP the other's trainable params get no
@@ -57,58 +58,63 @@ class Wan2_T2V_Adapter(BaseAdapter):
     ddp_find_unused_parameters = True
     supports_diffusers_cache = True
 
-    def __init__(self, config: Arguments, accelerator : Accelerator):
+    def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
         self.pipeline: WanPipeline
         self.scheduler: UniPCMultistepSDEScheduler
-    
+
     def load_pipeline(self) -> WanPipeline:
         return WanPipeline.from_pretrained(
             self.model_args.model_name_or_path,
         )
-    
+
     def apply_lora(
         self,
         target_modules: Union[str, List[str]],
-        components: Union[str, List[str]] = ['transformer', 'transformer_2'],
+        components: Union[str, List[str]] = ["transformer", "transformer_2"],
         **kwargs,
     ) -> Union[PeftModel, Dict[str, PeftModel]]:
         return super().apply_lora(target_modules=target_modules, components=components, **kwargs)
-    
+
     # ============================ Module Management ============================
     @property
     def default_target_modules(self) -> List[str]:
         """Default LoRA target modules for Wan transformer."""
         return [
             # --- Self Attention ---
-            "attn1.to_q", "attn1.to_k", "attn1.to_v", "attn1.to_out.0",
-            
+            "attn1.to_q",
+            "attn1.to_k",
+            "attn1.to_v",
+            "attn1.to_out.0",
             # --- Cross Attention ---
-            "attn2.to_q", "attn2.to_k", "attn2.to_v", "attn2.to_out.0",
-
+            "attn2.to_q",
+            "attn2.to_k",
+            "attn2.to_v",
+            "attn2.to_out.0",
             # --- Feed Forward Network ---
-            "ffn.net.0.proj", "ffn.net.2"
+            "ffn.net.0.proj",
+            "ffn.net.2",
         ]
-    
+
     @property
     def inference_modules(self) -> List[str]:
         """Modules that are required for inference and forward"""
         if self.pipeline.config.boundary_ratio is None or self.pipeline.config.boundary_ratio <= 0:
-            return ['transformer', 'vae']
+            return ["transformer", "vae"]
 
         if self.pipeline.config.boundary_ratio >= 1:
-            return ['transformer_2', 'vae']
+            return ["transformer_2", "vae"]
 
-        return ['transformer', 'transformer_2', 'vae']
-    
+        return ["transformer", "transformer_2", "vae"]
+
     # ======================== Component Getters & Setters ========================
     @property
     def transformer_2(self) -> torch.nn.Module:
-        return self.get_component('transformer_2')
+        return self.get_component("transformer_2")
 
     @transformer_2.setter
     def transformer_2(self, module: torch.nn.Module):
-        self.set_component('transformer_2', module)
+        self.set_component("transformer_2", module)
 
     # ======================== Encoding & Decoding ========================
     def _get_t5_prompt_embeds(
@@ -137,11 +143,17 @@ class Wan2_T2V_Adapter(BaseAdapter):
         text_input_ids, mask = text_inputs.input_ids, text_inputs.attention_mask
         seq_lens = mask.gt(0).sum(dim=1).long()
 
-        prompt_embeds = self.pipeline.text_encoder(text_input_ids.to(device), mask.to(device)).last_hidden_state
+        prompt_embeds = self.pipeline.text_encoder(
+            text_input_ids.to(device), mask.to(device)
+        ).last_hidden_state
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
         prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
         prompt_embeds = torch.stack(
-            [torch.cat([u, u.new_zeros(max_sequence_length - u.size(0), u.size(1))]) for u in prompt_embeds], dim=0
+            [
+                torch.cat([u, u.new_zeros(max_sequence_length - u.size(0), u.size(1))])
+                for u in prompt_embeds
+            ],
+            dim=0,
         )
 
         return text_input_ids, prompt_embeds
@@ -187,15 +199,21 @@ class Wan2_T2V_Adapter(BaseAdapter):
         )
 
         results = {
-            'prompt_ids': prompt_ids,
-            'prompt_embeds': prompt_embeds,
+            "prompt_ids": prompt_ids,
+            "prompt_embeds": prompt_embeds,
         }
 
         if do_classifier_free_guidance:
             negative_prompt = negative_prompt or ""
-            negative_prompt = [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
-            negative_prompt = negative_prompt * (len(prompt) // len(negative_prompt)) # Expand to match batch size
-            assert len(negative_prompt) == len(prompt), "The number of negative prompts must match the number of prompts."
+            negative_prompt = (
+                [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+            )
+            negative_prompt = negative_prompt * (
+                len(prompt) // len(negative_prompt)
+            )  # Expand to match batch size
+            assert len(negative_prompt) == len(
+                prompt
+            ), "The number of negative prompts must match the number of prompts."
 
             negative_prompt_ids, negative_prompt_embeds = self._get_t5_prompt_embeds(
                 prompt=negative_prompt,
@@ -203,13 +221,15 @@ class Wan2_T2V_Adapter(BaseAdapter):
                 device=device,
                 dtype=dtype,
             )
-            results.update({
-                "negative_prompt_ids": negative_prompt_ids,
-                "negative_prompt_embeds": negative_prompt_embeds
-            })
+            results.update(
+                {
+                    "negative_prompt_ids": negative_prompt_ids,
+                    "negative_prompt_embeds": negative_prompt_embeds,
+                }
+            )
 
         return results
-    
+
     def encode_image(self, images: Union[Image.Image, torch.Tensor, List[torch.Tensor]]):
         """Not needed for Wan text-to-video models."""
         pass
@@ -218,7 +238,9 @@ class Wan2_T2V_Adapter(BaseAdapter):
         """Not needed for Wan text-to-video models."""
         pass
 
-    def decode_latents(self, latents: torch.Tensor, output_type: Literal['pt', 'pil', 'np'] = 'pil') -> torch.Tensor:
+    def decode_latents(
+        self, latents: torch.Tensor, output_type: Literal["pt", "pil", "np"] = "pil"
+    ) -> torch.Tensor:
         """Decode the latents using the VAE decoder."""
         latents = latents.float()
         latents_mean = (
@@ -226,9 +248,9 @@ class Wan2_T2V_Adapter(BaseAdapter):
             .view(1, self.pipeline.vae.config.z_dim, 1, 1, 1)
             .to(latents.device, latents.dtype)
         )
-        latents_std = 1.0 / torch.tensor(self.pipeline.vae.config.latents_std).view(1, self.pipeline.vae.config.z_dim, 1, 1, 1).to(
-            latents.device, latents.dtype
-        )
+        latents_std = 1.0 / torch.tensor(self.pipeline.vae.config.latents_std).view(
+            1, self.pipeline.vae.config.z_dim, 1, 1, 1
+        ).to(latents.device, latents.dtype)
         latents = latents / latents_std + latents_mean
         video = self.pipeline.vae.decode(latents, return_dict=False)[0]
 
@@ -261,7 +283,7 @@ class Wan2_T2V_Adapter(BaseAdapter):
         max_sequence_length: int = 512,
         # Extra callback arguments
         extra_call_back_kwargs: List[str] = [],
-        trajectory_indices: TrajectoryIndicesType = 'all',
+        trajectory_indices: TrajectoryIndicesType = "all",
     ) -> List[WanT2VSample]:
         # 1. Setup args
         device = self.device
@@ -271,8 +293,15 @@ class Wan2_T2V_Adapter(BaseAdapter):
             guidance_scale_2 = guidance_scale
         # Check `num_frames`
         if (num_frames - 1) % self.pipeline.vae_scale_factor_temporal != 0:
-            logger.warning(f"`num_frames - 1` has to be divisible by {self.pipeline.vae_scale_factor_temporal}. Rounding to the nearest number.")
-            num_frames = num_frames // self.pipeline.vae_scale_factor_temporal * self.pipeline.vae_scale_factor_temporal + 1
+            logger.warning(
+                f"`num_frames - 1` has to be divisible by {self.pipeline.vae_scale_factor_temporal}. Rounding to the nearest number."
+            )
+            num_frames = (
+                num_frames
+                // self.pipeline.vae_scale_factor_temporal
+                * self.pipeline.vae_scale_factor_temporal
+                + 1
+            )
         num_frames = max(num_frames, 1)
         # Check `height` and `width`
         # Check `height` and `width`
@@ -309,13 +338,16 @@ class Wan2_T2V_Adapter(BaseAdapter):
             prompt_embeds = prompt_embeds.to(device)
             if negative_prompt_embeds is not None:
                 negative_prompt_embeds = negative_prompt_embeds.to(device)
-            
+
         batch_size = prompt_embeds.shape[0]
-        transformer_dtype = self.pipeline.transformer.dtype if self.pipeline.transformer is not None else self.pipeline.transformer_2.dtype
+        transformer_dtype = (
+            self.pipeline.transformer.dtype
+            if self.pipeline.transformer is not None
+            else self.pipeline.transformer_2.dtype
+        )
         prompt_embeds = prompt_embeds.to(transformer_dtype)
         if negative_prompt_embeds is not None:
             negative_prompt_embeds = negative_prompt_embeds.to(transformer_dtype)
-
 
         # 3. Set scheduler
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -346,14 +378,18 @@ class Wan2_T2V_Adapter(BaseAdapter):
         latents = self.cast_latents(latents)
         latent_collector.collect(latents, step_idx=0)
         if compute_log_prob:
-            log_prob_collector = create_trajectory_collector(trajectory_indices, num_inference_steps)
+            log_prob_collector = create_trajectory_collector(
+                trajectory_indices, num_inference_steps
+            )
         callback_collector = create_callback_collector(trajectory_indices, num_inference_steps)
 
         for i, t in enumerate(timesteps):
             self.pipeline._current_timestep = t
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
             t_next = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
-            return_kwargs = list(set(['next_latents', 'log_prob', 'velocity'] + extra_call_back_kwargs))
+            return_kwargs = list(
+                set(["next_latents", "log_prob", "velocity"] + extra_call_back_kwargs)
+            )
             current_compute_log_prob = compute_log_prob and current_noise_level > 0
 
             output = self.forward(
@@ -379,27 +415,35 @@ class Wan2_T2V_Adapter(BaseAdapter):
                 step_idx=i,
                 output=output,
                 keys=extra_call_back_kwargs,
-                capturable={'noise_level': current_noise_level},
+                capturable={"noise_level": current_noise_level},
             )
 
         self.pipeline._current_timestep = None
 
         # 7. Decode latents to videos (list of pil images)
-        decoded_videos = self.decode_latents(latents, output_type='pt')
+        decoded_videos = self.decode_latents(latents, output_type="pt")
 
         # 8. Prepare output samples
-        extra_call_back_res = callback_collector.get_result()          # (B, len(trajectory_indices), ...)
-        callback_index_map = callback_collector.get_index_map()        # (T,) LongTensor
-        all_latents = latent_collector.get_result()                    # List[torch.Tensor(B, ...)]
-        latent_index_map = latent_collector.get_index_map()            # (T+1,) LongTensor
+        extra_call_back_res = callback_collector.get_result()  # (B, len(trajectory_indices), ...)
+        callback_index_map = callback_collector.get_index_map()  # (T,) LongTensor
+        all_latents = latent_collector.get_result()  # List[torch.Tensor(B, ...)]
+        latent_index_map = latent_collector.get_index_map()  # (T+1,) LongTensor
         all_log_probs = log_prob_collector.get_result() if compute_log_prob else None
         log_prob_index_map = log_prob_collector.get_index_map() if compute_log_prob else None
         samples = [
             WanT2VSample(
                 # Denoising trajectory
                 timesteps=timesteps,
-                all_latents=torch.stack([lat[b] for lat in all_latents], dim=0) if all_latents is not None else None,
-                log_probs=torch.stack([lp[b] for lp in all_log_probs], dim=0) if all_log_probs is not None else None,
+                all_latents=(
+                    torch.stack([lat[b] for lat in all_latents], dim=0)
+                    if all_latents is not None
+                    else None
+                ),
+                log_probs=(
+                    torch.stack([lp[b] for lp in all_log_probs], dim=0)
+                    if all_log_probs is not None
+                    else None
+                ),
                 latent_index_map=latent_index_map,
                 log_prob_index_map=log_prob_index_map,
                 # Generated video & metadata
@@ -411,13 +455,19 @@ class Wan2_T2V_Adapter(BaseAdapter):
                 prompt_ids=prompt_ids[b],
                 prompt_embeds=prompt_embeds[b],
                 # Negative prompt info
-                negative_prompt=negative_prompt[b] if isinstance(negative_prompt, list) else negative_prompt,
-                negative_prompt_ids=negative_prompt_ids[b] if negative_prompt_ids is not None else None,
-                negative_prompt_embeds=negative_prompt_embeds[b] if negative_prompt_embeds is not None else None,
+                negative_prompt=(
+                    negative_prompt[b] if isinstance(negative_prompt, list) else negative_prompt
+                ),
+                negative_prompt_ids=(
+                    negative_prompt_ids[b] if negative_prompt_ids is not None else None
+                ),
+                negative_prompt_embeds=(
+                    negative_prompt_embeds[b] if negative_prompt_embeds is not None else None
+                ),
                 # Extra kwargs
                 extra_kwargs={
                     **{k: v[b] for k, v in extra_call_back_res.items()},
-                    'callback_index_map': callback_index_map,
+                    "callback_index_map": callback_index_map,
                 },
             )
             for b in range(batch_size)
@@ -445,7 +495,14 @@ class Wan2_T2V_Adapter(BaseAdapter):
         noise_level: Optional[float] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
-        return_kwargs: List[str] = ['velocity', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
+        return_kwargs: List[str] = [
+            "velocity",
+            "next_latents",
+            "next_latents_mean",
+            "std_dev_t",
+            "dt",
+            "log_prob",
+        ],
         boundary_timestep: Optional[float] = None,
     ) -> UniPCMultistepSDESchedulerOutput:
         """
@@ -469,17 +526,23 @@ class Wan2_T2V_Adapter(BaseAdapter):
             UniPCMultistepSDESchedulerOutput containing requested outputs.
         """
         # 1. Prepare variables
-        t = t[0] if t.ndim == 1 else t # A scalar
+        t = t[0] if t.ndim == 1 else t  # A scalar
         if t_next is not None:
             t_next = t_next[0] if t_next.ndim == 1 else t_next
 
         batch_size = latents.shape[0]
         device = latents.device
-        dtype = self.pipeline.transformer.dtype if self.pipeline.transformer is not None else self.pipeline.transformer_2.dtype
+        dtype = (
+            self.pipeline.transformer.dtype
+            if self.pipeline.transformer is not None
+            else self.pipeline.transformer_2.dtype
+        )
 
         # Determine boundary timestep
         if boundary_timestep is None and self.pipeline.config.boundary_ratio is not None:
-            boundary_timestep = self.pipeline.config.boundary_ratio * self.scheduler.config.num_train_timesteps
+            boundary_timestep = (
+                self.pipeline.config.boundary_ratio * self.scheduler.config.num_train_timesteps
+            )
         # Determine which transformer to use
         if boundary_timestep is None or t >= boundary_timestep:
             pipeline_transformer = self.pipeline.transformer
@@ -488,7 +551,9 @@ class Wan2_T2V_Adapter(BaseAdapter):
         else:
             pipeline_transformer = self.pipeline.transformer_2
             transformer = self.transformer_2
-            current_guidance_scale = guidance_scale_2 if guidance_scale_2 is not None else guidance_scale
+            current_guidance_scale = (
+                guidance_scale_2 if guidance_scale_2 is not None else guidance_scale
+            )
 
         # Auto-detect CFG
         if current_guidance_scale > 1.0 and negative_prompt_embeds is None:
@@ -497,8 +562,7 @@ class Wan2_T2V_Adapter(BaseAdapter):
                 "Classifier-free guidance will be disabled."
             )
         do_classifier_free_guidance = (
-            negative_prompt_embeds is not None
-            and current_guidance_scale > 1.0
+            negative_prompt_embeds is not None and current_guidance_scale > 1.0
         )
 
         # 2. Prepare timestep

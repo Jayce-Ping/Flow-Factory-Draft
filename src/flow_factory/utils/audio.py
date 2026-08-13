@@ -80,11 +80,10 @@ Examples:
 
 import hashlib
 from pathlib import Path
-from typing import List, Union, Any, Literal, Optional, Tuple
+from typing import Any, List, Literal, Optional, Tuple, Union
 
-import torch
 import numpy as np
-
+import torch
 
 # ----------------------------------- Type Aliases --------------------------------------
 
@@ -92,45 +91,46 @@ AudioSingle = Union[torch.Tensor, np.ndarray]
 """Type alias for a single audio waveform. Tensor shape (C, T) or (T,); array shape (C, T) or (T,)."""
 
 AudioBatch = Union[
-    torch.Tensor,           # (B, C, T)
-    np.ndarray,             # (B, C, T)
-    List[torch.Tensor],     # List of (C, T) — variable length allowed
-    List[np.ndarray],       # List of (C, T) — variable length allowed
+    torch.Tensor,  # (B, C, T)
+    np.ndarray,  # (B, C, T)
+    List[torch.Tensor],  # List of (C, T) — variable length allowed
+    List[np.ndarray],  # List of (C, T) — variable length allowed
 ]
 """Type alias for a batch of audio waveforms."""
 
 MultiAudioBatch = Union[
-    List[AudioBatch],       # Ragged: per-sample variable N (clips per sample) and variable C/T per clip
-    torch.Tensor,           # (B, N, C, T) uniform shape
-    np.ndarray,             # (B, N, C, T) uniform shape
+    List[AudioBatch],  # Ragged: per-sample variable N (clips per sample) and variable C/T per clip
+    torch.Tensor,  # (B, N, C, T) uniform shape
+    np.ndarray,  # (B, N, C, T) uniform shape
 ]
 """Type alias for a list of audio batches (multi-audio per sample)."""
 
 
 __all__ = [
     # Type aliases
-    'AudioSingle',
-    'AudioBatch',
-    'MultiAudioBatch',
+    "AudioSingle",
+    "AudioBatch",
+    "MultiAudioBatch",
     # Validation
-    'is_audio',
-    'is_audio_batch',
+    "is_audio",
+    "is_audio_batch",
     # Loading / Saving
-    'load_audio',
-    'save_audio',
+    "load_audio",
+    "save_audio",
     # Conversions
-    'audio_to_tensor',
-    'audio_to_numpy',
-    'convert_audio',
+    "audio_to_tensor",
+    "audio_to_numpy",
+    "convert_audio",
     # Standardization
-    'standardize_audio_batch',
+    "standardize_audio_batch",
     # Hashing
-    'hash_audio',
-    'hash_audio_list',
+    "hash_audio",
+    "hash_audio_list",
 ]
 
 
 # ----------------------------------- Validation --------------------------------------
+
 
 def is_audio(audio: Any) -> bool:
     """
@@ -214,6 +214,7 @@ def is_audio_batch(audios: Any) -> bool:
 
 
 # ----------------------------------- Loading / Saving --------------------------------------
+
 
 def load_audio(
     path: Union[str, Path],
@@ -305,6 +306,7 @@ def save_audio(
 
 
 # ----------------------------------- Conversions --------------------------------------
+
 
 def audio_to_tensor(audio: AudioSingle) -> torch.Tensor:
     """
@@ -413,9 +415,10 @@ def convert_audio(
 
 # ----------------------------------- Standardization --------------------------------------
 
+
 def standardize_audio_batch(
     audios: Union[AudioSingle, AudioBatch],
-    output_type: Literal['np', 'pt'] = 'pt',
+    output_type: Literal["np", "pt"] = "pt",
 ) -> AudioBatch:
     """
     Standardize input audio(s) (single or batch) to the desired output format.
@@ -467,7 +470,7 @@ def standardize_audio_batch(
                 f"expected audio tensor with 1-3 dims, got ndim={audios.ndim} "
                 f"with shape {tuple(audios.shape)}"
             )
-        if output_type == 'np':
+        if output_type == "np":
             return audios.detach().cpu().float().numpy()
         return audios  # pt
 
@@ -482,7 +485,7 @@ def standardize_audio_batch(
                 f"expected audio ndarray with 1-3 dims, got ndim={audios.ndim} "
                 f"with shape {audios.shape}"
             )
-        if output_type == 'pt':
+        if output_type == "pt":
             return torch.from_numpy(audios).float()
         return audios.astype(np.float32)  # np
 
@@ -494,11 +497,11 @@ def standardize_audio_batch(
             # Try to stack if all shapes match
             if all(a.shape == normalized[0].shape for a in normalized):
                 stacked = torch.stack(normalized, dim=0)
-                if output_type == 'np':
+                if output_type == "np":
                     return stacked.detach().cpu().float().numpy()
                 return stacked  # pt
             # Ragged: return as list
-            if output_type == 'np':
+            if output_type == "np":
                 return [a.detach().cpu().float().numpy() for a in normalized]
             return normalized  # pt
 
@@ -506,10 +509,10 @@ def standardize_audio_batch(
             normalized = [a[np.newaxis, :] if a.ndim == 1 else a for a in audios]
             if all(a.shape == normalized[0].shape for a in normalized):
                 stacked = np.stack(normalized, axis=0)
-                if output_type == 'pt':
+                if output_type == "pt":
                     return torch.from_numpy(stacked).float()
                 return stacked.astype(np.float32)  # np
-            if output_type == 'pt':
+            if output_type == "pt":
                 return [torch.from_numpy(a).float() for a in normalized]
             return [a.astype(np.float32) for a in normalized]  # np
 
@@ -517,6 +520,7 @@ def standardize_audio_batch(
 
 
 # ----------------------------------- Hashing --------------------------------------
+
 
 def hash_audio(audio: torch.Tensor, max_samples: int = 4096) -> str:
     """
@@ -581,6 +585,7 @@ def hash_audio_list(audios: List[torch.Tensor], max_samples: int = 4096) -> str:
 
 # ----------------------------------- Internal Helpers --------------------------------------
 
+
 def _load_audio_backend(path: str) -> Tuple[torch.Tensor, int]:
     """
     Load audio using the first available backend.
@@ -613,14 +618,15 @@ def _load_audio_backend(path: str) -> Tuple[torch.Tensor, int]:
     except ImportError:
         pass
     else:
-        data, sr = sf.read(path, dtype='float32', always_2d=True)
+        data, sr = sf.read(path, dtype="float32", always_2d=True)
         # soundfile returns (T, C), convert to (C, T)
         waveform = torch.from_numpy(data.T).float()
         return waveform, sr
 
     # Last resort: stdlib wave module (WAV only, always available)
     import wave
-    with wave.open(path, 'rb') as wf:
+
+    with wave.open(path, "rb") as wf:
         sr = wf.getframerate()
         n_channels = wf.getnchannels()
         n_frames = wf.getnframes()
@@ -632,7 +638,9 @@ def _load_audio_backend(path: str) -> Tuple[torch.Tensor, int]:
     elif sampwidth == 4:  # int32
         samples = np.frombuffer(raw_bytes, dtype=np.int32).astype(np.float32) / 2147483647.0
     else:
-        raise ValueError(f"Unsupported sample width: {sampwidth} bytes. Only 16-bit and 32-bit WAV supported.")
+        raise ValueError(
+            f"Unsupported sample width: {sampwidth} bytes. Only 16-bit and 32-bit WAV supported."
+        )
 
     # De-interleave channels: (T*C,) -> (C, T)
     samples = samples.reshape(-1, n_channels).T

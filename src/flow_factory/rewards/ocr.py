@@ -27,15 +27,17 @@ yum install -y mesa-libGL glib2
 ```
 For other versions of CUDA, please refer to the official documentation of PaddleOCR.
 """
+
 from typing import Optional
+
+import numpy as np
+import torch
 from accelerate import Accelerator
 from PIL import Image
-import torch
-import numpy as np
 
-from .abc import PointwiseRewardModel, GroupwiseRewardModel, RewardModelOutput
 from ..hparams import *
 from ..utils.logger_utils import setup_logger
+from .abc import GroupwiseRewardModel, PointwiseRewardModel, RewardModelOutput
 
 logger = setup_logger(__name__)
 
@@ -47,10 +49,14 @@ except ImportError:
 try:
     from Levenshtein import distance
 except ImportError:
-    raise ImportError("python-Levenshtein is required for OCR reward. Install with: pip install python-Levenshtein")
+    raise ImportError(
+        "python-Levenshtein is required for OCR reward. Install with: pip install python-Levenshtein"
+    )
+
 
 class OCRRewardModel(PointwiseRewardModel):
     required_fields = ("prompt", "image", "video")
+
     def __init__(self, config: RewardArguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
 
@@ -61,7 +67,7 @@ class OCRRewardModel(PointwiseRewardModel):
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
-            device=f"gpu:{device_index}" if "cuda" in str(self.device) else "cpu"
+            device=f"gpu:{device_index}" if "cuda" in str(self.device) else "cpu",
         )
 
     def _compute_scores_batch(
@@ -84,12 +90,12 @@ class OCRRewardModel(PointwiseRewardModel):
                 # OCR recognition using PP-OCRv5 predict API
                 result = self.model.predict(img)
                 # Extract recognized text from PP-OCRv5 result
-                recognized_text = ''
+                recognized_text = ""
                 for res in result:
-                    recognized_text += ''.join(res['rec_texts'])
+                    recognized_text += "".join(res["rec_texts"])
 
-                recognized_text = recognized_text.replace(' ', '').lower()
-                target_text = target_text.replace(' ', '').lower()
+                recognized_text = recognized_text.replace(" ", "").lower()
+                target_text = target_text.replace(" ", "").lower()
                 if target_text in recognized_text:
                     dist = 0
                 else:
@@ -102,7 +108,7 @@ class OCRRewardModel(PointwiseRewardModel):
                 # Error handling (e.g., OCR parsing failure)
                 logger.error(f"OCR processing failed: {str(e)}")
                 dist = len(target_text)  # Maximum penalty
-            
+
             reward = 1 - dist / (len(target_text))
             rewards.append(reward)
 
@@ -116,7 +122,7 @@ class OCRRewardModel(PointwiseRewardModel):
     ) -> torch.Tensor:
         """
         Compute mean PickScore across all frames for each video.
-        
+
         Uses flat-reconstruct strategy to handle variable frame counts
         while maintaining efficient batched computation.
         """
@@ -124,17 +130,17 @@ class OCRRewardModel(PointwiseRewardModel):
         frame_counts = [len(clip) for clip in video]
         flat_images = [frame for clip in video for frame in clip]
         flat_prompts = [p for p, n in zip(prompt, frame_counts) for _ in range(n)]
-        
+
         # Batched score computation
         all_scores = []
         for i in range(0, len(flat_images), batch_size):
             batch_scores = self._compute_scores_batch(
-                flat_prompts[i:i + batch_size],
-                flat_images[i:i + batch_size],
+                flat_prompts[i : i + batch_size],
+                flat_images[i : i + batch_size],
             )
             all_scores.append(batch_scores)
         flat_scores = torch.cat(all_scores, dim=0)
-        
+
         # Reconstruct: mean pooling per video
         scores = flat_scores.split(frame_counts)
         scores = torch.stack([s.mean() for s in scores])
@@ -151,19 +157,23 @@ class OCRRewardModel(PointwiseRewardModel):
             prompt = [prompt]
         if image is not None and video is not None:
             raise ValueError("Only one of image or video can be provided.")
-        
-        batch_size = getattr(self.config, 'batch_size', len(prompt))
-        
+
+        batch_size = getattr(self.config, "batch_size", len(prompt))
+
         if video is not None:
             scores = self._compute_video_scores(prompt, video, batch_size)
         else:
             scores = self._compute_scores_batch(prompt, image)
-        
+
         return RewardModelOutput(rewards=scores, extra_info={})
 
+
 def download_model():
-    ocr = PaddleOCR(use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False)
-    logger.info('PaddleOCR initialized successfully')
+    ocr = PaddleOCR(
+        use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False
+    )
+    logger.info("PaddleOCR initialized successfully")
+
 
 if __name__ == "__main__":
     download_model()

@@ -28,7 +28,6 @@ from ...samples import (
 )
 from .masks import _active_element_counts, _expand_active_mask
 
-
 _SIGNED_INTEGER_DTYPES = {
     torch.int8,
     torch.int16,
@@ -663,6 +662,7 @@ def validate_state_active_numel_per_sample(
             )
         validated[name] = counts
     return validated
+
 
 def _validate_replay_tolerance(value: Real, name: str) -> float:
     if not isinstance(value, Real) or isinstance(value, bool):

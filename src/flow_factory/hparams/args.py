@@ -18,7 +18,9 @@ Main arguments class that encapsulates all configurations.
 
 Supports loading from YAML files with nested structure.
 """
+
 from __future__ import annotations
+
 import copy
 import math
 import warnings
@@ -28,9 +30,14 @@ from typing import Any, Literal, Optional
 
 import yaml
 
+from ..utils.dist import get_world_size
+from ..utils.logger_utils import setup_logger
 from .abc import ArgABC
+from .acceleration_args import AccelerationArguments
 from .data_args import DataArguments
+from .log_args import LogArguments
 from .model_args import ModelArguments
+from .reward_args import MultiRewardArguments, RewardArguments
 from .scheduler_args import SchedulerArguments
 from .training_args import (
     DiffusionOPDTrainingArguments,
@@ -38,11 +45,6 @@ from .training_args import (
     TrainingArguments,
     get_training_args_class,
 )
-from .reward_args import RewardArguments, MultiRewardArguments
-from .acceleration_args import AccelerationArguments
-from .log_args import LogArguments
-from ..utils.logger_utils import setup_logger
-from ..utils.dist import get_world_size
 
 logger = setup_logger(__name__, rank_zero_only=True)
 
@@ -78,9 +80,9 @@ class Arguments(ArgABC):
     """
     Main arguments class encapsulating all configurations.
     """
-    
-    launcher: Literal['accelerate'] = field(
-        default='accelerate',
+
+    launcher: Literal["accelerate"] = field(
+        default="accelerate",
         metadata={"help": "Distributed launcher to use."},
     )
     config_file: str | None = field(
@@ -95,8 +97,8 @@ class Arguments(ArgABC):
         default=29500,
         metadata={"help": "Main process port for distributed training."},
     )
-    mixed_precision: Optional[Literal['no', 'fp16', 'bf16']] = field(
-        default='bf16',
+    mixed_precision: Optional[Literal["no", "fp16", "bf16"]] = field(
+        default="bf16",
         metadata={"help": "Mixed precision setting for training."},
     )
     # Runtime distributed fields (populated by reconcile_config after accelerator creation)
@@ -437,10 +439,7 @@ class Arguments(ArgABC):
             (f.default for f in fields(self.data_args.__class__) if f.name == "dataset_dir"),
             None,
         )
-        if (
-            default_dataset_dir is not None
-            and self.data_args.dataset_dir != default_dataset_dir
-        ):
+        if default_dataset_dir is not None and self.data_args.dataset_dir != default_dataset_dir:
             raise ValueError(
                 "Both `data.dataset_dir` (custom value: "
                 f"{self.data_args.dataset_dir!r}) and `data.datasets` are set. "
@@ -538,7 +537,7 @@ class Arguments(ArgABC):
         if self.eval_reward_args:
             all_configs += list(self.eval_reward_args)
 
-        self._has_async_rewards = any(getattr(cfg, 'async_reward', False) for cfg in all_configs)
+        self._has_async_rewards = any(getattr(cfg, "async_reward", False) for cfg in all_configs)
 
         # 2. Resolve sampler type
         ta = self.training_args
@@ -560,7 +559,7 @@ class Arguments(ArgABC):
                 f"Overriding '{user_choice}' → 'group_contiguous'."
             )
             self.data_args.sampler_type = "group_contiguous"
-        
+
         if user_choice == "auto" and trainer_type != "dgpo":
             # auto: prefer `group_contiguous` (all K copies on same rank → no cross-rank all-gather for rewards/advantages),
             # fall back to `distributed_k_repeat` (all K copies scattered across ranks → cross-rank all-gather for rewards/advantages)
@@ -569,8 +568,8 @@ class Arguments(ArgABC):
             #   - `local_batch_tiling_ok`: (unique_sample_num_per_epoch // num_replicas) * group_size % per_device_batch_size == 0
             world_size = get_world_size()
             m = ta.unique_sample_num_per_epoch
-            groups_per_rank_ok = (m % world_size == 0)
-            local_batch_tiling_ok = (m // world_size * ta.group_size % ta.per_device_batch_size == 0)
+            groups_per_rank_ok = m % world_size == 0
+            local_batch_tiling_ok = m // world_size * ta.group_size % ta.per_device_batch_size == 0
             # GroupContiguousSampler's requires both while DistributedKRepeatSampler's only requires the local batch tiling constraint.
             # If `groups_per_rank_ok` is not satisfied but `local_batch_tiling_ok` is satisfied,
             # use `distributed_k_repeat` to satisfy the constraint.
@@ -587,7 +586,6 @@ class Arguments(ArgABC):
                 f"Overriding '{self.data_args.sampler_type}' -> 'group_distributed'."
             )
             self.data_args.sampler_type = "group_distributed"
-
 
     def _align_batch_geometry(self) -> None:
         """Align ``unique_sample_num_per_epoch`` (and, for ``group_distributed``,
@@ -679,9 +677,7 @@ class Arguments(ArgABC):
             f"{prefix}unique_sample_num_per_epoch({new_unique_sample_num}) "
             f"* group_size({ta.group_size}) "
             f"% (num_replicas({world_size}) "
-            f"* per_device_batch_size({ta.per_device_batch_size})"
-            + constraint_suffix
-            + " == 0"
+            f"* per_device_batch_size({ta.per_device_batch_size})" + constraint_suffix + " == 0"
         )
         ta.unique_sample_num_per_epoch = new_unique_sample_num
 
@@ -697,9 +693,8 @@ class Arguments(ArgABC):
         ta = self.training_args
         sample_num_per_iteration = get_world_size() * ta.per_device_batch_size
         ta.num_batches_per_epoch = (
-            (ta.unique_sample_num_per_epoch * ta.group_size)
-            // sample_num_per_iteration
-        )
+            ta.unique_sample_num_per_epoch * ta.group_size
+        ) // sample_num_per_iteration
         if not ta._manual_gradient_accumulation_steps:
             ta.gradient_accumulation_steps = ta.compute_gradient_accumulation_steps(
                 ta.num_batches_per_epoch,
@@ -776,7 +771,7 @@ class Arguments(ArgABC):
         # Smallest new group_size = num_replicas * d  where
         # d divides per_device_batch_size  and  d >= ceil(group_size / num_replicas).
         min_copies_per_rank = -(-original_group_size // world_size)  # ceil division
-        best_copies_per_rank = per_device_batch_size                 # fallback (always valid)
+        best_copies_per_rank = per_device_batch_size  # fallback (always valid)
         i = 1
         while i * i <= per_device_batch_size:
             if per_device_batch_size % i == 0:
@@ -864,7 +859,7 @@ class Arguments(ArgABC):
         #       source (`num_batches_per_epoch % sum(weights) == 0` -> the scheduler
         #       can place each source's quota exactly).
         original_M = ta.unique_sample_num_per_epoch
-        weights = [int(d.train.weight) for d in tds]   # type: ignore[union-attr]
+        weights = [int(d.train.weight) for d in tds]  # type: ignore[union-attr]
         W_sum = sum(weights)
         if W_sum <= 0:
             # _validate_dataset_routing should have caught this; assert defensively.
@@ -872,7 +867,7 @@ class Arguments(ArgABC):
         partition_step = step * W_sum
         target_total = max(self._round_up_to_step(original_M, partition_step), partition_step)
         # Exact allocation: M_i = (target_total / sum(w)) * w_i = step * j * w_i.
-        per_source_unit = target_total // W_sum   # multiple of `step` by construction
+        per_source_unit = target_total // W_sum  # multiple of `step` by construction
         partition = {d.name: per_source_unit * w for d, w in zip(tds, weights)}
         final_total = sum(partition.values())
         if final_total != target_total:
@@ -928,7 +923,7 @@ class Arguments(ArgABC):
         Skipped for ODE dynamics (no stochastic steps).
         """
         sched = self.scheduler_args
-        if sched.dynamics_type == 'ODE':
+        if sched.dynamics_type == "ODE":
             return
 
         n_inf = self.training_args.num_inference_steps
@@ -956,7 +951,7 @@ class Arguments(ArgABC):
                 continue
             if isinstance(value, ArgABC):
                 # Remove '_args' suffix for nested configs
-                key = f.name.replace('_args', '')
+                key = f.name.replace("_args", "")
                 result[key] = value.to_dict()
             elif isinstance(value, list) and value and isinstance(value[0], ArgABC):
                 # List of ArgABC instances (e.g. eval_datasets)
@@ -993,21 +988,21 @@ class Arguments(ArgABC):
         args_dict = cls._migrate_legacy_eval_datasets(args_dict)
 
         # 1. Resolve TrainingArguments subclass based on trainer_type
-        train_dict = args_dict.get('train', {})
-        trainer_type = train_dict.get('trainer_type', 'grpo')
+        train_dict = args_dict.get("train", {})
+        trainer_type = train_dict.get("trainer_type", "grpo")
         training_args_cls = get_training_args_class(trainer_type)
 
         # 2. Nested arguments map
         nested_map = {
-            'data': ('data_args', DataArguments),
-            'model': ('model_args', ModelArguments),
-            'scheduler': ('scheduler_args', SchedulerArguments),
-            'train': ('training_args', training_args_cls),
-            'eval': ('eval_args', EvaluationArguments),
-            'log': ('log_args', LogArguments),
-            'acceleration': ('acceleration_args', AccelerationArguments),
-            'rewards': ('reward_args', MultiRewardArguments),
-            'eval_rewards': ('eval_reward_args', MultiRewardArguments),
+            "data": ("data_args", DataArguments),
+            "model": ("model_args", ModelArguments),
+            "scheduler": ("scheduler_args", SchedulerArguments),
+            "train": ("training_args", training_args_cls),
+            "eval": ("eval_args", EvaluationArguments),
+            "log": ("log_args", LogArguments),
+            "acceleration": ("acceleration_args", AccelerationArguments),
+            "rewards": ("reward_args", MultiRewardArguments),
+            "eval_rewards": ("eval_reward_args", MultiRewardArguments),
         }
 
         # 3. Build init kwargs
@@ -1041,9 +1036,9 @@ class Arguments(ArgABC):
         # 4. Handle explicit 'extra_kwargs' if present in YAML and merge
         if "extra_kwargs" in init_kwargs:
             extras.update(init_kwargs["extra_kwargs"])
-        
+
         init_kwargs["extra_kwargs"] = extras
-        
+
         return cls(**init_kwargs)
 
     @classmethod
@@ -1052,7 +1047,7 @@ class Arguments(ArgABC):
         Load Arguments from a YAML configuration file.
         Example: args = Arguments.load_from_yaml("config.yaml")
         """
-        with open(yaml_file, 'r', encoding='utf-8') as f:
+        with open(yaml_file, "r", encoding="utf-8") as f:
             args_dict = yaml.safe_load(f)
 
         return cls.from_dict(args_dict)
@@ -1081,14 +1076,14 @@ class Arguments(ArgABC):
           fields into it (rather than creating a duplicate, which
           would trip the duplicate-name validator).
         """
-        if 'eval_datasets' not in args_dict:
+        if "eval_datasets" not in args_dict:
             return args_dict
 
-        legacy = args_dict['eval_datasets']
+        legacy = args_dict["eval_datasets"]
         if not isinstance(legacy, list) or not legacy:
             # Empty list or weird shape — drop and let the validator complain.
             new_dict = dict(args_dict)
-            new_dict.pop('eval_datasets', None)
+            new_dict.pop("eval_datasets", None)
             return new_dict
 
         warnings.warn(
@@ -1105,23 +1100,26 @@ class Arguments(ArgABC):
         # Deep-copy so we never mutate the caller's dict (or its
         # nested data/datasets list, which we may extend in place below).
         new_dict = copy.deepcopy(args_dict)
-        data_dict = new_dict.get('data') or {}
+        data_dict = new_dict.get("data") or {}
         if not isinstance(data_dict, dict):
             data_dict = {}
-        existing_datasets: list = list(data_dict.get('datasets') or [])
+        existing_datasets: list = list(data_dict.get("datasets") or [])
         # Index existing entries by name for in-place merge below.
         by_name: dict[str, dict] = {}
         for i, d in enumerate(existing_datasets):
-            if isinstance(d, dict) and 'name' in d:
-                by_name[d['name']] = d
+            if isinstance(d, dict) and "name" in d:
+                by_name[d["name"]] = d
 
         # Field categorisation: a legacy top-level eval_datasets entry
         # carries both parent-level fields (name / dataset_dir / media
         # roots) and DatasetEvalSpec-level fields. Split accordingly.
         _PARENT_KEYS = {"name", "dataset_dir", "image_dir", "video_dir", "audio_dir"}
         _EVAL_SPEC_KEYS = {
-            "split", "max_dataset_size",
-            "resolution", "num_inference_steps", "guidance_scale",
+            "split",
+            "max_dataset_size",
+            "resolution",
+            "num_inference_steps",
+            "guidance_scale",
         }
 
         for entry in legacy:
@@ -1130,7 +1128,7 @@ class Arguments(ArgABC):
                     f"Legacy `eval_datasets:` entries must be dicts, got "
                     f"{type(entry).__name__}."
                 )
-            name = entry.get('name')
+            name = entry.get("name")
             if not name:
                 raise ValueError(
                     "Legacy `eval_datasets:` entry is missing a `name`. "
@@ -1143,37 +1141,35 @@ class Arguments(ArgABC):
             if unknown:
                 # Surface unknown keys as DatasetArguments extras (extra_kwargs)
                 # rather than silently dropping them.  Same shape as ArgABC.
-                parent_fields.setdefault('extra_kwargs', {}).update(
-                    {k: entry[k] for k in unknown}
-                )
+                parent_fields.setdefault("extra_kwargs", {}).update({k: entry[k] for k in unknown})
 
             if name in by_name:
                 # Merge eval-spec fields into existing entry's `eval` block.
                 target = by_name[name]
-                eval_block = target.get('eval')
+                eval_block = target.get("eval")
                 if eval_block is None:
-                    target['eval'] = eval_fields
+                    target["eval"] = eval_fields
                 elif isinstance(eval_block, dict):
                     # Newer schema wins on conflict (defensive — should be rare).
                     eval_block_merged = {**eval_fields, **eval_block}
-                    target['eval'] = eval_block_merged
+                    target["eval"] = eval_block_merged
                 # Don't overwrite parent fields when merging — the unified
                 # entry is authoritative.
             else:
                 # Create a fresh dataset entry from the legacy fields.
-                migrated = {**parent_fields, 'eval': eval_fields}
+                migrated = {**parent_fields, "eval": eval_fields}
                 existing_datasets.append(migrated)
                 by_name[name] = migrated
 
-        data_dict['datasets'] = existing_datasets
-        new_dict['data'] = data_dict
-        new_dict.pop('eval_datasets', None)
+        data_dict["datasets"] = existing_datasets
+        new_dict["data"] = data_dict
+        new_dict.pop("eval_datasets", None)
         return new_dict
-    
+
     def __str__(self) -> str:
         """Pretty print configuration as YAML."""
         return yaml.dump(self.to_dict(), default_flow_style=False, sort_keys=False, indent=2)
-    
+
     def __repr__(self) -> str:
         """Same as __str__ for consistency."""
         return self.__str__()

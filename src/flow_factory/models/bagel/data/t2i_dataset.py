@@ -3,8 +3,9 @@
 
 import io
 import json
-import pyarrow.parquet as pq
 import random
+
+import pyarrow.parquet as pq
 from PIL import Image
 
 from .data_utils import pil_img2rgb
@@ -16,8 +17,16 @@ Image.MAX_IMAGE_PIXELS = 20_000_000
 
 class T2IIterableDataset(DistributedIterableDataset):
     def __init__(
-        self, dataset_name, transform, tokenizer, data_dir_list, num_used_data, 
-        local_rank=0, world_size=1, num_workers=8, data_status=None,
+        self,
+        dataset_name,
+        transform,
+        tokenizer,
+        data_dir_list,
+        num_used_data,
+        local_rank=0,
+        world_size=1,
+        num_workers=8,
+        data_status=None,
     ):
         """
         data_dir_list: list of data directories contains parquet files
@@ -52,7 +61,9 @@ class T2IIterableDataset(DistributedIterableDataset):
 
         while True:
             data_paths_per_worker_ = data_paths_per_worker[parquet_start_id:]
-            for parquet_idx, parquet_file_path in enumerate(data_paths_per_worker_, start=parquet_start_id):
+            for parquet_idx, parquet_file_path in enumerate(
+                data_paths_per_worker_, start=parquet_start_id
+            ):
                 fs = init_arrow_pf_fs(parquet_file_path)
                 with fs.open_input_file(parquet_file_path) as f:
                     fr = pq.ParquetFile(f)
@@ -66,26 +77,26 @@ class T2IIterableDataset(DistributedIterableDataset):
                         for row_idx, row in df.iterrows():
                             num_tokens = 0
                             try:
-                                image_byte = row['image']
+                                image_byte = row["image"]
                                 image = pil_img2rgb(Image.open(io.BytesIO(image_byte)))
                             except Exception as e:
-                                print(f'Error: {e} in rg#{row_group_id}, {parquet_file_path}')
+                                print(f"Error: {e} in rg#{row_group_id}, {parquet_file_path}")
                                 continue
                             image_tensor = self.transform(image)
                             height, width = image_tensor.shape[1:]
-                            num_tokens += width * height // transform_stride ** 2
+                            num_tokens += width * height // transform_stride**2
 
                             try:
-                                caption_dict = row['captions']
+                                caption_dict = row["captions"]
                                 caption_dict = json.loads(caption_dict)
                             except Exception as e:
-                                print(f'Error: {e} in rg#{row_group_id}, {parquet_file_path}')
+                                print(f"Error: {e} in rg#{row_group_id}, {parquet_file_path}")
                                 continue
 
                             caps_token = [self.tokenizer.encode(v) for _, v in caption_dict.items()]
                             if len(caps_token) == 0:
-                                print(f'no caption in rg#{row_group_id}, {parquet_file_path}')
-                                caption_token = self.tokenizer.encode(' ')
+                                print(f"no caption in rg#{row_group_id}, {parquet_file_path}")
+                                caption_token = self.tokenizer.encode(" ")
                             else:
                                 caption_token = random.choice(caps_token)
 
@@ -93,24 +104,28 @@ class T2IIterableDataset(DistributedIterableDataset):
                             text_ids = caption_token
                             num_tokens += len(caption_token)
                             text_ids_list.append(text_ids)
-                            sequence_plan.append({
-                                'type': 'text',
-                                'enable_cfg': 1,
-                                'loss': 0,
-                                'special_token_loss': 0,
-                                'special_token_label': None,
-                            })
-                        
-                            sequence_plan.append({
-                                'type': 'vae_image',
-                                'enable_cfg': 0,
-                                'loss': 1,
-                                'special_token_loss': 0,
-                                'special_token_label': None,
-                            })
+                            sequence_plan.append(
+                                {
+                                    "type": "text",
+                                    "enable_cfg": 1,
+                                    "loss": 0,
+                                    "special_token_loss": 0,
+                                    "special_token_label": None,
+                                }
+                            )
+
+                            sequence_plan.append(
+                                {
+                                    "type": "vae_image",
+                                    "enable_cfg": 0,
+                                    "loss": 1,
+                                    "special_token_loss": 0,
+                                    "special_token_label": None,
+                                }
+                            )
 
                             sample = dict(
-                                image_tensor_list=[image_tensor], 
+                                image_tensor_list=[image_tensor],
                                 text_ids_list=text_ids_list,
                                 num_tokens=num_tokens,
                                 sequence_plan=sequence_plan,
@@ -118,7 +133,7 @@ class T2IIterableDataset(DistributedIterableDataset):
                                     "data_indexes": [parquet_idx, row_group_id, row_idx],
                                     "worker_id": worker_id,
                                     "dataset_name": self.dataset_name,
-                                }
+                                },
                             )
                             yield sample
 

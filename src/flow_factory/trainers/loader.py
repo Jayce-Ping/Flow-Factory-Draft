@@ -17,18 +17,20 @@
 Trainer loader factory for extensibility.
 Supports multiple RL algorithms via registry pattern.
 """
-import os
-from accelerate import Accelerator, DistributedDataParallelKwargs
-from accelerate.utils import set_seed, ProjectConfiguration
-import logging
 
+import logging
+import os
+
+from accelerate import Accelerator, DistributedDataParallelKwargs
+from accelerate.utils import ProjectConfiguration, set_seed
+
+from ..hparams import Arguments
 from ..models.loader import load_model
 from ..models.registry import get_model_adapter_class
+from ..utils.env_utils import reconcile_config
+from ..utils.logger_utils import setup_logger
 from .abc import BaseTrainer
 from .registry import get_trainer_class, list_registered_trainers
-from ..hparams import Arguments
-from ..utils.logger_utils import setup_logger
-from ..utils.env_utils import reconcile_config
 
 logger = setup_logger(__name__)
 
@@ -36,24 +38,24 @@ logger = setup_logger(__name__)
 def load_trainer(config: Arguments) -> BaseTrainer:
     """
     Factory function to instantiate trainer based on algorithm type.
-    
+
     Uses registry pattern for automatic trainer discovery and loading.
     Supports both built-in trainers and custom algorithms via python paths.
-    
+
     Args:
         config: Configuration containing trainer_type and all hyperparameters
-    
+
     Returns:
         An instance of a BaseTrainer subclass
-    
+
     Raises:
         ImportError: If the trainer is not registered or cannot be imported
-    
+
     Examples:
         # Using built-in trainer
         config.training_args.trainer_type = "grpo"
         trainer = load_trainer(config)
-        
+
         # Using custom trainer
         config.training_args.trainer_type = "my_package.trainers.PPOTrainer"
         trainer = load_trainer(config)
@@ -88,7 +90,7 @@ def load_trainer(config: Arguments) -> BaseTrainer:
 
     # Get trainer class from registry
     trainer_type = config.training_args.trainer_type
-    
+
     try:
         trainer_cls = get_trainer_class(trainer_type)
     except ImportError as e:
@@ -97,7 +99,7 @@ def load_trainer(config: Arguments) -> BaseTrainer:
             f"Failed to load trainer '{trainer_type}'. "
             f"Available trainers: {registered_trainers}"
         ) from e
-    
+
     return trainer_cls(
         config=config,
         accelerator=accelerator,

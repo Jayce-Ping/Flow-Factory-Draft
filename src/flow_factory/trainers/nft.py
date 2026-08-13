@@ -15,31 +15,33 @@
 # src/flow_factory/trainers/nft.py
 """
 DiffusionNFT Trainer.
-Reference: 
+Reference:
 [1] DiffusionNFT: Online Diffusion Reinforcement with Forward Process
     - https://arxiv.org/abs/2509.16117
 """
+
 import os
-from typing import List, Dict, Any, NamedTuple, Tuple, Union, Optional
-from functools import partial
 from collections import defaultdict
-from contextlib import nullcontext, contextmanager
+from contextlib import contextmanager, nullcontext
+from functools import partial
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
+
 import numpy as np
 import torch
 import tqdm as tqdm_
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
+from ..hparams import NFTTrainingArguments
+from ..rewards import RewardBuffer
+from ..samples import BaseSample, ComponentTimes, LatentState, NoisedState, StackedSampleBatch
+from ..utils.base import create_generator_by_prompt
+from ..utils.logger_utils import setup_logger
 from .abc import BaseTrainer
 from .forward_process import (
     forward_velocity_state,
     state_batch_size,
 )
-from ..hparams import NFTTrainingArguments
-from ..samples import BaseSample, ComponentTimes, LatentState, NoisedState, StackedSampleBatch
-from ..rewards import RewardBuffer
-from ..utils.base import create_generator_by_prompt
-from ..utils.logger_utils import setup_logger
 
 logger = setup_logger(__name__)
 
@@ -66,7 +68,7 @@ class DiffusionNFTTrainer(BaseTrainer):
         super().__init__(**kwargs)
 
         # NFT-specific config (from NFTTrainingArguments)
-        self.training_args : NFTTrainingArguments
+        self.training_args: NFTTrainingArguments
         self.nft_beta = self.training_args.nft_beta
         self.off_policy = self.training_args.off_policy
 
@@ -82,7 +84,7 @@ class DiffusionNFTTrainer(BaseTrainer):
     def enable_kl_loss(self) -> bool:
         """Check if KL penalty is enabled."""
         return self.training_args.kl_beta > 0.0
-    
+
     @contextmanager
     def sampling_context(self):
         """Context manager for sampling with or without EMA parameters."""
@@ -133,7 +135,7 @@ class DiffusionNFTTrainer(BaseTrainer):
                 )
                 noised = self.adapter.add_forward_process_noise(clean_state, times)
                 velocity = forward_velocity_state(
-                    self, batch, noised.state, times, source='sampling policy'
+                    self, batch, noised.state, times, source="sampling policy"
                 )
                 steps.append(
                     NFTPrecomputedStep(
@@ -247,23 +249,21 @@ class DiffusionNFTTrainer(BaseTrainer):
             for batch in tqdm(
                 self._iter_prefetched_batches(shuffled_samples, per_device_batch_size),
                 total=num_batches,
-                desc=f'Epoch {self.epoch} Training',
+                desc=f"Epoch {self.epoch} Training",
                 position=0,
                 disable=not self.show_progress_bar,
             ):
                 clean_state = self.adapter.get_terminal_state(batch)
-                batch_size = state_batch_size(self, clean_state, 'terminal clean state')
+                batch_size = state_batch_size(self, clean_state, "terminal clean state")
 
                 # ---------- Per-batch precompute: old v predictions under sampling policy ----------
-                precomputed = self._precompute_sampling_policy_steps(
-                    batch, clean_state, batch_size
-                )
+                precomputed = self._precompute_sampling_policy_steps(batch, clean_state, batch_size)
 
                 # ---------- Train this batch under current policy ----------
                 self.adapter.train()
                 for t_idx in tqdm(
                     range(self.num_train_timesteps),
-                    desc=f'Epoch {self.epoch} Timestep',
+                    desc=f"Epoch {self.epoch} Timestep",
                     position=1,
                     leave=False,
                     disable=not self.show_progress_bar,
@@ -275,11 +275,11 @@ class DiffusionNFTTrainer(BaseTrainer):
                         # 2. Forward pass for current policy
                         with self.autocast():
                             new_velocity = forward_velocity_state(
-                                self, batch, step.noised.state, step.times, source='policy'
+                                self, batch, step.noised.state, step.times, source="policy"
                             )
 
                         # 3. Compute NFT loss
-                        adv = batch['advantage']
+                        adv = batch["advantage"]
                         adv_clip_range = self.training_args.adv_clip_range
                         adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
 
@@ -292,7 +292,9 @@ class DiffusionNFTTrainer(BaseTrainer):
                         )
 
                         # Combined loss
-                        ori_policy_loss = (r * positive_loss + (1.0 - r) * negative_loss) / self.nft_beta
+                        ori_policy_loss = (
+                            r * positive_loss + (1.0 - r) * negative_loss
+                        ) / self.nft_beta
                         policy_loss = (ori_policy_loss * adv_clip_range[1]).mean()
                         loss = policy_loss
 
@@ -305,21 +307,19 @@ class DiffusionNFTTrainer(BaseTrainer):
                                         batch,
                                         step.noised.state,
                                         step.times,
-                                        source='reference',
+                                        source="reference",
                                     )
                                 # KL-loss in v-space
-                                kl_div = self._velocity_kl(
-                                    new_velocity, ref_velocity, step.noised
-                                )
+                                kl_div = self._velocity_kl(new_velocity, ref_velocity, step.noised)
                                 kl_loss = self.training_args.kl_beta * kl_div.mean()
                                 loss = loss + kl_loss
-                                loss_info['kl_div'].append(kl_div.detach())
-                                loss_info['kl_loss'].append(kl_loss.detach())
+                                loss_info["kl_div"].append(kl_div.detach())
+                                loss_info["kl_loss"].append(kl_loss.detach())
 
                         # 5. Log per-timestep info
-                        loss_info['policy_loss'].append(policy_loss.detach())
-                        loss_info['unweighted_policy_loss'].append(ori_policy_loss.mean().detach())
-                        loss_info['loss'].append(loss.detach())
+                        loss_info["policy_loss"].append(policy_loss.detach())
+                        loss_info["unweighted_policy_loss"].append(ori_policy_loss.mean().detach())
+                        loss_info["loss"].append(loss.detach())
 
                         # 6. Backward and optimizer step
                         self.accelerator.backward(loss)

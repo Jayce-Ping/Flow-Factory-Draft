@@ -11,24 +11,24 @@ class InterleavedBaseIterableDataset(DistributedIterableDataset):
 
     def _init_data(self):
         data = {
-            'sequence_plan': [],
-            'text_ids_list': [],
-            'image_tensor_list': [],
-            'num_tokens': 0,
+            "sequence_plan": [],
+            "text_ids_list": [],
+            "image_tensor_list": [],
+            "num_tokens": 0,
         }
         return data
 
     def _add_text(self, data, text, need_loss, enable_cfg=True):
         text_ids = self.tokenizer.encode(text)
-        data['num_tokens'] += len(text_ids)
-        data['text_ids_list'].append(text_ids)
-        data['sequence_plan'].append(
+        data["num_tokens"] += len(text_ids)
+        data["text_ids_list"].append(text_ids)
+        data["sequence_plan"].append(
             {
-                'type': 'text',
-                'enable_cfg': int(enable_cfg),
-                'loss': int(need_loss),
-                'special_token_loss': 0,
-                'special_token_label': None,
+                "type": "text",
+                "enable_cfg": int(enable_cfg),
+                "loss": int(need_loss),
+                "special_token_loss": 0,
+                "special_token_label": None,
             }
         )
         return data
@@ -37,51 +37,51 @@ class InterleavedBaseIterableDataset(DistributedIterableDataset):
         assert need_loss or need_vae or need_vit
 
         if need_loss:
-            data['sequence_plan'].append(
+            data["sequence_plan"].append(
                 {
-                    'type': 'vae_image', 
-                    'enable_cfg': 0, 
-                    'loss': 1, 
-                    'special_token_loss': 0,
-                    'special_token_label': None,
+                    "type": "vae_image",
+                    "enable_cfg": 0,
+                    "loss": 1,
+                    "special_token_loss": 0,
+                    "special_token_label": None,
                 }
             )
 
             image_tensor = self.transform(image)
             height, width = image_tensor.shape[1:]
-            data['num_tokens'] += width * height // self.transform.stride ** 2
-            data['image_tensor_list'].append(image_tensor)
+            data["num_tokens"] += width * height // self.transform.stride**2
+            data["image_tensor_list"].append(image_tensor)
 
         if need_vae:
-            data['sequence_plan'].append(
+            data["sequence_plan"].append(
                 {
-                    'type': 'vae_image', 
-                    'enable_cfg': int(enable_cfg), 
-                    'loss': 0, 
-                    'special_token_loss': 0,
-                    'special_token_label': None,
+                    "type": "vae_image",
+                    "enable_cfg": int(enable_cfg),
+                    "loss": 0,
+                    "special_token_loss": 0,
+                    "special_token_label": None,
                 }
             )
 
             image_tensor = self.transform(image)
             height, width = image_tensor.shape[1:]
-            data['num_tokens'] += width * height // self.transform.stride ** 2
-            data['image_tensor_list'].append(image_tensor.clone())
+            data["num_tokens"] += width * height // self.transform.stride**2
+            data["image_tensor_list"].append(image_tensor.clone())
 
         if need_vit:
-            data['sequence_plan'].append(
+            data["sequence_plan"].append(
                 {
-                    'type': 'vit_image',
-                    'enable_cfg': int(enable_cfg), 
-                    'loss': 0,
-                    'special_token_loss': 0,
-                    'special_token_label': None,
+                    "type": "vit_image",
+                    "enable_cfg": int(enable_cfg),
+                    "loss": 0,
+                    "special_token_loss": 0,
+                    "special_token_label": None,
                 },
             )
             vit_image_tensor = self.vit_transform(image)
             height, width = vit_image_tensor.shape[1:]
-            data['num_tokens'] += width * height // self.vit_transform.stride ** 2
-            data['image_tensor_list'].append(vit_image_tensor)
+            data["num_tokens"] += width * height // self.vit_transform.stride**2
+            data["image_tensor_list"].append(vit_image_tensor)
 
         return data
 
@@ -91,40 +91,40 @@ class InterleavedBaseIterableDataset(DistributedIterableDataset):
         if need_loss:
             for idx, (image, frame_idx) in enumerate(zip(frames, frame_indexes)):
                 current_sequence_plan = {
-                    'type': 'vae_image', 
-                    'enable_cfg': 0, 
-                    'loss': 1, 
-                    'special_token_loss': 0,
-                    'special_token_label': None,
-                    'split_start': idx == 0,
-                    'split_end': idx == len(frames) - 1,
+                    "type": "vae_image",
+                    "enable_cfg": 0,
+                    "loss": 1,
+                    "special_token_loss": 0,
+                    "special_token_label": None,
+                    "split_start": idx == 0,
+                    "split_end": idx == len(frames) - 1,
                 }
                 if idx < len(frame_indexes) - 1:
-                    current_sequence_plan['frame_delta'] = frame_indexes[idx + 1] - frame_idx
-                data['sequence_plan'].append(current_sequence_plan)
+                    current_sequence_plan["frame_delta"] = frame_indexes[idx + 1] - frame_idx
+                data["sequence_plan"].append(current_sequence_plan)
                 image_tensor = self.transform(image)
                 height, width = image_tensor.shape[1:]
-                data['image_tensor_list'].append(image_tensor)
-                data['num_tokens'] += width * height // self.transform.stride ** 2
+                data["image_tensor_list"].append(image_tensor)
+                data["num_tokens"] += width * height // self.transform.stride**2
 
         elif need_vae:
             for idx, (image, frame_idx) in enumerate(zip(frames, frame_indexes)):
                 current_sequence_plan = {
-                    'type': 'vae_image', 
-                    'enable_cfg': int(enable_cfg), 
-                    'loss': 0, 
-                    'special_token_loss': 0,
-                    'special_token_label': None,
-                    'split_start': idx == 0,
-                    'split_end': idx == len(frames) - 1,
+                    "type": "vae_image",
+                    "enable_cfg": int(enable_cfg),
+                    "loss": 0,
+                    "special_token_loss": 0,
+                    "special_token_label": None,
+                    "split_start": idx == 0,
+                    "split_end": idx == len(frames) - 1,
                 }
                 if idx < len(frame_indexes) - 1:
-                    current_sequence_plan['frame_delta'] = frame_indexes[idx + 1] - frame_idx
-                data['sequence_plan'].append(current_sequence_plan)
+                    current_sequence_plan["frame_delta"] = frame_indexes[idx + 1] - frame_idx
+                data["sequence_plan"].append(current_sequence_plan)
                 image_tensor = self.transform(image)
                 height, width = image_tensor.shape[1:]
-                data['image_tensor_list'].append(image_tensor)
-                data['num_tokens'] += width * height // self.transform.stride ** 2
+                data["image_tensor_list"].append(image_tensor)
+                data["num_tokens"] += width * height // self.transform.stride**2
 
         return data
 
@@ -132,9 +132,18 @@ class InterleavedBaseIterableDataset(DistributedIterableDataset):
 class ParquetStandardIterableDataset(DistributedIterableDataset):
 
     def __init__(
-        self, dataset_name, transform, tokenizer, vit_transform, 
-        data_dir_list, num_used_data, parquet_info,
-        local_rank=0, world_size=1, num_workers=8, data_status=None,
+        self,
+        dataset_name,
+        transform,
+        tokenizer,
+        vit_transform,
+        data_dir_list,
+        num_used_data,
+        parquet_info,
+        local_rank=0,
+        world_size=1,
+        num_workers=8,
+        data_status=None,
     ):
         """
         data_dir_list: list of data directories contains parquet files
@@ -155,7 +164,7 @@ class ParquetStandardIterableDataset(DistributedIterableDataset):
             data_paths = get_parquet_data_paths([data_dir], [num_data_path])
             for data_path in data_paths:
                 if data_path in parquet_info.keys():
-                    num_row_groups = parquet_info[data_path]['num_row_groups']
+                    num_row_groups = parquet_info[data_path]["num_row_groups"]
                     for rg_idx in range(num_row_groups):
                         row_groups.append((data_path, rg_idx))
         return row_groups
@@ -189,7 +198,7 @@ class ParquetStandardIterableDataset(DistributedIterableDataset):
                         df = fr.read_row_group(row_group_id).to_pandas()
                         df = df.iloc[row_start_id:]
                     except Exception as e:
-                        print(f'Error {e} in rg#{row_group_id}, {parquet_file_path}')
+                        print(f"Error {e} in rg#{row_group_id}, {parquet_file_path}")
                         continue
 
                     for row_idx, row in df.iterrows():
@@ -197,13 +206,13 @@ class ParquetStandardIterableDataset(DistributedIterableDataset):
                             data = self.parse_row(row)
                             if len(data) == 0:
                                 continue
-                            data['data_indexes'] = {
+                            data["data_indexes"] = {
                                 "data_indexes": [global_row_group_idx, row_idx],
                                 "worker_id": worker_id,
                                 "dataset_name": self.dataset_name,
                             }
                         except Exception as e:
-                            print(f'Error {e} in rg#{row_group_id}, {parquet_file_path}')
+                            print(f"Error {e} in rg#{row_group_id}, {parquet_file_path}")
                             continue
                         yield data
 

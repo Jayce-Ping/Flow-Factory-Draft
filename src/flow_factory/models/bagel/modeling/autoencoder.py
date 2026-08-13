@@ -13,8 +13,8 @@ from dataclasses import dataclass
 
 import torch
 from einops import rearrange
-from torch import Tensor, nn
 from safetensors.torch import load_file as load_sft
+from torch import Tensor, nn
 
 
 @dataclass
@@ -77,7 +77,9 @@ class ResnetBlock(nn.Module):
         self.norm2 = nn.GroupNorm(num_groups=32, num_channels=out_channels, eps=1e-6, affine=True)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
         if self.in_channels != self.out_channels:
-            self.nin_shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
+            self.nin_shortcut = nn.Conv2d(
+                in_channels, out_channels, kernel_size=1, stride=1, padding=0
+            )
 
     def forward(self, x):
         h = x
@@ -338,16 +340,16 @@ def print_load_warning(missing: list[str], unexpected: list[str]) -> None:
 
 def load_ae(local_path: str) -> AutoEncoder:
     ae_params = AutoEncoderParams(
-            resolution=256,
-            in_channels=3,
-            downsample=8,
-            ch=128,
-            out_ch=3,
-            ch_mult=[1, 2, 4, 4],
-            num_res_blocks=2,
-            z_channels=16,
-            scale_factor=0.3611,
-            shift_factor=0.1159,
+        resolution=256,
+        in_channels=3,
+        downsample=8,
+        ch=128,
+        out_ch=3,
+        ch_mult=[1, 2, 4, 4],
+        num_res_blocks=2,
+        z_channels=16,
+        scale_factor=0.3611,
+        shift_factor=0.1159,
     )
 
     # Loading the autoencoder

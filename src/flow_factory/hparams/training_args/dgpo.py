@@ -13,10 +13,11 @@
 # limitations under the License.
 
 """Training arguments for DGPO (Direct Group Preference Optimization)."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Union, Tuple
+from typing import Any, Literal, Tuple, Union
 
 from ._base import TrainingArguments, _standardize_clip_range, _standardize_timestep_range
 
@@ -30,9 +31,11 @@ class DGPOTrainingArguments(TrainingArguments):
     """
 
     # --- Group-wise advantage & clipping (same semantics as GRPO) ---
-    advantage_aggregation: Literal['sum', 'gdpo'] = field(
-        default='gdpo',
-        metadata={"help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo']."},
+    advantage_aggregation: Literal["sum", "gdpo"] = field(
+        default="gdpo",
+        metadata={
+            "help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo']."
+        },
     )
     clip_range: tuple[float, float] = field(
         default=(-1e-4, 1e-4),
@@ -42,8 +45,8 @@ class DGPOTrainingArguments(TrainingArguments):
         default=(-5.0, 5.0),
         metadata={"help": "Clipping range for advantages."},
     )
-    kl_type: Literal['v-based', 'x-based'] = field(
-        default='v-based',
+    kl_type: Literal["v-based", "x-based"] = field(
+        default="v-based",
         metadata={"help": "Type of KL divergence. DGPO defaults to 'v-based'."},
     )
     kl_beta: float = field(
@@ -62,50 +65,70 @@ class DGPOTrainingArguments(TrainingArguments):
     )
     clip_dsm: bool = field(
         default=True,
-        metadata={"help": "Whether to apply PPO-style DSM clipping using EMA old-policy predictions."},
+        metadata={
+            "help": "Whether to apply PPO-style DSM clipping using EMA old-policy predictions."
+        },
     )
     clip_kl: bool = field(
         default=False,
-        metadata={"help": "Whether to apply PPO-style clipping to the KL loss using the same ratio-based mask."},
+        metadata={
+            "help": "Whether to apply PPO-style clipping to the KL loss using the same ratio-based mask."
+        },
     )
     switch_ema_ref: int = field(
         default=200,
-        metadata={"help": "After this many optimizer steps, use EMA parameters for sampling instead of current params."},
+        metadata={
+            "help": "After this many optimizer steps, use EMA parameters for sampling instead of current params."
+        },
     )
     off_policy: bool = field(
         default=False,
-        metadata={"help": "Whether to use EMA parameters for sampling from the start (off-policy)."},
+        metadata={
+            "help": "Whether to use EMA parameters for sampling from the start (off-policy)."
+        },
     )
     kl_cfg: float = field(
         default=1.0,
-        metadata={"help": "CFG scale for reference model predictions. >1.0 enables CFG on the frozen ref model."},
+        metadata={
+            "help": "CFG scale for reference model predictions. >1.0 enables CFG on the frozen ref model."
+        },
     )
     use_ema_ref: bool = field(
         default=False,
-        metadata={"help": "Use EMA (old policy) as DGPO loss reference instead of frozen pretrained. Dynamic ref from TDM-R1."},
+        metadata={
+            "help": "Use EMA (old policy) as DGPO loss reference instead of frozen pretrained. Dynamic ref from TDM-R1."
+        },
     )
 
     # Old-policy EMA ref (ema_ref) — a fast-tracking EMA separate from the sampling EMA
     ema_ref_max_decay: float = field(
         default=0.3,
-        metadata={"help": "Maximum decay for old-policy EMA ref. Actual decay is min(ema_ref_max_decay, ema_ref_ramp_rate * step)."},
+        metadata={
+            "help": "Maximum decay for old-policy EMA ref. Actual decay is min(ema_ref_max_decay, ema_ref_ramp_rate * step)."
+        },
     )
     ema_ref_ramp_rate: float = field(
         default=0.001,
-        metadata={"help": "Linear ramp rate for old-policy EMA ref decay. decay(step) = min(max_decay, ramp_rate * step)."},
+        metadata={
+            "help": "Linear ramp rate for old-policy EMA ref decay. decay(step) = min(max_decay, ramp_rate * step)."
+        },
     )
     ema_ref_device: Literal["cpu", "cuda"] = field(
-        default='cuda',
+        default="cuda",
         metadata={"help": "Device for old-policy EMA ref parameters ('cuda' or 'cpu')."},
     )
 
     # Timestep control
     num_train_timesteps: int = field(
         default=0,
-        metadata={"help": "Number of training timesteps per sample. 0 defaults to `int(num_inference_steps * (timestep_range[1] - timestep_range[0]))`."},
+        metadata={
+            "help": "Number of training timesteps per sample. 0 defaults to `int(num_inference_steps * (timestep_range[1] - timestep_range[0]))`."
+        },
     )
-    time_sampling_strategy: Literal['uniform', 'logit_normal', 'discrete', 'discrete_with_init', 'discrete_wo_init'] = field(
-        default='discrete',
+    time_sampling_strategy: Literal[
+        "uniform", "logit_normal", "discrete", "discrete_with_init", "discrete_wo_init"
+    ] = field(
+        default="discrete",
         metadata={"help": "Strategy for sampling training timesteps."},
     )
     time_shift: float = field(
@@ -114,19 +137,23 @@ class DGPOTrainingArguments(TrainingArguments):
     )
     timestep_range: Union[float, Tuple[float, float]] = field(
         default=0.6,
-        metadata={"help": "Timestep range for discrete sampling. Float for [0, value], tuple for [start, end]."},
+        metadata={
+            "help": "Timestep range for discrete sampling. Float for [0, value], tuple for [start, end]."
+        },
     )
 
     def __post_init__(self):
         super().__post_init__()
         # Guard kl_beta against scientific-notation strings (e.g. "1e-3").
         self.kl_beta = float(self.kl_beta)
-        self.clip_range = _standardize_clip_range(self.clip_range, 'clip_range')
-        self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, 'adv_clip_range')
+        self.clip_range = _standardize_clip_range(self.clip_range, "clip_range")
+        self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, "adv_clip_range")
 
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
         if not self.num_train_timesteps or self.num_train_timesteps <= 0:
-            self.num_train_timesteps = max(1, int(self.num_inference_steps * (self.timestep_range[1] - self.timestep_range[0])))
+            self.num_train_timesteps = max(
+                1, int(self.num_inference_steps * (self.timestep_range[1] - self.timestep_range[0]))
+            )
 
     def get_num_train_timesteps(self, args: Any) -> int:
         assert self.num_train_timesteps is not None

@@ -16,16 +16,17 @@
 """
 Trainers module for various RL algorithms.
 """
+
 from .abc import BaseTrainer
-from .registry import get_trainer_class, list_registered_trainers
 from .loader import load_trainer
+from .registry import get_trainer_class, list_registered_trainers
 
 # Built-in Trainers
 # from .grpo import GRPOTrainer
 
 __all__ = [
-    'BaseTrainer',
-    'get_trainer_class',
-    'list_registered_trainers',
-    'load_trainer',
+    "BaseTrainer",
+    "get_trainer_class",
+    "list_registered_trainers",
+    "load_trainer",
 ]

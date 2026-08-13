@@ -27,6 +27,7 @@ Based on the GenEval benchmark (https://github.com/djghosh13/geneval).
 Dependencies:
     bash scripts/install_geneval_deps.sh
 """
+
 from __future__ import annotations
 
 import json
@@ -37,12 +38,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
 from accelerate import Accelerator
+from PIL import Image
 
-from .abc import PointwiseRewardModel, RewardModelOutput
 from ..hparams import RewardArguments
 from ..utils.logger_utils import setup_logger
+from .abc import PointwiseRewardModel, RewardModelOutput
 
 logger = setup_logger(__name__)
 
@@ -51,8 +52,16 @@ logger = setup_logger(__name__)
 # ---------------------------------------------------------------------------
 
 COLORS = [
-    "red", "orange", "yellow", "green", "blue",
-    "purple", "pink", "brown", "black", "white",
+    "red",
+    "orange",
+    "yellow",
+    "green",
+    "blue",
+    "purple",
+    "pink",
+    "brown",
+    "black",
+    "white",
 ]
 
 DEFAULT_DETECTION_THRESHOLD = 0.3
@@ -152,18 +161,12 @@ class GenEvalRewardModel(PointwiseRewardModel):
         self._detection_threshold = getattr(
             config, "detection_threshold", DEFAULT_DETECTION_THRESHOLD
         )
-        self._counting_threshold = getattr(
-            config, "counting_threshold", DEFAULT_COUNTING_THRESHOLD
-        )
+        self._counting_threshold = getattr(config, "counting_threshold", DEFAULT_COUNTING_THRESHOLD)
         self._max_objects = getattr(config, "max_objects", DEFAULT_MAX_OBJECTS)
 
-        object_names_path = getattr(
-            config, "object_names_path", DEFAULT_OBJECT_NAMES_PATH
-        )
+        object_names_path = getattr(config, "object_names_path", DEFAULT_OBJECT_NAMES_PATH)
         self._object_names = _load_object_names(object_names_path)
-        self._name_to_idx = {
-            name: idx for idx, name in enumerate(self._object_names)
-        }
+        self._name_to_idx = {name: idx for idx, name in enumerate(self._object_names)}
 
         # Load Mask2Former detector
         self._init_detector(config)
@@ -181,7 +184,7 @@ class GenEvalRewardModel(PointwiseRewardModel):
     def _init_detector(self, config: RewardArguments) -> None:
         """Initialize Mask2Former instance segmentation model."""
         try:
-            from mmdet.apis import init_detector, inference_detector
+            from mmdet.apis import inference_detector, init_detector
         except ImportError:
             raise ImportError(
                 "mmdet is required for GenEval reward. "
@@ -191,9 +194,7 @@ class GenEvalRewardModel(PointwiseRewardModel):
         self._inference_detector = inference_detector
 
         detector_config = getattr(config, "detector_config", DEFAULT_DETECTOR_CONFIG)
-        detector_checkpoint = getattr(
-            config, "detector_checkpoint", DEFAULT_DETECTOR_CHECKPOINT
-        )
+        detector_checkpoint = getattr(config, "detector_checkpoint", DEFAULT_DETECTOR_CHECKPOINT)
 
         # If config is a short name (no path separator, no .py), resolve from
         # mmdet's bundled model zoo configs. mmdet 3.x ships configs under
@@ -258,10 +259,8 @@ class GenEvalRewardModel(PointwiseRewardModel):
         clip_model_name = getattr(config, "clip_model", DEFAULT_CLIP_MODEL)
         device_str = f"cuda:{self.accelerator.local_process_index}"
 
-        self._clip_model, _, self._clip_preprocess = (
-            open_clip.create_model_and_transforms(
-                clip_model_name, pretrained="openai", device=device_str
-            )
+        self._clip_model, _, self._clip_preprocess = open_clip.create_model_and_transforms(
+            clip_model_name, pretrained="openai", device=device_str
         )
         self._clip_tokenizer = open_clip.get_tokenizer(clip_model_name)
         self._clip_model.eval()
@@ -318,9 +317,7 @@ class GenEvalRewardModel(PointwiseRewardModel):
         return COLORS[color_idx]
 
     @torch.no_grad()
-    def _detect_objects(
-        self, image: Image.Image
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _detect_objects(self, image: Image.Image) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Run Mask2Former detection on an image.
 
         Returns:
@@ -379,9 +376,9 @@ class GenEvalRewardModel(PointwiseRewardModel):
             class_scores = scores[class_mask]
 
             # For counting, use stricter threshold
-            if expected_count > 1 or (exclude and any(
-                e.get("class") == classname for e in exclude
-            )):
+            if expected_count > 1 or (
+                exclude and any(e.get("class") == classname for e in exclude)
+            ):
                 count_mask = class_scores >= self._counting_threshold
                 count_bboxes = class_bboxes[count_mask]
             else:
@@ -403,9 +400,7 @@ class GenEvalRewardModel(PointwiseRewardModel):
                     predicted_color = self._classify_color(image, bbox, classname)
                     if predicted_color == required_color:
                         colored_count += 1
-                color_reward = max(
-                    0.0, 1.0 - abs(expected_count - colored_count) / expected_count
-                )
+                color_reward = max(0.0, 1.0 - abs(expected_count - colored_count) / expected_count)
                 sub_rewards.append(min(count_reward, color_reward))
 
             elif position_spec and found_count > 0:
@@ -422,9 +417,7 @@ class GenEvalRewardModel(PointwiseRewardModel):
                             pos_satisfied = _check_position(
                                 ref_bboxes[0], count_bboxes[0], relation
                             )
-                            sub_rewards.append(
-                                count_reward if pos_satisfied else 0.0
-                            )
+                            sub_rewards.append(count_reward if pos_satisfied else 0.0)
                         else:
                             sub_rewards.append(0.0)
                     else:

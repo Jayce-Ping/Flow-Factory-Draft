@@ -14,6 +14,7 @@
 
 # src/flow_factory/models/ltx2/_common.py
 """Shared helpers for the LTX2 (T2AV / I2AV) adapters."""
+
 from __future__ import annotations
 
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -553,15 +554,11 @@ def build_ltx2_structured_trajectories(
             None
             if not structured_callbacks
             else {
-                field: {
-                    component: split(values, component) for component in LTX2_COMPONENT_ORDER
-                }
+                field: {component: split(values, component) for component in LTX2_COMPONENT_ORDER}
                 for field, values in structured_callbacks.items()
             }
         ),
-        callback_index_maps={
-            component: callback_index_map for component in LTX2_COMPONENT_ORDER
-        },
+        callback_index_maps={component: callback_index_map for component in LTX2_COMPONENT_ORDER},
     )
 
 

@@ -16,10 +16,14 @@ import torch
 from huggingface_hub import hf_hub_download
 from numpy import load
 from PIL import Image
-
-from transformers import SiglipConfig, SiglipImageProcessor, SiglipModel, SiglipProcessor, SiglipTokenizer
+from transformers import (
+    SiglipConfig,
+    SiglipImageProcessor,
+    SiglipModel,
+    SiglipProcessor,
+    SiglipTokenizer,
+)
 from transformers.utils import logging
-
 
 logging.set_verbosity_info()
 logger = logging.get_logger(__name__)
@@ -170,14 +174,20 @@ def create_rename_keys(config):
 def rename_key(dct, old, new, config):
     val = dct.pop(old)
 
-    if ("out_proj" in new or "v_proj" in new or "k_proj" in new or "q_proj" in new) and "vision" in new:
+    if (
+        "out_proj" in new or "v_proj" in new or "k_proj" in new or "q_proj" in new
+    ) and "vision" in new:
         val = val.reshape(-1, config.vision_config.hidden_size)
-    if ("out_proj" in new or "v_proj" in new or "k_proj" in new or "q_proj" in new) and "text" in new:
+    if (
+        "out_proj" in new or "v_proj" in new or "k_proj" in new or "q_proj" in new
+    ) and "text" in new:
         val = val.reshape(-1, config.text_config.hidden_size)
 
     if "patch_embedding.weight" in new:
         val = val.transpose(3, 2, 0, 1)
-    elif new.endswith("weight") and "position_embedding" not in new and "token_embedding" not in new:
+    elif (
+        new.endswith("weight") and "position_embedding" not in new and "token_embedding" not in new
+    ):
         val = val.T
 
     if "position_embedding" in new and "vision" in new:
@@ -198,19 +208,25 @@ def read_in_q_k_v_head(state_dict, config):
         .reshape(-1, config.vision_config.hidden_size)
         .T
     )
-    key_proj_bias = state_dict.pop("params/img/MAPHead_0/MultiHeadDotProductAttention_0/key/bias").reshape(-1)
+    key_proj_bias = state_dict.pop(
+        "params/img/MAPHead_0/MultiHeadDotProductAttention_0/key/bias"
+    ).reshape(-1)
     value_proj_weight = (
         state_dict.pop("params/img/MAPHead_0/MultiHeadDotProductAttention_0/value/kernel")
         .reshape(-1, config.vision_config.hidden_size)
         .T
     )
-    value_proj_bias = state_dict.pop("params/img/MAPHead_0/MultiHeadDotProductAttention_0/value/bias").reshape(-1)
+    value_proj_bias = state_dict.pop(
+        "params/img/MAPHead_0/MultiHeadDotProductAttention_0/value/bias"
+    ).reshape(-1)
     query_proj_weight = (
         state_dict.pop("params/img/MAPHead_0/MultiHeadDotProductAttention_0/query/kernel")
         .reshape(-1, config.vision_config.hidden_size)
         .T
     )
-    query_proj_bias = state_dict.pop("params/img/MAPHead_0/MultiHeadDotProductAttention_0/query/bias").reshape(-1)
+    query_proj_bias = state_dict.pop(
+        "params/img/MAPHead_0/MultiHeadDotProductAttention_0/query/bias"
+    ).reshape(-1)
 
     # next, add them to the state dict as a single matrix + vector
     state_dict["vision_model.head.attention.in_proj_weight"] = torch.from_numpy(
@@ -242,7 +258,9 @@ def flatten_nested_dict(params, parent_key="", sep="/"):
 
 
 @torch.no_grad()
-def convert_siglip_checkpoint(model_name, pytorch_dump_folder_path, verify_logits=True, push_to_hub=False):
+def convert_siglip_checkpoint(
+    model_name, pytorch_dump_folder_path, verify_logits=True, push_to_hub=False
+):
     """
     Copy/paste/tweak model's weights to our SigLIP structure.
     """
@@ -290,7 +308,9 @@ def convert_siglip_checkpoint(model_name, pytorch_dump_folder_path, verify_logit
     image_2 = Image.open(requests.get(url_2, stream=True).raw).convert("RGB")
     texts = ["an apple", "a picture of an apple"]
 
-    inputs = processor(images=[image_1, image_2], text=texts, return_tensors="pt", padding="max_length")
+    inputs = processor(
+        images=[image_1, image_2], text=texts, return_tensors="pt", padding="max_length"
+    )
 
     # verify input_ids against original ones
     if image_size == 224:
@@ -306,7 +326,9 @@ def convert_siglip_checkpoint(model_name, pytorch_dump_folder_path, verify_logit
 
     filepath = hf_hub_download(repo_id="nielsr/test-image", filename=filename, repo_type="dataset")
     original_pixel_values = torch.load(filepath)
-    filepath = hf_hub_download(repo_id="nielsr/test-image", filename="siglip_input_ids.pt", repo_type="dataset")
+    filepath = hf_hub_download(
+        repo_id="nielsr/test-image", filename="siglip_input_ids.pt", repo_type="dataset"
+    )
     original_input_ids = torch.load(filepath)
 
     if "i18n" not in model_name:
@@ -386,7 +408,10 @@ if __name__ == "__main__":
         help="Name of the model you'd like to convert.",
     )
     parser.add_argument(
-        "--pytorch_dump_folder_path", default=None, type=str, help="Path to the output PyTorch model directory."
+        "--pytorch_dump_folder_path",
+        default=None,
+        type=str,
+        help="Path to the output PyTorch model directory.",
     )
     parser.add_argument(
         "--verify_logits",
@@ -394,8 +419,12 @@ if __name__ == "__main__":
         help="Whether to verify logits against the original implementation.",
     )
     parser.add_argument(
-        "--push_to_hub", action="store_true", help="Whether or not to push the converted model to the 🤗 hub."
+        "--push_to_hub",
+        action="store_true",
+        help="Whether or not to push the converted model to the 🤗 hub.",
     )
 
     args = parser.parse_args()
-    convert_siglip_checkpoint(args.model_name, args.pytorch_dump_folder_path, args.verify_logits, args.push_to_hub)
+    convert_siglip_checkpoint(
+        args.model_name, args.pytorch_dump_folder_path, args.verify_logits, args.push_to_hub
+    )

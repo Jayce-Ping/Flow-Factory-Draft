@@ -15,7 +15,6 @@
 import torch
 
 
-
 def _expand_active_mask(
     mask: torch.Tensor,
     values: torch.Tensor,

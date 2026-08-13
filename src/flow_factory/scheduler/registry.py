@@ -17,18 +17,19 @@
 Scheduler Registry System
 Maps diffusers scheduler classes to custom SDE scheduler implementations.
 """
-from typing import Type, Dict, Optional
-import importlib
 
-from .abc import SDESchedulerMixin
+import importlib
+from typing import Dict, Optional, Type
+
 from ..utils.logger_utils import setup_logger
+from .abc import SDESchedulerMixin
 
 logger = setup_logger(__name__)
 
 # Maps diffusers scheduler class names to custom SDE scheduler paths
 _SCHEDULER_REGISTRY: Dict[str, str] = {
-    'FlowMatchEulerDiscreteScheduler': 'flow_factory.scheduler.flow_match_euler_discrete.FlowMatchEulerDiscreteSDEScheduler',
-    'UniPCMultistepScheduler': 'flow_factory.scheduler.unipc_multistep.UniPCMultistepSDEScheduler',
+    "FlowMatchEulerDiscreteScheduler": "flow_factory.scheduler.flow_match_euler_discrete.FlowMatchEulerDiscreteSDEScheduler",
+    "UniPCMultistepScheduler": "flow_factory.scheduler.unipc_multistep.UniPCMultistepSDEScheduler",
 }
 
 
@@ -41,13 +42,13 @@ def register_scheduler(diffusers_class_name: str, sde_class_path: str) -> None:
 def get_sde_scheduler_class(scheduler) -> Type:
     """
     Get the SDE scheduler class for a given diffusers scheduler.
-    
+
     Args:
         scheduler: A diffusers scheduler instance or class
-    
+
     Returns:
         Corresponding SDE scheduler class
-    
+
     Raises:
         ImportError: If no matching SDE scheduler is found
     """
@@ -64,9 +65,9 @@ def get_sde_scheduler_class(scheduler) -> Type:
             f"No SDE scheduler registered for '{class_name}'. "
             f"Registered schedulers: {list(_SCHEDULER_REGISTRY.keys())}"
         )
-    
+
     class_path = _SCHEDULER_REGISTRY[class_name]
-    module_path, cls_name = class_path.rsplit('.', 1)
+    module_path, cls_name = class_path.rsplit(".", 1)
     module = importlib.import_module(module_path)
     return getattr(module, cls_name)
 

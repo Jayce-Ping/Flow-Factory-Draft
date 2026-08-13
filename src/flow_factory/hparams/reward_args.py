@@ -18,22 +18,24 @@ Reward Model Arguments Configuration.
 
 Supports both single reward and multi-reward configurations.
 """
+
 from __future__ import annotations
-import yaml
+
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Literal, Optional, List, Union, Dict
+from typing import Any, Dict, Iterator, List, Literal, Optional, Union
+
 import torch
+import yaml
 
 from .abc import ArgABC
 
-
 dtype_map = {
-    'fp16': torch.float16,
-    'bf16': torch.bfloat16,    
-    'fp32': torch.float32,
-    'float16': torch.float16,
-    'bfloat16': torch.bfloat16,
-    'float32': torch.float32,
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+    "fp32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
 }
 
 
@@ -58,7 +60,7 @@ def _make_hashable(obj: Any):
 class RewardArguments(ArgABC):
     """
     Arguments pertaining to a single reward model configuration.
-    
+
     Attributes:
         name: Unique identifier for this reward configuration. Used for logging,
             deduplication, and referencing in eval_reward_names.
@@ -69,7 +71,7 @@ class RewardArguments(ArgABC):
         dtype: Data type for the reward model inference.
         device: Device to load the reward model on.
         batch_size: Batch size for reward model inference.
-    
+
     Examples:
         >>> args = RewardArguments(name="aesthetic", reward_model="PickScore")
         >>> args = RewardArguments(
@@ -89,8 +91,8 @@ class RewardArguments(ArgABC):
         default=None,
         metadata={
             "help": "The path or name of the reward model to use. "
-                    "You can specify 'PickScore' to use the registered PickScore model, "
-                    "or /path/to/your/model:class_name to use your own reward model."
+            "You can specify 'PickScore' to use the registered PickScore model, "
+            "or /path/to/your/model:class_name to use your own reward model."
         },
     )
 
@@ -109,14 +111,14 @@ class RewardArguments(ArgABC):
         },
     )
 
-    dtype: Union[Literal['float16', 'bfloat16', 'float32'], torch.dtype] = field(
-        default='bfloat16',
+    dtype: Union[Literal["float16", "bfloat16", "float32"], torch.dtype] = field(
+        default="bfloat16",
         metadata={"help": "The data type for the reward model."},
         repr=False,
     )
 
-    device: Union[Literal['cpu', 'cuda'], torch.device] = field(
-        default='cuda',
+    device: Union[Literal["cpu", "cuda"], torch.device] = field(
+        default="cuda",
         metadata={"help": "The device to load the reward model on."},
         repr=False,
     )
@@ -128,13 +130,17 @@ class RewardArguments(ArgABC):
 
     async_reward: bool = field(
         default=False,
-        metadata={"help": "Compute this reward asynchronously during sampling instead of after all samples are collected."},
+        metadata={
+            "help": "Compute this reward asynchronously during sampling instead of after all samples are collected."
+        },
     )
 
     num_workers: int = field(
         default=1,
-        metadata={"help": "Number of concurrent workers for async reward computation. "
-                          "Set >1 for IO-bound models (e.g. API calls) to enable concurrent requests."},
+        metadata={
+            "help": "Number of concurrent workers for async reward computation. "
+            "Set >1 for IO-bound models (e.g. API calls) to enable concurrent requests."
+        },
     )
 
     applicable_datasets: Optional[List[str]] = field(
@@ -172,7 +178,9 @@ class RewardArguments(ArgABC):
     # in the inner loop. `None` until that resolver runs (consumers fall
     # back to the string form).
     _datasets_resolved: Optional[frozenset[int]] = field(
-        default=None, repr=False, compare=False,
+        default=None,
+        repr=False,
+        compare=False,
     )
 
     def __post_init__(self):
@@ -185,16 +193,14 @@ class RewardArguments(ArgABC):
     def get_identity_key(self) -> tuple:
         """
         Generate a unique identity key for deduplication.
-        
+
         Two RewardArguments with the same identity key can share the same
         loaded model instance, even if they have different names or weights.
-        
+
         Returns:
             A tuple that uniquely identifies the model configuration.
         """
-        extras = tuple(
-            sorted((k, _make_hashable(v)) for k, v in self.extra_kwargs.items())
-        )
+        extras = tuple(sorted((k, _make_hashable(v)) for k, v in self.extra_kwargs.items()))
         return (self.reward_model, str(self.dtype), str(self.device), extras)
 
     def __hash__(self):
@@ -203,14 +209,14 @@ class RewardArguments(ArgABC):
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary with proper type serialization."""
         d = super().to_dict()
-        d['dtype'] = str(self.dtype).split('.')[-1]
-        d['device'] = str(self.device)
+        d["dtype"] = str(self.dtype).split(".")[-1]
+        d["device"] = str(self.device)
         return d
 
     def __str__(self) -> str:
         """Pretty print configuration as YAML."""
         return yaml.dump(self.to_dict(), default_flow_style=False, sort_keys=False, indent=2)
-    
+
     def __repr__(self) -> str:
         """Same as __str__ for consistency."""
         return self.__str__()
@@ -222,23 +228,21 @@ class RewardArguments(ArgABC):
         """
         if not isinstance(other, RewardArguments):
             return False
-        
+
         core_fields = [
-            'name',
-            'reward_model',
-            'dtype', 'device',
-            'batch_size',
-            'weight',
+            "name",
+            "reward_model",
+            "dtype",
+            "device",
+            "batch_size",
+            "weight",
         ]
         # Compare core fields
-        core_equal = all(
-            getattr(self, f) == getattr(other, f)
-            for f in core_fields
-        )
-        
+        core_equal = all(getattr(self, f) == getattr(other, f) for f in core_fields)
+
         if not core_equal:
             return False
-        
+
         # Compare extra_kwargs
         return self.extra_kwargs == other.extra_kwargs
 
@@ -247,13 +251,13 @@ class RewardArguments(ArgABC):
 class MultiRewardArguments(ArgABC):
     """
     Container for multiple reward model configurations.
-    
+
     Supports iteration, indexing, and lookup by name. Provides a unified
     interface for managing multiple reward models in training and evaluation.
-    
+
     Attributes:
         rewards: List of RewardArguments configurations.
-    
+
     Examples:
         >>> multi_args = MultiRewardArguments(rewards=[
         ...     RewardArguments(name="aesthetic", reward_model="PickScore"),
@@ -265,7 +269,7 @@ class MultiRewardArguments(ArgABC):
         2
         >>> for args in multi_args:
         ...     print(args.name)
-    
+
     YAML Configuration Example:
         ```yaml
         rewards:
@@ -273,7 +277,7 @@ class MultiRewardArguments(ArgABC):
             reward_model: "PickScore"
             weight: 1.0
             batch_size: 16
-          
+
           - name: "text_align"
             reward_model: "CLIPScore"
             weight: 0.5
@@ -286,10 +290,10 @@ class MultiRewardArguments(ArgABC):
     def get_by_name(self, name: str) -> Optional[RewardArguments]:
         """
         Retrieve a reward configuration by its unique name.
-        
+
         Args:
             name: The name of the reward configuration to find.
-        
+
         Returns:
             The matching RewardArguments, or None if not found.
         """
@@ -298,7 +302,7 @@ class MultiRewardArguments(ArgABC):
     def get_names(self) -> List[str]:
         """
         Get all reward names.
-        
+
         Returns:
             List of reward configuration names.
         """
@@ -324,14 +328,14 @@ class MultiRewardArguments(ArgABC):
     def from_dict(cls, args_input: Union[Dict, List]) -> MultiRewardArguments:
         """
         Create MultiRewardArguments from a dictionary or list.
-        
+
         Handles multiple input formats:
         - List format: [{...}, {...}]  (from YAML rewards: [...])
         - Dict format: {name: ..., reward_model: ...}  (single reward shorthand)
-        
+
         Args:
             args_dict: List of reward configs or dict that indicates one single reward.
-        
+
         Returns:
             MultiRewardArguments instance.
         """
@@ -348,7 +352,7 @@ class MultiRewardArguments(ArgABC):
     def to_list(self) -> List[dict[str, Any]]:
         """
         Convert to list of dictionaries for each reward configuration.
-        
+
         Returns:
             List of reward configuration dictionaries.
         """
@@ -356,14 +360,12 @@ class MultiRewardArguments(ArgABC):
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return {
-            f"reward_{i}": r.to_dict() for i, r in enumerate(self.reward_configs)
-        }
+        return {f"reward_{i}": r.to_dict() for i, r in enumerate(self.reward_configs)}
 
     def __str__(self) -> str:
         """Pretty print configuration as YAML."""
         return yaml.dump(self.to_dict(), default_flow_style=False, sort_keys=False, indent=2)
-    
+
     def __repr__(self) -> str:
         """Same as __str__ for consistency."""
         return self.__str__()

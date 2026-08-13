@@ -14,8 +14,8 @@
 
 # src/flow_factory/scheduler/abc.py
 from abc import ABC, abstractmethod
-from typing import Union, List, Optional, Literal, Any, Dict
 from dataclasses import dataclass, fields
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
 from diffusers.utils.outputs import BaseOutput
@@ -24,6 +24,7 @@ from diffusers.utils.outputs import BaseOutput
 @dataclass
 class SDESchedulerOutput(BaseOutput):
     """Single SDE step output with latents, statistics, and log probability."""
+
     next_latents: Optional[torch.FloatTensor] = None
     next_latents_mean: Optional[torch.FloatTensor] = None
     std_dev_t: Optional[torch.FloatTensor] = None
@@ -33,7 +34,7 @@ class SDESchedulerOutput(BaseOutput):
 
     def to_dict(self) -> Dict[str, Any]:
         return {f.name: getattr(self, f.name) for f in fields(self)}
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SDESchedulerOutput":
         field_names = {f.name for f in fields(cls)}
@@ -43,14 +44,14 @@ class SDESchedulerOutput(BaseOutput):
 class SDESchedulerMixin(ABC):
     """
     Abstract mixin for SDE-capable schedulers in RL fine-tuning.
-    
+
     Extends `diffusers` schedulers with stochastic sampling, noise injection control,
     and log probability computation for policy gradient methods.
-    
+
     Usage:
         class MySDEScheduler(DiffusersScheduler, SDESchedulerMixin):
             ...
-    
+
     Attributes:
         sigmas: Noise schedule sigma values (from `diffusers`).
         timesteps: Discrete timesteps (from `diffusers`).
@@ -59,12 +60,12 @@ class SDESchedulerMixin(ABC):
         seed: Random seed for stochastic step selection.
         dynamics_type: SDE variant ("Flow-SDE", "Dance-SDE", "CPS", "ODE").
     """
-    
+
     # From diffusers schedulers
     sigmas: torch.Tensor
     timesteps: torch.Tensor
     config: Any
-    
+
     # SDE-specific
     noise_level: float
     _sde_steps: Optional[torch.Tensor]
@@ -106,13 +107,13 @@ class SDESchedulerMixin(ABC):
     def sde_steps(self) -> torch.Tensor:
         """Step indices eligible for SDE noise injection."""
         ...
-    
+
     @property
     @abstractmethod
     def num_sde_steps(self) -> int:
         """Number of training steps with SDE noise."""
         ...
-        
+
     @property
     @abstractmethod
     def current_sde_steps(self) -> torch.Tensor:

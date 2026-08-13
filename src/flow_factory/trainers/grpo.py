@@ -17,16 +17,18 @@
 Group Relative Policy Optimization (GRPO) Trainer.
 Implements GRPO algorithm for flow matching models.
 """
+
 import os
-from typing import List, Dict, Mapping, Optional, Any, Tuple, Union, Literal, Callable
-from functools import partial
 from collections import defaultdict
-import torch
+from functools import partial
+from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Tuple, Union
+
 import numpy as np
+import torch
 import tqdm as tqdm_
+
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
-from .abc import BaseTrainer
 from ..hparams import GRPOTrainingArguments
 from ..samples import (
     BaseSample,
@@ -38,6 +40,7 @@ from ..samples import (
 from ..utils.base import create_generator_by_prompt
 from ..utils.logger_utils import setup_logger
 from ..utils.trajectory_collector import TrajectoryCollector, compute_trajectory_indices
+from .abc import BaseTrainer
 
 logger = setup_logger(__name__)
 
@@ -73,7 +76,7 @@ class GRPOTrainer(BaseTrainer):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.training_args : GRPOTrainingArguments
+        self.training_args: GRPOTrainingArguments
         self.num_train_timesteps = self.adapter.scheduler.num_sde_steps
 
     @property
@@ -313,15 +316,15 @@ class GRPOTrainer(BaseTrainer):
         # Forward fields: the ratio needs `log_prob`, and `dt` keeps the legacy request
         # shape; the reference KL space adds its own comparison field.
         if self.enable_kl_loss:
-            _, ref_return_field = self._kl_space_fields(self.training_args.kl_type, 'kl_type')
+            _, ref_return_field = self._kl_space_fields(self.training_args.kl_type, "kl_type")
             requested_fields = (
-                {'log_prob', 'velocity', 'dt'}
-                if self.training_args.kl_type == 'v-based'
-                else {'log_prob', 'next_latents', 'next_latents_mean', 'dt'}
+                {"log_prob", "velocity", "dt"}
+                if self.training_args.kl_type == "v-based"
+                else {"log_prob", "next_latents", "next_latents_mean", "dt"}
             )
         else:
             ref_return_field = None
-            requested_fields = {'log_prob', 'dt'}
+            requested_fields = {"log_prob", "dt"}
         return_fields = self._canonical_return_fields(requested_fields)
         for inner_epoch in range(self.training_args.num_inner_epochs):
             # Shuffle unless disabled for pack-composition-dependent adapters.
@@ -336,14 +339,14 @@ class GRPOTrainer(BaseTrainer):
             for batch in tqdm(
                 self._iter_prefetched_batches(shuffled_samples, per_device_batch_size),
                 total=num_batches,
-                desc=f'Epoch {self.epoch} Training',
+                desc=f"Epoch {self.epoch} Training",
                 position=0,
                 disable=not self.show_progress_bar,
             ):
                 # Iterate through timesteps
                 for timestep_index in tqdm(
                     train_step_indices,
-                    desc=f'Epoch {self.epoch} Timestep',
+                    desc=f"Epoch {self.epoch} Timestep",
                     position=1,
                     leave=False,
                     disable=not self.show_progress_bar,
@@ -359,7 +362,7 @@ class GRPOTrainer(BaseTrainer):
 
                         # 3. Compute loss
                         # Clip advantages
-                        adv = batch['advantage']
+                        adv = batch["advantage"]
                         adv_clip_range = self.training_args.adv_clip_range
                         adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
                         # PPO-style clipped loss
@@ -370,7 +373,9 @@ class GRPOTrainer(BaseTrainer):
                         ratio_clip_range = self.training_args.clip_range
 
                         unclipped_loss = -adv * ratio
-                        clipped_loss = -adv * torch.clamp(ratio, 1.0 + ratio_clip_range[0], 1.0 + ratio_clip_range[1])
+                        clipped_loss = -adv * torch.clamp(
+                            ratio, 1.0 + ratio_clip_range[0], 1.0 + ratio_clip_range[1]
+                        )
                         policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
 
                         loss = policy_loss
@@ -386,20 +391,22 @@ class GRPOTrainer(BaseTrainer):
                                 kl_div = self._reference_kl_divergence(output, ref_output, replay)
                                 kl_loss = self.training_args.kl_beta * kl_div
                                 loss += kl_loss
-                                loss_info['kl_div'].append(kl_div.detach())
-                                loss_info['kl_loss'].append(kl_loss.detach())
+                                loss_info["kl_div"].append(kl_div.detach())
+                                loss_info["kl_loss"].append(kl_loss.detach())
 
                         # 5. Log per-timestep info
-                        loss_info['ratio'].append(ratio.detach())
-                        loss_info['unclipped_loss'].append(unclipped_loss.detach())
-                        loss_info['clipped_loss'].append(clipped_loss.detach())
-                        loss_info['policy_loss'].append(policy_loss.detach())
-                        loss_info['loss'].append(loss.detach())
+                        loss_info["ratio"].append(ratio.detach())
+                        loss_info["unclipped_loss"].append(unclipped_loss.detach())
+                        loss_info["clipped_loss"].append(clipped_loss.detach())
+                        loss_info["policy_loss"].append(policy_loss.detach())
+                        loss_info["loss"].append(loss.detach())
                         clip_frac_high = torch.mean((ratio > 1.0 + ratio_clip_range[1]).float())
                         clip_frac_low = torch.mean((ratio < 1.0 + ratio_clip_range[0]).float())
                         loss_info["clip_frac_high"].append(clip_frac_high.detach())
                         loss_info["clip_frac_low"].append(clip_frac_low.detach())
-                        loss_info['clip_frac_total'].append((clip_frac_high + clip_frac_low).detach())
+                        loss_info["clip_frac_total"].append(
+                            (clip_frac_high + clip_frac_low).detach()
+                        )
 
                         # 6. Backward and optimizer step
                         self.accelerator.backward(loss)
@@ -407,6 +414,8 @@ class GRPOTrainer(BaseTrainer):
                             loss_info = self._apply_optimizer_step(loss_info)
 
     # =========================== Advantage Computation ============================
+
+
 # ============================ GRPO-Guard Trainer ============================
 class GRPOGuardTrainer(GRPOTrainer):
     """
@@ -525,9 +534,9 @@ class GRPOGuardTrainer(GRPOTrainer):
         num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
         train_step_indices = self.adapter.get_train_step_indices()
         # The reweighted ratio always needs the transition mean, its std, and dt.
-        requested_fields = {'log_prob', 'next_latents_mean', 'std_dev_t', 'dt'}
+        requested_fields = {"log_prob", "next_latents_mean", "std_dev_t", "dt"}
         if self.enable_kl_loss:
-            _, ref_return_field = self._kl_space_fields(self.training_args.kl_type, 'kl_type')
+            _, ref_return_field = self._kl_space_fields(self.training_args.kl_type, "kl_type")
             requested_fields.add(ref_return_field)
         else:
             ref_return_field = None
@@ -544,14 +553,14 @@ class GRPOGuardTrainer(GRPOTrainer):
             for batch in tqdm(
                 self._iter_prefetched_batches(shuffled_samples, per_device_batch_size),
                 total=num_batches,
-                desc=f'Epoch {self.epoch} Training',
+                desc=f"Epoch {self.epoch} Training",
                 position=0,
                 disable=not self.show_progress_bar,
             ):
                 # Iterate through timesteps
                 for timestep_index in tqdm(
                     train_step_indices,
-                    desc=f'Epoch {self.epoch} Timestep',
+                    desc=f"Epoch {self.epoch} Timestep",
                     position=1,
                     leave=False,
                     disable=not self.show_progress_bar,
@@ -562,7 +571,7 @@ class GRPOGuardTrainer(GRPOTrainer):
                         replay = self.adapter.get_replay_step(batch, step_index)
                         self._require_replay_log_prob(replay, step_index)
                         old_state_mean = self.adapter.get_replay_callback(
-                            batch, step_index, 'next_latents_mean'
+                            batch, step_index, "next_latents_mean"
                         )
                         # 2. Forward pass
                         with self.autocast():
@@ -570,7 +579,7 @@ class GRPOGuardTrainer(GRPOTrainer):
 
                         # 3. Compute loss
                         # Clip advantages
-                        adv = batch['advantage']
+                        adv = batch["advantage"]
                         adv_clip_range = self.training_args.adv_clip_range
                         adv = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
                         # Reweighted ratio
@@ -579,7 +588,9 @@ class GRPOGuardTrainer(GRPOTrainer):
                         ratio_clip_range = self.training_args.clip_range
 
                         unclipped_loss = -adv * ratio
-                        clipped_loss = -adv * torch.clamp(ratio, 1.0 + ratio_clip_range[0], 1.0 + ratio_clip_range[1])
+                        clipped_loss = -adv * torch.clamp(
+                            ratio, 1.0 + ratio_clip_range[0], 1.0 + ratio_clip_range[1]
+                        )
                         policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
 
                         loss = policy_loss
@@ -595,20 +606,22 @@ class GRPOGuardTrainer(GRPOTrainer):
                                 kl_div = self._reference_kl_divergence(output, ref_output, replay)
                                 kl_loss = self.training_args.kl_beta * kl_div
                                 loss += kl_loss
-                                loss_info['kl_div'].append(kl_div.detach())
-                                loss_info['kl_loss'].append(kl_loss.detach())
+                                loss_info["kl_div"].append(kl_div.detach())
+                                loss_info["kl_loss"].append(kl_loss.detach())
 
                         # 5. Log per-timestep info
-                        loss_info['ratio'].append(ratio.detach())
-                        loss_info['unclipped_loss'].append(unclipped_loss.detach())
-                        loss_info['clipped_loss'].append(clipped_loss.detach())
-                        loss_info['policy_loss'].append(policy_loss.detach())
-                        loss_info['loss'].append(loss.detach())
+                        loss_info["ratio"].append(ratio.detach())
+                        loss_info["unclipped_loss"].append(unclipped_loss.detach())
+                        loss_info["clipped_loss"].append(clipped_loss.detach())
+                        loss_info["policy_loss"].append(policy_loss.detach())
+                        loss_info["loss"].append(loss.detach())
                         clip_frac_high = torch.mean((ratio > 1.0 + ratio_clip_range[1]).float())
                         clip_frac_low = torch.mean((ratio < 1.0 + ratio_clip_range[0]).float())
                         loss_info["clip_frac_high"].append(clip_frac_high.detach())
                         loss_info["clip_frac_low"].append(clip_frac_low.detach())
-                        loss_info['clip_frac_total'].append((clip_frac_high + clip_frac_low).detach())
+                        loss_info["clip_frac_total"].append(
+                            (clip_frac_high + clip_frac_low).detach()
+                        )
 
                         # 6. Backward and optimizer step
                         self.accelerator.backward(loss)

@@ -16,16 +16,16 @@
 
 from .samples import (
     BaseSample,
-    StackedSampleBatch,
-    ImageConditionSample,
-    VideoConditionSample,
-    T2ISample,
-    T2VSample,
-    T2AVSample,
+    I2AVSample,
     I2ISample,
     I2VSample,
-    I2AVSample,
+    ImageConditionSample,
+    StackedSampleBatch,
+    T2AVSample,
+    T2ISample,
+    T2VSample,
     V2VSample,
+    VideoConditionSample,
 )
 from .trajectory import (
     ComponentTimes,
@@ -38,7 +38,6 @@ from .trajectory import (
     StructuredTrajectory,
     unstack_structured_trajectories,
 )
-
 
 __all__ = [
     # Sample classes

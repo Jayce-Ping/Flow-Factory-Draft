@@ -13,36 +13,36 @@
 # limitations under the License.
 
 """Training arguments registry and lookup functions."""
+
 from __future__ import annotations
 
 import importlib
-from typing import Type, Dict
+from typing import Dict, Type
 
 from ._base import TrainingArguments
-from .grpo import GRPOTrainingArguments
-from .dppo import DPPOTrainingArguments
-from .nft import NFTTrainingArguments
 from .awm import AWMTrainingArguments
-from .dpo import DPOTrainingArguments
-from .dgpo import DGPOTrainingArguments
 from .crd import CRDTrainingArguments
+from .dgpo import DGPOTrainingArguments
+from .dpo import DPOTrainingArguments
+from .dppo import DPPOTrainingArguments
+from .grpo import GRPOTrainingArguments
+from .nft import NFTTrainingArguments
 from .opd import DiffusionOPDTrainingArguments
-
 
 # ============================================================================
 # Training Arguments Registry
 # ============================================================================
 
 _TRAINING_ARGS_REGISTRY: Dict[str, Type[TrainingArguments]] = {
-    'grpo': GRPOTrainingArguments,
-    'grpo-guard': GRPOTrainingArguments,
-    'dppo': DPPOTrainingArguments,
-    'nft': NFTTrainingArguments,
-    'awm': AWMTrainingArguments,
-    'dgpo': DGPOTrainingArguments,
-    'dpo': DPOTrainingArguments,
-    'crd': CRDTrainingArguments,
-    'diffusion-opd': DiffusionOPDTrainingArguments,
+    "grpo": GRPOTrainingArguments,
+    "grpo-guard": GRPOTrainingArguments,
+    "dppo": DPPOTrainingArguments,
+    "nft": NFTTrainingArguments,
+    "awm": AWMTrainingArguments,
+    "dgpo": DGPOTrainingArguments,
+    "dpo": DPOTrainingArguments,
+    "crd": CRDTrainingArguments,
+    "diffusion-opd": DiffusionOPDTrainingArguments,
 }
 
 
@@ -64,7 +64,7 @@ def get_training_args_class(identifier: str) -> Type[TrainingArguments]:
 
     # Try dynamic import (python path like 'my_package.args.CustomArgs')
     try:
-        module_path, class_name = identifier.rsplit('.', 1)
+        module_path, class_name = identifier.rsplit(".", 1)
         module = importlib.import_module(module_path)
         cls = getattr(module, class_name)
         if isinstance(cls, type) and issubclass(cls, TrainingArguments):

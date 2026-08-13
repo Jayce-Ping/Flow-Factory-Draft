@@ -15,39 +15,40 @@
 # src/flow_factory/models/qwen_image/qwen_image.py
 from __future__ import annotations
 
-import os
-from typing import Union, List, Dict, Any, Optional, Tuple, ClassVar, Literal
-from dataclasses import dataclass
 import logging
+import os
 from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
 
-from PIL import Image
 import torch
-from torch.nn.utils.rnn import pad_sequence
-import diffusers
-from diffusers.pipelines.qwenimage.pipeline_qwenimage import QwenImagePipeline
 from accelerate import Accelerator
+from diffusers.pipelines.qwenimage.pipeline_qwenimage import QwenImagePipeline
+from PIL import Image
+from torch.nn.utils.rnn import pad_sequence
 
-from ..abc import BaseAdapter
-from ._utils import _pad_seq_dim
-from ...samples import T2ISample
+import diffusers
+
 from ...hparams import *
+from ...samples import T2ISample
 from ...scheduler import (
     FlowMatchEulerDiscreteSDEScheduler,
     FlowMatchEulerDiscreteSDESchedulerOutput,
     SDESchedulerOutput,
-    set_scheduler_timesteps
-)
-from ...utils.trajectory_collector import (
-    TrajectoryCollector,
-    CallbackCollector,
-    TrajectoryIndicesType, 
-    create_trajectory_collector,
-    create_callback_collector,
+    set_scheduler_timesteps,
 )
 from ...utils.base import filter_kwargs
 from ...utils.imports import is_version_at_least
 from ...utils.logger_utils import setup_logger
+from ...utils.trajectory_collector import (
+    CallbackCollector,
+    TrajectoryCollector,
+    TrajectoryIndicesType,
+    create_callback_collector,
+    create_trajectory_collector,
+)
+from ..abc import BaseAdapter
+from ._utils import _pad_seq_dim
 
 logger = setup_logger(__name__)
 
@@ -55,12 +56,14 @@ logger = setup_logger(__name__)
 @dataclass
 class QwenImageSample(T2ISample):
     """Output class for Qwen-Image models."""
+
     # Class var
     _shared_fields: ClassVar[frozenset[str]] = frozenset({})
     # Obj var
-    prompt_embeds_mask : Optional[torch.FloatTensor] = None
-    negative_prompt_embeds_mask : Optional[torch.FloatTensor] = None
-    img_shapes : Optional[List[Tuple[int, int, int]]] = None
+    prompt_embeds_mask: Optional[torch.FloatTensor] = None
+    negative_prompt_embeds_mask: Optional[torch.FloatTensor] = None
+    img_shapes: Optional[List[Tuple[int, int, int]]] = None
+
 
 class QwenImageAdapter(BaseAdapter):
     """Adapter for Qwen-Image text-to-image models."""
@@ -70,7 +73,7 @@ class QwenImageAdapter(BaseAdapter):
     ddp_find_unused_parameters = True
     supports_diffusers_cache = True
 
-    def __init__(self, config: Arguments, accelerator : Accelerator):
+    def __init__(self, config: Arguments, accelerator: Accelerator):
         if not is_version_at_least("diffusers", "0.37.0"):
             raise ImportError(
                 "QwenImageAdapter requires diffusers>=0.37.0 (the Qwen-Image "
@@ -85,26 +88,33 @@ class QwenImageAdapter(BaseAdapter):
 
         self._warned_cfg_no_neg_prompt = False
         self._warned_no_cfg = False
-    
+
     def load_pipeline(self) -> QwenImagePipeline:
         return QwenImagePipeline.from_pretrained(
-            self.model_args.model_name_or_path,
-            low_cpu_mem_usage=False
+            self.model_args.model_name_or_path, low_cpu_mem_usage=False
         )
-    
+
     @property
     def default_target_modules(self) -> List[str]:
         """Default LoRA target modules for Qwen-Image transformer."""
         return [
-            "attn.to_k", "attn.to_q", "attn.to_v", "attn.to_out.0", # Image Stream / Main Stream
-            "attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj", "attn.to_add_out", # Text Stream
+            "attn.to_k",
+            "attn.to_q",
+            "attn.to_v",
+            "attn.to_out.0",  # Image Stream / Main Stream
+            "attn.add_q_proj",
+            "attn.add_k_proj",
+            "attn.add_v_proj",
+            "attn.to_add_out",  # Text Stream
             # FFNs
-            "img_mlp.net.0.proj", "img_mlp.net.2.proj",
-            "txt_mlp.net.0.proj", "txt_mlp.net.2.proj"
+            "img_mlp.net.0.proj",
+            "img_mlp.net.2.proj",
+            "txt_mlp.net.0.proj",
+            "txt_mlp.net.2.proj",
         ]
-    
+
     # ======================== Encoding & Decoding ========================
-    
+
     def _get_qwen_prompt_embeds(
         self,
         prompt: Union[str, List[str]] = None,
@@ -123,7 +133,11 @@ class QwenImageAdapter(BaseAdapter):
         drop_idx = self.pipeline.prompt_template_encode_start_idx
         txt = [template.format(e) for e in prompt]
         txt_tokens = self.pipeline.tokenizer(
-            txt, max_length=max_sequence_length + drop_idx, padding=True, truncation=True, return_tensors="pt"
+            txt,
+            max_length=max_sequence_length + drop_idx,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
         ).to(device)
 
         input_ids = txt_tokens.input_ids
@@ -133,21 +147,28 @@ class QwenImageAdapter(BaseAdapter):
             output_hidden_states=True,
         )
         hidden_states = encoder_hidden_states.hidden_states[-1]
-        split_hidden_states = self.pipeline._extract_masked_hidden(hidden_states, txt_tokens.attention_mask)
+        split_hidden_states = self.pipeline._extract_masked_hidden(
+            hidden_states, txt_tokens.attention_mask
+        )
         split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
-        attn_mask_list = [torch.ones(e.size(0), dtype=torch.long, device=e.device) for e in split_hidden_states]
+        attn_mask_list = [
+            torch.ones(e.size(0), dtype=torch.long, device=e.device) for e in split_hidden_states
+        ]
         max_seq_len = max([e.size(0) for e in split_hidden_states])
         prompt_embeds = torch.stack(
-            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))]) for u in split_hidden_states]
+            [
+                torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))])
+                for u in split_hidden_states
+            ]
         )
         encoder_attention_mask = torch.stack(
             [torch.cat([u, u.new_zeros(max_seq_len - u.size(0))]) for u in attn_mask_list]
         )
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
 
-        input_ids = input_ids[:, drop_idx:] # Extract only user input ids
+        input_ids = input_ids[:, drop_idx:]  # Extract only user input ids
         return input_ids, prompt_embeds, encoder_attention_mask
-    
+
     def encode_prompt(
         self,
         prompt: Union[str, List[str]],
@@ -156,7 +177,7 @@ class QwenImageAdapter(BaseAdapter):
         max_sequence_length: int = 1024,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
-        **kwargs
+        **kwargs,
     ) -> Dict[str, Union[torch.Tensor, torch.Tensor]]:
         """Encode text prompts using the pipeline's text encoder."""
 
@@ -168,10 +189,7 @@ class QwenImageAdapter(BaseAdapter):
 
         # Encode positive prompt
         prompt_ids, prompt_embeds, prompt_embeds_mask = self._get_qwen_prompt_embeds(
-            prompt=prompt,
-            device=device,
-            dtype=dtype,
-            max_sequence_length=max_sequence_length
+            prompt=prompt, device=device, dtype=dtype, max_sequence_length=max_sequence_length
         )
         prompt_embeds = prompt_embeds[:, :max_sequence_length]
         prompt_embeds_mask = prompt_embeds_mask[:, :max_sequence_length]
@@ -184,23 +202,35 @@ class QwenImageAdapter(BaseAdapter):
         # Encode negative prompt
         if do_classifier_free_guidance:
             negative_prompt = "" if negative_prompt is None else negative_prompt
-            negative_prompt = [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
-            negative_prompt = negative_prompt * (len(prompt) // len(negative_prompt)) # Expand to match batch size
-            assert len(negative_prompt) == len(prompt), "The number of negative prompts must match the number of prompts."
-            negative_prompt_ids, negative_prompt_embeds, negative_prompt_embeds_mask = self._get_qwen_prompt_embeds(
-                prompt=negative_prompt,
-                device=device,
-                dtype=dtype,
-                max_sequence_length=max_sequence_length
+            negative_prompt = (
+                [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
             )
-            results.update({
-                "negative_prompt_ids": negative_prompt_ids,
-                "negative_prompt_embeds": negative_prompt_embeds[:, :max_sequence_length],
-                "negative_prompt_embeds_mask": negative_prompt_embeds_mask[:, :max_sequence_length],
-            })
+            negative_prompt = negative_prompt * (
+                len(prompt) // len(negative_prompt)
+            )  # Expand to match batch size
+            assert len(negative_prompt) == len(
+                prompt
+            ), "The number of negative prompts must match the number of prompts."
+            negative_prompt_ids, negative_prompt_embeds, negative_prompt_embeds_mask = (
+                self._get_qwen_prompt_embeds(
+                    prompt=negative_prompt,
+                    device=device,
+                    dtype=dtype,
+                    max_sequence_length=max_sequence_length,
+                )
+            )
+            results.update(
+                {
+                    "negative_prompt_ids": negative_prompt_ids,
+                    "negative_prompt_embeds": negative_prompt_embeds[:, :max_sequence_length],
+                    "negative_prompt_embeds_mask": negative_prompt_embeds_mask[
+                        :, :max_sequence_length
+                    ],
+                }
+            )
 
         return results
-    
+
     def encode_image(self, image: Union[Image.Image, torch.Tensor, List[torch.Tensor]]):
         """Not needed for Qwen-Image text-to-image models."""
         pass
@@ -209,36 +239,44 @@ class QwenImageAdapter(BaseAdapter):
         """Not needed for Qwen-Image text-to-image models."""
         pass
 
-    def decode_latents(self, latents: torch.Tensor, height: int, width: int, output_type: Literal['pil', 'pt', 'np'] = 'pil') -> List[Image.Image]:
+    def decode_latents(
+        self,
+        latents: torch.Tensor,
+        height: int,
+        width: int,
+        output_type: Literal["pil", "pt", "np"] = "pil",
+    ) -> List[Image.Image]:
         """Decode latents to images using VAE."""
-        
-        latents = self.pipeline._unpack_latents(latents, height, width, self.pipeline.vae_scale_factor)
+
+        latents = self.pipeline._unpack_latents(
+            latents, height, width, self.pipeline.vae_scale_factor
+        )
         latents = latents.to(self.pipeline.vae.dtype)
         latents_mean = (
             torch.tensor(self.pipeline.vae.config.latents_mean)
             .view(1, self.pipeline.vae.config.z_dim, 1, 1, 1)
             .to(latents.device, latents.dtype)
         )
-        latents_std = 1.0 / torch.tensor(self.pipeline.vae.config.latents_std).view(1, self.pipeline.vae.config.z_dim, 1, 1, 1).to(
-            latents.device, latents.dtype
-        )
+        latents_std = 1.0 / torch.tensor(self.pipeline.vae.config.latents_std).view(
+            1, self.pipeline.vae.config.z_dim, 1, 1, 1
+        ).to(latents.device, latents.dtype)
         latents = latents / latents_std + latents_mean
         images = self.pipeline.vae.decode(latents, return_dict=False)[0][:, :, 0]
         images = self.pipeline.image_processor.postprocess(images, output_type=output_type)
 
         return images
-    
+
     # ======================== Padding Utilities ========================
     def _standardize_data(
         self,
-        data : Union[None, torch.Tensor, List[torch.Tensor]],
-        padding_value : Union[int, float],
+        data: Union[None, torch.Tensor, List[torch.Tensor]],
+        padding_value: Union[int, float],
         device: Optional[torch.device] = None,
         max_len: Optional[int] = None,
     ):
-        if data is None: 
+        if data is None:
             return None
-        
+
         # If data is a list (ragged), pad it into a batch tensor first
         if isinstance(data, list):
             # Ensure data is on the correct device before padding
@@ -247,7 +285,7 @@ class QwenImageAdapter(BaseAdapter):
             data = pad_sequence(data, batch_first=True, padding_value=padding_value)
         else:
             data = data.to(device)
-        
+
         return data[:, :max_len] if data.shape[1] > max_len else data
 
     def _pad_batch_prompt(
@@ -255,7 +293,7 @@ class QwenImageAdapter(BaseAdapter):
         prompt_embeds_mask: Union[List[torch.Tensor], torch.Tensor],
         prompt_embeds: Optional[Union[List[torch.Tensor], torch.Tensor]] = None,
         prompt_ids: Optional[Union[List[torch.Tensor], torch.Tensor]] = None,
-        device : Optional[torch.device] = None,
+        device: Optional[torch.device] = None,
     ):
         if isinstance(prompt_embeds_mask, list):
             device = device or prompt_embeds_mask[0].device
@@ -265,7 +303,11 @@ class QwenImageAdapter(BaseAdapter):
             max_pos_len = max(1, int(prompt_embeds_mask.sum(dim=1).max()))
 
         if prompt_ids is not None:
-            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+            pad_token_id = (
+                self.tokenizer.pad_token_id
+                if self.tokenizer.pad_token_id is not None
+                else self.tokenizer.eos_token_id
+            )
             padded_prompt_ids = self._standardize_data(
                 prompt_ids,
                 padding_value=pad_token_id,
@@ -301,7 +343,7 @@ class QwenImageAdapter(BaseAdapter):
         prompt: Union[str, List[str]] = None,
         negative_prompt: Union[str, List[str]] = None,
         num_inference_steps: int = 50,
-        guidance_scale: float = 4.0, # Corresponds to `true_cfg_scale` in Qwen-Image-Pipeline.
+        guidance_scale: float = 4.0,  # Corresponds to `true_cfg_scale` in Qwen-Image-Pipeline.
         height: int = 1024,
         width: int = 1024,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -318,7 +360,7 @@ class QwenImageAdapter(BaseAdapter):
         compute_log_prob: bool = False,
         # Extra callback arguments
         extra_call_back_kwargs: List[str] = [],
-        trajectory_indices: TrajectoryIndicesType = 'all',
+        trajectory_indices: TrajectoryIndicesType = "all",
     ):
         # 1. Prepare inputs
         device = self.device
@@ -339,9 +381,9 @@ class QwenImageAdapter(BaseAdapter):
             )
 
         # 2. Get prompt embeddings
-        if (
-            (prompt is not None and (prompt_embeds is None or prompt_embeds_mask is None))
-            or (negative_prompt is not None and (negative_prompt_embeds is None or negative_prompt_embeds_mask is None))
+        if (prompt is not None and (prompt_embeds is None or prompt_embeds_mask is None)) or (
+            negative_prompt is not None
+            and (negative_prompt_embeds is None or negative_prompt_embeds_mask is None)
         ):
             encoded = self.encode_prompt(
                 prompt=prompt,
@@ -358,16 +400,32 @@ class QwenImageAdapter(BaseAdapter):
             negative_prompt_embeds = encoded.get("negative_prompt_embeds", None)
             negative_prompt_embeds_mask = encoded.get("negative_prompt_embeds_mask", None)
         else:
-            prompt_embeds = [p.to(device) for p in prompt_embeds] if isinstance(prompt_embeds, list) else prompt_embeds.to(device)
-            prompt_embeds_mask = [p.to(device) for p in prompt_embeds_mask] if isinstance(prompt_embeds_mask, list) else prompt_embeds_mask.to(device)
+            prompt_embeds = (
+                [p.to(device) for p in prompt_embeds]
+                if isinstance(prompt_embeds, list)
+                else prompt_embeds.to(device)
+            )
+            prompt_embeds_mask = (
+                [p.to(device) for p in prompt_embeds_mask]
+                if isinstance(prompt_embeds_mask, list)
+                else prompt_embeds_mask.to(device)
+            )
             if negative_prompt_embeds is not None:
-                negative_prompt_embeds = [p.to(device) for p in negative_prompt_embeds] if isinstance(negative_prompt_embeds, list) else negative_prompt_embeds.to(device)
+                negative_prompt_embeds = (
+                    [p.to(device) for p in negative_prompt_embeds]
+                    if isinstance(negative_prompt_embeds, list)
+                    else negative_prompt_embeds.to(device)
+                )
             if negative_prompt_embeds_mask is not None:
-                negative_prompt_embeds_mask = [p.to(device) for p in negative_prompt_embeds_mask] if isinstance(negative_prompt_embeds_mask, list) else negative_prompt_embeds_mask.to(device)
+                negative_prompt_embeds_mask = (
+                    [p.to(device) for p in negative_prompt_embeds_mask]
+                    if isinstance(negative_prompt_embeds_mask, list)
+                    else negative_prompt_embeds_mask.to(device)
+                )
 
         # 3. Prepare latents
         batch_size = len(prompt_embeds)
-        
+
         num_channels_latents = self.pipeline.transformer.config.in_channels // 4
         latents = self.pipeline.prepare_latents(
             batch_size=batch_size,
@@ -378,7 +436,15 @@ class QwenImageAdapter(BaseAdapter):
             device=device,
             generator=generator,
         )
-        img_shapes = [[(1, height // self.pipeline.vae_scale_factor // 2, width // self.pipeline.vae_scale_factor // 2)]] * batch_size
+        img_shapes = [
+            [
+                (
+                    1,
+                    height // self.pipeline.vae_scale_factor // 2,
+                    width // self.pipeline.vae_scale_factor // 2,
+                )
+            ]
+        ] * batch_size
 
         # 4. Set scheduler timesteps
         timesteps = set_scheduler_timesteps(
@@ -388,20 +454,24 @@ class QwenImageAdapter(BaseAdapter):
             device=device,
         )
 
-        guidance = None # Always None for Qwen-Image
+        guidance = None  # Always None for Qwen-Image
 
         # 5. Denoising loop
         latent_collector = create_trajectory_collector(trajectory_indices, num_inference_steps)
         latents = self.cast_latents(latents, default_dtype=dtype)
         latent_collector.collect(latents, step_idx=0)
         if compute_log_prob:
-            log_prob_collector = create_trajectory_collector(trajectory_indices, num_inference_steps)
+            log_prob_collector = create_trajectory_collector(
+                trajectory_indices, num_inference_steps
+            )
         callback_collector = create_callback_collector(trajectory_indices, num_inference_steps)
-        
+
         for i, t in enumerate(timesteps):
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
             t_next = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
-            return_kwargs = list(set(['next_latents', 'log_prob', 'velocity'] + extra_call_back_kwargs))
+            return_kwargs = list(
+                set(["next_latents", "log_prob", "velocity"] + extra_call_back_kwargs)
+            )
             current_compute_log_prob = compute_log_prob and current_noise_level > 0
 
             output = self.forward(
@@ -429,25 +499,33 @@ class QwenImageAdapter(BaseAdapter):
                 step_idx=i,
                 output=output,
                 keys=extra_call_back_kwargs,
-                capturable={'noise_level': current_noise_level},
+                capturable={"noise_level": current_noise_level},
             )
 
         # 6. Decode latents to images
-        decoded_images = self.decode_latents(latents, height, width, output_type='pt')
+        decoded_images = self.decode_latents(latents, height, width, output_type="pt")
 
         # 7. Prepare output samples
-        extra_call_back_res = callback_collector.get_result()          # (B, len(trajectory_indices), ...)
-        callback_index_map = callback_collector.get_index_map()        # (T,) LongTensor
-        all_latents = latent_collector.get_result()                    # List[torch.Tensor(B, ...)]
-        latent_index_map = latent_collector.get_index_map()            # (T+1,) LongTensor
+        extra_call_back_res = callback_collector.get_result()  # (B, len(trajectory_indices), ...)
+        callback_index_map = callback_collector.get_index_map()  # (T,) LongTensor
+        all_latents = latent_collector.get_result()  # List[torch.Tensor(B, ...)]
+        latent_index_map = latent_collector.get_index_map()  # (T+1,) LongTensor
         all_log_probs = log_prob_collector.get_result() if compute_log_prob else None
         log_prob_index_map = log_prob_collector.get_index_map() if compute_log_prob else None
         samples = [
             QwenImageSample(
                 # Denoising trajectory
                 timesteps=timesteps,
-                all_latents=torch.stack([lat[b] for lat in all_latents], dim=0) if all_latents is not None else None,
-                log_probs=torch.stack([lp[b] for lp in all_log_probs], dim=0) if all_log_probs is not None else None,
+                all_latents=(
+                    torch.stack([lat[b] for lat in all_latents], dim=0)
+                    if all_latents is not None
+                    else None
+                ),
+                log_probs=(
+                    torch.stack([lp[b] for lp in all_log_probs], dim=0)
+                    if all_log_probs is not None
+                    else None
+                ),
                 latent_index_map=latent_index_map,
                 log_prob_index_map=log_prob_index_map,
                 # Generated image & metadata
@@ -461,24 +539,32 @@ class QwenImageAdapter(BaseAdapter):
                 prompt_embeds=prompt_embeds[b],
                 prompt_embeds_mask=prompt_embeds_mask[b],
                 # Negative prompt info
-                negative_prompt=negative_prompt[b] if isinstance(negative_prompt, list) else negative_prompt,
-                negative_prompt_ids=negative_prompt_ids[b] if negative_prompt_ids is not None else None,
-                negative_prompt_embeds=negative_prompt_embeds[b] if negative_prompt_embeds is not None else None,
-                negative_prompt_embeds_mask=negative_prompt_embeds_mask[b] if negative_prompt_embeds_mask is not None else None,
+                negative_prompt=(
+                    negative_prompt[b] if isinstance(negative_prompt, list) else negative_prompt
+                ),
+                negative_prompt_ids=(
+                    negative_prompt_ids[b] if negative_prompt_ids is not None else None
+                ),
+                negative_prompt_embeds=(
+                    negative_prompt_embeds[b] if negative_prompt_embeds is not None else None
+                ),
+                negative_prompt_embeds_mask=(
+                    negative_prompt_embeds_mask[b]
+                    if negative_prompt_embeds_mask is not None
+                    else None
+                ),
                 # Extra kwargs
                 extra_kwargs={
                     **{k: v[b] for k, v in extra_call_back_res.items()},
-                    'callback_index_map': callback_index_map,
+                    "callback_index_map": callback_index_map,
                 },
             )
             for b in range(batch_size)
         ]
 
-
         self.pipeline.maybe_free_model_hooks()
 
         return samples
-    
 
     # ======================== Forward (Training) ========================
     def forward(
@@ -499,7 +585,14 @@ class QwenImageAdapter(BaseAdapter):
         noise_level: Optional[float] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
-        return_kwargs: List[str] = ['velocity', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
+        return_kwargs: List[str] = [
+            "velocity",
+            "next_latents",
+            "next_latents_mean",
+            "std_dev_t",
+            "dt",
+            "log_prob",
+        ],
     ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
         """
         Core forward pass for T2I generation.
@@ -529,8 +622,7 @@ class QwenImageAdapter(BaseAdapter):
         timestep = t.expand(batch_size).to(latents.dtype)
         guidance = None  # Always None for Qwen-Image
         has_negative_prompt = (
-            negative_prompt_embeds is not None
-            and negative_prompt_embeds_mask is not None
+            negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
         )
         if guidance_scale > 1.0 and not has_negative_prompt:
             logger.warning(
@@ -543,16 +635,14 @@ class QwenImageAdapter(BaseAdapter):
         # batch. diffusers (>=0.38) derives the per-sample text length from
         # encoder_hidden_states_mask, so the deprecated txt_seq_lens is not passed.
         prompt_embeds_mask, prompt_embeds, _ = self._pad_batch_prompt(
-            prompt_embeds_mask=prompt_embeds_mask,
-            prompt_embeds=prompt_embeds,
-            device=device
+            prompt_embeds_mask=prompt_embeds_mask, prompt_embeds=prompt_embeds, device=device
         )
 
         if do_true_cfg:
             negative_prompt_embeds_mask, negative_prompt_embeds, _ = self._pad_batch_prompt(
                 prompt_embeds_mask=negative_prompt_embeds_mask,
                 prompt_embeds=negative_prompt_embeds,
-                device=device
+                device=device,
             )
 
         # 2. Transformer forward pass
@@ -568,9 +658,7 @@ class QwenImageAdapter(BaseAdapter):
             prompt_embeds = _pad_seq_dim(prompt_embeds, seq_len, 0.0)
             prompt_embeds_mask = _pad_seq_dim(prompt_embeds_mask, seq_len, 0)
             negative_prompt_embeds = _pad_seq_dim(negative_prompt_embeds, seq_len, 0.0)
-            negative_prompt_embeds_mask = _pad_seq_dim(
-                negative_prompt_embeds_mask, seq_len, 0
-            )
+            negative_prompt_embeds_mask = _pad_seq_dim(negative_prompt_embeds_mask, seq_len, 0)
 
             with self.pipeline.transformer.cache_context("cond_uncond"):
                 both_pred = self.transformer(
@@ -580,9 +668,7 @@ class QwenImageAdapter(BaseAdapter):
                     encoder_hidden_states_mask=torch.cat(
                         [prompt_embeds_mask, negative_prompt_embeds_mask], dim=0
                     ),
-                    encoder_hidden_states=torch.cat(
-                        [prompt_embeds, negative_prompt_embeds], dim=0
-                    ),
+                    encoder_hidden_states=torch.cat([prompt_embeds, negative_prompt_embeds], dim=0),
                     img_shapes=img_shapes * 2,
                     attention_kwargs=attention_kwargs,
                     return_dict=False,

@@ -19,12 +19,14 @@ Reference:
 [1] Diffusion Reinforcement Learning via Centered Reward Distillation
     - https://arxiv.org/abs/2603.14128
 """
+
 import os
-from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
-from functools import partial
 from collections import defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass
+from functools import partial
+from typing import Any, Dict, List, Optional
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -32,9 +34,8 @@ import tqdm as tqdm_
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
-from .abc import BaseTrainer
-from .forward_process import forward_velocity_state, require_latent_state, state_batch_size
 from ..hparams import CRDTrainingArguments
+from ..rewards import RewardBuffer
 from ..samples import (
     BaseSample,
     ComponentTimes,
@@ -42,9 +43,10 @@ from ..samples import (
     NoisedState,
     StackedSampleBatch,
 )
-from ..rewards import RewardBuffer
 from ..utils.base import create_generator, create_generator_by_prompt
 from ..utils.logger_utils import setup_logger
+from .abc import BaseTrainer
+from .forward_process import forward_velocity_state, require_latent_state, state_batch_size
 
 logger = setup_logger(__name__)
 
@@ -89,12 +91,12 @@ _DECAY_PRESETS = {
     4: (0, 0.0, 0.02, 0.99),
     5: (0, 0.0, 0.01, 0.5),
     6: (0, 0.0, 0.0075, 0.999),
-    'none': (0, 0.0, 0.0, 0.0),
-    'slow': (0, 0.0, 0.001, 0.5),
-    'medium': (75, 0.0, 0.0075, 0.999),
-    'offline': (0, 1.0, 0.0, 1.0),
-    'fast': (0, 0.0, 0.02, 0.99),
-    'moderate': (0, 0.0, 0.01, 0.5),
+    "none": (0, 0.0, 0.0, 0.0),
+    "slow": (0, 0.0, 0.001, 0.5),
+    "medium": (75, 0.0, 0.0075, 0.999),
+    "offline": (0, 1.0, 0.0, 1.0),
+    "fast": (0, 0.0, 0.02, 0.99),
+    "moderate": (0, 0.0, 0.01, 0.5),
 }
 
 
@@ -118,12 +120,17 @@ def compute_decay(step: int, decay_type) -> float:
 
     if decay_type in _DECAY_PRESETS:
         start_step, start_value, slope, end_value = _DECAY_PRESETS[decay_type]
-    elif isinstance(decay_type, str) and '-' in decay_type:
-        parts = decay_type.split('-')
-        assert len(parts) == 4, (
-            f"Decay string format must be 'start_step-start_value-slope-end_value', got: {decay_type}"
+    elif isinstance(decay_type, str) and "-" in decay_type:
+        parts = decay_type.split("-")
+        assert (
+            len(parts) == 4
+        ), f"Decay string format must be 'start_step-start_value-slope-end_value', got: {decay_type}"
+        start_step, start_value, slope, end_value = (
+            float(parts[0]),
+            float(parts[1]),
+            float(parts[2]),
+            float(parts[3]),
         )
-        start_step, start_value, slope, end_value = float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])
         start_step = int(start_step)
     else:
         raise ValueError(
@@ -137,6 +144,7 @@ def compute_decay(step: int, decay_type) -> float:
 
 
 # ============================ CRD Trainer ============================
+
 
 class CRDTrainer(BaseTrainer):
     """
@@ -164,8 +172,8 @@ class CRDTrainer(BaseTrainer):
     # Decoupled paradigm: lossy rollout acceleration is permitted (constraints.md #7).
     paradigm = "decoupled"
 
-    _OLD_PARAMS_NAME = '_crd_old'
-    _SAMPLING_PARAMS_NAME = '_crd_sampling'
+    _OLD_PARAMS_NAME = "_crd_old"
+    _SAMPLING_PARAMS_NAME = "_crd_sampling"
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -195,11 +203,11 @@ class CRDTrainer(BaseTrainer):
         self.timestep_range = self.training_args.timestep_range
 
         self.kl_type = self.training_args.kl_type
-        if self.kl_type != 'v-based':
+        if self.kl_type != "v-based":
             logger.warning(
                 f"CRD-Trainer only supports 'v-based' KL loss, got {self.kl_type}, switching to 'v-based'."
             )
-            self.kl_type = 'v-based'
+            self.kl_type = "v-based"
 
         # Initialize model snapshots: "old" (for implicit reward) and "sampling" (for rollout)
         self._init_model_snapshots()
@@ -278,7 +286,9 @@ class CRDTrainer(BaseTrainer):
             info = self.adapter._named_parameters[name]
             current_params = self.adapter._get_component_parameters(info.target_components)
             with torch.no_grad():
-                for ema_param, param in zip(info.ema_wrapper.ema_parameters, current_params, strict=True):
+                for ema_param, param in zip(
+                    info.ema_wrapper.ema_parameters, current_params, strict=True
+                ):
                     ema_param.data.mul_(decay).add_(
                         param.detach().to(ema_param.device), alpha=(1.0 - decay)
                     )
@@ -294,7 +304,7 @@ class CRDTrainer(BaseTrainer):
 
         # Log decay value
         if self.accelerator.is_main_process:
-            self.log_data({'train/old_model_decay': decay}, step=self.step)
+            self.log_data({"train/old_model_decay": decay}, step=self.step)
 
     def _update_sampling_model(self):
         """
@@ -307,7 +317,7 @@ class CRDTrainer(BaseTrainer):
 
         # Log decay value
         if self.accelerator.is_main_process:
-            self.log_data({'train/sampling_model_decay': decay}, step=self.step)
+            self.log_data({"train/sampling_model_decay": decay}, step=self.step)
 
     # ========================= Sampling =========================
 
@@ -332,7 +342,7 @@ class CRDTrainer(BaseTrainer):
             Forward-argument overrides for the reference pass.
         """
         if self.kl_cfg > 1.0:
-            return {'guidance_scale': self.kl_cfg}
+            return {"guidance_scale": self.kl_cfg}
         return {}
 
     def _rebuild_noised_state(
@@ -364,10 +374,10 @@ class CRDTrainer(BaseTrainer):
         clean_state = require_latent_state(
             self,
             clean_state,
-            f'pass-2 terminal clean state at timestep_index={timestep_index}',
+            f"pass-2 terminal clean state at timestep_index={timestep_index}",
         )
         stored_noise = require_latent_state(
-            self, step.noise, f'pass-1 stored noise at timestep_index={timestep_index}'
+            self, step.noise, f"pass-1 stored noise at timestep_index={timestep_index}"
         )
         for name in self.adapter.trajectory_component_order:
             clean = clean_state.components[name]
@@ -400,7 +410,7 @@ class CRDTrainer(BaseTrainer):
             The batch bundled with one precomputed step per training timestep.
         """
         clean_state = self.adapter.get_terminal_state(batch)
-        batch_size = state_batch_size(self, clean_state, 'terminal clean state')
+        batch_size = state_batch_size(self, clean_state, "terminal clean state")
         steps: List[_CRDStep] = []
         with torch.no_grad(), self.autocast():
             all_timesteps = self._sample_timesteps(batch_size)  # (T, B)
@@ -416,17 +426,14 @@ class CRDTrainer(BaseTrainer):
                 )
                 with old_parameters:
                     velocity = forward_velocity_state(
-                        self, batch, noised.state, times, source='old policy'
+                        self, batch, noised.state, times, source="old policy"
                     )
                 steps.append(
                     _CRDStep(
                         times=times,
                         noise=noised.noise,
                         old_velocity=LatentState(
-                            {
-                                name: value.detach()
-                                for name, value in velocity.components.items()
-                            }
+                            {name: value.detach() for name, value in velocity.components.items()}
                         ),
                     )
                 )
@@ -464,8 +471,7 @@ class CRDTrainer(BaseTrainer):
                 current_weights = self.adapter.reduce_component_latent_values(
                     {
                         name: torch.abs(
-                            velocity.components[name].double()
-                            - target.components[name].double()
+                            velocity.components[name].double() - target.components[name].double()
                         )
                         for name in component_names
                     },
@@ -558,27 +564,27 @@ class CRDTrainer(BaseTrainer):
             Rc = adv_cur_rank - adv_cur_avg
             R_theta_c = r_theta_local - r_theta_avg.detach()
 
-            if self.crd_loss_type == 'bce':
+            if self.crd_loss_type == "bce":
                 ori_policy_loss = F.binary_cross_entropy_with_logits(
                     self.crd_beta * R_theta_c,
                     torch.sigmoid(Rc.detach()),
-                    reduction='mean',
+                    reduction="mean",
                 )
             else:
                 diff = self.crd_beta * R_theta_c - Rc
-                ori_policy_loss = (diff ** 2).mean()
+                ori_policy_loss = (diff**2).mean()
 
         else:
             # ---- Non-uniform: Dual-direction centering ----
             # Positive direction: weight towards higher-reward samples
             if weight_temp == 0:
                 # Hard selection: only positive-advantage samples
-                adv_plus_mask = (adv_cur > 0.0)
+                adv_plus_mask = adv_cur > 0.0
                 if adv_plus_mask.sum() == 0:
                     softmax_p = torch.ones_like(adv_cur) / adv_cur.shape[0]
                 else:
                     masked_adv = adv_cur.where(
-                        adv_plus_mask, torch.tensor(float('-inf'), device=device)
+                        adv_plus_mask, torch.tensor(float("-inf"), device=device)
                     )
                     softmax_p = torch.softmax(masked_adv, dim=0)
             else:
@@ -587,12 +593,12 @@ class CRDTrainer(BaseTrainer):
             # Negative direction: weight towards lower-reward samples
             if weight_temp == 0:
                 # Hard selection: only negative-advantage samples
-                adv_minus_mask = (adv_cur < 0.0)
+                adv_minus_mask = adv_cur < 0.0
                 if adv_minus_mask.sum() == 0:
                     softmax_p_minus = torch.ones_like(adv_cur) / adv_cur.shape[0]
                 else:
                     masked_adv = adv_cur.where(
-                        adv_minus_mask, torch.tensor(float('-inf'), device=device)
+                        adv_minus_mask, torch.tensor(float("-inf"), device=device)
                     )
                     softmax_p_minus = torch.softmax(masked_adv, dim=0)
             else:
@@ -610,20 +616,20 @@ class CRDTrainer(BaseTrainer):
             Rc_minus = adv_cur_rank - adv_cur_avg_minus
             R_theta_c_minus = r_theta_local - r_theta_avg_minus.detach()
 
-            if self.crd_loss_type == 'bce':
+            if self.crd_loss_type == "bce":
                 ori_policy_loss = 0.5 * F.binary_cross_entropy_with_logits(
                     self.crd_beta * R_theta_c,
                     torch.sigmoid(Rc.detach()),
-                    reduction='mean',
+                    reduction="mean",
                 ) + 0.5 * F.binary_cross_entropy_with_logits(
                     self.crd_beta * R_theta_c_minus,
                     torch.sigmoid(Rc_minus.detach()),
-                    reduction='mean',
+                    reduction="mean",
                 )
             else:
                 diff = self.crd_beta * R_theta_c - Rc
                 diff_minus = self.crd_beta * R_theta_c_minus - Rc_minus
-                ori_policy_loss = 0.5 * (diff ** 2).mean() + 0.5 * (diff_minus ** 2).mean()
+                ori_policy_loss = 0.5 * (diff**2).mean() + 0.5 * (diff_minus**2).mean()
 
         return ori_policy_loss
 
@@ -662,11 +668,9 @@ class CRDTrainer(BaseTrainer):
             ) // self.training_args.per_device_batch_size
             self.adapter.rollout()
             for batch in tqdm(
-                self._iter_prefetched_batches(
-                    samples, self.training_args.per_device_batch_size
-                ),
+                self._iter_prefetched_batches(samples, self.training_args.per_device_batch_size),
                 total=num_batches,
-                desc=f'Epoch {self.epoch} Pre-computing Old V Predictions',
+                desc=f"Epoch {self.epoch} Pre-computing Old V Predictions",
                 position=0,
                 disable=not self.show_progress_bar,
             ):
@@ -679,7 +683,7 @@ class CRDTrainer(BaseTrainer):
             for prepared in tqdm(
                 sample_batches,
                 total=len(sample_batches),
-                desc=f'Epoch {self.epoch} Training',
+                desc=f"Epoch {self.epoch} Training",
                 position=0,
                 disable=not self.show_progress_bar,
             ):
@@ -689,7 +693,7 @@ class CRDTrainer(BaseTrainer):
                 # Iterate through timesteps
                 for t_idx in tqdm(
                     range(self.num_train_timesteps),
-                    desc=f'Epoch {self.epoch} Timestep',
+                    desc=f"Epoch {self.epoch} Timestep",
                     position=1,
                     leave=False,
                     disable=not self.show_progress_bar,
@@ -697,15 +701,13 @@ class CRDTrainer(BaseTrainer):
                     with self.accumulate_gradients():
                         # 1. Replay the pass-1 forward process without drawing noise
                         step = prepared.steps[t_idx]
-                        noised = self._rebuild_noised_state(
-                            clean_state, step, timestep_index=t_idx
-                        )
+                        noised = self._rebuild_noised_state(clean_state, step, timestep_index=t_idx)
                         old_velocity = step.old_velocity
 
                         # 2. Current model forward pass
                         with self.autocast():
                             velocity = forward_velocity_state(
-                                self, batch, noised.state, step.times, source='policy'
+                                self, batch, noised.state, step.times, source="policy"
                             )
 
                         # 3. Reference model forward pass (for KL)
@@ -720,7 +722,7 @@ class CRDTrainer(BaseTrainer):
                                 batch,
                                 noised.state,
                                 step.times,
-                                source='reference',
+                                source="reference",
                                 **self._reference_cfg_overrides(),
                             )
 
@@ -733,7 +735,7 @@ class CRDTrainer(BaseTrainer):
                         )
 
                         # 5. Compute advantages for CRD centering
-                        adv = batch['advantage']
+                        adv = batch["advantage"]
                         adv_clip_range = self.training_args.adv_clip_range
                         adv_clipped = torch.clamp(adv, adv_clip_range[0], adv_clip_range[1])
 
@@ -755,7 +757,9 @@ class CRDTrainer(BaseTrainer):
                         )
 
                         # Scale by adv_clip_max / beta for gradient magnitude normalization
-                        policy_loss = (ori_policy_loss * adv_clip_range[1] / max(self.crd_beta, 1e-8)).mean()
+                        policy_loss = (
+                            ori_policy_loss * adv_clip_range[1] / max(self.crd_beta, 1e-8)
+                        ).mean()
                         loss = policy_loss
 
                         # 7. KL regularization against reference model
@@ -765,18 +769,18 @@ class CRDTrainer(BaseTrainer):
                             loss = loss + kl_loss
 
                         # 8. Logging
-                        loss_info['policy_loss'].append(policy_loss.detach())
-                        loss_info['unweighted_policy_loss'].append(ori_policy_loss.mean().detach())
-                        loss_info['kl_div'].append(kl_div.mean().detach())
-                        loss_info['kl_loss'].append(kl_loss.detach())
-                        loss_info['r_theta_mean'].append(r_theta_local.mean().detach())
-                        loss_info['loss'].append(loss.detach())
+                        loss_info["policy_loss"].append(policy_loss.detach())
+                        loss_info["unweighted_policy_loss"].append(ori_policy_loss.mean().detach())
+                        loss_info["kl_div"].append(kl_div.mean().detach())
+                        loss_info["kl_loss"].append(kl_loss.detach())
+                        loss_info["r_theta_mean"].append(r_theta_local.mean().detach())
+                        loss_info["loss"].append(loss.detach())
 
                         if self.use_old_for_loss:
                             old_kl = self._velocity_kl(old_velocity, ref_velocity, noised).mean()
-                            loss_info['old_kl_div'].append(old_kl.detach())
+                            loss_info["old_kl_div"].append(old_kl.detach())
                             old_deviate = self._velocity_kl(velocity, old_velocity, noised).mean()
-                            loss_info['old_deviate'].append(old_deviate.detach())
+                            loss_info["old_deviate"].append(old_deviate.detach())
 
                         # 9. Backward and optimizer step
                         self.accelerator.backward(loss)

@@ -12,25 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import math
+
 # src/flow_factory/hparams/model_args.py
 import os
-import math
-import yaml
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal, Optional, Union, List
-from .abc import ArgABC
-import logging
+from typing import Any, List, Literal, Optional, Union
 
 import torch
+import yaml
+
+from .abc import ArgABC
 
 dtype_map = {
-    'fp16': torch.float16,
-    'bf16': torch.bfloat16,    
-    'fp32': torch.float32,
-    'float16': torch.float16,
-    'bfloat16': torch.bfloat16,
-    'float32': torch.float32,
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+    "fp32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
 }
+
 
 @dataclass
 class ModelArguments(ArgABC):
@@ -38,86 +41,109 @@ class ModelArguments(ArgABC):
 
     model_name_or_path: str = field(
         default="black-forest-labs/FLUX.1-dev",
-        metadata={"help": "Path to pre-trained model or model identifier from huggingface.co/models"},
-    )
-
-    finetune_type : Literal['full', 'lora'] = field(
-        default='full',
-        metadata={"help": "Fine-tuning type. Options are ['full', 'lora']"}
-    )
-
-    trainable_parameters_dtype : Union[Literal['fp32', 'bf16', 'fp16', 'float16', 'bfloat16', 'float32'], torch.dtype] = field(
-        default='bfloat16',
         metadata={
-            "help": "Torch dtype for all trainable parameters (`requires_grad=True`) -- i.e. the "
-                    "optimizer 'master weight' precision. (Renamed from the misnamed "
-                    "`master_weight_dtype`, which despite its name only ever set the *trainable* "
-                    "parameter dtype.)"
+            "help": "Path to pre-trained model or model identifier from huggingface.co/models"
         },
     )
-    frozen_parameters_dtype : Optional[Union[Literal['fp32', 'bf16', 'fp16', 'float16', 'bfloat16', 'float32'], torch.dtype]] = field(
+
+    finetune_type: Literal["full", "lora"] = field(
+        default="full", metadata={"help": "Fine-tuning type. Options are ['full', 'lora']"}
+    )
+
+    trainable_parameters_dtype: Union[
+        Literal["fp32", "bf16", "fp16", "float16", "bfloat16", "float32"], torch.dtype
+    ] = field(
+        default="bfloat16",
+        metadata={
+            "help": "Torch dtype for all trainable parameters (`requires_grad=True`) -- i.e. the "
+            "optimizer 'master weight' precision. (Renamed from the misnamed "
+            "`master_weight_dtype`, which despite its name only ever set the *trainable* "
+            "parameter dtype.)"
+        },
+    )
+    frozen_parameters_dtype: Optional[
+        Union[Literal["fp32", "bf16", "fp16", "float16", "bfloat16", "float32"], torch.dtype]
+    ] = field(
         default=None,
         metadata={
             "help": "Torch dtype for frozen (`requires_grad=False`) parameters and floating-point "
-                    "buffers. `None` (default) preserves each frozen component's original "
-                    "`from_pretrained` dtype and never downcasts -- released checkpoints deliberately "
-                    "ship components in different dtypes (e.g. Z-Image: transformer fp32, text encoder "
-                    "bf16), so forcing one uniform frozen dtype would override those choices. Set an "
-                    "explicit dtype (e.g. 'bf16') to cast all frozen params to it, e.g. to save memory."
+            "buffers. `None` (default) preserves each frozen component's original "
+            "`from_pretrained` dtype and never downcasts -- released checkpoints deliberately "
+            "ship components in different dtypes (e.g. Z-Image: transformer fp32, text encoder "
+            "bf16), so forcing one uniform frozen dtype would override those choices. Set an "
+            "explicit dtype (e.g. 'bf16') to cast all frozen params to it, e.g. to save memory."
         },
     )
 
-    target_components : Union[str, List[str]] = field(
-        default='transformer',
-        metadata={"help": "Which components to fine-tune. Options are like ['transformer', 'transformer_2', ['transformer', 'transformer_2']]"}
+    target_components: Union[str, List[str]] = field(
+        default="transformer",
+        metadata={
+            "help": "Which components to fine-tune. Options are like ['transformer', 'transformer_2', ['transformer', 'transformer_2']]"
+        },
     )
-    target_modules : Union[str, List[str]] = field(
-        default='all',
-        metadata={"help": "Which layers to fine-tune. Options are like ['all',  'default', 'to_q', ['to_q', 'to_k', 'to_v']]"}
+    target_modules: Union[str, List[str]] = field(
+        default="all",
+        metadata={
+            "help": "Which layers to fine-tune. Options are like ['all',  'default', 'to_q', ['to_q', 'to_k', 'to_v']]"
+        },
     )
 
     model_type: Literal[
-        "sd3-5", "flux1", "flux1-kontext", "flux2", "flux2-klein",
-        "qwen-image", "qwen-image-edit-plus", "z-image",
-        "wan2_t2v", "wan2_i2v", "wan2_v2v", "bagel",
-        "ltx2_t2av", "ltx2_i2av",
+        "sd3-5",
+        "flux1",
+        "flux1-kontext",
+        "flux2",
+        "flux2-klein",
+        "qwen-image",
+        "qwen-image-edit-plus",
+        "z-image",
+        "wan2_t2v",
+        "wan2_i2v",
+        "wan2_v2v",
+        "bagel",
+        "ltx2_t2av",
+        "ltx2_i2av",
     ] = field(
         default="flux1",
-        metadata={"help": "Registered model adapter key (see models/registry.py), or a custom 'pkg.module.Adapter' python path."},
+        metadata={
+            "help": "Registered model adapter key (see models/registry.py), or a custom 'pkg.module.Adapter' python path."
+        },
     )
 
-    lora_rank : int = field(
+    lora_rank: int = field(
         default=8,
         metadata={"help": "Rank for LoRA adapters."},
     )
 
-    lora_alpha : Optional[int] = field(
+    lora_alpha: Optional[int] = field(
         default=None,
-        metadata={"help": "Alpha scaling factor for LoRA adapters. Default to `2 * lora_rank` if None."},
+        metadata={
+            "help": "Alpha scaling factor for LoRA adapters. Default to `2 * lora_rank` if None."
+        },
     )
 
-    resume_path : Optional[str] = field(
+    resume_path: Optional[str] = field(
         default=None,
         metadata={
             "help": "Resume from checkpoint. Accepts either a local directory or a "
-                    "Hugging Face repo spec ('owner/repo[/subfolder][@revision]', or "
-                    "explicit 'hf://owner/repo[/subfolder][@revision]'). When a local "
-                    "path doesn't exist, falls back to Hugging Face Hub download. "
-                    "Multi-node: HF_TOKEN must be set on every node; downloads happen "
-                    "once per node; consider HF_HUB_ENABLE_HF_TRANSFER=1 for large "
-                    "checkpoints to avoid NCCL watchdog timeouts."
-        }
+            "Hugging Face repo spec ('owner/repo[/subfolder][@revision]', or "
+            "explicit 'hf://owner/repo[/subfolder][@revision]'). When a local "
+            "path doesn't exist, falls back to Hugging Face Hub download. "
+            "Multi-node: HF_TOKEN must be set on every node; downloads happen "
+            "once per node; consider HF_HUB_ENABLE_HF_TRANSFER=1 for large "
+            "checkpoints to avoid NCCL watchdog timeouts."
+        },
     )
 
-    resume_type : Optional[Literal['lora', 'full', 'state']] = field(
+    resume_type: Optional[Literal["lora", "full", "state"]] = field(
         default=None,
         metadata={
             "help": "Type of checkpoint to load from resume_path. "
-                    "'lora': Load LoRA adapters only. "
-                    "'full': Load full model weights. "
-                    "'state': Load full training state (model + optimizer). "
-                    "If None, auto-detect based on finetune_type."
-        }
+            "'lora': Load LoRA adapters only. "
+            "'full': Load full model weights. "
+            "'state': Load full training state (model + optimizer). "
+            "If None, auto-detect based on finetune_type."
+        },
     )
 
     def __post_init__(self):
@@ -142,27 +168,28 @@ class ModelArguments(ArgABC):
         if isinstance(self.target_components, str):
             self.target_components = [self.target_components]
 
-
         if isinstance(self.target_modules, str):
-            if self.target_modules not in ['all', 'default']:
+            if self.target_modules not in ["all", "default"]:
                 self.target_modules = [self.target_modules]
 
         if self.lora_alpha is None:
             self.lora_alpha = 2 * self.lora_rank
 
-        self.resume_path = os.path.expanduser(self.resume_path) if self.resume_path is not None else None
+        self.resume_path = (
+            os.path.expanduser(self.resume_path) if self.resume_path is not None else None
+        )
 
     def to_dict(self) -> dict[str, Any]:
         d = super().to_dict()
-        d['trainable_parameters_dtype'] = str(self.trainable_parameters_dtype).split('.')[-1]
+        d["trainable_parameters_dtype"] = str(self.trainable_parameters_dtype).split(".")[-1]
         if self.frozen_parameters_dtype is not None:
-            d['frozen_parameters_dtype'] = str(self.frozen_parameters_dtype).split('.')[-1]
+            d["frozen_parameters_dtype"] = str(self.frozen_parameters_dtype).split(".")[-1]
         return d
 
     def __str__(self) -> str:
         """Pretty print configuration as YAML."""
         return yaml.dump(self.to_dict(), default_flow_style=False, sort_keys=False, indent=2)
-    
+
     def __repr__(self) -> str:
         """Same as __str__ for consistency."""
         return self.__str__()

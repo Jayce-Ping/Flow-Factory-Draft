@@ -24,8 +24,12 @@ from transformers.image_utils import (
     valid_images,
     validate_preprocess_arguments,
 )
-from transformers.utils import TensorType, filter_out_non_signature_kwargs, is_vision_available, logging
-
+from transformers.utils import (
+    TensorType,
+    filter_out_non_signature_kwargs,
+    is_vision_available,
+    logging,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -206,7 +210,12 @@ class SiglipImageProcessor(BaseImageProcessor):
         if do_resize:
             height, width = size["height"], size["width"]
             images = [
-                resize(image=image, size=(height, width), resample=resample, input_data_format=input_data_format)
+                resize(
+                    image=image,
+                    size=(height, width),
+                    resample=resample,
+                    input_data_format=input_data_format,
+                )
                 for image in images
             ]
 
@@ -218,12 +227,15 @@ class SiglipImageProcessor(BaseImageProcessor):
 
         if do_normalize:
             images = [
-                self.normalize(image=image, mean=image_mean, std=image_std, input_data_format=input_data_format)
+                self.normalize(
+                    image=image, mean=image_mean, std=image_std, input_data_format=input_data_format
+                )
                 for image in images
             ]
 
         images = [
-            to_channel_dimension_format(image, data_format, input_channel_dim=input_data_format) for image in images
+            to_channel_dimension_format(image, data_format, input_channel_dim=input_data_format)
+            for image in images
         ]
 
         data = {"pixel_values": images}

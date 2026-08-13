@@ -40,8 +40,8 @@ application**, encoded by ``stage``, not on numerical bit-exactness:
 
 from typing import Optional
 
-from .abc import BaseAccelerator
 from ..utils.logger_utils import setup_logger
+from .abc import BaseAccelerator
 
 logger = setup_logger(__name__)
 

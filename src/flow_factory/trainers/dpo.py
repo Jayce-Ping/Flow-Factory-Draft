@@ -33,21 +33,20 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
-from accelerate.utils import broadcast_object_list
 import torch.nn.functional as F
 import tqdm as tqdm_
+from accelerate.utils import broadcast_object_list
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
-from .abc import BaseTrainer
-from .forward_process import forward_velocity_state, require_latent_state, state_batch_size
 from ..hparams import DPOTrainingArguments
 from ..samples import BaseSample, LatentState, NoisedState
 from ..utils.base import create_generator, create_generator_by_prompt
 from ..utils.dist import gather_samples
 from ..utils.logger_utils import setup_logger
 from ..utils.noise_schedule import TimeSampler
-
+from .abc import BaseTrainer
+from .forward_process import forward_velocity_state, require_latent_state, state_batch_size
 
 logger = setup_logger(__name__)
 
@@ -113,8 +112,8 @@ class DPOTrainer(BaseTrainer):
     @staticmethod
     def _get_advantage(sample: BaseSample) -> float:
         """Extract scalar advantage from a sample."""
-        adv = sample.extra_kwargs['advantage']
-        return adv.item() if hasattr(adv, 'item') else float(adv)
+        adv = sample.extra_kwargs["advantage"]
+        return adv.item() if hasattr(adv, "item") else float(adv)
 
     def _form_pairs(
         self,
@@ -147,9 +146,7 @@ class DPOTrainer(BaseTrainer):
         else:
             # distributed_k_repeat: gather full samples across ranks so that
             # every group's K copies are available for pairing.
-            gather_field_names = [
-                f.name for f in dc_fields(samples[0]) if f.name != '_unique_id'
-            ]
+            gather_field_names = [f.name for f in dc_fields(samples[0]) if f.name != "_unique_id"]
             global_samples = gather_samples(
                 accelerator=self.accelerator,
                 samples=samples,
@@ -159,7 +156,7 @@ class DPOTrainer(BaseTrainer):
 
             # Form pairs on global data (every group has all K copies)
             all_pairs = self._form_pairs_from_advantages(global_samples)
-            
+
             # Distribute pairs evenly across ranks
             n_pairs = len(all_pairs)
             world_size = max(1, self.accelerator.num_processes)
@@ -200,19 +197,25 @@ class DPOTrainer(BaseTrainer):
             rejected_advs = np.array([self._get_advantage(p[1]) for p in stat_pairs])
             margins = chosen_advs - rejected_advs
             local_stats = torch.tensor(
-                [float(n), float(chosen_advs.sum()), float(rejected_advs.sum()), float(margins.sum())],
-                device=self.accelerator.device, dtype=torch.float64,
+                [
+                    float(n),
+                    float(chosen_advs.sum()),
+                    float(rejected_advs.sum()),
+                    float(margins.sum()),
+                ],
+                device=self.accelerator.device,
+                dtype=torch.float64,
             )
         else:
             local_stats = torch.zeros(4, device=self.accelerator.device, dtype=torch.float64)
 
         global_stats = self.accelerator.reduce(local_stats, reduction="sum")
         total_n = global_stats[0].item()
-        _log_data['train/dpo_num_pairs'] = int(total_n)
+        _log_data["train/dpo_num_pairs"] = int(total_n)
         if total_n > 0:
-            _log_data['train/dpo_chosen_adv_mean'] = global_stats[1].item() / total_n
-            _log_data['train/dpo_rejected_adv_mean'] = global_stats[2].item() / total_n
-            _log_data['train/dpo_adv_margin_mean'] = global_stats[3].item() / total_n
+            _log_data["train/dpo_chosen_adv_mean"] = global_stats[1].item() / total_n
+            _log_data["train/dpo_rejected_adv_mean"] = global_stats[2].item() / total_n
+            _log_data["train/dpo_adv_margin_mean"] = global_stats[3].item() / total_n
 
         return pairs, _log_data
 
@@ -326,7 +329,9 @@ class DPOTrainer(BaseTrainer):
         return pairs
 
     # ====================== Timestep Sampling ======================
-    def _sample_timesteps(self, batch_size: int, num_timesteps: int, timestep_range: Tuple[float, float]) -> torch.Tensor:
+    def _sample_timesteps(
+        self, batch_size: int, num_timesteps: int, timestep_range: Tuple[float, float]
+    ) -> torch.Tensor:
         """Sample T×B timesteps for DPO training.
 
         Reuses ``TimeSampler`` from ``utils.noise_schedule``.
@@ -337,7 +342,7 @@ class DPOTrainer(BaseTrainer):
             in [t_lo, t_hi].
         """
         device = self.accelerator.device
-        if self.training_args.weighting_scheme == 'logit_normal':
+        if self.training_args.weighting_scheme == "logit_normal":
             t = TimeSampler.logit_normal_shifted(
                 batch_size=batch_size,
                 num_timesteps=num_timesteps,
@@ -378,8 +383,8 @@ class DPOTrainer(BaseTrainer):
             Batch size shared by both arms.
         """
         expected_names = self.adapter.trajectory_component_order
-        batch_size = state_batch_size(self, chosen_state, 'chosen terminal state')
-        require_latent_state(self, rejected_state, 'rejected terminal state')
+        batch_size = state_batch_size(self, chosen_state, "chosen terminal state")
+        require_latent_state(self, rejected_state, "rejected terminal state")
         for name in expected_names:
             chosen = chosen_state.components[name]
             rejected = rejected_state.components[name]
@@ -417,8 +422,7 @@ class DPOTrainer(BaseTrainer):
         """
         errors = {
             name: (
-                velocity.components[name].float()
-                - noised.target_velocity.components[name].float()
+                velocity.components[name].float() - noised.target_velocity.components[name].float()
             )
             ** 2
             for name in self.adapter.trajectory_component_order
@@ -453,11 +457,11 @@ class DPOTrainer(BaseTrainer):
             implicit_reward_chosen = -0.5 * beta * w_diff
             implicit_reward_rejected = -0.5 * beta * l_diff
             metrics = {
-                'implicit_reward_chosen': implicit_reward_chosen,
-                'implicit_reward_rejected': implicit_reward_rejected,
-                'implicit_accuracy': (
-                    implicit_reward_chosen > implicit_reward_rejected
-                ).float().mean(),
+                "implicit_reward_chosen": implicit_reward_chosen,
+                "implicit_reward_rejected": implicit_reward_rejected,
+                "implicit_accuracy": (implicit_reward_chosen > implicit_reward_rejected)
+                .float()
+                .mean(),
             }
         return loss, metrics
 
@@ -468,7 +472,7 @@ class DPOTrainer(BaseTrainer):
         Does not form chosen/rejected pairs; :meth:`optimize` calls :meth:`_form_pairs` after
         advantages are stored on each sample.
         """
-        rewards = self.reward_buffer.finalize(store_to_samples=True, split='all')
+        rewards = self.reward_buffer.finalize(store_to_samples=True, split="all")
         self.compute_advantages(samples, rewards, store_to_samples=True)
         adv_metrics = self.advantage_processor.pop_advantage_metrics()
         if adv_metrics:
@@ -517,7 +521,7 @@ class DPOTrainer(BaseTrainer):
                     self._iter_prefetched_batches(rejected_list, batch_size),
                 ),
                 total=num_pair_batches,
-                desc=f'Epoch {self.epoch} DPO Training',
+                desc=f"Epoch {self.epoch} DPO Training",
                 position=0,
                 disable=not self.show_progress_bar,
             ):
@@ -552,23 +556,35 @@ class DPOTrainer(BaseTrainer):
                         # Policy forward
                         with self.autocast():
                             theta_w_pred = forward_velocity_state(
-                                self, chosen_batch, chosen_noised.state, times,
-                                source='policy chosen',
+                                self,
+                                chosen_batch,
+                                chosen_noised.state,
+                                times,
+                                source="policy chosen",
                             )
                             theta_l_pred = forward_velocity_state(
-                                self, rejected_batch, rejected_noised.state, times,
-                                source='policy rejected',
+                                self,
+                                rejected_batch,
+                                rejected_noised.state,
+                                times,
+                                source="policy rejected",
                             )
 
                         # Reference forward (frozen)
                         with torch.no_grad(), self.adapter.use_ref_parameters(), self.autocast():
                             ref_w_pred = forward_velocity_state(
-                                self, chosen_batch, chosen_noised.state, times,
-                                source='reference chosen',
+                                self,
+                                chosen_batch,
+                                chosen_noised.state,
+                                times,
+                                source="reference chosen",
                             )
                             ref_l_pred = forward_velocity_state(
-                                self, rejected_batch, rejected_noised.state, times,
-                                source='reference rejected',
+                                self,
+                                rejected_batch,
+                                rejected_noised.state,
+                                times,
+                                source="reference rejected",
                             )
 
                         # MSE errors per sample — target is flow-matching velocity (noise - x_0), same as
@@ -583,17 +599,17 @@ class DPOTrainer(BaseTrainer):
                             theta_w_err, theta_l_err, ref_w_err, ref_l_err
                         )
 
-                        loss_info['loss'].append(loss.detach())
-                        loss_info['theta_w_err'].append(theta_w_err.mean().detach())
-                        loss_info['theta_l_err'].append(theta_l_err.mean().detach())
-                        loss_info['ref_w_err'].append(ref_w_err.mean().detach())
-                        loss_info['ref_l_err'].append(ref_l_err.mean().detach())
-                        loss_info['implicit_accuracy'].append(metrics['implicit_accuracy'].detach())
-                        loss_info['implicit_reward_chosen'].append(
-                            metrics['implicit_reward_chosen'].mean().detach()
+                        loss_info["loss"].append(loss.detach())
+                        loss_info["theta_w_err"].append(theta_w_err.mean().detach())
+                        loss_info["theta_l_err"].append(theta_l_err.mean().detach())
+                        loss_info["ref_w_err"].append(ref_w_err.mean().detach())
+                        loss_info["ref_l_err"].append(ref_l_err.mean().detach())
+                        loss_info["implicit_accuracy"].append(metrics["implicit_accuracy"].detach())
+                        loss_info["implicit_reward_chosen"].append(
+                            metrics["implicit_reward_chosen"].mean().detach()
                         )
-                        loss_info['implicit_reward_rejected'].append(
-                            metrics['implicit_reward_rejected'].mean().detach()
+                        loss_info["implicit_reward_rejected"].append(
+                            metrics["implicit_reward_rejected"].mean().detach()
                         )
 
                         # Backward + optimizer step

@@ -111,6 +111,7 @@ def validate_supported_distributed_plan(accelerator: Accelerator) -> None:
             "FSDP, or DDP; received DeepSpeed stage 3."
         )
 
+
 _MULTIROLE_METADATA_FILENAME = "flow_factory_multirole_metadata.json"
 _MULTIROLE_METADATA_VERSION = 1
 _MULTIROLE_STATE_KEYS = {

@@ -16,36 +16,38 @@
 from __future__ import annotations
 
 import os
-from typing import Union, List, Dict, Any, Optional, Tuple, ClassVar, Literal
-from dataclasses import dataclass
 from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
-from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import StableDiffusion3Pipeline
+from accelerate import Accelerator
+from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import (
+    StableDiffusion3Pipeline,
+)
 from PIL import Image
 
-from accelerate import Accelerator
-
 from ...hparams import *
-from ..abc import BaseAdapter
 from ...samples import BaseSample
 from ...scheduler import (
     FlowMatchEulerDiscreteSDEScheduler,
     FlowMatchEulerDiscreteSDESchedulerOutput,
     SDESchedulerOutput,
-    set_scheduler_timesteps
-)
-from ...utils.trajectory_collector import (
-    TrajectoryCollector,
-    CallbackCollector,
-    TrajectoryIndicesType, 
-    create_trajectory_collector,
-    create_callback_collector,
+    set_scheduler_timesteps,
 )
 from ...utils.base import filter_kwargs
 from ...utils.logger_utils import setup_logger
+from ...utils.trajectory_collector import (
+    CallbackCollector,
+    TrajectoryCollector,
+    TrajectoryIndicesType,
+    create_callback_collector,
+    create_trajectory_collector,
+)
+from ..abc import BaseAdapter
 
 logger = setup_logger(__name__)
+
 
 @dataclass
 class SD3_5Sample(BaseSample):
@@ -54,12 +56,14 @@ class SD3_5Sample(BaseSample):
     # Obj var
     pooled_prompt_embeds: Optional[torch.Tensor] = None
     negative_pooled_prompt_embeds: Optional[torch.Tensor] = None
-    pooled_prompt_embeds : Optional[torch.Tensor] = None
-    negative_pooled_prompt_embeds : Optional[torch.Tensor] = None
+    pooled_prompt_embeds: Optional[torch.Tensor] = None
+    negative_pooled_prompt_embeds: Optional[torch.Tensor] = None
+
 
 class SD3_5Adapter(BaseAdapter):
     """Concrete implementation for Stable Diffusion 3 medium."""
-    def __init__(self, config: Arguments, accelerator : Accelerator):
+
+    def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
         self.pipeline: StableDiffusion3Pipeline
         self.scheduler: FlowMatchEulerDiscreteSDEScheduler
@@ -75,14 +79,20 @@ class SD3_5Adapter(BaseAdapter):
     def default_target_modules(self) -> List[str]:
         return [
             # Attention modules
-            "attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj", "attn.to_add_out",
-            "attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0",
+            "attn.add_q_proj",
+            "attn.add_k_proj",
+            "attn.add_v_proj",
+            "attn.to_add_out",
+            "attn.to_q",
+            "attn.to_k",
+            "attn.to_v",
+            "attn.to_out.0",
         ]
-    
+
     @property
     def tokenizer(self) -> Any:
         return self.pipeline.tokenizer_3
-    
+
     # ============================ Encoding & Decoding ============================
     def encode_prompt(
         self,
@@ -96,10 +106,10 @@ class SD3_5Adapter(BaseAdapter):
         device = device if device is not None else self.device
         do_classifier_free_guidance = guidance_scale > 1.0
         (
-            prompt_embeds, 
-            negative_prompt_embeds, 
-            pooled_prompt_embeds, 
-            negative_pooled_prompt_embeds
+            prompt_embeds,
+            negative_prompt_embeds,
+            pooled_prompt_embeds,
+            negative_pooled_prompt_embeds,
         ) = self.pipeline.encode_prompt(
             prompt=prompt,
             prompt_2=prompt,
@@ -108,11 +118,11 @@ class SD3_5Adapter(BaseAdapter):
             do_classifier_free_guidance=do_classifier_free_guidance,
             negative_prompt=negative_prompt,
             negative_prompt_2=negative_prompt,
-            negative_prompt_3=negative_prompt
+            negative_prompt_3=negative_prompt,
         )
         result = {
-            'prompt_embeds': prompt_embeds,
-            'pooled_prompt_embeds': pooled_prompt_embeds,
+            "prompt_embeds": prompt_embeds,
+            "pooled_prompt_embeds": pooled_prompt_embeds,
         }
 
         text_inputs = self.tokenizer(
@@ -125,15 +135,21 @@ class SD3_5Adapter(BaseAdapter):
         )
 
         # Token ids for downstream bookkeeping (used as `prompt_ids` in samples)
-        result['prompt_ids'] = text_inputs.input_ids.to(device)
+        result["prompt_ids"] = text_inputs.input_ids.to(device)
 
         if do_classifier_free_guidance:
             if negative_prompt is None:
                 negative_prompt = ["" for _ in prompt]
             else:
-                negative_prompt = [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
-                negative_prompt = negative_prompt * (len(prompt) // len(negative_prompt)) # Expand to match batch size
-            assert len(prompt) == len(negative_prompt), "The number of negative prompts must match the number of prompts."
+                negative_prompt = (
+                    [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+                )
+                negative_prompt = negative_prompt * (
+                    len(prompt) // len(negative_prompt)
+                )  # Expand to match batch size
+            assert len(prompt) == len(
+                negative_prompt
+            ), "The number of negative prompts must match the number of prompts."
             result["negative_prompt_embeds"] = negative_prompt_embeds
             result["negative_pooled_prompt_embeds"] = negative_pooled_prompt_embeds
 
@@ -146,7 +162,7 @@ class SD3_5Adapter(BaseAdapter):
                 return_tensors="pt",
             )
 
-            result['negative_prompt_ids'] = negative_text_inputs.input_ids.to(device)
+            result["negative_prompt_ids"] = negative_text_inputs.input_ids.to(device)
 
         return result
 
@@ -161,10 +177,12 @@ class SD3_5Adapter(BaseAdapter):
     def decode_latents(
         self,
         latents: torch.Tensor,
-        output_type: Literal['pil', 'pt', 'np'] = "pil",
+        output_type: Literal["pil", "pt", "np"] = "pil",
     ) -> torch.Tensor:
         latents = latents.to(self.pipeline.vae.dtype)
-        latents = (latents / self.pipeline.vae.config.scaling_factor) + self.pipeline.vae.config.shift_factor
+        latents = (
+            latents / self.pipeline.vae.config.scaling_factor
+        ) + self.pipeline.vae.config.shift_factor
 
         images = self.pipeline.vae.decode(latents, return_dict=False)[0]
         images = self.pipeline.image_processor.postprocess(images, output_type=output_type)
@@ -185,7 +203,7 @@ class SD3_5Adapter(BaseAdapter):
         generator: Optional[torch.Generator] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         # Encoded Prompt
-        prompt_ids : Optional[torch.Tensor] = None,
+        prompt_ids: Optional[torch.Tensor] = None,
         prompt_embeds: Optional[torch.Tensor] = None,
         pooled_prompt_embeds: Optional[torch.Tensor] = None,
         # Encoded Negative Prompt
@@ -195,22 +213,20 @@ class SD3_5Adapter(BaseAdapter):
         # Other args
         compute_log_prob: bool = True,
         extra_call_back_kwargs: List[str] = [],
-        trajectory_indices: TrajectoryIndicesType = 'all',
+        trajectory_indices: TrajectoryIndicesType = "all",
     ) -> List[SD3_5Sample]:
         # 1. Setup
         device = self.device
         dtype = self.pipeline.transformer.dtype
 
         do_classifier_free_guidance = guidance_scale > 1.0
-        has_negative_prompt = (
-            negative_prompt is not None
-            or (
-                negative_prompt_embeds is not None
-                and negative_pooled_prompt_embeds is not None
-            )
+        has_negative_prompt = negative_prompt is not None or (
+            negative_prompt_embeds is not None and negative_pooled_prompt_embeds is not None
         )
         if do_classifier_free_guidance and not has_negative_prompt:
-            logger.warning("No negative prompt/embeds provided, classifier-free-guidance will be disabled.")
+            logger.warning(
+                "No negative prompt/embeds provided, classifier-free-guidance will be disabled."
+            )
             do_classifier_free_guidance = False
 
         # 2. Encode prompt
@@ -221,20 +237,20 @@ class SD3_5Adapter(BaseAdapter):
                 guidance_scale=guidance_scale,
                 device=device,
             )
-            prompt_embeds = encoded['prompt_embeds']
-            pooled_prompt_embeds = encoded['pooled_prompt_embeds']
-            prompt_ids = encoded['prompt_ids']
+            prompt_embeds = encoded["prompt_embeds"]
+            pooled_prompt_embeds = encoded["pooled_prompt_embeds"]
+            prompt_ids = encoded["prompt_ids"]
             if do_classifier_free_guidance:
-                negative_prompt_embeds = encoded['negative_prompt_embeds']
-                negative_prompt_ids = encoded['negative_prompt_ids']
-                negative_pooled_prompt_embeds = encoded['negative_pooled_prompt_embeds']
+                negative_prompt_embeds = encoded["negative_prompt_embeds"]
+                negative_prompt_ids = encoded["negative_prompt_ids"]
+                negative_pooled_prompt_embeds = encoded["negative_pooled_prompt_embeds"]
         else:
             prompt_embeds = prompt_embeds.to(device)
             pooled_prompt_embeds = pooled_prompt_embeds.to(device)
             if do_classifier_free_guidance:
                 negative_prompt_embeds = negative_prompt_embeds.to(device)
                 negative_pooled_prompt_embeds = negative_pooled_prompt_embeds.to(device)
-    
+
         batch_size = len(prompt_embeds)
         num_channels_latents = self.pipeline.transformer.config.in_channels
 
@@ -251,9 +267,8 @@ class SD3_5Adapter(BaseAdapter):
         # latents : torch.Tensor of shape (B, C, H/8, W/8), not packed
 
         # 5. Prepare noise schedule
-        image_seq_len = (
-            (latents.shape[2] // self.pipeline.transformer.config.patch_size) * 
-            (latents.shape[3] // self.pipeline.transformer.config.patch_size)
+        image_seq_len = (latents.shape[2] // self.pipeline.transformer.config.patch_size) * (
+            latents.shape[3] // self.pipeline.transformer.config.patch_size
         )
         timesteps = set_scheduler_timesteps(
             scheduler=self.scheduler,
@@ -267,13 +282,17 @@ class SD3_5Adapter(BaseAdapter):
         latents = self.cast_latents(latents, default_dtype=dtype)
         latent_collector.collect(latents, step_idx=0)
         if compute_log_prob:
-            log_prob_collector = create_trajectory_collector(trajectory_indices, num_inference_steps)
+            log_prob_collector = create_trajectory_collector(
+                trajectory_indices, num_inference_steps
+            )
         callback_collector = create_callback_collector(trajectory_indices, num_inference_steps)
 
         for i, t in enumerate(timesteps):
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
             t_next = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
-            return_kwargs = list(set(['next_latents', 'log_prob', 'velocity'] + extra_call_back_kwargs))
+            return_kwargs = list(
+                set(["next_latents", "log_prob", "velocity"] + extra_call_back_kwargs)
+            )
             current_compute_log_prob = compute_log_prob and current_noise_level > 0
 
             output = self.forward(
@@ -300,37 +319,55 @@ class SD3_5Adapter(BaseAdapter):
                 step_idx=i,
                 output=output,
                 keys=extra_call_back_kwargs,
-                capturable={'noise_level': current_noise_level},
+                capturable={"noise_level": current_noise_level},
             )
 
         # 7. Decode latents
-        images = self.decode_latents(latents=latents, output_type='pt')
+        images = self.decode_latents(latents=latents, output_type="pt")
 
         # 8. Create samples
-        extra_call_back_res = callback_collector.get_result()          # (B, len(trajectory_indices), ...)
-        callback_index_map = callback_collector.get_index_map()        # (T,) LongTensor
-        all_latents = latent_collector.get_result()                    # List[torch.Tensor(B, ...)]
-        latent_index_map = latent_collector.get_index_map()            # (T+1,) LongTensor
+        extra_call_back_res = callback_collector.get_result()  # (B, len(trajectory_indices), ...)
+        callback_index_map = callback_collector.get_index_map()  # (T,) LongTensor
+        all_latents = latent_collector.get_result()  # List[torch.Tensor(B, ...)]
+        latent_index_map = latent_collector.get_index_map()  # (T+1,) LongTensor
         all_log_probs = log_prob_collector.get_result() if compute_log_prob else None
         log_prob_index_map = log_prob_collector.get_index_map() if compute_log_prob else None
         samples = [
             SD3_5Sample(
                 # Denoising trajectory
                 timesteps=timesteps,
-                all_latents=torch.stack([lat[b] for lat in all_latents], dim=0) if all_latents is not None else None,
-                log_probs=torch.stack([lp[b] for lp in all_log_probs], dim=0) if all_log_probs is not None else None,
+                all_latents=(
+                    torch.stack([lat[b] for lat in all_latents], dim=0)
+                    if all_latents is not None
+                    else None
+                ),
+                log_probs=(
+                    torch.stack([lp[b] for lp in all_log_probs], dim=0)
+                    if all_log_probs is not None
+                    else None
+                ),
                 latent_index_map=latent_index_map,
                 log_prob_index_map=log_prob_index_map,
                 # Prompt
                 prompt=prompt[b] if isinstance(prompt, list) else prompt,
                 prompt_ids=prompt_ids[b] if prompt_ids is not None else None,
                 prompt_embeds=prompt_embeds[b] if prompt_embeds is not None else None,
-                pooled_prompt_embeds=pooled_prompt_embeds[b] if pooled_prompt_embeds is not None else None,
+                pooled_prompt_embeds=(
+                    pooled_prompt_embeds[b] if pooled_prompt_embeds is not None else None
+                ),
                 # Negative Prompt
                 negative_prompt=negative_prompt[b] if negative_prompt is not None else None,
-                negative_prompt_ids=negative_prompt_ids[b] if negative_prompt_ids is not None else None,
-                negative_prompt_embeds=negative_prompt_embeds[b] if negative_prompt_embeds is not None else None,
-                negative_pooled_prompt_embeds=negative_pooled_prompt_embeds[b] if negative_pooled_prompt_embeds is not None else None,
+                negative_prompt_ids=(
+                    negative_prompt_ids[b] if negative_prompt_ids is not None else None
+                ),
+                negative_prompt_embeds=(
+                    negative_prompt_embeds[b] if negative_prompt_embeds is not None else None
+                ),
+                negative_pooled_prompt_embeds=(
+                    negative_pooled_prompt_embeds[b]
+                    if negative_pooled_prompt_embeds is not None
+                    else None
+                ),
                 # Image & metadata
                 height=height,
                 width=width,
@@ -338,7 +375,7 @@ class SD3_5Adapter(BaseAdapter):
                 # Extra kwargs
                 extra_kwargs={
                     **{k: v[b] for k, v in extra_call_back_res.items()},
-                    'callback_index_map': callback_index_map,
+                    "callback_index_map": callback_index_map,
                 },
             )
             for b in range(batch_size)
@@ -347,7 +384,7 @@ class SD3_5Adapter(BaseAdapter):
         self.pipeline.maybe_free_model_hooks()
 
         return samples
-    
+
     # ============================ Training Forward ============================
     def forward(
         self,
@@ -366,7 +403,14 @@ class SD3_5Adapter(BaseAdapter):
         noise_level: Optional[float] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
-        return_kwargs: List[str] = ['velocity', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
+        return_kwargs: List[str] = [
+            "velocity",
+            "next_latents",
+            "next_latents_mean",
+            "std_dev_t",
+            "dt",
+            "log_prob",
+        ],
     ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
         """
         Core forward pass for T2I generation.
@@ -392,9 +436,11 @@ class SD3_5Adapter(BaseAdapter):
         # 1. Prepare variables
         batch_size = latents.shape[0]
         timestep = t.expand(batch_size).to(latents.dtype)
-        
+
         # Auto-detect CFG
-        if guidance_scale > 1.0 and (negative_prompt_embeds is None or negative_pooled_prompt_embeds is None):
+        if guidance_scale > 1.0 and (
+            negative_prompt_embeds is None or negative_pooled_prompt_embeds is None
+        ):
             logger.warning(
                 "Passed `guidance_scale` > 1.0, but no `negative_prompt_embeds` or "
                 "`negative_pooled_prompt_embeds` provided. Classifier-free guidance will be disabled."
@@ -408,7 +454,9 @@ class SD3_5Adapter(BaseAdapter):
         # 2. Prepare inputs for CFG
         if do_classifier_free_guidance:
             prompt_embeds_input = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-            pooled_prompt_embeds_input = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
+            pooled_prompt_embeds_input = torch.cat(
+                [negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0
+            )
             latents_input = torch.cat([latents, latents], dim=0)
             timestep_input = timestep.repeat(2)
         else:
@@ -444,5 +492,5 @@ class SD3_5Adapter(BaseAdapter):
             return_kwargs=return_kwargs,
             noise_level=noise_level,
         )
-        
+
         return output

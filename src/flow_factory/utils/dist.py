@@ -22,6 +22,7 @@ Sections:
 - Scalar metric reductions (numpy-based, used by AdvantageProcessor)
 - Tensor metric reductions (batched global stats, used by Trainers)
 """
+
 from __future__ import annotations
 
 import math
@@ -100,21 +101,19 @@ def all_gather_tensor_list(
         Requires 3 NCCL calls: (1) gather list lengths, (2) gather per-tensor
         shapes, (3) gather flattened data.
     """
-    assert all(isinstance(t, torch.Tensor) for t in tensor_list), (
-        "All elements in tensor_list must be torch.Tensor"
-    )
-    assert all(t.dim() == tensor_list[0].dim() for t in tensor_list), (
-        "All tensors must have the same number of dimensions"
-    )
+    assert all(
+        isinstance(t, torch.Tensor) for t in tensor_list
+    ), "All elements in tensor_list must be torch.Tensor"
+    assert all(
+        t.dim() == tensor_list[0].dim() for t in tensor_list
+    ), "All tensors must have the same number of dimensions"
 
     tensor_dim = tensor_list[0].dim()
     tensor_dtype = tensor_list[0].dtype if dtype is None else dtype
     device = torch.device(device)
 
     # Step 1: Gather lengths of tensor_list from all ranks
-    local_length = torch.tensor(
-        [len(tensor_list)], device=accelerator.device, dtype=torch.long
-    )
+    local_length = torch.tensor([len(tensor_list)], device=accelerator.device, dtype=torch.long)
     gathered_lengths = [
         torch.zeros(1, dtype=torch.long, device=accelerator.device)
         for _ in range(accelerator.num_processes)
@@ -129,9 +128,7 @@ def all_gather_tensor_list(
         dtype=torch.long,
     )
     gathered_shapes = [
-        torch.zeros(
-            (length, tensor_dim), dtype=torch.long, device=accelerator.device
-        )
+        torch.zeros((length, tensor_dim), dtype=torch.long, device=accelerator.device)
         for length in gathered_lengths
     ]
     dist.all_gather(gathered_shapes, local_shapes)
@@ -145,10 +142,7 @@ def all_gather_tensor_list(
 
     # Step 3: Gather all tensors via flattened concatenation
     local_flat_tensor = torch.cat(
-        [
-            t.to(device=accelerator.device, dtype=tensor_dtype).flatten()
-            for t in tensor_list
-        ], dim=0
+        [t.to(device=accelerator.device, dtype=tensor_dtype).flatten() for t in tensor_list], dim=0
     )
     gathered_flat_tensors = [
         torch.zeros(length, dtype=tensor_dtype, device=accelerator.device)
@@ -159,16 +153,12 @@ def all_gather_tensor_list(
 
     # Step 4: Reconstruct tensors from gathered shapes and flattened data
     gathered_tensors = []
-    for this_rank_shapes, this_rank_flat_tensor in zip(
-        gathered_shapes, gathered_flat_tensors
-    ):
+    for this_rank_shapes, this_rank_flat_tensor in zip(gathered_shapes, gathered_flat_tensors):
         offset = 0
         for shape in this_rank_shapes:
             length = int(shape.prod().item())
             this_tensor = (
-                this_rank_flat_tensor[offset : offset + length]
-                .reshape(shape.tolist())
-                .to(device)
+                this_rank_flat_tensor[offset : offset + length].reshape(shape.tolist()).to(device)
             )
             gathered_tensors.append(this_tensor)
             offset += length
@@ -225,8 +215,7 @@ def all_gather_nested_tensor_list(
         [local_structure.numel()], device=accelerator.device, dtype=torch.long
     )
     gathered_list_counts = [
-        torch.zeros_like(local_list_count)
-        for _ in range(dist.get_world_size())
+        torch.zeros_like(local_list_count) for _ in range(dist.get_world_size())
     ]
     dist.all_gather(gathered_list_counts, local_list_count)
 
@@ -242,15 +231,13 @@ def all_gather_nested_tensor_list(
     for rank_structure in gathered_structures:
         for inner_list_len in rank_structure.tolist():
             length = int(inner_list_len)
-            inner_list = gathered_flat_tensors[
-                flat_tensor_idx : flat_tensor_idx + length
-            ]
+            inner_list = gathered_flat_tensors[flat_tensor_idx : flat_tensor_idx + length]
             gathered_nested_tensors.append(inner_list)
             flat_tensor_idx += length
 
-    assert flat_tensor_idx == len(gathered_flat_tensors), (
-        "Mismatch in reconstructed tensor count when rebuilding nested structure."
-    )
+    assert flat_tensor_idx == len(
+        gathered_flat_tensors
+    ), "Mismatch in reconstructed tensor count when rebuilding nested structure."
 
     return gathered_nested_tensors
 
@@ -285,12 +272,8 @@ def _gather_field_values(
         return gather_object(field_values)
 
     # 1. Single Tensor per sample with uniform shape
-    if (
-        isinstance(field_values[0], torch.Tensor)
-        and all(
-            isinstance(v, torch.Tensor) and v.shape == field_values[0].shape
-            for v in field_values
-        )
+    if isinstance(field_values[0], torch.Tensor) and all(
+        isinstance(v, torch.Tensor) and v.shape == field_values[0].shape for v in field_values
     ):
         stacked = torch.stack(field_values).to(accelerator.device)
         gathered = accelerator.gather(stacked)
@@ -368,9 +351,7 @@ def gather_samples(
     for i in range(n_gathered):
         kwargs = {f: d[f][i] for f in regular_fields}
         if has_extra_kwargs:
-            kwargs["extra_kwargs"] = {
-                k: d[f"{_EXTRA_PREFIX}{k}"][i] for k in extra_keys
-            }
+            kwargs["extra_kwargs"] = {k: d[f"{_EXTRA_PREFIX}{k}"][i] for k in extra_keys}
         gathered_samples.append(sample_cls(**kwargs))
     return gathered_samples
 
@@ -412,9 +393,7 @@ def all_reduce_max_float(accelerator: Accelerator, local: float) -> float:
     return float(t.item())
 
 
-def global_mean_std_numpy(
-    accelerator: Accelerator, x: np.ndarray
-) -> Tuple[float, float]:
+def global_mean_std_numpy(accelerator: Accelerator, x: np.ndarray) -> Tuple[float, float]:
     """Compute pooled global mean and population std from a local numpy shard.
 
     Args:
@@ -431,9 +410,7 @@ def global_mean_std_numpy(
     x = np.asarray(x, dtype=np.float64)
     n = float(len(x))
     if n == 0:
-        t = torch.tensor(
-            [0.0, 0.0, 0.0], device=accelerator.device, dtype=torch.float64
-        )
+        t = torch.tensor([0.0, 0.0, 0.0], device=accelerator.device, dtype=torch.float64)
     else:
         t = torch.tensor(
             [n, float(np.sum(x)), float(np.sum(x * x))],
@@ -490,9 +467,7 @@ def global_mean_stds_from_arrays(
     return out
 
 
-def global_min_max_numpy(
-    accelerator: Accelerator, x: np.ndarray
-) -> Tuple[float, float]:
+def global_min_max_numpy(accelerator: Accelerator, x: np.ndarray) -> Tuple[float, float]:
     """Compute global min and max of a 1-D numpy array across all ranks.
 
     Args:
@@ -511,9 +486,7 @@ def global_min_max_numpy(
         lo = float(np.min(x))
         hi = float(np.max(x))
     # Fuse min & max into one MIN all-reduce over [lo, -hi] (max(h) == -min(-h)).
-    packed = torch.tensor(
-        [lo, -hi], device=accelerator.device, dtype=torch.float64
-    )
+    packed = torch.tensor([lo, -hi], device=accelerator.device, dtype=torch.float64)
     if _is_distributed():
         dist.all_reduce(packed, op=dist.ReduceOp.MIN)
     lo = float(packed[0].item())
@@ -544,9 +517,7 @@ def global_mean_abs_numpy(accelerator: Accelerator, x: np.ndarray) -> float:
     return s_t / n_t
 
 
-def global_mean_of_scalar_per_group(
-    accelerator: Accelerator, g_stds: np.ndarray
-) -> float:
+def global_mean_of_scalar_per_group(accelerator: Accelerator, g_stds: np.ndarray) -> float:
     """Compute the global mean of per-group scalar values pooled across ranks.
 
     Args:
@@ -560,9 +531,7 @@ def global_mean_of_scalar_per_group(
     g_stds = np.asarray(g_stds, dtype=np.float64)
     local_sum = float(g_stds.sum()) if len(g_stds) else 0.0
     local_count = float(len(g_stds))
-    t = torch.tensor(
-        [local_sum, local_count], device=accelerator.device, dtype=torch.float64
-    )
+    t = torch.tensor([local_sum, local_count], device=accelerator.device, dtype=torch.float64)
     t = accelerator.reduce(t, reduction="sum")
     tot = t[1].item()
     if tot < 1:
@@ -599,9 +568,7 @@ def global_max_min_of_scalar_per_group(
     return mx, mn
 
 
-def global_std_of_group_means(
-    accelerator: Accelerator, g_means: np.ndarray
-) -> float:
+def global_std_of_group_means(accelerator: Accelerator, g_means: np.ndarray) -> float:
     """Compute the population std of per-group means across all ranks.
 
     Args:
@@ -617,9 +584,7 @@ def global_std_of_group_means(
     g_means = np.asarray(g_means, dtype=np.float64)
     n = float(len(g_means))
     if n == 0:
-        t = torch.tensor(
-            [0.0, 0.0, 0.0], device=accelerator.device, dtype=torch.float64
-        )
+        t = torch.tensor([0.0, 0.0, 0.0], device=accelerator.device, dtype=torch.float64)
     else:
         t = torch.tensor(
             [n, float(np.sum(g_means)), float(np.sum(g_means * g_means))],
@@ -653,11 +618,7 @@ def global_zero_std_ratio(
     """
     rewards = np.asarray(rewards, dtype=np.float64)
     unique_groups = np.unique(group_indices)
-    zero_std_count = sum(
-        1
-        for gid in unique_groups
-        if np.std(rewards[group_indices == gid]) < eps
-    )
+    zero_std_count = sum(1 for gid in unique_groups if np.std(rewards[group_indices == gid]) < eps)
     n_groups = len(unique_groups)
     t = torch.tensor(
         [float(zero_std_count), float(n_groups)],
@@ -707,18 +668,14 @@ def global_tensor_stats(
         local_min = float(x.min())
         local_max = float(x.max())
 
-    packed = torch.tensor(
-        [count, total, sum_sq], device=accelerator.device, dtype=torch.float64
-    )
+    packed = torch.tensor([count, total, sum_sq], device=accelerator.device, dtype=torch.float64)
     packed = accelerator.reduce(packed, reduction="sum")
     global_count = packed[0].item()
     global_sum = packed[1].item()
     global_sum_sq = packed[2].item()
 
     # Fuse min & max into one MIN all-reduce over [local_min, -local_max].
-    extrema = torch.tensor(
-        [local_min, -local_max], device=accelerator.device, dtype=torch.float64
-    )
+    extrema = torch.tensor([local_min, -local_max], device=accelerator.device, dtype=torch.float64)
     if _is_distributed():
         dist.all_reduce(extrema, op=dist.ReduceOp.MIN)
     global_min = float(extrema[0].item())

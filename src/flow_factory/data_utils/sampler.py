@@ -26,39 +26,47 @@ logger = setup_logger(__name__, rank_zero_only=True)
 
 def _dataset_size(dataset: Dataset) -> int:
     if not hasattr(dataset, "__len__"):
-        raise TypeError(
-            "Sampler requires dataset with __len__, "
-            f"got {type(dataset).__name__}."
-        )
+        raise TypeError("Sampler requires dataset with __len__, " f"got {type(dataset).__name__}.")
     return len(cast(Sized, dataset))
 
 
 class DistributedKRepeatSampler(Sampler):
-    """
-    """
-    def __init__(self, dataset : Dataset, batch_size : int, group_size : int, unique_sample_num : int, num_replicas : int, rank : int, seed : int = 0):
+    """ """
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        batch_size: int,
+        group_size: int,
+        unique_sample_num: int,
+        num_replicas: int,
+        rank: int,
+        seed: int = 0,
+    ):
         self.dataset = dataset
         self.batch_size = batch_size  # Batch size per replica
-        self.k = group_size                # Number of repetitions per sample
+        self.k = group_size  # Number of repetitions per sample
         self.num_replicas = num_replicas  # Total number of replicas, process num, gpu num
-        self.rank = rank              # Current replica rank
-        self.seed = seed              # Random seed for synchronization
-        self.m = unique_sample_num                    # `Least` number of unique sample per epoch
-        
+        self.rank = rank  # Current replica rank
+        self.seed = seed  # Random seed for synchronization
+        self.m = unique_sample_num  # `Least` number of unique sample per epoch
+
         dataset_size = _dataset_size(self.dataset)
         if unique_sample_num > dataset_size:
             raise ValueError(
                 f"`unique_sample_num` ({unique_sample_num}) must be <= dataset size ({dataset_size})."
             )
-        
+
         # Compute the number of samples for each batch iteration
         self.sample_num_per_iteration = self.num_replicas * self.batch_size
         step = self.sample_num_per_iteration // math.gcd(self.k, self.sample_num_per_iteration)
         new_m = (self.m + step - 1) // step * step  # Round up m to be multiple of step
         if new_m != self.m:
-            logger.warning(f"Adjusted `unique_sample_num` from {self.m} to {new_m} to make sure `unique_sample_num`*`group_size` is multiple of `batch_size`*`num_replicas` for even distribution.")
+            logger.warning(
+                f"Adjusted `unique_sample_num` from {self.m} to {new_m} to make sure `unique_sample_num`*`group_size` is multiple of `batch_size`*`num_replicas` for even distribution."
+            )
             self.m = new_m
-        
+
         self.num_batches_per_epoch = (self.m * self.k) // self.sample_num_per_iteration
 
         self.epoch = 0
@@ -68,13 +76,13 @@ class DistributedKRepeatSampler(Sampler):
             # Generate a deterministic random sequence to ensure all replicas are synchronized
             g = torch.Generator()
             g.manual_seed(self.seed + self.epoch)
-            
+
             # Randomly select m unique samples, less if dataset is smaller than m
-            indices = torch.randperm(_dataset_size(self.dataset), generator=g)[:self.m].tolist()
+            indices = torch.randperm(_dataset_size(self.dataset), generator=g)[: self.m].tolist()
 
             # Repeat each sample k times to generate m*k total samples.
             repeated_indices = [idx for idx in indices for _ in range(self.k)]
-            
+
             # Shuffle to ensure uniform distribution
             shuffled_indices = torch.randperm(len(repeated_indices), generator=g).tolist()
             shuffled_samples = [repeated_indices[i] for i in shuffled_indices]
@@ -89,7 +97,7 @@ class DistributedKRepeatSampler(Sampler):
             # Increment epoch for next iteration
             self.epoch += 1
 
-    def set_epoch(self, epoch : int):
+    def set_epoch(self, epoch: int):
         self.epoch = epoch  # Used to synchronize random state across epochs
 
 
@@ -102,8 +110,17 @@ class GroupContiguousSampler(Sampler):
     Constraint: m must be divisible by num_replicas (auto-enforced
     when any reward model has async_reward=True).
     """
-    def __init__(self, dataset: Dataset, batch_size: int, group_size: int,
-                 unique_sample_num: int, num_replicas: int, rank: int, seed: int = 0):
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        batch_size: int,
+        group_size: int,
+        unique_sample_num: int,
+        num_replicas: int,
+        rank: int,
+        seed: int = 0,
+    ):
         self.dataset = dataset
         self.batch_size = batch_size
         self.k = group_size
@@ -141,7 +158,7 @@ class GroupContiguousSampler(Sampler):
             g = torch.Generator()
             g.manual_seed(self.seed + self.epoch)
 
-            indices = torch.randperm(_dataset_size(self.dataset), generator=g)[:self.m].tolist()
+            indices = torch.randperm(_dataset_size(self.dataset), generator=g)[: self.m].tolist()
 
             # Shuffle group order (all ranks see the same permutation)
             group_perm = torch.randperm(self.m, generator=g).tolist()
@@ -260,16 +277,14 @@ class GroupDistributedSampler(Sampler):
             g = torch.Generator()
             g.manual_seed(self.seed + self.epoch)
 
-            indices = torch.randperm(_dataset_size(self.dataset), generator=g)[:self.m].tolist()
+            indices = torch.randperm(_dataset_size(self.dataset), generator=g)[: self.m].tolist()
             group_perm = torch.randperm(self.m, generator=g).tolist()
             shuffled_groups = [indices[i] for i in group_perm]
 
             # Every rank sees the same group order; each rank takes an equal
             # number of copies per group so global batches are group-complete.
             my_samples = [
-                group_idx
-                for group_idx in shuffled_groups
-                for _ in range(self.copies_per_rank)
+                group_idx for group_idx in shuffled_groups for _ in range(self.copies_per_rank)
             ]
             for i in range(self.num_batches_per_epoch):
                 yield my_samples[i * self.batch_size : (i + 1) * self.batch_size]

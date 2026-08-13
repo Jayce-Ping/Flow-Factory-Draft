@@ -41,7 +41,6 @@ from typing import (
 import numpy as np
 import torch
 import tqdm as tqdm_
-
 from diffusers.utils.torch_utils import randn_tensor
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
@@ -560,9 +559,7 @@ class DGPOTrainer(BaseTrainer):
         matching the reference DGPO implementation.
         """
         clean_state = p["clean_state"]
-        times = self.adapter.build_training_component_times(
-            p["timesteps"][t_idx], batch=p["batch"]
-        )
+        times = self.adapter.build_training_component_times(p["timesteps"][t_idx], batch=p["batch"])
         if self.use_shared_noise:
             noise = self._shared_group_noise(
                 clean_state,
@@ -808,9 +805,7 @@ class DGPOTrainer(BaseTrainer):
                 # here; the prefetch dividend is realised inside the single-pass
                 # trainers' optimize loops, not this builder. DGPO samples are
                 # final-latent-only, so the H2D is tiny regardless.
-                batch: StackedSampleBatch = BaseSample.stack(
-                    [s.to(device) for s in samples_slice]
-                )
+                batch: StackedSampleBatch = BaseSample.stack([s.to(device) for s in samples_slice])
                 clean_state = self.adapter.get_terminal_state(batch)
                 batch_size = state_batch_size(self, clean_state, "terminal clean state")
 
@@ -863,9 +858,7 @@ class DGPOTrainer(BaseTrainer):
         )
 
         for inner_epoch in range(self.training_args.num_inner_epochs):
-            sample_slices = [
-                samples[i : i + bsz] for i in range(0, len(samples), bsz)
-            ]
+            sample_slices = [samples[i : i + bsz] for i in range(0, len(samples), bsz)]
             shared_timesteps = self._sample_shared_timesteps(inner_epoch)  # (T,)
             training_batches = self._build_training_batches(
                 sample_slices,
@@ -949,4 +942,3 @@ class DGPOTrainer(BaseTrainer):
         per epoch through the shared training loop instead.
         """
         self._update_ema_ref(step=self.step)
-

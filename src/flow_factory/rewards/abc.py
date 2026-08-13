@@ -17,18 +17,20 @@
 Abstract Base Class for Reward Models
 Provides common interface for all reward models.
 """
+
 from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, Union, List, Tuple, Literal
-from enum import Enum, auto
 from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-from PIL import Image
-
 from accelerate import Accelerator
 from diffusers.utils.outputs import BaseOutput
+from PIL import Image
 
 from ..hparams import RewardArguments
 
@@ -36,6 +38,7 @@ from ..hparams import RewardArguments
 @dataclass
 class RewardModelOutput(BaseOutput):
     """Output for reward models."""
+
     rewards: Union[torch.Tensor, np.ndarray, List[float]]
     extra_info: Optional[Dict[str, Any]] = None
 
@@ -44,29 +47,28 @@ class BaseRewardModel(ABC):
     """
     Abstract base class for all reward models.
     Provides common interface and utilities.
-    """    
+    """
+
     # Fields required from `Sample` for reward computation
     required_fields: Tuple[str, ...] = ()
 
     # Whether the model accepts tensor inputs directly
-    use_tensor_inputs: bool = False # True: the input media are torch.Tensors; False: the input media are PIL Images
-    
+    use_tensor_inputs: bool = (
+        False  # True: the input media are torch.Tensors; False: the input media are PIL Images
+    )
+
     def __init__(self, config: RewardArguments, accelerator: Accelerator):
         self.accelerator = accelerator
         self.config = config
-        self.device = (
-            accelerator.device
-            if config.device == torch.device('cuda')
-            else config.device
-        )
+        self.device = accelerator.device if config.device == torch.device("cuda") else config.device
         self.dtype = config.dtype
         self.model: Optional[nn.Module] = None
-    
+
     @abstractmethod
     def __call__(self, *args, **kwargs) -> RewardModelOutput:
         """Compute rewards. Signature varies by subclass."""
         pass
-    
+
     def to(self, device: torch.device) -> BaseRewardModel:
         """Move model to device."""
         if self.model is not None:
@@ -79,13 +81,16 @@ class PointwiseRewardModel(BaseRewardModel):
     """
     Reward model that computes independent rewards for each sample.
     This is the original behavior - each sample's reward depends only on itself.
-    
+
     Usage:
         rewards = model(prompt=prompts, image=images)
     """
-    required_fields: Tuple[str, ...] = ('image', 'prompt')
-    use_tensor_inputs: bool = False # True: the input media are torch.Tensors; False: the input media are PIL Images
-    
+
+    required_fields: Tuple[str, ...] = ("image", "prompt")
+    use_tensor_inputs: bool = (
+        False  # True: the input media are torch.Tensors; False: the input media are PIL Images
+    )
+
     @abstractmethod
     def __call__(
         self,
@@ -144,8 +149,11 @@ class GroupwiseRewardModel(BaseRewardModel):
             ...
         )
     """
-    required_fields: Tuple[str, ...] = ('image', 'prompt')
-    use_tensor_inputs: bool = False # True: the input media are torch.Tensors; False: the input media are PIL Images
+
+    required_fields: Tuple[str, ...] = ("image", "prompt")
+    use_tensor_inputs: bool = (
+        False  # True: the input media are torch.Tensors; False: the input media are PIL Images
+    )
 
     @abstractmethod
     def __call__(
@@ -189,9 +197,11 @@ class GroupwiseRewardModel(BaseRewardModel):
         """
         pass
 
+
 class GlobalwiseRewardModel(BaseRewardModel):
     """
-        Reward model that computes rewards considering all samples globally - maybe can be merged with `advantage computation` stage.
-        A placeholder for future extension.
+    Reward model that computes rewards considering all samples globally - maybe can be merged with `advantage computation` stage.
+    A placeholder for future extension.
     """
+
     pass
