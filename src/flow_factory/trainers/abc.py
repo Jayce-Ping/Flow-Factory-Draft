@@ -437,11 +437,7 @@ class BaseTrainer(ABC):
     def _init_optimizer(self) -> torch.optim.Optimizer:
         """Initialize one AdamW with one ordered parameter group per trainable role."""
         registry = self.adapter.component_variant_registry
-        trainable_role_names = tuple(
-            variant_name
-            for variant_name in registry.variant_names
-            if registry.get_spec(variant_name).trainable
-        )
+        trainable_role_names = registry.variant_names
         role_configs = self._role_optimizer_configs()
         configured_role_names = tuple(config.role_name for config in role_configs)
         if configured_role_names != trainable_role_names:
@@ -850,11 +846,7 @@ class BaseTrainer(ABC):
             return tuple(declared)
         registry = getattr(getattr(self, "adapter", None), "component_variant_registry", None)
         if isinstance(registry, ComponentVariantRegistry):
-            return tuple(
-                variant_name
-                for variant_name in registry.variant_names
-                if registry.get_spec(variant_name).trainable
-            )
+            return registry.variant_names
         return (DEFAULT_BASE_VARIANT,)
 
     def _validate_multirole_backend(self) -> None:

@@ -25,6 +25,11 @@ from flow_factory.hparams.optimizer_args import (
     AdamWOptimizerArguments,
     MultiOptimizerArguments,
 )
+from flow_factory.models.variants import (
+    DEFAULT_BASE_VARIANT,
+    ComponentVariantRegistry,
+    ComponentVariantSpec,
+)
 from flow_factory.trainers.abc import BaseTrainer
 from flow_factory.trainers.role_optimization import (
     OptimizationRole,
@@ -308,11 +313,11 @@ def test_base_trainer_builds_one_ordered_adamw_with_role_hyperparameters() -> No
     bundle = TinyBundle()
 
     class Registry:
-        variant_names = ("generator", "fake", "reference")
+        variant_names = ("generator", "fake")
 
         @staticmethod
         def get_spec(role_name: str) -> Any:
-            return SimpleNamespace(trainable=role_name != "reference")
+            return SimpleNamespace(storage_mode="full")
 
         @staticmethod
         def parameters(role_name: str) -> Tuple[torch.nn.Parameter, ...]:
@@ -862,3 +867,41 @@ def test_role_plan_values_are_immutable_and_validate_ranges() -> None:
             max_grad_norm=1.0,
             update_frequency=0,
         )
+
+
+def test_required_roles_fall_back_to_every_declared_variant() -> None:
+    """Without a declaration on training_args the registry is the answer.
+
+    This branch had no coverage, which let a stale filter on the removed
+    ``ComponentVariantSpec.trainable`` field survive a full green suite.
+    """
+    registry = ComponentVariantRegistry(SimpleNamespace(trainable_component_names=("transformer",)))
+    registry.declare(
+        ComponentVariantSpec(
+            name="generator",
+            storage_mode="full",
+            component_routes={"transformer": "transformer"},
+        )
+    )
+    registry.declare(
+        ComponentVariantSpec(
+            name="fake",
+            storage_mode="full",
+            component_routes={"transformer": "fake__transformer"},
+        )
+    )
+    trainer = SimpleNamespace(
+        training_args=SimpleNamespace(required_trainable_roles=None),
+        adapter=SimpleNamespace(component_variant_registry=registry),
+    )
+
+    assert BaseTrainer._required_trainable_roles(trainer) == ("generator", "fake")
+
+
+def test_required_roles_default_to_one_base_variant_without_a_registry() -> None:
+    trainer = SimpleNamespace(
+        training_args=SimpleNamespace(required_trainable_roles=None),
+        adapter=SimpleNamespace(component_variant_registry=None),
+    )
+
+    assert BaseTrainer._required_trainable_roles(trainer) == (DEFAULT_BASE_VARIANT,)
