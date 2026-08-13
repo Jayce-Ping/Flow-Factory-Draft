@@ -106,10 +106,7 @@ def test_multirole_defaults_and_frozen_reference_only_surface() -> None:
     assert tdm_r1_defaults["fake"].betas == (0.0, 0.999)
     assert tdm_r1_defaults["surrogate"].learning_rate == 3e-4
     assert tdm_r1_defaults["surrogate"].betas == (0.9, 0.999)
-    assert (
-        tdm_r1_defaults["generator"].learning_rate
-        == tdm_r1_defaults["fake"].learning_rate / 4
-    )
+    assert tdm_r1_defaults["generator"].learning_rate == tdm_r1_defaults["fake"].learning_rate / 4
     assert tdm_r1.advantage_aggregation == "gdpo"
     assert tdm_r1.tdm_weight == 0.3
     assert tdm_r1.surrogate_preference_beta == 1.0
