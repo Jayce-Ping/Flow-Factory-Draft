@@ -71,10 +71,6 @@ train:
   global_std: false
   unique_sample_num_per_epoch: 32
   gradient_step_per_epoch: 1
-  learning_rate: 2.0e-4
-  adam_weight_decay: 1.0e-4
-  adam_betas: [0.9, 0.999]
-  adam_epsilon: 1.0e-8
   max_grad_norm: 1.0
   enable_gradient_checkpointing: false
   seed: 42
@@ -141,3 +137,13 @@ eval_rewards:
       - text_faithfulness
       - physical_quality
       - text_rendering
+
+
+# Optimizer Configuration
+# One entry per trainable variant. A single-policy run has exactly one.
+optimizers:
+  - name: default
+    learning_rate: 2.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8

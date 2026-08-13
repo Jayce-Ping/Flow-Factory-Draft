@@ -358,14 +358,23 @@ def test_base_trainer_builds_one_ordered_adamw_with_role_hyperparameters() -> No
     ]
 
 
-def test_base_trainer_default_role_config_preserves_legacy_generator_args() -> None:
+def test_flat_training_fields_reach_the_role_config_through_one_translation() -> None:
+    """The single-optimizer shorthand resolves to the same list an explicit config writes."""
     trainer = object.__new__(MinimalTrainer)
-    trainer.training_args = SimpleNamespace(
-        learning_rate=0.001,
-        adam_betas=(0.9, 0.95),
-        adam_weight_decay=0.1,
-        adam_epsilon=1e-7,
-        max_grad_norm=1.5,
+    trainer.training_args = SimpleNamespace()
+    trainer.config = SimpleNamespace(
+        optimizer_args=MultiOptimizerArguments(
+            optimizer_configs=[
+                AdamWOptimizerArguments(
+                    name="base",
+                    learning_rate=0.001,
+                    betas=(0.9, 0.95),
+                    weight_decay=0.1,
+                    eps=1e-7,
+                    max_grad_norm=1.5,
+                )
+            ]
+        )
     )
 
     assert BaseTrainer._role_optimizer_configs(trainer) == (

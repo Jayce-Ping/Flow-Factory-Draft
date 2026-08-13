@@ -126,10 +126,6 @@ train:
   gradient_step_per_epoch: 1  # One optimizer step per epoch (accumulate the 3 per-dataset batches)
   gradient_accumulation_steps: auto  # Options: auto, or positive integer
 
-  learning_rate: 3.0e-4  # Initial learning rate for AdamW optimizer
-  adam_weight_decay: 1.0e-4  # AdamW weight decay regularization
-  adam_betas: [0.9, 0.999]  # AdamW momentum coefficients (beta1, beta2)
-  adam_epsilon: 1.0e-8  # AdamW epsilon for numerical stability
   max_grad_norm: 1.0  # Max gradient norm for gradient clipping
   max_epochs: 500  # Stop after this many epochs (-1 / null = unbounded)
 
@@ -204,3 +200,13 @@ eval_rewards:
     device: "cuda"  # Device to run reward model on
     dtype: bfloat16  # Precision for reward model inference
     # applicable_datasets omitted -> applies to all eval datasets (pickscore, ocr, geneval)
+
+
+# Optimizer Configuration
+# One entry per trainable variant. A single-policy run has exactly one.
+optimizers:
+  - name: default
+    learning_rate: 3.0e-4  # Initial learning rate for AdamW optimizer
+    weight_decay: 1.0e-4  # AdamW weight decay regularization
+    betas: [0.9, 0.999]  # AdamW momentum coefficients (beta1, beta2)
+    eps: 1.0e-8  # AdamW epsilon for numerical stability

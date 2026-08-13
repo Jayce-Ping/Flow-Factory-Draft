@@ -403,21 +403,9 @@ def optimize(self, samples):
 ### Optimizer Configuration
 
 One optimizer root is built for the whole run, with one parameter group per trainable
-variant. A single-policy algorithm has exactly one, and configures it with the flat
-fields under `train:`:
-
-```yaml
-train:
-  learning_rate: 1.0e-5
-  adam_betas: [0.9, 0.999]
-  adam_weight_decay: 1.0e-4
-  adam_epsilon: 1.0e-8
-  max_grad_norm: 1.0
-```
-
-Those are translated once, in `Arguments.__post_init__`, into a single default AdamW
-entry; everything downstream reads only the resolved list. The explicit form is a
-top-level `optimizers:` section, one entry per variant, resolved by name:
+variant. Declare them in the top-level `optimizers:` section, one entry per variant,
+resolved by name; a single-policy algorithm has exactly one, which every shipped
+example writes as `name: default`:
 
 ```yaml
 optimizers:
@@ -430,8 +418,16 @@ optimizers:
     update_frequency: 5
 ```
 
-Declaring it is required to give several trainable variants their own optimizer, and
-is the only way to select an optimizer other than AdamW. `optimizer` selects both the
+Omitting the section entirely still works: the flat `train.learning_rate`,
+`adam_betas`, `adam_weight_decay` and `adam_epsilon` fields are translated once, in
+`Arguments.__post_init__`, into the same single default entry. That shorthand is kept
+for backward compatibility, but new configs should be explicit.
+
+`train.max_grad_norm` stays under `train:` because it clips every trainable parameter
+at the shared gradient step, which is a run-level policy. The per-entry
+`max_grad_norm` is the per-role clip that multi-role coordination applies.
+
+`optimizer` selects both the
 implementation and the argument schema (`hparams/optimizer_args/`), so AdamW and Muon
 hyperparameters never share a class:
 

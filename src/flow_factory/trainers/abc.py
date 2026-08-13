@@ -442,14 +442,7 @@ class BaseTrainer(ABC):
             for variant_name in registry.variant_names
             if registry.get_spec(variant_name).trainable
         )
-        role_config_builder = getattr(self, "_role_optimizer_configs", None)
-        if role_config_builder is None:
-            role_configs = tuple(
-                BaseTrainer._legacy_role_optimizer_config(self, role_name)
-                for role_name in trainable_role_names
-            )
-        else:
-            role_configs = role_config_builder()
+        role_configs = self._role_optimizer_configs()
         configured_role_names = tuple(config.role_name for config in role_configs)
         if configured_role_names != trainable_role_names:
             raise ValueError(
@@ -542,12 +535,6 @@ class BaseTrainer(ABC):
     def _role_optimizer_configs(self) -> Tuple[RoleOptimizerConfig, ...]:
         """Build role configs from nested arguments or legacy flat arguments."""
         required_roles = BaseTrainer._required_trainable_roles(self)
-        if len(required_roles) == 1:
-            # A single-policy algorithm has one parameter group, so the flat
-            # `train.learning_rate` family describes it and no per-role nesting is
-            # required whatever that single role happens to be called.
-            return (BaseTrainer._legacy_role_optimizer_config(self, required_roles[0]),)
-
         if getattr(self.training_args, "role_update_plan", None) is not None:
             update_plan = BaseTrainer._role_update_plan(self)
             plan_roles = {phase.role_name for phase in update_plan.phases}
@@ -588,17 +575,6 @@ class BaseTrainer(ABC):
             adam_epsilon=eps,
             max_grad_norm=optimizer_args.max_grad_norm,
             update_frequency=optimizer_args.update_frequency,
-        )
-
-    def _legacy_role_optimizer_config(self, role_name: str) -> RoleOptimizerConfig:
-        """Build one role config from the existing flat training arguments."""
-        return RoleOptimizerConfig(
-            role_name=role_name,
-            learning_rate=self.training_args.learning_rate,
-            adam_betas=self.training_args.adam_betas,
-            adam_weight_decay=self.training_args.adam_weight_decay,
-            adam_epsilon=self.training_args.adam_epsilon,
-            max_grad_norm=getattr(self.training_args, "max_grad_norm", 1.0),
         )
 
     def _finish_role_microbatch(self) -> bool:
