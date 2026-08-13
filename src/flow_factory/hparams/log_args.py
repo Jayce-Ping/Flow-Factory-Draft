@@ -15,7 +15,7 @@
 # src/flow_factory/hparams/log_args.py
 import os
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Union
 
 import yaml
 
@@ -34,9 +34,16 @@ class LogArguments(ArgABC):
         default="Flow-Factory",
         metadata={"help": "Project name for logging platforms."},
     )
-    logging_backend: Optional[Literal["wandb", "swanlab", "none"]] = field(
-        default=None,
-        metadata={"help": "Logging backend to use."},
+    logging_backend: Optional[Union[Literal["wandb", "swanlab", "tensorboard", "none"], str]] = (
+        field(
+            default=None,
+            metadata={
+                "help": (
+                    "Logging backend to use: a registered key, or a fully qualified path to a "
+                    "custom Logger subclass."
+                )
+            },
+        )
     )
 
     save_dir: str = field(

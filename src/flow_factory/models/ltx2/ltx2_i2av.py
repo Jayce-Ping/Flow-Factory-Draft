@@ -197,8 +197,8 @@ class LTX2_I2AV_Adapter(BaseAdapter):
         """Build the ordered video/audio scheduler group and its audio twin.
 
         Audio is sampled with the same SDE dynamics as video so that both
-        modalities form a single joint policy whose per-step log_prob feeds the
-        GRPO objective. A dedicated instance is still required because
+        modalities form a single joint policy with one per-step log_prob over
+        both. A dedicated instance is still required because
         scheduler.step() mutates internal state (step_index), which would
         conflict if shared with the video scheduler. ``load_scheduler`` rebuilds
         an independent scheduler from the same pipeline scheduler + scheduler

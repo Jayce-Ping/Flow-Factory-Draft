@@ -219,10 +219,15 @@ lifecycle loop cannot proceed without. Details: `topics/component_runtime.md`.
 mechanisms cover parameter ownership. Named parameter snapshots (`add_named_parameters` /
 `use_named_parameters`) are temporal, one set of weights installed at a time, and cover references,
 EMAs and old snapshots. `ComponentVariantRegistry` (`models/variants.py`) is spatial: several
-trainable copies live at once, each with its own optimizer group, storage (`lora`, `full` or
-`frozen`) and `component_routes`. Variant names are caller-chosen and the base variant is
-positional, so the model layer never learns what a "generator" is. `RoutedComponentProxy` resolves
-a canonical component name through the active variant, so adapter code is unchanged.
+trainable copies live at once, each with its own optimizer group, storage (`lora` or `full`) and
+`component_routes`. Variant names are caller-chosen and the base variant is positional, so the
+model layer never learns what a "generator" is. `RoutedComponentProxy` resolves a canonical
+component name through the active variant, so adapter code is unchanged.
+
+A variant is always a live trainable copy. A frozen reference is the same weights at another point
+in time, so it belongs to the temporal mechanism: `use_ref_parameters()` for the pre-finetune
+weights, or a named snapshot. Only the trainable copy carries gradients and optimizer state, which
+is what forces it into the prepared bundle in the first place.
 
 Roles are the trainer's vocabulary. `RoleOptimizationCoordinator`
 (`trainers/role_optimization.py`) is a utility a trainer composes to drive disjoint role updates
@@ -290,6 +295,8 @@ Arguments (top-level)
 ├── SchedulerArguments    # dynamics_type, timestep_range, num_inference_steps
 ├── DataArguments         # dataset, preprocessing, resolution, sampler_type
 ├── MultiRewardArguments  # reward_model configs (list of RewardArguments)
+├── MultiOptimizerArguments  # YAML `optimizers:`, one entry per variant (AdamW or Muon)
+├── AccelerationArguments # YAML `acceleration:`, compile / attention backend / caching
 ├── LogArguments          # logger type, verbose, project name
 └── EvaluationArguments   # evaluation settings
 ```

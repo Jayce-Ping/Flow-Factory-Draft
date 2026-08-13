@@ -533,7 +533,7 @@ model:
 
 ## Advanced: Custom `preprocess_func`
 
-The default `preprocess_func` calls `encode_prompt`, `encode_image`, and `encode_video` independently. Override it when your model requires **cross-modal preprocessing** — for example, FLUX.2 uses its text encoder to "upsample" (rewrite) prompts based on input images before encoding ([here](https://github.com/X-GenGroup/Flow-Factory/blob/main/src/flow_factory/models/flux/flux2.py#L371)):
+The default `preprocess_func` calls `encode_prompt`, `encode_image`, `encode_video` and `encode_audio` independently. Override it when your model requires **cross-modal preprocessing** — for example, FLUX.2 uses its text encoder to "upsample" (rewrite) prompts based on input images before encoding ([here](https://github.com/X-GenGroup/Flow-Factory/blob/main/src/flow_factory/models/flux/flux2.py#L371)):
 
 ```python
 # src/flow_factory/models/flux/flux2.py — Flux2Adapter.preprocess_func()

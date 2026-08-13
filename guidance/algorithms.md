@@ -361,10 +361,11 @@ Since DiffusionNFT decouples training from sampling dynamics, you can freely cho
 
 ```yaml
 train:
-  num_train_timesteps: 2 # Number of timesteps to train on. Set `null` to all timesteps.
+  num_train_timesteps: 2 # Timesteps to train on. 0 or `null` derives it as
+                         # int(num_inference_steps * timestep_range span).
   time_sampling_strategy: discrete_with_init # Options: uniform, logit_normal, discrete, discrete_with_init, discrete_wo_init
   time_shift: 3.0
-  timestep_fraction: 0.3 # Train using only the first 30% of timesteps.
+  timestep_range: 0.3 # Train using only the first 30% of timesteps.
 
 scheduler:
     dynamics_type: 'ODE' # Other options are also available.

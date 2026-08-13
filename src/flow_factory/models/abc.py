@@ -650,8 +650,8 @@ class BaseAdapter(ABC):
     """
         A single-policy algorithm trains one copy of the trainable components, so
         `target_module_map` alone describes parameter ownership. Some algorithms need
-        several copies live at the same time, each with its own optimizer group. The
-        named-parameter snapshots above are a *temporal* mechanism (one set of weights
+        several copies live at the same time, each owning its own optimizer groups. The
+        named-parameter snapshots below are a *temporal* mechanism (one set of weights
         installed at a time); variants are the *spatial* one.
 
         This adapter supplies the mechanism and holds no opinion about what a variant
@@ -987,15 +987,16 @@ class BaseAdapter(ABC):
         These utilities help to snapshot and restore named parameters for target components.
         NOTE: `use_ref_parameters` always refers to the original model weights before any fine-tuning.
 
-        For algorithms like DPO, GARDO, they requires to update reference model weights frequently.
-        So we need more flexible utilities to manage multiple named parameter snapshots.
-        The functions below help to store, use, update, and remove named parameter snapshots.
+        A caller that refreshes its frozen reference during training, or that keeps more
+        than one such copy, needs something more flexible than that single fixed reference.
+        The functions below store, use, update, and remove named parameter snapshots, and
+        attach no meaning to the names.
     """
 
-    def _get_component_parameters(self, target_modules: List[str]) -> List[torch.nn.Parameter]:
+    def _get_component_parameters(self, component_names: List[str]) -> List[torch.nn.Parameter]:
         """Get trainable parameters from specified components."""
         params = []
-        for comp_name in target_modules:
+        for comp_name in component_names:
             if self.has_component(comp_name):
                 component = self._require_component(comp_name)
                 params.extend(p for p in component.parameters() if p.requires_grad)
@@ -1015,14 +1016,14 @@ class BaseAdapter(ABC):
 
         Args:
             name: Identifier for this parameter snapshot
-            target_modules: Component names to store. Defaults to components with trainable params.
+            target_components: Component names to store. Defaults to components with trainable params.
             device: Storage device (defaults to 'cpu')
             overwrite: Whether to overwrite existing snapshot
         """
         if name in self._named_parameters and not overwrite:
             raise KeyError(f"Named parameters '{name}' exists. Use overwrite=True.")
 
-        # Normalize target_modules - filter only those with trainable params
+        # Normalize target components - keep only those with trainable params
         if target_components is None:
             target_components = [k for k, v in self.target_module_map.items() if v]
         elif isinstance(target_components, str):
@@ -1032,7 +1033,8 @@ class BaseAdapter(ABC):
         invalid = set(target_components) - set(self.target_module_map.keys())
         if invalid:
             raise ValueError(
-                f"Invalid target_modules: {invalid}. Valid: {list(self.target_module_map.keys())}"
+                f"expected target_components to name declared components "
+                f"{list(self.target_module_map.keys())}, received unknown {sorted(invalid)}"
             )
 
         device = torch.device(device) if device else torch.device("cpu")
@@ -1087,7 +1089,7 @@ class BaseAdapter(ABC):
 
         Args:
             name: Name of snapshot to update
-            target_modules: Components to update. Defaults to originally stored components.
+            target_components: Components to update. Defaults to originally stored components.
             new_parameters: Parameters to copy from. Defaults to current model parameters.
         """
         if name not in self._named_parameters:
@@ -1095,14 +1097,18 @@ class BaseAdapter(ABC):
 
         info = self._named_parameters[name]
 
-        # Resolve target_modules
+        # Resolve target components
         if target_components is None:
             target_components = info.target_components
         elif isinstance(target_components, str):
             target_components = [target_components]
 
         if not set(target_components).issubset(set(info.target_components)):
-            raise ValueError(f"Must be subset of original: {info.target_components}")
+            raise ValueError(
+                f"expected target_components for snapshot {name!r} to be a subset of the "
+                f"components it stored {info.target_components!r}, received "
+                f"{sorted(set(target_components) - set(info.target_components))!r}"
+            )
 
         # Resolve parameters
         if new_parameters is None:

@@ -159,10 +159,12 @@ rejected at startup as unverified: DDP and FSDP only read `param_groups` and cal
 
 ## Optimizer and backend contract
 
-`trainers/role_optimization.py` is a utility a trainer composes, not something `BaseTrainer` wires
-automatically. `RoleOptimizationCoordinator` drives disjoint role updates through one physical
-optimizer, one parameter group per role. `_validate_multirole_backend` rejects the layouts
-multi-role cannot support:
+`BaseTrainer._init_prepared_role_optimization` always constructs a `RoleOptimizationCoordinator`
+(`trainers/role_optimization.py`) once `prepare` has run, so `self.role_optimization` exists even
+for a single-policy trainer, where it degenerates to one role. It drives disjoint role updates
+through one physical optimizer; each role owns one or more `param_groups`, listed in
+`OptimizationRole.optimizer_group_ids`, since a Muon role contributes two.
+`_validate_multirole_backend` rejects the layouts multi-role cannot support:
 
 - more than one prepared model root or more than one prepared optimizer;
 - a prepared root or optimizer that is not the tracked `model_bundle` / `optimizer`;

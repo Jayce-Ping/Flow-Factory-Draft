@@ -9,13 +9,13 @@ These constraints MUST NOT be violated. Consult this file before making any code
 ## Registry & Loading (1–5)
 
 ### 1. Registry Path Accuracy
-The three registries (`_TRAINER_REGISTRY`, `_MODEL_ADAPTER_REGISTRY`, `_REWARD_MODEL_REGISTRY`) map string identifiers to **fully qualified Python class paths** for lazy import. If you move, rename, or restructure a class, the corresponding registry entry MUST be updated, or `ImportError` will occur at runtime.
+The four registries (`_TRAINER_REGISTRY`, `_MODEL_ADAPTER_REGISTRY`, `_REWARD_MODEL_REGISTRY`, `_ACCELERATOR_REGISTRY`) map string identifiers to **fully qualified Python class paths** for lazy import. If you move, rename, or restructure a class, the corresponding registry entry MUST be updated, or `ImportError` will occur at runtime.
 
 ### 2. Registry Identifier Convention
 Registry keys are **case-insensitive** (lowered at lookup). Model adapter keys use lowercase with hyphens (e.g., `flux1-kontext`). Trainer keys use lowercase (e.g., `grpo-guard`). Reward keys use lowercase (e.g., `pickscore`). New entries must follow the same convention.
 
 ### 3. Dynamic Import Fallback
-All three registries support a **direct Python path** fallback (e.g., `my_package.models.CustomAdapter`). If an identifier is not found in the registry, it is treated as a fully qualified import path. Do not break this two-mode resolution logic.
+All four registries support a **direct Python path** fallback (e.g., `my_package.models.CustomAdapter`). If an identifier is not found in the registry, it is treated as a fully qualified import path. Do not break this two-mode resolution logic.
 
 ### 4. Decorator Registration
 `@register_trainer` and `@register_reward_model` decorators exist for convenience but the canonical entries are the static dicts. If you use the decorator, ensure the static dict is also updated if the class should be discoverable by default.
@@ -61,14 +61,14 @@ All target components (trainable **and** frozen-but-shardable) are bundled into 
 Checkpoints are written and read for **trainable members only** — components whose `target_module_map[name]` is non-empty (`adapter.trainable_component_names`). Frozen-but-shardable bundle members (e.g. Wan2.2's `transformer_2`, kept in `target_components` only to be FSDP-sharded for memory; see #9) map to `None` and are skipped by both `save_checkpoint` and `_load_lora`/`_load_full_model`. Loaders MUST iterate `trainable_component_names`, not `target_components`, or resume logs a spurious error for a per-component subdir that was never written. `resume_type='state'` restores via `accelerator.load_state` into the prepared bundle root and is therefore keyed to bundle membership — resuming into a different `target_components` / bundle composition will mismatch.
 
 ### 10. DeepSpeed ZeRO-3 Is Unsupported
-Supported distributed plans are DDP, FSDP, and DeepSpeed ZeRO-1/2. Reward model sharding under ZeRO-3 is broken even with the `GatherParameter` context manager, and parameter sharding also breaks frozen-component synchronization. `validate_supported_distributed_plan` (`trainers/abc.py`) rejects it at `BaseTrainer.__init__`, before any weights load, and `config/deepspeed/` ships no ZeRO-3 profile. Multi-role training narrows this further: `_validate_multirole_backend` requires ZeRO-1/2 and, under FSDP2, `use_orig_params=True`.
+Supported distributed plans are DDP, FSDP, and DeepSpeed ZeRO-1/2. Reward model sharding under ZeRO-3 is broken even with DeepSpeed's own `zero.GatheredParameters` context manager, and parameter sharding also breaks frozen-component synchronization. `validate_supported_distributed_plan` (`trainers/abc.py`) rejects it at `BaseTrainer.__init__`, before any weights load, and `config/deepspeed/` ships no ZeRO-3 profile. Multi-role training narrows this further: `_validate_multirole_backend` requires ZeRO-1/2 and, under FSDP2, `use_orig_params=True`.
 
 ---
 
 ## Base Class Interfaces (11–14)
 
 ### 11. BaseTrainer Abstract Contract
-`BaseTrainer.__init__` expects `(accelerator, config, adapter)`. Subclasses must implement the three abstract methods `start()`, `prepare_feedback()`, and `optimize()`. `evaluate()` is a **concrete** base method — override only to customize evaluation. The `_initialization()` method handles dataloader, optimizer, accelerator preparation, reward model loading, and `AdvantageProcessor` instantiation — do not duplicate this logic.
+`BaseTrainer.__init__` expects `(accelerator, config, adapter)`. `optimize()` is the only abstract method subclasses must implement. `start()` (the shared epoch loop), `prepare_feedback()`, `compute_advantages()` and `evaluate()` are **concrete** base methods — override only to customize, and prefer the hooks (`sampling_context`, `_run_training_step`, `_after_gradient_step`, `_after_optimizer_step`) over restating the loop. The `_initialization()` method handles dataloader, optimizer, accelerator preparation, reward model loading, and `AdvantageProcessor` instantiation — do not duplicate this logic.
 
 **Per-epoch hook order**: `sample()` (Stages 2–3) → `prepare_feedback()` (Stages 4–5) → `optimize()` (Stage 6). `DPOTrainer` forms chosen/rejected pairs at the **start** of `optimize()` (not in `prepare_feedback()`).
 

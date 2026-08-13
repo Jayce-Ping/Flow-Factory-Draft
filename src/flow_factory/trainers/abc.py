@@ -306,7 +306,8 @@ class BaseTrainer(ABC):
         # If DeepSpeed ZeRO-3 is enabled, the reward model will be somehow sharded.
         # We need to disable ZeRO-3 init context when loading the model to avoid issues
         # NOTE: This bug persists even with this context manager. DONOT USE ZeRO-3.
-        # A possible solution: use DeepSpeed GatherParamter manually in the reward_model's `forward`.
+        # A possible solution: call DeepSpeed's `zero.GatheredParameters` manually inside the
+        # reward model's `forward`.
 
         # Collect training dataset names so MultiRewardLoader can pre-compute
         # the per-source reward routing used by the runtime reward gate
@@ -435,7 +436,12 @@ class BaseTrainer(ABC):
         return dataloader, eval_dataloaders
 
     def _init_optimizer(self) -> torch.optim.Optimizer:
-        """Initialize one AdamW with one ordered parameter group per trainable role."""
+        """Build the single optimizer root, its groups ordered and tagged by role.
+
+        All-AdamW runs get one ``torch.optim.AdamW``. A role that selects Muon
+        contributes two groups instead of one, since Muon takes only matrices, and
+        the root becomes a ``CompositeOptimizer``.
+        """
         registry = self.adapter.component_variant_registry
         trainable_role_names = registry.variant_names
         role_configs = self._role_optimizer_configs()

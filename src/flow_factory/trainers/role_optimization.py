@@ -45,7 +45,11 @@ def _validate_positive_float(value: object, field_name: str, role_name: RoleName
 
 @dataclass(frozen=True)
 class RoleOptimizerConfig:
-    """Store one role's AdamW and clipping configuration."""
+    """Store one role's clip norm, update cadence and moment hyperparameters.
+
+    The moment fields describe AdamW directly; a Muon role fills them from its
+    fallback settings, which govern the AdamW half of its split.
+    """
 
     role_name: RoleName
     learning_rate: float

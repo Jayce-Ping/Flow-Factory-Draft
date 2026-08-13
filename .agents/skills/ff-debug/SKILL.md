@@ -117,7 +117,7 @@ If the same approach fails three times:
 - [ ] Device mismatch between reward model and generated samples?
 
 ### Configuration Issues
-- [ ] YAML key doesn't match Pydantic field name? (Constraint #17)
+- [ ] YAML key doesn't match the dataclass field name? (Constraint #17)
 - [ ] Algorithm-specific args using wrong subclass? (Constraint #16)
 - [ ] Registry key doesn't match? (Constraint #1)
 

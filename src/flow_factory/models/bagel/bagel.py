@@ -1497,8 +1497,8 @@ class BagelAdapter(BaseAdapter):
         # Gating is shared across the pack, so when CFG is active all samples must be on
         # the same side of cfg_interval. Fail loudly on straddling rather than silently
         # applying the wrong CFG scale / renorm to some samples (a hidden train-inference
-        # inconsistency). Uniform-t schedules (GRPO) never straddle. When CFG is disabled
-        # (scales <= 1.0, e.g. NFT/AWM), gating is a no-op, so skip the check entirely.
+        # inconsistency). A schedule that draws one shared t for the pack never straddles.
+        # When CFG is disabled (scales <= 1.0) gating is a no-op, so skip the check entirely.
         if cfg_text_scale > 1.0 or cfg_img_scale > 1.0:
             sigma_vals = sigma.flatten()
             in_interval = (sigma_vals > cfg_interval[0]) & (sigma_vals <= cfg_interval[1])
