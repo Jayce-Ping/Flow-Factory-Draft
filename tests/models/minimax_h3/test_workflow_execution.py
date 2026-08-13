@@ -37,6 +37,7 @@ def _adapter(adapter_class: type, transformer: Any = None) -> Any:
     adapter.accelerator = SimpleNamespace(device=torch.device("cpu"))
     adapter.scheduler = SimpleNamespace(shift=12.0)
     adapter.audio_scheduler = SimpleNamespace(shift=3.0)
+    adapter.training_args = SimpleNamespace(latent_storage_dtype=None)
     adapter.get_component = lambda name: transformer or SimpleNamespace()
     adapter.on_load_components = lambda components, device=None: None
     return adapter
@@ -349,10 +350,12 @@ def test_forward_state_uses_prepared_component_and_forward_parity(monkeypatch) -
         trainer_metadata="drop",
     )
     direct = adapter.forward(
-        batch=batch,
         state=state,
         times=times,
         compute_log_prob=True,
+        prompt_embeds=batch["prompt_embeds"],
+        condition_prefixes=batch["condition_prefixes"],
+        layout=batch["layout"],
     )
     bridged.next_state.components["video"].sum().backward()
 
@@ -363,3 +366,13 @@ def test_forward_state_uses_prepared_component_and_forward_parity(monkeypatch) -
     assert weight.grad is not None
     assert "advantage" not in calls[0][1]
     assert "trainer_metadata" not in calls[0][1]
+
+
+def test_forward_rejects_replay_batch_argument() -> None:
+    adapter = _adapter(MiniMaxH3T2VAAdapter)
+
+    with pytest.raises(
+        ValueError,
+        match=r"workflow='t2va' forward received unsupported arguments=\('batch',\)",
+    ):
+        adapter.forward(batch=SimpleNamespace(), state=_state(1), times=_times())

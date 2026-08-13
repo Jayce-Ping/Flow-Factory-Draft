@@ -100,10 +100,15 @@ class ComponentRuntime(ABC):
             module: Replacement module or routed proxy.
 
         Raises:
-            ValueError: If the name is empty or the replacement is ``None``.
+            ValueError: If the name is empty or undeclared, or the replacement is ``None``.
         """
         if not name:
             raise ValueError("Component override name must be non-empty.")
+        if name not in self.declared_components:
+            raise ValueError(
+                f"Cannot install component override for undeclared name {name!r}; "
+                f"requested={name!r}, declared={self.declared_component_names}."
+            )
         if module is None:
             raise ValueError(
                 f"Component override '{name}' must be a module or routed proxy, got None."

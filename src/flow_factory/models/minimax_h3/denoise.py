@@ -181,8 +181,11 @@ def step_h3_components(
     outputs = {}
     schedulers = {"video": video_scheduler, "audio": audio_scheduler}
     for component in MINIMAX_H3_COMPONENT_ORDER:
+        # The state dtype is the trajectory's storage precision; the model velocity is
+        # aligned to it so the scheduler sees one precision and replay reproduces rollout.
+        component_velocity = velocity.components[component].to(state.components[component].dtype)
         outputs[component] = schedulers[component].step(
-            velocity.components[component],
+            component_velocity,
             times.timestep[component],
             state.components[component],
             next_latents=None if next_state is None else next_state.components[component],

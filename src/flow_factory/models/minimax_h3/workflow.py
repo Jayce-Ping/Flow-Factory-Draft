@@ -240,13 +240,14 @@ def infer_h3_workflow(adapter: Any, **kwargs: Any) -> List[Any]:
         workflow=adapter.workflow,
         generator=generator,
     )
+    # Store and consume the same precision, so replay reproduces the rollout inputs.
+    state = adapter.cast_latent_state(state)
     plan = build_h3_schedule_plan(
         adapter.scheduler,
         adapter.audio_scheduler,
         kwargs.get("num_inference_steps", 40),
         layout,
         state.components["video"].device,
-        keyframe_noise_aug=getattr(transformer, "keyframe_noise_aug", 0.999),
     )
     num_transitions = len(plan.schedules["video"][0]) - 1
     trajectory_indices = kwargs.get("trajectory_indices", "all")
@@ -298,7 +299,7 @@ def infer_h3_workflow(adapter: Any, **kwargs: Any) -> List[Any]:
                 f"MiniMax H3 workflow={adapter.workflow!r} transition {index} "
                 "expected target next_state, received None"
             )
-        state = output.next_state
+        state = adapter.cast_latent_state(output.next_state)
         if collected_states is not None and index + 1 in state_positions:
             _append_state(collected_states, state)
         if collected_log_probs is not None and index in transition_positions:
@@ -402,6 +403,26 @@ def infer_h3_workflow(adapter: Any, **kwargs: Any) -> List[Any]:
     return [sample]
 
 
+_H3_FORWARD_CONDITIONING_FIELDS = frozenset(
+    {
+        "condition_prefixes",
+        "prompt_embeds",
+        "layout",
+        "generator",
+        "attention_kwargs",
+        "guidance_scale",
+    }
+)
+_H3_FORWARD_FIELDS = _H3_FORWARD_CONDITIONING_FIELDS | {
+    "state",
+    "times",
+    "next_state",
+    "compute_log_prob",
+    "return_fields",
+    "noise_level",
+}
+
+
 def forward_h3_adapter_state(
     adapter: Any,
     *,
@@ -452,25 +473,28 @@ def forward_h3_adapter_state(
     )
 
 
-def forward_h3_adapter(adapter: Any, **kwargs: Any) -> Any:
-    """Route rollout and bridge calls through one adapter forward boundary."""
-    if "batch" in kwargs:
-        return adapter.forward_state(**kwargs)
-    allowed = {
-        "state",
-        "times",
-        "next_state",
-        "compute_log_prob",
-        "return_fields",
-        "noise_level",
-        "condition_prefixes",
-        "prompt_embeds",
-        "layout",
-        "generator",
-        "attention_kwargs",
-        "guidance_scale",
+def build_h3_replay_forward_kwargs(forward_kwargs: Mapping[str, Any]) -> Dict[str, Any]:
+    """Select the conditioning arguments H3 ``forward`` accepts from a replay batch.
+
+    Replay wrappers receive every collated batch field, while ``forward`` is a strict
+    public boundary. Selecting here keeps that boundary strict for rollout callers.
+
+    Args:
+        forward_kwargs: Conditioning arguments resolved from the stored batch.
+
+    Returns:
+        Conditioning arguments accepted by ``forward``.
+    """
+    return {
+        name: value
+        for name, value in forward_kwargs.items()
+        if name in _H3_FORWARD_CONDITIONING_FIELDS
     }
-    unknown = tuple(sorted(set(kwargs) - allowed))
+
+
+def forward_h3_adapter(adapter: Any, **kwargs: Any) -> Any:
+    """Run one rollout or replay transition through the single H3 forward boundary."""
+    unknown = tuple(sorted(set(kwargs) - _H3_FORWARD_FIELDS))
     if unknown:
         raise ValueError(
             f"MiniMax H3 workflow={adapter.workflow!r} forward received unsupported "

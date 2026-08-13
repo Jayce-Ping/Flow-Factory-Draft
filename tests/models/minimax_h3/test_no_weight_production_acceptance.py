@@ -287,6 +287,50 @@ def test_no_weight_production_inference_terminal_only_stores_one_state(
     assert trajectory.component_log_probs is None
 
 
+def test_no_weight_production_inference_stores_states_in_latent_storage_dtype(
+    monkeypatch,
+) -> None:
+    adapter = _production_adapter()
+    adapter.training_args.latent_storage_dtype = "bf16"
+
+    sample = _run_production_inference(
+        monkeypatch,
+        trajectory_indices="all",
+        adapter=adapter,
+        callback_fields=("velocity",),
+    )
+
+    trajectory = sample.trajectory
+    assert trajectory is not None
+    for component in ("video", "audio"):
+        assert trajectory.components[component].states.dtype == torch.bfloat16
+
+
+def test_no_weight_production_inference_replays_the_consumed_state_dtype(
+    monkeypatch,
+) -> None:
+    adapter = _production_adapter()
+    adapter.training_args.latent_storage_dtype = "bf16"
+    consumed_dtypes: list[torch.dtype] = []
+    original_forward = type(adapter).forward
+
+    def recording_forward(self, **kwargs: Any) -> Any:
+        consumed_dtypes.append(kwargs["state"].components["video"].dtype)
+        return original_forward(self, **kwargs)
+
+    monkeypatch.setattr(type(adapter), "forward", recording_forward)
+
+    sample = _run_production_inference(
+        monkeypatch,
+        trajectory_indices="all",
+        adapter=adapter,
+    )
+
+    stored = sample.trajectory.components["video"].states
+    assert consumed_dtypes == [torch.bfloat16, torch.bfloat16]
+    assert stored.dtype == torch.bfloat16
+
+
 def test_no_weight_production_inference_none_skips_trajectory_construction(
     monkeypatch,
 ) -> None:
@@ -395,6 +439,26 @@ def test_no_weight_coupled_optimize_uses_production_h3_path(
         adapter,
         **argument_overrides,
     )
+
+    result = trainer.optimize([sample])
+
+    assert result is None
+    assert accelerator.backward_calls == 2
+    assert accelerator.observed_grad
+
+
+def test_no_weight_coupled_optimize_replays_reduced_precision_storage(
+    monkeypatch,
+) -> None:
+    adapter = _production_adapter()
+    adapter.training_args.latent_storage_dtype = "bf16"
+    sample = _run_production_inference(
+        monkeypatch,
+        trajectory_indices="all",
+        adapter=adapter,
+    )
+    sample.extra_kwargs["advantage"] = torch.tensor(1.0)
+    trainer, accelerator = _production_trainer(GRPOTrainer, adapter)
 
     result = trainer.optimize([sample])
 

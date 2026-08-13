@@ -524,6 +524,35 @@ def test_component_override_vocabulary_preserves_prepared_compatibility_aliases(
     assert pipeline.transformer.moves == []
 
 
+def test_component_override_requires_declared_canonical_or_alias_name() -> None:
+    modular_pipeline = ModularPipelineFake()
+    canonical_runtime = ModularPipelineRuntime(modular_pipeline)
+    canonical_override = TrackingModule()
+
+    canonical_runtime.set_component_override("transformer", canonical_override)
+
+    assert canonical_runtime.get_component("transformer") is canonical_override
+    assert modular_pipeline.load_calls == []
+    assert not hasattr(modular_pipeline, "transformer")
+    with pytest.raises(
+        ValueError,
+        match=r"override.*undeclared.*missing.*declared.*text_encoder.*transformer.*vae",
+    ):
+        canonical_runtime.set_component_override("missing", TrackingModule())
+    assert modular_pipeline.load_calls == []
+
+    alias_runtime = PseudoPipelineRuntime(
+        SimpleNamespace(),
+        {"bagel": BagelContainerFake()},
+        aliases={"transformer": TrackingModule()},
+    )
+    alias_override = TrackingModule()
+
+    alias_runtime.set_component_override("transformer", alias_override)
+
+    assert alias_runtime.get_component("transformer") is alias_override
+
+
 class AcceleratorFake:
     """Minimal accelerator surface used during adapter construction."""
 
@@ -713,6 +742,24 @@ def test_bundle_proxy_installation_resolves_through_adapter_runtime(
     assert torch.equal(
         adapter.get_component("transformer")(torch.tensor([2.0])), torch.tensor([2.0])
     )
+
+
+def test_model_bundle_routes_transformer_ref_and_preserves_autograd() -> None:
+    transformer_ref = TrackingModule()
+    bundle = ModelBundle({"transformer_ref": transformer_ref})
+    proxy = RoutedComponentProxy(bundle, "transformer_ref", transformer_ref)
+
+    named_trainable_parameters = [
+        name for name, parameter in bundle.members.named_parameters() if parameter.requires_grad
+    ]
+    output = proxy(torch.tensor([3.0]))
+    output.sum().backward()
+
+    assert list(bundle.members) == ["transformer_ref"]
+    assert named_trainable_parameters == ["transformer_ref.weight"]
+    assert torch.equal(output, torch.tensor([3.0]))
+    assert torch.equal(transformer_ref.weight.grad, torch.tensor([3.0]))
+    assert "transformer" not in bundle.members
 
 
 class LifecycleAdapterFake:

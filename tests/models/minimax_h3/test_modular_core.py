@@ -468,7 +468,7 @@ def test_row_timestep_oracle_and_transition_schedules():
     }
     plan = build_h3_schedule_plan(video_scheduler, audio_scheduler, 2, layout, torch.device("cpu"))
 
-    assert len(plan.row_timestep_plan) == 2
+    assert [field.name for field in dataclasses.fields(plan)] == ["schedules"]
     assert len(plan.schedules["video"][1]) == 3
     assert plan.schedules["video"][1][-1].item() == 0
     unique, inverse = build_row_timesteps(layout, 0.2, 0.4, 0.999)

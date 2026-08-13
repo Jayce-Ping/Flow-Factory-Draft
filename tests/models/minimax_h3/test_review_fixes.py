@@ -52,6 +52,7 @@ def _adapter(adapter_class: type, transformer: Any = None) -> Any:
     adapter.accelerator = SimpleNamespace(device=torch.device("cpu"))
     adapter.scheduler = SimpleNamespace(shift=12.0, noise_level=0.7)
     adapter.audio_scheduler = SimpleNamespace(shift=3.0, noise_level=0.7)
+    adapter.training_args = SimpleNamespace(latent_storage_dtype=None)
     adapter.get_component = lambda name: transformer or SimpleNamespace()
     adapter.loaded: List[Any] = []
     adapter.on_load_components = lambda components, device=None: adapter.loaded.append(

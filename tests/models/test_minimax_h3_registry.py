@@ -35,7 +35,12 @@ def test_registry_lazy_resolves_all_h3_workflows_without_installed_symbols(monke
         adapter_class = get_model_adapter_class(key)
         assert registered[key].endswith(f".{class_name}")
         assert adapter_class.__name__ == class_name
-        assert adapter_class.__bases__ == (BaseAdapter,)
+        assert BaseAdapter in adapter_class.__bases__
+        assert not [
+            base
+            for base in adapter_class.__mro__[1:]
+            if issubclass(base, BaseAdapter) and base is not BaseAdapter
+        ]
 
 
 def test_model_type_literal_contains_all_h3_registry_keys() -> None:

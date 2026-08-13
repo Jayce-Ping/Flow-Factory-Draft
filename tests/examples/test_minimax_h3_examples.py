@@ -63,7 +63,12 @@ def test_examples_parse_through_production_config_and_registry(
     assert config.model_args.model_type == expected["model_type"]
     assert config.model_args.target_components == [expected["target"]]
     assert issubclass(adapter_class, BaseAdapter)
-    assert adapter_class.__base__ is BaseAdapter
+    assert BaseAdapter in adapter_class.__bases__
+    assert not [
+        base
+        for base in adapter_class.__mro__[1:]
+        if issubclass(base, BaseAdapter) and base is not BaseAdapter
+    ]
     assert config.data_args.preprocessing_batch_size == 1
     assert config.training_args.per_device_batch_size == 1
     assert config.eval_args.per_device_batch_size == 1

@@ -14,20 +14,20 @@
 """Build independent H3 component schedules and packed-row timestep plans."""
 
 from dataclasses import dataclass
-from typing import Any, List, Mapping, Tuple
+from typing import Any, Mapping, Tuple
 
 import torch
-
-from ._common import framework_sigma_to_model_time
 
 
 @dataclass(frozen=True)
 class H3SchedulePlan:
-    """Hold full component schedules and one row plan per transition."""
+    """Hold the full independent component schedules of one rollout.
+
+    Row timesteps are derived per transition at the transformer boundary from the
+    current component times, so they are not precomputed here.
+    """
 
     schedules: Mapping[str, Tuple[torch.Tensor, torch.Tensor]]
-    model_times: Mapping[str, torch.Tensor]
-    row_timestep_plan: List[Tuple[torch.Tensor, torch.Tensor]]
 
 
 def build_row_timesteps(
@@ -66,10 +66,8 @@ def build_h3_schedule_plan(
     num_inference_steps: int,
     layout: Mapping[str, Any],
     device: torch.device,
-    *,
-    keyframe_noise_aug: float = 0.999,
 ) -> H3SchedulePlan:
-    """Set two N-transition schedulers and build all row-time plans.
+    """Set two N-transition schedulers and validate the packed row layout.
 
     Args:
         video_scheduler: Resolved Flow-Factory H3 video scheduler.
@@ -77,10 +75,9 @@ def build_h3_schedule_plan(
         num_inference_steps: Exact number of transitions.
         layout: Packed row layout.
         device: Transformer execution device.
-        keyframe_noise_aug: Visual conditioning clean-time floor.
 
     Returns:
-        Independent full schedules, clean times, and row plans.
+        Independent full component schedules.
     """
     if (
         not isinstance(num_inference_steps, int)
@@ -101,25 +98,13 @@ def build_h3_schedule_plan(
                 f"MiniMax H3 component={component!r} expected N={num_inference_steps} transitions "
                 f"and N+1 sigma points, received {len(scheduler.timesteps)} and {len(scheduler.sigmas)}"
             )
-    schedules = {
-        "video": (video_scheduler.sigmas * 1000, video_scheduler.sigmas),
-        "audio": (audio_scheduler.sigmas * 1000, audio_scheduler.sigmas),
-    }
-    model_times = {
-        component: framework_sigma_to_model_time(sigmas)
-        for component, (_, sigmas) in schedules.items()
-    }
-    row_plan = [
-        build_row_timesteps(
-            layout,
-            float(model_times["video"][index]),
-            float(model_times["audio"][index]),
-            keyframe_noise_aug,
-            device=device,
-        )
-        for index in range(num_inference_steps)
-    ]
-    return H3SchedulePlan(schedules=schedules, model_times=model_times, row_timestep_plan=row_plan)
+    _validate_layout(layout)
+    return H3SchedulePlan(
+        schedules={
+            "video": (video_scheduler.sigmas * 1000, video_scheduler.sigmas),
+            "audio": (audio_scheduler.sigmas * 1000, audio_scheduler.sigmas),
+        }
+    )
 
 
 def _validate_layout(

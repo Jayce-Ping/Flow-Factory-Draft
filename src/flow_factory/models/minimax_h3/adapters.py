@@ -31,11 +31,11 @@ from ..runtime import ModularPipelineRuntime
 from ._common import apply_forward_process_noise, draw_forward_process_noise
 from .workflow import (
     build_h3_component_runtime,
+    build_h3_replay_forward_kwargs,
     build_h3_scheduler,
     build_h3_scheduler_group,
     decode_h3_adapter_latents,
     forward_h3_adapter,
-    forward_h3_adapter_state,
     freeze_h3_setup_components,
     infer_h3_workflow,
     init_h3_target_module_map,
@@ -48,25 +48,20 @@ _H3_PREPROCESS_CACHE_FIELDS = frozenset({"height", "width", "num_frames"})
 _H3_PREPROCESS_CACHE_VERSION = "minimax-h3-v1"
 
 
-class MiniMaxH3T2VAAdapter(BaseAdapter):
-    """Load the workflow-pruned MiniMax H3 text-to-video-audio partition."""
+class _MiniMaxH3WorkflowAdapter:
+    """Share the workflow-invariant behavior of the MiniMax H3 adapters.
 
-    workflow: ClassVar[str] = "t2va"
-    transformer_component_name: ClassVar[str] = "transformer"
+    Concrete adapters remain direct ``BaseAdapter`` subclasses and differ only in
+    workflow identity, canonical transformer name, and component lists.
+    """
+
     trajectory_component_order: ClassVar[Tuple[str, ...]] = ("video", "audio")
     flow_velocity_direction: ClassVar[Literal["data"]] = "data"
     preprocess_cache_fields: ClassVar[frozenset[str]] = _H3_PREPROCESS_CACHE_FIELDS
     preprocess_cache_version: ClassVar[str] = _H3_PREPROCESS_CACHE_VERSION
-    preprocessing_modules: ClassVar[List[str]] = ["text_encoder", "tokenizer", "processor"]
-    inference_modules: ClassVar[List[str]] = [
-        "transformer",
-        "vae",
-        "video_processor",
-        "audio_vae",
-    ]
 
     def load_pipeline(self) -> Any:
-        """Load only the T2VA modular workflow."""
+        """Load only this adapter's modular workflow."""
         return load_h3_workflow_pipeline(
             self.model_args.model_name_or_path,
             workflow=self.workflow,
@@ -137,30 +132,40 @@ class MiniMaxH3T2VAAdapter(BaseAdapter):
         noise_level: Optional[float],
         forward_kwargs: Mapping[str, Any],
     ) -> MultiModalStepOutput:
-        return forward_h3_adapter_state(
-            self,
+        """Replay one stored transition through the public rollout entry point."""
+        return self.forward(
             state=state,
             times=times,
             next_state=next_state,
             compute_log_prob=compute_log_prob,
             return_fields=return_fields,
             noise_level=noise_level,
-            forward_kwargs=forward_kwargs,
+            **build_h3_replay_forward_kwargs(forward_kwargs),
         )
 
     def forward(self, **kwargs: Any) -> MultiModalStepOutput:
         return forward_h3_adapter(self, **kwargs)
 
 
-class MiniMaxH3FL2VAAdapter(BaseAdapter):
+class MiniMaxH3T2VAAdapter(_MiniMaxH3WorkflowAdapter, BaseAdapter):
+    """Load the workflow-pruned MiniMax H3 text-to-video-audio partition."""
+
+    workflow: ClassVar[str] = "t2va"
+    transformer_component_name: ClassVar[str] = "transformer"
+    preprocessing_modules: ClassVar[List[str]] = ["text_encoder", "tokenizer", "processor"]
+    inference_modules: ClassVar[List[str]] = [
+        "transformer",
+        "vae",
+        "video_processor",
+        "audio_vae",
+    ]
+
+
+class MiniMaxH3FL2VAAdapter(_MiniMaxH3WorkflowAdapter, BaseAdapter):
     """Load the workflow-pruned MiniMax H3 first/last-frame partition."""
 
     workflow: ClassVar[str] = "fl2va"
     transformer_component_name: ClassVar[str] = "transformer"
-    trajectory_component_order: ClassVar[Tuple[str, ...]] = ("video", "audio")
-    flow_velocity_direction: ClassVar[Literal["data"]] = "data"
-    preprocess_cache_fields: ClassVar[frozenset[str]] = _H3_PREPROCESS_CACHE_FIELDS
-    preprocess_cache_version: ClassVar[str] = _H3_PREPROCESS_CACHE_VERSION
     preprocessing_modules: ClassVar[List[str]] = [
         "image_processor",
         "text_encoder",
@@ -175,103 +180,13 @@ class MiniMaxH3FL2VAAdapter(BaseAdapter):
         "audio_vae",
     ]
 
-    def load_pipeline(self) -> Any:
-        """Load only the FL2VA modular workflow."""
-        return load_h3_workflow_pipeline(
-            self.model_args.model_name_or_path,
-            workflow=self.workflow,
-            transformer_component_name=self.transformer_component_name,
-        )
 
-    def build_component_runtime(self) -> ModularPipelineRuntime:
-        """Build the workflow-pruned modular runtime."""
-        return build_h3_component_runtime(self)
-
-    def load_scheduler(self) -> MiniMaxH3SDEScheduler:
-        """Build the canonical shift-12 video scheduler."""
-        return build_h3_scheduler(self.config.scheduler_args, shift=12.0)
-
-    def build_scheduler_group(self) -> SchedulerGroup:
-        """Build ordered fresh video/audio schedulers."""
-        return build_h3_scheduler_group(self)
-
-    def _init_target_module_map(self) -> Dict[str, Union[List[str], None]]:
-        return init_h3_target_module_map(self)
-
-    def _freeze_components(self) -> None:
-        freeze_h3_setup_components(self)
-
-    def preprocess_func(self, **kwargs: Any) -> Dict[str, Any]:
-        return preprocess_h3_workflow(self, **kwargs)
-
-    def build_training_component_times(
-        self,
-        primary_timesteps: torch.Tensor,
-        *,
-        batch: Optional[StackedSampleBatch] = None,
-    ) -> ComponentTimes:
-        return map_h3_training_component_times(self, primary_timesteps)
-
-    def add_forward_process_noise(
-        self,
-        clean_state: LatentState,
-        times: ComponentTimes,
-        *,
-        generator: Optional[torch.Generator] = None,
-    ) -> NoisedState:
-        return draw_forward_process_noise(clean_state, times, generator=generator)
-
-    def apply_forward_process_noise(
-        self,
-        clean_state: LatentState,
-        times: ComponentTimes,
-        noise: LatentState,
-    ) -> NoisedState:
-        return apply_forward_process_noise(clean_state, times, noise)
-
-    def decode_latents(self, latents: Any, **kwargs: Any) -> Any:
-        return decode_h3_adapter_latents(self, latents, **kwargs)
-
-    def inference(self, **kwargs: Any) -> List[Any]:
-        return infer_h3_workflow(self, **kwargs)
-
-    def _forward_state(
-        self,
-        *,
-        batch: StackedSampleBatch,
-        state: LatentState,
-        times: ComponentTimes,
-        next_state: Optional[LatentState],
-        compute_log_prob: bool,
-        return_fields: Tuple[str, ...],
-        noise_level: Optional[float],
-        forward_kwargs: Mapping[str, Any],
-    ) -> MultiModalStepOutput:
-        return forward_h3_adapter_state(
-            self,
-            state=state,
-            times=times,
-            next_state=next_state,
-            compute_log_prob=compute_log_prob,
-            return_fields=return_fields,
-            noise_level=noise_level,
-            forward_kwargs=forward_kwargs,
-        )
-
-    def forward(self, **kwargs: Any) -> MultiModalStepOutput:
-        return forward_h3_adapter(self, **kwargs)
-
-
-class MiniMaxH3Ref2VAAdapter(BaseAdapter):
+class MiniMaxH3Ref2VAAdapter(_MiniMaxH3WorkflowAdapter, BaseAdapter):
     """Load the workflow-pruned MiniMax H3 omni-reference partition."""
 
     workflow: ClassVar[str] = "ref2va"
     transformer_component_name: ClassVar[str] = "transformer_ref"
-    trajectory_component_order: ClassVar[Tuple[str, ...]] = ("video", "audio")
-    flow_velocity_direction: ClassVar[Literal["data"]] = "data"
     supports_ordered_references: ClassVar[bool] = True
-    preprocess_cache_fields: ClassVar[frozenset[str]] = _H3_PREPROCESS_CACHE_FIELDS
-    preprocess_cache_version: ClassVar[str] = _H3_PREPROCESS_CACHE_VERSION
     preprocessing_modules: ClassVar[List[str]] = [
         "image_processor",
         "text_encoder",
@@ -286,89 +201,3 @@ class MiniMaxH3Ref2VAAdapter(BaseAdapter):
         "video_processor",
         "audio_vae",
     ]
-
-    def load_pipeline(self) -> Any:
-        """Load only the Ref2VA modular workflow."""
-        return load_h3_workflow_pipeline(
-            self.model_args.model_name_or_path,
-            workflow=self.workflow,
-            transformer_component_name=self.transformer_component_name,
-        )
-
-    def build_component_runtime(self) -> ModularPipelineRuntime:
-        """Build the workflow-pruned modular runtime."""
-        return build_h3_component_runtime(self)
-
-    def load_scheduler(self) -> MiniMaxH3SDEScheduler:
-        """Build the canonical shift-12 video scheduler."""
-        return build_h3_scheduler(self.config.scheduler_args, shift=12.0)
-
-    def build_scheduler_group(self) -> SchedulerGroup:
-        """Build ordered fresh video/audio schedulers."""
-        return build_h3_scheduler_group(self)
-
-    def _init_target_module_map(self) -> Dict[str, Union[List[str], None]]:
-        return init_h3_target_module_map(self)
-
-    def _freeze_components(self) -> None:
-        freeze_h3_setup_components(self)
-
-    def preprocess_func(self, **kwargs: Any) -> Dict[str, Any]:
-        return preprocess_h3_workflow(self, **kwargs)
-
-    def build_training_component_times(
-        self,
-        primary_timesteps: torch.Tensor,
-        *,
-        batch: Optional[StackedSampleBatch] = None,
-    ) -> ComponentTimes:
-        return map_h3_training_component_times(self, primary_timesteps)
-
-    def add_forward_process_noise(
-        self,
-        clean_state: LatentState,
-        times: ComponentTimes,
-        *,
-        generator: Optional[torch.Generator] = None,
-    ) -> NoisedState:
-        return draw_forward_process_noise(clean_state, times, generator=generator)
-
-    def apply_forward_process_noise(
-        self,
-        clean_state: LatentState,
-        times: ComponentTimes,
-        noise: LatentState,
-    ) -> NoisedState:
-        return apply_forward_process_noise(clean_state, times, noise)
-
-    def decode_latents(self, latents: Any, **kwargs: Any) -> Any:
-        return decode_h3_adapter_latents(self, latents, **kwargs)
-
-    def inference(self, **kwargs: Any) -> List[Any]:
-        return infer_h3_workflow(self, **kwargs)
-
-    def _forward_state(
-        self,
-        *,
-        batch: StackedSampleBatch,
-        state: LatentState,
-        times: ComponentTimes,
-        next_state: Optional[LatentState],
-        compute_log_prob: bool,
-        return_fields: Tuple[str, ...],
-        noise_level: Optional[float],
-        forward_kwargs: Mapping[str, Any],
-    ) -> MultiModalStepOutput:
-        return forward_h3_adapter_state(
-            self,
-            state=state,
-            times=times,
-            next_state=next_state,
-            compute_log_prob=compute_log_prob,
-            return_fields=return_fields,
-            noise_level=noise_level,
-            forward_kwargs=forward_kwargs,
-        )
-
-    def forward(self, **kwargs: Any) -> MultiModalStepOutput:
-        return forward_h3_adapter(self, **kwargs)

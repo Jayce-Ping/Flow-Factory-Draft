@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
 from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any, ClassVar, Dict, List
@@ -28,6 +29,7 @@ from flow_factory.models.minimax_h3.adapters import (
     MiniMaxH3T2VAAdapter,
 )
 from flow_factory.models.runtime import ModularPipelineRuntime
+from flow_factory.samples import ComponentTimes, LatentState
 from flow_factory.scheduler import MiniMaxH3SDEScheduler
 
 
@@ -38,9 +40,45 @@ class UpstreamSchedulerFake:
 class TransformerFake(nn.Module):
     """Provide one parameter for BaseAdapter freeze and precision setup."""
 
+    loaded_paths: ClassVar[List[str]] = []
+
     def __init__(self) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(1))
+        self.gradient_checkpointing_calls = 0
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        """Scale an input by the trainable parameter."""
+        return value * self.weight
+
+    def enable_gradient_checkpointing(self) -> None:
+        """Record activation of the transformer capability."""
+        self.gradient_checkpointing_calls += 1
+
+    @classmethod
+    def from_pretrained(cls, path: str) -> "TransformerFake":
+        """Build a replacement module while recording its checkpoint path."""
+        cls.loaded_paths.append(path)
+        replacement = cls()
+        replacement.weight.data.fill_(7.0)
+        return replacement
+
+
+class PeftModelEquivalentFake(TransformerFake):
+    """Provide the adapter-disable context used by LoRA reference evaluation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.disable_adapter_events: List[str] = []
+
+    @contextmanager
+    def disable_adapter(self) -> Any:
+        """Record adapter-disable context entry and exit."""
+        self.disable_adapter_events.append("enter")
+        try:
+            yield
+        finally:
+            self.disable_adapter_events.append("exit")
 
 
 class WorkflowPipelineFake:
@@ -115,10 +153,14 @@ class AcceleratorFake:
     device = torch.device("cpu")
     distributed_type = DistributedType.NO
     is_fsdp2 = False
+    is_main_process = True
     mixed_precision = "no"
 
     def unwrap_model(self, module: nn.Module) -> nn.Module:
         return module
+
+    def wait_for_everyone(self) -> None:
+        """Provide the checkpoint synchronization surface."""
 
 
 def _config(target_components: List[str]) -> SimpleNamespace:
@@ -153,6 +195,7 @@ def _config(target_components: List[str]) -> SimpleNamespace:
 def _fake_dependency(monkeypatch: pytest.MonkeyPatch) -> None:
     WorkflowPipelineFake.calls.clear()
     WorkflowPipelineFake.component_overrides = {}
+    TransformerFake.loaded_paths.clear()
     monkeypatch.setattr(
         "flow_factory.models.minimax_h3.workflow.require_minimax_h3_support",
         lambda: SimpleNamespace(MiniMaxH3ModularPipeline=WorkflowPipelineFake),
@@ -197,7 +240,12 @@ def test_workflow_adapter_loads_pruned_runtime_and_exact_setup_components(
 ) -> None:
     adapter = adapter_class(_config([transformer_name]), AcceleratorFake())
 
-    assert adapter_class.__bases__ == (BaseAdapter,)
+    assert BaseAdapter in adapter_class.__bases__
+    assert not [
+        base
+        for base in adapter_class.__mro__[1:]
+        if issubclass(base, BaseAdapter) and base is not BaseAdapter
+    ]
     assert WorkflowPipelineFake.calls == [("MiniMaxAI/MiniMax-H3", workflow)]
     assert isinstance(adapter.component_runtime, ModularPipelineRuntime)
     assert adapter.pipeline.component_names == list(adapter.pipeline.components)
@@ -224,6 +272,222 @@ def test_workflow_adapter_loads_pruned_runtime_and_exact_setup_components(
     ]
     assert adapter.pipeline.load_calls[-1] == expected_lazy_names
     assert not hasattr(adapter.pipeline, "unrelated")
+
+
+_SHARED_H3_ADAPTER_METHODS = (
+    "load_pipeline",
+    "build_component_runtime",
+    "load_scheduler",
+    "build_scheduler_group",
+    "_init_target_module_map",
+    "_freeze_components",
+    "preprocess_func",
+    "build_training_component_times",
+    "add_forward_process_noise",
+    "apply_forward_process_noise",
+    "decode_latents",
+    "inference",
+    "_forward_state",
+    "forward",
+)
+
+
+@pytest.mark.parametrize("method_name", _SHARED_H3_ADAPTER_METHODS)
+def test_workflow_adapters_share_one_implementation_per_method(method_name: str) -> None:
+    implementations = {
+        getattr(adapter_class, method_name)
+        for adapter_class in (
+            MiniMaxH3T2VAAdapter,
+            MiniMaxH3FL2VAAdapter,
+            MiniMaxH3Ref2VAAdapter,
+        )
+    }
+
+    assert len(implementations) == 1
+
+
+@pytest.mark.parametrize(
+    ("adapter_class", "transformer_name"),
+    [
+        (MiniMaxH3T2VAAdapter, "transformer"),
+        (MiniMaxH3FL2VAAdapter, "transformer"),
+        (MiniMaxH3Ref2VAAdapter, "transformer_ref"),
+    ],
+)
+def test_forward_state_routes_through_the_public_forward(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter_class: type[BaseAdapter],
+    transformer_name: str,
+) -> None:
+    adapter = adapter_class(_config([transformer_name]), AcceleratorFake())
+    state = LatentState({"video": torch.ones(1, 1, 96), "audio": torch.ones(1, 1, 32)})
+    times = ComponentTimes(
+        timestep={"video": torch.tensor([1000.0]), "audio": torch.tensor([1000.0])},
+        next_timestep={"video": torch.tensor([0.0]), "audio": torch.tensor([0.0])},
+    )
+    observed: List[Dict[str, Any]] = []
+    monkeypatch.setattr(
+        type(adapter),
+        "forward",
+        lambda self, **kwargs: observed.append(kwargs) or "step-output",
+    )
+
+    result = adapter._forward_state(
+        batch=SimpleNamespace(),
+        state=state,
+        times=times,
+        next_state=None,
+        compute_log_prob=True,
+        return_fields=("next_latents",),
+        noise_level=0.7,
+        forward_kwargs={
+            "prompt_embeds": torch.zeros(1, 2, 4),
+            "condition_prefixes": {
+                "video": torch.zeros(1, 0, 96),
+                "audio": torch.zeros(1, 0, 32),
+            },
+            "layout": {
+                "video_indices": torch.arange(1),
+                "audio_indices": torch.arange(1, 2),
+                "text_indices": torch.arange(2, 4),
+                "num_condition_video_rows": 0,
+                "num_condition_audio_rows": 0,
+            },
+        },
+    )
+
+    assert result == "step-output"
+    assert len(observed) == 1
+    assert observed[0]["state"] is state
+    assert observed[0]["times"] is times
+    assert observed[0]["compute_log_prob"] is True
+    assert observed[0]["return_fields"] == ("next_latents",)
+    assert observed[0]["noise_level"] == 0.7
+    assert "batch" not in observed[0]
+
+
+def test_ref2va_optimizer_uses_canonical_runtime_component() -> None:
+    adapter = MiniMaxH3Ref2VAAdapter(_config(["transformer_ref"]), AcceleratorFake())
+    transformer_ref = adapter.get_component("transformer_ref")
+
+    assert adapter.trainable_component_names == ["transformer_ref"]
+    assert adapter.get_trainable_parameters() == [transformer_ref.weight]
+    assert not adapter.component_runtime.has_component_override("transformer")
+
+    optimizer = torch.optim.AdamW(adapter.get_trainable_parameters())
+
+    assert optimizer.param_groups[0]["params"] == [transformer_ref.weight]
+
+
+def test_ref2va_gradient_checkpointing_uses_canonical_runtime_component() -> None:
+    config = _config(["transformer_ref"])
+    config.training_args.enable_gradient_checkpointing = True
+
+    adapter = MiniMaxH3Ref2VAAdapter(config, AcceleratorFake())
+    transformer_ref = adapter.get_component("transformer_ref")
+
+    assert transformer_ref.gradient_checkpointing_calls == 1
+    assert not adapter.component_runtime.has_component_override("transformer")
+
+
+def test_ref2va_lora_reference_context_disables_canonical_runtime_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = MiniMaxH3Ref2VAAdapter(_config(["transformer_ref"]), AcceleratorFake())
+    peft_model = PeftModelEquivalentFake()
+    adapter.set_component("transformer_ref", peft_model)
+    adapter.model_args.finetune_type = "lora"
+    monkeypatch.setattr("flow_factory.models.abc.PeftModel", PeftModelEquivalentFake)
+
+    with adapter.use_ref_parameters():
+        assert peft_model.disable_adapter_events == ["enter"]
+
+    assert peft_model.disable_adapter_events == ["enter", "exit"]
+    assert adapter.get_component("transformer_ref") is peft_model
+
+
+def test_ref2va_parameter_collection_and_snapshots_preserve_canonical_prefix() -> None:
+    config = _config(["transformer_ref"])
+    config.training_args.requires_ref_model = True
+    config.training_args.ref_param_device = "cpu"
+    adapter = MiniMaxH3Ref2VAAdapter(config, AcceleratorFake())
+    transformer_ref = adapter.get_component("transformer_ref")
+    component_name = adapter.trainable_component_names[0]
+    named_trainable_parameters = {
+        f"{component_name}.{parameter_name}": parameter
+        for parameter_name, parameter in transformer_ref.named_parameters()
+        if parameter.requires_grad
+    }
+
+    assert list(named_trainable_parameters) == ["transformer_ref.weight"]
+    assert named_trainable_parameters["transformer_ref.weight"] is transformer_ref.weight
+
+    adapter.add_named_parameters("snapshot")
+    adapter._init_ref_parameters()
+    assert adapter.get_named_parameters_info("snapshot")["target_components"] == ["transformer_ref"]
+
+    transformer_ref.weight.data.fill_(2.0)
+    with adapter.use_named_parameters("snapshot"):
+        assert transformer_ref.weight.item() == pytest.approx(1.0)
+    assert transformer_ref.weight.item() == pytest.approx(2.0)
+
+    with adapter.use_ref_parameters():
+        assert transformer_ref.weight.item() == pytest.approx(1.0)
+    assert transformer_ref.weight.item() == pytest.approx(2.0)
+
+
+def test_ref2va_full_checkpoint_load_installs_canonical_runtime_override(tmp_path: Any) -> None:
+    adapter = MiniMaxH3Ref2VAAdapter(_config(["transformer_ref"]), AcceleratorFake())
+    original = adapter.get_component("transformer_ref")
+
+    adapter._load_full_model(str(tmp_path))
+
+    replacement = adapter.get_component("transformer_ref")
+    assert TransformerFake.loaded_paths == [str(tmp_path)]
+    assert replacement is not original
+    assert replacement.weight.item() == pytest.approx(7.0)
+    assert adapter.component_runtime.override_components == {"transformer_ref": replacement}
+    assert "transformer" not in adapter.component_runtime.declared_component_names
+
+
+def test_ref2va_model_only_save_routes_canonical_component_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    adapter = MiniMaxH3Ref2VAAdapter(_config(["transformer_ref"]), AcceleratorFake())
+    save_directory = tmp_path / "checkpoint"
+    save_calls: List[tuple[str, nn.Module, str]] = []
+
+    def record_full_model_save(
+        component: nn.Module,
+        component_path: str,
+        **kwargs: Any,
+    ) -> None:
+        save_calls.append(("transformer_ref", component, component_path))
+
+    monkeypatch.setattr(adapter, "_save_full_model", record_full_model_save)
+
+    adapter.save_checkpoint(
+        str(save_directory),
+        dtype=torch.float32,
+        save_ema=False,
+        model_only=True,
+    )
+
+    assert save_calls == [
+        ("transformer_ref", adapter.get_component("transformer_ref"), str(save_directory))
+    ]
+
+
+def test_ref2va_unknown_lifecycle_component_fails_with_runtime_context() -> None:
+    adapter = MiniMaxH3Ref2VAAdapter(_config(["transformer_ref"]), AcceleratorFake())
+    adapter.model_args.target_components = ["missing"]
+
+    with pytest.raises(
+        ValueError,
+        match=r"unknown components.*missing.*received=.*transformer_ref",
+    ):
+        adapter.enable_gradient_checkpointing()
 
 
 @pytest.mark.parametrize(

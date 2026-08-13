@@ -319,6 +319,38 @@ class BaseAdapter(ABC):
                 latents = latents.clamp(-65504.0, 65504.0)
         return latents.to(target)
 
+    def cast_latent_state(
+        self, state: LatentState, default_dtype: Optional[torch.dtype] = None
+    ) -> LatentState:
+        """Cast every component latent of a state to the storage dtype.
+
+        Active masks are boolean selectors rather than latents, so they are carried
+        over unchanged.
+
+        Args:
+            state: Structured multi-component latent state.
+            default_dtype: Fallback dtype when no storage dtype is configured.
+
+        Returns:
+            State whose component latents use the storage dtype.
+
+        Raises:
+            TypeError: If ``state`` is not a ``LatentState``.
+        """
+        if not isinstance(state, LatentState):
+            raise TypeError(
+                f"expected LatentState for cast_latent_state, got {type(state).__name__}: {state!r}"
+            )
+        if self.latent_storage_dtype is None and default_dtype is None:
+            return state
+        components = {
+            name: self.cast_latents(latents, default_dtype=default_dtype)
+            for name, latents in state.components.items()
+        }
+        if all(components[name] is latents for name, latents in state.components.items()):
+            return state
+        return LatentState(components, active_masks=state.active_masks)
+
     # ============================== Loading Components ==============================
     @abstractmethod
     def load_pipeline(self) -> DiffusionPipeline:
@@ -744,18 +776,17 @@ class BaseAdapter(ABC):
             with ExitStack() as stack:
                 enabled_any = False
                 for comp_name in self.target_module_map.keys():
-                    if hasattr(self, comp_name):
-                        component = self.get_component(comp_name)
-                        unwrapped = self._unwrap(component)
+                    component = self.get_component(comp_name)
+                    unwrapped = self._unwrap(component)
 
-                        # Handle Compiled Models (torch.compile)
-                        if hasattr(unwrapped, "_orig_mod"):
-                            unwrapped = unwrapped._orig_mod
+                    # Handle Compiled Models (torch.compile)
+                    if hasattr(unwrapped, "_orig_mod"):
+                        unwrapped = unwrapped._orig_mod
 
-                        if isinstance(unwrapped, PeftModel):
-                            # Enter disable_adapter context for each component
-                            stack.enter_context(unwrapped.disable_adapter())
-                            enabled_any = True
+                    if isinstance(unwrapped, PeftModel):
+                        # Enter disable_adapter context for each component
+                        stack.enter_context(unwrapped.disable_adapter())
+                        enabled_any = True
                 if not enabled_any:
                     logger.warning("No LoRA adapters found to disable in use_ref_parameters")
 
@@ -786,11 +817,8 @@ class BaseAdapter(ABC):
         """Get trainable parameters from specified components."""
         params = []
         for comp_name in target_modules:
-            if hasattr(self, comp_name):
-                component = self.get_component(comp_name)
-                params.extend(p for p in component.parameters() if p.requires_grad)
-            else:
-                logger.warning(f"Component '{comp_name}' not found in the model. Skipping.")
+            component = self.get_component(comp_name)
+            params.extend(p for p in component.parameters() if p.requires_grad)
         return params
     
     def add_named_parameters(
@@ -953,13 +981,12 @@ class BaseAdapter(ABC):
     def enable_gradient_checkpointing(self):
         """Enable gradient checkpointing for target components."""
         for comp_name in self.model_args.target_components:
-            if hasattr(self, comp_name):
-                component = self.get_component(comp_name)
-                if hasattr(component, 'enable_gradient_checkpointing'):
-                    component.enable_gradient_checkpointing()
-                    logger.info(f"Enabled gradient checkpointing for {comp_name}")
-                else:
-                    logger.warning(f"{comp_name} does not support gradient checkpointing")
+            component = self.get_component(comp_name)
+            if hasattr(component, "enable_gradient_checkpointing"):
+                component.enable_gradient_checkpointing()
+                logger.info(f"Enabled gradient checkpointing for {comp_name}")
+            else:
+                logger.warning(f"{comp_name} does not support gradient checkpointing")
 
     # ============================== Precision Management ==============================
     def _cast_module_mixed_precision(
@@ -1609,10 +1636,6 @@ class BaseAdapter(ABC):
         
         with save_context():
             for comp_name, target_modules in self.target_module_map.items():
-                if not hasattr(self, comp_name):
-                    logger.warning(f"Component {comp_name} not found, skipping save")
-                    continue
-                
                 if not target_modules:
                     logger.info(f"No target modules applied to {comp_name}, skip saving")
                     continue
@@ -1750,10 +1773,6 @@ class BaseAdapter(ABC):
         # `target_components` here would instead look for a `.../transformer_2/`
         # subdir that was never written and log a spurious error on every resume.
         for comp_name in self.trainable_component_names:
-            if not hasattr(self, comp_name):
-                logger.warning(f"Component {comp_name} not found, skipping")
-                continue
-            
             component = self.get_component(comp_name)
             comp_path = (
                 os.path.join(path, comp_name) 
@@ -1852,10 +1871,6 @@ class BaseAdapter(ABC):
         # written, so frozen bundled members (`target_module_map[name] is None`)
         # must be skipped here rather than iterating all `target_components`.
         for comp_name in self.trainable_component_names:
-            if not hasattr(self, comp_name):
-                logger.warning(f"Component {comp_name} not found, skipping")
-                continue
-            
             component = self.get_component(comp_name)
             comp_path = (
                 os.path.join(path, comp_name) 
@@ -1869,7 +1884,7 @@ class BaseAdapter(ABC):
             # Try from_pretrained first
             try:
                 new_component = component_class.from_pretrained(comp_path)
-                setattr(self, comp_name, new_component)
+                self.set_component(comp_name, new_component)
                 if self.accelerator.is_main_process:
                     logger.info(f"Loaded {comp_name} via from_pretrained from {comp_path}")
                 continue
@@ -2010,10 +2025,9 @@ class BaseAdapter(ABC):
     def _freeze_transformers(self):
         """Freeze transformer components (e.g., UNet, ControlNets)."""
         for name in self.transformer_names:
-            if hasattr(self, name):
-                comp = self.get_component(name)
-                comp.requires_grad_(False)
-                comp.eval()
+            comp = self.get_component(name)
+            comp.requires_grad_(False)
+            comp.eval()
 
     def _freeze_components(self):
         """Freeze strategy using cached target_module_map."""
@@ -2024,10 +2038,6 @@ class BaseAdapter(ABC):
 
         # Selectively unfreeze target components
         for comp_name in self.model_args.target_components:
-            if not hasattr(self, comp_name):
-                logger.warning(f"Component {comp_name} not found, skipping freeze")
-                continue
-            
             trainable_modules = self.target_module_map.get(comp_name)
             
             if self.model_args.finetune_type == 'lora':
@@ -2080,17 +2090,13 @@ class BaseAdapter(ABC):
         """Get trainable parameters from all target components."""
         params = []
         for comp_name in self.model_args.target_components:
-            if hasattr(self, comp_name):
-                component = self.get_component(comp_name)
-                params.extend(filter(lambda p: p.requires_grad, component.parameters()))
+            component = self.get_component(comp_name)
+            params.extend(filter(lambda p: p.requires_grad, component.parameters()))
         return params
 
     def log_trainable_parameters(self):
         """Log trainable parameter statistics for all target components."""
         for comp_name in self.model_args.target_components:
-            if not hasattr(self, comp_name):
-                continue
-            
             component = self.get_component(comp_name)
             total_params = 0
             trainable_params = 0
