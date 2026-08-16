@@ -30,11 +30,47 @@ def _accelerator(distributed_type: DistributedType, zero_stage: object = None) -
 
 
 def test_zero_three_is_rejected_before_any_weights_load() -> None:
-    """Parameter sharding breaks reward loading, so it must fail at startup."""
+    """The backend validator rejects parameter-sharded DeepSpeed."""
     accelerator = _accelerator(DistributedType.DEEPSPEED, zero_stage=3)
 
     with pytest.raises(ValueError, match="ZeRO-3 is not supported"):
         validate_supported_distributed_plan(accelerator)
+
+
+def test_loader_rejects_zero_three_before_loading_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The trainer factory must reject ZeRO-3 before constructing an adapter."""
+    from flow_factory.trainers import loader
+
+    accelerator = _accelerator(DistributedType.DEEPSPEED, zero_stage=3)
+    model_load_attempted = False
+
+    class Adapter:
+        ddp_find_unused_parameters = False
+
+    def unexpected_model_load(**kwargs: object) -> None:
+        del kwargs
+        nonlocal model_load_attempted
+        model_load_attempted = True
+        raise AssertionError("load_model must not run for DeepSpeed ZeRO-3")
+
+    config = SimpleNamespace(
+        mixed_precision="bf16",
+        model_args=SimpleNamespace(model_type="test"),
+        log_args=SimpleNamespace(save_dir="/tmp", run_name="zero3-rejection-test"),
+        training_args=SimpleNamespace(
+            gradient_accumulation_steps=1,
+            max_grad_norm=1.0,
+            seed=42,
+        ),
+    )
+    monkeypatch.setattr(loader, "get_model_adapter_class", lambda model_type: Adapter)
+    monkeypatch.setattr(loader, "Accelerator", lambda **kwargs: accelerator)
+    monkeypatch.setattr(loader, "load_model", unexpected_model_load)
+
+    with pytest.raises(ValueError, match="ZeRO-3 is not supported"):
+        loader.load_trainer(config)
+
+    assert model_load_attempted is False
 
 
 @pytest.mark.parametrize("zero_stage", [1, 2])

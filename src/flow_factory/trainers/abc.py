@@ -1040,7 +1040,7 @@ class BaseTrainer(ABC):
                 RoutedComponentProxy(
                     self.model_bundle,
                     name,
-                    role_registry,
+                    variant_registry,
                     inner_bundle.members,
                 ),
             )
