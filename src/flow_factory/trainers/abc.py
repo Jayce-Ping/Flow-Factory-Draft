@@ -115,6 +115,36 @@ def validate_supported_distributed_plan(accelerator: Accelerator) -> None:
         )
 
 
+def configure_deepspeed_micro_batch_size(
+    accelerator: Accelerator, per_device_batch_size: int
+) -> None:
+    """Supply batch geometry when the custom train loader is not prepared."""
+    if not isinstance(per_device_batch_size, int):
+        raise TypeError(
+            "expected int for per_device_batch_size, "
+            f"got {type(per_device_batch_size).__name__}: {per_device_batch_size!r}"
+        )
+    if per_device_batch_size < 1:
+        raise ValueError(
+            f"expected per_device_batch_size >= 1, got {per_device_batch_size}"
+        )
+    if accelerator.distributed_type != DistributedType.DEEPSPEED:
+        return
+    deepspeed_plugin = accelerator.state.deepspeed_plugin
+    if deepspeed_plugin is None:
+        raise RuntimeError(
+            "expected a DeepSpeed plugin for distributed_type=DEEPSPEED, received None"
+        )
+    key = "train_micro_batch_size_per_gpu"
+    configured = deepspeed_plugin.deepspeed_config.get(key)
+    if configured not in (None, "auto", per_device_batch_size):
+        raise ValueError(
+            f"expected DeepSpeed {key} to equal per_device_batch_size "
+            f"{per_device_batch_size}, got {configured!r}"
+        )
+    deepspeed_plugin.deepspeed_config[key] = per_device_batch_size
+
+
 _MULTIROLE_METADATA_FILENAME = "flow_factory_multirole_metadata.json"
 _MULTIROLE_METADATA_VERSION = 1
 _MULTIROLE_STATE_KEYS = {
@@ -984,6 +1014,9 @@ class BaseTrainer(ABC):
 
     def _initialization(self):
         self._validate_paradigm_dynamics()
+        configure_deepspeed_micro_batch_size(
+            self.accelerator, self.training_args.per_device_batch_size
+        )
 
         # Fix for FSDP, synchronize frozen components like text encoder & VAE.
         # Otherwise they may be uninitialized on Rank > 0.

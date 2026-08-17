@@ -18,7 +18,10 @@ from types import SimpleNamespace
 import pytest
 from accelerate.utils import DistributedType
 
-from flow_factory.trainers.abc import validate_supported_distributed_plan
+from flow_factory.trainers.abc import (
+    configure_deepspeed_micro_batch_size,
+    validate_supported_distributed_plan,
+)
 
 
 def _accelerator(distributed_type: DistributedType, zero_stage: object = None) -> SimpleNamespace:
@@ -91,6 +94,20 @@ def test_non_deepspeed_plans_pass(distributed_type: DistributedType) -> None:
 def test_deepspeed_without_a_plugin_is_not_rejected() -> None:
     """A DeepSpeed distributed type with no plugin has no stage to reject."""
     validate_supported_distributed_plan(_accelerator(DistributedType.DEEPSPEED))
+
+
+def test_deepspeed_micro_batch_size_is_set_for_custom_train_loader() -> None:
+    accelerator = _accelerator(DistributedType.DEEPSPEED, zero_stage=2)
+    accelerator.state.deepspeed_plugin.deepspeed_config = {}
+
+    configure_deepspeed_micro_batch_size(accelerator, per_device_batch_size=3)
+
+    assert (
+        accelerator.state.deepspeed_plugin.deepspeed_config[
+            "train_micro_batch_size_per_gpu"
+        ]
+        == 3
+    )
 
 
 def test_muon_with_deepspeed_is_rejected_as_unverified() -> None:
