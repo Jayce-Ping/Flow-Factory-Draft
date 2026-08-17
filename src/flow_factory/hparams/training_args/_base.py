@@ -187,12 +187,6 @@ class TrainingArguments(ArgABC):
         default=3.5,
         metadata={"help": "Guidance scale for sampling."},
     )
-    max_sequence_length: int = field(
-        default=512,
-        metadata={
-            "help": "Maximum tokenizer sequence length used by adapters that support it."
-        },
-    )
 
     # --- Seed ---
     seed: int = field(
@@ -285,18 +279,6 @@ class TrainingArguments(ArgABC):
     )
 
     def __post_init__(self):
-        if not isinstance(self.max_sequence_length, int):
-            raise TypeError(
-                "expected int for max_sequence_length, "
-                f"got {type(self.max_sequence_length).__name__}: "
-                f"{self.max_sequence_length!r}"
-            )
-        if self.max_sequence_length < 1:
-            raise ValueError(
-                "expected max_sequence_length >= 1, "
-                f"got {self.max_sequence_length}"
-            )
-
         # --- Resolution standardization ---
         if not self.resolution:
             logger.warning("`resolution` is not set, using default (512, 512).")
