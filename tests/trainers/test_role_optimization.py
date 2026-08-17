@@ -534,6 +534,27 @@ def test_rejects_duplicate_and_non_exhaustive_optimizer_ownership() -> None:
         )
 
 
+def test_accepts_deepspeed_style_flattened_optimizer_tensor() -> None:
+    flat_parameter = torch.zeros(8, requires_grad=True)
+    optimizer = torch.optim.AdamW(
+        [{"params": [flat_parameter], "role_name": "base"}]
+    )
+    role = OptimizationRole(
+        config=_config("base"),
+        parameters=(flat_parameter,),
+        optimizer_group_ids=(0,),
+    )
+
+    coordinator = RoleOptimizationCoordinator(
+        SimpleNamespace(),
+        torch.nn.Identity(),
+        optimizer,
+        {"base": role},
+    )
+
+    assert coordinator.roles["base"].parameters[0] is flat_parameter
+
+
 def test_active_role_only_receives_adamw_state_and_clipping() -> None:
     accelerator = DeterministicAccelerator((True,))
     bundle, optimizer, roles, coordinator = _runtime(accelerator)

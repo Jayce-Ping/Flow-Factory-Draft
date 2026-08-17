@@ -110,7 +110,7 @@ class OptimizationRole:
     """Store one role's optimizer ownership and local update state."""
 
     config: RoleOptimizerConfig
-    parameters: Tuple[torch.nn.Parameter, ...]
+    parameters: Tuple[torch.Tensor, ...]
     optimizer_group_ids: Tuple[int, ...]
     step: int = 0
     scheduler: Optional[Any] = None
@@ -515,9 +515,9 @@ class RoleOptimizationCoordinator:
                     f"expected role {role_name!r} to own optimizer groups, received none"
                 )
             for parameter in role.parameters:
-                if not isinstance(parameter, torch.nn.Parameter):
+                if not isinstance(parameter, torch.Tensor) or not parameter.requires_grad:
                     raise TypeError(
-                        f"expected torch.nn.Parameter owned by role {role_name!r}, "
+                        f"expected a trainable torch.Tensor owned by role {role_name!r}, "
                         f"received {type(parameter).__name__}: {parameter!r}"
                     )
                 existing_owner = parameter_owners.get(id(parameter))
