@@ -1,0 +1,64 @@
+import json
+
+import numpy as np
+import pytest
+
+from flow_factory.rewards.ocr import OCRRewardModel
+
+
+class _FakeOCR:
+    def __init__(self, recognized_texts: list[str]) -> None:
+        self.recognized_texts = recognized_texts
+
+    def predict(self, image: np.ndarray) -> list[dict[str, list[str]]]:
+        assert isinstance(image, np.ndarray)
+        return [{"rec_texts": self.recognized_texts}]
+
+
+def _reward(recognized_texts: list[str]) -> OCRRewardModel:
+    reward = object.__new__(OCRRewardModel)
+    reward.model = _FakeOCR(recognized_texts)
+    return reward
+
+
+def test_ocr_scores_every_visible_text_target() -> None:
+    reward = _reward(["OPEN", "EX1T"])
+    metadata = json.dumps({"visible_texts": json.dumps(["OPEN", "EXIT"])})
+    scores = reward._compute_scores_batch(
+        prompt=['signs reading "OPEN" and "EXIT"'],
+        image=[np.zeros((8, 8, 3), dtype=np.uint8)],
+        metadata=[metadata],
+    )
+    assert scores == pytest.approx([0.875])
+
+
+def test_ocr_accepts_native_visible_texts_list() -> None:
+    metadata = json.dumps({"visible_texts": ["Federal Bank", "Policy 2025"]})
+    assert OCRRewardModel._targets_from_metadata(metadata, sample_index=3) == [
+        "Federal Bank",
+        "Policy 2025",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("metadata", "match"),
+    [
+        (json.dumps({}), "visible_texts"),
+        (json.dumps({"visible_texts": []}), "at least one"),
+        (json.dumps({"visible_texts": [""]}), "nonempty"),
+        (json.dumps({"visible_texts": [1]}), "list\\[str\\]"),
+    ],
+)
+def test_ocr_rejects_invalid_visible_texts(metadata: str, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        OCRRewardModel._targets_from_metadata(metadata, sample_index=7)
+
+
+def test_ocr_rejects_mismatched_batch_lengths() -> None:
+    reward = _reward(["OPEN"])
+    with pytest.raises(ValueError, match="prompt=1, image=0, metadata=1"):
+        reward._compute_scores_batch(
+            prompt=["prompt"],
+            image=[],
+            metadata=[json.dumps({"visible_texts": ["OPEN"]})],
+        )
