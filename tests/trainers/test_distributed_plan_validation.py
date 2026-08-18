@@ -65,6 +65,10 @@ def test_loader_rejects_zero_three_before_loading_model(monkeypatch: pytest.Monk
             gradient_accumulation_steps=1,
             max_grad_norm=1.0,
             seed=42,
+            # Read before the Accelerator exists, to size DDP's unused-parameter
+            # detection from the algorithm's role count.
+            trainer_type="grpo",
+            required_trainable_roles=None,
         ),
     )
     monkeypatch.setattr(loader, "get_model_adapter_class", lambda model_type: Adapter)
