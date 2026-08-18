@@ -120,10 +120,34 @@ def test_muon_with_deepspeed_is_rejected_as_unverified() -> None:
     with pytest.raises(ValueError, match="Muon with DeepSpeed is not verified"):
         BaseTrainer._validate_optimizer_backend(trainer, (MuonOptimizerArguments(name="base"),))
 
-    # AdamW is unaffected, and Muon is fine on the backends that only read groups.
+    # AdamW is unaffected, and Muon is fine on the backends that preserve parameter rank.
     BaseTrainer._validate_optimizer_backend(trainer, (AdamWOptimizerArguments(name="base"),))
-    fsdp_trainer = SimpleNamespace(accelerator=_accelerator(DistributedType.FSDP))
-    BaseTrainer._validate_optimizer_backend(fsdp_trainer, (MuonOptimizerArguments(name="base"),))
+    fsdp2_trainer = SimpleNamespace(accelerator=_fsdp_accelerator(fsdp_version=2))
+    BaseTrainer._validate_optimizer_backend(fsdp2_trainer, (MuonOptimizerArguments(name="base"),))
+
+
+def _fsdp_accelerator(fsdp_version: int) -> SimpleNamespace:
+    """Accelerator reporting an FSDP plan of the requested major version."""
+    accelerator = _accelerator(DistributedType.FSDP)
+    accelerator.state.fsdp_plugin = SimpleNamespace(fsdp_version=fsdp_version)
+    return accelerator
+
+
+def test_muon_with_fsdp1_is_rejected_before_a_rollout_is_paid_for() -> None:
+    """FSDP1 flattens to 1D, so Muon would only fail after the first full rollout."""
+    from flow_factory.hparams.optimizer_args import (
+        AdamWOptimizerArguments,
+        MuonOptimizerArguments,
+    )
+    from flow_factory.trainers.abc import BaseTrainer
+
+    trainer = SimpleNamespace(accelerator=_fsdp_accelerator(fsdp_version=1))
+
+    with pytest.raises(ValueError, match="Muon with FSDP1 does not work"):
+        BaseTrainer._validate_optimizer_backend(trainer, (MuonOptimizerArguments(name="base"),))
+
+    # FSDP1 stays available to every optimizer that accepts a flattened parameter.
+    BaseTrainer._validate_optimizer_backend(trainer, (AdamWOptimizerArguments(name="base"),))
 
 
 def test_no_zero_three_profile_is_shipped() -> None:
