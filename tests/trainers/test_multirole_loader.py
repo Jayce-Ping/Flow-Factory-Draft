@@ -19,6 +19,7 @@ from typing import ClassVar, Tuple
 
 import pytest
 import yaml
+from accelerate.utils import DistributedType
 
 from flow_factory.hparams.training_args import TrainingArguments
 from flow_factory.trainers import loader
@@ -117,6 +118,10 @@ def test_loader_builds_ddp_handler_before_one_accelerator(
         return handler
 
     class FakeAccelerator:
+        # `load_trainer` validates the distributed plan on the fresh Accelerator, so the
+        # fake has to report one; DDP is the plan this test is describing.
+        distributed_type = DistributedType.MULTI_GPU
+
         def __init__(self, **kwargs: object) -> None:
             events.append(("accelerator", kwargs["kwargs_handlers"]))
 
