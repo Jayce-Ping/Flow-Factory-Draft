@@ -103,10 +103,7 @@ def test_deepspeed_micro_batch_size_is_set_for_custom_train_loader() -> None:
     configure_deepspeed_micro_batch_size(accelerator, per_device_batch_size=3)
 
     assert (
-        accelerator.state.deepspeed_plugin.deepspeed_config[
-            "train_micro_batch_size_per_gpu"
-        ]
-        == 3
+        accelerator.state.deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] == 3
     )
 
 

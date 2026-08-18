@@ -125,9 +125,7 @@ def configure_deepspeed_micro_batch_size(
             f"got {type(per_device_batch_size).__name__}: {per_device_batch_size!r}"
         )
     if per_device_batch_size < 1:
-        raise ValueError(
-            f"expected per_device_batch_size >= 1, got {per_device_batch_size}"
-        )
+        raise ValueError(f"expected per_device_batch_size >= 1, got {per_device_batch_size}")
     if accelerator.distributed_type != DistributedType.DEEPSPEED:
         return
     deepspeed_plugin = accelerator.state.deepspeed_plugin

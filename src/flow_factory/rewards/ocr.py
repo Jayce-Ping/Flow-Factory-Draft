@@ -98,9 +98,7 @@ class OCRRewardModel(PointwiseRewardModel):
             for res in result:
                 rec_texts.extend(res["rec_texts"])
 
-            target_scores = [
-                self._target_similarity(target, rec_texts) for target in targets
-            ]
+            target_scores = [self._target_similarity(target, rec_texts) for target in targets]
             rewards.append(float(np.mean(target_scores)))
 
         return rewards
@@ -143,9 +141,7 @@ class OCRRewardModel(PointwiseRewardModel):
     def _target_similarity(cls, target: str, recognized_parts: list[str]) -> float:
         normalized_target = cls._normalize_text(target)
         normalized_parts = [
-            normalized
-            for part in recognized_parts
-            if (normalized := cls._normalize_text(part))
+            normalized for part in recognized_parts if (normalized := cls._normalize_text(part))
         ]
         if not normalized_parts:
             return 0.0
@@ -156,8 +152,7 @@ class OCRRewardModel(PointwiseRewardModel):
 
         candidates = [*normalized_parts, recognized_text]
         normalized_distance = min(
-            distance(normalized_target, candidate)
-            / max(len(normalized_target), len(candidate))
+            distance(normalized_target, candidate) / max(len(normalized_target), len(candidate))
             for candidate in candidates
         )
         return max(0.0, 1.0 - normalized_distance)

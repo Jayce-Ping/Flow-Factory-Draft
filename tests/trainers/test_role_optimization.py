@@ -536,9 +536,7 @@ def test_rejects_duplicate_and_non_exhaustive_optimizer_ownership() -> None:
 
 def test_accepts_deepspeed_style_flattened_optimizer_tensor() -> None:
     flat_parameter = torch.zeros(8, requires_grad=True)
-    optimizer = torch.optim.AdamW(
-        [{"params": [flat_parameter], "role_name": "base"}]
-    )
+    optimizer = torch.optim.AdamW([{"params": [flat_parameter], "role_name": "base"}])
     role = OptimizationRole(
         config=_config("base"),
         parameters=(flat_parameter,),
