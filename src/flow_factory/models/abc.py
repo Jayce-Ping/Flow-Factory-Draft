@@ -1440,6 +1440,30 @@ class BaseAdapter(ABC):
         )
 
     # ------------------------------ FSDP Views ----------------------------------------
+    def _fsdp_root_and_member_prefix(self, model) -> Tuple[Any, str]:
+        """Return the prepared FSDP root holding ``model`` and ``model``'s key prefix.
+
+        FSDP bookkeeping lives on the root that ``prepare`` produced, and every collective
+        state-dict call has to go through it. The bundle keeps its members in an
+        ``nn.ModuleDict``, so a member's parameters appear under ``members.<name>.`` in the
+        root's state dict and the caller strips that back off.
+
+        Falls back to ``(model, "")`` when ``model`` is itself the prepared root or is not a
+        bundle member, which is what a single-component adapter looks like.
+        """
+        target = self._unwrap(model)
+        for prepared in getattr(self.accelerator, "_models", ()):
+            inner = self.accelerator.unwrap_model(prepared)
+            members = getattr(inner, "members", None)
+            if members is None:
+                continue
+            if inner is target or prepared is model:
+                return prepared, ""
+            for name, member in members.items():
+                if member is target or self._unwrap(member) is target:
+                    return prepared, f"members.{name}."
+        return model, ""
+
     def _fsdp_state_dict_type(self):
         """Get FSDP state_dict_type, returns None if not FSDP."""
         if not self._is_fsdp():
@@ -1575,16 +1599,45 @@ class BaseAdapter(ABC):
             )
             state_dict = get_model_state_dict(model, options=options)
         elif self.accelerator.distributed_type == DistributedType.FSDP:
-            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            # FSDP1 through the same DTensor-aware API as FSDP2. The older
+            # `FSDP.state_dict_type(model, ...)` is not only deprecated, it mutates FSDP
+            # bookkeeping on whichever instance it is handed: components live inside the
+            # prepared bundle, so `model` here is a NON-root FSDP instance, and entering
+            # that context left `_is_root` set on it. The next rollout forward then died
+            # in the real root's `_root_pre_forward` with "Non-root FSDP instance's
+            # `_is_root` should not have been set yet", one full epoch after the save.
             from torch.distributed.checkpoint.state_dict import (
-                get_state_dict as fsdp_get_state_dict,
-                get_model_state_dict as fsdp_get_model_state_dict,
+                StateDictOptions,
+                get_model_state_dict,
             )
 
-            full_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_state_dict_config):
-                state_dict = model.state_dict()
+            # Gather through the FSDP ROOT, never through the component. Components sit
+            # inside the prepared bundle, so a component is a non-root FSDP instance (or
+            # holds them); handing one to any state-dict API lazy-initializes it as a root
+            # and the next rollout forward dies in the real root's `_root_pre_forward` with
+            # "Non-root FSDP instance's `_is_root` should not have been set yet" -- a full
+            # epoch after the save that caused it. The same applied to the deprecated
+            # `FSDP.state_dict_type(component, ...)` this replaced.
+            #
+            # `ignore_frozen_params` is likewise not forwarded: torch drops frozen entries
+            # with `state_dict.pop(fqn)` and no default, and under FSDP1 the FQN it rebuilds
+            # for a PEFT parameter wrapped in both `_fsdp_wrapped_module` and
+            # `_checkpoint_wrapped_module` is absent from the gathered dict, raising KeyError
+            # on a frozen base weight. The `state_dict_keys` filter below already narrows to
+            # the adapter.
+            root, prefix = self._fsdp_root_and_member_prefix(model)
+            options = StateDictOptions(
+                full_state_dict=True,
+                broadcast_from_rank0=True,
+                cpu_offload=True,
+            )
+            state_dict = get_model_state_dict(root, options=options)
+            if prefix:
+                state_dict = {
+                    key[len(prefix) :]: value
+                    for key, value in state_dict.items()
+                    if key.startswith(prefix)
+                }
         else:
             if unwrap:
                 model = self._unwrap(model)
@@ -2417,8 +2470,14 @@ class BaseAdapter(ABC):
             trainable_size_gb = trainable_size_bytes / (1024**3)
             trainable_percentage = 100 * trainable_params / total_params if total_params > 0 else 0
 
+            # Under FSDP these are this rank's shard, and a shard can legitimately hold
+            # none of a small adapter: FSDP splits a flattened unit by byte range, so with
+            # LoRA the frozen base fills the early shards and the whole adapter can land on
+            # one rank. Say so, or "Trainable: 0" on rank 0 reads as a broken run.
+            sharded = self.accelerator.distributed_type == DistributedType.FSDP
+            scope = " (this rank's shard)" if sharded else ""
             logger.info("=" * 70)
-            logger.info(f"{comp_name.capitalize()} Trainable Parameters:")
+            logger.info(f"{comp_name.capitalize()} Trainable Parameters:{scope}")
             logger.info(f"  Total:      {total_params:>15,d} ({total_size_gb:>6.2f} GB)")
             logger.info(f"  Trainable:  {trainable_params:>15,d} ({trainable_size_gb:>6.2f} GB)")
             logger.info(f"  Percentage: {trainable_percentage:>14.2f}%")

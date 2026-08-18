@@ -341,7 +341,8 @@ def _dgpo_trainer(
     trainer.autocast = nullcontext
     trainer.accelerator = accelerator if accelerator is not None else AcceleratorFake(events)
     trainer.optimizer = OptimizerFake(events)
-    trainer.model_bundle = object()
+    # `_apply_optimizer_step` hands the prepared root's parameters to the clip helper.
+    trainer.model_bundle = torch.nn.Module()
     trainer.logger = LoggerFake(events)
     trainer.log_args = SimpleNamespace(verbose=False, save_freq=0, save_dir=None, run_name="run")
     trainer.epoch = 3
@@ -784,7 +785,8 @@ def _crd_trainer(
     trainer.autocast = nullcontext
     trainer.accelerator = accelerator if accelerator is not None else AcceleratorFake(events)
     trainer.optimizer = OptimizerFake(events)
-    trainer.model_bundle = object()
+    # `_apply_optimizer_step` hands the prepared root's parameters to the clip helper.
+    trainer.model_bundle = torch.nn.Module()
     trainer.logger = LoggerFake(events)
     trainer.log_args = SimpleNamespace(verbose=False, save_freq=0, save_dir=None, run_name="run")
     trainer.epoch = 2
