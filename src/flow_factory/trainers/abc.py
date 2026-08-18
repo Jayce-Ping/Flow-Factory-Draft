@@ -949,7 +949,14 @@ class BaseTrainer(ABC):
                 f"algorithm {algorithm!r} with roles {required_roles!r} expected exactly "
                 f"one prepared model root, received {len(prepared_models)}"
             )
-        if prepared_models[0] is not self.model_bundle:
+        # Compare through `unwrap_model`: accelerate registers the module in `_models`
+        # before wrapping it, so under DDP the tracked entry is the inner bundle while
+        # `prepare` hands back the DistributedDataParallel around it. Comparing the
+        # wrappers rejected every multi-role DDP run. What has to hold is that the one
+        # tracked root is the one this trainer drives, which the unwrapped identity says.
+        tracked = self.accelerator.unwrap_model(prepared_models[0])
+        driven = self.accelerator.unwrap_model(self.model_bundle)
+        if tracked is not driven:
             raise RuntimeError(
                 f"algorithm {algorithm!r} with roles {required_roles!r} expected the tracked "
                 "prepared model root to be self.model_bundle, received different identities"
