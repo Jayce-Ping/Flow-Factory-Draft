@@ -33,8 +33,6 @@ class TDMTrainingArguments(DMD2TrainingArguments):
     )
     num_inference_steps: int = 4
     trajectory_steps: int = 4
-    replay_rtol: float = 1e-4
-    replay_atol: float = 1e-4
     use_huber: bool = True
     huber_c: float = 1e-3
     tdm_snr_gamma: float = 5.0
@@ -62,8 +60,6 @@ class TDMTrainingArguments(DMD2TrainingArguments):
             "train.tdm_snr_gamma",
             allow_zero=False,
         )
-        self.replay_rtol = self._validate_replay_tolerance(self.replay_rtol, "train.replay_rtol")
-        self.replay_atol = self._validate_replay_tolerance(self.replay_atol, "train.replay_atol")
 
     def get_num_train_timesteps(self, args: Any) -> int:
         """Count one accumulation unit per rollout; K boundaries are averaged.

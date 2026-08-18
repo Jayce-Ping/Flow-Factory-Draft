@@ -81,8 +81,6 @@ class DMD2Trainer(BaseTrainer):
         )
 
     _BOUNDARY_INDEX: ClassVar[int] = 1
-    _REPLAY_RTOL: ClassVar[float] = 1e-4
-    _REPLAY_ATOL: ClassVar[float] = 1e-4
 
     def __init__(
         self,
@@ -148,10 +146,7 @@ class DMD2Trainer(BaseTrainer):
         eval-time reward monitoring behave exactly as they do for every other
         trainer.
         """
-        # simulate the old evaluate=False loop
-        self.sample()
-        self.sample()
-        self.optimize([[], []])
+        run_distillation_training_step(self)
 
     def sample(self) -> List[BaseSample]:
         """Collect the initial state and generated boundary of one fresh rollout."""
@@ -276,8 +271,8 @@ class DMD2Trainer(BaseTrainer):
                     batch,
                     self._BOUNDARY_INDEX,
                     return_fields=("velocity", "next_latents", "next_latents_mean"),
-                    rtol=self._REPLAY_RTOL,
-                    atol=self._REPLAY_ATOL,
+                    rtol=self.training_args.replay_rtol,
+                    atol=self.training_args.replay_atol,
                     **self._replay_forward_kwargs(batch),
                 )
         boundary_state = generator_output.next_state
