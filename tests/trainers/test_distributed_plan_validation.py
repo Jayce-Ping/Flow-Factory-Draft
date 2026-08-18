@@ -175,37 +175,41 @@ def test_deepspeed_gradient_clipping_is_wired_from_the_configured_norm() -> None
     assert source.index("ACCELERATE_GRADIENT_CLIPPING") < source.index("accelerator = Accelerator(")
 
 
-def _prepared_trainer(distributed_type: DistributedType, trainable: int, **plugin: object):
-    """Trainer stub whose prepared bundle exposes ``trainable`` gradient elements."""
+def _prepared_trainer(distributed_type: DistributedType, local: int, others: int = 0):
+    """Trainer stub owning ``local`` trainable elements, with ``others`` on the peers.
+
+    ``reduce`` stands in for the collective: the guard asks whether ANY rank holds
+    trainable elements, so the stub adds what the peers would report.
+    """
     from flow_factory.trainers.abc import BaseTrainer
 
     accelerator = _accelerator(distributed_type)
-    if plugin:
-        accelerator.state.fsdp_plugin = SimpleNamespace(**plugin)
-    parameter = torch.nn.Parameter(torch.zeros(trainable or 1))
-    parameter.requires_grad = trainable > 0
+    accelerator.device = torch.device("cpu")
+    accelerator.num_processes = 2
+    accelerator.reduce = lambda tensor, reduction="sum": tensor + float(others)
+    parameter = torch.nn.Parameter(torch.zeros(local or 1))
+    parameter.requires_grad = local > 0
     return (
         SimpleNamespace(
             accelerator=accelerator,
             model_bundle=SimpleNamespace(parameters=lambda: iter([parameter])),
-            model_args=SimpleNamespace(finetune_type="lora"),
         ),
         BaseTrainer,
     )
 
 
-def test_a_prepared_root_with_nothing_to_train_is_rejected() -> None:
-    """FSDP1 absorbs LoRA into a frozen FlatParameter and trains nothing, silently."""
-    trainer, BaseTrainer = _prepared_trainer(DistributedType.FSDP, trainable=0, fsdp_version=1)
+def test_a_prepared_root_no_rank_can_train_is_rejected() -> None:
+    """Nothing anywhere requires a gradient, so an optimizer step would change nothing."""
+    trainer, BaseTrainer = _prepared_trainer(DistributedType.FSDP, local=0, others=0)
 
-    with pytest.raises(RuntimeError, match="received 0.*FSDP1 cannot train LoRA"):
+    with pytest.raises(RuntimeError, match="received 0 across all 2 rank"):
         BaseTrainer._validate_trainable_parameters_survived_prepare(trainer)
 
 
-def test_a_prepared_root_that_kept_its_gradients_passes() -> None:
-    """The guard must not fire on the backends that preserve requires_grad."""
-    trainer, BaseTrainer = _prepared_trainer(DistributedType.FSDP, trainable=8, fsdp_version=2)
+def test_a_rank_holding_no_shard_of_the_adapter_is_accepted() -> None:
+    """FSDP splits by byte range: a rank can own none of a small adapter and be healthy."""
+    trainer, BaseTrainer = _prepared_trainer(DistributedType.FSDP, local=0, others=2048)
     BaseTrainer._validate_trainable_parameters_survived_prepare(trainer)
 
-    trainer, BaseTrainer = _prepared_trainer(DistributedType.DEEPSPEED, trainable=8)
+    trainer, BaseTrainer = _prepared_trainer(DistributedType.DEEPSPEED, local=8)
     BaseTrainer._validate_trainable_parameters_survived_prepare(trainer)

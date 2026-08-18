@@ -907,42 +907,33 @@ class BaseTrainer(ABC):
         return (DEFAULT_BASE_VARIANT,)
 
     def _validate_trainable_parameters_survived_prepare(self) -> None:
-        """Reject a prepared root that exposes nothing to train.
+        """Reject a prepared root that no rank can train.
 
-        Ownership is checked before ``prepare``, but a backend can still absorb the
-        trainable parameters while wrapping. FSDP1 does exactly that to LoRA: its
-        transformer-based auto-wrap flattens each block's frozen weights together with
-        the adapter into one FlatParameter, and a flattened unit carries a single
-        ``requires_grad``, which the frozen majority wins. The run then completes with
-        a plausible loss, a zero gradient norm and unchanged weights -- a silent no-op
-        that costs a full training budget before anyone notices.
+        Ownership is checked before ``prepare``, but a backend can still leave nothing
+        to optimize afterwards. The check must be collective: FSDP shards a flattened
+        unit by byte range, so a rank whose slice covers only frozen weights holds
+        zero-element views of the adapter and is perfectly healthy. Under FSDP1 with
+        LoRA that is the common case -- the frozen base fills the early shards and the
+        whole adapter can land on one rank -- so a rank-local count would reject a run
+        that trains correctly.
 
         Raises:
-            RuntimeError: If no prepared parameter requires a gradient.
+            RuntimeError: If no rank holds a parameter that requires a gradient.
         """
-        trainable = sum(
+        local = sum(
             parameter.numel()
             for parameter in self.model_bundle.parameters()
             if parameter.requires_grad
         )
-        if trainable > 0:
+        counts = torch.tensor([float(local)], device=self.accelerator.device)
+        global_trainable = int(self.accelerator.reduce(counts, reduction="sum").item())
+        if global_trainable > 0:
             return
-
-        plan = self.accelerator.distributed_type
-        detail = ""
-        if plan == DistributedType.FSDP:
-            fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
-            fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) if fsdp_plugin else 1
-            if fsdp_version < 2 and self.model_args.finetune_type == "lora":
-                detail = (
-                    " FSDP1 cannot train LoRA here: it flattens frozen weights and adapter "
-                    "into one FlatParameter that carries a single requires_grad. Set "
-                    "`fsdp_version: 2` in the accelerate config "
-                    "(config/accelerate_configs/fsdp2.yaml), or use DDP or DeepSpeed."
-                )
         raise RuntimeError(
-            f"expected the prepared model to expose trainable parameters under {plan}, "
-            f"received 0.{detail}"
+            "expected the prepared model to expose trainable parameters under "
+            f"{self.accelerator.distributed_type}, received 0 across all "
+            f"{self.accelerator.num_processes} rank(s). Every parameter was frozen or "
+            "absorbed while wrapping, so an optimizer step would change nothing."
         )
 
     def _validate_multirole_backend(self) -> None:
@@ -1502,8 +1493,15 @@ class BaseTrainer(ABC):
         Returns:
             An empty accumulator for the next optimizer step.
         """
+        # Hand over the prepared root's full parameter list, not just the trainable
+        # subset. Accelerate only delegates to FSDP's collective `clip_grad_norm_`
+        # when the list it receives is exactly `model.parameters()`; given a subset it
+        # falls through to the plain utility, which under FSDP1 computes the norm from
+        # this rank's shard alone and clips inconsistently across ranks. Frozen
+        # parameters carry no gradient, so including them changes nothing for the
+        # backends that do not shard.
         grad_norm = self.accelerator.clip_grad_norm_(
-            self.adapter.get_trainable_parameters(),
+            self.model_bundle.parameters(),
             self.training_args.max_grad_norm,
         )
         self.optimizer.step()
