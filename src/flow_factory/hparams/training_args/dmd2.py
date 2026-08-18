@@ -55,10 +55,18 @@ class DMD2TrainingArguments(TrainingArguments):
     )
     ttur_fake_updates: int = 5
     perturbation_timestep_range: Tuple[float, float] = (0.02, 0.98)
+    # The boundary replay re-runs the generator forward with gradients enabled, and
+    # autocast is free to pick different kernels than the no-grad rollout did. Under bf16
+    # that lands a few ULPs apart -- 9.8e-04 measured on 8 GPUs -- which no tolerance
+    # below bf16 resolution can accept, so the window is configurable rather than fixed.
+    replay_rtol: float = 1e-4
+    replay_atol: float = 1e-4
 
     def __post_init__(self) -> None:
         """Validate DMD2 controls."""
         super().__post_init__()
+        self.replay_rtol = self._validate_replay_tolerance(self.replay_rtol, "train.replay_rtol")
+        self.replay_atol = self._validate_replay_tolerance(self.replay_atol, "train.replay_atol")
         if (
             not isinstance(self.ttur_fake_updates, int)
             or isinstance(self.ttur_fake_updates, bool)
@@ -158,6 +166,23 @@ class DMD2TrainingArguments(TrainingArguments):
     def requires_ref_model(self) -> bool:
         """Require the frozen pretrained score reference."""
         return True
+
+    @staticmethod
+    def _validate_replay_tolerance(value: object, field_name: str) -> float:
+        """Convert and validate one non-negative finite replay tolerance."""
+        if isinstance(value, bool):
+            raise TypeError(
+                f"expected numeric {field_name}, received {type(value).__name__}: {value!r}"
+            )
+        try:
+            converted = float(value)
+        except (TypeError, ValueError) as error:
+            raise TypeError(
+                f"expected numeric {field_name}, received {type(value).__name__}: {value!r}"
+            ) from error
+        if not math.isfinite(converted) or converted < 0:
+            raise ValueError(f"expected finite {field_name} >= 0, received {value!r}")
+        return converted
 
 
 DMD2_DEFAULT_OPTIMIZERS: Tuple[AdamWOptimizerArguments, ...] = (

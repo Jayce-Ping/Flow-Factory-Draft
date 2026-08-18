@@ -543,6 +543,10 @@ def _fake_accelerator(
                 None if zero_stage is None else SimpleNamespace(zero_stage=zero_stage)
             ),
         ),
+        # The multi-role check compares the tracked root through `unwrap_model`, because
+        # accelerate registers the module before DDP wraps it. These fakes register the
+        # module itself, so unwrapping is the identity here.
+        unwrap_model=lambda model: model,
     )
 
 
