@@ -924,3 +924,44 @@ def test_required_roles_default_to_one_base_variant_without_a_registry() -> None
     )
 
     assert BaseTrainer._required_trainable_roles(trainer) == (DEFAULT_BASE_VARIANT,)
+
+
+def test_the_lone_optimizer_entry_adopts_the_role_name_it_configures() -> None:
+    """Every shipped example names its single entry `default`, not after the role.
+
+    `build_optimizer` looks parameters up by `OptimizerArguments.name` while the
+    lookup table is keyed by role, so returning the entry under its own name found
+    no parameters and every one of those configs died at startup with
+    "expected optimizer 'default' to own parameters, received none".
+    """
+    trainer = SimpleNamespace(
+        config=SimpleNamespace(
+            optimizer_args=MultiOptimizerArguments.from_dict(
+                [{"name": "default", "learning_rate": 1e-4}]
+            )
+        )
+    )
+
+    resolved = BaseTrainer._optimizer_args_for_role(trainer, DEFAULT_BASE_VARIANT)
+
+    assert resolved.name == DEFAULT_BASE_VARIANT
+    assert resolved.learning_rate == 1e-4
+
+
+def test_a_named_optimizer_entry_still_wins_over_the_fallback() -> None:
+    """Renaming the lone entry must not mask a config that names its roles."""
+    trainer = SimpleNamespace(
+        config=SimpleNamespace(
+            optimizer_args=MultiOptimizerArguments.from_dict(
+                [
+                    {"name": "generator", "learning_rate": 1e-4},
+                    {"name": "fake", "learning_rate": 2e-4},
+                ]
+            )
+        )
+    )
+
+    assert BaseTrainer._optimizer_args_for_role(trainer, "fake").learning_rate == 2e-4
+
+    with pytest.raises(ValueError, match="expected an optimizer configuration named 'missing'"):
+        BaseTrainer._optimizer_args_for_role(trainer, "missing")

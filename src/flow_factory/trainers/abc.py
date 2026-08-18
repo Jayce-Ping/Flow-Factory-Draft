@@ -18,7 +18,7 @@ import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import (
     Any,
@@ -529,7 +529,11 @@ class BaseTrainer(ABC):
         if configured is not None:
             return configured
         if len(self.config.optimizer_args) == 1:
-            return self.config.optimizer_args[0]
+            # The lone entry configures whichever role this run trains, whatever the
+            # file happens to call it. Adopt the role name: `build_optimizer` looks
+            # parameters up by `OptimizerArguments.name`, and that lookup is keyed by
+            # role, so returning the entry unrenamed finds no parameters at all.
+            return replace(self.config.optimizer_args[0], name=role_name)
         available = tuple(config.name for config in self.config.optimizer_args)
         raise ValueError(
             f"expected an optimizer configuration named {role_name!r} under `optimizers`, "
@@ -540,26 +544,45 @@ class BaseTrainer(ABC):
         """Reject optimizer and distributed-backend pairings that are not verified.
 
         Muon rejects non-matrix parameters, so a Muon variant is driven by a
-        CompositeOptimizer holding both Muon and AdamW. DDP and FSDP only read
-        ``param_groups`` and call ``step``, which the composite provides. DeepSpeed
-        instead rebuilds its own optimizer wrapper around the object it is given,
-        and that combination has not been verified here.
+        CompositeOptimizer holding both Muon and AdamW, and the split is decided by
+        parameter rank before ``prepare`` reshapes anything. DDP and FSDP2 preserve
+        that rank -- DDP does not reshape, FSDP2 shards each parameter as a 2D
+        DTensor -- so the composite still sees matrices at step time.
+
+        Two backends do not. DeepSpeed rebuilds its own optimizer wrapper around the
+        object it receives. FSDP1 flattens every wrapped unit into one 1D
+        FlatParameter, so Muon takes matrices at construction and is handed a 1D
+        gradient at the first step, failing with "Param gradient must be a 2D matrix"
+        after a full rollout has already been paid for.
 
         Args:
             optimizer_args: Optimizer configurations for this run.
 
         Raises:
-            ValueError: If Muon is combined with DeepSpeed.
+            ValueError: If Muon is combined with DeepSpeed or FSDP1.
         """
         if not uses_muon(optimizer_args):
             return
-        if self.accelerator.distributed_type != DistributedType.DEEPSPEED:
+        if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+            raise ValueError(
+                "Muon with DeepSpeed is not verified in this framework: Muon rejects "
+                "non-matrix parameters, so it runs inside a CompositeOptimizer, and "
+                "DeepSpeed rebuilds its own optimizer wrapper around the object it "
+                "receives. Use DDP or FSDP2 with Muon, or select the adamw optimizer."
+            )
+        if self.accelerator.distributed_type != DistributedType.FSDP:
+            return
+        fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
+        fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) if fsdp_plugin else 1
+        if fsdp_version >= 2:
             return
         raise ValueError(
-            "Muon with DeepSpeed is not verified in this framework: Muon rejects "
-            "non-matrix parameters, so it runs inside a CompositeOptimizer, and "
-            "DeepSpeed rebuilds its own optimizer wrapper around the object it "
-            "receives. Use DDP or FSDP with Muon, or select the adamw optimizer."
+            "Muon with FSDP1 does not work: FSDP1 flattens each wrapped unit into a "
+            "1D FlatParameter, so Muon is constructed over matrices and then receives "
+            "a 1D gradient, failing with 'Param gradient must be a 2D matrix' at the "
+            "first optimizer step. Set `fsdp_version: 2` in the accelerate config "
+            "(config/accelerate_configs/fsdp2.yaml), use DDP, or select the adamw "
+            "optimizer."
         )
 
     def _role_optimizer_configs(self) -> Tuple[RoleOptimizerConfig, ...]:
