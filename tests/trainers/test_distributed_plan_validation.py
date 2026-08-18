@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 from accelerate.utils import DistributedType
 
 from flow_factory.trainers.abc import (
@@ -172,3 +173,39 @@ def test_deepspeed_gradient_clipping_is_wired_from_the_configured_norm() -> None
     source = inspect.getsource(loader.load_trainer)
     assert "ACCELERATE_GRADIENT_CLIPPING" in source
     assert source.index("ACCELERATE_GRADIENT_CLIPPING") < source.index("accelerator = Accelerator(")
+
+
+def _prepared_trainer(distributed_type: DistributedType, trainable: int, **plugin: object):
+    """Trainer stub whose prepared bundle exposes ``trainable`` gradient elements."""
+    from flow_factory.trainers.abc import BaseTrainer
+
+    accelerator = _accelerator(distributed_type)
+    if plugin:
+        accelerator.state.fsdp_plugin = SimpleNamespace(**plugin)
+    parameter = torch.nn.Parameter(torch.zeros(trainable or 1))
+    parameter.requires_grad = trainable > 0
+    return (
+        SimpleNamespace(
+            accelerator=accelerator,
+            model_bundle=SimpleNamespace(parameters=lambda: iter([parameter])),
+            model_args=SimpleNamespace(finetune_type="lora"),
+        ),
+        BaseTrainer,
+    )
+
+
+def test_a_prepared_root_with_nothing_to_train_is_rejected() -> None:
+    """FSDP1 absorbs LoRA into a frozen FlatParameter and trains nothing, silently."""
+    trainer, BaseTrainer = _prepared_trainer(DistributedType.FSDP, trainable=0, fsdp_version=1)
+
+    with pytest.raises(RuntimeError, match="received 0.*FSDP1 cannot train LoRA"):
+        BaseTrainer._validate_trainable_parameters_survived_prepare(trainer)
+
+
+def test_a_prepared_root_that_kept_its_gradients_passes() -> None:
+    """The guard must not fire on the backends that preserve requires_grad."""
+    trainer, BaseTrainer = _prepared_trainer(DistributedType.FSDP, trainable=8, fsdp_version=2)
+    BaseTrainer._validate_trainable_parameters_survived_prepare(trainer)
+
+    trainer, BaseTrainer = _prepared_trainer(DistributedType.DEEPSPEED, trainable=8)
+    BaseTrainer._validate_trainable_parameters_survived_prepare(trainer)
