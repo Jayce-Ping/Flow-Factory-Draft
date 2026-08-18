@@ -738,6 +738,16 @@ class Arguments(ArgABC):
 
         if isinstance(self.training_args, DMD2TrainingArguments):
             self._validate_distillation_manual_geometry()
+            # Refusing to auto-align the total is not the same as refusing to say how it
+            # divides between sources. The multi-source loader reads the per-source count
+            # off each training spec, so skipping the write-back left it None and the
+            # dataloader raised "per-source unique_sample_num_per_epoch is missing".
+            # `step=1` makes the shared allocator a pure partition: it distributes the
+            # total the config already validated instead of rounding it up.
+            self._align_unique_sample_num(
+                sampler_name=self.training_args.trainer_type,
+                base_step_func=lambda: 1,
+            )
             self._recompute_derived_batch_quantities()
             return
         sampler_type = self.data_args.sampler_type
