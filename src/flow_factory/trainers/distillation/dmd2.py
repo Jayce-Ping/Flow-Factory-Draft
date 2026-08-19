@@ -89,13 +89,6 @@ class DMD2Trainer(BaseTrainer):
         config: Arguments,
         adapter: BaseAdapter,
     ) -> None:
-        training_args = config.training_args
-        if training_args.num_inference_steps != 1:
-            raise ValueError(
-                "DMD2 requires train.num_inference_steps=1 for its one-step generator; "
-                f"received train.num_inference_steps={training_args.num_inference_steps}. "
-                "Use TDM for few-step trajectory distribution matching."
-            )
         super().__init__(accelerator=accelerator, config=config, adapter=adapter)
         self.training_args: DMD2TrainingArguments
         self._validate_generation_schedule()
