@@ -515,6 +515,39 @@ def test_clearing_one_entry_does_not_touch_the_roles_nested_inside_it(tmp_path: 
         torch.testing.assert_close(actual, want, rtol=0, atol=0)
 
 
+def test_leaving_the_reference_context_hands_back_variant_trainability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PEFT keeps only the active adapter trainable, so this has to be reasserted.
+
+    Measured on TDM-R1: both non-base roles went from 382 trainable parameters to 0
+    across the reference query, and since autograd reads requires_grad when backward
+    executes, the roles lost every gradient and the optimizer stepped on nothing --
+    with no error anywhere.
+
+    Asserted through the call rather than the resulting flags because this tiny harness
+    does not reproduce PEFT's freezing; a state assertion would pass with or without the
+    fix and guard nothing.
+    """
+    adapter = _adapter("lora", roles=(BASE_VARIANT, "fake"))
+    registry = adapter.component_variant_registry
+    calls: List[str] = []
+    monkeypatch.setattr(registry, "restore_trainable_parameters", lambda: calls.append("restored"))
+
+    # The adapter under test overrides this hook to a no-op, so exercise the real one.
+    with BaseAdapter.use_ref_parameters(adapter):
+        pass
+
+    assert calls == ["restored"]
+
+
+def test_restoring_trainability_is_a_no_op_without_variants() -> None:
+    bare = TinyAdapter(Accelerator(cpu=True), "lora")
+
+    with BaseAdapter.use_ref_parameters(bare):
+        pass
+
+
 def test_restoring_roles_before_declaring_them_is_refused(tmp_path: Path) -> None:
     adapter = _adapter("lora")
     adapter.save_checkpoint(str(tmp_path), save_ema=False)

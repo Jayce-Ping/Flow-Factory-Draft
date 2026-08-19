@@ -935,11 +935,23 @@ class ComponentVariantRegistry:
             if parameter.requires_grad:
                 self.register_parameter(variant_name, component_name, parameter_name, parameter)
 
-    def _restore_trainable_variant_parameters(self) -> None:
-        """Keep every identity-owned variant parameter trainable."""
+    def restore_trainable_parameters(self) -> None:
+        """Re-mark every identity-owned variant parameter as trainable.
+
+        Public because anything that changes adapter state behind the registry's back has
+        to hand this invariant back. PEFT keeps only the active adapter trainable, so a
+        run with several trainable variants relies on this being reasserted after every
+        such change; a variant left frozen between its forward and its backward loses
+        every gradient and reports nothing, because autograd reads ``requires_grad`` when
+        backward executes rather than when the graph was built.
+        """
         for variant_name in self._specs:
             for record in self._parameter_records[variant_name]:
                 record.parameter.requires_grad = True
+
+    def _restore_trainable_variant_parameters(self) -> None:
+        """Keep every identity-owned variant parameter trainable."""
+        self.restore_trainable_parameters()
 
     def _get_peft_component(self, component_name: str) -> PeftModel:
         """Return one canonical PEFT component with detailed validation."""

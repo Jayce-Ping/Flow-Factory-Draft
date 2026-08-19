@@ -1020,28 +1020,38 @@ class BaseAdapter(ABC):
     def use_ref_parameters(self):
         """Context manager to use reference parameters."""
         if self.model_args.finetune_type == "lora":
-            # Use ExitStack to manage multiple context managers (one per component)
-            with ExitStack() as stack:
-                enabled_any = False
-                for comp_name in self.target_module_map.keys():
-                    component = (
-                        self.get_component(comp_name) if self.has_component(comp_name) else None
-                    )
-                    if component is not None:
-                        unwrapped = self._unwrap(component)
+            # The restoration below has to happen after PEFT's disable_adapter contexts
+            # have unwound, since leaving one re-marks only the active adapter, so the
+            # ExitStack is closed before it runs rather than around it.
+            try:
+                with ExitStack() as stack:
+                    enabled_any = False
+                    for comp_name in self.target_module_map.keys():
+                        component = (
+                            self.get_component(comp_name) if self.has_component(comp_name) else None
+                        )
+                        if component is not None:
+                            unwrapped = self._unwrap(component)
 
-                        # Handle Compiled Models (torch.compile)
-                        if hasattr(unwrapped, "_orig_mod"):
-                            unwrapped = unwrapped._orig_mod
+                            # Handle Compiled Models (torch.compile)
+                            if hasattr(unwrapped, "_orig_mod"):
+                                unwrapped = unwrapped._orig_mod
 
-                        if isinstance(unwrapped, PeftModel):
-                            # Enter disable_adapter context for each component
-                            stack.enter_context(unwrapped.disable_adapter())
-                            enabled_any = True
-                if not enabled_any:
-                    logger.warning("No LoRA adapters found to disable in use_ref_parameters")
+                            if isinstance(unwrapped, PeftModel):
+                                # Enter disable_adapter context for each component
+                                stack.enter_context(unwrapped.disable_adapter())
+                                enabled_any = True
+                    if not enabled_any:
+                        logger.warning("No LoRA adapters found to disable in use_ref_parameters")
 
-                yield
+                    yield
+            finally:
+                # A multi-role objective that queries its frozen reference between a
+                # role's forward and its backward would otherwise lose that role's
+                # gradients with no error: measured on TDM-R1, both non-base roles went
+                # from 382 trainable parameters to 0 across this context, and the
+                # optimizer then stepped on nothing.
+                self._restore_variant_trainability()
 
         elif self._ref_ema is not None:
             trainable_params = self.get_trainable_parameters()
@@ -1050,6 +1060,16 @@ class BaseAdapter(ABC):
                 yield
         else:
             yield
+
+    def _restore_variant_trainability(self) -> None:
+        """Re-mark every declared variant's own parameters as trainable.
+
+        A no-op for a single-policy algorithm, which declares no variants.
+        """
+        registry = getattr(self, "component_variant_registry", None)
+        if registry is None:
+            return
+        registry.restore_trainable_parameters()
 
     # ============================== Named Parameters Snapshot ==============================
     """
