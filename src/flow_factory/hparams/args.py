@@ -26,7 +26,7 @@ import math
 import warnings
 from dataclasses import dataclass, field, fields
 from datetime import datetime
-from typing import Any, Literal, Optional
+from typing import Any, Dict, Literal, Optional
 
 import yaml
 
@@ -269,19 +269,14 @@ class Arguments(ArgABC):
             )
         if not isinstance(ta, TDMR1TrainingArguments):
             return
-        if ta.per_device_batch_size % ta.group_size != 0:
+        # Which shapes tile is a property of the resolved sampler, so the geometry is
+        # checked against that one rather than against the strictest of them.
+        sampler_type = self.data_args.sampler_type
+        reason = self._tdm_r1_sampler_support().get(sampler_type)
+        if reason is not None:
             raise ValueError(
-                "tdm-r1 requires per_device_batch_size % group_size == 0 so each "
-                "microbatch contains complete rank-local reward groups; received "
-                f"per_device_batch_size={ta.per_device_batch_size} and "
-                f"group_size={ta.group_size}"
-            )
-        if ta.unique_sample_num_per_epoch % world_size != 0:
-            raise ValueError(
-                "tdm-r1 requires unique_sample_num_per_epoch % num_replicas == 0 for "
-                "group_contiguous sampling and does not auto-align it; received "
-                f"unique_sample_num_per_epoch={ta.unique_sample_num_per_epoch} and "
-                f"num_replicas={world_size}"
+                f"tdm-r1 does not auto-align its batch geometry, and sampler_type="
+                f"{sampler_type!r} cannot deliver whole reward groups here: {reason}"
             )
 
     def __post_init__(self):
@@ -668,13 +663,9 @@ class Arguments(ArgABC):
 
         trainer_type = str(ta.trainer_type).lower()
 
-        if trainer_type == "tdm-r1" and self.data_args.sampler_type != "group_contiguous":
-            logger.warning(
-                "TDM-R1 requires sampler_type='group_contiguous' so complete reward groups "
-                f"remain rank-local. Overriding '{self.data_args.sampler_type}' -> "
-                "'group_contiguous'."
-            )
-            self.data_args.sampler_type = "group_contiguous"
+        if trainer_type == "tdm-r1":
+            self.data_args.sampler_type = self._resolve_tdm_r1_sampler_type(user_choice)
+            return
 
         if (
             user_choice in {"distributed_k_repeat", "group_distributed"}
@@ -717,6 +708,116 @@ class Arguments(ArgABC):
                 f"Overriding '{self.data_args.sampler_type}' -> 'group_distributed'."
             )
             self.data_args.sampler_type = "group_distributed"
+
+    def _tdm_r1_sampler_support(self) -> Dict[str, Optional[str]]:
+        """Report why each sampler can or cannot serve TDM-R1's group preference.
+
+        Returns:
+            Sampler name to the reason it is unusable, or ``None`` when usable.
+        """
+        ta = self.training_args
+        world_size = get_world_size()
+        group_size = ta.group_size
+        batch_size = ta.per_device_batch_size
+        unique_num = ta.unique_sample_num_per_epoch
+
+        contiguous_reason: Optional[str] = None
+        if batch_size % group_size != 0:
+            contiguous_reason = (
+                f"per_device_batch_size({batch_size}) % group_size({group_size}) != 0, so a "
+                "rank-local microbatch would straddle a group boundary"
+            )
+        elif unique_num % world_size != 0:
+            contiguous_reason = (
+                f"unique_sample_num_per_epoch({unique_num}) % num_replicas({world_size}) != 0, "
+                "so complete groups cannot be dealt one rank at a time"
+            )
+
+        distributed_reason: Optional[str] = None
+        if group_size % world_size != 0:
+            distributed_reason = (
+                f"group_size({group_size}) % num_replicas({world_size}) != 0, so a group cannot "
+                "be split evenly across ranks"
+            )
+        elif (world_size * batch_size) % group_size != 0:
+            distributed_reason = (
+                f"num_replicas({world_size}) * per_device_batch_size({batch_size}) % "
+                f"group_size({group_size}) != 0, so a global microbatch would not hold whole groups"
+            )
+
+        return {
+            "group_contiguous": contiguous_reason,
+            "group_distributed": distributed_reason,
+        }
+
+    def _resolve_tdm_r1_sampler_type(self, user_choice: str) -> str:
+        """Pick the sampler whose group layout TDM-R1's preference loss can read.
+
+        TDM-R1 needs each preference microbatch to carry whole reward groups, but that
+        is a property of the sampler rather than a constraint the batch shape has to
+        satisfy: ``group_contiguous`` keeps a whole group on one rank, while
+        ``group_distributed`` gives every rank an equal share of every group and sums
+        the group logits across ranks. Requiring only the former forced
+        ``per_device_batch_size % group_size == 0`` on every run, which rules out the
+        common case of one group per global step.
+
+        Args:
+            user_choice: Configured ``data.sampler_type``, possibly ``"auto"``.
+
+        Returns:
+            The resolved sampler name.
+
+        Raises:
+            ValueError: If the choice cannot deliver whole groups, or if no sampler can.
+        """
+        support = self._tdm_r1_sampler_support()
+
+        # Group-wise async rewards are scored on one rank, so they need the whole group
+        # there regardless of what the preference loss could otherwise handle.
+        if self._has_async_rewards:
+            reason = support["group_contiguous"]
+            if reason is not None:
+                raise ValueError(
+                    "tdm-r1 with async rewards requires sampler_type='group_contiguous', "
+                    f"which this geometry cannot satisfy: {reason}"
+                )
+            if user_choice not in {"auto", "group_contiguous"}:
+                logger.warning(
+                    f"Async rewards require 'group_contiguous' sampler. Overriding "
+                    f"'{user_choice}' -> 'group_contiguous'."
+                )
+            return "group_contiguous"
+
+        if user_choice == "distributed_k_repeat":
+            logger.warning(
+                "TDM-R1 cannot use sampler_type='distributed_k_repeat': it scatters a group's "
+                "members over arbitrary ranks, leaving each rank a different set of partial "
+                "groups and no shared group-id space to sum the preference logits in. "
+                "Selecting a group-preserving sampler instead."
+            )
+            user_choice = "auto"
+
+        if user_choice in support:
+            reason = support[user_choice]
+            if reason is not None:
+                raise ValueError(
+                    f"tdm-r1 cannot use sampler_type={user_choice!r} with this batch geometry: "
+                    f"{reason}"
+                )
+            return user_choice
+
+        # Prefer the rank-local layout: it reads its group logits without a collective.
+        if support["group_contiguous"] is None:
+            return "group_contiguous"
+        if support["group_distributed"] is None:
+            return "group_distributed"
+        raise ValueError(
+            "tdm-r1 needs each microbatch to carry whole reward groups and no sampler can "
+            "deliver that here. 'group_contiguous' is unusable because "
+            f"{support['group_contiguous']}; 'group_distributed' is unusable because "
+            f"{support['group_distributed']}. Set per_device_batch_size to a multiple of "
+            "group_size, or group_size to a multiple of num_replicas."
+        )
 
     def _align_batch_geometry(self) -> None:
         """Align ``unique_sample_num_per_epoch`` (and, for ``group_distributed``,
