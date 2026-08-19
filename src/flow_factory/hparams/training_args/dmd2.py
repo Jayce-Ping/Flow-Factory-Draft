@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any, ClassVar, Mapping, Tuple, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Mapping, Optional, Tuple, cast
 
 from ..optimizer_args import AdamWOptimizerArguments
 from ._base import TrainingArguments
@@ -55,6 +55,12 @@ class DMD2TrainingArguments(TrainingArguments):
     )
     ttur_fake_updates: int = 5
     perturbation_timestep_range: Tuple[float, float] = (0.02, 0.98)
+    # The real score is the only role that wants classifier-free guidance: it supplies
+    # the target distribution, and a guided teacher is what makes the match worth
+    # anything. The generator rolls out CFG-free and the fake score must model exactly
+    # what the generator produces, so both keep `train.guidance_scale` (normally 1.0).
+    # Left unset, the real score follows `train.guidance_scale` and nothing changes.
+    real_guidance_scale: Optional[float] = None
     # The boundary replay re-runs the generator forward with gradients enabled, and
     # autocast is free to pick different kernels than the no-grad rollout did. Under bf16
     # that lands a few ULPs apart -- 9.8e-04 measured on 8 GPUs -- which no tolerance
@@ -67,6 +73,15 @@ class DMD2TrainingArguments(TrainingArguments):
         super().__post_init__()
         self.replay_rtol = self._validate_replay_tolerance(self.replay_rtol, "train.replay_rtol")
         self.replay_atol = self._validate_replay_tolerance(self.replay_atol, "train.replay_atol")
+        if self.real_guidance_scale is not None:
+            self.real_guidance_scale = _finite_float(
+                self.real_guidance_scale, "train.real_guidance_scale", allow_zero=True
+            )
+            if self.real_guidance_scale < 1.0:
+                raise ValueError(
+                    "expected train.real_guidance_scale >= 1.0, "
+                    f"received {self.real_guidance_scale!r}"
+                )
         if (
             not isinstance(self.ttur_fake_updates, int)
             or isinstance(self.ttur_fake_updates, bool)
