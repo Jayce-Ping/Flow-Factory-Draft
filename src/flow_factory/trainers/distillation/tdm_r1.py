@@ -39,6 +39,7 @@ from .distillation_runtime import (
     run_distillation_training_step,
     run_role_phase,
 )
+from .distribution_matching import revised_x0_loss
 from .group_preference import GroupPreferenceBatch, group_preference_loss
 from .tdm import TDMBoundaryUnit, TDMTrainer
 
@@ -223,37 +224,178 @@ class TDMR1Trainer(BaseTrainer):
             "train/surrogate_value_delta",
             (trainable_values - reference_values).mean(),
         )
-        return group_preference_loss(
-            self.accelerator,
-            preference_batch,
-            trainable_values,
-            reference_values,
-            self.training_args.surrogate_preference_beta,
-        )
-
-    def _generator_boundary_loss(self, unit: TDMBoundaryUnit) -> torch.Tensor:
-        """Combine the TDM generator term with a scaled live-boundary preference term."""
-        terms = self._generator_score_terms(unit)
-        trainable_values, reference_values = self._live_generator_preference_values(unit, terms)
-        preference_batch = self._group_preference_batch(unit, trainable_values)
         preference_loss = group_preference_loss(
             self.accelerator,
             preference_batch,
-            trainable_values,
+            self._clip_runaway_surrogate(trainable_values, reference_values, preference_batch),
             reference_values,
             self.training_args.surrogate_preference_beta,
         )
-        # The generator optimizes a sum, so the total alone hides which half is moving:
-        # a preference term that swamps the distribution-matching term trades image
-        # quality for reward and shows up here before it shows up in the samples.
-        record_distillation_metric(self, "train/generator_tdm_loss", terms.loss)
-        record_distillation_metric(self, "train/generator_preference_loss", preference_loss)
-        record_distillation_metric(
-            self,
-            "train/generator_value_delta",
-            (trainable_values - reference_values).mean(),
+        # Without this the surrogate is free to walk away from the frozen model and
+        # score everything higher, which reads as progress in the preference loss while
+        # the guidance it hands the generator becomes meaningless.
+        reference_penalty = (trainable_values - reference_values).square().mean()
+        record_distillation_metric(self, "train/surrogate_reference_penalty", reference_penalty)
+        loss = preference_loss + self.training_args.surrogate_reference_beta * reference_penalty
+        return self._time_weight(unit) * loss
+
+    def _clip_runaway_surrogate(
+        self,
+        trainable_values: torch.Tensor,
+        reference_values: torch.Tensor,
+        preference_batch: GroupPreferenceBatch,
+    ) -> torch.Tensor:
+        """Stop the gradient on samples already moved far enough past the reference.
+
+        A sample whose surrogate density has improved in the direction its advantage
+        asks for, while sitting further from the frozen reference than the threshold
+        allows, has nothing left to gain from another step and everything to lose in
+        drift. Detaching it leaves the rest of the batch training normally.
+        """
+        threshold = self.training_args.surrogate_reference_threshold
+        deviation = (trainable_values - reference_values).square()
+        improved = torch.where(
+            preference_batch.advantages > 0,
+            trainable_values < reference_values,
+            trainable_values > reference_values,
         )
-        return terms.loss + self.training_args.tdm_weight * preference_loss
+        clipped = improved & (deviation > threshold)
+        record_distillation_metric(self, "train/surrogate_clip_ratio", clipped.float().mean())
+        return torch.where(clipped, trainable_values.detach(), trainable_values)
+
+    def _time_weight(self, unit: TDMBoundaryUnit) -> float:
+        """Weight a boundary by how far along the trajectory it sits.
+
+        Later boundaries are closer to the image the reward actually scored, so TDM-R1
+        ramps their contribution linearly rather than treating every step alike.
+        """
+        if not self.training_args.use_time_weighting:
+            return 1.0
+        return (unit.boundary_index + 1) / self.training_args.num_inference_steps
+
+    def _generator_boundary_loss(self, unit: TDMBoundaryUnit) -> torch.Tensor:
+        """Combine the distribution-matching term with two rewards, as TDM-R1 defines it.
+
+        The generator follows three detached directions in clean-prediction space: the
+        teacher against the fake score, which is the TDM reverse-KL term and carries no
+        coefficient; the teacher's guidance direction, treated as a reward; and the
+        surrogate's guided direction against its frozen reference, which is the learned
+        reward. ``tdm_weight`` mixes the two rewards convexly, so raising it trades
+        learned reward for guidance and never weakens the distribution-matching anchor.
+        """
+        terms = self._generator_score_terms(unit)
+        batch = self._stack_replay_unit(unit.samples)
+        tdm_weight = self.training_args.tdm_weight
+
+        guidance_direction = self._guidance_reward_direction(batch, terms)
+        guidance_loss = revised_x0_loss(
+            self.adapter,
+            terms.boundary_state,
+            guidance_direction,
+            terms.x0_real,
+            use_huber=self.training_args.use_huber,
+            huber_c=self.training_args.huber_c,
+        )
+        surrogate_direction, surrogate_target = self._surrogate_reward_direction(batch, terms)
+        surrogate_loss = revised_x0_loss(
+            self.adapter,
+            terms.boundary_state,
+            surrogate_direction,
+            surrogate_target,
+            use_huber=self.training_args.use_huber,
+            huber_c=self.training_args.huber_c,
+        )
+
+        record_distillation_metric(self, "train/generator_tdm_loss", terms.loss)
+        record_distillation_metric(self, "train/generator_guidance_reward_loss", guidance_loss)
+        record_distillation_metric(self, "train/generator_surrogate_reward_loss", surrogate_loss)
+        return terms.loss + tdm_weight * guidance_loss + (1.0 - tdm_weight) * surrogate_loss
+
+    def _guidance_reward_direction(self, batch: Any, terms: Any) -> LatentState:
+        """Recover the teacher's conditional-minus-unconditional direction.
+
+        The adapter combines guidance internally and returns only the guided velocity,
+        so the two ends are recovered from two queries rather than by reaching into it:
+        a query at scale 1 is the conditional prediction, and the guided query at scale
+        ``s`` is ``uncond + s * (cond - uncond)``, which leaves
+        ``cond - uncond = (guided - cond) / (s - 1)``.
+        """
+        scale = float(self.training_args.get_reference_guidance_scale())
+        if scale <= 1.0:
+            raise ValueError(
+                "TDM-R1 treats classifier-free guidance as a reward and needs a reference "
+                "guidance scale above 1 to have a direction to follow; received "
+                f"real_guidance_scale={scale}. Set train.real_guidance_scale > 1 or "
+                "train.cfg_reward_scale=0 to drop the term."
+            )
+        conditional_velocity = query_score_velocity(
+            self.adapter,
+            batch,
+            terms.noised.state,
+            terms.times,
+            role_name="reference",
+            autocast=self.autocast,
+            forward_kwargs=self._replay_forward_kwargs(batch),
+            algorithm_name="TDM-R1",
+        )
+        x0_conditional = self.adapter.project_velocity_to_clean_state(
+            terms.noised.state,
+            terms.times,
+            conditional_velocity,
+        )
+        reward_scale = self.training_args.cfg_reward_scale / (scale - 1.0)
+        return LatentState(
+            {
+                name: (
+                    reward_scale
+                    * (
+                        terms.x0_real.components[name].to(torch.float32)
+                        - x0_conditional.components[name].to(torch.float32)
+                    )
+                ).detach()
+                for name in self.adapter.trajectory_component_order
+            },
+            active_masks=terms.boundary_state.active_masks,
+        )
+
+    def _surrogate_reward_direction(self, batch: Any, terms: Any) -> tuple[LatentState, LatentState]:
+        """Return the surrogate's guided direction against its frozen reference.
+
+        The surrogate is queried with guidance so its learned preference is amplified the
+        same way the teacher's is, and the frozen reference subtracts off what the base
+        model would have predicted, leaving only what the surrogate learned.
+        """
+        surrogate_velocity = query_score_velocity(
+            self.adapter,
+            batch,
+            terms.noised.state,
+            terms.times,
+            role_name="surrogate",
+            autocast=self.autocast,
+            forward_kwargs=self._reference_forward_kwargs(batch),
+            algorithm_name="TDM-R1",
+        )
+        x0_surrogate = self.adapter.project_velocity_to_clean_state(
+            terms.noised.state,
+            terms.times,
+            surrogate_velocity,
+        )
+        component_names = self.adapter.trajectory_component_order
+        direction = LatentState(
+            {
+                name: (
+                    x0_surrogate.components[name].to(torch.float32)
+                    - terms.x0_real.components[name].to(torch.float32)
+                ).detach()
+                for name in component_names
+            },
+            active_masks=terms.boundary_state.active_masks,
+        )
+        normalizer_reference = LatentState(
+            {name: x0_surrogate.components[name].detach() for name in component_names},
+            active_masks=terms.boundary_state.active_masks,
+        )
+        return direction, normalizer_reference
 
     def _generator_score_terms(self, unit: TDMBoundaryUnit) -> Any:
         return TDMTrainer._generator_score_terms(self, unit)

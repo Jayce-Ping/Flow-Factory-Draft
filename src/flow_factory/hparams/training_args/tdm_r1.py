@@ -36,6 +36,10 @@ class TDMR1TrainingArguments(TDMTrainingArguments):
     surrogate_preference_beta: float = 1.0
     advantage_clip_range: float = 5.0
     use_huber: bool = False
+    surrogate_reference_beta: float = 0.001
+    surrogate_reference_threshold: float = 0.05
+    cfg_reward_scale: float = 3.5
+    use_time_weighting: bool = True
 
     def __post_init__(self) -> None:
         """Validate reward and generator objective controls."""
@@ -56,6 +60,32 @@ class TDMR1TrainingArguments(TDMTrainingArguments):
             "train.advantage_clip_range",
             allow_zero=False,
         )
+        if not 0.0 < self.tdm_weight < 1.0:
+            raise ValueError(
+                "expected train.tdm_weight in (0, 1): it mixes the guidance reward against "
+                "the surrogate reward as tdm_weight * cfg_reward + (1 - tdm_weight) * "
+                f"surrogate_reward, received {self.tdm_weight!r}"
+            )
+        self.surrogate_reference_beta = _finite_float(
+            self.surrogate_reference_beta,
+            "train.surrogate_reference_beta",
+            allow_zero=True,
+        )
+        self.surrogate_reference_threshold = _finite_float(
+            self.surrogate_reference_threshold,
+            "train.surrogate_reference_threshold",
+            allow_zero=False,
+        )
+        self.cfg_reward_scale = _finite_float(
+            self.cfg_reward_scale,
+            "train.cfg_reward_scale",
+            allow_zero=True,
+        )
+        if not isinstance(self.use_time_weighting, bool):
+            raise TypeError(
+                "expected train.use_time_weighting to be a bool, received "
+                f"{type(self.use_time_weighting).__name__}: {self.use_time_weighting!r}"
+            )
 
     def role_update_plan(self) -> RoleUpdatePlan:
         """Return fake TTUR phases, then one surrogate and one generator phase."""
