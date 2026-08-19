@@ -38,6 +38,9 @@ class TDMR1TrainingArguments(TDMTrainingArguments):
     use_huber: bool = False
     surrogate_reference_beta: float = 0.001
     surrogate_reference_threshold: float = 0.05
+    surrogate_clip_range: float = 1e-3
+    surrogate_slow_decay_min: float = 0.001
+    surrogate_slow_decay_max: float = 0.3
     cfg_reward_scale: float = 3.5
     use_time_weighting: bool = True
 
@@ -81,6 +84,21 @@ class TDMR1TrainingArguments(TDMTrainingArguments):
             "train.cfg_reward_scale",
             allow_zero=True,
         )
+        self.surrogate_clip_range = _finite_float(
+            self.surrogate_clip_range,
+            "train.surrogate_clip_range",
+            allow_zero=True,
+        )
+        for name in ("surrogate_slow_decay_min", "surrogate_slow_decay_max"):
+            decay = _finite_float(getattr(self, name), f"train.{name}", allow_zero=True)
+            if decay > 1.0:
+                raise ValueError(f"expected train.{name} in [0, 1], received {decay!r}")
+            setattr(self, name, decay)
+        if self.surrogate_slow_decay_min > self.surrogate_slow_decay_max:
+            raise ValueError(
+                "expected train.surrogate_slow_decay_min <= train.surrogate_slow_decay_max, "
+                f"received {self.surrogate_slow_decay_min} and {self.surrogate_slow_decay_max}"
+            )
         if not isinstance(self.use_time_weighting, bool):
             raise TypeError(
                 "expected train.use_time_weighting to be a bool, received "

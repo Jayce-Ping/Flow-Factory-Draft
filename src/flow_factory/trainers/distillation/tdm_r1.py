@@ -43,6 +43,9 @@ from .distribution_matching import revised_x0_loss
 from .group_preference import GroupPreferenceBatch, group_preference_loss
 from .tdm import TDMBoundaryUnit, TDMTrainer
 
+SLOW_SURROGATE_SNAPSHOT = "tdm_r1_slow_surrogate"
+"""Name of the lagging surrogate copy the PPO trust region is measured against."""
+
 
 class TDMR1Trainer(BaseTrainer):
     """Reinforce deterministic TDM trajectories through a frozen-reference surrogate."""
@@ -187,6 +190,7 @@ class TDMR1Trainer(BaseTrainer):
 
     def _surrogate_phase(self, microbatches: Sequence[Sequence[BaseSample]]) -> None:
         """Update the surrogate with group preference on endpoint advantages."""
+        self._ensure_slow_surrogate()
         run_role_phase(
             self,
             "surrogate",
@@ -196,6 +200,24 @@ class TDMR1Trainer(BaseTrainer):
                 self._surrogate_boundary_loss,
             ),
         )
+        # The trust region widens as training settles: early on the slow copy tracks the
+        # surrogate closely so the ratio stays meaningful while both move fast, and it is
+        # then allowed to lag, which is what makes the clip bite later.
+        decay = min(
+            self.training_args.surrogate_slow_decay_max,
+            self.training_args.surrogate_slow_decay_min + 0.001 * self.step,
+        )
+        self.adapter.update_variant_snapshot(SLOW_SURROGATE_SNAPSHOT, decay)
+        record_distillation_metric(self, "train/surrogate_slow_decay", decay)
+
+    def _ensure_slow_surrogate(self) -> None:
+        """Create the slow surrogate copy the trust region is measured against.
+
+        Declared on first use rather than at construction because the variant it copies
+        does not exist until the adapter has declared its trainable roles.
+        """
+        if not self.adapter.has_variant_snapshot(SLOW_SURROGATE_SNAPSHOT):
+            self.adapter.declare_variant_snapshot("surrogate", SLOW_SURROGATE_SNAPSHOT)
 
     def _generator_phase(self, microbatches: Sequence[Sequence[BaseSample]]) -> None:
         """Update the generator with TDM plus a scaled preference term."""
@@ -224,10 +246,11 @@ class TDMR1Trainer(BaseTrainer):
             "train/surrogate_value_delta",
             (trainable_values - reference_values).mean(),
         )
+        clipped_values = self._clip_outside_trust_region(unit, trainable_values, preference_batch)
         preference_loss = group_preference_loss(
             self.accelerator,
             preference_batch,
-            self._clip_runaway_surrogate(trainable_values, reference_values, preference_batch),
+            self._clip_runaway_surrogate(clipped_values, reference_values, preference_batch),
             reference_values,
             self.training_args.surrogate_preference_beta,
         )
@@ -238,6 +261,39 @@ class TDMR1Trainer(BaseTrainer):
         record_distillation_metric(self, "train/surrogate_reference_penalty", reference_penalty)
         loss = preference_loss + self.training_args.surrogate_reference_beta * reference_penalty
         return self._time_weight(unit) * loss
+
+    def _clip_outside_trust_region(
+        self,
+        unit: TDMBoundaryUnit,
+        trainable_values: torch.Tensor,
+        preference_batch: GroupPreferenceBatch,
+    ) -> torch.Tensor:
+        """Freeze samples that have moved too far since the slow copy was taken.
+
+        This is the PPO trust region, measured on the same quantity the preference loss
+        uses: the ratio ``exp(old_dsm - dsm)`` is above one exactly when the surrogate
+        now denoises the sample better than its slow copy did. A sample that has already
+        moved further than ``surrogate_clip_range`` in the direction its advantage asks
+        for keeps the update it earned but stops accumulating more, which is what bounds
+        how far one batch of noisy rewards can drag the surrogate.
+        """
+        clip_range = self.training_args.surrogate_clip_range
+        if clip_range == 0.0:
+            return trainable_values
+        with self.adapter.use_variant_snapshot(SLOW_SURROGATE_SNAPSHOT):
+            with torch.no_grad():
+                slow_values, _ = self._boundary_preference_values(
+                    unit,
+                    trainable_role="surrogate",
+                )
+        ratio = torch.exp(slow_values.detach() - trainable_values.detach())
+        clipped = torch.where(
+            preference_batch.advantages > 0,
+            ratio > 1.0 + clip_range,
+            ratio < 1.0 - clip_range,
+        )
+        record_distillation_metric(self, "train/surrogate_trust_clip_ratio", clipped.float().mean())
+        return torch.where(clipped, trainable_values.detach(), trainable_values)
 
     def _clip_runaway_surrogate(
         self,
