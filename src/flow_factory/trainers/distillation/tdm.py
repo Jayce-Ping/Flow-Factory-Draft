@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, Iterator, List, Literal, Sequence, Tuple
+from typing import Any, ClassVar, Dict, Iterator, List, Literal, Optional, Sequence, Tuple
 
 import torch
 from accelerate import Accelerator
@@ -223,7 +223,9 @@ class TDMTrainer(BaseTrainer):
                 replay_step.times.timestep[primary_name], batch_size
             )
             interval_start = self._as_per_sample_coordinate(
-                replay_step.times.next_timestep[primary_name], batch_size
+                replay_step.times.next_timestep[primary_name],
+                batch_size,
+                like=interval_end,
             )
             self._validate_interval(
                 batch,
@@ -245,32 +247,39 @@ class TDMTrainer(BaseTrainer):
         return units
 
     @staticmethod
-    def _as_per_sample_coordinate(coordinate: torch.Tensor, batch_size: int) -> torch.Tensor:
-        """Return a scheduler coordinate as one value per sample.
+    def _as_per_sample_coordinate(
+        coordinate: torch.Tensor,
+        batch_size: int,
+        like: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return a scheduler coordinate as one real value per sample.
 
-        A coordinate shared by the whole batch -- the terminal boundary is the usual case
-        -- arrives as a scalar. That says the same thing as a ``(B,)`` tensor of the value
-        and everything downstream wants the latter, so widen it here rather than teach
-        each consumer to accept both.
+        The terminal boundary is shared by the whole batch and is synthesized as an
+        integer zero, so it arrives as a scalar of the wrong dtype. Both are the same
+        number the schedule means; widen and convert once here rather than teach every
+        consumer downstream to accept the other form.
 
         Args:
             coordinate: Scalar or per-sample scheduler coordinate.
             batch_size: Number of samples in the replay unit.
+            like: Coordinate from the same boundary whose dtype and device to match.
 
         Returns:
-            A ``(B,)`` tensor.
+            A ``(B,)`` tensor in the schedule's real dtype.
 
         Raises:
             ValueError: If the coordinate is neither scalar nor ``(B,)``.
         """
         if coordinate.ndim == 0:
-            return coordinate.expand(batch_size)
-        if coordinate.ndim == 1 and coordinate.shape[0] == batch_size:
-            return coordinate
-        raise ValueError(
-            f"expected a scalar or ({batch_size},) scheduler coordinate, "
-            f"received shape {tuple(coordinate.shape)}"
-        )
+            coordinate = coordinate.expand(batch_size)
+        elif coordinate.ndim != 1 or coordinate.shape[0] != batch_size:
+            raise ValueError(
+                f"expected a scalar or ({batch_size},) scheduler coordinate, "
+                f"received shape {tuple(coordinate.shape)}"
+            )
+        if like is not None and coordinate.dtype != like.dtype:
+            coordinate = coordinate.to(dtype=like.dtype, device=like.device)
+        return coordinate
 
     def _validate_sample_boundaries(
         self,
