@@ -188,6 +188,14 @@ class TrainingArguments(ArgABC):
         metadata={"help": "Guidance scale for sampling."},
     )
 
+    # Read by `BaseAdapter._init_ref_parameters`, which every algorithm inherits, so it
+    # belongs to every algorithm's arguments. Six of them declared it separately and the
+    # rest crashed on a full-weight run the moment they needed a reference.
+    ref_param_device: Literal["cpu", "cuda"] = field(
+        default="cuda",
+        metadata={"help": "Device to store reference model parameters."},
+    )
+
     # --- Seed ---
     seed: int = field(
         default=42,

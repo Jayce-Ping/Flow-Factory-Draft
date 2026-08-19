@@ -60,11 +60,6 @@ class NFTTrainingArguments(TrainingArguments):
         default=0,
         metadata={"help": "KL penalty beta. 0 to disable."},
     )
-    ref_param_device: Literal["cpu", "cuda"] = field(
-        default="cuda",
-        metadata={"help": "Device to store reference model parameters."},
-    )
-
     # Timestep control
     num_train_timesteps: int = field(
         default=0,

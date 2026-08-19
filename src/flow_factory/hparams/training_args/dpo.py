@@ -37,11 +37,6 @@ class DPOTrainingArguments(TrainingArguments):
         default=2000.0,
         metadata={"help": "DPO temperature parameter controlling preference sharpness."},
     )
-    ref_param_device: Literal["cpu", "cuda"] = field(
-        default="cuda",
-        metadata={"help": "Device to store reference model parameters."},
-    )
-
     # Advantage / pair formation
     global_std: bool = field(
         default=True,

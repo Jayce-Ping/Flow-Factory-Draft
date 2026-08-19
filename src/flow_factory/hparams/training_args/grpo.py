@@ -56,10 +56,6 @@ class GRPOTrainingArguments(TrainingArguments):
         default=0,
         metadata={"help": "KL penalty beta. 0 to disable."},
     )
-    ref_param_device: Literal["cpu", "cuda"] = field(
-        default="cuda",
-        metadata={"help": "Device to store reference model parameters."},
-    )
 
     def __post_init__(self):
         super().__post_init__()

@@ -114,11 +114,6 @@ class CRDTrainingArguments(TrainingArguments):
         default=True,
         metadata={"help": "Dynamically adjust KL strength based on reward signal."},
     )
-    ref_param_device: Literal["cpu", "cuda"] = field(
-        default="cuda",
-        metadata={"help": "Device to store reference model parameters."},
-    )
-
     # Timestep control
     num_train_timesteps: int = field(
         default=0,
