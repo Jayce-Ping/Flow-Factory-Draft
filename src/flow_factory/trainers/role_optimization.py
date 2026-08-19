@@ -357,12 +357,10 @@ class RoleOptimizationCoordinator:
         role = self.roles[role_name]
         if self._gradients_reach_parameters():
             if not any(parameter.grad is not None for parameter in role.parameters):
-                trainable = sum(1 for p in role.parameters if p.requires_grad)
                 raise RuntimeError(
-                    f"active role {role_name!r} expected at least one gradient at the "
-                    f"sync boundary, received none across {len(role.parameters)} parameter(s) "
-                    f"of which {trainable} require grad; backend is "
-                    f"{self.accelerator.distributed_type}"
+                    f"active role {role_name!r} expected at least one gradient at the sync "
+                    f"boundary, received none. Backend {self.accelerator.distributed_type}; "
+                    f"{self._role_ownership_report()}"
                 )
             inactive_gradients = tuple(
                 other_name
@@ -392,6 +390,37 @@ class RoleOptimizationCoordinator:
         if role.scheduler is not None:
             role.scheduler.step()
         return True
+
+    def _role_ownership_report(self) -> str:
+        """Describe what every role owns right now, for a gradient failure to quote.
+
+        A role that reaches its sync boundary without gradients has either been handed
+        the wrong parameters or had them frozen since its forward, and telling those two
+        apart from the outside is otherwise a guessing game.
+
+        Returns:
+            One clause per role, plus which parameter identities the roles share.
+        """
+        clauses = []
+        for name, role in self.roles.items():
+            total = len(role.parameters)
+            trainable = sum(1 for parameter in role.parameters if parameter.requires_grad)
+            with_grad = sum(1 for parameter in role.parameters if parameter.grad is not None)
+            clauses.append(
+                f"{name}: {total} params, {trainable} require grad, {with_grad} have grad"
+            )
+        identities = {name: {id(p) for p in role.parameters} for name, role in self.roles.items()}
+        names = list(identities)
+        overlaps = [
+            f"{left}/{right} share {len(identities[left] & identities[right])}"
+            for index, left in enumerate(names)
+            for right in names[index + 1 :]
+            if identities[left] & identities[right]
+        ]
+        report = "; ".join(clauses)
+        if overlaps:
+            report = f"{report}; overlapping identities: {', '.join(overlaps)}"
+        return report
 
     def _gradients_reach_parameters(self) -> bool:
         """Report whether this backend leaves gradients on ``parameter.grad``.
