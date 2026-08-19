@@ -83,8 +83,8 @@ class TDMR1Trainer(BaseTrainer):
     def _build_boundary_units(self, samples: Sequence[BaseSample]) -> List[TDMBoundaryUnit]:
         return TDMTrainer._build_boundary_units(self, samples)
 
-    def _validate_sample_boundaries(self, samples: Tuple[BaseSample, ...]) -> None:
-        TDMTrainer._validate_sample_boundaries(self, samples)
+    def _validate_sample_boundaries(self, samples: Tuple[BaseSample, ...], batch: Any) -> None:
+        TDMTrainer._validate_sample_boundaries(self, samples, batch)
 
     def _validate_interval(self, *args: Any, **kwargs: Any) -> None:
         TDMTrainer._validate_interval(self, *args, **kwargs)

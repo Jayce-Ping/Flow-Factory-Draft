@@ -209,8 +209,8 @@ class TDMTrainer(BaseTrainer):
 
         units: List[TDMBoundaryUnit] = []
         replay_samples = tuple(samples)
-        self._validate_sample_boundaries(replay_samples)
         batch = self._stack_replay_unit(replay_samples)
+        self._validate_sample_boundaries(replay_samples, batch)
         previous_interval_start: torch.Tensor | None = None
         for boundary_index in range(1, self.training_args.trajectory_steps + 1):
             replay_step = self.adapter.get_replay_step(
@@ -239,18 +239,51 @@ class TDMTrainer(BaseTrainer):
             previous_interval_start = interval_start
         return units
 
-    def _validate_sample_boundaries(self, samples: Tuple[BaseSample, ...]) -> None:
-        """Require dense structured state storage at all K + 1 rollout positions."""
+    def _validate_sample_boundaries(
+        self,
+        samples: Tuple[BaseSample, ...],
+        batch: StackedSampleBatch,
+    ) -> None:
+        """Require every one of the K + 1 rollout positions to be readable.
+
+        Expressed through the same accessor the replay itself uses, because that is what
+        the precondition is about. Reading ``sample.trajectory`` directly would restrict
+        the algorithm to the adapters that publish a ``StructuredTrajectory`` -- today
+        only the LTX2 pair -- while every other adapter stores the same boundaries in the
+        legacy layout that ``get_replay_step`` understands.
+
+        Where a structured trajectory is present its internals are checked too, since
+        they say more than the accessor can.
+
+        Args:
+            samples: Rollout samples forming one replay unit.
+            batch: The same samples, collated.
+
+        Raises:
+            ValueError: If any boundary is missing or inconsistently stored.
+        """
+        for boundary_index in range(self.training_args.trajectory_steps):
+            try:
+                self.adapter.get_replay_step(batch, boundary_index)
+            except (KeyError, IndexError, ValueError, TypeError) as error:
+                raise ValueError(
+                    f"TDM requires all {self.training_args.trajectory_steps} rollout "
+                    f"transitions to be stored; reading transition {boundary_index} failed. "
+                    "The rollout must collect every boundary, so "
+                    "`trajectory_indices` has to span the full schedule."
+                ) from error
+
+        self._validate_structured_boundaries(samples)
+
+    def _validate_structured_boundaries(self, samples: Tuple[BaseSample, ...]) -> None:
+        """Check the stronger invariants an adapter that publishes structure can offer."""
         expected_length = self.training_args.trajectory_steps + 1
         component_order = self.adapter.trajectory_component_order
         expected_map = torch.arange(expected_length, dtype=torch.int64)
         for sample_index, sample in enumerate(samples):
             trajectory = sample.trajectory
             if not isinstance(trajectory, StructuredTrajectory):
-                raise TypeError(
-                    "TDM requires StructuredTrajectory for every rollout sample; "
-                    f"received {type(trajectory).__name__} for sample_index={sample_index}"
-                )
+                continue
             if trajectory.component_names != component_order:
                 raise ValueError(
                     f"TDM expected trajectory component order {component_order}, received "
