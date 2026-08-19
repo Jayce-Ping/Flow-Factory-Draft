@@ -33,6 +33,7 @@ from typing import (
 )
 
 import torch
+from tqdm import tqdm
 
 from ...models.abc import BaseAdapter
 from ...samples import (
@@ -404,6 +405,29 @@ def generate_one_rollout_batch(
         )
 
 
+def role_repeat_progress(trainer: Any, *, role_name: str, repeats: int) -> Iterator[int]:
+    """Report progress through a role's repeated phases.
+
+    TTUR runs the fake role several times per generator step, so the repeat count --
+    not the microbatch window -- is what a reader watching the log wants to see move.
+
+    Args:
+        trainer: Trainer owning the epoch counter and progress-bar preference.
+        role_name: Role being repeated, shown in the bar description.
+        repeats: Number of phases to run.
+
+    Returns:
+        Iterator over the repeat indices, wrapped in a progress bar.
+    """
+    return tqdm(
+        range(repeats),
+        desc=f"Epoch {trainer.epoch} {role_name.capitalize()}",
+        position=1,
+        leave=False,
+        disable=not trainer.show_progress_bar,
+    )
+
+
 def run_role_phase(
     trainer: Any,
     role_name: str,
@@ -421,7 +445,15 @@ def run_role_phase(
     if not microbatches:
         raise ValueError(f"{role_name} phase expected at least one microbatch, received none")
     with trainer.role_optimization.phase(role_name):
-        for microbatch in microbatches:
+        # A single microbatch would render a 1/1 bar once per TTUR repeat, which is
+        # noise; the role's own progress is already carried by the caller's bar.
+        for microbatch in tqdm(
+            microbatches,
+            desc=f"Epoch {trainer.epoch} {role_name.capitalize()}",
+            position=2,
+            leave=False,
+            disable=not trainer.show_progress_bar or len(microbatches) < 2,
+        ):
             with trainer.role_optimization.microbatch():
                 trainer.role_optimization.backward(loss_fn(microbatch))
                 trainer._finish_role_microbatch()
@@ -454,7 +486,12 @@ def run_distillation_training_step(trainer: Any) -> None:
             f"{type(accumulation_steps).__name__}: {accumulation_steps!r}"
         )
     microbatches: List[List[BaseSample]] = []
-    for _ in range(accumulation_steps):
+    for _ in tqdm(
+        range(accumulation_steps),
+        desc=f"Epoch {trainer.epoch} Sampling",
+        position=0,
+        disable=not trainer.show_progress_bar,
+    ):
         with trainer.sampling_context():
             samples = trainer.sample()
         trainer.prepare_feedback(samples)
