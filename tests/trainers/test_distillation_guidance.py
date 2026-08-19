@@ -69,3 +69,21 @@ def test_a_real_scale_below_one_is_refused(value: float) -> None:
 def test_a_negative_real_scale_is_refused() -> None:
     with pytest.raises(ValueError, match="real_guidance_scale >= 0, received -1.0"):
         DMD2TrainingArguments(real_guidance_scale=-1.0)
+
+
+def test_preprocessing_encodes_negatives_for_the_guided_real_score() -> None:
+    """Otherwise the guided query finds no negatives and quietly runs unguided.
+
+    Preprocessing decides whether to encode negative prompts from one number. The
+    configuration this algorithm wants -- a CFG-free generator beside a guided real
+    score -- puts 1.0 in `guidance_scale`, which would skip them.
+    """
+    guided = DMD2TrainingArguments(guidance_scale=1.0, real_guidance_scale=4.0)
+
+    assert guided.get_preprocess_guidance_scale() == 4.0
+
+
+def test_preprocessing_follows_the_sampling_scale_when_the_real_score_is_unset() -> None:
+    plain = DMD2TrainingArguments(guidance_scale=3.5)
+
+    assert plain.get_preprocess_guidance_scale() == 3.5

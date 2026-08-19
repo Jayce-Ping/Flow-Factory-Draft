@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+from unittest import mock
 from contextlib import contextmanager, nullcontext
 from types import MethodType, SimpleNamespace
 from typing import Any, Iterator, Mapping, Tuple
@@ -394,14 +395,29 @@ def test_dmd2_generator_loss_is_finite_and_depends_on_fake_minus_real() -> None:
     assert torch.isfinite(gradient)
 
 
-def test_dmd2_initializes_no_reward_or_advantage_runtime() -> None:
-    trainer = object.__new__(DMD2Trainer)
+def test_dmd2_refuses_to_train_against_rewards_but_keeps_the_eval_runtime() -> None:
+    """The reward-free contract covers training, not eval.
 
-    assert trainer._init_reward_model() == ({}, {})
-    assert trainer.reward_models == {}
-    assert trainer.eval_reward_models == {}
-    assert trainer.reward_buffer is None
-    assert trainer.advantage_processor is None
+    Zeroing the whole feedback runtime took eval monitoring with it: `eval_freq` fired
+    and every dataset was skipped for want of a reward buffer. Training rewards are
+    rejected in `Arguments`, so the shared implementation is safe to reuse; this guards
+    the one thing DMD2 still has to assert.
+    """
+    trainer = object.__new__(DMD2Trainer)
+    trainer._init_reward_model_calls = []
+
+    def fake_base(self_: object) -> tuple:
+        return {"ocr": object()}, {}
+
+    with mock.patch.object(BaseTrainer, "_init_reward_model", fake_base):
+        with pytest.raises(RuntimeError, match="must not train against rewards.*ocr"):
+            trainer._init_reward_model()
+
+    with mock.patch.object(BaseTrainer, "_init_reward_model", lambda self_: ({}, {"ocr": 1})):
+        training_models, eval_models = trainer._init_reward_model()
+
+    assert training_models == {}
+    assert eval_models == {"ocr": 1}
 
 
 def test_dmd2_production_source_has_no_forbidden_data_objectives() -> None:

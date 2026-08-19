@@ -68,6 +68,21 @@ class DMD2TrainingArguments(TrainingArguments):
     replay_rtol: float = 1e-4
     replay_atol: float = 1e-4
 
+    def get_preprocess_guidance_scale(self) -> float:
+        """Account for the real score's guidance: the generator samples CFG-free.
+
+        Preprocessing decides from this whether to encode negative prompts. Reading only
+        `guidance_scale` would skip them for exactly the configuration this algorithm
+        wants -- a CFG-free generator beside a guided real score -- and the guided query
+        would then find no negatives and silently fall back to no guidance.
+
+        Returns:
+            The largest guidance scale any stage of this run may ask for.
+        """
+        if self.real_guidance_scale is None:
+            return self.guidance_scale
+        return max(self.guidance_scale, self.real_guidance_scale)
+
     def __post_init__(self) -> None:
         """Validate DMD2 controls."""
         super().__post_init__()

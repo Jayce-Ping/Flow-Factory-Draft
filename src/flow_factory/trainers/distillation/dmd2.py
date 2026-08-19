@@ -38,6 +38,7 @@ from ...hparams import Arguments, DMD2TrainingArguments
 from ...hparams.training_args.dmd2 import DMD2_DEFAULT_OPTIMIZERS
 from ...models.abc import BaseAdapter
 from ...samples import BaseSample, ComponentTimes, LatentState, StackedSampleBatch
+from ...rewards import BaseRewardModel
 from ..abc import BaseTrainer
 from .distillation_runtime import (
     as_role_microbatches,
@@ -125,16 +126,25 @@ class DMD2Trainer(BaseTrainer):
                 "Start a fresh rollout before another generator update."
             )
 
-    def _init_reward_model(self) -> Tuple[Dict[str, object], Dict[str, object]]:
-        """Initialize an explicitly empty feedback runtime."""
-        self.reward_loader = None
-        self.reward_models = {}
-        self.eval_reward_models = {}
-        self.reward_buffer = None
-        self.eval_dataset_reward_buffers = {}
-        self._eval_dataset_configs = {}
-        self.advantage_processor = None
-        return self.reward_models, self.eval_reward_models
+    def _init_reward_model(self) -> Tuple[Dict[str, BaseRewardModel], Dict[str, BaseRewardModel]]:
+        """Build the shared feedback runtime, which for this algorithm is eval-only.
+
+        The reward-free training contract is enforced where it belongs: `Arguments`
+        rejects any `rewards` entry for this trainer, so the training side of the shared
+        implementation builds empty on its own. Zeroing the whole runtime here as well
+        used to take the eval side with it, which is why `eval_freq` fired and every
+        dataset was skipped for want of a reward buffer.
+
+        Returns:
+            Training and eval reward models; the training mapping is always empty.
+        """
+        training_models, eval_models = super()._init_reward_model()
+        if training_models:
+            raise RuntimeError(
+                "DMD2 is data-free and must not train against rewards, received "
+                f"{sorted(training_models)}"
+            )
+        return training_models, eval_models
 
     def _run_training_step(self) -> None:
         """Run GAS distinct rollouts, then fake TTUR updates, then one generator step.
