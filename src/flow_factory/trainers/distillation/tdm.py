@@ -42,6 +42,7 @@ from .distillation_runtime import (
     query_score_velocity,
     replay_forward_kwargs,
     require_velocity,
+    role_repeat_progress,
     run_distillation_training_step,
     run_role_phase,
     validate_media_free_rollout,
@@ -184,7 +185,9 @@ class TDMTrainer(BaseTrainer):
             algorithm_name="TDM",
         )
         self.adapter.train()
-        for _ in range(self.training_args.ttur_fake_updates):
+        for _ in role_repeat_progress(
+            self, role_name="fake", repeats=self.training_args.ttur_fake_updates
+        ):
             self._fake_phase(microbatches)
         self._generator_phase(microbatches)
 
