@@ -75,6 +75,7 @@ class TinyRoleAdapter(BaseAdapter):
         self.model_args = SimpleNamespace(
             finetune_type=finetune_type,
             target_components=["transformer"],
+            trainable_parameters_dtype=torch.float32,
         )
         self.target_module_map = {"transformer": ["target"]}
         component: torch.nn.Module = TinyRoleModule()

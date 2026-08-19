@@ -95,6 +95,7 @@ class TinyAdapter(BaseAdapter):
             target_components=list(component_names),
             target_modules=["target"],
             lora_alpha=1,
+            trainable_parameters_dtype=torch.float32,
         )
         self.target_module_map = {name: ["target"] for name in component_names}
         self._component_names = component_names
@@ -399,6 +400,34 @@ def test_a_resume_that_runs_before_the_roles_exist_is_finished_once_they_do(
         torch.testing.assert_close(actual, want, rtol=0, atol=0)
     for actual, want in zip(_values(target, BASE_VARIANT), expected_base):
         torch.testing.assert_close(actual, want, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("finetune_type", ["lora", "full"])
+def test_a_late_variant_gets_the_dtype_the_base_was_already_given(finetune_type: str) -> None:
+    """Variants are materialized after `_mix_precision` ran, from PEFT fp32 defaults.
+
+    Left alone, a DMD2 fake score trains in fp32 beside a bf16 generator: twice the
+    memory, a different numerical path, and every RMSNorm it feeds drops off the
+    fused kernel because the weight dtype stops matching the activations.
+    """
+    adapter = TinyAdapter(Accelerator(cpu=True), finetune_type)
+    adapter.model_args.trainable_parameters_dtype = torch.bfloat16
+    for parameter in adapter.get_component("transformer").parameters():
+        parameter.data = parameter.data.to(torch.bfloat16)
+
+    adapter.declare_component_variants((BASE_VARIANT, "fake"))
+
+    fake = list(adapter.component_variant_registry.parameters("fake"))
+    assert fake
+    assert all(parameter.dtype == torch.bfloat16 for parameter in fake)
+
+
+def test_a_dtype_that_names_nothing_is_refused_with_what_it_received() -> None:
+    adapter = TinyAdapter(Accelerator(cpu=True), "lora")
+    adapter.model_args.trainable_parameters_dtype = "not-a-dtype"
+
+    with pytest.raises(TypeError, match="trainable_parameters_dtype.*received str: 'not-a-dtype'"):
+        adapter.declare_component_variants((BASE_VARIANT, "fake"))
 
 
 def test_restoring_roles_before_declaring_them_is_refused(tmp_path: Path) -> None:

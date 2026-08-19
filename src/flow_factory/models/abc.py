@@ -761,6 +761,39 @@ class BaseAdapter(ABC):
             )
         registry.materialize(trainable_variants)
         self.component_variant_registry = registry
+        self._apply_trainable_dtype_to_late_variants(registry, base_variant)
+
+    def _apply_trainable_dtype_to_late_variants(
+        self, registry: ComponentVariantRegistry, base_variant: str
+    ) -> None:
+        """Give variants created here the dtype ``_mix_precision`` already applied.
+
+        ``_mix_precision`` runs while the adapter is built and only sees the base
+        components; these variants are materialized later, from PEFT defaults, so
+        without this a DMD2 fake score would train in fp32 beside a bf16 generator --
+        twice the memory, a different numerical path, and every RMSNorm it feeds
+        falling off the fused kernel because its weight no longer matches the
+        activations.
+
+        Args:
+            registry: Registry holding the freshly materialized variants.
+            base_variant: Variant that ``_mix_precision`` already handled.
+        """
+        train_dtype = self.model_args.trainable_parameters_dtype
+        if train_dtype is None:
+            return
+        target_dtype = self._DTYPE_MAP.get(train_dtype, train_dtype)
+        if not isinstance(target_dtype, torch.dtype):
+            raise TypeError(
+                "expected model trainable_parameters_dtype to name a torch dtype, received "
+                f"{type(train_dtype).__name__}: {train_dtype!r}"
+            )
+        for variant_name in registry.variant_names:
+            if variant_name == base_variant:
+                continue
+            for parameter in registry.parameters(variant_name):
+                if parameter.is_floating_point() and parameter.dtype != target_dtype:
+                    parameter.data = parameter.data.to(target_dtype)
 
     def _require_variant_registry(self, purpose: str) -> ComponentVariantRegistry:
         """Return the variant registry, naming the caller that needs it."""
