@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from numbers import Real
-from typing import Any, ClassVar, Dict, Iterator, List, Literal, Sequence, Tuple
+from typing import Any, ClassVar, Dict, Iterator, List, Literal, Optional, Sequence, Tuple
 
 import torch
 from accelerate import Accelerator
@@ -233,9 +233,14 @@ class TDMR1Trainer(BaseTrainer):
 
     def _surrogate_boundary_loss(self, unit: TDMBoundaryUnit) -> torch.Tensor:
         """Score one stored boundary with the surrogate and apply group preference."""
+        # One draw shared by the live surrogate and its slow copy, so the trust-region
+        # ratio below reflects the step the surrogate took rather than a fresh
+        # perturbation.
+        context = self._boundary_score_context(unit)
         trainable_values, reference_values = self._boundary_preference_values(
             unit,
             trainable_role="surrogate",
+            context=context,
         )
         preference_batch = self._group_preference_batch(unit, trainable_values)
         # How far the surrogate density has drifted from its frozen reference. The
@@ -246,7 +251,9 @@ class TDMR1Trainer(BaseTrainer):
             "train/surrogate_value_delta",
             (trainable_values - reference_values).mean(),
         )
-        clipped_values = self._clip_outside_trust_region(unit, trainable_values, preference_batch)
+        clipped_values = self._clip_outside_trust_region(
+            unit, trainable_values, preference_batch, context=context
+        )
         preference_loss = group_preference_loss(
             self.accelerator,
             preference_batch,
@@ -267,6 +274,8 @@ class TDMR1Trainer(BaseTrainer):
         unit: TDMBoundaryUnit,
         trainable_values: torch.Tensor,
         preference_batch: GroupPreferenceBatch,
+        *,
+        context: Optional[tuple[Any, Any, Any]] = None,
     ) -> torch.Tensor:
         """Freeze samples that have moved too far since the slow copy was taken.
 
@@ -285,6 +294,7 @@ class TDMR1Trainer(BaseTrainer):
                 slow_values, _ = self._boundary_preference_values(
                     unit,
                     trainable_role="surrogate",
+                    context=context,
                 )
         ratio = torch.exp(slow_values.detach() - trainable_values.detach())
         clipped = torch.where(
@@ -490,13 +500,42 @@ class TDMR1Trainer(BaseTrainer):
         )
         return trainable_values, reference_values.detach()
 
+    def _boundary_score_context(self, unit: TDMBoundaryUnit) -> tuple[Any, Any, Any]:
+        """Draw one noised boundary for every role scored against it.
+
+        Returned rather than redrawn per role because two roles compared on different
+        perturbations differ by the draw as much as by their parameters, which would
+        turn the trust-region ratio into a measure of sampling noise.
+
+        Args:
+            unit: Boundary unit to perturb.
+
+        Returns:
+            The stacked batch, the noised state, and the component times.
+        """
+        batch = self._stack_replay_unit(unit.samples)
+        replay_step = self.adapter.get_replay_step(batch, unit.boundary_index - 1)
+        boundary_state = detach_state(replay_step.next_state)
+        primary_times = self._sample_perturbation_times(unit)
+        times = self.adapter.build_training_component_times(primary_times, batch=batch)
+        self._validate_score_query_sigmas(
+            times,
+            primary_times,
+            boundary_index=unit.boundary_index,
+        )
+        return batch, self.adapter.add_forward_process_noise(boundary_state, times), times
+
     def _boundary_preference_values(
         self,
         unit: TDMBoundaryUnit,
         *,
         trainable_role: str,
+        context: Optional[tuple[Any, Any, Any]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return per-sample DSM values for a trainable role and frozen reference."""
+        if context is not None:
+            batch, noised, times = context
+            return self._score_boundary_values(batch, noised, times, trainable_role)
         batch = self._stack_replay_unit(unit.samples)
         replay_step = self.adapter.get_replay_step(batch, unit.boundary_index - 1)
         boundary_state = detach_state(replay_step.next_state)
@@ -508,6 +547,16 @@ class TDMR1Trainer(BaseTrainer):
             boundary_index=unit.boundary_index,
         )
         noised = self.adapter.add_forward_process_noise(boundary_state, times)
+        return self._score_boundary_values(batch, noised, times, trainable_role)
+
+    def _score_boundary_values(
+        self,
+        batch: Any,
+        noised: Any,
+        times: Any,
+        trainable_role: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Score one already-noised boundary with a trainable role and the reference."""
         with self.adapter.use_component_variant(trainable_role):
             with self.autocast():
                 trainable_output = self.adapter.forward_state(

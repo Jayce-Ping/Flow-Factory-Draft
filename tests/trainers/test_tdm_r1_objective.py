@@ -196,6 +196,33 @@ def test_a_surrogate_that_has_drifted_far_enough_stops_receiving_gradient(
     torch.testing.assert_close(trainable.grad, torch.tensor([0.0, 1.0, 1.0]))
 
 
+def test_the_slow_copy_is_scored_on_the_same_draw_as_the_live_surrogate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two draws would make the ratio measure perturbation noise, not the step taken."""
+    monkeypatch.setattr(tdm_r1_module, "record_distillation_metric", lambda *args: None)
+    trainer = _generator_trainer(tdm_weight=0.3)
+    trainer.training_args.surrogate_clip_range = 0.1
+    trainer.adapter = SimpleNamespace(use_variant_snapshot=lambda name: _null_context())
+    seen: list = []
+
+    def record_context(self: Any, unit: Any, *, trainable_role: str, context: Any = None):
+        seen.append(context)
+        return torch.ones(2), torch.ones(2)
+
+    monkeypatch.setattr(TDMR1Trainer, "_boundary_preference_values", record_context)
+    sentinel = ("batch", "noised", "times")
+
+    trainer._clip_outside_trust_region(
+        SimpleNamespace(),
+        torch.ones(2),
+        _preference_batch(torch.ones(2)),
+        context=sentinel,
+    )
+
+    assert seen == [sentinel]
+
+
 def test_samples_that_left_the_trust_region_stop_accumulating_updates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -213,7 +240,7 @@ def test_samples_that_left_the_trust_region_stop_accumulating_updates(
     monkeypatch.setattr(
         TDMR1Trainer,
         "_boundary_preference_values",
-        lambda self, unit, *, trainable_role: (slow, slow),
+        lambda self, unit, *, trainable_role, context=None: (slow, slow),
     )
     trainable = torch.tensor([0.5, 0.99, 1.5], requires_grad=True)
     advantages = torch.tensor([1.0, 1.0, -1.0])
