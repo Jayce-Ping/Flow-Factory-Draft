@@ -345,9 +345,11 @@ def _trainer(**overrides: Any) -> TDMTrainer:
     defaults.update(overrides)
     trainer.training_args = SimpleNamespace(**defaults)
     trainer.adapter = TinyTDMAdapter()
-    trainer.accelerator = SimpleNamespace(device=torch.device("cpu"))
+    trainer.accelerator = SimpleNamespace(device=torch.device("cpu"), is_local_main_process=True)
+    trainer.log_args = SimpleNamespace(verbose=False)
     trainer.autocast = nullcontext
     trainer.step = 0
+    trainer.epoch = 0
     return trainer
 
 
@@ -407,6 +409,8 @@ def _objective_trainer() -> tuple[TDMTrainer, ObjectiveTDMAdapter, ObjectiveBund
     )
     trainer.autocast = nullcontext
     trainer.step = 0
+    trainer.epoch = 0
+    trainer.log_args = SimpleNamespace(verbose=False)
     return trainer, adapter, bundle
 
 

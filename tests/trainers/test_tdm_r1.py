@@ -236,6 +236,8 @@ def test_tdm_r1_constructs_without_guidance_branch_hook() -> None:
         num_inner_epochs=1,
     )
     events: list[str] = []
+    trainer.epoch = 0
+    trainer.log_args = SimpleNamespace(verbose=False)
     trainer.adapter = SimpleNamespace(train=lambda: None, scheduler_group={})
     trainer._build_boundary_units = MethodType(
         lambda self, samples: [SimpleNamespace(boundary_index=1, samples=tuple(samples))],
@@ -322,6 +324,8 @@ def test_tdm_r1_feedback_uses_reward_buffer_and_configured_advantages() -> None:
     trainer.advantage_processor = AdvantageProcessorFake()
     trainer.training_args = SimpleNamespace(advantage_aggregation="gdpo")
     trainer.step = 0
+    trainer.epoch = 0
+    trainer.log_args = SimpleNamespace(verbose=False)
     trainer.log_data = lambda *args, **kwargs: None
 
     trainer.prepare_feedback(samples)

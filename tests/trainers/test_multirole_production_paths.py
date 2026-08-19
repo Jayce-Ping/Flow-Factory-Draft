@@ -213,6 +213,8 @@ def _phase_trainer(
     )
     trainer.autocast = nullcontext
     trainer.step = 0
+    trainer.epoch = 0
+    trainer.log_args = SimpleNamespace(verbose=False)
 
     def fake_loss(self: DMD2Trainer, batch: StackedSampleBatch) -> torch.Tensor:
         target = batch["prompt_embeds"].flatten()
@@ -290,6 +292,8 @@ def _real_objective_trainer() -> tuple[DMD2Trainer, TinyDMD2Adapter, TinyBundle]
 
     trainer.autocast = recording_autocast
     trainer.step = 0
+    trainer.epoch = 0
+    trainer.log_args = SimpleNamespace(verbose=False)
     return trainer, adapter, bundle
 
 
