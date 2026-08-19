@@ -52,7 +52,8 @@ def _trainer(**training_overrides: Any) -> DMD2Trainer:
     }
     defaults.update(training_overrides)
     trainer.training_args = SimpleNamespace(**defaults)
-    trainer.accelerator = SimpleNamespace(device=torch.device("cpu"))
+    trainer.accelerator = SimpleNamespace(device=torch.device("cpu"), is_local_main_process=True)
+    trainer.log_args = SimpleNamespace(verbose=False)
     trainer.adapter = SimpleNamespace(train=lambda: None)
     trainer.autocast = nullcontext
     trainer.role_optimization = _FakeCoordinator()

@@ -256,6 +256,8 @@ def _run_production_tdm_r1_optimize(
         per_device_batch_size=2,
     )
     trainer.step = 0
+    trainer.epoch = 0
+    trainer.log_args = SimpleNamespace(verbose=False)
     units = [SimpleNamespace(boundary_index=1)]
     samples = [SimpleNamespace(unique_id=7), SimpleNamespace(unique_id=7)]
     microbatches = [samples for _ in range(gradient_accumulation_steps)]
@@ -330,6 +332,8 @@ def _run_production_tdm_optimize(
         num_inner_epochs=1,
     )
     trainer.step = 0
+    trainer.epoch = 0
+    trainer.log_args = SimpleNamespace(verbose=False)
     trace: list[str] = []
     value = torch.tensor([2.0], device=accelerator.device)
     target = torch.tensor([0.25], device=accelerator.device)
@@ -400,6 +404,8 @@ def _run_production_dmd2_optimize(
         required_trainable_roles=("generator", "fake"),
     )
     trainer.step = 0
+    trainer.epoch = 0
+    trainer.log_args = SimpleNamespace(verbose=False)
     trace: list[str] = []
     value = torch.tensor([2.0], device=accelerator.device)
     target = torch.tensor([0.25], device=accelerator.device)
