@@ -350,6 +350,98 @@ def tdm_fake_loss(
     return (per_sample * importance.to(per_sample) * weight).mean()
 
 
+def revised_x0_loss(
+    adapter: BaseAdapter,
+    x0_student: LatentState,
+    correction: LatentState,
+    normalizer_reference: LatentState,
+    *,
+    use_huber: bool,
+    huber_c: float,
+    eps: float = _EPS,
+) -> torch.Tensor:
+    """Regress the student's clean state toward ``x0_student + correction``.
+
+    Every TDM-R1 generator term has this shape and differs only in which direction
+    revises the target and which reference sets the scale: the distribution-matching
+    term follows the teacher against the fake score, the guidance reward follows the
+    teacher's conditional-minus-unconditional direction, and the surrogate reward
+    follows the surrogate's guided direction against its frozen reference. Sharing one
+    implementation keeps the three from drifting apart in normalization or stop-grad
+    placement, which is where a silently wrong objective would hide.
+
+    Args:
+        adapter: Adapter providing component order and latent reduction.
+        x0_student: Live clean prediction carrying the gradient.
+        correction: Detached direction added to the student to form the target.
+        normalizer_reference: Detached state whose distance to the student scales the loss.
+        use_huber: Whether to use the Pseudo-Huber metric instead of squared error.
+        huber_c: Finite positive Pseudo-Huber constant.
+        eps: Lower clamp on the normalizer.
+
+    Returns:
+        Scalar loss whose gradient drives the student along ``correction``.
+    """
+    adapter = _require_adapter(adapter)
+    x0_student = _require_state(x0_student, identifier="x0_student")
+    correction = _require_state(correction, identifier="correction")
+    normalizer_reference = _require_state(
+        normalizer_reference, identifier="normalizer_reference"
+    )
+    if not isinstance(use_huber, bool):
+        raise TypeError(
+            f"expected use_huber as a bool, received {type(use_huber).__name__}: {use_huber!r}"
+        )
+    if (
+        not isinstance(huber_c, Real)
+        or isinstance(huber_c, bool)
+        or not math.isfinite(float(huber_c))
+        or huber_c <= 0
+    ):
+        raise ValueError(f"expected finite huber_c > 0, received {huber_c!r}")
+    if (
+        not isinstance(eps, Real)
+        or isinstance(eps, bool)
+        or not math.isfinite(float(eps))
+        or eps <= 0
+    ):
+        raise ValueError(f"expected finite eps > 0, received {eps!r}")
+    expected_names = adapter.trajectory_component_order
+    _require_component_order(x0_student, expected_names, identifier="x0_student")
+    _validate_state_against(correction, x0_student, identifier="correction", require_detached=True)
+    _validate_state_against(
+        normalizer_reference,
+        x0_student,
+        identifier="normalizer_reference",
+        require_detached=True,
+    )
+
+    abs_diff = {
+        name: (
+            x0_student.components[name].detach().to(torch.float32)
+            - normalizer_reference.components[name].to(torch.float32)
+        ).abs()
+        for name in expected_names
+    }
+    normalizer = (
+        adapter.reduce_latent_values(abs_diff, state=x0_student)
+        .to(torch.float32)
+        .clamp_min(float(eps))
+    )
+    residuals: dict[str, torch.Tensor] = {}
+    for name in expected_names:
+        student = x0_student.components[name].to(torch.float32)
+        target = (student.detach() + correction.components[name].to(torch.float32)).detach()
+        delta = student - target
+        if use_huber:
+            c = float(huber_c)
+            residuals[name] = torch.sqrt(delta.square() + c * c) - c
+        else:
+            residuals[name] = 0.5 * delta.square()
+    reduced = adapter.reduce_latent_values(residuals, state=x0_student).to(torch.float32)
+    return (reduced / normalizer).mean()
+
+
 def tdm_generator_loss(
     adapter: BaseAdapter,
     x0_student: LatentState,
@@ -388,30 +480,22 @@ def tdm_generator_loss(
     _validate_state_against(x0_real, x0_student, identifier="x0_real", require_detached=True)
     _validate_state_against(x0_fake, x0_student, identifier="x0_fake", require_detached=True)
 
-    abs_diff = {
-        name: (
-            x0_student.components[name].detach().to(torch.float32)
-            - x0_real.components[name].to(torch.float32)
-        ).abs()
-        for name in expected_names
-    }
-    normalizer = (
-        adapter.reduce_latent_values(abs_diff, state=x0_student)
-        .to(torch.float32)
-        .clamp_min(float(eps))
+    correction = LatentState(
+        {
+            name: (
+                x0_real.components[name].to(torch.float32)
+                - x0_fake.components[name].to(torch.float32)
+            ).detach()
+            for name in expected_names
+        },
+        active_masks=x0_student.active_masks,
     )
-    residuals: dict[str, torch.Tensor] = {}
-    for name in expected_names:
-        student = x0_student.components[name].to(torch.float32)
-        real = x0_real.components[name].to(torch.float32)
-        fake = x0_fake.components[name].to(torch.float32)
-        correction = (real - fake).detach()
-        target = (student.detach() + correction).detach()
-        delta = student - target
-        if use_huber:
-            c = float(huber_c)
-            residuals[name] = torch.sqrt(delta.square() + c * c) - c
-        else:
-            residuals[name] = 0.5 * delta.square()
-    reduced = adapter.reduce_latent_values(residuals, state=x0_student).to(torch.float32)
-    return (reduced / normalizer).mean()
+    return revised_x0_loss(
+        adapter,
+        x0_student,
+        correction,
+        x0_real,
+        use_huber=use_huber,
+        huber_c=huber_c,
+        eps=eps,
+    )

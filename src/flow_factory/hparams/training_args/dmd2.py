@@ -83,6 +83,16 @@ class DMD2TrainingArguments(TrainingArguments):
             return self.guidance_scale
         return max(self.guidance_scale, self.real_guidance_scale)
 
+    def get_reference_guidance_scale(self) -> float:
+        """Return the guidance scale the real score is actually queried at.
+
+        Returns:
+            ``real_guidance_scale`` when set, otherwise the shared scale.
+        """
+        if self.real_guidance_scale is None:
+            return self.guidance_scale
+        return self.real_guidance_scale
+
     def __post_init__(self) -> None:
         """Validate DMD2 controls."""
         super().__post_init__()
