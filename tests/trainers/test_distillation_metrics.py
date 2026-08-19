@@ -38,18 +38,20 @@ class SingleRankAccelerator:
 
     def reduce(self, tensor: torch.Tensor, reduction: str) -> torch.Tensor:
         """Return the tensor untouched, as a one-rank group reduction would."""
-        if reduction not in {"sum", "min", "max"}:
-            raise ValueError(f"expected sum, min, or max reduction, received {reduction!r}")
+        # Accelerate maps every reduction other than "max" onto a sum, so the buffer
+        # may only ask for the two it really implements.
+        if reduction not in {"sum", "max"}:
+            raise ValueError(f"expected a sum or max reduction, received {reduction!r}")
         return tensor
 
 
 class DivergentAccelerator(SingleRankAccelerator):
-    """Simulate a peer rank that buffered a different metric set."""
+    """Simulate a peer rank that buffered a larger metric set."""
 
     def reduce(self, tensor: torch.Tensor, reduction: str) -> torch.Tensor:
-        """Skew the min side so the signature check sees the ranks disagree."""
-        if reduction == "min":
-            return tensor - 1.0
+        """Raise the group maximum above this rank's own signature."""
+        if reduction == "max":
+            return tensor + 1.0
         return tensor
 
 

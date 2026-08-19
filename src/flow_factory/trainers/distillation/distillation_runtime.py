@@ -581,9 +581,12 @@ def pop_distillation_metrics(trainer: Any) -> Dict[str, float]:
         device=accelerator.device,
         dtype=torch.float64,
     )
-    lowest = accelerator.reduce(signature.clone(), reduction="min")
+    # Compared against the group maximum rather than a min/max pair because Accelerate
+    # maps every reduction other than "max" onto a sum, so "min" would silently return
+    # one. Any rank that disagrees sits below the maximum and raises, which is enough to
+    # stop the run.
     highest = accelerator.reduce(signature.clone(), reduction="max")
-    if not torch.equal(lowest, highest):
+    if not torch.equal(highest, signature):
         raise RuntimeError(
             "expected every rank to buffer the same distillation metrics; this rank "
             f"buffered {len(names)}: {names}. Metrics are recorded on code paths that "
