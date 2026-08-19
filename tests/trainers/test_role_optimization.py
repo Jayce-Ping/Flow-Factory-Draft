@@ -76,12 +76,18 @@ class MinimalTrainer(BaseTrainer):
 class DeterministicAccelerator:
     """Implement the accumulation surface needed by the coordinator tests."""
 
-    def __init__(self, sync_sequence: Tuple[bool, ...]) -> None:
+    def __init__(
+        self,
+        sync_sequence: Tuple[bool, ...],
+        distributed_type: DistributedType = DistributedType.MULTI_GPU,
+    ) -> None:
         self._sync_sequence = sync_sequence
         self._microbatch_index = 0
         self.sync_gradients = False
         self.accumulate_depth = 0
         self.clipped_parameter_ids: List[Tuple[int, ...]] = []
+        # The coordinator reads this to decide whether `parameter.grad` is authoritative.
+        self.distributed_type = distributed_type
 
     @contextmanager
     def accumulate(self, model: torch.nn.Module) -> Iterator[None]:
