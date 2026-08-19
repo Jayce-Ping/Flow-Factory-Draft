@@ -23,8 +23,10 @@ distribution the generator never samples from.
 from types import SimpleNamespace
 
 import pytest
+from accelerate.utils import DistributedType
 
 from flow_factory.hparams.training_args.dmd2 import DMD2TrainingArguments
+from flow_factory.trainers.role_optimization import RoleOptimizationCoordinator
 from flow_factory.trainers.distillation.distillation_runtime import (
     reference_forward_kwargs,
     replay_forward_kwargs,
@@ -87,3 +89,26 @@ def test_preprocessing_follows_the_sampling_scale_when_the_real_score_is_unset()
     plain = DMD2TrainingArguments(guidance_scale=3.5)
 
     assert plain.get_preprocess_guidance_scale() == 3.5
+
+
+@pytest.mark.parametrize(
+    ("distributed_type", "authoritative"),
+    [
+        (DistributedType.MULTI_GPU, True),
+        (DistributedType.FSDP, True),
+        (DistributedType.DEEPSPEED, False),
+    ],
+)
+def test_only_backends_that_leave_gradients_on_parameters_are_asserted_against(
+    distributed_type: DistributedType,
+    authoritative: bool,
+) -> None:
+    """DeepSpeed reduces into its own buffers and clears `parameter.grad`.
+
+    Reading it there reports "no gradients" for every role of every correct run, so the
+    per-microbatch assertions have to know when they can see anything at all.
+    """
+    coordinator = object.__new__(RoleOptimizationCoordinator)
+    coordinator.accelerator = SimpleNamespace(distributed_type=distributed_type)
+
+    assert coordinator._gradients_reach_parameters() is authoritative

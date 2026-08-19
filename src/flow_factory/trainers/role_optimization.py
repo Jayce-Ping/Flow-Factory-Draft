@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Mapping, Optional, Tuple, cast
 
 import torch
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedType
 
 # Roles are the trainer's vocabulary. The model layer only knows component
 # variants under caller-chosen names; the mapping from a role to a variant is
@@ -329,6 +329,8 @@ class RoleOptimizationCoordinator:
             Whether the prepared optimizer applied a parameter update. Returns
             ``False`` for non-sync microbatches and mixed-precision overflow skips.
         """
+        # Both role-gradient assertions below read ``parameter.grad``; see
+        # ``_gradients_reach_parameters`` for why that is not universal.
         role_name = self.active_role_name
         if not self._microbatch_open:
             raise RuntimeError(
@@ -353,22 +355,26 @@ class RoleOptimizationCoordinator:
             )
 
         role = self.roles[role_name]
-        if not any(parameter.grad is not None for parameter in role.parameters):
-            raise RuntimeError(
-                f"active role {role_name!r} expected at least one gradient at the "
-                "sync boundary, received none"
+        if self._gradients_reach_parameters():
+            if not any(parameter.grad is not None for parameter in role.parameters):
+                trainable = sum(1 for p in role.parameters if p.requires_grad)
+                raise RuntimeError(
+                    f"active role {role_name!r} expected at least one gradient at the "
+                    f"sync boundary, received none across {len(role.parameters)} parameter(s) "
+                    f"of which {trainable} require grad; backend is "
+                    f"{self.accelerator.distributed_type}"
+                )
+            inactive_gradients = tuple(
+                other_name
+                for other_name, other_role in self.roles.items()
+                if other_name != role_name
+                and any(parameter.grad is not None for parameter in other_role.parameters)
             )
-        inactive_gradients = tuple(
-            other_name
-            for other_name, other_role in self.roles.items()
-            if other_name != role_name
-            and any(parameter.grad is not None for parameter in other_role.parameters)
-        )
-        if inactive_gradients:
-            raise RuntimeError(
-                f"inactive role gradients for {inactive_gradients!r} while role "
-                f"{role_name!r} is active; expected every inactive gradient to be None"
-            )
+            if inactive_gradients:
+                raise RuntimeError(
+                    f"inactive role gradients for {inactive_gradients!r} while role "
+                    f"{role_name!r} is active; expected every inactive gradient to be None"
+                )
 
         self.accelerator.clip_grad_norm_(role.parameters, role.config.max_grad_norm)
         self.optimizer.step()
@@ -386,6 +392,23 @@ class RoleOptimizationCoordinator:
         if role.scheduler is not None:
             role.scheduler.step()
         return True
+
+    def _gradients_reach_parameters(self) -> bool:
+        """Report whether this backend leaves gradients on ``parameter.grad``.
+
+        DeepSpeed reduces gradients into the engine's own partitioned buffers and clears
+        ``parameter.grad``, so reading it there says nothing about whether a role produced
+        gradients -- the answer is always "none", for every role, always. Asserting on it
+        would reject every correct DeepSpeed run.
+
+        What the per-microbatch assertions guard against, a role that trains nothing, is
+        checked once at setup by the prepared-trainability guard, and DeepSpeed itself
+        raises if asked to step without gradients. So the loss here is narrow.
+
+        Returns:
+            Whether ``parameter.grad`` is authoritative for this backend.
+        """
+        return self.accelerator.distributed_type != DistributedType.DEEPSPEED
 
     def state_dict(self) -> Dict[str, Any]:
         """Return closed-phase role counters and optimizer-group ownership."""
