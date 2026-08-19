@@ -35,6 +35,7 @@ from ...samples import (
     StructuredTrajectory,
 )
 from ..abc import BaseTrainer
+from .dmd2 import DMD2Trainer
 from .distillation_runtime import (
     as_role_microbatches,
     detach_state,
@@ -138,15 +139,16 @@ class TDMTrainer(BaseTrainer):
             )
 
     def _init_reward_model(self) -> Tuple[Dict[str, object], Dict[str, object]]:
-        """Initialize an explicitly empty feedback runtime."""
-        self.reward_loader = None
-        self.reward_models = {}
-        self.eval_reward_models = {}
-        self.reward_buffer = None
-        self.eval_dataset_reward_buffers = {}
-        self._eval_dataset_configs = {}
-        self.advantage_processor = None
-        return self.reward_models, self.eval_reward_models
+        """Build the shared feedback runtime, which for this algorithm is eval-only.
+
+        See :meth:`DMD2Trainer._init_reward_model`: the reward-free training contract is
+        enforced in `Arguments`, and zeroing the runtime here removed eval monitoring
+        along with it.
+
+        Returns:
+            Training and eval reward models; the training mapping is always empty.
+        """
+        return DMD2Trainer._init_reward_model(self)
 
     def _run_training_step(self) -> None:
         """Run GAS distinct trajectory rollouts and one fake/generator phase pair.
