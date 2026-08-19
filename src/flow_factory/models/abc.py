@@ -2181,6 +2181,38 @@ class BaseAdapter(ABC):
             "training state (`save_model_only: false`)."
         )
 
+    # Artifacts a save authors. A shard index is the dangerous one: it is trusted ahead of
+    # a single-file save, so one left behind by a bigger model sends the loader looking for
+    # shards that no longer exist.
+    _CHECKPOINT_ARTIFACT_GLOBS: ClassVar[Tuple[str, ...]] = (
+        "*.safetensors",
+        "*.safetensors.index.json",
+        "*.bin",
+        "*.bin.index.json",
+        CONFIG_NAME,
+        LORA_ADAPTER_CONFIG_NAME,
+        "README.md",
+    )
+
+    def _clear_stale_checkpoint_artifacts(self, directory: str) -> None:
+        """Remove what a previous save left in this entry's directory.
+
+        Re-running an experiment under the same ``run_name`` writes into a directory that
+        already holds another model's files, and nothing overwrites what the new save does
+        not happen to produce. The result loads the stale file in preference to the fresh
+        one, or fails looking for shards that were never written.
+
+        Only this directory's own artifacts are removed, never its subdirectories, so the
+        roles and components nested inside survive to be written in their own turn.
+
+        Args:
+            directory: Entry directory about to be written.
+        """
+        for pattern in self._CHECKPOINT_ARTIFACT_GLOBS:
+            for stale in glob.glob(os.path.join(directory, pattern)):
+                if os.path.isfile(stale):
+                    os.remove(stale)
+
     def _write_checkpoint_manifest(self, path: str, entries: Sequence[CheckpointEntry]) -> None:
         """Record what was written so a loader never has to guess.
 
@@ -2294,6 +2326,8 @@ class BaseAdapter(ABC):
                     component = self._unwrap(self._require_component(entry.component))
                     comp_path = entry.directory(save_directory)
                     os.makedirs(comp_path, exist_ok=True)
+                    if self.accelerator.is_main_process:
+                        self._clear_stale_checkpoint_artifacts(comp_path)
 
                     if self.model_args.finetune_type == "lora":
                         if self.accelerator.is_main_process:

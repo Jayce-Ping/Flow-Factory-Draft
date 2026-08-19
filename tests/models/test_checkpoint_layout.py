@@ -467,6 +467,54 @@ def test_a_dtype_that_names_nothing_is_refused_with_what_it_received() -> None:
         adapter.declare_component_variants((BASE_VARIANT, "fake"))
 
 
+@pytest.mark.parametrize("finetune_type", ["lora", "full"])
+def test_saving_over_another_model_leaves_nothing_of_it_behind(
+    tmp_path: Path,
+    finetune_type: str,
+) -> None:
+    """Re-running an experiment under the same run_name writes into a used directory.
+
+    A shard index is the dangerous leftover: it is trusted ahead of a single-file save,
+    so one written by a larger model sends the loader after shards that no longer exist.
+    """
+    stale_index = tmp_path / "diffusion_pytorch_model.safetensors.index.json"
+    stale_index.write_text(
+        json.dumps({"weight_map": {"a": "diffusion_pytorch_model-00001-of-00002.safetensors"}})
+    )
+    (tmp_path / "diffusion_pytorch_model-00007-of-00009.safetensors").write_bytes(b"")
+
+    adapter = _adapter(finetune_type)
+    _fill(adapter, BASE_VARIANT, 2.0)
+    expected = _values(adapter, BASE_VARIANT)
+    adapter.save_checkpoint(str(tmp_path), save_ema=False, include_training_roles=True)
+
+    assert not (tmp_path / "diffusion_pytorch_model-00007-of-00009.safetensors").exists()
+
+    target = _adapter(finetune_type)
+    _fill(target, BASE_VARIANT, 9.0)
+    target.load_checkpoint(str(tmp_path))
+
+    for actual, want in zip(_values(target, BASE_VARIANT), expected):
+        torch.testing.assert_close(actual, want, rtol=0, atol=0)
+
+
+def test_clearing_one_entry_does_not_touch_the_roles_nested_inside_it(tmp_path: Path) -> None:
+    adapter = _adapter("lora", roles=(BASE_VARIANT, "fake"))
+    _fill(adapter, BASE_VARIANT, 1.0)
+    _fill(adapter, "fake", 2.0)
+    expected_fake = _values(adapter, "fake")
+
+    adapter.save_checkpoint(str(tmp_path), save_ema=False, include_training_roles=True)
+    adapter.save_checkpoint(str(tmp_path), save_ema=False, include_training_roles=True)
+
+    target = _adapter("lora", roles=(BASE_VARIANT, "fake"))
+    _fill(target, "fake", 9.0)
+    target.load_checkpoint(str(tmp_path))
+
+    for actual, want in zip(_values(target, "fake"), expected_fake):
+        torch.testing.assert_close(actual, want, rtol=0, atol=0)
+
+
 def test_restoring_roles_before_declaring_them_is_refused(tmp_path: Path) -> None:
     adapter = _adapter("lora")
     adapter.save_checkpoint(str(tmp_path), save_ema=False)
