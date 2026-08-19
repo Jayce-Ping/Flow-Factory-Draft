@@ -218,7 +218,7 @@ class TDMTrainer(BaseTrainer):
                 boundary_index - 1,
             )
             primary_name = self.adapter.trajectory_component_order[0]
-            times = self._normalize_replay_times(replay_step.times, len(replay_samples))
+            times = TDMTrainer._normalize_replay_times(self, replay_step.times, len(replay_samples))
             interval_end = times.timestep[primary_name]
             interval_start = times.next_timestep[primary_name]
             self._validate_interval(
@@ -261,7 +261,7 @@ class TDMTrainer(BaseTrainer):
             if mapping is None:
                 return None
             return {
-                name: self._as_per_sample_coordinate(value, batch_size, like=reference)
+                name: TDMTrainer._as_per_sample_coordinate(value, batch_size, like=reference)
                 for name, value in mapping.items()
             }
 
@@ -341,7 +341,9 @@ class TDMTrainer(BaseTrainer):
                     "`trajectory_indices` has to span the full schedule."
                 ) from error
 
-        self._validate_structured_boundaries(samples)
+        # Unbound on purpose: TDM-R1 is a sibling that delegates method by method, so
+        # `self` here need not carry TDM's private helpers.
+        TDMTrainer._validate_structured_boundaries(self, samples)
 
     def _validate_structured_boundaries(self, samples: Tuple[BaseSample, ...]) -> None:
         """Check the stronger invariants an adapter that publishes structure can offer."""
