@@ -443,6 +443,12 @@ def generate_one_rollout_batch(
         trainer._rollout_data_iter = None
 
     trainer.adapter.rollout()
+    # Each outer iteration scores exactly the batch it just rolled out, matching
+    # BaseTrainer.generate_samples. Left uncleared, the buffer carries the previous
+    # iteration's samples into this one, and the reward count stops matching the
+    # sample count as soon as an epoch accumulates more than one batch.
+    if reward_buffer is not None:
+        reward_buffer.clear()
     if trainer._rollout_data_iter is None:
         if hasattr(trainer.dataloader, "set_epoch"):
             trainer.dataloader.set_epoch(trainer._rollout_dataloader_epoch)

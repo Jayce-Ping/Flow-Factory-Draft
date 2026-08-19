@@ -27,6 +27,7 @@ from flow_factory.trainers.distillation.distillation_runtime import (
     pop_distillation_metrics,
     record_distillation_metric,
     record_state_statistics,
+    generate_one_rollout_batch,
     run_distillation_training_step,
 )
 
@@ -183,6 +184,44 @@ def test_an_epoch_logs_what_its_roles_recorded() -> None:
     run_distillation_training_step(trainer)
 
     assert logged == [({"train/generator_loss": 7.0}, 11)]
+
+
+def test_each_rollout_scores_only_the_batch_it_just_generated() -> None:
+    """A buffer carried between iterations mismatches reward and sample counts.
+
+    The reward processor packs rewards beside per-sample ids before gathering, so a
+    stale batch in the buffer surfaces as a shape error deep in the advantage code
+    rather than anywhere near the rollout that caused it.
+    """
+
+    class RecordingBuffer:
+        def __init__(self) -> None:
+            self.samples: list = []
+            self.clears = 0
+
+        def clear(self) -> None:
+            self.clears += 1
+            self.samples = []
+
+        def add_samples(self, samples: list) -> None:
+            self.samples.extend(samples)
+
+    buffer = RecordingBuffer()
+    trainer = SimpleNamespace(
+        dataloader=[["prompt"]],
+        adapter=SimpleNamespace(rollout=lambda: None),
+        _rollout_acceleration=_null_context,
+        autocast=_null_context,
+        sample_batch=lambda batch, **kwargs: (
+            kwargs["reward_buffer"].add_samples(["sample"]) or ["sample"]
+        ),
+    )
+
+    for _ in range(2):
+        generate_one_rollout_batch(trainer, reward_buffer=buffer, algorithm_name="TDM-R1")
+
+    assert buffer.clears == 2
+    assert buffer.samples == ["sample"]
 
 
 def test_an_epoch_that_records_nothing_logs_nothing() -> None:
