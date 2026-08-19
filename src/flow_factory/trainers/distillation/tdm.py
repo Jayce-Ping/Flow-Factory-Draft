@@ -218,8 +218,13 @@ class TDMTrainer(BaseTrainer):
                 boundary_index - 1,
             )
             primary_name = self.adapter.trajectory_component_order[0]
-            interval_end = replay_step.times.timestep[primary_name]
-            interval_start = replay_step.times.next_timestep[primary_name]
+            batch_size = len(replay_samples)
+            interval_end = self._as_per_sample_coordinate(
+                replay_step.times.timestep[primary_name], batch_size
+            )
+            interval_start = self._as_per_sample_coordinate(
+                replay_step.times.next_timestep[primary_name], batch_size
+            )
             self._validate_interval(
                 batch,
                 replay_step.times,
@@ -238,6 +243,34 @@ class TDMTrainer(BaseTrainer):
             )
             previous_interval_start = interval_start
         return units
+
+    @staticmethod
+    def _as_per_sample_coordinate(coordinate: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """Return a scheduler coordinate as one value per sample.
+
+        A coordinate shared by the whole batch -- the terminal boundary is the usual case
+        -- arrives as a scalar. That says the same thing as a ``(B,)`` tensor of the value
+        and everything downstream wants the latter, so widen it here rather than teach
+        each consumer to accept both.
+
+        Args:
+            coordinate: Scalar or per-sample scheduler coordinate.
+            batch_size: Number of samples in the replay unit.
+
+        Returns:
+            A ``(B,)`` tensor.
+
+        Raises:
+            ValueError: If the coordinate is neither scalar nor ``(B,)``.
+        """
+        if coordinate.ndim == 0:
+            return coordinate.expand(batch_size)
+        if coordinate.ndim == 1 and coordinate.shape[0] == batch_size:
+            return coordinate
+        raise ValueError(
+            f"expected a scalar or ({batch_size},) scheduler coordinate, "
+            f"received shape {tuple(coordinate.shape)}"
+        )
 
     def _validate_sample_boundaries(
         self,
