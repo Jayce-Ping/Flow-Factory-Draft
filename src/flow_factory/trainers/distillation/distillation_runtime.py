@@ -291,6 +291,29 @@ def replay_forward_kwargs(training_args: Any, batch: Mapping[str, Any]) -> Dict[
     return kwargs
 
 
+def reference_forward_kwargs(training_args: Any, batch: Mapping[str, Any]) -> Dict[str, object]:
+    """Return forward arguments for the real score, the only role that may be guided.
+
+    The real score defines the target distribution, so classifier-free guidance on it
+    is what the match is worth. The generator rolls out CFG-free and the fake score has
+    to model what the generator actually produces, so both stay on
+    ``train.guidance_scale``. Leaving ``train.real_guidance_scale`` unset keeps every
+    role on one scale, which is what these algorithms did before.
+
+    Args:
+        training_args: Trainer configuration carrying the guidance knobs.
+        batch: Collated sample batch whose keys take precedence.
+
+    Returns:
+        Keyword arguments for the reference query.
+    """
+    kwargs = replay_forward_kwargs(training_args, batch)
+    real_guidance_scale = getattr(training_args, "real_guidance_scale", None)
+    if real_guidance_scale is not None and "guidance_scale" not in batch:
+        kwargs["guidance_scale"] = real_guidance_scale
+    return kwargs
+
+
 def as_role_microbatches(
     samples: Sequence[Any],
     *,

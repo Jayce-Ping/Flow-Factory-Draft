@@ -40,6 +40,7 @@ from .distillation_runtime import (
     detach_state,
     generate_one_rollout_batch,
     query_score_velocity,
+    reference_forward_kwargs,
     replay_forward_kwargs,
     require_velocity,
     role_repeat_progress,
@@ -723,7 +724,7 @@ class TDMTrainer(BaseTrainer):
             times,
             role_name="reference",
             autocast=self.autocast,
-            forward_kwargs=self._replay_forward_kwargs(batch),
+            forward_kwargs=self._reference_forward_kwargs(batch),
             algorithm_name="TDM",
         )
         fake_velocity = query_score_velocity(
@@ -775,6 +776,10 @@ class TDMTrainer(BaseTrainer):
     def _replay_forward_kwargs(self, batch: StackedSampleBatch) -> Dict[str, object]:
         """Return allow-listed adapter arguments not already owned by the batch."""
         return replay_forward_kwargs(self.training_args, batch)
+
+    def _reference_forward_kwargs(self, batch: StackedSampleBatch) -> Dict[str, object]:
+        """Return forward arguments for the real score, which alone may be guided."""
+        return reference_forward_kwargs(self.training_args, batch)
 
     def _validate_media_free_rollout(self) -> None:
         """Require inference to expose a suppressible media reconstruction seam."""

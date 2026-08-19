@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from contextlib import contextmanager, nullcontext
 from types import MethodType, SimpleNamespace
 from typing import Any, Iterator, List, Tuple
+
 
 import pytest
 import torch
@@ -70,18 +72,27 @@ def test_dmd2_is_direct_data_free_distillation_trainer() -> None:
     assert DMD2Trainer.paradigm == "distillation"
 
 
-@pytest.mark.parametrize("num_inference_steps", [0, 2, 4])
-def test_dmd2_rejects_non_one_step_generation(num_inference_steps: int) -> None:
+@pytest.mark.parametrize("num_inference_steps", [0, -1, 1.5])
+def test_dmd2_rejects_a_schedule_with_no_boundary_to_match_on(
+    num_inference_steps: object,
+) -> None:
     trainer = _trainer(num_inference_steps=num_inference_steps)
 
     with pytest.raises(
         ValueError,
-        match=(
-            rf"DMD2.*num_inference_steps=1.*received "
-            rf"train.num_inference_steps={num_inference_steps}.*TDM"
-        ),
+        match=rf"num_inference_steps as an int >= 1.*received {re.escape(repr(num_inference_steps))}",
     ):
-        trainer._validate_one_step_configuration()
+        trainer._validate_generation_schedule()
+
+
+@pytest.mark.parametrize("num_inference_steps", [1, 2, 4])
+def test_dmd2_accepts_a_multi_step_generator(num_inference_steps: int) -> None:
+    trainer = _trainer(num_inference_steps=num_inference_steps)
+
+    trainer._validate_generation_schedule()
+
+    drawn = {trainer._draw_boundary_index() for _ in range(200)}
+    assert drawn == set(range(1, num_inference_steps + 1))
 
 
 def test_dmd2_rejects_multiple_generator_inner_epochs_per_rollout() -> None:
@@ -91,7 +102,7 @@ def test_dmd2_rejects_multiple_generator_inner_epochs_per_rollout() -> None:
         ValueError,
         match=r"DMD2.*num_inner_epochs=1.*received train.num_inner_epochs=2.*fresh rollout",
     ):
-        trainer._validate_one_step_configuration()
+        trainer._validate_generation_schedule()
 
 
 def test_dmd2_sample_collects_only_initial_and_generated_boundary() -> None:

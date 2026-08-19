@@ -113,6 +113,10 @@ class TDMR1Trainer(BaseTrainer):
     def _replay_forward_kwargs(self, batch: Any) -> Dict[str, object]:
         return TDMTrainer._replay_forward_kwargs(self, batch)
 
+    def _reference_forward_kwargs(self, batch: Any) -> Dict[str, object]:
+        """Return forward arguments for the real score, which alone may be guided."""
+        return reference_forward_kwargs(self.training_args, batch)
+
     def _sample_perturbation_times(self, unit: TDMBoundaryUnit) -> torch.Tensor:
         return TDMTrainer._sample_perturbation_times(self, unit)
 
@@ -308,7 +312,7 @@ class TDMR1Trainer(BaseTrainer):
             times,
             role_name="reference",
             autocast=self.autocast,
-            forward_kwargs=self._replay_forward_kwargs(batch),
+            forward_kwargs=self._reference_forward_kwargs(batch),
             algorithm_name="TDM-R1",
         )
         trainable_values = self._diffusion_density_values(

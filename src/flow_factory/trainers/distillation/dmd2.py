@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import random
 from contextlib import contextmanager
 from typing import (
     TYPE_CHECKING,
@@ -43,6 +44,7 @@ from .distillation_runtime import (
     detach_state,
     generate_one_rollout_batch,
     query_score_velocity,
+    reference_forward_kwargs,
     replay_forward_kwargs,
     require_velocity,
     role_repeat_progress,
@@ -81,8 +83,6 @@ class DMD2Trainer(BaseTrainer):
             f"`optimizers` entry and no DMD2 default"
         )
 
-    _BOUNDARY_INDEX: ClassVar[int] = 1
-
     def __init__(
         self,
         accelerator: Accelerator,
@@ -98,7 +98,7 @@ class DMD2Trainer(BaseTrainer):
             )
         super().__init__(accelerator=accelerator, config=config, adapter=adapter)
         self.training_args: DMD2TrainingArguments
-        self._validate_one_step_configuration()
+        self._validate_generation_schedule()
         self._rollout_data_iter: Optional[Iterator[Any]] = None
         self._rollout_dataloader_epoch = 0
         non_ode = {
@@ -112,14 +112,17 @@ class DMD2Trainer(BaseTrainer):
                 f"received scheduler dynamics {non_ode!r}"
             )
 
-    def _validate_one_step_configuration(self) -> None:
-        """Reject generation schedules that need an unimplemented multi-step objective."""
+    def _validate_generation_schedule(self) -> None:
+        """Reject generation schedules the boundary objective cannot be defined on."""
         num_inference_steps = self.training_args.num_inference_steps
-        if num_inference_steps != 1:
+        if (
+            not isinstance(num_inference_steps, int)
+            or isinstance(num_inference_steps, bool)
+            or num_inference_steps < 1
+        ):
             raise ValueError(
-                "DMD2 requires train.num_inference_steps=1 for its one-step generator; "
-                f"received train.num_inference_steps={num_inference_steps}. "
-                "Use TDM for few-step trajectory distribution matching."
+                "expected train.num_inference_steps as an int >= 1 for the DMD2 generator, "
+                f"received {num_inference_steps!r}"
             )
         if self.training_args.num_inner_epochs != 1:
             raise ValueError(
@@ -151,13 +154,15 @@ class DMD2Trainer(BaseTrainer):
 
     def sample(self) -> List[BaseSample]:
         """Collect the initial state and generated boundary of one fresh rollout."""
-        self._validate_one_step_configuration()
+        self._validate_generation_schedule()
         self._validate_media_free_rollout()
         with self._without_media_decoding():
             return self.generate_samples(
                 reward_buffer=None,
                 compute_log_prob=False,
-                trajectory_indices=[0, self._BOUNDARY_INDEX],
+                # Every boundary is kept, because the objective matches distributions at
+                # one step drawn per replay unit rather than at a fixed terminal one.
+                trajectory_indices=list(range(int(self.training_args.num_inference_steps) + 1)),
             )
 
     def generate_samples(
@@ -195,7 +200,7 @@ class DMD2Trainer(BaseTrainer):
         """Run fake TTUR updates, then one generator step, over GAS replay units."""
         if not samples:
             return
-        self._validate_one_step_configuration()
+        self._validate_generation_schedule()
         replay_units = as_role_microbatches(
             samples,
             batch_size=self.training_args.per_device_batch_size,
@@ -243,9 +248,24 @@ class DMD2Trainer(BaseTrainer):
         with without_media_decoding(self.adapter, algorithm_name="DMD2"):
             yield
 
+    def _draw_boundary_index(self) -> int:
+        """Pick which rollout boundary this replay unit matches distributions at.
+
+        A multi-step generator is supervised at one step drawn uniformly from its
+        schedule, so over training every step is covered; a one-step schedule reduces
+        to the single boundary this trainer used before.
+
+        Returns:
+            Boundary index in ``[1, num_inference_steps]``.
+        """
+        return random.randint(1, int(self.training_args.num_inference_steps))
+
     def _fake_replay_loss(self, batch: StackedSampleBatch) -> torch.Tensor:
         """Compute fake clean-state denoising loss for one replay unit."""
-        boundary_state = detach_state(self.adapter.get_terminal_state(batch))
+        boundary_index = self._draw_boundary_index()
+        boundary_state = detach_state(
+            self.adapter.get_replay_step(batch, boundary_index - 1).next_state
+        )
         times = self._sample_perturbation_times(boundary_state, batch)
         noised = self.adapter.add_forward_process_noise(boundary_state, times)
         with self.adapter.use_component_variant("fake"):
@@ -267,12 +287,13 @@ class DMD2Trainer(BaseTrainer):
         )
 
     def _generator_replay_loss(self, batch: StackedSampleBatch) -> torch.Tensor:
-        """Compute the one-step generator pseudo-loss for one replay unit."""
+        """Compute the generator pseudo-loss at one drawn boundary of the rollout."""
+        boundary_index = self._draw_boundary_index()
         with self.adapter.use_component_variant("generator"):
             with self.autocast():
                 generator_output = self.adapter.replay_generator_boundary(
                     batch,
-                    self._BOUNDARY_INDEX,
+                    boundary_index,
                     return_fields=("velocity", "next_latents", "next_latents_mean"),
                     rtol=self.training_args.replay_rtol,
                     atol=self.training_args.replay_atol,
@@ -282,7 +303,7 @@ class DMD2Trainer(BaseTrainer):
         if boundary_state is None:
             raise ValueError(
                 "DMD2 generator boundary replay expected next_state, received None "
-                f"for boundary_index={self._BOUNDARY_INDEX}"
+                f"for boundary_index={boundary_index}"
             )
 
         detached_boundary = detach_state(boundary_state)
@@ -295,7 +316,7 @@ class DMD2Trainer(BaseTrainer):
             times,
             role_name="reference",
             autocast=self.autocast,
-            forward_kwargs=self._replay_forward_kwargs(batch),
+            forward_kwargs=self._reference_forward_kwargs(batch),
             algorithm_name="DMD2",
         )
         fake_velocity = query_score_velocity(
@@ -346,3 +367,7 @@ class DMD2Trainer(BaseTrainer):
     def _replay_forward_kwargs(self, batch: StackedSampleBatch) -> Dict[str, object]:
         """Return allow-listed adapter arguments not already owned by the batch."""
         return replay_forward_kwargs(self.training_args, batch)
+
+    def _reference_forward_kwargs(self, batch: StackedSampleBatch) -> Dict[str, object]:
+        """Return forward arguments for the real score, which alone may be guided."""
+        return reference_forward_kwargs(self.training_args, batch)
