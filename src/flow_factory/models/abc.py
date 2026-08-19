@@ -16,6 +16,7 @@ import glob
 import hashlib
 import json
 import logging
+import shutil
 
 # src/flow_factory/models/abc.py
 import os
@@ -23,7 +24,6 @@ import re
 from abc import ABC, abstractmethod
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, fields
-from functools import partial
 from typing import (
     Any,
     ClassVar,
@@ -104,7 +104,7 @@ from . import trajectory_bridge as bridge
 from .latent_geometry import LatentAxes, infer_latent_axes
 from .model_bundle import RoutedComponentProxy
 from .runtime import ClassicPipelineRuntime, ComponentRuntime
-from .variants import ComponentVariantRegistry, ComponentVariantSpec
+from .variants import DEFAULT_BASE_VARIANT, ComponentVariantRegistry, ComponentVariantSpec
 
 # Constants
 CONFIG_NAME = "config.json"
@@ -116,6 +116,9 @@ SAFE_DIFFUSION_WEIGHTS_PATTERN_NAME = "diffusion_pytorch_model{suffix}.safetenso
 SAFE_DIFFUSION_WEIGHTS_INDEX_NAME = f"{SAFE_DIFFUSION_WEIGHTS_NAME}.index.json"
 LORA_ADAPTER_CONFIG_NAME = "adapter_config.json"
 LORA_ADAPTER_WEIGHTS_NAME = "adapter_model.safetensors"
+CHECKPOINT_MANIFEST_NAME = "manifest.json"
+CHECKPOINT_MANIFEST_VERSION = 1
+CHECKPOINT_ROLES_DIRNAME = "roles"
 
 logger = setup_logger(__name__)
 
@@ -126,6 +129,39 @@ class NamedParametersInfo:
 
     target_components: List[str]
     ema_wrapper: EMAModuleWrapper
+
+
+@dataclass(frozen=True)
+class CheckpointEntry:
+    """One writable/readable artifact inside a checkpoint directory.
+
+    A checkpoint holds one artifact per (component, role) pair: a single-policy
+    algorithm has exactly one, while a multi-role algorithm such as DMD2 also ships
+    its fake score. Save and every load path derive their paths from these entries,
+    so the two can never disagree about where a role's weights live.
+
+    Attributes:
+        component: Target component name, e.g. ``"transformer"``.
+        role: Component variant that owns the weights, e.g. ``"base"`` or ``"fake"``.
+        relative_path: Location inside the checkpoint, POSIX-style, ``"."`` for root.
+    """
+
+    component: str
+    role: str
+    relative_path: str
+
+    def directory(self, checkpoint_path: str) -> str:
+        """Return the absolute directory this entry occupies.
+
+        Args:
+            checkpoint_path: Root of the checkpoint.
+
+        Returns:
+            Absolute path to the entry's directory.
+        """
+        if self.relative_path == ".":
+            return checkpoint_path
+        return os.path.join(checkpoint_path, *self.relative_path.split("/"))
 
 
 class BaseAdapter(ABC):
@@ -1725,7 +1761,33 @@ class BaseAdapter(ABC):
                     selected_adapters=selected_adapters,
                 )
 
+        if self.accelerator.is_main_process and selected_adapters is not None:
+            self._flatten_peft_adapter_subdirectory(save_directory, selected_adapters[0])
+
         self.accelerator.wait_for_everyone()
+
+    @staticmethod
+    def _flatten_peft_adapter_subdirectory(save_directory: str, adapter_name: str) -> None:
+        """Lift a named adapter's files out of the subfolder PEFT nests them in.
+
+        ``PeftModel.save_pretrained`` writes any adapter other than ``"default"`` into
+        ``<save_directory>/<adapter_name>/``. The role already names the directory it
+        was given, so the extra level would make one role's artifact a different shape
+        from another's and stop ``PeftModel.from_pretrained`` from reading it directly.
+
+        Args:
+            save_directory: Directory the adapter was asked to write to.
+            adapter_name: Adapter that was written.
+        """
+        nested = os.path.join(save_directory, adapter_name)
+        if adapter_name == "default" or not os.path.isdir(nested):
+            return
+        for filename in os.listdir(nested):
+            destination = os.path.join(save_directory, filename)
+            if os.path.exists(destination):
+                os.remove(destination)
+            shutil.move(os.path.join(nested, filename), destination)
+        os.rmdir(nested)
 
     def _save_full_model(
         self,
@@ -1884,6 +1946,175 @@ class BaseAdapter(ABC):
             if self.accelerator.is_main_process:
                 logger.info(f"Model weights saved in {path_to_weights}")
 
+    # ------------------------------------- Checkpoint layout -------------------------------------
+    def _checkpoint_role_names(self) -> Tuple[str, ...]:
+        """Return the variants a checkpoint carries, base first.
+
+        Returns:
+            Declared variant names, or just the base name when this adapter
+            declares no variants at all.
+        """
+        registry = getattr(self, "component_variant_registry", None)
+        if registry is None:
+            return (DEFAULT_BASE_VARIANT,)
+        return registry.variant_names
+
+    def _checkpoint_base_role(self) -> str:
+        """Return the variant whose weights are the checkpoint's primary artifact."""
+        registry = getattr(self, "component_variant_registry", None)
+        if registry is None:
+            return DEFAULT_BASE_VARIANT
+        return registry.base_variant
+
+    def _checkpoint_entries_from_config(self) -> List[CheckpointEntry]:
+        """Derive the entries this run would write, from the live configuration.
+
+        The base role of each component keeps the layout every released checkpoint
+        already uses -- root for a single target component, ``<component>/`` when
+        there are several -- so an existing consumer keeps working. Extra roles
+        nest under ``roles/`` beside their component.
+
+        Returns:
+            One entry per (component, role) pair that owns weights.
+        """
+        nests_by_component = len(self.model_args.target_components) > 1
+        base_role = self._checkpoint_base_role()
+        entries: List[CheckpointEntry] = []
+        for component_name, target_modules in self.target_module_map.items():
+            if not target_modules or not self.has_component(component_name):
+                continue
+            component_prefix = f"{component_name}/" if nests_by_component else ""
+            for role in self._checkpoint_role_names():
+                if role == base_role:
+                    relative = component_name if nests_by_component else "."
+                else:
+                    relative = f"{component_prefix}{CHECKPOINT_ROLES_DIRNAME}/{role}"
+                entries.append(CheckpointEntry(component_name, role, relative))
+        return entries
+
+    def _read_checkpoint_manifest(self, path: str) -> Optional[Dict[str, Any]]:
+        """Return a checkpoint's manifest, or ``None`` when it predates manifests.
+
+        Args:
+            path: Checkpoint directory.
+
+        Returns:
+            Parsed manifest, or ``None`` when the file is absent.
+
+        Raises:
+            ValueError: If the manifest exists but cannot be used.
+        """
+        manifest_path = os.path.join(path, CHECKPOINT_MANIFEST_NAME)
+        if not os.path.isfile(manifest_path):
+            return None
+        with open(manifest_path, "r", encoding="utf-8") as manifest_file:
+            manifest = json.load(manifest_file)
+        version = manifest.get("format_version")
+        if version != CHECKPOINT_MANIFEST_VERSION:
+            raise ValueError(
+                f"expected checkpoint manifest format_version "
+                f"{CHECKPOINT_MANIFEST_VERSION} at {manifest_path!r}, received {version!r}"
+            )
+        return manifest
+
+    def _checkpoint_entries(self, path: Optional[str] = None) -> List[CheckpointEntry]:
+        """Return every (component, role, directory) a checkpoint holds.
+
+        This is the single source of truth for checkpoint layout. ``save_checkpoint``
+        uses it to decide where to write, and every load path uses it to decide where
+        to read, so the two cannot drift apart.
+
+        Args:
+            path: Checkpoint to inspect. When it carries a manifest the manifest is
+                authoritative. When omitted, entries come from the live configuration,
+                which is what a save needs.
+
+        Returns:
+            Entries in write order, base role first.
+
+        Raises:
+            ValueError: If a manifest entry is malformed, or a manifest-free checkpoint
+                is asked to supply roles it cannot possibly contain.
+        """
+        if path is None:
+            return self._checkpoint_entries_from_config()
+
+        manifest = self._read_checkpoint_manifest(path)
+        if manifest is not None:
+            entries = []
+            for raw_entry in manifest.get("entries", []):
+                missing_keys = {"component", "role", "path"} - set(raw_entry)
+                if missing_keys:
+                    raise ValueError(
+                        f"checkpoint manifest entry in {path!r} is missing "
+                        f"{sorted(missing_keys)}, received {raw_entry!r}"
+                    )
+                entries.append(
+                    CheckpointEntry(raw_entry["component"], raw_entry["role"], raw_entry["path"])
+                )
+        else:
+            # A checkpoint written before manifests existed carries the base role at the
+            # legacy paths and nothing else.
+            base_role = self._checkpoint_base_role()
+            entries = [
+                entry for entry in self._checkpoint_entries_from_config() if entry.role == base_role
+            ]
+
+        self._warn_about_roles_the_checkpoint_omits(path, entries)
+        return entries
+
+    def _warn_about_roles_the_checkpoint_omits(
+        self, path: str, entries: Sequence[CheckpointEntry]
+    ) -> None:
+        """Say plainly which trainable roles this checkpoint cannot restore.
+
+        Loading an export (base weights only) into a multi-role run is a legitimate
+        way to initialize a generator, so this is not an error. It is silent damage
+        only if nobody says it happened: the omitted roles keep their initial weights.
+
+        Args:
+            path: Checkpoint being loaded.
+            entries: Entries the checkpoint actually provides.
+        """
+        omitted = [
+            role for role in self._checkpoint_role_names() if role not in {e.role for e in entries}
+        ]
+        if not omitted or not self.accelerator.is_main_process:
+            return
+        logger.warning(
+            f"checkpoint {path} carries roles {sorted({e.role for e in entries})} but this run "
+            f"trains {list(self._checkpoint_role_names())}; roles {omitted} keep their initial "
+            "weights. That is expected when initializing from an export, and wrong when resuming "
+            "-- resume from a checkpoint saved with include_training_roles, or from a full "
+            "training state (`save_model_only: false`)."
+        )
+
+    def _write_checkpoint_manifest(self, path: str, entries: Sequence[CheckpointEntry]) -> None:
+        """Record what was written so a loader never has to guess.
+
+        Args:
+            path: Checkpoint directory.
+            entries: Entries that were written.
+        """
+        base_role = self._checkpoint_base_role()
+        primary = next((entry for entry in entries if entry.role == base_role), None)
+        manifest = {
+            "format_version": CHECKPOINT_MANIFEST_VERSION,
+            "finetune_type": self.model_args.finetune_type,
+            "base_role": base_role,
+            "primary": (
+                None
+                if primary is None
+                else {"component": primary.component, "path": primary.relative_path}
+            ),
+            "entries": [
+                {"component": e.component, "role": e.role, "path": e.relative_path} for e in entries
+            ],
+        }
+        with open(os.path.join(path, CHECKPOINT_MANIFEST_NAME), "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, sort_keys=True)
+            f.write("\n")
+
     def save_checkpoint(
         self,
         save_directory: str,
@@ -1893,6 +2124,7 @@ class BaseAdapter(ABC):
         model_only: bool = True,
         safe_serialization: bool = True,
         variant: Optional[str] = None,
+        include_training_roles: bool = False,
         **kwargs,
     ):
         """Save a checkpoint for the target components.
@@ -1904,9 +2136,16 @@ class BaseAdapter(ABC):
             save_ema: Whether to install the EMA parameters while saving.
             model_only: Whether to write model weights rather than training state.
             safe_serialization: Whether to write safetensors.
-            variant: Component variant to write. ``None`` writes the base
-                components, which is what a single-policy algorithm always wants.
+            variant: Component variant to write. ``None`` writes the base components,
+                which is what an export ships; naming one restricts the write to it.
+            include_training_roles: Whether to also write the training-only variants
+                (e.g. DMD2's fake score). An export does not want them; a checkpoint
+                a run will resume from does, because a generator restored beside a
+                freshly initialized fake score silently trains something else.
             **kwargs: Forwarded to ``accelerator.save_state`` for a training state.
+
+        Raises:
+            ValueError: If ``variant`` names a role that owns no savable component.
         """
         # Normalize dtype
         if isinstance(dtype, str):
@@ -1934,63 +2173,62 @@ class BaseAdapter(ABC):
                 logger.info(f"Training state saved.")
             return
 
-        # 2. Save the model only. The scope is the caller's: `variant=None` writes the
-        # base components, and an algorithm that keeps training-only variants asks for
-        # the one it ships rather than relying on a rule spelled out here.
+        # 2. Save the model only. The scope is the caller's: an export ships the base
+        # components, while a checkpoint a run will resume from also carries the
+        # training-only roles.
         save_context = self.use_ema_parameters if save_ema else nullcontext
         registry = getattr(self, "component_variant_registry", None)
-        if registry is None:
-            variant_context = nullcontext
-        elif variant is None:
-            variant_context = registry.use_base_variant
-        else:
-            variant_context = partial(registry.use, variant)
 
-        with variant_context(), save_context():
-            for comp_name, target_modules in self.target_module_map.items():
-                if not self.has_component(comp_name):
-                    logger.warning(f"Component {comp_name} not found, skipping save")
-                    continue
-
-                if not target_modules:
-                    logger.info(f"No target modules applied to {comp_name}, skip saving")
-                    continue
-
-                # Peel the RoutedComponentProxy to the inner module so the save
-                # path operates on the real diffusers/PeftModel (the prepared root
-                # is the ModelBundle; FSDP/DeepSpeed gathering happens inside
-                # get_state_dict on this member's params).
-                component = self._unwrap(self._require_component(comp_name))
-
-                # Determine save path
-                comp_path = (
-                    os.path.join(save_directory, comp_name)
-                    if len(self.model_args.target_components) > 1
-                    else save_directory
+        entries = self._checkpoint_entries()
+        if variant is not None:
+            entries = [entry for entry in entries if entry.role == variant]
+            if not entries:
+                raise ValueError(
+                    f"expected variant {variant!r} to own savable components, received none; "
+                    f"declared variants are {list(self._checkpoint_role_names())}"
                 )
+        elif not include_training_roles:
+            base_role = self._checkpoint_base_role()
+            entries = [entry for entry in entries if entry.role == base_role]
 
-                os.makedirs(comp_path, exist_ok=True)
+        with save_context():
+            for entry in entries:
+                role_context = nullcontext() if registry is None else registry.use(entry.role)
+                with role_context:
+                    # Peel the RoutedComponentProxy to the inner module so the save
+                    # path operates on the real diffusers/PeftModel (the prepared root
+                    # is the ModelBundle; FSDP/DeepSpeed gathering happens inside
+                    # get_state_dict on this member's params).
+                    component = self._unwrap(self._require_component(entry.component))
+                    comp_path = entry.directory(save_directory)
+                    os.makedirs(comp_path, exist_ok=True)
 
-                # Dispatch to appropriate save method
-                if self.model_args.finetune_type == "lora":
-                    if self.accelerator.is_main_process:
-                        logger.info(f"Saving LoRA weights for {comp_name} to {comp_path}")
-                    self._save_lora(component, comp_path)
-                else:
-                    if self.accelerator.is_main_process:
-                        logger.info(f"Saving full weights for {comp_name} to {comp_path}")
-                    self._save_full_model(
-                        component,
-                        comp_path,
-                        max_shard_size=max_shard_size,
-                        safe_serialization=safe_serialization,
-                        dtype=dtype,
-                    )
+                    if self.model_args.finetune_type == "lora":
+                        if self.accelerator.is_main_process:
+                            logger.info(
+                                f"Saving LoRA weights for {entry.component} "
+                                f"role={entry.role} to {comp_path}"
+                            )
+                        self._save_lora(component, comp_path)
+                    else:
+                        if self.accelerator.is_main_process:
+                            logger.info(
+                                f"Saving full weights for {entry.component} "
+                                f"role={entry.role} to {comp_path}"
+                            )
+                        self._save_full_model(
+                            component,
+                            comp_path,
+                            max_shard_size=max_shard_size,
+                            safe_serialization=safe_serialization,
+                            dtype=dtype,
+                        )
 
             # Sync after saving
             self.accelerator.wait_for_everyone()
 
         if self.accelerator.is_main_process:
+            self._write_checkpoint_manifest(save_directory, entries)
             logger.info(f"Checkpoint saved successfully to {save_directory}")
 
     # -------------------------------------------- Load -------------------------------------------
@@ -2081,150 +2319,170 @@ class BaseAdapter(ABC):
         return state_dict
 
     def _load_lora(self, path: str) -> None:
-        """Load LoRA adapters for target components with auto-format detection."""
-        # Iterate only components that actually carry target modules. Frozen
-        # bundled members (e.g. Wan2.2's `transformer_2`, kept in
-        # `target_components` solely to be FSDP-sharded for memory) map to None
-        # in `target_module_map` and are skipped by `save_checkpoint`; iterating
-        # `target_components` here would instead look for a `.../transformer_2/`
-        # subdir that was never written and log a spurious error on every resume.
-        for comp_name in self.trainable_component_names:
+        """Load LoRA adapters for every (component, role) the checkpoint holds.
+
+        Paths come from :meth:`_checkpoint_entries`, the same resolver
+        ``save_checkpoint`` writes through, and each entry is loaded inside its own
+        role context so a role's weights land on that role's variant instead of
+        whichever adapter happens to be active.
+
+        Args:
+            path: Checkpoint directory.
+        """
+        registry = getattr(self, "component_variant_registry", None)
+        for entry in self._checkpoint_entries(path):
+            comp_name = entry.component
             if not self.has_component(comp_name):
                 logger.warning(f"Component {comp_name} not found, skipping")
                 continue
 
-            component = self._require_component(comp_name)
-            comp_path = (
-                os.path.join(path, comp_name)
-                if len(self.model_args.target_components) > 1
-                else path
-            )
+            role_context = nullcontext() if registry is None else registry.use(entry.role)
+            with role_context:
+                self._load_lora_entry(entry, path)
 
-            unwrapped = self._unwrap(component)
+    def _load_lora_entry(self, entry: CheckpointEntry, path: str) -> None:
+        """Load one checkpoint entry into the currently active variant.
 
-            # Auto-detect checkpoint format
-            adapter_config_path = os.path.join(comp_path, LORA_ADAPTER_CONFIG_NAME)
-            has_config_file = os.path.exists(adapter_config_path)
+        Args:
+            entry: Entry describing which component and role to restore.
+            path: Checkpoint directory the entry belongs to.
+        """
+        comp_name = entry.component
+        component = self._require_component(comp_name)
+        comp_path = entry.directory(path)
 
-            if has_config_file:
-                # Standard PeftModel format
-                if not isinstance(unwrapped, PeftModel):
-                    unwrapped = PeftModel.from_pretrained(unwrapped, comp_path, is_trainable=True)
-                    unwrapped.set_adapter("default")
-                    self.set_component(comp_name, unwrapped)
-                else:
-                    unwrapped.load_adapter(comp_path, unwrapped.active_adapter)
-            else:
-                # No config file found, manual `state_dict` loading with key mapping
-                # Detect `safetensors` or `bin` format with `safetensors` preferred
-                safetensors_files = glob.glob(os.path.join(comp_path, "*.safetensors"))
-                if safetensors_files:
-                    state_dict_path = sorted(safetensors_files)[0]
-                    state_dict = load_file(state_dict_path)
-                else:
-                    bin_files = glob.glob(os.path.join(comp_path, "*.bin"))
-                    if bin_files:
-                        state_dict_path = sorted(bin_files)[0]
-                        state_dict = torch.load(state_dict_path, map_location="cpu")
-                    else:
-                        logger.error(
-                            f"No checkpoint file (.safetensors or .bin) found at {comp_path}"
-                        )
-                        continue
+        unwrapped = self._unwrap(component)
 
-                if self.accelerator.is_main_process:
-                    logger.info(
-                        f"Loaded LoRA `state_dict` from: {state_dict_path}. "
-                        f"If this is not wanted, please make sure the directory contains only single checkpoint file. "
-                    )
+        # Auto-detect checkpoint format
+        adapter_config_path = os.path.join(comp_path, LORA_ADAPTER_CONFIG_NAME)
+        has_config_file = os.path.exists(adapter_config_path)
 
-                # Apply key mapping for legacy format
-                state_dict = mapping_lora_state_dict(state_dict)
-
-                # Infer LoRA configuration from state_dict
-                lora_rank, lora_alpha = infer_lora_config(state_dict)
-                lora_alpha = self.model_args.lora_alpha or lora_alpha  # Use model arg if given
-                if self.model_args.target_modules in [None, "default"]:
-                    # If default, infer target modules
-                    target_modules = infer_target_modules(state_dict)
-                else:
-                    target_modules = self.model_args.target_modules
-
-                if self.accelerator.is_main_process:
-                    logger.info(
-                        f"Inferred LoRA config for {comp_name}: "
-                        f"rank={lora_rank}, alpha={lora_alpha}, target_modules={target_modules[:5]}..."
-                    )
-
-                # Create PeftModel if not already
-                if not isinstance(unwrapped, PeftModel):
-                    lora_config = LoraConfig(
-                        r=lora_rank,
-                        lora_alpha=lora_alpha,
-                        init_lora_weights="gaussian",
-                        target_modules=target_modules,
-                    )
-
-                    unwrapped = get_peft_model(unwrapped, lora_config)
-                    unwrapped.set_adapter("default")
-
-                # Load mapped state_dict
-                missing, unexpected = unwrapped.load_state_dict(state_dict, strict=False)
-
-                # Filter missing keys to LoRA only
-                missing = [k for k in missing if any(lk in k for lk in self.lora_keys)]
-
-                if self.accelerator.is_main_process:
-                    if missing:
-                        logger.warning(f"Missing keys: {missing[:5]}...")
-                    if unexpected:
-                        logger.warning(f"Unexpected keys: {unexpected[:5]}...")
-
+        if has_config_file:
+            # Standard PeftModel format
+            if not isinstance(unwrapped, PeftModel):
+                unwrapped = PeftModel.from_pretrained(unwrapped, comp_path, is_trainable=True)
+                unwrapped.set_adapter("default")
                 self.set_component(comp_name, unwrapped)
+            else:
+                unwrapped.load_adapter(comp_path, unwrapped.active_adapter)
+        else:
+            # No config file found, manual `state_dict` loading with key mapping
+            # Detect `safetensors` or `bin` format with `safetensors` preferred
+            safetensors_files = glob.glob(os.path.join(comp_path, "*.safetensors"))
+            if safetensors_files:
+                state_dict_path = sorted(safetensors_files)[0]
+                state_dict = load_file(state_dict_path)
+            else:
+                bin_files = glob.glob(os.path.join(comp_path, "*.bin"))
+                if bin_files:
+                    state_dict_path = sorted(bin_files)[0]
+                    state_dict = torch.load(state_dict_path, map_location="cpu")
+                else:
+                    logger.error(f"No checkpoint file (.safetensors or .bin) found at {comp_path}")
+                    return
 
             if self.accelerator.is_main_process:
-                logger.info(f"LoRA adapter loaded for {comp_name} from {comp_path}")
+                logger.info(
+                    f"Loaded LoRA `state_dict` from: {state_dict_path}. "
+                    f"If this is not wanted, please make sure the directory contains only single checkpoint file. "
+                )
+
+            # Apply key mapping for legacy format
+            state_dict = mapping_lora_state_dict(state_dict)
+
+            # Infer LoRA configuration from state_dict
+            lora_rank, lora_alpha = infer_lora_config(state_dict)
+            lora_alpha = self.model_args.lora_alpha or lora_alpha  # Use model arg if given
+            if self.model_args.target_modules in [None, "default"]:
+                # If default, infer target modules
+                target_modules = infer_target_modules(state_dict)
+            else:
+                target_modules = self.model_args.target_modules
+
+            if self.accelerator.is_main_process:
+                logger.info(
+                    f"Inferred LoRA config for {comp_name}: "
+                    f"rank={lora_rank}, alpha={lora_alpha}, target_modules={target_modules[:5]}..."
+                )
+
+            # Create PeftModel if not already
+            if not isinstance(unwrapped, PeftModel):
+                lora_config = LoraConfig(
+                    r=lora_rank,
+                    lora_alpha=lora_alpha,
+                    init_lora_weights="gaussian",
+                    target_modules=target_modules,
+                )
+
+                unwrapped = get_peft_model(unwrapped, lora_config)
+                unwrapped.set_adapter("default")
+
+            # Load mapped state_dict
+            missing, unexpected = unwrapped.load_state_dict(state_dict, strict=False)
+
+            # Filter missing keys to LoRA only
+            missing = [k for k in missing if any(lk in k for lk in self.lora_keys)]
+
+            if self.accelerator.is_main_process:
+                if missing:
+                    logger.warning(f"Missing keys: {missing[:5]}...")
+                if unexpected:
+                    logger.warning(f"Unexpected keys: {unexpected[:5]}...")
+
+            self.set_component(comp_name, unwrapped)
+
+        if self.accelerator.is_main_process:
+            logger.info(f"LoRA adapter loaded for {comp_name} role={entry.role} from {comp_path}")
 
     def _load_full_model(self, path: str, strict: bool = True) -> None:
-        """Load full model weights for target components."""
-        # Match `save_checkpoint`: only components with target modules are
-        # written, so frozen bundled members (`target_module_map[name] is None`)
-        # must be skipped here rather than iterating all `target_components`.
-        for comp_name in self.trainable_component_names:
+        """Load full model weights for every (component, role) the checkpoint holds.
+
+        Args:
+            path: Checkpoint directory.
+            strict: Whether to enforce exact ``state_dict`` key matching.
+        """
+        registry = getattr(self, "component_variant_registry", None)
+        for entry in self._checkpoint_entries(path):
+            comp_name = entry.component
             if not self.has_component(comp_name):
                 logger.warning(f"Component {comp_name} not found, skipping")
                 continue
 
-            component = self._require_component(comp_name)
-            comp_path = (
-                os.path.join(path, comp_name)
-                if len(self.model_args.target_components) > 1
-                else path
-            )
+            role_context = nullcontext() if registry is None else registry.use(entry.role)
+            with role_context:
+                self._load_full_model_entry(entry, path, strict=strict)
 
-            unwrapped = self._unwrap(component)
-            component_class = unwrapped.__class__
+    def _load_full_model_entry(
+        self, entry: CheckpointEntry, path: str, strict: bool = True
+    ) -> None:
+        """Load one full-weight entry into the currently active variant.
 
-            # `from_pretrained` is the fast path; a checkpoint written by the manual
-            # saver has no model index, so only that lookup is guarded. Installing the
-            # result must stay outside the guard, or a rejected component name would be
-            # downgraded to a debug line and the loaded weights silently discarded.
-            new_component = None
-            try:
-                new_component = component_class.from_pretrained(comp_path)
-            except (OSError, ValueError) as e:
-                if self.accelerator.is_main_process:
-                    logger.debug(
-                        f"from_pretrained failed for {comp_name}: {e}, trying manual load..."
-                    )
+        Args:
+            entry: Entry describing which component and role to restore.
+            path: Checkpoint directory the entry belongs to.
+            strict: Whether to enforce exact ``state_dict`` key matching.
+        """
+        comp_name = entry.component
+        component = self._require_component(comp_name)
+        comp_path = entry.directory(path)
 
-            if new_component is not None:
-                self.set_component(comp_name, new_component)
-                if self.accelerator.is_main_process:
-                    logger.info(f"Loaded {comp_name} via from_pretrained from {comp_path}")
-                continue
+        unwrapped = self._unwrap(component)
+        component_class = unwrapped.__class__
 
-            # Detect the checkpoint type
+        # `from_pretrained` reads Diffusers-format checkpoints that the manual loader
+        # below cannot; a checkpoint written by the manual saver has no model index, so
+        # only that lookup is guarded. Its weights are copied into the live module
+        # rather than replacing it: the module is a member of the prepared root and a
+        # variant of the registry, and swapping the object would silently detach both,
+        # leaving the run training a module nobody holds a reference to.
+        state_dict = None
+        try:
+            state_dict = component_class.from_pretrained(comp_path).state_dict()
+        except (OSError, ValueError) as e:
+            if self.accelerator.is_main_process:
+                logger.debug(f"from_pretrained failed for {comp_name}: {e}, trying manual load...")
+
+        if state_dict is None:
             index_file = os.path.join(comp_path, SAFE_DIFFUSION_WEIGHTS_INDEX_NAME)
             weights_file = os.path.join(comp_path, SAFE_DIFFUSION_WEIGHTS_NAME)
 
@@ -2234,17 +2492,19 @@ class BaseAdapter(ABC):
                 state_dict = load_file(weights_file)
             else:
                 logger.error(f"No valid checkpoint found for {comp_name} at {comp_path}")
-                continue
+                return
 
-            # Load state_dict
-            missing, unexpected = unwrapped.load_state_dict(state_dict, strict=strict)
+        # Load state_dict
+        missing, unexpected = unwrapped.load_state_dict(state_dict, strict=strict)
 
-            if self.accelerator.is_main_process:
-                if missing:
-                    logger.warning(f"Missing keys for {comp_name}: {missing[:5]}...")
-                if unexpected:
-                    logger.warning(f"Unexpected keys for {comp_name}: {unexpected[:5]}...")
-                logger.info(f"Full model weights loaded for {comp_name} from {comp_path}")
+        if self.accelerator.is_main_process:
+            if missing:
+                logger.warning(f"Missing keys for {comp_name}: {missing[:5]}...")
+            if unexpected:
+                logger.warning(f"Unexpected keys for {comp_name}: {unexpected[:5]}...")
+            logger.info(
+                f"Full model weights loaded for {comp_name} role={entry.role} from {comp_path}"
+            )
 
     def _load_training_state(self, path: str) -> None:
         """Load full training state for resuming training."""
@@ -2265,15 +2525,18 @@ class BaseAdapter(ABC):
         """
         Auto-detect checkpoint format by inspecting directory contents.
 
-        Checks whether the checkpoint directory (or component subdirectories)
-        contains LoRA adapter files (adapter_config.json). Falls back to 'full'
-        if no LoRA signature files are found.
+        A manifest states the format outright. Without one, the entry directories
+        are probed for LoRA adapter files (adapter_config.json), falling back to
+        'full' when no LoRA signature is found.
         """
-        paths_to_check = (
-            [os.path.join(path, comp_name) for comp_name in self.model_args.target_components]
-            if len(self.model_args.target_components) > 1
-            else [path]
-        )
+        manifest = self._read_checkpoint_manifest(path)
+        if manifest is not None and manifest.get("finetune_type") in ("lora", "full"):
+            finetune_type = cast(Literal["lora", "full"], manifest["finetune_type"])
+            if self.accelerator.is_main_process:
+                logger.info(f"Checkpoint manifest at {path} declares a {finetune_type} checkpoint")
+            return finetune_type
+
+        paths_to_check = [entry.directory(path) for entry in self._checkpoint_entries(path)]
         for check_path in paths_to_check:
             if os.path.exists(os.path.join(check_path, LORA_ADAPTER_CONFIG_NAME)):
                 if self.accelerator.is_main_process:

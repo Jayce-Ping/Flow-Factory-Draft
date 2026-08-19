@@ -1981,13 +1981,20 @@ class BaseTrainer(ABC):
         self.accelerator.wait_for_everyone()
 
     def save_checkpoint(self, save_directory: str, epoch: Optional[int] = None):
-        """Save trainer state to a specific path."""
+        """Save trainer state to a specific path.
+
+        A periodic checkpoint exists to be resumed from, so it carries the
+        training-only roles too. A multi-role run that saved just its generator would
+        come back with a freshly initialized fake score and keep training happily
+        against the wrong critic.
+        """
         if epoch is not None:
             save_directory = os.path.join(save_directory, f"checkpoint-{epoch}")
 
         self.adapter.save_checkpoint(
             save_directory=save_directory,
             model_only=self.log_args.save_model_only,
+            include_training_roles=True,
         )
 
         self.accelerator.wait_for_everyone()
