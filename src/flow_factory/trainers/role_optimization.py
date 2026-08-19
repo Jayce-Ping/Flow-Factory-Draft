@@ -114,6 +114,7 @@ class OptimizationRole:
     optimizer_group_ids: Tuple[int, ...]
     step: int = 0
     scheduler: Optional[Any] = None
+    last_grad_norm: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -374,7 +375,11 @@ class RoleOptimizationCoordinator:
                     f"{role_name!r} is active; expected every inactive gradient to be None"
                 )
 
-        self.accelerator.clip_grad_norm_(role.parameters, role.config.max_grad_norm)
+        # Kept so a caller can report it: a role whose gradient norm collapses or spikes
+        # is the first sign that its objective went wrong, and the losses alone do not
+        # show it.
+        grad_norm = self.accelerator.clip_grad_norm_(role.parameters, role.config.max_grad_norm)
+        role.last_grad_norm = None if grad_norm is None else float(grad_norm)
         self.optimizer.step()
         step_was_skipped = getattr(self.optimizer, "step_was_skipped", False)
         self.optimizer.zero_grad(set_to_none=True)

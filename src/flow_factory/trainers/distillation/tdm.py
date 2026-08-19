@@ -41,6 +41,8 @@ from .distillation_runtime import (
     detach_state,
     generate_one_rollout_batch,
     query_score_velocity,
+    record_distillation_metric,
+    record_state_statistics,
     reference_forward_kwargs,
     reject_training_rewards,
     replay_forward_kwargs,
@@ -853,6 +855,10 @@ class TDMTrainer(BaseTrainer):
             times,
             fake_velocity,
         )
+        record_state_statistics(self, "train/x0_gen", boundary_state)
+        record_state_statistics(self, "train/x0_real", x0_real)
+        record_state_statistics(self, "train/x0_fake", x0_fake)
+        record_distillation_metric(self, "train/boundary_index", unit.boundary_index)
         loss = tdm_generator_loss(
             self.adapter,
             boundary_state,
