@@ -254,6 +254,43 @@ def test_every_role_returns_to_its_own_variant_not_to_whichever_is_active(
 
 
 @pytest.mark.parametrize("finetune_type", ["lora", "full"])
+def test_three_roles_each_return_to_their_own_variant(
+    tmp_path: Path,
+    finetune_type: str,
+) -> None:
+    """TDM-R1's shape: a generator, the fake score, and a surrogate between them.
+
+    Three roles is where an off-by-one in the layout stops being invisible: two roles
+    can be swapped and still look plausible, three cannot.
+    """
+    roles = (BASE_VARIANT, "fake", "surrogate")
+    source = _adapter(finetune_type, roles=roles)
+    values = {role: float(index + 1) for index, role in enumerate(roles)}
+    for role, value in values.items():
+        _fill(source, role, value)
+    expected = {role: _values(source, role) for role in roles}
+
+    source.save_checkpoint(str(tmp_path), save_ema=False, include_training_roles=True)
+
+    assert (tmp_path / "roles" / "fake").is_dir()
+    assert (tmp_path / "roles" / "surrogate").is_dir()
+
+    target = _adapter(finetune_type, roles=roles)
+    for role in roles:
+        _fill(target, role, 9.0)
+    target.load_checkpoint(str(tmp_path))
+
+    for role in roles:
+        for actual, want in zip(_values(target, role), expected[role]):
+            torch.testing.assert_close(actual, want, rtol=0, atol=0)
+    # No two roles may have collapsed onto the same weights.
+    restored = [_values(target, role)[0] for role in roles]
+    assert not torch.equal(restored[0], restored[1])
+    assert not torch.equal(restored[1], restored[2])
+    assert not torch.equal(restored[0], restored[2])
+
+
+@pytest.mark.parametrize("finetune_type", ["lora", "full"])
 def test_several_components_nest_by_component_and_still_round_trip(
     tmp_path: Path,
     finetune_type: str,
