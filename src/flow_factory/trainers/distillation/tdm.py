@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, Iterator, List, Literal, Optional, Sequence, Tuple
+from typing import Any, ClassVar, Dict, Iterator, List, Literal, Mapping, Optional, Sequence, Tuple
 
 import torch
 from accelerate import Accelerator
@@ -218,18 +218,12 @@ class TDMTrainer(BaseTrainer):
                 boundary_index - 1,
             )
             primary_name = self.adapter.trajectory_component_order[0]
-            batch_size = len(replay_samples)
-            interval_end = self._as_per_sample_coordinate(
-                replay_step.times.timestep[primary_name], batch_size
-            )
-            interval_start = self._as_per_sample_coordinate(
-                replay_step.times.next_timestep[primary_name],
-                batch_size,
-                like=interval_end,
-            )
+            times = self._normalize_replay_times(replay_step.times, len(replay_samples))
+            interval_end = times.timestep[primary_name]
+            interval_start = times.next_timestep[primary_name]
             self._validate_interval(
                 batch,
-                replay_step.times,
+                times,
                 boundary_index=boundary_index,
                 interval_start=interval_start,
                 interval_end=interval_end,
@@ -245,6 +239,38 @@ class TDMTrainer(BaseTrainer):
             )
             previous_interval_start = interval_start
         return units
+
+    def _normalize_replay_times(self, times: ComponentTimes, batch_size: int) -> ComponentTimes:
+        """Return one real coordinate per sample for every component of a transition.
+
+        The terminal transition's next coordinate is shared by the batch and synthesized
+        as an integer zero. That is the number the schedule means, in a container nothing
+        downstream accepts, and it reaches several independent checks -- normalize the
+        whole transition once here instead of at each of them.
+
+        Args:
+            times: Coordinates as the replay accessor returned them.
+            batch_size: Number of samples in the replay unit.
+
+        Returns:
+            The same coordinates, each shaped ``(B,)`` in the schedule's real dtype.
+        """
+        reference = next(iter(times.timestep.values()))
+
+        def widen(mapping: Optional[Mapping[str, torch.Tensor]]) -> Optional[Dict[str, Any]]:
+            if mapping is None:
+                return None
+            return {
+                name: self._as_per_sample_coordinate(value, batch_size, like=reference)
+                for name, value in mapping.items()
+            }
+
+        return ComponentTimes(
+            timestep=widen(times.timestep),
+            next_timestep=widen(times.next_timestep),
+            sigma=widen(times.sigma),
+            next_sigma=widen(times.next_sigma),
+        )
 
     @staticmethod
     def _as_per_sample_coordinate(
