@@ -752,7 +752,9 @@ def test_tdm_rejects_non_dense_or_misaligned_state_maps(
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
-        ({"state_index_map": torch.tensor([0, -1, 2])}, "missing boundary"),
+        # A hole in the map is now caught by the replay accessor, which reports which
+        # transition could not be read rather than which map entry was -1.
+        ({"state_index_map": torch.tensor([0, -1, 2])}, "reading transition .* failed"),
         ({"video_times": torch.tensor([1000.0, 500.0, 100.0])}, "gap|terminal"),
         ({"video_times": torch.tensor([1000.0, 1100.0, 0.0])}, "reversed"),
         ({"audio_times": torch.tensor([500.0, 300.0, 0.0])}, "shared interval"),
