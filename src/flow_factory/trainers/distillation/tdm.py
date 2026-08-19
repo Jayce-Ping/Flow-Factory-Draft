@@ -876,8 +876,10 @@ class TDMTrainer(BaseTrainer):
             noised=noised,
             reference_velocity=reference_velocity,
             fake_velocity=fake_velocity,
-            x0_real=x0_real,
-            x0_fake=x0_fake,
+            # Detached: these are frozen score queries, and every consumer uses them as
+            # a target or a scale rather than a path for the generator's gradient.
+            x0_real=detach_state(x0_real),
+            x0_fake=detach_state(x0_fake),
         )
 
     def _stack_replay_unit(
