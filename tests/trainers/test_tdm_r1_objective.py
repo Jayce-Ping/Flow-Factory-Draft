@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, List
 
@@ -47,6 +48,12 @@ class AdapterFake(BaseAdapter):
 
     def forward(self, **kwargs: Any) -> SDESchedulerOutput:
         raise NotImplementedError
+
+
+@contextmanager
+def _null_context():
+    """Stand in for the snapshot installation context."""
+    yield
 
 
 def _adapter() -> AdapterFake:
@@ -187,6 +194,56 @@ def test_a_surrogate_that_has_drifted_far_enough_stops_receiving_gradient(
     clipped.sum().backward()
 
     torch.testing.assert_close(trainable.grad, torch.tensor([0.0, 1.0, 1.0]))
+
+
+def test_samples_that_left_the_trust_region_stop_accumulating_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The PPO ratio is measured against the slow copy, not the frozen reference.
+
+    Sample 0 now denoises far better than the slow copy did and has a positive
+    advantage, so it is outside the region; sample 1 barely moved; sample 2 moved the
+    way a negative advantage asks, which for that sample is also outside.
+    """
+    monkeypatch.setattr(tdm_r1_module, "record_distillation_metric", lambda *args: None)
+    trainer = _generator_trainer(tdm_weight=0.3)
+    trainer.training_args.surrogate_clip_range = 0.1
+    slow = torch.tensor([1.0, 1.0, 1.0])
+    trainer.adapter = SimpleNamespace(use_variant_snapshot=lambda name: _null_context())
+    monkeypatch.setattr(
+        TDMR1Trainer,
+        "_boundary_preference_values",
+        lambda self, unit, *, trainable_role: (slow, slow),
+    )
+    trainable = torch.tensor([0.5, 0.99, 1.5], requires_grad=True)
+    advantages = torch.tensor([1.0, 1.0, -1.0])
+
+    kept = trainer._clip_outside_trust_region(
+        SimpleNamespace(), trainable, _preference_batch(advantages)
+    )
+    kept.sum().backward()
+
+    torch.testing.assert_close(trainable.grad, torch.tensor([0.0, 1.0, 0.0]))
+
+
+def test_a_zero_clip_range_skips_the_slow_copy_entirely(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Disabling the trust region must not still pay for an extra score query."""
+    trainer = _generator_trainer(tdm_weight=0.3)
+    trainer.training_args.surrogate_clip_range = 0.0
+
+    def refuse(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("the slow surrogate must not be queried when clipping is off")
+
+    monkeypatch.setattr(TDMR1Trainer, "_boundary_preference_values", refuse)
+    trainable = torch.tensor([0.5, 0.99])
+
+    kept = trainer._clip_outside_trust_region(
+        SimpleNamespace(), trainable, _preference_batch(torch.tensor([1.0, 1.0]))
+    )
+
+    assert kept is trainable
 
 
 def test_a_negative_advantage_reverses_which_direction_counts_as_improvement(

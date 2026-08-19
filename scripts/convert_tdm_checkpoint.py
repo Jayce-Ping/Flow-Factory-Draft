@@ -26,7 +26,7 @@ Usage:
     # then, in a training config:
     #   model:
     #     resume_path: /path/to/tdm_sd35_lora
-    #     resume_type: model
+    #     resume_type: lora
 """
 
 from __future__ import annotations
@@ -265,7 +265,7 @@ def main() -> None:
         target_modules=args.target_modules,
     )
     print(f"wrote {len(state_dict)} named tensors to {args.output}")
-    print("set model.resume_path to this directory with model.resume_type: model")
+    print("set model.resume_path to this directory with model.resume_type: lora")
 
 
 if __name__ == "__main__":

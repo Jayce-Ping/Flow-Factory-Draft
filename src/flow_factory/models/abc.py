@@ -980,6 +980,44 @@ class BaseAdapter(ABC):
         with registry.use_snapshot(snapshot_name):
             yield
 
+    def declare_variant_snapshot(self, variant_name: str, snapshot_name: str) -> None:
+        """Register a parameter EMA that tracks one trainable variant.
+
+        Args:
+            variant_name: Trainable variant the snapshot follows.
+            snapshot_name: Unique identifier the caller will read it back by.
+
+        Raises:
+            RuntimeError: If no component variants were declared.
+        """
+        registry = self._require_variant_registry("parameter EMA")
+        registry.add_snapshot(variant_name, snapshot_name)
+
+    def has_variant_snapshot(self, snapshot_name: str) -> bool:
+        """Report whether a parameter EMA snapshot exists.
+
+        Args:
+            snapshot_name: Identifier to look up.
+
+        Returns:
+            Whether the snapshot has been declared.
+        """
+        registry = self._require_variant_registry("parameter EMA")
+        return registry.has_snapshot(snapshot_name)
+
+    def update_variant_snapshot(self, snapshot_name: str, decay: float) -> None:
+        """Advance a parameter EMA toward its variant's live parameters.
+
+        Args:
+            snapshot_name: Existing snapshot identifier.
+            decay: Weight kept on the existing snapshot, in ``[0, 1]``.
+
+        Raises:
+            RuntimeError: If no component variants were declared.
+        """
+        registry = self._require_variant_registry("parameter EMA")
+        registry.update_snapshot(snapshot_name, decay)
+
     def get_variant_snapshot(self, snapshot_name: str) -> Tuple[torch.Tensor, ...]:
         """Return the raw tensors of a variant-local parameter EMA snapshot.
 

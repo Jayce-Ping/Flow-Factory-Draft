@@ -665,6 +665,17 @@ class ComponentVariantRegistry:
                 )
             target["update_count"] = update_count
 
+    def has_snapshot(self, snapshot_name: str) -> bool:
+        """Report whether a parameter EMA snapshot has been created.
+
+        Args:
+            snapshot_name: Identifier to look up.
+
+        Returns:
+            Whether the snapshot exists.
+        """
+        return snapshot_name in self._snapshots
+
     def _get_snapshot(self, snapshot_name: str) -> Dict[str, Any]:
         """Return one parameter EMA snapshot or fail with available names."""
         if snapshot_name not in self._snapshots:

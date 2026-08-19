@@ -17,9 +17,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from types import MethodType, SimpleNamespace
-from typing import Any, Dict, Mapping, Tuple
+from typing import Any, Dict, Iterator, Mapping, Tuple
 
 import pytest
 import torch
@@ -229,6 +230,26 @@ def _run_production_tdm_r1_optimize(
         def update_parameter_ema(self, name: str, decay: float) -> None:
             self.snapshots[name].lerp_(self.live[name].detach(), 1 - decay)
 
+        def has_snapshot(self, name: str) -> bool:
+            return name in self.snapshots
+
+        def add_snapshot(self, variant_name: str, name: str) -> None:
+            self.live[name] = roles[variant_name].parameters[0]
+            self.snapshots[name] = self.live[name].detach().clone()
+
+        def update_snapshot(self, name: str, decay: float) -> None:
+            self.update_parameter_ema(name, decay)
+
+        @contextmanager
+        def use_snapshot(self, name: str) -> Iterator[None]:
+            live = self.live[name]
+            restored = live.detach().clone()
+            live.data.copy_(self.snapshots[name])
+            try:
+                yield
+            finally:
+                live.data.copy_(restored)
+
     class ProductionPathTDMR1Trainer(TDMR1Trainer):
         optimize_calls = 0
 
@@ -246,14 +267,22 @@ def _run_production_tdm_r1_optimize(
     trainer.optimizer = optimizer
     trainer.optimization_roles = roles
     trainer.role_optimization = coordinator
+    # Delegated to the real registry so the slow surrogate copy TDM-R1 keeps is
+    # exercised by the distributed wiring rather than stubbed away.
     trainer.adapter = SimpleNamespace(
         component_variant_registry=registry,
         train=lambda: None,
+        has_variant_snapshot=registry.has_snapshot,
+        declare_variant_snapshot=registry.add_snapshot,
+        update_variant_snapshot=registry.update_snapshot,
+        use_variant_snapshot=registry.use_snapshot,
     )
     trainer.training_args = SimpleNamespace(
         gradient_accumulation_steps=gradient_accumulation_steps,
         ttur_fake_updates=1,
         per_device_batch_size=2,
+        surrogate_slow_decay_min=0.001,
+        surrogate_slow_decay_max=0.3,
     )
     trainer.step = 0
     trainer.epoch = 0
