@@ -32,6 +32,7 @@ from .distillation_runtime import (
     detach_state,
     generate_one_rollout_batch,
     query_score_velocity,
+    reference_forward_kwargs,
     require_velocity,
     role_repeat_progress,
     run_distillation_training_step,
