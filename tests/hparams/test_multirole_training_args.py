@@ -364,8 +364,9 @@ def test_dmd2_rejects_untiled_unique_sample_without_auto_align() -> None:
         )
 
 
-def test_tdm_r1_rejects_batch_not_divisible_by_group_size() -> None:
-    with pytest.raises(ValueError, match="per_device_batch_size % group_size == 0"):
+def test_tdm_r1_rejects_a_geometry_no_sampler_can_group() -> None:
+    """One rank holding half a group cannot form a group logit under any layout."""
+    with pytest.raises(ValueError, match="no sampler can"):
         _parse_train(
             "tdm-r1",
             train_overrides={
@@ -374,6 +375,45 @@ def test_tdm_r1_rejects_batch_not_divisible_by_group_size() -> None:
             },
             rewards=[{"name": "score", "reward_model": "clip"}],
         )
+
+
+def test_tdm_r1_splits_a_group_across_ranks_when_a_microbatch_cannot_hold_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A group larger than the microbatch used to be rejected outright.
+
+    ``group_distributed`` deals every rank an equal share of every group, so the group
+    logit is a cross-rank sum rather than a local one. That admits the common shape of
+    one reward group spanning the whole global step.
+    """
+    monkeypatch.setenv("WORLD_SIZE", "2")
+
+    config = _parse_train(
+        "tdm-r1",
+        train_overrides={
+            "group_size": 4,
+            "per_device_batch_size": 2,
+            "unique_sample_num_per_epoch": 4,
+        },
+        rewards=[{"name": "score", "reward_model": "clip"}],
+    )
+
+    assert config.data_args.sampler_type == "group_distributed"
+
+
+def test_tdm_r1_prefers_the_rank_local_layout_when_a_microbatch_holds_whole_groups() -> None:
+    """Keeping a group on one rank saves the collective, so it wins when both fit."""
+    config = _parse_train(
+        "tdm-r1",
+        train_overrides={
+            "group_size": 2,
+            "per_device_batch_size": 4,
+            "unique_sample_num_per_epoch": 4,
+        },
+        rewards=[{"name": "score", "reward_model": "clip"}],
+    )
+
+    assert config.data_args.sampler_type == "group_contiguous"
 
 
 @pytest.mark.parametrize("trainer_type", ["dmd2", "tdm"])

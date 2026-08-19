@@ -377,36 +377,78 @@ class TDMR1Trainer(BaseTrainer):
         unit: TDMBoundaryUnit,
         values: torch.Tensor,
     ) -> GroupPreferenceBatch:
-        """Build dense rank-local group indices for one complete replay unit."""
+        """Build the dense group indices for one replay unit under either layout.
+
+        ``group_contiguous`` puts a whole group on one rank, so the group logit is a
+        local sum. ``group_distributed`` deals every rank an equal share of every
+        group, so each rank holds ``group_size // num_replicas`` members and the logits
+        are summed across ranks. Both give the preference loss whole groups; they
+        differ only in where the members live.
+        """
         unique_ids = torch.as_tensor(
             [int(sample.unique_id) for sample in unit.samples],
             device=values.device,
             dtype=torch.int64,
         )
-        local_group_indices = torch.unique(unique_ids, return_inverse=True)[1]
-        num_groups = int(torch.unique(local_group_indices).shape[0])
+        sorted_unique_ids, local_group_indices = torch.unique(unique_ids, return_inverse=True)
+        num_groups = int(sorted_unique_ids.shape[0])
         group_size = self.training_args.group_size
+        rank_local_groups = self.config.data_args.sampler_type == "group_contiguous"
+        members_per_rank = (
+            group_size if rank_local_groups else group_size // self.accelerator.num_processes
+        )
+
         counts = torch.bincount(local_group_indices, minlength=num_groups)
         expected_counts = torch.full(
             (num_groups,),
-            group_size,
+            members_per_rank,
             device=counts.device,
             dtype=counts.dtype,
         )
         if not torch.equal(counts, expected_counts):
             raise ValueError(
-                "TDM-R1 expected every rank-local group to contain exactly "
-                f"group_size={group_size} members in one microbatch, received "
+                "TDM-R1 expected every group to contribute exactly "
+                f"{members_per_rank} members to one rank-local microbatch under "
+                f"sampler_type={self.config.data_args.sampler_type!r} with group_size={group_size} "
+                f"and num_replicas={self.accelerator.num_processes}, received "
                 f"counts={counts.tolist()} for unique_ids={unique_ids.tolist()}"
             )
+        if not rank_local_groups:
+            self._validate_shared_group_identity(sorted_unique_ids)
+
         advantages = self._advantages_for_samples(unit.samples, values)
         return GroupPreferenceBatch(
             local_group_indices=local_group_indices,
             num_groups=num_groups,
             group_size=group_size,
             advantages=advantages,
-            reduce_across_ranks=False,
+            reduce_across_ranks=not rank_local_groups,
         )
+
+    def _validate_shared_group_identity(self, sorted_unique_ids: torch.Tensor) -> None:
+        """Check every rank agrees on which prompt each dense group index names.
+
+        The cross-rank sum adds group ``g`` on one rank to group ``g`` on another, so
+        ranks holding different prompt sets would mix unrelated samples into one logit
+        and train on a plausible but meaningless preference. ``group_distributed``
+        guarantees the agreement; this makes a violation say so.
+
+        Args:
+            sorted_unique_ids: This rank's group identities, ascending.
+
+        Raises:
+            RuntimeError: If the ranks disagree on the group-id space.
+        """
+        signature = sorted_unique_ids.to(torch.float64)
+        highest = self.accelerator.reduce(signature.clone(), reduction="max")
+        if not torch.equal(highest, signature):
+            raise RuntimeError(
+                "TDM-R1 expected every rank to hold the same reward groups in a microbatch "
+                f"under sampler_type={self.config.data_args.sampler_type!r}; this rank holds "
+                f"unique_ids={sorted_unique_ids.tolist()} while the group maximum is "
+                f"{highest.tolist()}. Cross-rank group logits are summed by index, so the "
+                "ranks must agree on what each index names."
+            )
 
     def _advantages_for_samples(
         self,

@@ -252,7 +252,8 @@ def test_tdm_r1_constructs_without_guidance_branch_hook() -> None:
     assert events == ["fake", "fake", "surrogate", "generator"]
 
 
-def test_tdm_r1_forces_rank_local_complete_reward_groups() -> None:
+def test_tdm_r1_replaces_a_sampler_that_scatters_group_members() -> None:
+    """distributed_k_repeat leaves each rank a different set of partial groups."""
     config = Arguments.from_dict(
         {
             "data": {"sampler_type": "distributed_k_repeat"},
@@ -335,9 +336,20 @@ def test_tdm_r1_feedback_uses_reward_buffer_and_configured_advantages() -> None:
     assert calls[1][1]["aggregation_func"] == "gdpo"
 
 
-def test_tdm_r1_group_preference_batch_is_rank_local() -> None:
+def _preference_trainer(sampler_type: str, *, num_processes: int = 1) -> TDMR1Trainer:
+    """Build the trainer surface the group-preference batch reads."""
     trainer = object.__new__(TDMR1Trainer)
     trainer.training_args = SimpleNamespace(group_size=2, advantage_clip_range=5.0)
+    trainer.config = SimpleNamespace(data_args=SimpleNamespace(sampler_type=sampler_type))
+    trainer.accelerator = SimpleNamespace(
+        num_processes=num_processes,
+        reduce=lambda tensor, reduction: tensor,
+    )
+    return trainer
+
+
+def test_tdm_r1_group_preference_batch_is_rank_local() -> None:
+    trainer = _preference_trainer("group_contiguous")
     unit = SimpleNamespace(
         samples=(
             SimpleNamespace(unique_id=7, extra_kwargs={"advantage": 1.0}),
@@ -352,6 +364,54 @@ def test_tdm_r1_group_preference_batch_is_rank_local() -> None:
     assert batch.reduce_across_ranks is False
     assert batch.group_size == 2
     torch.testing.assert_close(batch.local_group_indices, torch.zeros(2, dtype=torch.int64))
+
+
+def test_tdm_r1_sums_group_logits_across_ranks_when_the_group_is_split() -> None:
+    """Under group_distributed a rank holds group_size // num_replicas of each group."""
+    trainer = _preference_trainer("group_distributed", num_processes=2)
+    unit = SimpleNamespace(
+        samples=(
+            SimpleNamespace(unique_id=7, extra_kwargs={"advantage": 1.0}),
+            SimpleNamespace(unique_id=9, extra_kwargs={"advantage": -0.5}),
+        )
+    )
+    values = torch.tensor([0.25, 0.75])
+
+    batch = trainer._group_preference_batch(unit, values)
+
+    assert batch.num_groups == 2
+    assert batch.reduce_across_ranks is True
+    assert batch.group_size == 2
+    torch.testing.assert_close(batch.local_group_indices, torch.tensor([0, 1]))
+
+
+def test_tdm_r1_rejects_a_microbatch_holding_the_wrong_share_of_a_split_group() -> None:
+    """Two members of one group on one rank means another rank has none of it."""
+    trainer = _preference_trainer("group_distributed", num_processes=2)
+    unit = SimpleNamespace(
+        samples=(
+            SimpleNamespace(unique_id=7, extra_kwargs={"advantage": 1.0}),
+            SimpleNamespace(unique_id=7, extra_kwargs={"advantage": -0.5}),
+        )
+    )
+
+    with pytest.raises(ValueError, match="exactly 1 members"):
+        trainer._group_preference_batch(unit, torch.tensor([0.25, 0.75]))
+
+
+def test_tdm_r1_rejects_ranks_that_disagree_on_the_group_id_space() -> None:
+    """Summing group g on one rank into group g on another would mix unrelated samples."""
+    trainer = _preference_trainer("group_distributed", num_processes=2)
+    trainer.accelerator.reduce = lambda tensor, reduction: tensor + 1.0
+    unit = SimpleNamespace(
+        samples=(
+            SimpleNamespace(unique_id=7, extra_kwargs={"advantage": 1.0}),
+            SimpleNamespace(unique_id=9, extra_kwargs={"advantage": -0.5}),
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="same reward groups"):
+        trainer._group_preference_batch(unit, torch.tensor([0.25, 0.75]))
 
 
 def test_group_preference_rank_local_mode_skips_cross_rank_reduce() -> None:
