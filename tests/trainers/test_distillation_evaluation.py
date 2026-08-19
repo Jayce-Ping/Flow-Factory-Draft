@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from typing import Any, List
 
 import pytest
+import torch
 
 from flow_factory.hparams import Arguments
 from flow_factory.trainers.distillation.dmd2 import DMD2Trainer
@@ -34,6 +35,12 @@ def _loop_trainer(trainer_cls: type, *, eval_freq: int, epochs: int = 2) -> Any:
     trainer.adapter = SimpleNamespace(
         set_trajectory_seed=lambda seed: None,
         ema_step=lambda step: None,
+    )
+    # The epoch closes by reducing its buffered metrics across ranks, which is a
+    # one-rank no-op here.
+    trainer.accelerator = SimpleNamespace(
+        device=torch.device("cpu"),
+        reduce=lambda tensor, reduction: tensor,
     )
     trainer.training_args = SimpleNamespace(seed=0, gradient_accumulation_steps=2)
     trainer.log_args = SimpleNamespace(save_freq=0, save_dir=None, run_name="run", verbose=False)

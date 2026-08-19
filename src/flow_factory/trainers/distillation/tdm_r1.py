@@ -32,6 +32,7 @@ from .distillation_runtime import (
     detach_state,
     generate_one_rollout_batch,
     query_score_velocity,
+    record_distillation_metric,
     reference_forward_kwargs,
     require_velocity,
     role_repeat_progress,
@@ -214,6 +215,14 @@ class TDMR1Trainer(BaseTrainer):
             trainable_role="surrogate",
         )
         preference_batch = self._group_preference_batch(unit, trainable_values)
+        # How far the surrogate density has drifted from its frozen reference. The
+        # preference loss alone cannot distinguish a surrogate that is learning from
+        # one that has run away from the reference and is scoring everything higher.
+        record_distillation_metric(
+            self,
+            "train/surrogate_value_delta",
+            (trainable_values - reference_values).mean(),
+        )
         return group_preference_loss(
             self.accelerator,
             preference_batch,
@@ -233,6 +242,16 @@ class TDMR1Trainer(BaseTrainer):
             trainable_values,
             reference_values,
             self.training_args.surrogate_preference_beta,
+        )
+        # The generator optimizes a sum, so the total alone hides which half is moving:
+        # a preference term that swamps the distribution-matching term trades image
+        # quality for reward and shows up here before it shows up in the samples.
+        record_distillation_metric(self, "train/generator_tdm_loss", terms.loss)
+        record_distillation_metric(self, "train/generator_preference_loss", preference_loss)
+        record_distillation_metric(
+            self,
+            "train/generator_value_delta",
+            (trainable_values - reference_values).mean(),
         )
         return terms.loss + self.training_args.tdm_weight * preference_loss
 

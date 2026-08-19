@@ -33,7 +33,10 @@ from flow_factory.samples import (
 )
 from flow_factory.scheduler import SDESchedulerOutput
 from flow_factory.trainers.abc import BaseTrainer
-from flow_factory.trainers.distillation.distillation_runtime import require_velocity
+from flow_factory.trainers.distillation.distillation_runtime import (
+    pop_distillation_metrics,
+    require_velocity,
+)
 from flow_factory.trainers.distillation.dmd2 import DMD2Trainer
 from flow_factory.trainers.distillation.tdm import TDMTrainer
 from flow_factory.trainers.distillation.tdm_r1 import TDMR1Trainer
@@ -343,6 +346,28 @@ def test_dmd2_gas_two_phase_matches_explicit_large_batch(phase_name: str) -> Non
     expected_optimizer.step()
 
     torch.testing.assert_close(parameter, expected, rtol=0, atol=1e-7)
+
+
+def test_a_real_role_phase_reports_its_loss_and_gradient_norm() -> None:
+    """The wandb view of a distillation run comes entirely from these two per role."""
+    torch.manual_seed(17)
+    trainer, _, _ = _real_objective_trainer()
+
+    trainer._fake_phase([_trajectory_unit()])
+    trainer._generator_phase([_trajectory_unit()])
+    metrics = pop_distillation_metrics(trainer)
+
+    assert set(metrics) >= {
+        "train/fake_loss",
+        "train/fake_grad_norm",
+        "train/generator_loss",
+        "train/generator_grad_norm",
+        "train/x0_real_std",
+        "train/x0_fake_std",
+        "train/x0_gen_std",
+    }
+    assert metrics["train/fake_grad_norm"] > 0
+    assert metrics["train/generator_grad_norm"] > 0
 
 
 def test_dmd2_real_objective_uses_fresh_fake_perturbations_and_detached_queries() -> None:

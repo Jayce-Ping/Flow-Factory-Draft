@@ -17,7 +17,10 @@
 from __future__ import annotations
 
 import inspect
+import math
+import zlib
 from contextlib import contextmanager
+from numbers import Real
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -30,6 +33,7 @@ from typing import (
     Mapping,
     Optional,
     Sequence,
+    Tuple,
 )
 
 import torch
@@ -484,6 +488,121 @@ def role_repeat_progress(trainer: Any, *, role_name: str, repeats: int) -> Itera
     )
 
 
+def record_distillation_metric(trainer: Any, name: str, value: Any) -> None:
+    """Buffer one scalar for the next sync-boundary log.
+
+    Buffered rather than logged on the spot because a role phase runs once per TTUR
+    repeat and once per microbatch inside that, so logging directly would emit many
+    values against a single ``step`` and let the last writer win.
+
+    Args:
+        trainer: Trainer owning the buffer.
+        name: Metric key, already carrying its ``train/`` prefix.
+        value: Scalar or 0-dim tensor to average into the metric.
+
+    Raises:
+        TypeError: If ``name`` is not a non-empty string.
+        ValueError: If ``value`` is not a finite scalar.
+    """
+    if not isinstance(name, str) or not name:
+        raise TypeError(
+            f"expected a non-empty metric name, received {type(name).__name__}: {name!r}"
+        )
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            raise ValueError(
+                f"expected a scalar for metric {name!r}, received a tensor of "
+                f"shape {tuple(value.shape)}"
+            )
+        value = value.detach().float().item()
+    if not isinstance(value, Real) or isinstance(value, bool) or not math.isfinite(float(value)):
+        raise ValueError(f"expected a finite scalar for metric {name!r}, received {value!r}")
+
+    buffer: Dict[str, Tuple[float, float]] = trainer.__dict__.setdefault(
+        "_distillation_metrics", {}
+    )
+    total, count = buffer.get(name, (0.0, 0.0))
+    buffer[name] = (total + float(value), count + 1.0)
+
+
+def record_state_statistics(trainer: Any, prefix: str, state: Any) -> None:
+    """Buffer the mean and standard deviation of one latent state.
+
+    These are the drift monitors. A generator whose clean latents wander out of the
+    VAE's range decodes as dark or washed-out images while its loss keeps falling, so
+    the losses alone never show it; a reference state whose std strays far from 1 means
+    the teacher is being queried at the wrong time.
+
+    Args:
+        trainer: Trainer owning the buffer.
+        prefix: Metric key prefix, already carrying its ``train/`` prefix.
+        state: Latent state whose components are pooled into one mean and std.
+    """
+    total = 0.0
+    total_square = 0.0
+    count = 0.0
+    for component in state.components.values():
+        values = component.detach().float()
+        total += float(values.sum())
+        total_square += float(values.square().sum())
+        count += float(values.numel())
+    if count == 0:
+        raise ValueError(f"expected a non-empty state for metric prefix {prefix!r}, received none")
+
+    mean = total / count
+    variance = max(total_square / count - mean * mean, 0.0)
+    record_distillation_metric(trainer, f"{prefix}_mean", mean)
+    record_distillation_metric(trainer, f"{prefix}_std", math.sqrt(variance))
+
+
+def pop_distillation_metrics(trainer: Any) -> Dict[str, float]:
+    """Average the buffered metrics across ranks and clear the buffer.
+
+    Args:
+        trainer: Trainer owning the buffer.
+
+    Returns:
+        Metric name to its process-group mean, empty when nothing was buffered.
+
+    Raises:
+        RuntimeError: If the ranks buffered different metrics, which would otherwise
+            hang the reduction below instead of failing.
+    """
+    buffer: Dict[str, Tuple[float, float]] = (
+        trainer.__dict__.pop("_distillation_metrics", None) or {}
+    )
+    names = sorted(buffer)
+    accelerator = trainer.accelerator
+
+    # A rank-dependent key set makes the reduction below deadlock rather than raise,
+    # and a deadlock 40 minutes into a 64-GPU run costs far more than this check.
+    signature = torch.tensor(
+        [float(len(names)), float(sum(zlib.crc32(name.encode()) for name in names))],
+        device=accelerator.device,
+        dtype=torch.float64,
+    )
+    lowest = accelerator.reduce(signature.clone(), reduction="min")
+    highest = accelerator.reduce(signature.clone(), reduction="max")
+    if not torch.equal(lowest, highest):
+        raise RuntimeError(
+            "expected every rank to buffer the same distillation metrics; this rank "
+            f"buffered {len(names)}: {names}. Metrics are recorded on code paths that "
+            "must be rank-uniform, so a mismatch means one rank skipped a role phase."
+        )
+    if not names:
+        return {}
+
+    packed = torch.tensor(
+        [buffer[name][0] for name in names] + [buffer[name][1] for name in names],
+        device=accelerator.device,
+        dtype=torch.float64,
+    )
+    reduced = accelerator.reduce(packed, reduction="sum")
+    totals = reduced[: len(names)]
+    counts = reduced[len(names) :]
+    return {name: totals[i].item() / counts[i].item() for i, name in enumerate(names)}
+
+
 def run_role_phase(
     trainer: Any,
     role_name: str,
@@ -511,8 +630,14 @@ def run_role_phase(
             disable=not trainer.show_progress_bar or len(microbatches) < 2,
         ):
             with trainer.role_optimization.microbatch():
-                trainer.role_optimization.backward(loss_fn(microbatch))
+                loss = loss_fn(microbatch)
+                record_distillation_metric(trainer, f"train/{role_name}_loss", loss)
+                trainer.role_optimization.backward(loss)
                 trainer._finish_role_microbatch()
+
+    grad_norm = trainer.role_optimization.roles[role_name].last_grad_norm
+    if grad_norm is not None:
+        record_distillation_metric(trainer, f"train/{role_name}_grad_norm", grad_norm)
 
 
 def run_distillation_training_step(trainer: Any) -> None:
@@ -553,3 +678,7 @@ def run_distillation_training_step(trainer: Any) -> None:
         trainer.prepare_feedback(samples)
         microbatches.append(samples)
     trainer.optimize(microbatches)
+
+    metrics = pop_distillation_metrics(trainer)
+    if metrics:
+        trainer.log_data(metrics, step=trainer.step)
