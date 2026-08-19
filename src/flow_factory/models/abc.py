@@ -2060,8 +2060,63 @@ class BaseAdapter(ABC):
                 entry for entry in self._checkpoint_entries_from_config() if entry.role == base_role
             ]
 
+        if getattr(self, "component_variant_registry", None) is None:
+            # The trainer declares variants after the adapter is built, so a weight-only
+            # resume runs before the roles exist. Loading a second role now would route
+            # it to the one live adapter and overwrite the first, so keep the primary
+            # artifact and let `restore_training_roles` place the rest once they exist.
+            entries = self._primary_entries(entries)
+
         self._warn_about_roles_the_checkpoint_omits(path, entries)
         return entries
+
+    def _primary_entries(self, entries: Sequence[CheckpointEntry]) -> List[CheckpointEntry]:
+        """Return one entry per component: the one an export would ship.
+
+        Args:
+            entries: Every entry a checkpoint provides.
+
+        Returns:
+            The first entry seen for each component, in order.
+        """
+        primary: Dict[str, CheckpointEntry] = {}
+        for entry in entries:
+            primary.setdefault(entry.component, entry)
+        return list(primary.values())
+
+    def restore_training_roles(self, path: str) -> None:
+        """Place a checkpoint's non-primary roles now that the variants exist.
+
+        A weight-only resume runs while the adapter is being built, before the trainer
+        declares the roles it trains, so only the primary artifact can be placed then.
+        This finishes the job: without it a DMD2 resume would carry its generator
+        forward beside an untouched fake score.
+
+        Args:
+            path: Checkpoint directory to restore from.
+        """
+        registry = getattr(self, "component_variant_registry", None)
+        if registry is None:
+            raise RuntimeError(
+                "restore_training_roles() expected declared component variants, received none; "
+                "call declare_component_variants() first"
+            )
+        path = self._resolve_checkpoint_path(path)
+        entries = self._checkpoint_entries(path)
+        deferred = [entry for entry in entries if entry not in self._primary_entries(entries)]
+        if not deferred:
+            return
+
+        resume_type = self._detect_checkpoint_type(path)
+        for entry in deferred:
+            if not self.has_component(entry.component):
+                continue
+            with registry.use(entry.role):
+                if resume_type == "lora":
+                    self._load_lora_entry(entry, path)
+                else:
+                    self._load_full_model_entry(entry, path)
+        self.accelerator.wait_for_everyone()
 
     def _warn_about_roles_the_checkpoint_omits(
         self, path: str, entries: Sequence[CheckpointEntry]
@@ -2076,6 +2131,10 @@ class BaseAdapter(ABC):
             path: Checkpoint being loaded.
             entries: Entries the checkpoint actually provides.
         """
+        if getattr(self, "component_variant_registry", None) is None:
+            # Variants are declared by the trainer after the adapter is built, so before
+            # that there is no role vocabulary to compare against and nothing to report.
+            return
         omitted = [
             role for role in self._checkpoint_role_names() if role not in {e.role for e in entries}
         ]

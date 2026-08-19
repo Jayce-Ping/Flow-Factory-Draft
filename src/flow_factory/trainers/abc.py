@@ -889,6 +889,15 @@ class BaseTrainer(ABC):
         """
         self.adapter.declare_component_variants(self._required_trainable_roles())
 
+        # A weight-only resume already ran while the adapter was being built, when the
+        # roles did not exist yet and only the primary artifact could be placed. Now
+        # that they do, restore the rest -- a generator resumed beside an untouched fake
+        # score trains against the wrong critic and reports nothing wrong.
+        resume_path = getattr(self.adapter.model_args, "resume_path", None)
+        resume_type = getattr(self.adapter.model_args, "resume_type", None)
+        if resume_path and resume_type != "state":
+            self.adapter.restore_training_roles(resume_path)
+
     def _required_trainable_roles(self) -> Tuple[str, ...]:
         """Return every role this run trains, the one owning the base weights first.
 

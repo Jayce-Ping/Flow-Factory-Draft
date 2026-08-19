@@ -165,13 +165,20 @@ def _adapter(
 ) -> TinyAdapter:
     adapter = TinyAdapter(Accelerator(cpu=True), finetune_type, component_names)
     adapter.declare_component_variants(roles)
-    # Component access has to route through the registry, or every role would read
-    # the base module and the round trip would pass without proving anything.
+    _route_through_registry(adapter, component_names)
+    return adapter
+
+
+def _route_through_registry(adapter: TinyAdapter, component_names: Tuple[str, ...]) -> None:
+    """Make component access follow the active variant.
+
+    Without this every role would read the base module and a round trip would pass
+    while proving nothing.
+    """
     registry = adapter.component_variant_registry
     bundle = ModelBundle(registry.bundle_members())
     for name in component_names:
         adapter.set_component(name, RoutedComponentProxy(bundle, name, registry, bundle.members))
-    return adapter
 
 
 def _fill(adapter: TinyAdapter, role: str, value: float) -> None:
@@ -358,6 +365,49 @@ def test_naming_a_role_that_owns_nothing_is_refused_with_the_declared_names(
 
     with pytest.raises(ValueError, match="variant 'surrogate'.*declared variants.*fake"):
         adapter.save_checkpoint(str(tmp_path), save_ema=False, variant="surrogate")
+
+
+def test_a_resume_that_runs_before_the_roles_exist_is_finished_once_they_do(
+    tmp_path: Path,
+) -> None:
+    """The adapter loads weights while it is built; the trainer names roles later.
+
+    Placing a second role during that early load would route it to the one live
+    adapter and overwrite the first, so only the primary artifact is placed then and
+    the rest wait for the variants to exist.
+    """
+    source = _adapter("lora", roles=(BASE_VARIANT, "fake"))
+    _fill(source, BASE_VARIANT, 1.0)
+    _fill(source, "fake", 2.0)
+    expected_base = _values(source, BASE_VARIANT)
+    expected_fake = _values(source, "fake")
+    source.save_checkpoint(str(tmp_path), save_ema=False, include_training_roles=True)
+
+    target = TinyAdapter(Accelerator(cpu=True), "lora")
+    target.load_checkpoint(str(tmp_path))
+    target.declare_component_variants((BASE_VARIANT, "fake"))
+    _route_through_registry(target, ("transformer",))
+    _fill(target, "fake", 9.0)
+
+    # The early load must not have let the fake weights land on the generator.
+    for actual, want in zip(_values(target, BASE_VARIANT), expected_base):
+        torch.testing.assert_close(actual, want, rtol=0, atol=0)
+
+    target.restore_training_roles(str(tmp_path))
+
+    for actual, want in zip(_values(target, "fake"), expected_fake):
+        torch.testing.assert_close(actual, want, rtol=0, atol=0)
+    for actual, want in zip(_values(target, BASE_VARIANT), expected_base):
+        torch.testing.assert_close(actual, want, rtol=0, atol=0)
+
+
+def test_restoring_roles_before_declaring_them_is_refused(tmp_path: Path) -> None:
+    adapter = _adapter("lora")
+    adapter.save_checkpoint(str(tmp_path), save_ema=False)
+    bare = TinyAdapter(Accelerator(cpu=True), "lora")
+
+    with pytest.raises(RuntimeError, match="declared component variants, received none"):
+        bare.restore_training_roles(str(tmp_path))
 
 
 def test_each_role_directory_is_directly_loadable_by_peft(tmp_path: Path) -> None:
