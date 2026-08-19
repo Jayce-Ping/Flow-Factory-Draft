@@ -42,6 +42,7 @@ from .distillation_runtime import (
     generate_one_rollout_batch,
     query_score_velocity,
     reference_forward_kwargs,
+    reject_training_rewards,
     replay_forward_kwargs,
     require_velocity,
     role_repeat_progress,
@@ -148,7 +149,7 @@ class TDMTrainer(BaseTrainer):
         Returns:
             Training and eval reward models; the training mapping is always empty.
         """
-        return DMD2Trainer._init_reward_model(self)
+        return reject_training_rewards(self, algorithm_name="TDM")
 
     def _run_training_step(self) -> None:
         """Run GAS distinct trajectory rollouts and one fake/generator phase pair.

@@ -46,6 +46,7 @@ from .distillation_runtime import (
     generate_one_rollout_batch,
     query_score_velocity,
     reference_forward_kwargs,
+    reject_training_rewards,
     replay_forward_kwargs,
     require_velocity,
     role_repeat_progress,
@@ -138,13 +139,7 @@ class DMD2Trainer(BaseTrainer):
         Returns:
             Training and eval reward models; the training mapping is always empty.
         """
-        training_models, eval_models = super()._init_reward_model()
-        if training_models:
-            raise RuntimeError(
-                "DMD2 is data-free and must not train against rewards, received "
-                f"{sorted(training_models)}"
-            )
-        return training_models, eval_models
+        return reject_training_rewards(self, algorithm_name="DMD2")
 
     def _run_training_step(self) -> None:
         """Run GAS distinct rollouts, then fake TTUR updates, then one generator step.

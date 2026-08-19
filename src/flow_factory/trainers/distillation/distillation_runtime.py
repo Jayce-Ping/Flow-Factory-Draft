@@ -291,6 +291,39 @@ def replay_forward_kwargs(training_args: Any, batch: Mapping[str, Any]) -> Dict[
     return kwargs
 
 
+def reject_training_rewards(trainer: Any, *, algorithm_name: str) -> tuple:
+    """Build the shared feedback runtime and assert the training side stayed empty.
+
+    A reward-free loss is a property of training, not of evaluation. Zeroing the whole
+    runtime to express it takes eval monitoring down with it, so instead build the shared
+    one -- `Arguments` already rejects training rewards for these trainers, so the
+    training side comes back empty on its own -- and check that it did.
+
+    Written as a function rather than a base method because these trainers are siblings
+    under `BaseTrainer`, not a chain: a zero-argument `super()` inside one of them
+    resolves against the wrong class when another calls it.
+
+    Args:
+        trainer: Distillation trainer being initialized.
+        algorithm_name: User-facing name included in diagnostics.
+
+    Returns:
+        Training and eval reward models; the training mapping is always empty.
+
+    Raises:
+        RuntimeError: If a training reward survived configuration validation.
+    """
+    from ..abc import BaseTrainer
+
+    training_models, eval_models = BaseTrainer._init_reward_model(trainer)
+    if training_models:
+        raise RuntimeError(
+            f"{algorithm_name} is data-free and must not train against rewards, received "
+            f"{sorted(training_models)}"
+        )
+    return training_models, eval_models
+
+
 def reference_forward_kwargs(training_args: Any, batch: Mapping[str, Any]) -> Dict[str, object]:
     """Return forward arguments for the real score, the only role that may be guided.
 
