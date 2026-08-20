@@ -69,6 +69,8 @@ def run_h3_joint_transformer(
             f"MiniMax H3 workflow={workflow!r} field='prompt_embeds' requires B=1, "
             f"received B={prompt_embeds.shape[0]}"
         )
+    target_device = target_state.components["video"].device
+    prompt_embeds = prompt_embeds.to(target_device)
     full_state = {}
     for component in MINIMAX_H3_COMPONENT_ORDER:
         prefix = condition_prefixes.get(component)
@@ -100,9 +102,13 @@ def run_h3_joint_transformer(
         getattr(transformer, "keyframe_noise_aug", 0.999),
         device=target_state.components["video"].device,
     )
-    forward_parameters = inspect.signature(transformer.forward).parameters
+    signature_transformer = getattr(transformer, "inner", transformer)
+    get_base_model = getattr(signature_transformer, "get_base_model", None)
+    if callable(get_base_model):
+        signature_transformer = get_base_model()
+    forward_parameters = inspect.signature(signature_transformer.forward).parameters
     layout_kwargs = {
-        field: value
+        field: value.to(target_device)
         for field, value in layout.items()
         if field in forward_parameters and isinstance(value, torch.Tensor)
     }
@@ -247,6 +253,53 @@ def forward_h3_state(
     Returns:
         Target velocity or multimodal scheduler output.
     """
+    transformer_parameters = getattr(transformer, "parameters", None)
+    if callable(transformer_parameters):
+        try:
+            execution_device = next(transformer_parameters()).device
+        except StopIteration:
+            execution_device = state.components["video"].device
+    else:
+        execution_device = state.components["video"].device
+    state = LatentState(
+        {name: value.to(execution_device) for name, value in state.components.items()},
+        active_masks=(
+            None
+            if state.active_masks is None
+            else {name: value.to(execution_device) for name, value in state.active_masks.items()}
+        ),
+    )
+    if next_state is not None:
+        next_state = LatentState(
+            {name: value.to(execution_device) for name, value in next_state.components.items()},
+            active_masks=(
+                None
+                if next_state.active_masks is None
+                else {
+                    name: value.to(execution_device)
+                    for name, value in next_state.active_masks.items()
+                }
+            ),
+        )
+    condition_prefixes = {
+        name: value.to(execution_device) for name, value in condition_prefixes.items()
+    }
+    times = ComponentTimes(
+        timestep={name: value.to(execution_device) for name, value in times.timestep.items()},
+        next_timestep={
+            name: value.to(execution_device) for name, value in times.next_timestep.items()
+        },
+        sigma=(
+            None
+            if times.sigma is None
+            else {name: value.to(execution_device) for name, value in times.sigma.items()}
+        ),
+        next_sigma=(
+            None
+            if times.next_sigma is None
+            else {name: value.to(execution_device) for name, value in times.next_sigma.items()}
+        ),
+    )
     velocity = run_h3_joint_transformer(
         transformer,
         state,
