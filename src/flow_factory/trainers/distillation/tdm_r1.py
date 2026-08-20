@@ -471,6 +471,12 @@ class TDMR1Trainer(BaseTrainer):
     def _generator_score_terms(self, unit: TDMBoundaryUnit) -> Any:
         return TDMTrainer._generator_score_terms(self, unit)
 
+    def _replay_generator_prediction(
+        self,
+        unit: TDMBoundaryUnit,
+    ) -> Tuple[Any, LatentState, LatentState]:
+        return TDMTrainer._replay_generator_prediction(self, unit)
+
     def _live_generator_preference_values(
         self,
         unit: TDMBoundaryUnit,
