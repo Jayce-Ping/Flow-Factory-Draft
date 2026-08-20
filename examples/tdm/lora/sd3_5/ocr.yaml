@@ -1,0 +1,126 @@
+# SD3.5-Medium 4-step TDM with official stage-conditional re-noising.
+# TDM is reward-free; OCR is evaluated every 30 epochs for text-rendering quality.
+# Prepare the bundled prompt metadata once:
+#   python scripts/convert_ocr_prompts.py \
+#     --input-dir dataset/ocr --output-dir dataset/ocr_metadata
+
+# Environment
+launcher: "accelerate"
+config_file: config/accelerate_configs/multi_gpu.yaml  # 8-GPU DDP
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# Data
+data:
+  datasets:
+    - name: ocr
+      dataset_dir: "dataset/ocr_metadata"
+      train:
+        weight: 1
+        max_dataset_size: 512  # One global batch: 8 GPUs × 16 samples
+      eval:
+        split: test
+  preprocessing_batch_size: 8
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  sampler_type: "auto"
+
+# Model
+model:
+  model_type: "sd3-5"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  finetune_type: "lora"
+  lora_rank: 32
+  lora_alpha: 64
+  target_modules: "default"
+  frozen_parameters_dtype: "bf16"
+  trainable_parameters_dtype: "bf16"
+  resume_path: null
+  resume_type: null
+
+# Logging and checkpoints
+log:
+  run_name: null
+  project: "Flow-Factory-TDM"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 30
+  save_model_only: true
+
+# TDM
+train:
+  trainer_type: "tdm"
+  max_epochs: 10000
+
+  # Four deterministic ODE transitions; all four stage losses are averaged.
+  resolution: 512
+  num_inference_steps: 4
+  trajectory_steps: 4
+  guidance_scale: 1.0        # Generator/fake model the unguided distribution
+  real_guidance_scale: 4.0   # CFG is applied only to the frozen real score
+
+  per_device_batch_size: 16
+  group_size: 1
+  unique_sample_num_per_epoch: 128
+  gradient_step_per_epoch: 1
+  gradient_accumulation_steps: "auto"
+
+  ttur_fake_updates: 1       # One fake update, then one generator update
+  use_huber: true
+  huber_c: 0.001
+  tdm_snr_gamma: 5.0         # Cap fake-score SNR weighting
+  tdm_importance_clip: 20.0  # Clip conditional-noise density ratios
+
+  enable_gradient_checkpointing: true
+  offload_samples_to_cpu: true
+  latent_storage_dtype: "fp16"
+  ema_decay: 0
+  ema_update_interval: 1
+  ema_device: "cuda"
+  replay_rtol: 0             # ODE replay is expected to be bit-exact
+  replay_atol: 0
+  seed: 42
+
+scheduler:
+  dynamics_type: "ODE"
+  noise_level: 0.8
+  num_sde_steps: 3
+  sde_steps: [0, 1, 2, 3]
+  seed: 42
+
+# Evaluation uses the same 4-step unguided generator as training.
+eval:
+  resolution: 512
+  per_device_batch_size: 16
+  guidance_scale: 1.0
+  num_inference_steps: 4
+  eval_freq: 30
+  seed: 42
+
+eval_rewards:
+  - name: "ocr"
+    reward_model: "OCR"
+    weight: 1
+    batch_size: 1
+    device: "cpu"
+    dtype: "float32"
+    async_reward: true
+    num_workers: 1
+    applicable_datasets: [ocr]
+
+# One optimizer per trainable role.
+optimizers:
+  - name: "generator"
+    learning_rate: 1.0e-5
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    max_grad_norm: 1.0
+  - name: "fake"
+    learning_rate: 1.0e-5
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    max_grad_norm: 1.0
