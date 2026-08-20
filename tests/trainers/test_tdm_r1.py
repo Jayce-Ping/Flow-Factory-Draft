@@ -231,7 +231,6 @@ def test_tdm_r1_constructs_without_guidance_branch_hook() -> None:
         ttur_fake_updates=2,
         gradient_accumulation_steps=1,
         per_device_batch_size=1,
-        trajectory_steps=1,
         num_inference_steps=1,
         num_inner_epochs=1,
     )
@@ -261,7 +260,6 @@ def test_tdm_r1_replaces_a_sampler_that_scatters_group_members() -> None:
                 "trainer_type": "tdm-r1",
                 "group_size": 2,
                 "per_device_batch_size": 2,
-                "trajectory_steps": 1,
                 "num_inference_steps": 1,
             },
             "scheduler": {"dynamics_type": "ODE"},
@@ -275,7 +273,7 @@ def test_tdm_r1_sample_submits_dense_trajectory_endpoints_to_reward_buffer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = object.__new__(TDMR1Trainer)
-    trainer.training_args = SimpleNamespace(trajectory_steps=3)
+    trainer.training_args = SimpleNamespace(num_inference_steps=3)
     trainer.reward_buffer = object()
     received: dict[str, object] = {}
 

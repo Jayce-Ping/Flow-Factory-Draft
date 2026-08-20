@@ -122,14 +122,6 @@ class TDMTrainer(BaseTrainer):
 
     def _validate_trajectory_configuration(self) -> None:
         """Require one deterministic rollout with exactly K generated transitions."""
-        trajectory_steps = self.training_args.trajectory_steps
-        num_inference_steps = self.training_args.num_inference_steps
-        if trajectory_steps != num_inference_steps:
-            raise ValueError(
-                "TDM requires train.trajectory_steps to equal train.num_inference_steps; "
-                f"received trajectory_steps={trajectory_steps} and "
-                f"num_inference_steps={num_inference_steps}"
-            )
         if self.training_args.num_inner_epochs != 1:
             raise ValueError(
                 "TDM requires train.num_inner_epochs=1 so every generator update owns a "
@@ -172,7 +164,7 @@ class TDMTrainer(BaseTrainer):
         """Collect the initial state and every generated ODE boundary."""
         self._validate_trajectory_configuration()
         self._validate_media_free_rollout()
-        trajectory_indices = list(range(self.training_args.trajectory_steps + 1))
+        trajectory_indices = list(range(self.training_args.num_inference_steps + 1))
         with self._without_media_decoding():
             return generate_one_rollout_batch(
                 self,
@@ -220,7 +212,7 @@ class TDMTrainer(BaseTrainer):
         batch = self._stack_replay_unit(replay_samples)
         self._validate_sample_boundaries(replay_samples, batch)
         previous_interval_start: torch.Tensor | None = None
-        for boundary_index in range(1, self.training_args.trajectory_steps + 1):
+        for boundary_index in range(1, self.training_args.num_inference_steps + 1):
             replay_step = self.adapter.get_replay_step(
                 batch,
                 boundary_index - 1,
@@ -338,12 +330,12 @@ class TDMTrainer(BaseTrainer):
         Raises:
             ValueError: If any boundary is missing or inconsistently stored.
         """
-        for boundary_index in range(self.training_args.trajectory_steps):
+        for boundary_index in range(self.training_args.num_inference_steps):
             try:
                 self.adapter.get_replay_step(batch, boundary_index)
             except (KeyError, IndexError, ValueError, TypeError) as error:
                 raise ValueError(
-                    f"TDM requires all {self.training_args.trajectory_steps} rollout "
+                    f"TDM requires all {self.training_args.num_inference_steps} rollout "
                     f"transitions to be stored; reading transition {boundary_index} failed. "
                     "The rollout must collect every boundary, so "
                     "`trajectory_indices` has to span the full schedule."
@@ -355,7 +347,7 @@ class TDMTrainer(BaseTrainer):
 
     def _validate_structured_boundaries(self, samples: Tuple[BaseSample, ...]) -> None:
         """Check the stronger invariants an adapter that publishes structure can offer."""
-        expected_length = self.training_args.trajectory_steps + 1
+        expected_length = self.training_args.num_inference_steps + 1
         component_order = self.adapter.trajectory_component_order
         expected_map = torch.arange(expected_length, dtype=torch.int64)
         for sample_index, sample in enumerate(samples):
@@ -476,7 +468,7 @@ class TDMTrainer(BaseTrainer):
                 f"previous_start={previous_interval_start.tolist()}, "
                 f"current_end={interval_end.tolist()}"
             )
-        if boundary_index == self.training_args.trajectory_steps and not self._coordinates_equal(
+        if boundary_index == self.training_args.num_inference_steps and not self._coordinates_equal(
             interval_start,
             torch.zeros_like(interval_start),
         ):

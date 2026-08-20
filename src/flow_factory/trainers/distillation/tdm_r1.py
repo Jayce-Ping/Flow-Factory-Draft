@@ -144,7 +144,7 @@ class TDMR1Trainer(BaseTrainer):
     def sample(self) -> List[BaseSample]:
         """Generate complete reward groups with every deterministic boundary stored."""
         self._validate_trajectory_configuration()
-        trajectory_indices = list(range(self.training_args.trajectory_steps + 1))
+        trajectory_indices = list(range(self.training_args.num_inference_steps + 1))
         return generate_one_rollout_batch(
             self,
             reward_buffer=self.reward_buffer,

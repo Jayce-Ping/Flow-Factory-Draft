@@ -356,7 +356,6 @@ def _run_production_tdm_optimize(
         per_device_batch_size=1,
         gradient_accumulation_steps=gradient_accumulation_steps,
         ttur_fake_updates=ratio,
-        trajectory_steps=1,
         num_inference_steps=1,
         num_inner_epochs=1,
     )

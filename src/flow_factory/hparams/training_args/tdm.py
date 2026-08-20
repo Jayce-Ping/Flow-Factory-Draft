@@ -32,7 +32,6 @@ class TDMTrainingArguments(DMD2TrainingArguments):
         metadata={"help": "TDM requires one generator optimizer step per rollout."},
     )
     num_inference_steps: int = 4
-    trajectory_steps: int = 4
     use_huber: bool = True
     huber_c: float = 1e-3
     tdm_snr_gamma: float = 5.0
@@ -41,15 +40,6 @@ class TDMTrainingArguments(DMD2TrainingArguments):
     def __post_init__(self) -> None:
         """Validate trajectory count, replay tolerances, and Huber controls."""
         super().__post_init__()
-        if (
-            not isinstance(self.trajectory_steps, int)
-            or isinstance(self.trajectory_steps, bool)
-            or self.trajectory_steps < 1
-        ):
-            raise ValueError(
-                "expected train.trajectory_steps as an int >= 1, "
-                f"received {self.trajectory_steps!r}"
-            )
         if not isinstance(self.use_huber, bool):
             raise TypeError(
                 f"expected train.use_huber as a bool, received {type(self.use_huber).__name__}: "
