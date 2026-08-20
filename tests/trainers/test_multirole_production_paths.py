@@ -387,8 +387,13 @@ def test_dmd2_real_objective_uses_fresh_fake_perturbations_and_detached_queries(
 
     assert not torch.equal(bundle.fake, fake_before)
     assert not torch.equal(bundle.generator, generator_before)
-    assert len(adapter.perturbation_times) == 3
-    assert not torch.equal(adapter.perturbation_times[0], adapter.perturbation_times[1])
+    perturbation_times = [
+        timestep
+        for timestep in adapter.perturbation_times
+        if not torch.equal(timestep, torch.full_like(timestep, 1000.0))
+    ]
+    assert len(perturbation_times) == 3
+    assert not torch.equal(perturbation_times[0], perturbation_times[1])
     fake_states = [
         state
         for (role_name, grad_enabled, _, _), (_, state) in zip(
@@ -398,19 +403,34 @@ def test_dmd2_real_objective_uses_fresh_fake_perturbations_and_detached_queries(
         if role_name == "fake" and grad_enabled
     ]
     fake_noises = []
-    for state, timestep in zip(fake_states, adapter.perturbation_times[:2]):
+    for state, timestep in zip(fake_states, perturbation_times[:2]):
         sigma = timestep / 1000.0
-        fake_noises.append((state - (1 - sigma) * 1.4) / sigma)
+        # At t=1000 the generator's clean prediction is x_t - sigma*v = 1.0-0.4.
+        fake_noises.append((state - (1 - sigma) * 0.6) / sigma)
     assert not torch.equal(fake_noises[0], fake_noises[1])
     generator_event, reference_event, fake_query_event = adapter.forward_events[-3:]
     assert generator_event[:2] == ("generator", True)
     assert reference_event[:2] == ("reference", False)
     assert fake_query_event[:2] == ("fake", False)
     assert reference_event[2:] == fake_query_event[2:]
-    assert trainer.autocast_entries == 5
+    # Each fake phase now replays one generator step to obtain its clean prediction,
+    # in addition to the fake forward; generator optimization adds generator/real/fake.
+    assert trainer.autocast_entries == 7
     assert trainer.optimization_roles["fake"].step == 2
     assert trainer.optimization_roles["generator"].step == 1
     assert trainer.step == 1
+
+
+def test_dmd2_projects_each_selected_step_to_clean_space() -> None:
+    """An intermediate x_{i+1} is not the DMD generated clean sample."""
+    trainer, _, _ = _real_objective_trainer()
+    batch = BaseSample.stack(_trajectory_unit())
+
+    clean = trainer._replay_generator_clean_prediction(batch, boundary_index=1)
+
+    # Stored x_1 is 1.4, but x0_hat from x_t=1, sigma=1, v=0.4 is 0.6.
+    torch.testing.assert_close(clean.components["latent"], torch.tensor([[0.6]]))
+    assert clean.components["latent"].requires_grad
 
 
 def test_dmd2_generator_loss_is_finite_and_depends_on_fake_minus_real() -> None:

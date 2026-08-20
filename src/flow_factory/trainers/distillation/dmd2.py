@@ -280,11 +280,15 @@ class DMD2Trainer(BaseTrainer):
     def _fake_replay_loss(self, batch: StackedSampleBatch) -> torch.Tensor:
         """Compute fake clean-state denoising loss for one replay unit."""
         boundary_index = self._draw_boundary_index()
-        boundary_state = detach_state(
-            self.adapter.get_replay_step(batch, boundary_index - 1).next_state
-        )
-        times = self._sample_perturbation_times(boundary_state, batch)
-        noised = self.adapter.add_forward_process_noise(boundary_state, times)
+        # DMD matches a clean prediction, not the still-noisy x_{i+1} boundary.
+        # Recompute v_i and project (x_i, t_i, v_i) into clean space for every
+        # selected denoising step; only the terminal transition has x_{i+1} == x0.
+        with torch.no_grad():
+            clean_state = detach_state(
+                self._replay_generator_clean_prediction(batch, boundary_index)
+            )
+        times = self._sample_perturbation_times(clean_state, batch)
+        noised = self.adapter.add_forward_process_noise(clean_state, times)
         with self.adapter.use_component_variant("fake"):
             with self.autocast():
                 output = self.adapter.forward_state(
@@ -304,28 +308,12 @@ class DMD2Trainer(BaseTrainer):
         )
 
     def _generator_replay_loss(self, batch: StackedSampleBatch) -> torch.Tensor:
-        """Compute the generator pseudo-loss at one drawn boundary of the rollout."""
+        """Compute the generator pseudo-loss from one step's live clean prediction."""
         boundary_index = self._draw_boundary_index()
-        with self.adapter.use_component_variant("generator"):
-            with self.autocast():
-                generator_output = self.adapter.replay_generator_boundary(
-                    batch,
-                    boundary_index,
-                    return_fields=("velocity", "next_latents", "next_latents_mean"),
-                    rtol=self.training_args.replay_rtol,
-                    atol=self.training_args.replay_atol,
-                    **self._replay_forward_kwargs(batch),
-                )
-        boundary_state = generator_output.next_state
-        if boundary_state is None:
-            raise ValueError(
-                "DMD2 generator boundary replay expected next_state, received None "
-                f"for boundary_index={boundary_index}"
-            )
-
-        detached_boundary = detach_state(boundary_state)
-        times = self._sample_perturbation_times(detached_boundary, batch)
-        noised = self.adapter.add_forward_process_noise(detached_boundary, times)
+        clean_state = self._replay_generator_clean_prediction(batch, boundary_index)
+        detached_clean = detach_state(clean_state)
+        times = self._sample_perturbation_times(detached_clean, batch)
+        noised = self.adapter.add_forward_process_noise(detached_clean, times)
         reference_velocity = query_score_velocity(
             self.adapter,
             batch,
@@ -356,15 +344,50 @@ class DMD2Trainer(BaseTrainer):
             times,
             fake_velocity,
         )
-        record_state_statistics(self, "train/x0_gen", boundary_state)
+        record_state_statistics(self, "train/x0_gen", clean_state)
         record_state_statistics(self, "train/x0_real", x0_real)
         record_state_statistics(self, "train/x0_fake", x0_fake)
         record_distillation_metric(self, "train/boundary_index", boundary_index)
         return dmd_generator_loss(
             self.adapter,
-            boundary_state,
+            clean_state,
             detach_state(x0_real),
             detach_state(x0_fake),
+        )
+
+    def _replay_generator_clean_prediction(
+        self,
+        batch: StackedSampleBatch,
+        boundary_index: int,
+    ) -> LatentState:
+        """Replay one ODE step and project its live velocity to clean x0.
+
+        ``boundary_index`` names ``x_i -> x_{i+1}``, while DMD's generated sample
+        is ``x0_hat_i = project(x_i, t_i, v_i)``. The transition replay remains
+        valuable: it verifies the live generator still lands exactly on the stored
+        trajectory before its velocity is used to form the clean prediction.
+        """
+        replay_step = self.adapter.get_replay_step(batch, boundary_index - 1)
+        with self.adapter.use_component_variant("generator"):
+            with self.autocast():
+                output = self.adapter.replay_generator_boundary(
+                    batch,
+                    boundary_index,
+                    return_fields=("velocity", "next_latents", "next_latents_mean"),
+                    rtol=self.training_args.replay_rtol,
+                    atol=self.training_args.replay_atol,
+                    **self._replay_forward_kwargs(batch),
+                )
+        velocity = require_velocity(output, algorithm_name="DMD2", role_name="generator")
+        primary_name = self.adapter.trajectory_component_order[0]
+        projection_times = self.adapter.build_training_component_times(
+            replay_step.times.timestep[primary_name],
+            batch=batch,
+        )
+        return self.adapter.project_velocity_to_clean_state(
+            replay_step.state,
+            projection_times,
+            velocity,
         )
 
     def _sample_perturbation_times(
