@@ -545,8 +545,8 @@ Epoch N
 `trajectory is None` tensors remain only for backward-compatible single-component
 models. New multimodal adapters emit structured trajectories only.
 
-For T transitions, component state maps have length `T + 1`; log-probability and
-callback maps have length T. An index of `-1` means that coordinate was not collected,
+For T transitions, component state maps have length `T + 1`;
+log-probability and callback maps have length T. An index of `-1` means that coordinate was not collected,
 and an omitted log-probability or callback collection is represented by `None`.
 
 The component order is adapter-owned, for example `("video", "audio")` in MiniMax

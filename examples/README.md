@@ -36,7 +36,7 @@ ff-train examples/grpo/lora/flux1/default.yaml
 - [`minimax-h3-fl2va`](../examples/grpo/lora/minimax_h3_fl2va/default.yaml)
 - [`minimax-h3-ref2va`](../examples/grpo/lora/minimax_h3_ref2va/default.yaml)
 
-These configs have schema, dependency, and no-weight workflow validation only. They
+**Schema/API validated only.** These configs have dependency and no-weight workflow validation. They
 are not yet training-verified with the 61 GB checkpoint; framework-interface
 compatibility is distinct from real-weight numerical parity and reward improvement.
 
