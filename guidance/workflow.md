@@ -451,6 +451,39 @@ DeepSpeed clips inside its own engine and ignores the value handed to
 threshold is published to the plugin through `ACCELERATE_GRADIENT_CLIPPING` before
 the Accelerator is built.
 
+### Variant Memory Placement
+
+Component variants are optimizer-owned live parameters, not disposable model
+copies. Once `accelerator.prepare()` has run, do **not** call `.to("cpu")`,
+`off_load_components()`, or a custom offload/onload routine on an individual
+trainable variant:
+
+- DDP reducer hooks are bound to the prepared parameter devices.
+- FSDP1 `FlatParameter` and FSDP2 `DTensor` placement belong to the sharded root.
+- DeepSpeed ZeRO owns parameter partitions and optimizer state placement.
+
+This also applies while a role is inactive in a multi-role phase. “Inactive” only
+means that its optimizer groups and gradients are hidden for that phase; its
+parameters still belong to the prepared root. Flow-Factory intentionally exposes no
+`offload_variant()` / `onload_variant()` API because moving those parameters would
+invalidate reducer hooks, optimizer identities, or shards.
+
+The supported memory controls are:
+
+| State | Supported placement |
+|---|---|
+| Text/image/audio encoders and VAE outside the prepared root | `on_load_components()` / `off_load_components()` lifecycle |
+| Legacy named parameter snapshots | `add_named_parameters(..., device="cpu")`; copied into live parameters only inside their use context |
+| Sampling EMA | `train.ema_device: cpu` or `cuda` |
+| Variant-local EMA snapshots | Kept on the owning variant's device; no manual move API |
+| Rollout samples | `train.offload_samples_to_cpu: true` |
+| Prepared full/LoRA variants and optimizer state | Backend-managed DDP/FSDP/ZeRO placement only |
+
+For whole-root CPU offload, configure the FSDP or DeepSpeed backend rather than
+moving one role manually. CPU snapshots reduce persistent VRAM but add a synchronous
+copy whenever installed; use them for infrequent teacher/reference passes, not as a
+per-layer streaming mechanism.
+
 `optimizer` selects both the
 implementation and the argument schema (`hparams/optimizer_args/`), so AdamW and Muon
 hyperparameters never share a class:
