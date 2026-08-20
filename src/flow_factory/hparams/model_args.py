@@ -103,6 +103,9 @@ class ModelArguments(ArgABC):
         "bagel",
         "ltx2_t2av",
         "ltx2_i2av",
+        "minimax-h3-t2va",
+        "minimax-h3-fl2va",
+        "minimax-h3-ref2va",
     ] = field(
         default="flux1",
         metadata={

@@ -65,6 +65,9 @@ __all__ = [
     "V2VSample",
     "OrderedReferenceConditionSample",
     "Ref2AVSample",
+    "MiniMaxH3T2VASample",
+    "MiniMaxH3FL2VASample",
+    "MiniMaxH3Ref2VASample",
 ]
 
 
@@ -657,5 +660,26 @@ class OrderedReferenceConditionSample(BaseSample):
 @dataclass
 class Ref2AVSample(OrderedReferenceConditionSample):
     """Reference-to-Audio-Video sample output."""
+
+    pass
+
+
+@dataclass
+class MiniMaxH3T2VASample(T2AVSample):
+    """MiniMax H3 Text-to-Audio-Video sample output."""
+
+    pass
+
+
+@dataclass
+class MiniMaxH3FL2VASample(I2AVSample):
+    """MiniMax H3 First/Last-frame-to-Audio-Video sample output."""
+
+    pass
+
+
+@dataclass
+class MiniMaxH3Ref2VASample(Ref2AVSample):
+    """MiniMax H3 ordered-reference-to-Audio-Video sample output."""
 
     pass

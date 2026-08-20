@@ -29,6 +29,7 @@ logger = setup_logger(__name__)
 # Maps diffusers scheduler class names to custom SDE scheduler paths
 _SCHEDULER_REGISTRY: Dict[str, str] = {
     "FlowMatchEulerDiscreteScheduler": "flow_factory.scheduler.flow_match_euler_discrete.FlowMatchEulerDiscreteSDEScheduler",
+    "MiniMaxH3Scheduler": "flow_factory.scheduler.minimax_h3.MiniMaxH3SDEScheduler",
     "UniPCMultistepScheduler": "flow_factory.scheduler.unipc_multistep.UniPCMultistepSDEScheduler",
 }
 

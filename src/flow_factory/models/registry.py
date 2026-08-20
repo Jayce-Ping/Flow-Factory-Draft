@@ -42,6 +42,9 @@ _MODEL_ADAPTER_REGISTRY: Dict[str, str] = {
     "bagel": "flow_factory.models.bagel.bagel.BagelAdapter",
     "ltx2_t2av": "flow_factory.models.ltx2.ltx2_t2av.LTX2_T2AV_Adapter",
     "ltx2_i2av": "flow_factory.models.ltx2.ltx2_i2av.LTX2_I2AV_Adapter",
+    "minimax-h3-t2va": "flow_factory.models.minimax_h3.adapters.MiniMaxH3T2VAAdapter",
+    "minimax-h3-fl2va": "flow_factory.models.minimax_h3.adapters.MiniMaxH3FL2VAAdapter",
+    "minimax-h3-ref2va": "flow_factory.models.minimax_h3.adapters.MiniMaxH3Ref2VAAdapter",
 }
 
 
