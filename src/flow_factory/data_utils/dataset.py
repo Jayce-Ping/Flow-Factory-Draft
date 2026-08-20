@@ -17,12 +17,14 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import shutil
 from dataclasses import asdict
 from typing import Any, Callable, Dict, List, Optional, Protocol, Union
 
 import imageio.v3 as iio
+import numpy as np
 import torch
 from datasets import Dataset as HFDataset
 from datasets import Image as HFImage
@@ -32,6 +34,7 @@ from datasets.utils.logging import disable_progress_bar
 from PIL import Image
 from torch.utils.data import Dataset
 
+from ..samples.references import canonicalize_reference_manifest
 from ..utils.audio import load_audio
 from ..utils.base import (
     filter_kwargs,
@@ -39,6 +42,11 @@ from ..utils.base import (
     standardize_image_batch,
 )
 from ..utils.logger_utils import setup_logger
+
+try:
+    import av
+except ImportError:
+    av = None
 
 logger = setup_logger(__name__, rank_zero_only=True)
 
@@ -194,6 +202,7 @@ class GeneralDataset(Dataset):
         self.image_dir = image_dir
         self.video_dir = video_dir
         self.audio_dir = audio_dir
+        self._uses_ordered_references = _supports_ordered_references(preprocess_func)
 
         if self.shard_index is not None and self.shard_index > 0:
             disable_progress_bar()
@@ -203,6 +212,24 @@ class GeneralDataset(Dataset):
         if max_dataset_size is not None and len(raw_dataset) > max_dataset_size:
             raw_dataset = raw_dataset.select(range(max_dataset_size))
             logger.info(f"Dataset size limited to {max_dataset_size} samples.")
+
+        self._ordered_reference_source_hash = ""
+        if self._uses_ordered_references:
+            if "references" not in raw_dataset.column_names:
+                raise ValueError(
+                    "ordered-reference preprocessing requires a references column, "
+                    f"got columns={raw_dataset.column_names!r} in {self.data_root!r}"
+                )
+            canonical_manifests = [
+                canonicalize_reference_manifest(references, row_index=row_index)
+                for row_index, references in enumerate(raw_dataset["references"])
+            ]
+            self._ordered_reference_source_hash = hashlib.sha256(
+                "\n".join(canonical_manifests).encode("utf-8")
+            ).hexdigest()
+            extra_hash_strs = list(extra_hash_strs or []) + [
+                self._ordered_reference_source_hash
+            ]
 
         if enable_preprocess:
             self.processed_dataset = self._preprocess_dataset(
@@ -311,6 +338,7 @@ class GeneralDataset(Dataset):
         processed_dataset = raw_dataset.map(
             self._preprocess_batch,
             batched=True,
+            with_indices=True,
             batch_size=preprocessing_batch_size,
             fn_kwargs={
                 "image_dir": self.image_dir,
@@ -348,6 +376,7 @@ class GeneralDataset(Dataset):
     def _preprocess_batch(
         self,
         batch: Dict[str, Any],
+        indices: List[int],
         image_dir: Optional[str],
         video_dir: Optional[str],
         audio_dir: Optional[str],
@@ -395,8 +424,16 @@ class GeneralDataset(Dataset):
             forces every downstream consumer to handle three input shapes.
         """
         assert self._preprocess_func is not None, "Preprocess function must be provided."
+        if self._uses_ordered_references and len(batch["prompt"]) != 1:
+            raise ValueError(
+                "ordered-reference preprocessing expected B=1, "
+                f"received B={len(batch['prompt'])} for split={self.split!r}"
+            )
         # The columns that are used in preprocess and maintained in the final results.
         PREPROCESS_COLUMNS = ("prompt", "negative_prompt", "images", "videos", "audios")
+        metadata_excluded_columns = set(PREPROCESS_COLUMNS)
+        if self._uses_ordered_references:
+            metadata_excluded_columns.update({"references", "reference_manifest"})
 
         # 1. Prepare prompt inputs (text)
         prompt = batch["prompt"]
@@ -490,12 +527,36 @@ class GeneralDataset(Dataset):
                     audio_args["audios"].append(audios)
                     batch["audios"].append(audios)
 
+        reference_args: Dict[str, Any] = {}
+        if self._uses_ordered_references:
+            raw_references = batch.pop("references")
+            loaded_reference_batch = []
+            canonical_manifests = []
+            for row_offset, references in enumerate(raw_references):
+                row_index = indices[row_offset]
+                manifest = canonicalize_reference_manifest(references, row_index=row_index)
+                canonical_manifests.append(manifest)
+                loaded_reference_batch.append(
+                    [
+                        _load_ordered_reference(
+                            entry,
+                            self.data_root,
+                            row_index=row_index,
+                            reference_index=reference_index,
+                        )
+                        for reference_index, entry in enumerate(json.loads(manifest))
+                    ]
+                )
+            reference_args["references"] = loaded_reference_batch
+            batch["reference_manifest"] = canonical_manifests
+
         # 5. Call preprocess function with filtered kwargs
         input_args = {
             **prompt_args,
             **image_args,
             **video_args,
             **audio_args,
+            **reference_args,
             **self._preprocess_kwargs,
         }
         filtered_args = filter_kwargs(self._preprocess_func, **input_args)
@@ -535,6 +596,8 @@ class GeneralDataset(Dataset):
 
         # 7. Prepare final results
         batch_dict = {**batch, **final_res}
+        if self._uses_ordered_references:
+            _validate_arrow_safe_ordered_result(batch_dict, len(batch["prompt"]))
         # Pack non-preprocess fields into the METADATA_COLUMN (dict[list] -> list[dict]).
         # At sample time, BaseTrainer._inject_batch_metadata stores each per-sample
         # dict as a single JSON string under `sample.extra_kwargs['metadata']`.
@@ -543,7 +606,11 @@ class GeneralDataset(Dataset):
         # Complex values (nested lists/dicts) in the source JSONL must already be
         # stored as JSON strings for Arrow compatibility.
         batch_dict[METADATA_COLUMN] = [
-            {k: v[idx] for k, v in batch.items() if k not in PREPROCESS_COLUMNS}
+            {
+                k: v[idx]
+                for k, v in batch.items()
+                if k not in metadata_excluded_columns
+            }
             for idx in range(len(batch["prompt"]))
         ]
 
@@ -831,6 +898,236 @@ class GeneralDataset(Dataset):
 # ========================================================================================
 # Utility Functions
 # ========================================================================================
+
+
+def _supports_ordered_references(preprocess_func: Optional[Callable]) -> bool:
+    """Return whether a bound preprocessor explicitly opts into ordered references."""
+    if preprocess_func is None:
+        return False
+    owner = getattr(preprocess_func, "__self__", None)
+    return bool(
+        getattr(preprocess_func, "supports_ordered_references", False)
+        or getattr(owner, "supports_ordered_references", False)
+    )
+
+
+def _load_ordered_reference(
+    entry: Dict[str, Any],
+    data_root: str,
+    row_index: int,
+    reference_index: int,
+) -> Dict[str, Any]:
+    """Decode one ordered reference with dataset row/reference context."""
+    kind = entry["kind"]
+    resolved_path = _resolve_path(data_root, entry["path"])
+    failing_path = resolved_path
+    loaded = dict(entry)
+    try:
+        if kind == "image":
+            loaded["media"] = Image.open(resolved_path).convert("RGB")
+        elif kind == "video":
+            frames, fps, audio, sample_rate = _decode_ordered_video(resolved_path)
+            effective_fps = entry.get("fps", fps)
+            _require_finite_positive_rate(
+                effective_fps,
+                "effective fps",
+                row_index,
+                reference_index,
+                kind,
+                resolved_path,
+            )
+            loaded["frames"] = frames
+            loaded["fps"] = effective_fps
+            if "audio_path" in entry:
+                audio_path = _resolve_path(data_root, entry["audio_path"])
+                failing_path = audio_path
+                audio, sample_rate = _decode_ordered_audio(audio_path)
+            if audio is not None:
+                _require_finite_positive_rate(
+                    sample_rate,
+                    "sample_rate",
+                    row_index,
+                    reference_index,
+                    kind,
+                    failing_path,
+                )
+                effective_sample_rate = entry.get("sample_rate", sample_rate)
+                _require_finite_positive_rate(
+                    effective_sample_rate,
+                    "effective sample_rate",
+                    row_index,
+                    reference_index,
+                    kind,
+                    failing_path,
+                )
+                loaded["audio"] = audio
+                loaded["sample_rate"] = effective_sample_rate
+        elif kind == "audio":
+            audio, sample_rate = _decode_ordered_audio(resolved_path)
+            _require_finite_positive_rate(
+                sample_rate,
+                "sample_rate",
+                row_index,
+                reference_index,
+                kind,
+                resolved_path,
+            )
+            effective_sample_rate = entry.get("sample_rate", sample_rate)
+            _require_finite_positive_rate(
+                effective_sample_rate,
+                "effective sample_rate",
+                row_index,
+                reference_index,
+                kind,
+                resolved_path,
+            )
+            loaded["media"] = audio
+            loaded["sample_rate"] = effective_sample_rate
+        else:
+            raise ValueError(
+                "expected ordered reference kind in ('image', 'video', 'audio'), "
+                f"got {kind!r}"
+            )
+    except (FileNotFoundError, ImportError, OSError, RuntimeError, ValueError) as error:
+        raise ValueError(
+            f"failed to decode ordered reference at row {row_index}, "
+            f"reference {reference_index}, kind={kind!r}, path={failing_path!r}: {error}"
+        ) from error
+    return loaded
+
+
+def _require_finite_positive_rate(
+    value: Any,
+    rate_name: str,
+    row_index: int,
+    reference_index: int,
+    kind: str,
+    media_path: str,
+) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(
+            f"at row {row_index}, reference {reference_index}, kind={kind!r}, "
+            f"path={media_path!r}, expected decoded {rate_name} to be finite positive, "
+            f"got {value!r}"
+        )
+
+
+def _require_pyav() -> Any:
+    if av is None:
+        raise ImportError(
+            "ordered video/audio references require PyAV>=18.0.0; "
+            "install with `pip install 'av>=18.0.0'`"
+        )
+    return av
+
+
+def _decode_ordered_video(
+    video_path: str,
+) -> tuple[np.ndarray, Any, Optional[torch.Tensor], Optional[int]]:
+    """Decode frames, FPS, and optional soundtrack without resampling."""
+    av_module = _require_pyav()
+    with av_module.open(video_path) as container:
+        if not container.streams.video:
+            raise ValueError(f"expected a video stream in {video_path!r}, got none")
+        video_stream = container.streams.video[0]
+        frames = [
+            frame.to_ndarray(format="rgb24")
+            for frame in container.decode(video_stream)
+        ]
+        reported_frame_rate = video_stream.average_rate or video_stream.guessed_rate
+        frame_rate = None if reported_frame_rate is None else float(reported_frame_rate)
+        audio = None
+        sample_rate = None
+        if container.streams.audio:
+            container.seek(0)
+            audio, sample_rate = _decode_av_audio_stream(
+                container, container.streams.audio[0]
+            )
+    if not frames:
+        raise ValueError(f"expected video frames in {video_path!r}, decoded none")
+    return np.stack(frames), frame_rate, audio, sample_rate
+
+
+def _decode_ordered_audio(audio_path: str) -> tuple[torch.Tensor, int]:
+    """Decode an audio file and preserve its source sample rate."""
+    av_module = _require_pyav()
+    with av_module.open(audio_path) as container:
+        if not container.streams.audio:
+            raise ValueError(f"expected an audio stream in {audio_path!r}, got none")
+        return _decode_av_audio_stream(container, container.streams.audio[0])
+
+
+def _decode_av_audio_stream(container: Any, stream: Any) -> tuple[torch.Tensor, int]:
+    """Decode one PyAV audio stream without changing its sample rate."""
+    av_module = _require_pyav()
+    reported_sample_rate = stream.codec_context.sample_rate
+    if reported_sample_rate is None:
+        raise ValueError("expected decoded audio sample_rate, got None")
+    sample_rate = int(reported_sample_rate)
+    resampler = av_module.audio.resampler.AudioResampler(
+        format="fltp", layout=stream.layout, rate=sample_rate
+    )
+    chunks = []
+    for frame in container.decode(stream):
+        chunks.extend(
+            torch.from_numpy(resampled.to_ndarray())
+            for resampled in resampler.resample(frame)
+        )
+    chunks.extend(
+        torch.from_numpy(resampled.to_ndarray())
+        for resampled in resampler.resample(None)
+    )
+    if not chunks:
+        raise ValueError("expected decoded audio samples, got none")
+    return torch.cat(chunks, dim=-1).to(torch.float32), sample_rate
+
+
+def _validate_arrow_safe_ordered_result(
+    batch_dict: Dict[str, Any],
+    expected_batch_size: int,
+) -> None:
+    """Reject transient media and malformed columns before Arrow serialization."""
+    for column_name, values in batch_dict.items():
+        if not isinstance(values, list) or len(values) != expected_batch_size:
+            received_length = len(values) if isinstance(values, list) else None
+            raise ValueError(
+                f"expected ordered-reference column {column_name!r} to have outer "
+                f"B={expected_batch_size}, got type={type(values).__name__}, "
+                f"length={received_length}"
+            )
+        _validate_arrow_safe_value(values, column_name)
+
+
+def _validate_arrow_safe_value(value: Any, field_path: str) -> None:
+    if value is None:
+        raise ValueError(
+            f"expected Arrow-safe ordered-reference value for {field_path!r}, got None"
+        )
+    if isinstance(value, Image.Image):
+        raise TypeError(
+            f"expected Arrow-safe ordered-reference value for {field_path!r}, "
+            f"got PIL.Image {value!r}"
+        )
+    if isinstance(value, torch.Tensor):
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_arrow_safe_value(item, f"{field_path}[{index}]")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _validate_arrow_safe_value(item, f"{field_path}.{key}")
+        return
+    if not isinstance(value, (str, int, float, bool)):
+        raise TypeError(
+            f"expected Arrow-safe scalar/list/dict/tensor for {field_path!r}, "
+            f"got {type(value).__name__}: {value!r}"
+        )
 
 
 def _move_to_cpu(obj):

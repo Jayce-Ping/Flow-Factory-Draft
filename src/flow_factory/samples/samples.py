@@ -45,6 +45,7 @@ from ..utils.base import (
     standardize_video_batch,
 )
 from ..utils.logger_utils import setup_logger
+from .references import canonicalize_reference_manifest, parse_reference_manifest
 from .trajectory import StructuredTrajectory
 
 logger = setup_logger(__name__)
@@ -62,6 +63,8 @@ __all__ = [
     "I2VSample",
     "I2AVSample",
     "V2VSample",
+    "OrderedReferenceConditionSample",
+    "Ref2AVSample",
 ]
 
 
@@ -619,5 +622,40 @@ class V2VSample(VideoConditionSample):
 @dataclass
 class T2AVSample(BaseSample):
     """Text-to-Audio-Video sample output."""
+
+    pass
+
+
+@dataclass
+class OrderedReferenceConditionSample(BaseSample):
+    """Sample conditioned by an ordered heterogeneous reference manifest."""
+
+    _id_fields: ClassVar[frozenset[str]] = BaseSample._id_fields | frozenset(
+        {"reference_manifest"}
+    )
+
+    reference_manifest: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.reference_manifest is None:
+            raise ValueError(
+                f"expected reference_manifest string for {type(self).__name__}, got None"
+            )
+        references = parse_reference_manifest(self.reference_manifest, row_index=0)
+        self.reference_manifest = canonicalize_reference_manifest(references, row_index=0)
+
+    def _hash_id_fields(self, hasher: hashlib._Hash) -> None:
+        super()._hash_id_fields(hasher)
+        if self.reference_manifest is None:
+            raise ValueError(
+                f"expected reference_manifest string for {type(self).__name__}, got None"
+            )
+        hasher.update(self.reference_manifest.encode("utf-8"))
+
+
+@dataclass
+class Ref2AVSample(OrderedReferenceConditionSample):
+    """Reference-to-Audio-Video sample output."""
 
     pass
