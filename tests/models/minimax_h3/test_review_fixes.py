@@ -53,7 +53,8 @@ def _adapter(adapter_class: type, transformer: Any = None) -> Any:
     adapter.scheduler = SimpleNamespace(shift=12.0, noise_level=0.7)
     adapter.audio_scheduler = SimpleNamespace(shift=3.0, noise_level=0.7)
     adapter.training_args = SimpleNamespace(latent_storage_dtype=None)
-    adapter.get_component = lambda name: transformer or SimpleNamespace()
+    resolved_transformer = transformer or torch.nn.Linear(1, 1)
+    adapter.get_component = lambda name: resolved_transformer
     adapter.loaded: List[Any] = []
     adapter.on_load_components = lambda components, device=None: adapter.loaded.append(
         (components, device)

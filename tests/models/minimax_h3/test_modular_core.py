@@ -597,6 +597,46 @@ def test_transformer_dispatches_through_real_prepared_component_proxy():
     assert len(inner.calls) == 1
 
 
+def test_transformer_reads_layout_signature_through_peft_wrapper():
+    from flow_factory.models.minimax_h3.denoise import run_h3_joint_transformer
+
+    inner = FakeTransformer()
+
+    class PeftWrapper(torch.nn.Module):
+        def get_base_model(self):
+            return inner
+
+        def forward(self, *args, **kwargs):
+            return inner(*args, **kwargs)
+
+    layout = {
+        "video_indices": torch.tensor([2, 5, 6]),
+        "audio_indices": torch.tensor([3, 4, 7, 8, 9]),
+        "text_indices": torch.tensor([0, 1]),
+        "num_condition_video_rows": 1,
+        "num_condition_audio_rows": 2,
+        "token_tags": torch.arange(10),
+        "position_ids": torch.zeros(10, 3),
+    }
+    times = ComponentTimes(
+        timestep={"video": torch.tensor([800.0]), "audio": torch.tensor([600.0])},
+        next_timestep={"video": torch.tensor([0.0]), "audio": torch.tensor([0.0])},
+        sigma={"video": torch.tensor([0.8]), "audio": torch.tensor([0.6])},
+        next_sigma={"video": torch.tensor([0.0]), "audio": torch.tensor([0.0])},
+    )
+
+    run_h3_joint_transformer(
+        PeftWrapper(),
+        _state(),
+        {"video": torch.zeros(1, 1, 96), "audio": torch.zeros(1, 2, 32)},
+        torch.ones(1, 2, 8),
+        times,
+        layout,
+    )
+
+    torch.testing.assert_close(inner.calls[0]["token_tags"], layout["token_tags"])
+
+
 def test_transformer_rejects_batch_greater_than_one():
     from flow_factory.models.minimax_h3.denoise import run_h3_joint_transformer
 
@@ -797,6 +837,37 @@ def test_decode_uses_target_only_upstream_order_and_zero_condition_counts(monkey
     assert videos == ["video"]
     assert audio.shape == (1, 2, 16)
     assert sampling_rate == 32000
+
+
+def test_decode_uses_vae_device_when_preprocessing_module_is_offloaded():
+    from flow_factory.models.minimax_h3.decoding import _decoder_execution_device
+
+    class Pipeline:
+        def __init__(self):
+            self.text_encoder = torch.nn.Linear(1, 1, device="meta")
+            self.vae = torch.nn.Linear(1, 1)
+            self.audio_vae = torch.nn.Linear(1, 1)
+
+        @property
+        def components(self):
+            return {
+                name: value
+                for name in ("text_encoder", "vae", "audio_vae")
+                if (value := getattr(self, name)) is not None
+            }
+
+        @property
+        def _execution_device(self):
+            return next(iter(self.components.values())).weight.device
+
+    pipeline = Pipeline()
+    text_encoder = pipeline.text_encoder
+
+    with _decoder_execution_device(pipeline):
+        assert pipeline.text_encoder is None
+        assert pipeline._execution_device == torch.device("cpu")
+
+    assert pipeline.text_encoder is text_encoder
 
 
 def test_decode_preserves_upstream_output_type_validation(monkeypatch):

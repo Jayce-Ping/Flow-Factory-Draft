@@ -87,6 +87,32 @@ def test_preprocess_uses_exact_workflow_inputs_and_b1(
         adapter.preprocess_func(prompt=["one", "two"], height=64, width=96, num_frames=5)
 
 
+def test_preprocess_adds_outer_batch_to_arrow_cache_fields(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "flow_factory.models.minimax_h3.workflow.encode_h3_workflow_inputs",
+        lambda *args, **kwargs: {
+            "prompt_embeds": torch.zeros(1, 2, 4),
+            "text_token_tags": torch.tensor([1, 1]),
+            "height": 64,
+            "keyframe_anchors": (),
+        },
+    )
+    adapter = _adapter(MiniMaxH3T2VAAdapter)
+
+    result = adapter.preprocess_func(
+        prompt=["describe"],
+        height=64,
+        width=96,
+        num_frames=124,
+    )
+
+    assert result["prompt_embeds"].shape == (1, 2, 4)
+    assert len(result["text_token_tags"]) == 1
+    torch.testing.assert_close(result["text_token_tags"][0], torch.tensor([1, 1]))
+    assert result["height"] == [64]
+    assert result["keyframe_anchors"] == [[]]
+
+
 def test_ref_preprocess_builds_ordered_pinned_objects_without_returning_them(monkeypatch) -> None:
     constructed: List[Any] = []
 
@@ -178,6 +204,7 @@ def test_training_times_map_primary_video_coordinate_to_audio_shift(
 
 def test_inference_collects_structured_target_only_trajectory(monkeypatch) -> None:
     calls: List[Any] = []
+    prepared_values: List[Dict[str, Any]] = []
     prefixes = {
         "video": torch.ones(1, 1, 96),
         "audio": torch.ones(1, 1, 32),
@@ -186,9 +213,15 @@ def test_inference_collects_structured_target_only_trajectory(monkeypatch) -> No
         "video": (torch.tensor([1000.0, 500.0, 0.0]), torch.tensor([1.0, 0.5, 0.0])),
         "audio": (torch.tensor([1000.0, 300.0, 0.0]), torch.tensor([1.0, 0.3, 0.0])),
     }
+
+    def prepare(pipeline, values, **kwargs):
+        del pipeline, kwargs
+        prepared_values.append(values)
+        return _state(), prefixes
+
     monkeypatch.setattr(
         "flow_factory.models.minimax_h3.workflow.prepare_h3_rollout_state",
-        lambda *args, **kwargs: (_state(), prefixes),
+        prepare,
         raising=False,
     )
     monkeypatch.setattr(
@@ -219,7 +252,7 @@ def test_inference_collects_structured_target_only_trajectory(monkeypatch) -> No
         lambda *args, **kwargs: (torch.zeros(1, 2, 3, 4, 4), torch.zeros(1, 2, 16), 32000),
         raising=False,
     )
-    adapter = _adapter(MiniMaxH3T2VAAdapter, transformer=SimpleNamespace())
+    adapter = _adapter(MiniMaxH3T2VAAdapter, transformer=torch.nn.Linear(1, 1))
     adapter_forward = adapter.forward
     adapter_forward_calls: List[Dict[str, Any]] = []
     adapter_decode = adapter.decode_latents
@@ -227,12 +260,9 @@ def test_inference_collects_structured_target_only_trajectory(monkeypatch) -> No
     adapter.forward = lambda **kwargs: adapter_forward_calls.append(kwargs) or adapter_forward(
         **kwargs
     )
-    adapter.decode_latents = (
-        lambda latents, **kwargs: adapter_decode_calls.append(
-            {"latents": latents, **kwargs}
-        )
-        or adapter_decode(latents, **kwargs)
-    )
+    adapter.decode_latents = lambda latents, **kwargs: adapter_decode_calls.append(
+        {"latents": latents, **kwargs}
+    ) or adapter_decode(latents, **kwargs)
 
     samples = adapter.inference(
         prompt=["describe"],
@@ -257,6 +287,9 @@ def test_inference_collects_structured_target_only_trajectory(monkeypatch) -> No
     )
 
     assert len(calls) == 2
+    assert prepared_values[0]["num_condition_video_rows"] == 1
+    assert prepared_values[0]["num_condition_audio_rows"] == 1
+    assert prepared_values[0]["num_latent_frames"] == 1
     assert len(adapter_forward_calls) == 2
     assert len(adapter_decode_calls) == 1
     assert adapter_decode_calls[0]["geometry"]["num_latent_frames"] == 1

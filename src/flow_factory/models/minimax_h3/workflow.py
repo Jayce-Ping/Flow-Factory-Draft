@@ -14,6 +14,7 @@
 
 """Own MiniMax H3 workflow loading, setup, and execution contracts."""
 
+import os
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import torch
@@ -89,6 +90,24 @@ def load_h3_workflow_pipeline(
         model_name_or_path,
         workflow=workflow,
     )
+    if os.path.isdir(model_name_or_path):
+        component_specs = getattr(pipeline, "_component_specs", None)
+        if not isinstance(component_specs, dict):
+            raise TypeError(
+                f"MiniMax H3 local workflow={workflow!r} expected authoritative "
+                f"pipeline._component_specs dict, received {type(component_specs).__name__}"
+            )
+        for component_name in pipeline.pretrained_component_names:
+            component_spec = component_specs.get(component_name)
+            if component_spec is None or not hasattr(
+                component_spec, "pretrained_model_name_or_path"
+            ):
+                raise TypeError(
+                    f"MiniMax H3 local workflow={workflow!r} expected pretrained "
+                    f"ComponentSpec for {component_name!r}, received {component_spec!r}"
+                )
+            component_spec.pretrained_model_name_or_path = model_name_or_path
+            component_spec.revision = None
     declared_specs = ModularPipelineRuntime(pipeline).canonical_components
 
     opposite_component_name = (
@@ -130,10 +149,14 @@ def build_h3_scheduler(scheduler_args: Any, *, shift: float) -> MiniMaxH3SDESche
 def build_h3_scheduler_group(adapter: Any) -> SchedulerGroup:
     """Build fresh shift-12/shift-3 schedulers in video/audio order."""
     adapter.audio_scheduler = build_h3_scheduler(adapter.config.scheduler_args, shift=3.0)
-    return SchedulerGroup(
+    group = SchedulerGroup(
         {"video": adapter.scheduler, "audio": adapter.audio_scheduler},
         primary_name="video",
     )
+    num_inference_steps = adapter.training_args.num_inference_steps
+    for scheduler in group.values():
+        scheduler.set_timesteps(num_inference_steps, device="cpu")
+    return group
 
 
 def init_h3_target_module_map(
@@ -202,7 +225,22 @@ def preprocess_h3_workflow(adapter: Any, **kwargs: Any) -> Dict[str, Any]:
 
     with torch.no_grad():
         encoded = encode_h3_workflow_inputs(adapter.pipeline, values, workflow=adapter.workflow)
-    result = dict(encoded)
+    result = {}
+    for field, value in encoded.items():
+        if field == "prompt_embeds":
+            if not isinstance(value, torch.Tensor) or value.ndim != 3 or value.shape[0] != 1:
+                raise ValueError(
+                    f"MiniMax H3 workflow={adapter.workflow!r} preprocessing "
+                    f"prompt_embeds expected shape (B=1,N,C), received "
+                    f"{getattr(value, 'shape', None)}"
+                )
+            result[field] = value
+            continue
+        # Upstream blocks operate on one request and return sample-level
+        # scalars/tensors. GeneralDataset.map is batched, so every cache column
+        # needs an explicit outer B=1 container. Tuples are not Arrow batch
+        # columns; canonicalize them to lists before adding that outer axis.
+        result[field] = [list(value) if isinstance(value, tuple) else value]
     if adapter.workflow == "ref2va":
         manifest = kwargs.get("reference_manifest")
         _single_outer_value(manifest, "reference_manifest", adapter.workflow)
@@ -234,12 +272,41 @@ def infer_h3_workflow(adapter: Any, **kwargs: Any) -> List[Any]:
     geometry = _normalize_geometry(kwargs)
     generator = kwargs.get("generator")
     transformer = adapter.get_component(adapter.transformer_component_name)
+    rollout_values = dict(kwargs)
+    rollout_values.update(layout)
+    rollout_values.update(geometry)
     state, condition_prefixes = prepare_h3_rollout_state(
         adapter.pipeline,
-        kwargs,
+        rollout_values,
         workflow=adapter.workflow,
         generator=generator,
     )
+    transformer_parameters = getattr(transformer, "parameters", None)
+    if not callable(transformer_parameters):
+        raise TypeError(
+            f"MiniMax H3 workflow={adapter.workflow!r} prepared transformer expected "
+            f"callable parameters(), received {type(transformer).__name__}"
+        )
+    try:
+        execution_device = next(transformer_parameters()).device
+    except StopIteration as error:
+        raise ValueError(
+            f"MiniMax H3 workflow={adapter.workflow!r} prepared transformer has no parameters"
+        ) from error
+    state = LatentState(
+        {component: values.to(execution_device) for component, values in state.components.items()},
+        active_masks=(
+            None
+            if state.active_masks is None
+            else {
+                component: values.to(execution_device)
+                for component, values in state.active_masks.items()
+            }
+        ),
+    )
+    condition_prefixes = {
+        component: values.to(execution_device) for component, values in condition_prefixes.items()
+    }
     # Store and consume the same precision, so replay reproduces the rollout inputs.
     state = adapter.cast_latent_state(state)
     plan = build_h3_schedule_plan(

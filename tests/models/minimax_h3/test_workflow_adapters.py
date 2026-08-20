@@ -28,6 +28,7 @@ from flow_factory.models.minimax_h3.adapters import (
     MiniMaxH3Ref2VAAdapter,
     MiniMaxH3T2VAAdapter,
 )
+from flow_factory.models.minimax_h3.workflow import load_h3_workflow_pipeline
 from flow_factory.models.runtime import ModularPipelineRuntime
 from flow_factory.samples import ComponentTimes, LatentState
 from flow_factory.scheduler import MiniMaxH3SDEScheduler
@@ -163,6 +164,58 @@ class AcceleratorFake:
         """Provide the checkpoint synchronization surface."""
 
 
+def test_local_workflow_rebinds_pretrained_component_specs(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    required = (
+        "scheduler",
+        "text_encoder",
+        "tokenizer",
+        "processor",
+        "vae",
+        "audio_vae",
+        "transformer",
+    )
+
+    class LocalPipeline:
+        def __init__(self) -> None:
+            self.pretrained_component_names = list(required)
+            self.config_component_names = []
+            self.specs = {
+                name: SimpleNamespace(
+                    pretrained_model_name_or_path="MiniMaxAI/MiniMax-H3",
+                    revision="main",
+                )
+                for name in required
+            }
+            self._component_specs = self.specs
+
+        @classmethod
+        def from_pretrained(cls, path: str, *, workflow: str):
+            assert path == str(tmp_path)
+            assert workflow == "t2va"
+            return cls()
+
+        def get_component_spec(self, name: str):
+            return self.specs[name]
+
+    monkeypatch.setattr(
+        "flow_factory.models.minimax_h3.workflow.require_minimax_h3_support",
+        lambda: SimpleNamespace(MiniMaxH3ModularPipeline=LocalPipeline),
+    )
+
+    pipeline = load_h3_workflow_pipeline(
+        str(tmp_path),
+        workflow="t2va",
+        transformer_component_name="transformer",
+    )
+
+    assert all(
+        spec.pretrained_model_name_or_path == str(tmp_path) and spec.revision is None
+        for spec in pipeline.specs.values()
+    )
+
+
 def _config(target_components: List[str]) -> SimpleNamespace:
     return SimpleNamespace(
         model_args=SimpleNamespace(
@@ -178,6 +231,7 @@ def _config(target_components: List[str]) -> SimpleNamespace:
         training_args=SimpleNamespace(
             enable_gradient_checkpointing=False,
             latent_storage_dtype=None,
+            num_inference_steps=4,
         ),
         eval_args=SimpleNamespace(),
         scheduler_args=SimpleNamespace(
@@ -259,6 +313,8 @@ def test_workflow_adapter_loads_pruned_runtime_and_exact_setup_components(
         "video_processor",
     }
     assert adapter.pipeline.load_calls == [[transformer_name], ["scheduler"]]
+    assert len(adapter.scheduler.timesteps) == 4
+    assert len(adapter.audio_scheduler.timesteps) == 4
     assert not hasattr(adapter.pipeline, "unrelated")
     assert transformer_name in adapter.component_runtime.materialized_component_names
     opposite = "transformer_ref" if transformer_name == "transformer" else "transformer"
