@@ -201,6 +201,9 @@ def _phase_trainer(
     }
     trainer = object.__new__(DMD2Trainer)
     trainer.accelerator = accelerator
+    trainer.adapter = SimpleNamespace(
+        use_component_variant=lambda role_name: nullcontext()
+    )
     trainer.model_bundle = bundle
     trainer.optimizer = optimizer
     trainer.optimization_roles = roles

@@ -29,6 +29,7 @@ from flow_factory.trainers.distillation.distillation_runtime import (
     record_state_statistics,
     generate_one_rollout_batch,
     run_distillation_training_step,
+    run_role_phase,
 )
 
 
@@ -184,6 +185,57 @@ def test_an_epoch_logs_what_its_roles_recorded() -> None:
     run_distillation_training_step(trainer)
 
     assert logged == [({"train/generator_loss": 7.0}, 11)]
+
+
+def test_role_variant_stays_active_through_backward_recomputation() -> None:
+    events: list[tuple[str, str]] = []
+
+    class Adapter:
+        active = "generator"
+
+        @contextmanager
+        def use_component_variant(self, role_name: str) -> Iterator[None]:
+            previous = self.active
+            self.active = role_name
+            try:
+                yield
+            finally:
+                self.active = previous
+
+    class Coordinator:
+        roles = {"surrogate": SimpleNamespace(last_grad_norm=None)}
+
+        @contextmanager
+        def phase(self, role_name: str) -> Iterator[None]:
+            events.append(("phase", role_name))
+            yield
+
+        @contextmanager
+        def microbatch(self) -> Iterator[None]:
+            yield
+
+        def backward(self, loss: torch.Tensor) -> None:
+            events.append(("backward", adapter.active))
+            loss.backward()
+
+    adapter = Adapter()
+    trainer = SimpleNamespace(
+        adapter=adapter,
+        role_optimization=Coordinator(),
+        epoch=0,
+        show_progress_bar=False,
+        _finish_role_microbatch=lambda: None,
+    )
+
+    run_role_phase(
+        trainer,
+        "surrogate",
+        [["sample"]],
+        lambda batch: torch.ones((), requires_grad=True),
+    )
+
+    assert events == [("phase", "surrogate"), ("backward", "surrogate")]
+    assert adapter.active == "generator"
 
 
 def test_each_rollout_scores_only_the_batch_it_just_generated() -> None:

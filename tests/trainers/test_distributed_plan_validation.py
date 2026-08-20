@@ -217,3 +217,55 @@ def test_a_rank_holding_no_shard_of_the_adapter_is_accepted() -> None:
 
     trainer, BaseTrainer = _prepared_trainer(DistributedType.DEEPSPEED, local=8)
     BaseTrainer._validate_trainable_parameters_survived_prepare(trainer)
+
+
+def test_tdm_r1_fsdp1_disables_incompatible_activation_checkpointing() -> None:
+    from flow_factory.trainers.abc import BaseTrainer
+
+    plugin = SimpleNamespace(fsdp_version=1, activation_checkpointing=True)
+    disabled = []
+    trainer = SimpleNamespace(
+        accelerator=SimpleNamespace(
+            distributed_type=DistributedType.FSDP,
+            state=SimpleNamespace(fsdp_plugin=plugin),
+        ),
+        training_args=SimpleNamespace(
+            trainer_type="tdm-r1",
+            enable_gradient_checkpointing=True,
+        ),
+        adapter=SimpleNamespace(
+            disable_gradient_checkpointing=lambda: disabled.append(True)
+        ),
+    )
+
+    BaseTrainer._apply_backend_checkpointing_constraints(trainer)
+
+    assert disabled == [True]
+    assert trainer.training_args.enable_gradient_checkpointing is False
+    assert plugin.activation_checkpointing is False
+
+
+def test_tdm_r1_fsdp2_keeps_activation_checkpointing_enabled() -> None:
+    from flow_factory.trainers.abc import BaseTrainer
+
+    plugin = SimpleNamespace(fsdp_version=2, activation_checkpointing=True)
+    trainer = SimpleNamespace(
+        accelerator=SimpleNamespace(
+            distributed_type=DistributedType.FSDP,
+            state=SimpleNamespace(fsdp_plugin=plugin),
+        ),
+        training_args=SimpleNamespace(
+            trainer_type="tdm-r1",
+            enable_gradient_checkpointing=True,
+        ),
+        adapter=SimpleNamespace(
+            disable_gradient_checkpointing=lambda: pytest.fail(
+                "FSDP2 must keep checkpointing enabled"
+            )
+        ),
+    )
+
+    BaseTrainer._apply_backend_checkpointing_constraints(trainer)
+
+    assert trainer.training_args.enable_gradient_checkpointing is True
+    assert plugin.activation_checkpointing is True

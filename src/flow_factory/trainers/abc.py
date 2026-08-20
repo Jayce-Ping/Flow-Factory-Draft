@@ -38,7 +38,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from accelerate import Accelerator
-from accelerate.utils import ProjectConfiguration, set_seed
+from accelerate.utils import DistributedType, ProjectConfiguration, set_seed
 from diffusers.utils.outputs import BaseOutput
 from PIL import Image
 from torch.utils.data import DataLoader
@@ -559,6 +559,10 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         resume_type = getattr(self.adapter.model_args, "resume_type", None)
         if resume_path and resume_type != "state":
             self.adapter.restore_training_roles(resume_path)
+            # PEFT/full checkpoint loaders may materialize restored role weights
+            # in fp32. FSDP1 flattens each wrapped block and rejects mixed dtypes,
+            # so reapply the adapter's declared trainable dtype before prepare.
+            self.adapter.align_component_variant_dtypes()
 
     def _required_trainable_roles(self) -> Tuple[str, ...]:
         """Return every role this run trains, the one owning the base weights first.
@@ -630,6 +634,33 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
                     "decoupled algorithm (see constraints #7)."
                 )
 
+    def _apply_backend_checkpointing_constraints(self) -> None:
+        """Disable an FSDP1 checkpointing combination that recomputes a different graph."""
+        if (
+            self.accelerator.distributed_type != DistributedType.FSDP
+            or self.training_args.trainer_type != "tdm-r1"
+        ):
+            return
+        fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
+        if getattr(fsdp_plugin, "fsdp_version", 1) >= 2:
+            return
+        model_checkpointing = bool(
+            getattr(self.training_args, "enable_gradient_checkpointing", False)
+        )
+        fsdp_checkpointing = bool(getattr(fsdp_plugin, "activation_checkpointing", False))
+        if not model_checkpointing and not fsdp_checkpointing:
+            return
+        self.adapter.disable_gradient_checkpointing()
+        self.training_args.enable_gradient_checkpointing = False
+        if fsdp_plugin is not None:
+            fsdp_plugin.activation_checkpointing = False
+        logger.warning(
+            "Disabled model and FSDP activation checkpointing for TDM-R1 on FSDP1: "
+            "the surrogate objective runs reference/snapshot forwards between its live "
+            "forward and backward, so FSDP1 recomputation saves a different graph. "
+            "FSDP2 does not require this fallback."
+        )
+
     def _initialization(self):
         self._validate_paradigm_dynamics()
         configure_deepspeed_micro_batch_size(
@@ -647,6 +678,7 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         # optimizer and distributed bundle construction.
         self.dataloader, eval_dataloaders = self._init_dataloader()
         self._declare_model_variants()
+        self._apply_backend_checkpointing_constraints()
         self.optimizer = self._init_optimizer()
 
         # Bundle ALL target components (trainable + frozen-but-shardable, e.g.

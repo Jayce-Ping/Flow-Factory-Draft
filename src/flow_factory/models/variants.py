@@ -660,7 +660,9 @@ class ComponentVariantRegistry:
         variant_name = cast(VariantName, snapshot["variant_name"])
         for record in self.parameter_records(variant_name):
             key = f"{record.component_name}.{record.parameter_name}"
-            snapshot["parameters"][key].lerp_(record.parameter.detach(), 1 - decay_value)
+            stored = snapshot["parameters"][key]
+            live = record.parameter.detach().to(device=stored.device, dtype=stored.dtype)
+            stored.lerp_(live, 1 - decay_value)
         snapshot["update_count"] += 1
 
     def snapshot_tensors(self, snapshot_name: str) -> Tuple[torch.Tensor, ...]:

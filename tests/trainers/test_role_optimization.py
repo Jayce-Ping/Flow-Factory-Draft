@@ -88,6 +88,13 @@ class DeterministicAccelerator:
         self.clipped_parameter_ids: List[Tuple[int, ...]] = []
         # The coordinator reads this to decide whether `parameter.grad` is authoritative.
         self.distributed_type = distributed_type
+        self.state = SimpleNamespace(
+            fsdp_plugin=(
+                SimpleNamespace(fsdp_version=1)
+                if distributed_type == DistributedType.FSDP
+                else None
+            )
+        )
 
     @contextmanager
     def accumulate(self, model: torch.nn.Module) -> Iterator[None]:
@@ -570,6 +577,21 @@ def test_active_role_only_receives_adamw_state_and_clipping() -> None:
     assert bundle.generator not in optimizer.state
     assert optimizer.state[bundle.fake]["step"].item() == 1
     assert accelerator.clipped_parameter_ids == [(id(bundle.fake),)]
+    assert roles["fake"].step == 1
+    assert roles["generator"].step == 0
+
+
+def test_fsdp1_uses_collective_root_clipping_and_role_exclusive_step() -> None:
+    accelerator = DeterministicAccelerator((True,), DistributedType.FSDP)
+    bundle, optimizer, roles, coordinator = _runtime(accelerator)
+
+    stepped = _run_phase(coordinator, "fake", ((bundle.fake - 2.0).square(),))
+
+    assert stepped == [True]
+    assert set(optimizer.state) == {bundle.fake}
+    assert accelerator.clipped_parameter_ids == [
+        tuple(id(parameter) for parameter in bundle.parameters())
+    ]
     assert roles["fake"].step == 1
     assert roles["generator"].step == 0
 

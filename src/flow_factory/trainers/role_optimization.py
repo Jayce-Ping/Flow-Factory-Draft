@@ -441,7 +441,13 @@ class RoleOptimizationCoordinator:
         # Kept so a caller can report it: a role whose gradient norm collapses or spikes
         # is the first sign that its objective went wrong, and the losses alone do not
         # show it.
-        grad_norm = self.accelerator.clip_grad_norm_(role.parameters, role.config.max_grad_norm)
+        clip_parameters = (
+            self.model_bundle.parameters() if self._uses_fsdp1() else role.parameters
+        )
+        grad_norm = self.accelerator.clip_grad_norm_(
+            clip_parameters,
+            role.config.max_grad_norm,
+        )
         role.last_grad_norm = None if grad_norm is None else float(grad_norm)
         with self._active_optimizer_groups_only(role):
             self.optimizer.step()
@@ -506,7 +512,25 @@ class RoleOptimizationCoordinator:
         Returns:
             Whether ``parameter.grad`` is authoritative for this backend.
         """
-        return self.accelerator.distributed_type != DistributedType.DEEPSPEED
+        return (
+            self.accelerator.distributed_type != DistributedType.DEEPSPEED
+            and not self._uses_fsdp1()
+        )
+
+    def _uses_fsdp1(self) -> bool:
+        """Return whether gradients live on FSDP1 flattened/sharded storage.
+
+        With ``use_orig_params=True``, an original parameter can expose no local
+        grad on ranks that do not own its shard, while another role's original
+        parameter can expose a non-None zero view into the same FlatParameter.
+        Those views are not authoritative for role ownership. FSDP1 clipping
+        likewise needs the complete prepared root so Accelerate delegates to
+        FSDP's collective norm implementation.
+        """
+        if self.accelerator.distributed_type != DistributedType.FSDP:
+            return False
+        fsdp_plugin = getattr(getattr(self.accelerator, "state", None), "fsdp_plugin", None)
+        return getattr(fsdp_plugin, "fsdp_version", 1) < 2
 
     def state_dict(self) -> Dict[str, Any]:
         """Return closed-phase role counters and optimizer-group ownership."""

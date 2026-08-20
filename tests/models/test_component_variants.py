@@ -626,6 +626,12 @@ def test_a_frozen_reference_comes_from_the_adapter_snapshot_not_a_variant() -> N
         for module in component.modules()
         if hasattr(module, "disable_adapters")
     )
+    with adapter.use_component_variant("fake"):
+        with BaseAdapter.use_ref_parameters(adapter):
+            pass
+        assert adapter.component_variant_registry.active_variant == "fake"
+        assert component.active_adapter == "fake"
+        _assert_all_owned_role_parameters_trainable(adapter.component_variant_registry)
 
 
 @pytest.mark.parametrize("required_roles", [None, BASE_VARIANT, b"base", 7, {BASE_VARIANT}])
