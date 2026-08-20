@@ -286,6 +286,7 @@ _SHARED_H3_ADAPTER_METHODS = (
     "add_forward_process_noise",
     "apply_forward_process_noise",
     "decode_latents",
+    "empty_decoded_media",
     "inference",
     "_forward_state",
     "forward",
@@ -304,6 +305,19 @@ def test_workflow_adapters_share_one_implementation_per_method(method_name: str)
     }
 
     assert len(implementations) == 1
+
+
+@pytest.mark.parametrize(
+    "adapter_class",
+    (MiniMaxH3T2VAAdapter, MiniMaxH3FL2VAAdapter, MiniMaxH3Ref2VAAdapter),
+)
+def test_empty_decoded_media_keeps_h3_return_structure(adapter_class) -> None:
+    adapter = object.__new__(adapter_class)
+    assert adapter.empty_decoded_media(2) == (
+        [None, None],
+        [None, None],
+        None,
+    )
 
 
 @pytest.mark.parametrize(

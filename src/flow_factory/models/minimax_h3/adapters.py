@@ -117,6 +117,18 @@ class _MiniMaxH3WorkflowAdapter:
     def decode_latents(self, latents: Any, **kwargs: Any) -> Any:
         return decode_h3_adapter_latents(self, latents, **kwargs)
 
+    def empty_decoded_media(self, batch_size: int) -> Any:
+        """Preserve H3's video/audio/sample-rate decode structure without decoding."""
+        if (
+            not isinstance(batch_size, int)
+            or isinstance(batch_size, bool)
+            or batch_size < 1
+        ):
+            raise ValueError(
+                f"MiniMax H3 expected positive int batch_size, received {batch_size!r}"
+            )
+        return ([None] * batch_size, [None] * batch_size, None)
+
     def inference(self, **kwargs: Any) -> List[Any]:
         return infer_h3_workflow(self, **kwargs)
 
