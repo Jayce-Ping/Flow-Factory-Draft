@@ -132,9 +132,15 @@ eval:
   guidance_scale: 1.0
 ```
 
-The checked-in configurations are schema/API-validated starting points. They have not been run
-with the 61 GB checkpoint and do not establish GPU memory fit, generated-media parity, numerical
-parity, training stability, or reward improvement.
+MiniMax H3 accepts 5–15 seconds at 24 fps. `num_frames` is rounded up to
+`17*n+5`, so 124 is the smallest explicit frame count that satisfies both the
+duration and VAE chunking contracts.
+
+T2VA `debug.yaml` is real-weight validated on one H20 and 16 H20s across two
+nodes, including LoRA checkpoint save/resume. Its 64x96 canvas validates
+correctness and memory fit, not visual quality or reward improvement. The
+quality-oriented T2VA default and FL2VA/Ref2VA configs remain schema/API-validated
+starting points.
 
 ### T2VA: `minimax-h3-t2va`
 

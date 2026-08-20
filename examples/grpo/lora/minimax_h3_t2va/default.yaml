@@ -1,6 +1,5 @@
-# This configuration is schema- and API-validated against the pinned diffusers commit.
-# It has not been run with the 61 GB checkpoint and is not a claim of training quality,
-# memory fit, generated-media parity, numerical parity, or hardware validation.
+# This quality-oriented geometry has not been run with the 61 GB checkpoint.
+# For a real-weight validated low-memory correctness recipe, use debug.yaml.
 # MiniMax H3 requires B=1 and has no CFG; guidance must remain neutral at 1.0.
 
 launcher: "accelerate"
@@ -49,7 +48,7 @@ train:
   kl_beta: 0
   ref_param_device: "cuda"
   resolution: [512, 768]  # Unvalidated starting geometry.
-  num_frames: 121  # Unvalidated starting frame count.
+  num_frames: 124  # Minimum valid 17*n+5 frame count (5.17 seconds at 24 fps).
   frame_rate: 24.0
   # num_inference_steps=N produces N + 1 states and exactly N trainable transitions.
   num_inference_steps: 24

@@ -49,7 +49,7 @@ train:
   kl_beta: 0
   ref_param_device: "cuda"
   resolution: [512, 768]  # Unvalidated starting geometry.
-  num_frames: 121  # Unvalidated starting frame count.
+  num_frames: 124  # Minimum valid 17*n+5 frame count (5.17 seconds at 24 fps).
   frame_rate: 24.0
   # num_inference_steps=N produces N + 1 states and exactly N trainable transitions.
   num_inference_steps: 24

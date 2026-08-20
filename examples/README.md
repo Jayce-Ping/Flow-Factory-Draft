@@ -30,15 +30,21 @@ ff-train examples/grpo/lora/flux1/default.yaml
   [W&B run uf4dgbgv](https://wandb.ai/315229706-xi-an-jiaotong-university-/Flow-Factory-DMD2/runs/uf4dgbgv).
 - [`tdm` SD3.5 OCR recipe](tdm/lora/sd3_5/ocr.yaml) — official conditional-noise objective.
 
-## MiniMax H3 API-validated examples
+## MiniMax H3 examples
 
 - [`minimax-h3-t2va`](../examples/grpo/lora/minimax_h3_t2va/default.yaml)
+- [`minimax-h3-t2va` real-weight debug recipe](../examples/grpo/lora/minimax_h3_t2va/debug.yaml)
 - [`minimax-h3-fl2va`](../examples/grpo/lora/minimax_h3_fl2va/default.yaml)
 - [`minimax-h3-ref2va`](../examples/grpo/lora/minimax_h3_ref2va/default.yaml)
 
-**Schema/API validated only.** These configs have dependency and no-weight workflow validation. They
-are not yet training-verified with the 61 GB checkpoint; framework-interface
-compatibility is distinct from real-weight numerical parity and reward improvement.
+The T2VA `debug.yaml` recipe is real-weight validated with the 61 GB checkpoint
+(61.74 GiB transformer):
+one H20 and 16 H20s across two nodes both completed CPS rollout, video/audio decode,
+CLAP reward, GRPO replay/backward/optimizer step, and LoRA checkpoint save/resume.
+Its 64x96 canvas is intentionally a correctness geometry. The quality-oriented T2VA
+default remains an unverified quality starting point. FL2VA and Ref2VA are
+**Schema/API validated only** rather than claims of training stability or reward
+improvement.
 
 ## Contributing
 
