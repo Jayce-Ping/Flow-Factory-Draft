@@ -320,8 +320,71 @@ class RoleOptimizationCoordinator:
                 f"expected scalar loss for role {role_name!r}, "
                 f"received shape {tuple(loss.shape)!r}"
             )
-        self.accelerator.backward(loss)
+        # DeepSpeed performs the optimizer step from inside `backward()` at the GAS
+        # boundary (`DeepSpeedOptimizerWrapper.step()` is intentionally a no-op), so
+        # role isolation has to cover this call as well as the explicit step below.
+        role = self.roles[role_name]
+        with self._active_optimizer_groups_only(role):
+            self.accelerator.backward(loss)
         self._microbatch_backward_count = 1
+
+    @contextmanager
+    def _active_optimizer_groups_only(self, role: OptimizationRole) -> Iterator[None]:
+        """Hide inactive parameter groups for one physical optimizer step.
+
+        Native AdamW skips parameters whose gradients are ``None``. DeepSpeed ZeRO-2
+        materializes partitioned zero gradients instead, so stepping the shared
+        optimizer also advances inactive roles' Adam state and mutates parameters that
+        already have momentum or weight decay. Temporarily emptying inactive groups
+        gives every backend the role-exclusive step this coordinator promises without
+        changing group order, hyperparameters, or checkpoint layout.
+
+        Args:
+            role: Active role whose optimizer groups remain populated.
+
+        Yields:
+            Control while only the active role owns parameters visible to ``step()``.
+        """
+        active_group_ids = set(role.optimizer_group_ids)
+        if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+            # Accelerate wraps DeepSpeedZeroOptimizer, whose step ignores its public
+            # param_groups and iterates internal `bit16_groups`. `_optimizer_step(i)` is
+            # the narrow seam that advances one group's AdamW parameters and state; all
+            # reduction, partition cleanup, and all-gather remain in DeepSpeed.step().
+            zero_optimizer = getattr(self.optimizer, "optimizer", None)
+            optimizer_step = getattr(zero_optimizer, "_optimizer_step", None)
+            if not callable(optimizer_step):
+                raise RuntimeError(
+                    "DeepSpeed multi-role optimization requires a callable "
+                    "DeepSpeedZeroOptimizer._optimizer_step(group_no) to isolate active "
+                    f"role {role.config.role_name!r}; received optimizer wrapper "
+                    f"{type(self.optimizer).__name__} with inner "
+                    f"{type(zero_optimizer).__name__}. This DeepSpeed version cannot "
+                    "guarantee inactive roles remain unchanged."
+                )
+
+            def active_only_optimizer_step(group_no: int) -> None:
+                if group_no in active_group_ids:
+                    optimizer_step(group_no)
+
+            zero_optimizer._optimizer_step = active_only_optimizer_step
+            try:
+                yield
+            finally:
+                zero_optimizer._optimizer_step = optimizer_step
+            return
+
+        hidden: Dict[int, Any] = {}
+        for group_id, group in enumerate(self.optimizer.param_groups):
+            if group_id in active_group_ids:
+                continue
+            hidden[group_id] = group["params"]
+            group["params"] = []
+        try:
+            yield
+        finally:
+            for group_id, parameters in hidden.items():
+                self.optimizer.param_groups[group_id]["params"] = parameters
 
     def finish_microbatch(self) -> bool:
         """Finish one replay unit and step only at a valid sync boundary.
@@ -380,7 +443,8 @@ class RoleOptimizationCoordinator:
         # show it.
         grad_norm = self.accelerator.clip_grad_norm_(role.parameters, role.config.max_grad_norm)
         role.last_grad_norm = None if grad_norm is None else float(grad_norm)
-        self.optimizer.step()
+        with self._active_optimizer_groups_only(role):
+            self.optimizer.step()
         step_was_skipped = getattr(self.optimizer, "step_was_skipped", False)
         self.optimizer.zero_grad(set_to_none=True)
         self._phase_step_count = 1

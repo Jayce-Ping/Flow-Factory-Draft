@@ -574,6 +574,83 @@ def test_active_role_only_receives_adamw_state_and_clipping() -> None:
     assert roles["generator"].step == 0
 
 
+def test_active_role_hides_inactive_groups_from_zero_style_optimizer_step() -> None:
+    """ZeRO materializes zero gradients, so it must not even see inactive params."""
+
+    class UpdatesEveryVisibleParameter(torch.optim.Optimizer):
+        """Simulate a backend optimizer that updates zero-gradient partitions."""
+
+        def __init__(self, groups: List[dict[str, Any]]) -> None:
+            super().__init__(groups, {"lr": 0.1})
+
+        @torch.no_grad()
+        def step(self, closure: Any = None) -> None:
+            del closure
+            for group in self.param_groups:
+                for parameter in group["params"]:
+                    parameter.add_(group["lr"])
+
+    accelerator = DeterministicAccelerator((True,))
+    bundle, optimizer, roles, coordinator = _runtime(
+        accelerator,
+        optimizer_factory=UpdatesEveryVisibleParameter,
+    )
+    generator_before = bundle.generator.detach().clone()
+    original_generator_group = tuple(optimizer.param_groups[0]["params"])
+
+    _run_phase(coordinator, "fake", ((bundle.fake - 2.0).square(),))
+
+    torch.testing.assert_close(bundle.generator, generator_before, rtol=0, atol=0)
+    assert tuple(optimizer.param_groups[0]["params"]) == original_generator_group
+    assert optimizer.param_groups[0]["params"][0] is bundle.generator
+    assert roles["fake"].step == 1
+    assert roles["generator"].step == 0
+
+
+def test_deepspeed_group_filter_calls_only_active_private_optimizer_step() -> None:
+    """ZeRO-2 iterates internal bit16 groups instead of public param_groups."""
+
+    class ZeroOptimizerFake:
+        def __init__(self) -> None:
+            self.calls: List[int] = []
+
+        def _optimizer_step(self, group_no: int) -> None:
+            self.calls.append(group_no)
+
+    class DeepSpeedWrapperFake:
+        def __init__(self, groups: List[dict[str, Any]]) -> None:
+            self.param_groups = groups
+            self.optimizer = ZeroOptimizerFake()
+
+    bundle = TinyBundle(generator=0.4, fake=-0.2)
+    configs = (_config("generator"), _config("fake"))
+    roles = {
+        "generator": OptimizationRole(configs[0], (bundle.generator,), (0,)),
+        "fake": OptimizationRole(configs[1], (bundle.fake,), (1,)),
+    }
+    wrapper = DeepSpeedWrapperFake(
+        [
+            {"params": [bundle.generator], "role_name": "generator"},
+            {"params": [bundle.fake], "role_name": "fake"},
+        ]
+    )
+    coordinator = RoleOptimizationCoordinator(
+        SimpleNamespace(distributed_type=DistributedType.DEEPSPEED),
+        bundle,
+        wrapper,  # type: ignore[arg-type]
+        roles,
+    )
+
+    with coordinator._active_optimizer_groups_only(roles["fake"]):
+        wrapper.optimizer._optimizer_step(0)
+        wrapper.optimizer._optimizer_step(1)
+
+    assert wrapper.optimizer.calls == [1]
+    # The exact original method is restored after the role-local window.
+    wrapper.optimizer._optimizer_step(0)
+    assert wrapper.optimizer.calls == [1, 0]
+
+
 def test_rejects_inactive_and_stale_gradients_with_role_context() -> None:
     bundle, _, _, coordinator = _runtime(DeterministicAccelerator((True,)))
     bundle.fake.grad = torch.ones_like(bundle.fake)
