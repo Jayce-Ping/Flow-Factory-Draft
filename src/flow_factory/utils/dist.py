@@ -83,10 +83,9 @@ def gather_aligned_floating_tensors(
 ) -> Dict[str, torch.Tensor]:
     """Gather same-shape floating tensors with one packed collective.
 
-    Each sample row is packed as raw bytes. This preserves heterogeneous
-    floating dtypes bit-for-bit while Accelerate concatenates rank shards along
-    dimension zero, avoiding arithmetic promotion that can perturb strict
-    replay/parity checks.
+    Same-dtype fields are stacked behind one named axis. Heterogeneous dtypes
+    fall back to one gather per field: byte packing preserves values but costs
+    more than the saved launch on the small CRD vectors this helper serves.
     """
     if not tensors:
         return {}
@@ -104,8 +103,7 @@ def gather_aligned_floating_tensors(
         )
     expected_shape = first.shape
     expected_device = first.device
-    elements_per_sample = math.prod(expected_shape[1:])
-    layouts = []
+    dtypes = set()
     for name in names:
         tensor = tensors[name]
         if not isinstance(tensor, torch.Tensor):
@@ -133,37 +131,24 @@ def gather_aligned_floating_tensors(
                 f"expected tensor {name!r} to be detached before packed gather, "
                 "received requires_grad=True"
             )
-        layouts.append((name, tensor.dtype, elements_per_sample * tensor.element_size()))
+        dtypes.add(tensor.dtype)
 
-    byte_rows = [
-        tensors[name]
-        .contiguous()
-        .view(torch.uint8)
-        .reshape(expected_shape[0], bytes_per_sample)
-        for name, _, bytes_per_sample in layouts
-    ]
-    packed = torch.cat(byte_rows, dim=1)
+    if len(dtypes) > 1:
+        return {name: accelerator.gather(tensors[name]) for name in names}
+
+    packed = torch.stack([tensors[name] for name in names], dim=-1)
     gathered = accelerator.gather(packed)
     if not isinstance(gathered, torch.Tensor):
         raise TypeError(
             "expected packed gather to return torch.Tensor, "
             f"received {type(gathered).__name__}: {gathered!r}"
         )
-    if gathered.ndim != 2 or gathered.shape[1] != packed.shape[1]:
+    if gathered.ndim != packed.ndim or gathered.shape[1:] != packed.shape[1:]:
         raise ValueError(
-            "expected packed gather to preserve byte-row width "
-            f"{packed.shape[1]}, received shape {tuple(gathered.shape)}"
+            "expected packed gather to preserve every non-batch dimension "
+            f"{tuple(packed.shape[1:])}, received shape {tuple(gathered.shape)}"
         )
-    unpacked = {}
-    offset = 0
-    for name, dtype, bytes_per_sample in layouts:
-        field_bytes = gathered[:, offset : offset + bytes_per_sample].contiguous()
-        unpacked[name] = field_bytes.view(dtype).reshape(
-            gathered.shape[0],
-            *expected_shape[1:],
-        )
-        offset += bytes_per_sample
-    return unpacked
+    return {name: gathered[..., index] for index, name in enumerate(names)}
 
 
 def all_gather_tensor_list(
@@ -389,6 +374,122 @@ def _gather_field_values(
 
 
 _EXTRA_PREFIX = "__extra__."
+_CPU_PACKED_GATHER_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _is_uniform_tensor_field(field_values: List[Any]) -> bool:
+    """Return whether one sample field can participate in numeric packing."""
+    if not field_values or not isinstance(field_values[0], torch.Tensor):
+        return False
+    first = field_values[0]
+    if first.numel() == 0 or first.requires_grad:
+        return False
+    return all(
+        isinstance(value, torch.Tensor)
+        and value.shape == first.shape
+        and value.dtype == first.dtype
+        and value.device == first.device
+        and not value.requires_grad
+        for value in field_values
+    )
+
+
+def _packed_tensor_field_chunks(
+    accelerator: Accelerator,
+    values_by_key: Mapping[str, List[Any]],
+    target_device: torch.device,
+) -> List[List[str]]:
+    """Choose deterministic same-dtype/device field chunks worth packing."""
+    groups: Dict[Tuple[torch.dtype, torch.device], List[str]] = {}
+    for key in sorted(values_by_key):
+        values = values_by_key[key]
+        if _is_uniform_tensor_field(values):
+            first = values[0]
+            groups.setdefault((first.dtype, first.device), []).append(key)
+
+    chunks: List[List[str]] = []
+    for names in groups.values():
+        if len(names) < 2:
+            continue
+        if target_device.type != "cpu":
+            chunks.append(names)
+            continue
+
+        current: List[str] = []
+        current_bytes = 0
+        for name in names:
+            values = values_by_key[name]
+            field_bytes = (
+                len(values)
+                * values[0].numel()
+                * values[0].element_size()
+                * accelerator.num_processes
+            )
+            if field_bytes > _CPU_PACKED_GATHER_MAX_BYTES:
+                if len(current) >= 2:
+                    chunks.append(current)
+                current = []
+                current_bytes = 0
+                continue
+            if current and current_bytes + field_bytes > _CPU_PACKED_GATHER_MAX_BYTES:
+                if len(current) >= 2:
+                    chunks.append(current)
+                current = []
+                current_bytes = 0
+            current.append(name)
+            current_bytes += field_bytes
+        if len(current) >= 2:
+            chunks.append(current)
+    return chunks
+
+
+def _gather_packed_tensor_fields(
+    accelerator: Accelerator,
+    values_by_key: Mapping[str, List[Any]],
+    keys: List[str],
+    target_device: torch.device,
+) -> Dict[str, List[torch.Tensor]]:
+    """Gather one same-dtype field chunk and reconstruct its original shapes."""
+    batch_size = len(values_by_key[keys[0]])
+    widths = {key: values_by_key[key][0].numel() for key in keys}
+    total_width = sum(widths.values())
+    first = values_by_key[keys[0]][0]
+    packed = torch.empty(
+        (batch_size, total_width),
+        device=accelerator.device,
+        dtype=first.dtype,
+    )
+    offset = 0
+    for key in keys:
+        width = widths[key]
+        stacked = torch.stack(values_by_key[key]).to(accelerator.device)
+        packed[:, offset : offset + width].copy_(stacked.reshape(batch_size, width))
+        offset += width
+
+    gathered = accelerator.gather(packed)
+    if not isinstance(gathered, torch.Tensor):
+        raise TypeError(
+            "expected packed sample-field gather to return torch.Tensor, "
+            f"received {type(gathered).__name__}: {gathered!r}"
+        )
+    if gathered.ndim != 2 or gathered.shape[1] != total_width:
+        raise ValueError(
+            "expected packed sample-field gather to preserve width "
+            f"{total_width}, received shape {tuple(gathered.shape)}"
+        )
+    gathered = gathered.to(target_device)
+    reconstructed: Dict[str, List[torch.Tensor]] = {}
+    offset = 0
+    for key in keys:
+        width = widths[key]
+        sample_shape = values_by_key[key][0].shape
+        field = gathered[:, offset : offset + width].reshape(
+            gathered.shape[0],
+            *sample_shape,
+        )
+        reconstructed[key] = list(field)
+        offset += width
+    return reconstructed
 
 
 def gather_samples(
@@ -424,15 +525,26 @@ def gather_samples(
 
     all_keys = regular_fields + [f"{_EXTRA_PREFIX}{k}" for k in extra_keys]
     d: dict = {key: [] for key in all_keys}
-
-    # Collect and gather each key
+    values_by_key: Dict[str, List[Any]] = {}
     for key in all_keys:
         if key.startswith(_EXTRA_PREFIX):
             extra_k = key[len(_EXTRA_PREFIX) :]
             field_values = [s.extra_kwargs.get(extra_k) for s in samples]
         else:
             field_values = [getattr(sample, key) for sample in samples]
-        d[key] = _gather_field_values(accelerator, field_values, device)
+        values_by_key[key] = field_values
+
+    # Same-dtype numeric fields share one gather. For CPU output, cap the
+    # global payload: a large monolithic D2H copy benchmarks substantially
+    # slower than field-wise copies even though it launches fewer collectives.
+    packed_keys = set()
+    for chunk in _packed_tensor_field_chunks(accelerator, values_by_key, device):
+        d.update(_gather_packed_tensor_fields(accelerator, values_by_key, chunk, device))
+        packed_keys.update(chunk)
+
+    for key in all_keys:
+        if key not in packed_keys:
+            d[key] = _gather_field_values(accelerator, values_by_key[key], device)
 
     # Reconstruct BaseSample objects
     n_gathered = len(d[all_keys[0]]) if all_keys else 0

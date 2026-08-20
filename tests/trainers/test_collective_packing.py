@@ -4,14 +4,17 @@ import numpy as np
 import pytest
 import torch
 
+import flow_factory.utils.dist as dist_utils
 from flow_factory.advantage import AdvantageProcessor
 from flow_factory.samples import BaseSample
-from flow_factory.utils.dist import gather_aligned_floating_tensors
+from flow_factory.utils.dist import gather_aligned_floating_tensors, gather_samples
 
 
 class GatherRecorder:
     def __init__(self) -> None:
         self.calls: list[torch.Tensor] = []
+        self.device = torch.device("cpu")
+        self.num_processes = 2
 
     def gather(self, tensor: torch.Tensor) -> torch.Tensor:
         self.calls.append(tensor.detach().clone())
@@ -24,22 +27,38 @@ def test_aligned_floating_tensors_use_one_gather_and_round_trip_named_columns():
     gathered = gather_aligned_floating_tensors(
         accelerator,
         {
-            "reward": torch.tensor([3.0, 4.0], dtype=torch.float64),
+            "reward": torch.tensor([3.0, 4.0], dtype=torch.float32),
             "advantage": torch.tensor([1.0, 2.0], dtype=torch.float32),
         },
     )
 
     assert len(accelerator.calls) == 1
-    assert accelerator.calls[0].shape == (2, 12)
-    assert accelerator.calls[0].dtype == torch.uint8
+    assert accelerator.calls[0].shape == (2, 2)
+    assert accelerator.calls[0].dtype == torch.float32
     torch.testing.assert_close(
         gathered["advantage"],
         torch.tensor([1.0, 2.0, 1.0, 2.0], dtype=torch.float32),
     )
     torch.testing.assert_close(
         gathered["reward"],
-        torch.tensor([3.0, 4.0, 3.0, 4.0], dtype=torch.float64),
+        torch.tensor([3.0, 4.0, 3.0, 4.0], dtype=torch.float32),
     )
+
+
+def test_aligned_floating_tensors_preserve_mixed_dtypes_with_separate_gathers():
+    accelerator = GatherRecorder()
+
+    gathered = gather_aligned_floating_tensors(
+        accelerator,
+        {
+            "reward": torch.tensor([3.0, 4.0], dtype=torch.float64),
+            "advantage": torch.tensor([1.0, 2.0], dtype=torch.float32),
+        },
+    )
+
+    assert len(accelerator.calls) == 2
+    assert gathered["advantage"].dtype == torch.float32
+    assert gathered["reward"].dtype == torch.float64
 
 
 def test_aligned_floating_tensors_reject_misaligned_or_nonfloating_fields():
@@ -61,6 +80,60 @@ def test_aligned_floating_tensors_reject_misaligned_or_nonfloating_fields():
                 "reward": torch.ones(2, dtype=torch.int64),
             },
         )
+
+
+def test_gather_samples_packs_same_dtype_fields_and_preserves_other_fields():
+    accelerator = GatherRecorder()
+    samples = [
+        BaseSample(
+            prompt_embeds=torch.tensor([1.0, 2.0]),
+            negative_prompt_embeds=torch.tensor([3.0, 4.0]),
+            prompt_ids=torch.tensor([1, 2, 3]),
+        ),
+        BaseSample(
+            prompt_embeds=torch.tensor([5.0, 6.0]),
+            negative_prompt_embeds=torch.tensor([7.0, 8.0]),
+            prompt_ids=torch.tensor([4, 5, 6]),
+        ),
+    ]
+
+    gathered = gather_samples(
+        accelerator,
+        samples,
+        ["prompt_embeds", "negative_prompt_embeds", "prompt_ids"],
+        device=torch.device("cpu"),
+    )
+
+    assert len(accelerator.calls) == 2
+    assert accelerator.calls[0].shape == (2, 4)
+    assert accelerator.calls[1].shape == (2, 3)
+    assert len(gathered) == 4
+    torch.testing.assert_close(gathered[0].prompt_embeds, samples[0].prompt_embeds)
+    torch.testing.assert_close(
+        gathered[3].negative_prompt_embeds, samples[1].negative_prompt_embeds
+    )
+    torch.testing.assert_close(gathered[2].prompt_ids, samples[0].prompt_ids)
+
+
+def test_gather_samples_keeps_large_cpu_fields_on_separate_paths(monkeypatch):
+    monkeypatch.setattr(dist_utils, "_CPU_PACKED_GATHER_MAX_BYTES", 1)
+    accelerator = GatherRecorder()
+    samples = [
+        BaseSample(
+            prompt_embeds=torch.tensor([1.0, 2.0]),
+            negative_prompt_embeds=torch.tensor([3.0, 4.0]),
+        )
+    ]
+
+    gather_samples(
+        accelerator,
+        samples,
+        ["prompt_embeds", "negative_prompt_embeds"],
+        device=torch.device("cpu"),
+    )
+
+    assert len(accelerator.calls) == 2
+    assert all(call.shape == (1, 2) for call in accelerator.calls)
 
 
 def test_zero_std_ratio_rides_the_existing_batched_stats_reduction():
