@@ -609,8 +609,14 @@ def _load_audio_backend(path: str) -> Tuple[torch.Tensor, int]:
     except ImportError:
         pass
     else:
-        waveform, sr = torchaudio.load(path)
-        return waveform, sr
+        try:
+            waveform, sr = torchaudio.load(path)
+        except ImportError:
+            # Newer torchaudio delegates decoding to optional torchcodec. Continue to
+            # the documented soundfile/WAV fallbacks when it is unavailable.
+            pass
+        else:
+            return waveform, sr
 
     # Fallback to soundfile (handles wav, flac, ogg)
     try:

@@ -668,15 +668,36 @@ class GeneralDataset(Dataset):
         Returns:
             Cache path with fingerprint of specified length
         """
-        dataset_name = os.path.basename(dataset_dir)
+        dataset_root = os.path.abspath(os.path.expanduser(dataset_dir))
+        dataset_name = os.path.basename(dataset_root)
+        source_candidates = (
+            os.path.join(dataset_root, f"{split}.jsonl"),
+            os.path.join(dataset_root, f"{split}.txt"),
+        )
+        source_path = next((path for path in source_candidates if os.path.isfile(path)), None)
+        if source_path is None:
+            source_hash = "missing"
+        else:
+            hasher = hashlib.sha256()
+            with open(source_path, "rb") as source_file:
+                for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
+                    hasher.update(chunk)
+            source_hash = hasher.hexdigest()
         cutoff_str = str(max_dataset_size) if max_dataset_size else "full"
         funcs_hash = _compute_encode_funcs_hash(preprocess_func, digits=16)
         hashable_kwargs = _select_cache_relevant_kwargs(preprocess_func, preprocess_kwargs)
+        owner = getattr(preprocess_func, "__self__", None)
+        cache_fields = getattr(owner, "preprocess_cache_fields", frozenset())
+        for field_name in cache_fields:
+            if preprocess_kwargs is not None and field_name in preprocess_kwargs:
+                hashable_kwargs[field_name] = preprocess_kwargs[field_name]
+        cache_version = getattr(owner, "preprocess_cache_version", "")
         kwargs_hash = hashlib.md5(str(sorted(hashable_kwargs.items())).encode()).hexdigest()[:16]
         extra_hash = "|".join(extra_hash_strs) if extra_hash_strs else ""
 
         combined = (
-            f"{dataset_name}|{split}|{cutoff_str}|{funcs_hash}|{kwargs_hash}"
+            f"{dataset_root}|{dataset_name}|{source_hash}|{split}|{cutoff_str}|"
+            f"{funcs_hash}|{kwargs_hash}|cachev={cache_version}"
             f"|{extra_hash}|fmtv{_PREPROCESS_FORMAT_VERSION}"
         )
         fingerprint = hashlib.md5(combined.encode()).hexdigest()[: min(digits, 32)]
