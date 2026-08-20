@@ -785,4 +785,4 @@ def test_no_weight_two_rank_gloo_runs_structured_dgpo_and_crd(
             Path(tmp_path, f"rank-{rank}.txt").read_text(encoding="utf-8").split(",")
         )
         assert int(dgpo_reduce_calls) >= 1
-        assert int(crd_gather_calls) >= 2
+        assert int(crd_gather_calls) == 1
