@@ -96,8 +96,10 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
 
 > **MiniMax H3 status:** examples are schema/API and no-weight workflow validated.
 > The 61 GB checkpoint has not yet completed a real-weight GPU training smoke, so no
-> memory-fit, reward-improvement, or numerical-parity claim is made. H3 requires B=1,
-> neutral guidance `1.0`, separate video/audio trajectories, and data-ward velocity.
+> memory-fit, reward-improvement, or numerical parity claim is made. H3 requires B=1,
+> has no CFG, uses neutral guidance `1.0`, and keeps separate video/audio trajectories.
+> Video uses shift 12, audio uses shift 3, and the model predicts data-ward velocity.
+> `num_inference_steps=N` means N transitions and N + 1 states.
 
 # 💻 Supported Algorithms
 
