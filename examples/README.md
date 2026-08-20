@@ -32,6 +32,16 @@ ff-train examples/grpo/lora/flux1/default.yaml
 - [`tdm-r1` SD3.5 OCR recipe](tdm_r1/lora/sd3_5/ocr.yaml) — official G24
   fake-surrogate-generator objective initialized from the released TDM adapter.
 
+## MiniMax H3 API-validated examples
+
+- [`minimax-h3-t2va`](../examples/grpo/lora/minimax_h3_t2va/default.yaml)
+- [`minimax-h3-fl2va`](../examples/grpo/lora/minimax_h3_fl2va/default.yaml)
+- [`minimax-h3-ref2va`](../examples/grpo/lora/minimax_h3_ref2va/default.yaml)
+
+These configs have schema, dependency, and no-weight workflow validation only. They
+are not yet training-verified with the 61 GB checkpoint; framework-interface
+compatibility is distinct from real-weight numerical parity and reward improvement.
+
 ## Contributing
 
 We welcome community contributions! Here's what you can contribute and how:
