@@ -1262,13 +1262,12 @@ class BaseAdapter(ABC):
     def enable_gradient_checkpointing(self):
         """Enable gradient checkpointing for target components."""
         for comp_name in self.model_args.target_components:
-            if self.has_component(comp_name):
-                component = self.get_component(comp_name)
-                if hasattr(component, "enable_gradient_checkpointing"):
-                    component.enable_gradient_checkpointing()
-                    logger.info(f"Enabled gradient checkpointing for {comp_name}")
-                else:
-                    logger.warning(f"{comp_name} does not support gradient checkpointing")
+            component = self.get_component(comp_name)
+            if hasattr(component, "enable_gradient_checkpointing"):
+                component.enable_gradient_checkpointing()
+                logger.info(f"Enabled gradient checkpointing for {comp_name}")
+            else:
+                logger.warning(f"{comp_name} does not support gradient checkpointing")
 
     # ============================== Precision Management ==============================
     def _cast_module_mixed_precision(

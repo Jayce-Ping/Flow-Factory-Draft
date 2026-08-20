@@ -668,6 +668,20 @@ def test_base_adapter_default_runtime_preserves_existing_subclass_contract(
     assert adapter.scheduler_group.primary is adapter.scheduler
 
 
+def test_gradient_checkpointing_rejects_unknown_target_component(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "flow_factory.models.abc._load_scheduler",
+        lambda pipeline_scheduler, scheduler_args: pipeline_scheduler,
+    )
+    adapter = ExistingStyleAdapterFake(_adapter_config(), AcceleratorFake())
+    adapter.model_args.target_components = ["missing"]
+
+    with pytest.raises(ValueError, match="missing.*transformer"):
+        adapter.enable_gradient_checkpointing()
+
+
 def test_base_adapter_constructs_with_optional_transformer_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
