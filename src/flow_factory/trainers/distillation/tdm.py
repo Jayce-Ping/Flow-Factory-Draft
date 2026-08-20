@@ -53,7 +53,11 @@ from .distillation_runtime import (
     validate_media_free_rollout,
     without_media_decoding,
 )
-from .distribution_matching import tdm_fake_loss, tdm_generator_loss
+from .distribution_matching import (
+    tdm_conditional_renoise,
+    tdm_fake_loss,
+    tdm_generator_loss,
+)
 
 
 @dataclass(frozen=True)
@@ -749,13 +753,11 @@ class TDMTrainer(BaseTrainer):
         )
 
     def _fake_boundary_loss(self, unit: TDMBoundaryUnit) -> torch.Tensor:
-        """Compute fake DSM loss for one detached stored trajectory boundary."""
-        batch = self._stack_replay_unit(unit.samples)
-        replay_step = self.adapter.get_replay_step(
-            batch,
-            unit.boundary_index - 1,
-        )
-        boundary_state = detach_state(replay_step.next_state)
+        """Compute official conditionally-renoised fake DSM loss for one stage."""
+        with torch.no_grad():
+            batch, clean_state, model_noise = self._replay_generator_prediction(unit)
+        detached_clean = detach_state(clean_state)
+        mid_times = self.adapter.build_training_component_times(unit.interval_start, batch=batch)
         primary_times = self._sample_perturbation_times(unit)
         times = self.adapter.build_training_component_times(primary_times, batch=batch)
         self._validate_score_query_sigmas(
@@ -763,7 +765,14 @@ class TDMTrainer(BaseTrainer):
             primary_times,
             boundary_index=unit.boundary_index,
         )
-        noised = self.adapter.add_forward_process_noise(boundary_state, times)
+        noised, importance = tdm_conditional_renoise(
+            self.adapter,
+            detached_clean,
+            detach_state(model_noise),
+            mid_times=mid_times,
+            target_times=times,
+            importance_clip=self.training_args.tdm_importance_clip,
+        )
         with self.adapter.use_component_variant("fake"):
             with self.autocast():
                 output = self.adapter.forward_state(
@@ -780,16 +789,11 @@ class TDMTrainer(BaseTrainer):
             times,
             velocity,
         )
-        importance = torch.ones(
-            next(iter(boundary_state.components.values())).shape[0],
-            device=next(iter(boundary_state.components.values())).device,
-            dtype=torch.float32,
-        )
         primary_sigma = times.sigma[self.adapter.trajectory_component_order[0]]
         return tdm_fake_loss(
             self.adapter,
             predicted_clean,
-            boundary_state,
+            detached_clean,
             sigma=primary_sigma,
             importance=importance,
             snr_gamma=self.training_args.tdm_snr_gamma,
@@ -800,25 +804,9 @@ class TDMTrainer(BaseTrainer):
         return self._generator_score_terms(unit).loss
 
     def _generator_score_terms(self, unit: TDMBoundaryUnit) -> TDMGeneratorScoreTerms:
-        """Replay a live boundary and query frozen scores once on the same noised state."""
-        batch = self._stack_replay_unit(unit.samples)
-        with self.adapter.use_component_variant("generator"):
-            with self.autocast():
-                generator_output = self.adapter.replay_generator_boundary(
-                    batch,
-                    unit.boundary_index,
-                    return_fields=("velocity", "next_latents", "next_latents_mean"),
-                    rtol=self.training_args.replay_rtol,
-                    atol=self.training_args.replay_atol,
-                    **self._replay_forward_kwargs(batch),
-                )
-        boundary_state = generator_output.next_state
-        if boundary_state is None:
-            raise ValueError(
-                "TDM generator replay expected next_state, received None for "
-                f"boundary_index={unit.boundary_index}"
-            )
-
+        """Replay a live clean prediction and query scores on conditional stage noise."""
+        batch, clean_state, model_noise = self._replay_generator_prediction(unit)
+        mid_times = self.adapter.build_training_component_times(unit.interval_start, batch=batch)
         primary_times = self._sample_perturbation_times(unit)
         times = self.adapter.build_training_component_times(primary_times, batch=batch)
         self._validate_score_query_sigmas(
@@ -826,7 +814,14 @@ class TDMTrainer(BaseTrainer):
             primary_times,
             boundary_index=unit.boundary_index,
         )
-        noised = self.adapter.add_forward_process_noise(boundary_state, times)
+        noised, _ = tdm_conditional_renoise(
+            self.adapter,
+            detach_state(clean_state),
+            detach_state(model_noise),
+            mid_times=mid_times,
+            target_times=times,
+            importance_clip=self.training_args.tdm_importance_clip,
+        )
         reference_velocity = query_score_velocity(
             self.adapter,
             batch,
@@ -857,13 +852,13 @@ class TDMTrainer(BaseTrainer):
             times,
             fake_velocity,
         )
-        record_state_statistics(self, "train/x0_gen", boundary_state)
+        record_state_statistics(self, "train/x0_gen", clean_state)
         record_state_statistics(self, "train/x0_real", x0_real)
         record_state_statistics(self, "train/x0_fake", x0_fake)
         record_distillation_metric(self, "train/boundary_index", unit.boundary_index)
         loss = tdm_generator_loss(
             self.adapter,
-            boundary_state,
+            clean_state,
             detach_state(x0_real),
             detach_state(x0_fake),
             use_huber=self.training_args.use_huber,
@@ -871,7 +866,7 @@ class TDMTrainer(BaseTrainer):
         )
         return TDMGeneratorScoreTerms(
             loss=loss,
-            boundary_state=boundary_state,
+            boundary_state=clean_state,
             times=times,
             noised=noised,
             reference_velocity=reference_velocity,
@@ -881,6 +876,53 @@ class TDMTrainer(BaseTrainer):
             x0_real=detach_state(x0_real),
             x0_fake=detach_state(x0_fake),
         )
+
+    def _replay_generator_prediction(
+        self,
+        unit: TDMBoundaryUnit,
+    ) -> Tuple[StackedSampleBatch, LatentState, LatentState]:
+        """Replay a stage and return its live clean prediction and implied noise."""
+        batch = self._stack_replay_unit(unit.samples)
+        replay_step = self.adapter.get_replay_step(batch, unit.boundary_index - 1)
+        with self.adapter.use_component_variant("generator"):
+            with self.autocast():
+                output = self.adapter.replay_generator_boundary(
+                    batch,
+                    unit.boundary_index,
+                    return_fields=("velocity", "next_latents", "next_latents_mean"),
+                    rtol=self.training_args.replay_rtol,
+                    atol=self.training_args.replay_atol,
+                    **self._replay_forward_kwargs(batch),
+                )
+        velocity = require_velocity(output, algorithm_name="TDM", role_name="generator")
+        primary_name = self.adapter.trajectory_component_order[0]
+        projection_times = self.adapter.build_training_component_times(
+            replay_step.times.timestep[primary_name],
+            batch=batch,
+        )
+        clean_state = self.adapter.project_velocity_to_clean_state(
+            replay_step.state,
+            projection_times,
+            velocity,
+        )
+        direction = self.adapter.flow_velocity_direction
+        if direction not in ("noise", "data"):
+            raise ValueError(
+                "TDM expected adapter.flow_velocity_direction in ('noise', 'data'), "
+                f"received {direction!r}"
+            )
+        sign = 1.0 if direction == "noise" else -1.0
+        model_noise = LatentState(
+            {
+                name: (
+                    clean_state.components[name].to(torch.float32)
+                    + sign * velocity.components[name].to(torch.float32)
+                ).detach()
+                for name in self.adapter.trajectory_component_order
+            },
+            active_masks=clean_state.active_masks,
+        )
+        return batch, clean_state, model_noise
 
     def _stack_replay_unit(
         self,

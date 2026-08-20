@@ -17,13 +17,14 @@ from typing import Any, List
 import torch
 
 from flow_factory.models.abc import BaseAdapter
-from flow_factory.samples import BaseSample, LatentState
+from flow_factory.samples import BaseSample, ComponentTimes, LatentState
 from flow_factory.scheduler import SDESchedulerOutput
 from flow_factory.trainers.distillation.distribution_matching import (
     add_flow_noise,
     dmd_generator_loss,
     flow_matching_loss,
     flow_velocity_target,
+    tdm_conditional_renoise,
     tdm_fake_loss,
     tdm_generator_loss,
     velocity_to_x0,
@@ -54,6 +55,15 @@ def _adapter() -> AdapterFake:
 
 def _state(tensor: torch.Tensor) -> LatentState:
     return LatentState({"latent": tensor})
+
+
+def _times(sigma: torch.Tensor) -> ComponentTimes:
+    return ComponentTimes(
+        timestep={"latent": sigma * 1000.0},
+        next_timestep={"latent": torch.zeros_like(sigma)},
+        sigma={"latent": sigma},
+        next_sigma={"latent": torch.zeros_like(sigma)},
+    )
 
 
 def test_flow_x0_round_trip() -> None:
@@ -124,6 +134,46 @@ def test_tdm_fake_loss_uses_per_sample_snr_weights() -> None:
     assert mixed.item() != low.item()
     assert mixed.item() != high.item()
     assert low.item() < high.item()
+
+
+def test_tdm_conditional_renoise_matches_official_linear_flow_formula() -> None:
+    """Mixed noise, state, velocity target, and importance share one derivation."""
+    torch.manual_seed(11)
+    adapter = _adapter()
+    clean = _state(torch.randn(2, 3, 2, 2))
+    model_noise = _state(torch.randn_like(clean.components["latent"]))
+    sigma_mid = torch.tensor([0.25, 0.4])
+    sigma_t = torch.tensor([0.7, 0.8])
+
+    noised, importance = tdm_conditional_renoise(
+        adapter,
+        clean,
+        model_noise,
+        mid_times=_times(sigma_mid),
+        target_times=_times(sigma_t),
+        importance_clip=20.0,
+    )
+
+    mixed = noised.noise.components["latent"]
+    shape = (2, 1, 1, 1)
+    sm = sigma_mid.reshape(shape)
+    st = sigma_t.reshape(shape)
+    ratio = (1 - st) / (1 - sm)
+    old_noise_coeff = ratio * sm
+    beta = (st.square() - old_noise_coeff.square()).sqrt()
+    fresh = (st * mixed - old_noise_coeff * model_noise.components["latent"]) / beta
+    x_mid = (1 - sm) * clean.components["latent"] + sm * model_noise.components["latent"]
+    expected_state = ratio * x_mid + beta * fresh
+    expected_target = mixed - clean.components["latent"]
+    expected_importance = torch.exp(
+        -0.5 * mixed.square().flatten(1).mean(1)
+        + 0.5 * fresh.square().flatten(1).mean(1)
+    ).clamp(1 / 20.0, 20.0)
+
+    torch.testing.assert_close(noised.state.components["latent"], expected_state)
+    torch.testing.assert_close(noised.target_velocity.components["latent"], expected_target)
+    torch.testing.assert_close(importance, expected_importance)
+    assert importance.requires_grad is False
 
 
 def test_tdm_fake_loss_is_finite_with_unit_importance() -> None:
