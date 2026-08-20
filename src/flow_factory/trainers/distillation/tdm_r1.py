@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from numbers import Real
-from typing import Any, ClassVar, Dict, Iterator, List, Literal, Optional, Sequence, Tuple
+from typing import Any, ClassVar, List, Literal, Optional, Sequence
 
 import torch
 from accelerate import Accelerator
@@ -33,10 +33,8 @@ from .distillation_runtime import (
     generate_one_rollout_batch,
     query_score_velocity,
     record_distillation_metric,
-    reference_forward_kwargs,
     require_velocity,
     role_repeat_progress,
-    run_distillation_training_step,
     run_role_phase,
 )
 from .distribution_matching import revised_x0_loss
@@ -47,7 +45,7 @@ SLOW_SURROGATE_SNAPSHOT = "tdm_r1_slow_surrogate"
 """Name of the lagging surrogate copy the PPO trust region is measured against."""
 
 
-class TDMR1Trainer(BaseTrainer):
+class TDMR1Trainer(TDMTrainer):
     """Reinforce deterministic TDM trajectories through a frozen-reference surrogate."""
 
     paradigm: ClassVar[Literal["decoupled"]] = "decoupled"
@@ -79,67 +77,10 @@ class TDMR1Trainer(BaseTrainer):
     ) -> None:
         super().__init__(accelerator=accelerator, config=config, adapter=adapter)
         self.training_args: TDMR1TrainingArguments
-        self._rollout_data_iter: Iterator[Any] | None = None
-        self._rollout_dataloader_epoch = 0
-        TDMTrainer._validate_trajectory_configuration(self)
 
-    def _validate_trajectory_configuration(self) -> None:
-        TDMTrainer._validate_trajectory_configuration(self)
-
-    def _build_boundary_units(self, samples: Sequence[BaseSample]) -> List[TDMBoundaryUnit]:
-        return TDMTrainer._build_boundary_units(self, samples)
-
-    def _validate_sample_boundaries(self, samples: Tuple[BaseSample, ...], batch: Any) -> None:
-        TDMTrainer._validate_sample_boundaries(self, samples, batch)
-
-    def _validate_interval(self, *args: Any, **kwargs: Any) -> None:
-        TDMTrainer._validate_interval(self, *args, **kwargs)
-
-    def _require_matching_coordinate(self, *args: Any, **kwargs: Any) -> None:
-        TDMTrainer._require_matching_coordinate(self, *args, **kwargs)
-
-    def _validate_score_query_sigmas(self, *args: Any, **kwargs: Any) -> None:
-        TDMTrainer._validate_score_query_sigmas(self, *args, **kwargs)
-
-    @staticmethod
-    def _validate_coordinate(*args: Any, **kwargs: Any) -> None:
-        TDMTrainer._validate_coordinate(*args, **kwargs)
-
-    @staticmethod
-    def _normalize_coordinates(*args: Any, **kwargs: Any):
-        return TDMTrainer._normalize_coordinates(*args, **kwargs)
-
-    @classmethod
-    def _coordinates_equal(cls, left: torch.Tensor, right: torch.Tensor) -> bool:
-        return TDMTrainer._coordinates_equal(left, right)
-
-    def _stack_replay_unit(self, replay_samples: Sequence[BaseSample]) -> Any:
-        return TDMTrainer._stack_replay_unit(self, replay_samples)
-
-    def _replay_forward_kwargs(self, batch: Any) -> Dict[str, object]:
-        return TDMTrainer._replay_forward_kwargs(self, batch)
-
-    def _reference_forward_kwargs(self, batch: Any) -> Dict[str, object]:
-        """Return forward arguments for the real score, which alone may be guided."""
-        return reference_forward_kwargs(self.training_args, batch)
-
-    def _sample_perturbation_times(self, unit: TDMBoundaryUnit) -> torch.Tensor:
-        return TDMTrainer._sample_perturbation_times(self, unit)
-
-    def _fake_boundary_loss(self, unit: TDMBoundaryUnit) -> torch.Tensor:
-        return TDMTrainer._fake_boundary_loss(self, unit)
-
-    def _mean_boundary_loss(self, units: Sequence[TDMBoundaryUnit], loss_fn: Any) -> torch.Tensor:
-        return TDMTrainer._mean_boundary_loss(self, units, loss_fn)
-
-    def _run_training_step(self) -> None:
-        """Run reward feedback followed by fake, surrogate, and generator updates.
-
-        Overriding only this keeps the shared epoch loop, so checkpointing and
-        eval-time reward monitoring behave exactly as they do for every other
-        trainer.
-        """
-        run_distillation_training_step(self)
+    def _init_reward_model(self):
+        """Use train-time rewards instead of TDM's reward-free runtime."""
+        return BaseTrainer._init_reward_model(self)
 
     def sample(self) -> List[BaseSample]:
         """Generate complete reward groups with every deterministic boundary stored."""
@@ -184,10 +125,6 @@ class TDMR1Trainer(BaseTrainer):
         self._surrogate_phase(microbatches)
         self._generator_phase(microbatches)
 
-    def _fake_phase(self, microbatches: Sequence[Sequence[BaseSample]]) -> None:
-        """Fit the fake score over the complete ordered boundary window."""
-        TDMTrainer._fake_phase(self, microbatches)
-
     def _surrogate_phase(self, microbatches: Sequence[Sequence[BaseSample]]) -> None:
         """Update the surrogate with group preference on endpoint advantages."""
         self._ensure_slow_surrogate()
@@ -218,18 +155,6 @@ class TDMR1Trainer(BaseTrainer):
         """
         if not self.adapter.has_variant_snapshot(SLOW_SURROGATE_SNAPSHOT):
             self.adapter.declare_variant_snapshot("surrogate", SLOW_SURROGATE_SNAPSHOT)
-
-    def _generator_phase(self, microbatches: Sequence[Sequence[BaseSample]]) -> None:
-        """Update the generator with TDM plus a scaled preference term."""
-        run_role_phase(
-            self,
-            "generator",
-            microbatches,
-            lambda batch: self._mean_boundary_loss(
-                self._build_boundary_units(batch),
-                self._generator_boundary_loss,
-            ),
-        )
 
     def _surrogate_boundary_loss(self, unit: TDMBoundaryUnit) -> torch.Tensor:
         """Score one stored boundary with the surrogate and apply group preference."""
@@ -467,15 +392,6 @@ class TDMR1Trainer(BaseTrainer):
             active_masks=terms.boundary_state.active_masks,
         )
         return direction, normalizer_reference
-
-    def _generator_score_terms(self, unit: TDMBoundaryUnit) -> Any:
-        return TDMTrainer._generator_score_terms(self, unit)
-
-    def _replay_generator_prediction(
-        self,
-        unit: TDMBoundaryUnit,
-    ) -> Tuple[Any, LatentState, LatentState]:
-        return TDMTrainer._replay_generator_prediction(self, unit)
 
     def _live_generator_preference_values(
         self,

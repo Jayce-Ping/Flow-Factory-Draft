@@ -21,12 +21,12 @@ import torch
 
 from flow_factory.hparams import Arguments
 from flow_factory.samples import BaseSample
-from flow_factory.trainers.abc import BaseTrainer
 from flow_factory.trainers.distillation.group_preference import (
     GroupPreferenceBatch,
     group_preference_loss,
     reduce_group_sums,
 )
+from flow_factory.trainers.distillation.tdm import TDMTrainer
 from flow_factory.trainers.distillation.tdm_r1 import TDMR1Trainer
 
 
@@ -216,8 +216,8 @@ def test_reduce_group_sums_rejects_a_cross_rank_shape_change() -> None:
         )
 
 
-def test_tdm_r1_is_direct_decoupled_trainer_without_guidance_mandate() -> None:
-    assert TDMR1Trainer.__bases__ == (BaseTrainer,)
+def test_tdm_r1_inherits_tdm_math_without_guidance_mandate() -> None:
+    assert TDMR1Trainer.__bases__ == (TDMTrainer,)
     assert TDMR1Trainer.paradigm == "decoupled"
     source = inspect.getsource(TDMR1Trainer)
     assert "_forward_guidance_branches" not in source
