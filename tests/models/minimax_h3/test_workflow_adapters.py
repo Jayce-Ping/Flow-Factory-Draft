@@ -458,9 +458,11 @@ def test_ref2va_full_checkpoint_load_installs_canonical_runtime_override(tmp_pat
 
     replacement = adapter.get_component("transformer_ref")
     assert TransformerFake.loaded_paths == [str(tmp_path)]
-    assert replacement is not original
+    # Current infra loads into the prepared canonical module in place so routing,
+    # optimizer identities, and FSDP registration cannot be detached by replacement.
+    assert replacement is original
     assert replacement.weight.item() == pytest.approx(7.0)
-    assert adapter.component_runtime.override_components == {"transformer_ref": replacement}
+    assert adapter.component_runtime.override_components == {}
     assert "transformer" not in adapter.component_runtime.declared_component_names
 
 

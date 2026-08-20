@@ -181,6 +181,9 @@ def _production_adapter() -> MiniMaxH3T2VAAdapter:
         device=torch.device("cpu"),
         unwrap_model=lambda model: model,
     )
+    adapter.component_runtime = SimpleNamespace(
+        declared_component_names=("transformer",),
+    )
     adapter.scheduler = MiniMaxH3SDEScheduler(
         shift=12.0,
         dynamics_type="Flow-SDE",
