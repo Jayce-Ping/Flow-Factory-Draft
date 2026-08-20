@@ -24,6 +24,7 @@ from .flow_match_euler_discrete import (
 )
 from .group import SchedulerGroup
 from .loader import load_scheduler
+from .minimax_h3 import MiniMaxH3SDEScheduler, MiniMaxH3SDESchedulerOutput
 from .registry import (
     get_sde_scheduler_class,
     list_registered_schedulers,
@@ -42,6 +43,8 @@ __all__ = [
     "set_scheduler_timesteps",
     "UniPCMultistepSDEScheduler",
     "UniPCMultistepSDESchedulerOutput",
+    "MiniMaxH3SDEScheduler",
+    "MiniMaxH3SDESchedulerOutput",
     "load_scheduler",
     "SchedulerGroup",
     "get_sde_scheduler_class",

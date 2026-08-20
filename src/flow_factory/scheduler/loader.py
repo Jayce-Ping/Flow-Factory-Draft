@@ -53,7 +53,11 @@ def load_scheduler(
     sde_class = get_sde_scheduler_class(pipeline_scheduler)
 
     # Merge base config with SDE args
-    base_config = dict(pipeline_scheduler.config)
+    base_config = {
+        key: value
+        for key, value in dict(pipeline_scheduler.config).items()
+        if not key.startswith("_")
+    }
     base_config.update(scheduler_args.to_dict())
 
     scheduler = sde_class(**base_config)
