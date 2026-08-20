@@ -72,7 +72,7 @@ from ..utils.base import (
     filter_kwargs,
     json_default,
 )
-from ..utils.dist import reduce_loss_info
+from ..utils.dist import gather_aligned_floating_tensors, reduce_loss_info
 from ..utils.logger_utils import setup_logger
 from ..utils.noise_schedule import TimeSampler
 from .common.sample_prefetch import iter_prefetched_batches
@@ -1492,12 +1492,18 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
 
                 rewards = buffer.finalize(store_to_samples=True, split="pointwise")
 
-                # Gather across ranks
+                # Pack all reward columns so evaluation pays for one gather per
+                # dataset rather than one gather per reward model.
                 rewards_tensors = {
-                    k: torch.as_tensor(v).to(self.accelerator.device) for k, v in rewards.items()
+                    key: torch.as_tensor(value).to(self.accelerator.device)
+                    for key, value in rewards.items()
                 }
                 gathered_rewards = {
-                    k: self.accelerator.gather(v).cpu().numpy() for k, v in rewards_tensors.items()
+                    key: value.cpu().numpy()
+                    for key, value in gather_aligned_floating_tensors(
+                        self.accelerator,
+                        rewards_tensors,
+                    ).items()
                 }
 
                 # Log per-dataset immediately to avoid accumulating all samples in memory

@@ -44,6 +44,7 @@ from ...samples import (
     StackedSampleBatch,
 )
 from ...utils.base import create_generator, create_generator_by_prompt
+from ...utils.dist import gather_aligned_floating_tensors
 from ...utils.logger_utils import setup_logger
 from ..abc import BaseTrainer
 from ..common.state_validation import require_latent_state, state_batch_size
@@ -730,11 +731,6 @@ class CRDTrainer(BaseTrainer):
                         # 4. Compute implicit reward: r_theta = -(||pred_theta - v_target||^2 - ||pred_old - v_target||^2)
                         r_theta_local = self._implicit_reward(velocity, old_velocity, noised)
 
-                        # Gather r_theta across all GPUs for centering
-                        r_theta_gathered = self.accelerator.gather(r_theta_local.detach()).to(
-                            self.accelerator.device
-                        )
-
                         # 5. Compute advantages for CRD centering
                         adv = batch["advantage"]
                         adv_clip_range = self.training_args.adv_clip_range
@@ -744,10 +740,17 @@ class CRDTrainer(BaseTrainer):
                         normalized_adv = (adv_clipped / max(adv_clip_range)) / 2.0 + 0.5
                         adv_cur_rank = torch.clamp(normalized_adv, 0, 1)
 
-                        # Gather advantages across all GPUs
-                        adv_cur = self.accelerator.gather(adv_cur_rank.detach()).to(
-                            self.accelerator.device
+                        # Centering needs both global vectors. Pack them into one
+                        # aligned gather instead of launching two collectives.
+                        gathered_centering = gather_aligned_floating_tensors(
+                            self.accelerator,
+                            {
+                                "advantage": adv_cur_rank.detach(),
+                                "implicit_reward": r_theta_local.detach(),
+                            },
                         )
+                        adv_cur = gathered_centering["advantage"]
+                        r_theta_gathered = gathered_centering["implicit_reward"]
 
                         # 6. Centered Reward Distillation loss (supports dual-direction centering)
                         ori_policy_loss = self._compute_crd_loss(

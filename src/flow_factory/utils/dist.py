@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -75,6 +75,95 @@ def get_world_size() -> int:
 # ---------------------------------------------------------------------------
 # Tensor gathering
 # ---------------------------------------------------------------------------
+
+
+def gather_aligned_floating_tensors(
+    accelerator: Accelerator,
+    tensors: Mapping[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Gather same-shape floating tensors with one packed collective.
+
+    Each sample row is packed as raw bytes. This preserves heterogeneous
+    floating dtypes bit-for-bit while Accelerate concatenates rank shards along
+    dimension zero, avoiding arithmetic promotion that can perturb strict
+    replay/parity checks.
+    """
+    if not tensors:
+        return {}
+    names = tuple(sorted(tensors))
+    first = tensors[names[0]]
+    if not isinstance(first, torch.Tensor):
+        raise TypeError(
+            f"expected tensor {names[0]!r} to be torch.Tensor for packed gather, "
+            f"received {type(first).__name__}: {first!r}"
+        )
+    if first.ndim < 1:
+        raise ValueError(
+            f"expected tensor {names[0]!r} to have a leading batch dimension for packed "
+            f"gather, received shape {tuple(first.shape)}"
+        )
+    expected_shape = first.shape
+    expected_device = first.device
+    elements_per_sample = math.prod(expected_shape[1:])
+    layouts = []
+    for name in names:
+        tensor = tensors[name]
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                f"expected tensor {name!r} to be torch.Tensor for packed gather, "
+                f"received {type(tensor).__name__}: {tensor!r}"
+            )
+        if not tensor.is_floating_point():
+            raise TypeError(
+                f"expected tensor {name!r} to use a floating dtype for packed gather, "
+                f"received dtype={tensor.dtype}"
+            )
+        if tensor.shape != expected_shape:
+            raise ValueError(
+                f"expected tensor {name!r} shape {tuple(expected_shape)} for packed gather, "
+                f"received shape {tuple(tensor.shape)}"
+            )
+        if tensor.device != expected_device:
+            raise ValueError(
+                f"expected tensor {name!r} on device {expected_device} for packed gather, "
+                f"received device {tensor.device}"
+            )
+        if tensor.requires_grad:
+            raise ValueError(
+                f"expected tensor {name!r} to be detached before packed gather, "
+                "received requires_grad=True"
+            )
+        layouts.append((name, tensor.dtype, elements_per_sample * tensor.element_size()))
+
+    byte_rows = [
+        tensors[name]
+        .contiguous()
+        .view(torch.uint8)
+        .reshape(expected_shape[0], bytes_per_sample)
+        for name, _, bytes_per_sample in layouts
+    ]
+    packed = torch.cat(byte_rows, dim=1)
+    gathered = accelerator.gather(packed)
+    if not isinstance(gathered, torch.Tensor):
+        raise TypeError(
+            "expected packed gather to return torch.Tensor, "
+            f"received {type(gathered).__name__}: {gathered!r}"
+        )
+    if gathered.ndim != 2 or gathered.shape[1] != packed.shape[1]:
+        raise ValueError(
+            "expected packed gather to preserve byte-row width "
+            f"{packed.shape[1]}, received shape {tuple(gathered.shape)}"
+        )
+    unpacked = {}
+    offset = 0
+    for name, dtype, bytes_per_sample in layouts:
+        field_bytes = gathered[:, offset : offset + bytes_per_sample].contiguous()
+        unpacked[name] = field_bytes.view(dtype).reshape(
+            gathered.shape[0],
+            *expected_shape[1:],
+        )
+        offset += bytes_per_sample
+    return unpacked
 
 
 def all_gather_tensor_list(

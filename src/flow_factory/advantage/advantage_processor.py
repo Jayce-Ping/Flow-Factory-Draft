@@ -37,7 +37,7 @@ from accelerate import Accelerator
 
 from ..rewards import RewardProcessor
 from ..samples import BaseSample
-from ..utils.dist import global_tensor_stats_batch, global_zero_std_ratio
+from ..utils.dist import global_tensor_stats_batch
 from ..utils.logger_utils import setup_logger
 
 logger = setup_logger(__name__)
@@ -371,12 +371,6 @@ class AdvantageProcessor:
                 }
         return out
 
-    def _metric_zero_std_ratio(self, rewards: np.ndarray, group_indices: np.ndarray) -> float:
-        """Fraction of groups with near-zero std — global-reduced when ``group_on_same_rank``."""
-        if self.group_on_same_rank:
-            return global_zero_std_ratio(self.accelerator, rewards, group_indices)
-        return RewardProcessor.compute_group_zero_std_ratio(rewards, group_indices)
-
     @staticmethod
     def _group_normalize(
         values: np.ndarray,
@@ -693,7 +687,7 @@ class AdvantageProcessor:
         applicable: Optional[np.ndarray] = None,
         reward_keys: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        stat_arrays, r_applicable = self._build_base_log_stats(
+        stat_arrays, _ = self._build_base_log_stats(
             gathered_rewards, group_indices, applicable, reward_keys
         )
 
@@ -703,6 +697,7 @@ class AdvantageProcessor:
         )
         stat_arrays["reward_agg_g_stds"] = agg_group_stds
         stat_arrays["reward_agg_g_means"] = agg_group_means
+        stat_arrays["reward_agg_zero_std_flags"] = (agg_group_stds < 1e-6).astype(np.float64)
         stat_arrays["adv"] = advantages
         stat_arrays["adv_abs"] = np.abs(advantages)
 
@@ -718,10 +713,9 @@ class AdvantageProcessor:
         _log_data["train/reward_group_std_max"] = agg_group_std_stats["max"]
         _log_data["train/reward_group_mean_std"] = agg_group_mean_stats["std"]
 
-        # Zero-std ratio (count-based; requires a separate all-reduce)
-        _log_data["train/reward_zero_std_ratio"] = self._metric_zero_std_ratio(
-            aggregated_rewards, group_indices
-        )
+        _log_data["train/reward_zero_std_ratio"] = all_stats[
+            "reward_agg_zero_std_flags"
+        ]["mean"]
 
         # Unpack advantage stats
         adv_stats = all_stats["adv"]
@@ -743,23 +737,27 @@ class AdvantageProcessor:
         applicable: Optional[np.ndarray] = None,
         reward_keys: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        stat_arrays, r_applicable = self._build_base_log_stats(
+        stat_arrays, _ = self._build_base_log_stats(
             gathered_rewards, group_indices, applicable, reward_keys
         )
 
         stat_arrays["adv"] = advantages
         stat_arrays["adv_abs"] = np.abs(advantages)
+        keys_sorted = sorted(gathered_rewards.keys())
+        for key in keys_sorted:
+            group_stds = stat_arrays[f"reward_{key}_g_stds"]
+            stat_arrays[f"reward_{key}_zero_std_flags"] = (group_stds < 1e-6).astype(
+                np.float64
+            )
 
         all_stats = self._batch_reduce_stats(stat_arrays)
 
         _log_data = self._unpack_per_reward_log_data(all_stats, gathered_rewards)
 
-        keys_sorted = sorted(gathered_rewards.keys())
         for key in keys_sorted:
-            mask_k = r_applicable[key]
-            _log_data[f"train/reward_{key}_zero_std_ratio"] = self._metric_zero_std_ratio(
-                gathered_rewards[key][mask_k], group_indices[mask_k]
-            )
+            _log_data[f"train/reward_{key}_zero_std_ratio"] = all_stats[
+                f"reward_{key}_zero_std_flags"
+            ]["mean"]
 
         adv_stats = all_stats["adv"]
         _log_data.update(
