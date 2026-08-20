@@ -23,7 +23,7 @@ import torch
 
 from flow_factory.hparams import Arguments
 from flow_factory.models.abc import BaseAdapter
-from flow_factory.samples import BaseSample
+from flow_factory.samples import BaseSample, LatentState
 from flow_factory.trainers.abc import BaseTrainer
 from flow_factory.trainers.distillation.dmd2 import DMD2Trainer
 
@@ -232,7 +232,7 @@ def test_dmd2_media_suppression_rejects_missing_batch_tensor() -> None:
             TypeError,
             match=(
                 r"DMD2 media-free decoder adapter='KeywordDecoderAdapter'.*"
-                r"signature=.*latents.*expected tensor argument named.*"
+                    r"signature=.*latents.*expected tensor or LatentState argument named.*"
                 r"received latents=str"
             ),
         ):
@@ -268,7 +268,7 @@ def test_dmd2_rejects_adapter_that_bypasses_media_decode_hook() -> None:
         trainer._validate_media_free_rollout()
 
 
-def test_dmd2_rejects_minimax_h3_direct_decode_helper() -> None:
+def test_dmd2_accepts_minimax_h3_when_decode_routes_through_adapter() -> None:
     trainer = _trainer()
 
     class MiniMaxBypassAdapter:
@@ -279,11 +279,38 @@ def test_dmd2_rejects_minimax_h3_direct_decode_helper() -> None:
 
     trainer.adapter = MiniMaxBypassAdapter()
 
-    with pytest.raises(
-        ValueError,
-        match=r"DMD2 media-free rollout.*MiniMaxBypassAdapter.*bypasses.*decode_latents",
-    ):
-        trainer._validate_media_free_rollout()
+    trainer._validate_media_free_rollout()
+
+
+def test_dmd2_suppresses_structured_h3_media_through_adapter_owned_shape() -> None:
+    trainer = _trainer()
+
+    class MiniMaxAdapter:
+        __module__ = "flow_factory.models.minimax_h3.adapters"
+        trajectory_component_order = ("video", "audio")
+
+        def decode_latents(self, latents: LatentState, **kwargs: Any) -> Any:
+            del latents, kwargs
+            raise AssertionError("real H3 decoder must remain suppressed")
+
+        def empty_decoded_media(self, batch_size: int) -> Any:
+            return ([None] * batch_size, [None] * batch_size, None)
+
+    adapter = MiniMaxAdapter()
+    trainer.adapter = adapter
+    state = LatentState(
+        {
+            "video": torch.zeros(2, 3, 4),
+            "audio": torch.zeros(2, 5),
+        }
+    )
+
+    with trainer._without_media_decoding():
+        assert adapter.decode_latents(state, geometry={}) == (
+            [None, None],
+            [None, None],
+            None,
+        )
 
 
 def test_dmd2_rejects_bagel_per_sample_decode_contract() -> None:

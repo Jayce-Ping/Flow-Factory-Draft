@@ -55,7 +55,6 @@ _REPLAY_FORWARD_KEYS: tuple[str, ...] = ("guidance_scale", "stg_scale", "true_cf
 
 UNSUPPORTED_MEDIA_FREE_PREFIX_REASONS: Mapping[str, str] = {
     "flow_factory.models.bagel.": "inference has an unsupported media decode contract",
-    "flow_factory.models.minimax_h3.": "inference bypasses adapter.decode_latents",
 }
 
 
@@ -124,26 +123,34 @@ def without_media_decoding(
             for name, value in bound.arguments.items()
             if name == "latents" or name.endswith("_latents")
         }
-        invalid_arguments = {
-            name: value
-            for name, value in latent_arguments.items()
-            if value is not None and (not isinstance(value, torch.Tensor) or value.ndim < 1)
-        }
-        if invalid_arguments:
-            received = ", ".join(
-                f"{name}={type(value).__name__}" for name, value in invalid_arguments.items()
-            )
+        batch_sizes = {}
+        for name, value in latent_arguments.items():
+            if value is None:
+                continue
+            if isinstance(value, torch.Tensor) and value.ndim >= 1:
+                batch_sizes[name] = value.shape[0]
+                continue
+            if isinstance(value, LatentState):
+                component_sizes = {
+                    component: tensor.shape[0]
+                    for component, tensor in value.components.items()
+                    if isinstance(tensor, torch.Tensor) and tensor.ndim >= 1
+                }
+                if len(component_sizes) != len(value.components) or len(
+                    set(component_sizes.values())
+                ) != 1:
+                    raise ValueError(
+                        f"{algorithm_name} media-free decoder adapter={adapter_name!r}, "
+                        f"signature={decoder_signature} received invalid LatentState batch "
+                        f"sizes for {name!r}: {component_sizes!r}"
+                    )
+                batch_sizes[name] = next(iter(component_sizes.values()))
+                continue
             raise TypeError(
                 f"{algorithm_name} media-free decoder adapter={adapter_name!r}, "
-                f"signature={decoder_signature} expected tensor argument named "
-                "'latents' or '*_latents' with a batch dimension; "
-                f"received {received}"
+                f"signature={decoder_signature} expected tensor or LatentState argument "
+                f"named 'latents' or '*_latents', received {name}={type(value).__name__}"
             )
-        batch_sizes = {
-            name: value.shape[0]
-            for name, value in latent_arguments.items()
-            if isinstance(value, torch.Tensor) and value.ndim >= 1
-        }
         if not batch_sizes:
             received = ", ".join(
                 f"{name}={type(value).__name__}" for name, value in latent_arguments.items()
@@ -162,10 +169,10 @@ def without_media_decoding(
             )
 
         batch_size = next(iter(batch_sizes.values()))
-        empty_batch = [None] * batch_size
-        if len(adapter.trajectory_component_order) == 1:
-            return empty_batch
-        return tuple(list(empty_batch) for _ in adapter.trajectory_component_order)
+        empty_factory = getattr(adapter, "empty_decoded_media", None)
+        if callable(empty_factory):
+            return empty_factory(batch_size)
+        return BaseAdapter.empty_decoded_media(adapter, batch_size)
 
     adapter.decode_latents = empty_media
     try:
