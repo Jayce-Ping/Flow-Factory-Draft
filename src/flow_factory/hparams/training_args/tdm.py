@@ -36,6 +36,7 @@ class TDMTrainingArguments(DMD2TrainingArguments):
     use_huber: bool = True
     huber_c: float = 1e-3
     tdm_snr_gamma: float = 5.0
+    tdm_importance_clip: float = 20.0
 
     def __post_init__(self) -> None:
         """Validate trajectory count, replay tolerances, and Huber controls."""
@@ -58,6 +59,11 @@ class TDMTrainingArguments(DMD2TrainingArguments):
         self.tdm_snr_gamma = _finite_float(
             self.tdm_snr_gamma,
             "train.tdm_snr_gamma",
+            allow_zero=False,
+        )
+        self.tdm_importance_clip = _finite_float(
+            self.tdm_importance_clip,
+            "train.tdm_importance_clip",
             allow_zero=False,
         )
 

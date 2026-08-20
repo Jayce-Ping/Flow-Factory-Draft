@@ -18,12 +18,13 @@ from __future__ import annotations
 
 import math
 from numbers import Real
-from typing import Mapping
+from typing import Mapping, Tuple
 
 import torch
 
 from ...models.abc import BaseAdapter
-from ...samples import LatentState
+from ...samples import ComponentTimes, LatentState, NoisedState
+from ...utils.base import to_broadcast_tensor
 
 _EPS = 1e-6
 
@@ -282,6 +283,132 @@ def dmd_generator_loss(
         target = (gen - direction).detach()
         squared[name] = 0.5 * (gen - target).square()
     return adapter.reduce_latent_values(squared, state=x0_gen).to(torch.float32).mean()
+
+
+def tdm_conditional_renoise(
+    adapter: BaseAdapter,
+    clean_state: LatentState,
+    model_noise: LatentState,
+    *,
+    mid_times: ComponentTimes,
+    target_times: ComponentTimes,
+    importance_clip: float = 20.0,
+    eps: float = _EPS,
+) -> Tuple[NoisedState, torch.Tensor]:
+    """Conditionally diffuse one generator clean prediction within its ODE stage.
+
+    This is the linear-flow form of the official TDM transition. ``model_noise``
+    carries the noise paired with ``clean_state`` by the selected generator velocity;
+    the target state preserves that trajectory noise and adds only the conditional
+    variance needed to reach ``target_times``. The returned density ratio corrects
+    fake-score training from fresh Gaussian noise to the resulting mixed noise.
+
+    Args:
+        adapter: Adapter providing component order and masked forward noising.
+        clean_state: Detached/live generator clean prediction by component.
+        model_noise: Generator-implied noise paired with the clean prediction.
+        mid_times: Lower-noise boundary coordinates ``sigma_mid``.
+        target_times: Sampled higher-noise coordinates ``sigma_t``.
+        importance_clip: Symmetric cap on the importance ratio.
+        eps: Positive numerical floor.
+
+    Returns:
+        Conditional noised state and one detached importance ratio per sample.
+    """
+    adapter = _require_adapter(adapter)
+    clean_state = _require_state(clean_state, identifier="tdm clean_state")
+    model_noise = _require_state(model_noise, identifier="tdm model_noise")
+    expected_names = adapter.trajectory_component_order
+    _require_component_order(clean_state, expected_names, identifier="tdm clean_state")
+    _validate_state_against(
+        model_noise,
+        clean_state,
+        identifier="tdm model_noise",
+        require_detached=True,
+    )
+    if mid_times.sigma is None or tuple(mid_times.sigma) != expected_names:
+        received = None if mid_times.sigma is None else tuple(mid_times.sigma)
+        raise ValueError(
+            f"expected TDM mid sigma component order {expected_names}, received {received}"
+        )
+    if target_times.sigma is None or tuple(target_times.sigma) != expected_names:
+        received = None if target_times.sigma is None else tuple(target_times.sigma)
+        raise ValueError(
+            f"expected TDM target sigma component order {expected_names}, received {received}"
+        )
+    if (
+        isinstance(importance_clip, bool)
+        or not isinstance(importance_clip, Real)
+        or not math.isfinite(float(importance_clip))
+        or importance_clip <= 0
+    ):
+        raise ValueError(
+            f"expected finite TDM importance_clip > 0, received {importance_clip!r}"
+        )
+    if (
+        isinstance(eps, bool)
+        or not isinstance(eps, Real)
+        or not math.isfinite(float(eps))
+        or eps <= 0
+    ):
+        raise ValueError(f"expected finite TDM eps > 0, received {eps!r}")
+
+    mixed_components: dict[str, torch.Tensor] = {}
+    fresh_components: dict[str, torch.Tensor] = {}
+    for name in expected_names:
+        clean = clean_state.components[name].to(torch.float32)
+        implied_noise = model_noise.components[name].to(torch.float32)
+        sigma_mid = to_broadcast_tensor(mid_times.sigma[name].to(clean), clean)
+        sigma_t = to_broadcast_tensor(target_times.sigma[name].to(clean), clean)
+        valid = (
+            torch.isfinite(sigma_mid)
+            & torch.isfinite(sigma_t)
+            & (sigma_mid >= 0)
+            & (sigma_mid < sigma_t)
+            & (sigma_t < 1)
+        )
+        if not bool(valid.all().item()):
+            raise ValueError(
+                f"expected TDM component {name!r} sigmas to satisfy "
+                f"0 <= sigma_mid < sigma_t < 1, received "
+                f"sigma_mid={mid_times.sigma[name].tolist()}, "
+                f"sigma_t={target_times.sigma[name].tolist()}"
+            )
+        alpha_mid = 1.0 - sigma_mid
+        alpha_t = 1.0 - sigma_t
+        ratio = alpha_t / alpha_mid.clamp_min(float(eps))
+        old_noise_coeff = ratio * sigma_mid
+        beta_sq = sigma_t.square() - old_noise_coeff.square()
+        if bool((beta_sq < -float(eps)).any().item()):
+            raise ValueError(
+                f"TDM conditional variance became negative for component {name!r}: "
+                f"minimum beta^2={beta_sq.min().item()}"
+            )
+        beta = beta_sq.clamp_min(0).sqrt()
+        fresh = torch.randn_like(clean)
+        mixed = (old_noise_coeff * implied_noise + beta * fresh) / sigma_t.clamp_min(
+            float(eps)
+        )
+        mixed_components[name] = mixed
+        fresh_components[name] = fresh
+
+    mixed_noise = LatentState(mixed_components, active_masks=clean_state.active_masks)
+    fresh_noise = LatentState(fresh_components, active_masks=clean_state.active_masks)
+    noised = adapter.apply_forward_process_noise(clean_state, target_times, mixed_noise)
+    mixed_square = {
+        name: mixed_noise.components[name].square() for name in expected_names
+    }
+    fresh_square = {
+        name: fresh_noise.components[name].square() for name in expected_names
+    }
+    log_ratio = -0.5 * adapter.reduce_latent_values(
+        mixed_square, state=clean_state
+    ).to(torch.float32) + 0.5 * adapter.reduce_latent_values(
+        fresh_square, state=clean_state
+    ).to(torch.float32)
+    log_clip = math.log(float(importance_clip))
+    importance = torch.exp(log_ratio.clamp(-log_clip, log_clip)).detach()
+    return noised, importance
 
 
 def tdm_fake_loss(

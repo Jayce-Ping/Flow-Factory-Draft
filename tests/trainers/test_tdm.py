@@ -860,21 +860,36 @@ def test_tdm_generator_graph_owns_one_transition_and_no_auxiliary_parameters() -
     assert sum(role == "generator" and grad for role, grad, _, _ in adapter.events) == 1
 
 
-def test_tdm_fake_units_draw_fresh_noise_for_every_component_and_repeat() -> None:
+def test_tdm_fake_units_draw_fresh_noise_for_every_component_and_repeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     trainer, adapter, _ = _objective_trainer()
     first_unit, second_unit = trainer._build_boundary_units([_sample()])
     torch.manual_seed(31)
+    original_randn_like = torch.randn_like
+    draws: list[torch.Tensor] = []
+
+    def recording_randn_like(value: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        draw = original_randn_like(value, *args, **kwargs)
+        draws.append(draw.detach().clone())
+        return draw
+
+    monkeypatch.setattr(torch, "randn_like", recording_randn_like)
 
     trainer._fake_boundary_loss(first_unit)
     trainer._fake_boundary_loss(second_unit)
     trainer._fake_boundary_loss(first_unit)
 
-    assert len(adapter.noise_draws) == 3
-    for draw in adapter.noise_draws:
-        assert draw.component_names == adapter.trajectory_component_order
-        assert not torch.equal(draw.components["video"], draw.components["audio"])
-    for name in adapter.trajectory_component_order:
-        component_draws = [draw.components[name] for draw in adapter.noise_draws]
+    component_count = len(adapter.trajectory_component_order)
+    assert len(draws) == 3 * component_count
+    grouped = [
+        draws[offset : offset + component_count]
+        for offset in range(0, len(draws), component_count)
+    ]
+    for draw in grouped:
+        assert not torch.equal(draw[0], draw[1])
+    for component_index in range(component_count):
+        component_draws = [draw[component_index] for draw in grouped]
         assert all(
             not torch.equal(component_draws[left], component_draws[right])
             for left in range(len(component_draws))
