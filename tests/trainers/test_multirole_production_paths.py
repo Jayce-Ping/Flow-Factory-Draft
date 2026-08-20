@@ -40,6 +40,7 @@ from flow_factory.trainers.distillation.distillation_runtime import (
 from flow_factory.trainers.distillation.dmd2 import DMD2Trainer
 from flow_factory.trainers.distillation.tdm import TDMTrainer
 from flow_factory.trainers.distillation.tdm_r1 import TDMR1Trainer
+from flow_factory.trainers.distillation.tdm_trajectory import TDMTrajectoryRuntimeMixin
 from flow_factory.trainers.role_optimization import (
     OptimizationRole,
     RoleOptimizationCoordinator,
@@ -469,6 +470,17 @@ def test_dmd2_refuses_to_train_against_rewards_but_keeps_the_eval_runtime() -> N
     assert eval_models == {"ocr": 1}
 
 
+def test_tdm_r1_bypasses_tdms_reward_free_runtime() -> None:
+    trainer = object.__new__(TDMR1Trainer)
+    expected = ({"ocr": object()}, {"clip": object()})
+
+    with mock.patch.object(BaseTrainer, "_init_reward_model", return_value=expected) as initialize:
+        actual = trainer._init_reward_model()
+
+    assert actual is expected
+    initialize.assert_called_once_with(trainer)
+
+
 def test_dmd2_production_source_has_no_forbidden_data_objectives() -> None:
     source = inspect.getsource(DMD2Trainer).lower()
 
@@ -484,7 +496,7 @@ def test_dmd2_production_source_has_no_forbidden_data_objectives() -> None:
 
 
 def test_tdm_production_path_is_direct_and_data_free() -> None:
-    assert TDMTrainer.__bases__ == (BaseTrainer,)
+    assert TDMTrainer.__bases__ == (TDMTrajectoryRuntimeMixin, BaseTrainer)
     source = inspect.getsource(TDMTrainer).lower()
     for forbidden in (
         "reward_processor",
@@ -508,7 +520,7 @@ def test_distribution_matching_trainers_share_focused_runtime_helpers() -> None:
 
 
 def test_tdm_r1_production_path_keeps_frozen_reference_and_surrogate() -> None:
-    assert TDMR1Trainer.__bases__ == (BaseTrainer,)
+    assert TDMR1Trainer.__bases__ == (TDMTrainer,)
     source = inspect.getsource(TDMR1Trainer).lower()
     assert "group_preference_loss(" in source
     assert "use_component_variant(" in source

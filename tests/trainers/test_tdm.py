@@ -34,6 +34,7 @@ from flow_factory.samples import (
 from flow_factory.scheduler import SDESchedulerOutput
 from flow_factory.trainers.abc import BaseTrainer
 from flow_factory.trainers.distillation.tdm import TDMBoundaryUnit, TDMTrainer
+from flow_factory.trainers.distillation.tdm_trajectory import TDMTrajectoryRuntimeMixin
 from flow_factory.trainers.role_optimization import (
     OptimizationRole,
     RoleOptimizationCoordinator,
@@ -413,7 +414,7 @@ def _objective_trainer() -> tuple[TDMTrainer, ObjectiveTDMAdapter, ObjectiveBund
 
 
 def test_tdm_is_direct_deterministic_distillation_trainer() -> None:
-    assert TDMTrainer.__bases__ == (BaseTrainer,)
+    assert TDMTrainer.__bases__ == (TDMTrajectoryRuntimeMixin, BaseTrainer)
     assert TDMTrainer.paradigm == "distillation"
 
 
