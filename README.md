@@ -119,8 +119,8 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
 See [`Algorithm Guidance`](guidance/algorithms.md) for more information.
 
 > Models and algorithms are decoupled at the framework interface. Validation status varies by example.
-> Training-verified examples carry hardware and reward-trend evidence; MiniMax
-> H3 examples are schema/API validated only. Unlisted combinations require their own
+> Training-verified examples carry hardware and reward-trend evidence.
+> MiniMax H3 examples are schema/API validated only. Unlisted combinations require their own
 > compatibility and training evidence.
 
 # 💾 Hardware Requirements

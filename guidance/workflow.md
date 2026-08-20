@@ -576,5 +576,5 @@ and an omitted log-probability or callback collection is represented by `None`.
 The component order is adapter-owned, for example `("video", "audio")` in MiniMax
 H3. Conditioning is packed and replayed by the adapter; trainers such as GRPO,
 GRPO-Guard, DPPO, DiffusionNFT, AWM, DPO, DGPO, CRD, and DiffusionOPD consume the
-same state interface. H3 accepts neutral guidance `1.0`; framework-interface
-compatibility does not itself establish real-weight numerical parity.
+same state interface. H3 accepts neutral guidance `1.0`; framework-interface compatibility
+does not itself establish real-weight numerical parity.
