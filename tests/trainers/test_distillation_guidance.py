@@ -95,7 +95,7 @@ def test_preprocessing_follows_the_sampling_scale_when_the_real_score_is_unset()
     ("distributed_type", "authoritative"),
     [
         (DistributedType.MULTI_GPU, True),
-        (DistributedType.FSDP, True),
+        (DistributedType.FSDP, False),
         (DistributedType.DEEPSPEED, False),
     ],
 )
@@ -103,7 +103,7 @@ def test_only_backends_that_leave_gradients_on_parameters_are_asserted_against(
     distributed_type: DistributedType,
     authoritative: bool,
 ) -> None:
-    """DeepSpeed reduces into its own buffers and clears `parameter.grad`.
+    """DeepSpeed and FSDP1 do not expose authoritative original-parameter grads.
 
     Reading it there reports "no gradients" for every role of every correct run, so the
     per-microbatch assertions have to know when they can see anything at all.
@@ -112,3 +112,13 @@ def test_only_backends_that_leave_gradients_on_parameters_are_asserted_against(
     coordinator.accelerator = SimpleNamespace(distributed_type=distributed_type)
 
     assert coordinator._gradients_reach_parameters() is authoritative
+
+
+def test_fsdp2_dtensor_parameter_gradients_remain_authoritative() -> None:
+    coordinator = object.__new__(RoleOptimizationCoordinator)
+    coordinator.accelerator = SimpleNamespace(
+        distributed_type=DistributedType.FSDP,
+        state=SimpleNamespace(fsdp_plugin=SimpleNamespace(fsdp_version=2)),
+    )
+
+    assert coordinator._gradients_reach_parameters() is True

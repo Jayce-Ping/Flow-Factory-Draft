@@ -635,7 +635,13 @@ def run_role_phase(
     """
     if not microbatches:
         raise ValueError(f"{role_name} phase expected at least one microbatch, received none")
-    with trainer.role_optimization.phase(role_name):
+    # Keep the role routed for the complete forward/backward window. Activation
+    # checkpointing recomputes the forward during backward; if the inner loss
+    # context has already restored another variant, FSDP1 observes a different
+    # graph (and, worse, can recompute with the wrong role's weights).
+    with trainer.role_optimization.phase(role_name), trainer.adapter.use_component_variant(
+        role_name
+    ):
         # A single microbatch would render a 1/1 bar once per TTUR repeat, which is
         # noise; the role's own progress is already carried by the caller's bar.
         for microbatch in tqdm(
@@ -648,7 +654,12 @@ def run_role_phase(
             with trainer.role_optimization.microbatch():
                 loss = loss_fn(microbatch)
                 record_distillation_metric(trainer, f"train/{role_name}_loss", loss)
-                trainer.role_optimization.backward(loss)
+                # Nested score/reference contexts can change PEFT's active
+                # adapter without changing the registry's logical role. Re-enter
+                # immediately before backward so activation-checkpoint
+                # recomputation sees exactly the adapter used by the live forward.
+                with trainer.adapter.use_component_variant(role_name):
+                    trainer.role_optimization.backward(loss)
                 trainer._finish_role_microbatch()
 
     grad_norm = trainer.role_optimization.roles[role_name].last_grad_norm

@@ -459,6 +459,27 @@ def test_a_late_variant_gets_the_dtype_the_base_was_already_given(finetune_type:
     assert all(parameter.dtype == torch.bfloat16 for parameter in fake)
 
 
+@pytest.mark.parametrize("finetune_type", ["lora", "full"])
+def test_checkpoint_mutated_variant_dtypes_are_realigned_before_prepare(
+    finetune_type: str,
+) -> None:
+    adapter = TinyAdapter(Accelerator(cpu=True), finetune_type)
+    adapter.model_args.trainable_parameters_dtype = torch.bfloat16
+    adapter.declare_component_variants((BASE_VARIANT, "fake"))
+    registry = adapter.component_variant_registry
+    for variant_name in registry.variant_names:
+        for parameter in registry.parameters(variant_name):
+            parameter.data = parameter.data.to(torch.float32)
+
+    adapter.align_component_variant_dtypes()
+
+    assert all(
+        parameter.dtype == torch.bfloat16
+        for variant_name in registry.variant_names
+        for parameter in registry.parameters(variant_name)
+    )
+
+
 def test_a_dtype_that_names_nothing_is_refused_with_what_it_received() -> None:
     adapter = TinyAdapter(Accelerator(cpu=True), "lora")
     adapter.model_args.trainable_parameters_dtype = "not-a-dtype"

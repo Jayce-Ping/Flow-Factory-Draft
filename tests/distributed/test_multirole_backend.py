@@ -39,6 +39,12 @@ from flow_factory.trainers.role_optimization import (
 )
 
 
+@contextmanager
+def _variant_context(role_name: str) -> Iterator[None]:
+    del role_name
+    yield
+
+
 class TinyRoleLayer(torch.nn.Module):
     """Apply one scalar trainable role weight."""
 
@@ -272,6 +278,7 @@ def _run_production_tdm_r1_optimize(
     trainer.adapter = SimpleNamespace(
         component_variant_registry=registry,
         train=lambda: None,
+        use_component_variant=_variant_context,
         has_variant_snapshot=registry.has_snapshot,
         declare_variant_snapshot=registry.add_snapshot,
         update_variant_snapshot=registry.update_snapshot,
@@ -351,7 +358,10 @@ def _run_production_tdm_optimize(
     trainer.optimizer = optimizer
     trainer.optimization_roles = roles
     trainer.role_optimization = coordinator
-    trainer.adapter = SimpleNamespace(train=lambda: None)
+    trainer.adapter = SimpleNamespace(
+        train=lambda: None,
+        use_component_variant=_variant_context,
+    )
     trainer.training_args = SimpleNamespace(
         per_device_batch_size=1,
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -421,7 +431,10 @@ def _run_production_dmd2_optimize(
     trainer.optimizer = optimizer
     trainer.optimization_roles = roles
     trainer.role_optimization = coordinator
-    trainer.adapter = SimpleNamespace(train=lambda: None)
+    trainer.adapter = SimpleNamespace(
+        train=lambda: None,
+        use_component_variant=_variant_context,
+    )
     trainer.training_args = SimpleNamespace(
         num_inference_steps=1,
         num_inner_epochs=1,

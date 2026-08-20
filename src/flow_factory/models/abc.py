@@ -761,12 +761,17 @@ class BaseAdapter(ABC):
             )
         registry.materialize(trainable_variants)
         self.component_variant_registry = registry
-        self._apply_trainable_dtype_to_late_variants(registry, base_variant)
+        self._apply_trainable_dtype_to_variants(
+            registry,
+            tuple(name for name in registry.variant_names if name != base_variant),
+        )
 
-    def _apply_trainable_dtype_to_late_variants(
-        self, registry: ComponentVariantRegistry, base_variant: str
+    def _apply_trainable_dtype_to_variants(
+        self,
+        registry: ComponentVariantRegistry,
+        variant_names: Sequence[str],
     ) -> None:
-        """Give variants created here the dtype ``_mix_precision`` already applied.
+        """Give selected variants the configured trainable parameter dtype.
 
         ``_mix_precision`` runs while the adapter is built and only sees the base
         components; these variants are materialized later, from PEFT defaults, so
@@ -776,8 +781,8 @@ class BaseAdapter(ABC):
         activations.
 
         Args:
-            registry: Registry holding the freshly materialized variants.
-            base_variant: Variant that ``_mix_precision`` already handled.
+            registry: Registry holding the materialized variants.
+            variant_names: Variants to align after creation or checkpoint load.
         """
         train_dtype = self.model_args.trainable_parameters_dtype
         if train_dtype is None:
@@ -788,12 +793,15 @@ class BaseAdapter(ABC):
                 "expected model trainable_parameters_dtype to name a torch dtype, received "
                 f"{type(train_dtype).__name__}: {train_dtype!r}"
             )
-        for variant_name in registry.variant_names:
-            if variant_name == base_variant:
-                continue
+        for variant_name in variant_names:
             for parameter in registry.parameters(variant_name):
                 if parameter.is_floating_point() and parameter.dtype != target_dtype:
                     parameter.data = parameter.data.to(target_dtype)
+
+    def align_component_variant_dtypes(self) -> None:
+        """Reapply dtype policy after checkpoint loaders mutate adapter weights."""
+        registry = self._require_variant_registry("dtype alignment")
+        self._apply_trainable_dtype_to_variants(registry, registry.variant_names)
 
     def _require_variant_registry(self, purpose: str) -> ComponentVariantRegistry:
         """Return the variant registry, naming the caller that needs it."""
@@ -925,6 +933,27 @@ class BaseAdapter(ABC):
         return component_map
 
     # ============================== EMA Management ==============================
+    def _ema_tracked_parameters(self) -> List[torch.nn.Parameter]:
+        """Return live prepared parameters owned by the base trainable variant.
+
+        FSDP2 replaces module parameters with DTensors during ``prepare``. The
+        variant registry is explicitly rebound to those identities, while an
+        adapter component lookup can still expose a pre-prepare inner module.
+        EMA/reference swaps must therefore use registry ownership whenever it is
+        available or they mix plain tensors with live DTensors.
+        """
+        registry = getattr(self, "component_variant_registry", None)
+        if isinstance(registry, ComponentVariantRegistry):
+            parameters = list(registry.parameters(registry.base_variant))
+        else:
+            parameters = self.get_trainable_parameters()
+        if not parameters:
+            raise RuntimeError(
+                "expected at least one live trainable parameter for EMA/reference tracking, "
+                f"received none for adapter={type(self).__name__!r}"
+            )
+        return parameters
+
     def _init_ema(self):
         """Initialize EMA wrapper for the transformer."""
         if self.training_args.ema_decay > 0:
@@ -934,7 +963,7 @@ class BaseAdapter(ABC):
                 else torch.device("cpu")
             )
             self.ema_wrapper = EMAModuleWrapper(
-                parameters=self.get_trainable_parameters(),
+                parameters=self._ema_tracked_parameters(),
                 decay=self.training_args.ema_decay,
                 update_step_interval=self.training_args.ema_update_interval,
                 device=ema_device,
@@ -948,12 +977,12 @@ class BaseAdapter(ABC):
     def ema_step(self, step: int):
         """Update EMA parameters."""
         if hasattr(self, "ema_wrapper") and self.ema_wrapper is not None:
-            self.ema_wrapper.step(self.get_trainable_parameters(), optimization_step=step)
+            self.ema_wrapper.step(self._ema_tracked_parameters(), optimization_step=step)
 
     @contextmanager
     def use_ema_parameters(self):
         if hasattr(self, "ema_wrapper") and self.ema_wrapper is not None:
-            trainable_params = self.get_trainable_parameters()
+            trainable_params = self._ema_tracked_parameters()
             with self.ema_wrapper.use_ema_parameters(trainable_params):
                 yield
         else:
@@ -1046,7 +1075,7 @@ class BaseAdapter(ABC):
                 else torch.device("cpu")
             )
             self._ref_ema = EMAModuleWrapper(
-                parameters=self.get_trainable_parameters(),
+                parameters=self._ema_tracked_parameters(),
                 decay=0.0,  # No decay,
                 update_step_interval=0,  # No updates, just store original weights
                 device=ref_param_device,
@@ -1092,7 +1121,7 @@ class BaseAdapter(ABC):
                 self._restore_variant_trainability()
 
         elif self._ref_ema is not None:
-            trainable_params = self.get_trainable_parameters()
+            trainable_params = self._ema_tracked_parameters()
             # If ref_ema is on CPU, this line will be very slow!
             with self._ref_ema.use_ema_parameters(trainable_params):
                 yield
@@ -1100,14 +1129,17 @@ class BaseAdapter(ABC):
             yield
 
     def _restore_variant_trainability(self) -> None:
-        """Re-mark every declared variant's own parameters as trainable.
+        """Reassert active routing and mark every variant parameter trainable.
 
         A no-op for a single-policy algorithm, which declares no variants.
         """
         registry = getattr(self, "component_variant_registry", None)
         if registry is None:
             return
-        registry.restore_trainable_parameters()
+        # PEFT's reference context mutates both requires_grad flags and adapter
+        # routing. Merely restoring flags leaves activation-checkpoint
+        # recomputation free to run with the disabled/default adapter.
+        registry.activate(registry.active_variant)
 
     # ============================== Named Parameters Snapshot ==============================
     """
@@ -1306,6 +1338,31 @@ class BaseAdapter(ABC):
                 logger.info(f"Enabled gradient checkpointing for {comp_name}")
             else:
                 logger.warning(f"{comp_name} does not support gradient checkpointing")
+
+    def disable_gradient_checkpointing(self) -> None:
+        """Disable checkpointing on every materialized trainable variant."""
+        registry = getattr(self, "component_variant_registry", None)
+        if isinstance(registry, ComponentVariantRegistry):
+            components = tuple(registry.bundle_members().values())
+        else:
+            components = tuple(
+                self.get_component(name)
+                for name in self.model_args.target_components
+                if self.has_component(name)
+            )
+        seen = set()
+        for component in components:
+            if id(component) in seen:
+                continue
+            seen.add(id(component))
+            if hasattr(component, "disable_gradient_checkpointing"):
+                component.disable_gradient_checkpointing()
+                logger.info("Disabled gradient checkpointing for %s", type(component).__name__)
+            else:
+                logger.warning(
+                    "%s does not support disabling gradient checkpointing",
+                    type(component).__name__,
+                )
 
     # ============================== Precision Management ==============================
     def _cast_module_mixed_precision(
