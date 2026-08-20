@@ -3150,6 +3150,32 @@ class BaseAdapter(ABC):
         """
         pass
 
+    def empty_decoded_media(self, batch_size: int) -> Any:
+        """Return model-shaped empty media when rollout decoding is disabled.
+
+        Distillation needs trajectories and conditioning metadata but not decoded
+        images/video/audio. The adapter owns the decode return structure, so trainers
+        must not infer it from model type or inspect conditioning fields.
+
+        Args:
+            batch_size: Number of generated samples.
+
+        Returns:
+            Empty media matching this adapter's ``decode_latents`` return structure.
+        """
+        if (
+            not isinstance(batch_size, int)
+            or isinstance(batch_size, bool)
+            or batch_size < 1
+        ):
+            raise ValueError(
+                f"expected positive int batch_size for empty decoded media, got {batch_size!r}"
+            )
+        empty_batch = [None] * batch_size
+        if len(self.trajectory_component_order) == 1:
+            return empty_batch
+        return tuple(list(empty_batch) for _ in self.trajectory_component_order)
+
     # ======================================= Latent Geometry =======================================
     def resolve_latent_axes(self, latents: torch.Tensor) -> LatentAxes:
         """Resolve the :class:`LatentAxes` (axis roles) for ``latents``.

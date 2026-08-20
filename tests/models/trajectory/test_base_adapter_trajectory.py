@@ -85,6 +85,21 @@ def _structured_adapter() -> StructuredAdapterFake:
     return adapter
 
 
+def test_empty_decoded_media_preserves_adapter_owned_output_structure() -> None:
+    """Trainer-side decode suppression must not guess a model's modalities."""
+    assert _adapter().empty_decoded_media(2) == [None, None]
+    assert _structured_adapter().empty_decoded_media(2) == (
+        [None, None],
+        [None, None],
+    )
+
+
+@pytest.mark.parametrize("batch_size", [0, -1, True, 1.5])
+def test_empty_decoded_media_rejects_invalid_batch_size(batch_size: Any) -> None:
+    with pytest.raises(ValueError, match="positive int batch_size"):
+        _adapter().empty_decoded_media(batch_size)
+
+
 def _legacy_batch() -> Any:
     return BaseSample.stack(
         [
