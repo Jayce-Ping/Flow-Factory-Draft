@@ -14,6 +14,7 @@
 """Run the local gradient-bearing MiniMax H3 transformer and component steps."""
 
 import inspect
+from functools import lru_cache
 from typing import Any, List, Mapping, Optional, Sequence, Union
 
 import torch
@@ -25,6 +26,11 @@ from ._common import (
     validate_target_state,
 )
 from .layout import build_row_timesteps
+
+
+@lru_cache(maxsize=None)
+def _forward_parameter_names(module_type: type) -> frozenset[str]:
+    return frozenset(inspect.signature(module_type.forward).parameters)
 
 
 def run_h3_joint_transformer(
@@ -106,7 +112,7 @@ def run_h3_joint_transformer(
     get_base_model = getattr(signature_transformer, "get_base_model", None)
     if callable(get_base_model):
         signature_transformer = get_base_model()
-    forward_parameters = inspect.signature(signature_transformer.forward).parameters
+    forward_parameters = _forward_parameter_names(type(signature_transformer))
     layout_kwargs = {
         field: value.to(target_device)
         for field, value in layout.items()

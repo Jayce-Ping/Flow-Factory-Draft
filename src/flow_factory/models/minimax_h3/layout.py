@@ -50,14 +50,24 @@ def build_row_timesteps(
     Returns:
         Sorted unique times and per-row inverse indices.
     """
-    video_indices, audio_indices, text_indices, video_count, audio_count = _validate_layout(layout)
+    video_indices, audio_indices, text_indices, video_count, audio_count = _validate_layout(
+        layout,
+        validate_permutation=False,
+    )
     sequence_length = int(video_indices.numel() + audio_indices.numel() + text_indices.numel())
-    row_times = torch.full((sequence_length,), float(video_time), dtype=torch.float32)
+    row_times = torch.full(
+        (sequence_length,),
+        float(video_time),
+        dtype=torch.float32,
+        device=device,
+    )
+    video_indices = video_indices.to(device)
+    audio_indices = audio_indices.to(device)
     row_times[video_indices[:video_count]] = max(float(video_time), float(keyframe_noise_aug))
     row_times[audio_indices[audio_count:]] = float(audio_time)
     row_times[audio_indices[:audio_count]] = 1.0
     unique, inverse = torch.unique(row_times, sorted=True, return_inverse=True)
-    return unique.to(device), inverse.to(device)
+    return unique, inverse
 
 
 def build_h3_schedule_plan(
@@ -109,6 +119,8 @@ def build_h3_schedule_plan(
 
 def _validate_layout(
     layout: Mapping[str, Any],
+    *,
+    validate_permutation: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
     required = (
         "video_indices",
@@ -129,7 +141,7 @@ def _validate_layout(
                 f"received {type(value).__name__}/{getattr(value, 'shape', None)}/"
                 f"{getattr(value, 'dtype', None)}"
             )
-        indices.append(value.cpu())
+        indices.append(value)
     counts = []
     for field, index_values in zip(required[3:], indices[:2]):
         count = layout[field]
@@ -143,11 +155,18 @@ def _validate_layout(
                 f"received {count!r}"
             )
         counts.append(count)
-    all_indices = torch.cat(indices)
-    expected = torch.arange(all_indices.numel())
-    if not torch.equal(torch.sort(all_indices).values, expected):
-        raise ValueError(
-            "MiniMax H3 packed layout expected each sequence row exactly once, "
-            f"received indices={all_indices.tolist()}"
-        )
+    if validate_permutation:
+        devices = {value.device for value in indices}
+        if len(devices) != 1:
+            raise ValueError(
+                "MiniMax H3 packed layout expected every index tensor on one device, "
+                f"received devices={tuple(str(device) for device in devices)}"
+            )
+        all_indices = torch.cat(indices)
+        expected = torch.arange(all_indices.numel(), device=all_indices.device)
+        if not torch.equal(torch.sort(all_indices).values, expected):
+            raise ValueError(
+                "MiniMax H3 packed layout expected each sequence row exactly once, "
+                f"received indices={all_indices.tolist()}"
+            )
     return indices[0], indices[1], indices[2], counts[0], counts[1]
