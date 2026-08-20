@@ -354,14 +354,17 @@ class TDMR1Trainer(BaseTrainer):
         tdm_weight = self.training_args.tdm_weight
 
         guidance_direction = self._guidance_reward_direction(batch, terms)
-        guidance_loss = revised_x0_loss(
-            self.adapter,
-            terms.boundary_state,
-            guidance_direction,
-            terms.x0_real,
-            use_huber=self.training_args.use_huber,
-            huber_c=self.training_args.huber_c,
-        )
+        if guidance_direction is None:
+            guidance_loss = torch.zeros((), device=self.accelerator.device)
+        else:
+            guidance_loss = revised_x0_loss(
+                self.adapter,
+                terms.boundary_state,
+                guidance_direction,
+                terms.x0_real,
+                use_huber=self.training_args.use_huber,
+                huber_c=self.training_args.huber_c,
+            )
         surrogate_direction, surrogate_target = self._surrogate_reward_direction(batch, terms)
         surrogate_loss = revised_x0_loss(
             self.adapter,
@@ -377,7 +380,7 @@ class TDMR1Trainer(BaseTrainer):
         record_distillation_metric(self, "train/generator_surrogate_reward_loss", surrogate_loss)
         return terms.loss + tdm_weight * guidance_loss + (1.0 - tdm_weight) * surrogate_loss
 
-    def _guidance_reward_direction(self, batch: Any, terms: Any) -> LatentState:
+    def _guidance_reward_direction(self, batch: Any, terms: Any) -> Optional[LatentState]:
         """Recover the teacher's conditional-minus-unconditional direction.
 
         The adapter combines guidance internally and returns only the guided velocity,
@@ -385,15 +388,17 @@ class TDMR1Trainer(BaseTrainer):
         a query at scale 1 is the conditional prediction, and the guided query at scale
         ``s`` is ``uncond + s * (cond - uncond)``, which leaves
         ``cond - uncond = (guided - cond) / (s - 1)``.
+
+        Returns:
+            The direction, or ``None`` when this run has no guidance to reward.
         """
         scale = float(self.training_args.get_reference_guidance_scale())
-        if scale <= 1.0:
-            raise ValueError(
-                "TDM-R1 treats classifier-free guidance as a reward and needs a reference "
-                "guidance scale above 1 to have a direction to follow; received "
-                f"real_guidance_scale={scale}. Set train.real_guidance_scale > 1 or "
-                "train.cfg_reward_scale=0 to drop the term."
-            )
+        # A CFG-free reference has no conditional-minus-unconditional direction to
+        # follow, so this reward simply does not exist for that run rather than being a
+        # misconfiguration: the generator then trains on the distribution match and the
+        # learned reward alone.
+        if scale <= 1.0 or self.training_args.cfg_reward_scale == 0.0:
+            return None
         conditional_velocity = query_score_velocity(
             self.adapter,
             batch,

@@ -148,6 +148,21 @@ def test_tdm_weight_mixes_the_two_rewards_and_leaves_the_anchor_alone(
     assert float(loss) == pytest.approx(5.0 + 0.3 * 2.0 + 0.7 * 10.0)
 
 
+@pytest.mark.parametrize("scale", [1.0, 4.5])
+def test_a_cfg_free_reference_simply_has_no_guidance_reward(scale: float) -> None:
+    """Refusing to run would break every CFG-free config that trained fine before.
+
+    With no guidance on the reference there is no conditional-minus-unconditional
+    direction to follow, so the reward does not exist for that run; the generator
+    still has its distribution match and its learned reward.
+    """
+    trainer = _generator_trainer(tdm_weight=0.3)
+    trainer.training_args.get_reference_guidance_scale = lambda: scale
+    trainer.training_args.cfg_reward_scale = 0.0 if scale > 1.0 else 3.5
+
+    assert trainer._guidance_reward_direction(None, None) is None
+
+
 @pytest.mark.parametrize(
     ("boundary_index", "expected"),
     [(0, 0.25), (1, 0.5), (3, 1.0)],
