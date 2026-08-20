@@ -57,7 +57,6 @@ train:
   # Four deterministic ODE transitions; all four stage losses are averaged.
   resolution: 512
   num_inference_steps: 4
-  trajectory_steps: 4
   guidance_scale: 1.0        # Generator/fake model the unguided distribution
   real_guidance_scale: 4.0   # CFG is applied only to the frozen real score
 
@@ -85,10 +84,6 @@ train:
 
 scheduler:
   dynamics_type: "ODE"
-  noise_level: 0.8
-  num_sde_steps: 3
-  sde_steps: [0, 1, 2, 3]
-  seed: 42
 
 # Evaluation uses the same 4-step unguided generator as training.
 eval:

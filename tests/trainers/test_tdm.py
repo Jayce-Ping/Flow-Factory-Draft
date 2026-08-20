@@ -330,7 +330,6 @@ def _sample(
 def _trainer(**overrides: Any) -> TDMTrainer:
     trainer = object.__new__(TDMTrainer)
     defaults = {
-        "trajectory_steps": 2,
         "num_inference_steps": 2,
         "num_inner_epochs": 1,
         "per_device_batch_size": 1,
@@ -399,7 +398,6 @@ def _objective_trainer() -> tuple[TDMTrainer, ObjectiveTDMAdapter, ObjectiveBund
     )
     trainer.training_args = TDMTrainingArguments(
         num_inference_steps=2,
-        trajectory_steps=2,
         per_device_batch_size=1,
         gradient_accumulation_steps=1,
         ttur_fake_updates=1,
@@ -429,7 +427,6 @@ def test_tdm_config_counts_every_boundary_in_one_generator_window() -> None:
         {
             "train": {
                 "trainer_type": "tdm",
-                "trajectory_steps": 4,
                 "num_inference_steps": 4,
                 "unique_sample_num_per_epoch": 8,
                 "per_device_batch_size": 1,
@@ -447,7 +444,6 @@ def test_tdm_config_accepts_manual_gas(manual_gas: int) -> None:
         {
             "train": {
                 "trainer_type": "tdm",
-                "trajectory_steps": 4,
                 "num_inference_steps": 4,
                 "unique_sample_num_per_epoch": 8,
                 "per_device_batch_size": 1,
@@ -770,16 +766,11 @@ def test_tdm_rejects_invalid_boundary_geometry(
         trainer._build_boundary_units([_sample(**overrides)])
 
 
-def test_tdm_rejects_non_ode_or_k_mismatch_before_building_units() -> None:
+def test_tdm_rejects_non_ode_before_building_units() -> None:
     non_ode = _trainer()
     non_ode.adapter.scheduler_group["audio"].dynamics_type = "Flow-SDE"
     with pytest.raises(ValueError, match=r"deterministic ODE.*audio.*Flow-SDE"):
         non_ode._build_boundary_units([_sample()])
-
-    mismatch = _trainer(trajectory_steps=3, num_inference_steps=2)
-    with pytest.raises(ValueError, match=r"trajectory_steps=3.*num_inference_steps=2"):
-        mismatch._build_boundary_units([_sample()])
-
 
 def test_tdm_optimize_runs_fake_ttur_then_generator_over_identical_ordered_units() -> None:
     trainer = _trainer(ttur_fake_updates=3)

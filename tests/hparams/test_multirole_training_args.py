@@ -93,8 +93,7 @@ def test_multirole_defaults_and_frozen_reference_only_surface() -> None:
     assert tdm.ttur_fake_updates == 5
     assert tdm.gradient_step_per_epoch == 1
     assert tdm.use_huber is True
-    assert tdm.trajectory_steps == 4
-    assert tdm.num_inference_steps == tdm.trajectory_steps
+    assert tdm.num_inference_steps == 4
     assert tdm.get_num_train_timesteps(None) == 1
     assert tdm.replay_rtol == 1e-4
     assert tdm.replay_atol == 1e-4
