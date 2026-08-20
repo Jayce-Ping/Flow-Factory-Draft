@@ -222,8 +222,16 @@ def test_inference_collects_structured_target_only_trajectory(monkeypatch) -> No
     adapter = _adapter(MiniMaxH3T2VAAdapter, transformer=SimpleNamespace())
     adapter_forward = adapter.forward
     adapter_forward_calls: List[Dict[str, Any]] = []
+    adapter_decode = adapter.decode_latents
+    adapter_decode_calls: List[Dict[str, Any]] = []
     adapter.forward = lambda **kwargs: adapter_forward_calls.append(kwargs) or adapter_forward(
         **kwargs
+    )
+    adapter.decode_latents = (
+        lambda latents, **kwargs: adapter_decode_calls.append(
+            {"latents": latents, **kwargs}
+        )
+        or adapter_decode(latents, **kwargs)
     )
 
     samples = adapter.inference(
@@ -250,6 +258,8 @@ def test_inference_collects_structured_target_only_trajectory(monkeypatch) -> No
 
     assert len(calls) == 2
     assert len(adapter_forward_calls) == 2
+    assert len(adapter_decode_calls) == 1
+    assert adapter_decode_calls[0]["geometry"]["num_latent_frames"] == 1
     sample = samples[0]
     assert isinstance(sample.trajectory, StructuredTrajectory)
     assert sample.trajectory.components["video"].state_index_map.tolist() == [0, -1, 1]

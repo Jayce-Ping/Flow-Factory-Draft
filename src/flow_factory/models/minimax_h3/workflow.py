@@ -322,8 +322,7 @@ def infer_h3_workflow(adapter: Any, **kwargs: Any) -> List[Any]:
                         value.components[component].detach()
                     )
 
-    video, audio, sample_rate = decode_h3_adapter_latents(
-        adapter,
+    video, audio, sample_rate = adapter.decode_latents(
         state,
         geometry=geometry,
         output_type=kwargs.get("output_type", "pt"),
