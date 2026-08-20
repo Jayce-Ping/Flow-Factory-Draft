@@ -128,7 +128,7 @@ pip install -e .[deepspeed]
 > **Note**: The Bagel adapter requires `flash-attn` (>= 2.5.8) and `opencv-python`. Install them with `pip install -e .[bagel]` (the `[bagel]` extra is intentionally not part of `[all]` because flash-attn is heavy to build).
 
 > **Dependency pin**: Project metadata installs `diffusers` from exact Git commit
-> `f53d552036a0d1bd5570782a39cd40cfabf112bc`; MiniMax H3 depends on unreleased modular APIs at
+> `4e0466f3e5260f0d78b5e2b68ffbf27d819cc6db`; MiniMax H3 depends on unreleased modular APIs at
 > this revision. PyAV >=18.0.0 is a core dependency for reliable ordered video/audio reference
 > decoding. A future stable-release upgrade must rerun the H3 feature probe, real no-weight
 > component-spec/workflow checks, focused tests, and a separately documented real-weight smoke

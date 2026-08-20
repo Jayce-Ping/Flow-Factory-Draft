@@ -19,7 +19,7 @@ from typing import Any, Tuple, Type
 
 import torch
 
-MINIMAX_H3_DIFFUSERS_COMMIT = "f53d552036a0d1bd5570782a39cd40cfabf112bc"
+MINIMAX_H3_DIFFUSERS_COMMIT = "4e0466f3e5260f0d78b5e2b68ffbf27d819cc6db"
 MINIMAX_H3_INSTALL = (
     "pip install 'diffusers @ "
     "git+https://github.com/huggingface/diffusers.git@"

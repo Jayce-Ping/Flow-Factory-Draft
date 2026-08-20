@@ -6,7 +6,7 @@ verification claims.
 ## Dependency and workflows
 
 Required diffusers commit:
-`f53d552036a0d1bd5570782a39cd40cfabf112bc`.
+`4e0466f3e5260f0d78b5e2b68ffbf27d819cc6db`.
 
 | Registry key | Workflow input | Trainable component |
 |---|---|---|

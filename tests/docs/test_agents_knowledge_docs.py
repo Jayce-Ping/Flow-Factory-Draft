@@ -103,7 +103,7 @@ def test_leaf_docs_cover_runtime_trajectory_and_h3_contracts() -> None:
 
     h3 = _text(KNOWLEDGE / "topics/minimax_h3.md")
     for required in (
-        "f53d552036a0d1bd5570782a39cd40cfabf112bc",
+        "4e0466f3e5260f0d78b5e2b68ffbf27d819cc6db",
         "minimax-h3-t2va",
         "minimax-h3-fl2va",
         "minimax-h3-ref2va",

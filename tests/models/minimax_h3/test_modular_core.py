@@ -825,7 +825,7 @@ def test_dependency_probe_error_names_pin(monkeypatch):
     monkeypatch.setattr(dependency, "_SYMBOLS", None)
     import_error = ImportError("missing")
     monkeypatch.setattr(dependency, "_IMPORT_ERROR", import_error)
-    with pytest.raises(ImportError, match="f53d552036a0d1bd5570782a39cd40cfabf112bc") as raised:
+    with pytest.raises(ImportError, match="4e0466f3e5260f0d78b5e2b68ffbf27d819cc6db") as raised:
         dependency.require_minimax_h3_support()
     assert raised.value.__cause__ is import_error
 
@@ -899,7 +899,7 @@ def test_dependency_probe_rejects_incompatible_api_with_actionable_pin(monkeypat
         dependency.require_minimax_h3_support()
 
     message = str(raised.value)
-    assert "f53d552036a0d1bd5570782a39cd40cfabf112bc" in message
+    assert "4e0466f3e5260f0d78b5e2b68ffbf27d819cc6db" in message
     assert "pip install 'diffusers @ git+https://github.com/huggingface/diffusers.git@" in message
     assert broken_field in message
 
@@ -908,7 +908,7 @@ def test_pyproject_pins_exact_h3_diffusers_revision():
     text = Path("pyproject.toml").read_text()
     requirement = (
         "diffusers @ git+https://github.com/huggingface/diffusers.git@"
-        "f53d552036a0d1bd5570782a39cd40cfabf112bc"
+        "4e0466f3e5260f0d78b5e2b68ffbf27d819cc6db"
     )
     assert text.count(requirement) == 1
     assert '"diffusers>=0.37.0"' not in text

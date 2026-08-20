@@ -45,7 +45,7 @@ def test_readme_documents_h3_links_pin_and_limits() -> None:
         assert (ROOT / link).is_file()
 
     for required in (
-        "f53d552036a0d1bd5570782a39cd40cfabf112bc",
+        "4e0466f3e5260f0d78b5e2b68ffbf27d819cc6db",
         "pip install -e .",
         "PyAV >=18.0.0",
         "B=1",
