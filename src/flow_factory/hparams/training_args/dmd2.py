@@ -61,10 +61,10 @@ class DMD2TrainingArguments(TrainingArguments):
     # what the generator produces, so both keep `train.guidance_scale` (normally 1.0).
     # Left unset, the real score follows `train.guidance_scale` and nothing changes.
     real_guidance_scale: Optional[float] = None
-    # The boundary replay re-runs the generator forward with gradients enabled, and
-    # autocast is free to pick different kernels than the no-grad rollout did. Under bf16
-    # that lands a few ULPs apart -- 9.8e-04 measured on 8 GPUs -- which no tolerance
-    # below bf16 resolution can accept, so the window is configurable rather than fixed.
+    # The boundary replay must reproduce the stored rollout point. Scheduler dtype
+    # round-trips make the supported ODE path bit-exact; configurable tolerances remain
+    # for adapters with model-specific numerical seams, and the replay error reports the
+    # discrepancy in each original dtype's ULPs rather than encouraging a blind increase.
     replay_rtol: float = 1e-4
     replay_atol: float = 1e-4
 

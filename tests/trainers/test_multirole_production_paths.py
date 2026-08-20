@@ -241,6 +241,10 @@ def _real_objective_trainer() -> tuple[DMD2Trainer, TinyDMD2Adapter, TinyBundle]
     accelerator = Accelerator(cpu=True, gradient_accumulation_steps=1)
     bundle = TinyBundle()
     adapter = TinyDMD2Adapter(bundle)
+    adapter.scheduler_group = SimpleNamespace(
+        primary=SimpleNamespace(seed=42),
+        sample_ode_step_index=lambda draw_index: 0,
+    )
     configs = {
         "generator": _role_config("generator", 0.03),
         "fake": _role_config("fake", 0.07),

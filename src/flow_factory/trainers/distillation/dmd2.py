@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import random
 from contextlib import contextmanager
 from typing import (
     TYPE_CHECKING,
@@ -249,16 +248,34 @@ class DMD2Trainer(BaseTrainer):
             yield
 
     def _draw_boundary_index(self) -> int:
-        """Pick which rollout boundary this replay unit matches distributions at.
+        """Pick a reproducible rank-shared rollout boundary.
 
         A multi-step generator is supervised at one step drawn uniformly from its
-        schedule, so over training every step is covered; a one-step schedule reduces
-        to the single boundary this trainer used before.
+        schedule, so over training every step is covered. The scheduler seed is reset
+        from ``training_args.seed + epoch`` by the shared loop; a local draw counter
+        then gives each replay unit a deterministic sample without touching Python's
+        global RNG. All ranks execute the same role plan and therefore draw the same
+        boundary.
 
         Returns:
             Boundary index in ``[1, num_inference_steps]``.
         """
-        return random.randint(1, int(self.training_args.num_inference_steps))
+        scheduler_seed = int(self.adapter.scheduler_group.primary.seed)
+        if getattr(self, "_boundary_draw_seed", None) != scheduler_seed:
+            self._boundary_draw_seed = scheduler_seed
+            self._boundary_draw_count = 0
+        step_index = self.adapter.scheduler_group.sample_ode_step_index(
+            self._boundary_draw_count
+        )
+        self._boundary_draw_count += 1
+        num_steps = int(self.training_args.num_inference_steps)
+        if step_index >= num_steps:
+            raise ValueError(
+                "scheduler selected ODE replay step outside the configured generator "
+                f"schedule: step_index={step_index}, num_inference_steps={num_steps}, "
+                f"scheduler_seed={scheduler_seed}, draw_index={self._boundary_draw_count - 1}"
+            )
+        return step_index + 1
 
     def _fake_replay_loss(self, batch: StackedSampleBatch) -> torch.Tensor:
         """Compute fake clean-state denoising loss for one replay unit."""

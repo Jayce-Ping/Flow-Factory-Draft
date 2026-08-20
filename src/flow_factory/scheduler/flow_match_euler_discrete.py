@@ -166,11 +166,7 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler, SDESch
         """
         if self.num_sde_steps >= len(self.sde_steps):
             return self.sde_steps
-        generator = torch.Generator().manual_seed(self.seed)
-        selected_indices = torch.randperm(len(self.sde_steps), generator=generator)[
-            : self.num_sde_steps
-        ]
-        return self.sde_steps[selected_indices]
+        return self.select_random_step_indices(self.sde_steps, self.num_sde_steps)
 
     @property
     def train_timesteps(self) -> torch.Tensor:
@@ -360,6 +356,11 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler, SDESch
         if dynamics_type == "ODE":
             # ODE Sampling
             next_latents_mean = latents + velocity * dt
+            # Rollout stores every boundary in `_input_dtype`, then reloads that
+            # quantized state for the following step. Replay must expose the same
+            # boundary while retaining the graph; otherwise a non-zero LoRA makes the
+            # fp32 mean differ from the stored fp16/bf16 point by many ULPs.
+            next_latents_mean = next_latents_mean.to(_input_dtype).float()
             std_dev_t = torch.zeros_like(sigma)
 
             if next_latents is None:

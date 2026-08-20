@@ -56,7 +56,15 @@ def _trainer(**training_overrides: Any) -> DMD2Trainer:
     trainer.training_args = SimpleNamespace(**defaults)
     trainer.accelerator = SimpleNamespace(device=torch.device("cpu"), is_local_main_process=True)
     trainer.log_args = SimpleNamespace(verbose=False)
-    trainer.adapter = SimpleNamespace(train=lambda: None)
+
+    class SchedulerGroupFake:
+        primary = SimpleNamespace(seed=42)
+
+        def sample_ode_step_index(self, draw_index: int) -> int:
+            generator = torch.Generator().manual_seed(self.primary.seed + draw_index)
+            return int(torch.randperm(defaults["num_inference_steps"], generator=generator)[0])
+
+    trainer.adapter = SimpleNamespace(train=lambda: None, scheduler_group=SchedulerGroupFake())
     trainer.autocast = nullcontext
     trainer.role_optimization = _FakeCoordinator()
     trainer.dataloader = None
@@ -93,6 +101,20 @@ def test_dmd2_accepts_a_multi_step_generator(num_inference_steps: int) -> None:
 
     drawn = {trainer._draw_boundary_index() for _ in range(200)}
     assert drawn == set(range(1, num_inference_steps + 1))
+
+
+def test_dmd2_boundary_draw_restarts_reproducibly_with_scheduler_seed() -> None:
+    """Epoch reseeding resets the deterministic draw sequence on every rank."""
+    trainer = _trainer(num_inference_steps=4)
+
+    first = [trainer._draw_boundary_index() for _ in range(8)]
+    trainer.adapter.scheduler_group.primary.seed += 1
+    second = [trainer._draw_boundary_index() for _ in range(8)]
+    trainer.adapter.scheduler_group.primary.seed -= 1
+    repeated = [trainer._draw_boundary_index() for _ in range(8)]
+
+    assert first == repeated
+    assert first != second
 
 
 def test_dmd2_rejects_multiple_generator_inner_epochs_per_rollout() -> None:
