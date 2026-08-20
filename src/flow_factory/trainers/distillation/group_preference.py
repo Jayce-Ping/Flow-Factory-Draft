@@ -223,22 +223,14 @@ def _validate_preference_values(
 
 
 def _validate_sign_partitions(
-    accelerator: Accelerator,
-    batch: GroupPreferenceBatch,
-    advantages: torch.Tensor,
+    group_membership: torch.Tensor,
 ) -> None:
     """Require positive and non-positive members in every global group."""
-    local_membership = torch.stack(
-        ((advantages > 0).to(advantages.dtype), (advantages <= 0).to(advantages.dtype)),
-        dim=1,
-    )
-    group_membership = reduce_group_sums(
-        accelerator,
-        local_membership,
-        batch.local_group_indices,
-        batch.num_groups,
-        reduce_across_ranks=batch.reduce_across_ranks,
-    )
+    if group_membership.ndim != 2 or group_membership.shape[1] != 2:
+        raise ValueError(
+            "expected reduced group membership with shape (num_groups, 2), "
+            f"received shape {tuple(group_membership.shape)}"
+        )
     missing = (group_membership[:, 0] == 0) | (group_membership[:, 1] == 0)
     if torch.any(missing):
         missing_groups = torch.nonzero(missing, as_tuple=False).flatten().tolist()
@@ -311,18 +303,31 @@ def group_preference_loss(
         batch.local_group_indices,
         batch.num_groups,
     )
-    if require_both_signs:
-        _validate_sign_partitions(accelerator, batch, advantages)
-
     delta = trainable_values.detach() - reference_values.detach()
     local_preference = advantages * beta_value * delta / batch.group_size
-    group_logits = reduce_group_sums(
-        accelerator,
-        local_preference,
-        batch.local_group_indices,
-        batch.num_groups,
-        reduce_across_ranks=batch.reduce_across_ranks,
-    )
+    if require_both_signs:
+        local_membership = torch.stack(
+            ((advantages > 0).to(advantages.dtype), (advantages <= 0).to(advantages.dtype)),
+            dim=1,
+        )
+        local_reduction = torch.cat((local_preference.unsqueeze(1), local_membership), dim=1)
+        group_reduction = reduce_group_sums(
+            accelerator,
+            local_reduction,
+            batch.local_group_indices,
+            batch.num_groups,
+            reduce_across_ranks=batch.reduce_across_ranks,
+        )
+        group_logits = group_reduction[:, 0]
+        _validate_sign_partitions(group_reduction[:, 1:])
+    else:
+        group_logits = reduce_group_sums(
+            accelerator,
+            local_preference,
+            batch.local_group_indices,
+            batch.num_groups,
+            reduce_across_ranks=batch.reduce_across_ranks,
+        )
     group_weights = torch.sigmoid(group_logits)[batch.local_group_indices].detach()
     if not require_both_signs:
         return (group_weights * advantages * trainable_values).mean()

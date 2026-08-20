@@ -122,6 +122,28 @@ def test_group_preference_default_mode_preserves_sign_incomplete_dgpo_groups(
     assert torch.equal(loss, expected)
 
 
+def test_strict_group_preference_packs_membership_and_logits_into_one_reduce() -> None:
+    accelerator = AcceleratorFake(num_processes=2)
+    advantages = torch.tensor([1.0, -1.0])
+    batch = _batch(advantages, group_size=2)
+    trainable_values = torch.tensor([0.25, 0.75], requires_grad=True)
+
+    loss = group_preference_loss(
+        accelerator,
+        batch,
+        trainable_values,
+        torch.tensor([0.5, 0.5]),
+        beta=1.0,
+        require_both_signs=True,
+    )
+    loss.backward()
+
+    assert len(accelerator.reduced) == 1
+    assert accelerator.reduced[0].shape == (1, 3)
+    assert torch.isfinite(loss)
+    assert torch.isfinite(trainable_values.grad).all()
+
+
 @pytest.mark.parametrize("beta", [float("nan"), float("inf"), float("-inf")])
 def test_group_preference_rejects_a_nonfinite_beta(beta: float) -> None:
     with pytest.raises(ValueError, match=r"finite beta"):
