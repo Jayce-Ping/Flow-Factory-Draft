@@ -773,11 +773,56 @@ def replay_generator_boundary(
             atol=validated_atol,
             equal_nan=False,
         ):
-            max_abs = (comparison_recomputed - comparison_stored).abs().max()
+            absolute_error = (comparison_recomputed - comparison_stored).abs()
+            flat_index = int(absolute_error.reshape(-1).argmax().item())
+            stored_value = comparison_stored.reshape(-1)[flat_index]
+            recomputed_value = comparison_recomputed.reshape(-1)[flat_index]
+            stored_source_value = stored.reshape(-1)[flat_index]
+            recomputed_source_value = recomputed.reshape(-1)[flat_index]
+            max_abs = absolute_error.reshape(-1)[flat_index]
+            # Report spacing in each tensor's original dtype. Computing ULP after dtype
+            # promotion would describe float32 spacing even when the stored trajectory
+            # was quantized to fp16/bf16, overstating the discrepancy by orders of
+            # magnitude.
+            stored_ulp = (
+                torch.nextafter(
+                    stored_source_value,
+                    recomputed_source_value.to(stored_source_value.dtype),
+                )
+                - stored_source_value
+            ).abs()
+            recomputed_ulp = (
+                torch.nextafter(
+                    recomputed_source_value,
+                    stored_source_value.to(recomputed_source_value.dtype),
+                )
+                - recomputed_source_value
+            ).abs()
+            stored_ulp_ratio = (
+                max_abs / stored_ulp.to(max_abs.dtype)
+                if bool(torch.isfinite(stored_ulp).item()) and float(stored_ulp.item()) > 0
+                else torch.full_like(max_abs, float("nan"))
+            )
+            recomputed_ulp_ratio = (
+                max_abs / recomputed_ulp.to(max_abs.dtype)
+                if bool(torch.isfinite(recomputed_ulp).item())
+                and float(recomputed_ulp.item()) > 0
+                else torch.full_like(max_abs, float("nan"))
+            )
+            effective_tolerance = validated_atol + validated_rtol * stored_value.abs()
             raise ValueError(
                 f"replay_generator_boundary mismatch at boundary_index={boundary_index} for "
                 f"component {name!r} with rtol={validated_rtol} and atol={validated_atol}: "
-                f"max_abs={max_abs.item()}"
+                f"max_abs={max_abs.item()}, stored={stored_value.item()}, "
+                f"recomputed={recomputed_value.item()}, stored_dtype={stored.dtype}, "
+                f"recomputed_dtype={recomputed.dtype}, comparison_dtype={comparison_dtype}, "
+                f"stored_ulp={stored_ulp.item()}, "
+                f"error_stored_ulps={stored_ulp_ratio.item()}, "
+                f"recomputed_ulp={recomputed_ulp.item()}, "
+                f"error_recomputed_ulps={recomputed_ulp_ratio.item()}, "
+                f"effective_tolerance={effective_tolerance.item()}, "
+                f"stored_abs_max={comparison_stored.abs().max().item()}, "
+                f"recomputed_abs_max={comparison_recomputed.abs().max().item()}"
             )
     output.next_state = recomputed_state
     return output
