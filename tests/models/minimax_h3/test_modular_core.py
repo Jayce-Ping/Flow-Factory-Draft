@@ -478,6 +478,40 @@ def test_row_timestep_oracle_and_transition_schedules():
     torch.testing.assert_close(inverse, expected_inverse)
 
 
+def test_layout_permutation_validation_runs_once_outside_step_loop(monkeypatch):
+    from flow_factory.models.minimax_h3 import layout as layout_module
+    from flow_factory.scheduler import MiniMaxH3SDEScheduler
+
+    calls = []
+    original_validate = layout_module._validate_layout
+
+    def record_validate(values, *, validate_permutation=True):
+        calls.append(validate_permutation)
+        return original_validate(
+            values,
+            validate_permutation=validate_permutation,
+        )
+
+    monkeypatch.setattr(layout_module, "_validate_layout", record_validate)
+    values = {
+        "video_indices": torch.tensor([2, 5, 6]),
+        "audio_indices": torch.tensor([3, 4]),
+        "text_indices": torch.tensor([0, 1]),
+        "num_condition_video_rows": 1,
+        "num_condition_audio_rows": 1,
+    }
+    layout_module.build_h3_schedule_plan(
+        MiniMaxH3SDEScheduler(shift=12.0, dynamics_type="ODE"),
+        MiniMaxH3SDEScheduler(shift=3.0, dynamics_type="ODE"),
+        2,
+        values,
+        torch.device("cpu"),
+    )
+    layout_module.build_row_timesteps(values, 0.2, 0.4, 0.999)
+
+    assert calls == [True, False]
+
+
 class FakeTransformer(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -635,6 +669,49 @@ def test_transformer_reads_layout_signature_through_peft_wrapper():
     )
 
     torch.testing.assert_close(inner.calls[0]["token_tags"], layout["token_tags"])
+
+
+def test_transformer_signature_is_cached_by_real_module_type(monkeypatch):
+    from flow_factory.models.minimax_h3 import denoise
+
+    denoise._forward_parameter_names.cache_clear()
+    signature_calls = []
+    original_signature = denoise.inspect.signature
+
+    def record_signature(value):
+        signature_calls.append(value)
+        return original_signature(value)
+
+    monkeypatch.setattr(denoise.inspect, "signature", record_signature)
+    transformer = FakeTransformer()
+    layout = {
+        "video_indices": torch.tensor([2, 5, 6]),
+        "audio_indices": torch.tensor([3, 4, 7, 8, 9]),
+        "text_indices": torch.tensor([0, 1]),
+        "num_condition_video_rows": 1,
+        "num_condition_audio_rows": 2,
+        "token_tags": torch.arange(10),
+        "position_ids": torch.zeros(10, 3),
+    }
+    times = ComponentTimes(
+        timestep={"video": torch.tensor([800.0]), "audio": torch.tensor([600.0])},
+        next_timestep={"video": torch.tensor([0.0]), "audio": torch.tensor([0.0])},
+        sigma={"video": torch.tensor([0.8]), "audio": torch.tensor([0.6])},
+        next_sigma={"video": torch.tensor([0.0]), "audio": torch.tensor([0.0])},
+    )
+    prefixes = {"video": torch.zeros(1, 1, 96), "audio": torch.zeros(1, 2, 32)}
+
+    for _ in range(2):
+        denoise.run_h3_joint_transformer(
+            transformer,
+            _state(),
+            prefixes,
+            torch.ones(1, 2, 8),
+            times,
+            layout,
+        )
+
+    assert signature_calls == [FakeTransformer.forward]
 
 
 def test_transformer_rejects_batch_greater_than_one():
