@@ -23,14 +23,10 @@ Reference:
 import os
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
-from functools import partial
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import numpy as np
 import torch
-import tqdm as tqdm_
-
-tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
 from ...hparams import NFTTrainingArguments
 from ...rewards import RewardBuffer
@@ -38,10 +34,8 @@ from ...samples import BaseSample, ComponentTimes, LatentState, NoisedState, Sta
 from ...utils.base import create_generator_by_prompt
 from ...utils.logger_utils import setup_logger
 from ..abc import BaseTrainer
-from ..forward_process import (
-    forward_velocity_state,
-    state_batch_size,
-)
+from ..decoupled import iter_decoupled_replay_batches, iter_decoupled_steps
+from ..forward_process import forward_velocity_state
 
 logger = setup_logger(__name__)
 
@@ -237,41 +231,22 @@ class DiffusionNFTTrainer(BaseTrainer):
         See ``.agents/knowledge/topics/sample_lifecycle.md`` for the memory,
         train-inference consistency, and RNG-order trade-offs.
         """
-        per_device_batch_size = self.training_args.per_device_batch_size
-        num_batches = (len(samples) + per_device_batch_size - 1) // per_device_batch_size
-
         for inner_epoch in range(self.training_args.num_inner_epochs):
-            # Shuffle unless disabled for pack-composition-dependent adapters.
-            shuffled_samples = self._order_samples_for_optimize(samples, inner_epoch)
-
             loss_info = defaultdict(list)
 
-            for batch in tqdm(
-                self._iter_prefetched_batches(shuffled_samples, per_device_batch_size),
-                total=num_batches,
-                desc=f"Epoch {self.epoch} Training",
-                position=0,
-                disable=not self.show_progress_bar,
+            for replay_batch in iter_decoupled_replay_batches(
+                self,
+                samples,
+                inner_epoch,
+                self._precompute_sampling_policy_steps,
             ):
-                clean_state = self.adapter.get_terminal_state(batch)
-                batch_size = state_batch_size(self, clean_state, "terminal clean state")
-
-                # ---------- Per-batch precompute: old v predictions under sampling policy ----------
-                precomputed = self._precompute_sampling_policy_steps(batch, clean_state, batch_size)
+                batch = replay_batch.batch
+                clean_state = replay_batch.clean_state
 
                 # ---------- Train this batch under current policy ----------
-                self.adapter.train()
-                for t_idx in tqdm(
-                    range(self.num_train_timesteps),
-                    desc=f"Epoch {self.epoch} Timestep",
-                    position=1,
-                    leave=False,
-                    disable=not self.show_progress_bar,
-                ):
+                for _, step in iter_decoupled_steps(self, replay_batch.steps):
                     with self.accumulate_gradients():
                         # 1. Reuse the forward-process state drawn for this timestep
-                        step = precomputed[t_idx]
-
                         # 2. Forward pass for current policy
                         with self.autocast():
                             new_velocity = forward_velocity_state(

@@ -28,7 +28,6 @@ from typing import (
     Iterator,
     List,
     Literal,
-    Mapping,
     Optional,
     Tuple,
     Union,
@@ -39,7 +38,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from accelerate import Accelerator
-from accelerate.utils import DistributedType, ProjectConfiguration, set_seed
+from accelerate.utils import ProjectConfiguration, set_seed
 from diffusers.utils.outputs import BaseOutput
 from PIL import Image
 from torch.utils.data import DataLoader
@@ -58,7 +57,7 @@ from ..logger import LogFormatter, load_logger
 from ..models.abc import BaseAdapter
 from ..models.model_bundle import ModelBundle, RoutedComponentProxy
 from ..models.variants import DEFAULT_BASE_VARIANT, ComponentVariantRegistry
-from ..optimizer import build_optimizer, uses_muon
+from ..optimizer import build_optimizer
 from ..rewards import (
     BaseRewardModel,
     MultiRewardLoader,
@@ -72,11 +71,17 @@ from ..utils.base import (
     create_generator_by_prompt,
     filter_kwargs,
     json_default,
-    visit_tensor_leaves,
 )
 from ..utils.dist import reduce_loss_info
 from ..utils.logger_utils import setup_logger
 from ..utils.noise_schedule import TimeSampler
+from .common.sample_prefetch import iter_prefetched_batches
+from .multirole import (
+    MultiRoleBackendValidationMixin,
+    MultiRoleCheckpointingMixin,
+    configure_deepspeed_micro_batch_size,
+    validate_supported_distributed_plan,
+)
 from .role_optimization import (
     OptimizationRole,
     RoleOptimizationCoordinator,
@@ -88,130 +93,7 @@ from .role_optimization import (
 logger = setup_logger(__name__)
 
 
-def validate_supported_distributed_plan(accelerator: Accelerator) -> None:
-    """Reject distributed plans this framework cannot train correctly.
-
-    Supported plans are DDP, FSDP, and DeepSpeed ZeRO-1/2. ZeRO-3 shards
-    parameters across ranks, which breaks reward-model loading and the
-    frozen-component synchronization this framework relies on. Rejecting it here
-    fails at startup rather than partway through a training step.
-
-    Args:
-        accelerator: Configured Accelerate accelerator.
-
-    Raises:
-        ValueError: If DeepSpeed ZeRO-3 is configured.
-    """
-    if accelerator.distributed_type != DistributedType.DEEPSPEED:
-        return
-    deepspeed_plugin = accelerator.state.deepspeed_plugin
-    if deepspeed_plugin is None:
-        return
-    if deepspeed_plugin.zero_stage == 3:
-        raise ValueError(
-            "DeepSpeed ZeRO-3 is not supported by Flow-Factory: parameter sharding breaks "
-            "reward-model loading and frozen-component synchronization. Expected ZeRO-1/2, "
-            "FSDP, or DDP; received DeepSpeed stage 3."
-        )
-
-
-def configure_deepspeed_micro_batch_size(
-    accelerator: Accelerator, per_device_batch_size: int
-) -> None:
-    """Supply batch geometry when the custom train loader is not prepared."""
-    if not isinstance(per_device_batch_size, int):
-        raise TypeError(
-            "expected int for per_device_batch_size, "
-            f"got {type(per_device_batch_size).__name__}: {per_device_batch_size!r}"
-        )
-    if per_device_batch_size < 1:
-        raise ValueError(f"expected per_device_batch_size >= 1, got {per_device_batch_size}")
-    if accelerator.distributed_type != DistributedType.DEEPSPEED:
-        return
-    deepspeed_plugin = accelerator.state.deepspeed_plugin
-    if deepspeed_plugin is None:
-        raise RuntimeError(
-            "expected a DeepSpeed plugin for distributed_type=DEEPSPEED, received None"
-        )
-    key = "train_micro_batch_size_per_gpu"
-    configured = deepspeed_plugin.deepspeed_config.get(key)
-    if configured not in (None, "auto", per_device_batch_size):
-        raise ValueError(
-            f"expected DeepSpeed {key} to equal per_device_batch_size "
-            f"{per_device_batch_size}, got {configured!r}"
-        )
-    deepspeed_plugin.deepspeed_config[key] = per_device_batch_size
-
-
-_MULTIROLE_METADATA_FILENAME = "flow_factory_multirole_metadata.json"
-_MULTIROLE_METADATA_VERSION = 1
-_MULTIROLE_STATE_KEYS = {
-    "version",
-    "metadata",
-    "coordinator",
-    "trainer_step",
-    "variant_snapshots",
-}
-
-
-def _record_stream_on_batch(value: Any, stream: "torch.cuda.Stream") -> None:
-    """Record ``stream`` on every CUDA tensor in a stacked batch.
-
-    Required for the copy-stream prefetch: it stops the caching allocator from
-    reusing copy-stream-produced tensors until the consuming stream is done.
-    """
-    visit_tensor_leaves(value, lambda t: t.record_stream(stream) if t.is_cuda else None)
-
-
-class _MultiRoleCheckpointState:
-    """Delegate Accelerate custom checkpoint state to one trainer."""
-
-    def __init__(self, trainer: "BaseTrainer") -> None:
-        self._trainer = trainer
-
-    def state_dict(self) -> Dict[str, Any]:
-        """Return multi-role counters and defensive compatibility metadata."""
-        return self._trainer._multirole_state_dict()
-
-    def load_state_dict(self, state: Mapping[str, Any]) -> None:
-        """Restore multi-role counters after Accelerate restores prepared state."""
-        self._trainer._load_multirole_state_dict(state)
-
-    def prepare_save(self, output_dir: str) -> None:
-        """Validate a closed boundary and write metadata before Accelerate saves."""
-        try:
-            custom_state = self.state_dict()
-        except RuntimeError as error:
-            raise RuntimeError(
-                "cannot checkpoint invalid multi-role training state before "
-                f"model/optimizer save; validation reported: {error}"
-            ) from error
-        accelerator = self._trainer.accelerator
-        save_on_each_node = accelerator.project_configuration.save_on_each_node
-        should_write_metadata = accelerator.is_main_process or (
-            save_on_each_node and accelerator.is_local_main_process
-        )
-        if should_write_metadata:
-            os.makedirs(output_dir, exist_ok=True)
-            metadata_path = os.path.join(output_dir, _MULTIROLE_METADATA_FILENAME)
-            with open(metadata_path, "w", encoding="utf-8") as metadata_file:
-                json.dump(custom_state["metadata"], metadata_file, indent=2, sort_keys=True)
-                metadata_file.write("\n")
-
-    def validate_load(self, input_dir: str) -> None:
-        """Validate metadata before Accelerate can mutate prepared state."""
-        metadata_path = os.path.join(input_dir, _MULTIROLE_METADATA_FILENAME)
-        if not os.path.isfile(metadata_path):
-            raise FileNotFoundError(
-                "multi-role metadata compatibility gate expected file "
-                f"{metadata_path!r}, received missing file"
-            )
-        with open(metadata_path, "r", encoding="utf-8") as metadata_file:
-            metadata = json.load(metadata_file)
-        self._trainer._validate_multirole_metadata(metadata)
-
-
-class BaseTrainer(ABC):
+class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, ABC):
     """
     Abstract Base Class for Flow-Factory trainers.
     """
@@ -540,51 +422,6 @@ class BaseTrainer(ABC):
             f"received {available!r}"
         )
 
-    def _validate_optimizer_backend(self, optimizer_args: Tuple[OptimizerArguments, ...]) -> None:
-        """Reject optimizer and distributed-backend pairings that are not verified.
-
-        Muon rejects non-matrix parameters, so a Muon variant is driven by a
-        CompositeOptimizer holding both Muon and AdamW, and the split is decided by
-        parameter rank before ``prepare`` reshapes anything. DDP and FSDP2 preserve
-        that rank -- DDP does not reshape, FSDP2 shards each parameter as a 2D
-        DTensor -- so the composite still sees matrices at step time.
-
-        Two backends do not. DeepSpeed rebuilds its own optimizer wrapper around the
-        object it receives. FSDP1 flattens every wrapped unit into one 1D
-        FlatParameter, so Muon takes matrices at construction and is handed a 1D
-        gradient at the first step, failing with "Param gradient must be a 2D matrix"
-        after a full rollout has already been paid for.
-
-        Args:
-            optimizer_args: Optimizer configurations for this run.
-
-        Raises:
-            ValueError: If Muon is combined with DeepSpeed or FSDP1.
-        """
-        if not uses_muon(optimizer_args):
-            return
-        if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
-            raise ValueError(
-                "Muon with DeepSpeed is not verified in this framework: Muon rejects "
-                "non-matrix parameters, so it runs inside a CompositeOptimizer, and "
-                "DeepSpeed rebuilds its own optimizer wrapper around the object it "
-                "receives. Use DDP or FSDP2 with Muon, or select the adamw optimizer."
-            )
-        if self.accelerator.distributed_type != DistributedType.FSDP:
-            return
-        fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
-        fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) if fsdp_plugin else 1
-        if fsdp_version >= 2:
-            return
-        raise ValueError(
-            "Muon with FSDP1 does not work: FSDP1 flattens each wrapped unit into a "
-            "1D FlatParameter, so Muon is constructed over matrices and then receives "
-            "a 1D gradient, failing with 'Param gradient must be a 2D matrix' at the "
-            "first optimizer step. Set `fsdp_version: 2` in the accelerate config "
-            "(config/accelerate_configs/fsdp2.yaml), use DDP, or select the adamw "
-            "optimizer."
-        )
-
     def _role_optimizer_configs(self) -> Tuple[RoleOptimizerConfig, ...]:
         """Build role configs from nested arguments or legacy flat arguments."""
         required_roles = BaseTrainer._required_trainable_roles(self)
@@ -689,25 +526,6 @@ class BaseTrainer(ABC):
             roles=self.optimization_roles,
         )
 
-    def _multirole_metadata(self) -> Dict[str, Any]:
-        """Return deterministic metadata used to validate resume compatibility."""
-        role_metadata = self.adapter.component_variant_registry.training_state_dict()
-        update_plan = self._role_update_plan()
-        return {
-            "version": _MULTIROLE_METADATA_VERSION,
-            "roles": role_metadata["variants"],
-            "optimizer_group_roles": [
-                group.get("role_name") for group in self.optimizer.param_groups
-            ],
-            "update_plan": [
-                {
-                    "role_name": phase.role_name,
-                    "repeats": phase.repeats,
-                }
-                for phase in update_plan.phases
-            ],
-        }
-
     def _role_update_plan(self) -> RoleUpdatePlan:
         """Return the ordered role plan used for checkpoint compatibility."""
         configured_plan_builder = getattr(self.training_args, "role_update_plan", None)
@@ -722,162 +540,6 @@ class BaseTrainer(ABC):
         return RoleUpdatePlan(
             phases=tuple(RolePhase(role_name) for role_name in self.optimization_roles)
         )
-
-    def _validate_multirole_metadata(self, state: Mapping[str, Any]) -> None:
-        """Validate all metadata that must match before prepared-state mutation."""
-        if not isinstance(state, Mapping):
-            raise TypeError(
-                "expected multi-role metadata as a mapping, "
-                f"received {type(state).__name__}: {state!r}"
-            )
-        expected_keys = {"version", "roles", "optimizer_group_roles", "update_plan"}
-        received_keys = set(state)
-        if received_keys != expected_keys:
-            raise ValueError(
-                "multi-role metadata keys mismatch: expected "
-                f"{tuple(sorted(expected_keys))!r}, "
-                f"received {tuple(sorted(received_keys))!r}"
-            )
-        received_version = state.get("version")
-        if (
-            not isinstance(received_version, int)
-            or isinstance(received_version, bool)
-            or received_version != _MULTIROLE_METADATA_VERSION
-        ):
-            raise ValueError(
-                "multi-role metadata version mismatch: expected "
-                f"{_MULTIROLE_METADATA_VERSION}, received {received_version!r}"
-            )
-
-        # The checkpoint speaks the trainer's word, the registry speaks its own;
-        # translate at the boundary rather than leaking either vocabulary.
-        self.adapter.component_variant_registry.load_training_state_dict(
-            {
-                "version": received_version,
-                "variants": state.get("roles"),
-            }
-        )
-        expected = self._multirole_metadata()
-        for field_name in ("optimizer_group_roles", "update_plan"):
-            expected_value = expected[field_name]
-            received_value = state.get(field_name)
-            if received_value != expected_value:
-                raise ValueError(
-                    f"multi-role metadata {field_name} mismatch: expected "
-                    f"{expected_value!r}, received {received_value!r}"
-                )
-
-    def _primary_role(self) -> str:
-        """Return the role whose optimizer step defines this run's public step.
-
-        The primary role is the first one declared. Which algorithm concept that
-        corresponds to is the algorithm's business; the loop only needs one role to
-        pace the global counter.
-        """
-        return self._required_trainable_roles()[0]
-
-    def _multirole_state_dict(self) -> Dict[str, Any]:
-        """Return registered custom state without duplicating prepared state."""
-        coordinator_state = self.role_optimization.state_dict()
-        primary_role = self._primary_role()
-        primary_step = coordinator_state["role_steps"][primary_role]
-        if self.step != primary_step:
-            raise RuntimeError(
-                "multi-role checkpoint counter mismatch: expected trainer step to equal "
-                f"{primary_role!r} role step {primary_step}, received trainer_step={self.step}"
-            )
-        return {
-            "version": 1,
-            "metadata": self._multirole_metadata(),
-            "coordinator": coordinator_state,
-            "trainer_step": self.step,
-            "variant_snapshots": self.adapter.component_variant_registry.snapshot_state_dict(),
-        }
-
-    def _load_multirole_state_dict(self, state: Mapping[str, Any]) -> None:
-        """Restore custom multi-role counters after complete validation."""
-        if not isinstance(state, Mapping):
-            raise TypeError(
-                "expected registered multi-role state as a mapping, "
-                f"received {type(state).__name__}: {state!r}"
-            )
-        received_keys = set(state)
-        if received_keys != _MULTIROLE_STATE_KEYS:
-            raise ValueError(
-                "registered multi-role state keys mismatch: expected "
-                f"{tuple(sorted(_MULTIROLE_STATE_KEYS))!r}, "
-                f"received {tuple(sorted(received_keys))!r}"
-            )
-        state_version = state["version"]
-        if (
-            not isinstance(state_version, int)
-            or isinstance(state_version, bool)
-            or state_version != 1
-        ):
-            raise ValueError(
-                f"registered multi-role state version mismatch: expected 1, "
-                f"received {state_version!r}"
-            )
-        self._validate_multirole_metadata(state["metadata"])
-        trainer_step = state["trainer_step"]
-        if not isinstance(trainer_step, int) or isinstance(trainer_step, bool) or trainer_step < 0:
-            raise ValueError(
-                "expected non-negative int trainer_step in registered multi-role state, "
-                f"received {trainer_step!r}"
-            )
-        coordinator_state = state["coordinator"]
-        if not isinstance(coordinator_state, Mapping):
-            raise TypeError(
-                "expected coordinator in registered multi-role state as a mapping, "
-                f"received {type(coordinator_state).__name__}: {coordinator_state!r}"
-            )
-        role_steps = coordinator_state.get("role_steps")
-        primary_role = self._primary_role()
-        if not isinstance(role_steps, Mapping) or role_steps.get(primary_role) != trainer_step:
-            received_primary_step = (
-                role_steps.get(primary_role) if isinstance(role_steps, Mapping) else role_steps
-            )
-            raise ValueError(
-                "registered multi-role counter mismatch: expected trainer_step "
-                f"{trainer_step} to equal {primary_role!r} role step, "
-                f"received {primary_role!r} step {received_primary_step!r}"
-            )
-        self.role_optimization.load_state_dict(coordinator_state)
-        self.adapter.component_variant_registry.load_snapshot_state_dict(state["variant_snapshots"])
-        self.step = trainer_step
-        self.adapter.component_variant_registry.activate(
-            self.adapter.component_variant_registry.base_variant
-        )
-
-    def _register_multirole_checkpointing(self) -> None:
-        """Register Accelerate metadata gates and custom state for multi-role runs."""
-        if len(self._required_trainable_roles()) <= 1:
-            return
-        if getattr(self, "_multirole_checkpoint_registered", False):
-            raise RuntimeError(
-                "cannot register multi-role checkpointing twice for trainer "
-                f"{type(self).__name__}"
-            )
-
-        def save_metadata_hook(
-            models: List[torch.nn.Module],
-            weights: List[Dict[str, torch.Tensor]],
-            output_dir: str,
-        ) -> None:
-            del models, weights
-            checkpoint_state.prepare_save(output_dir)
-
-        def load_metadata_hook(models: List[torch.nn.Module], input_dir: str) -> None:
-            del models
-            checkpoint_state.validate_load(input_dir)
-
-        checkpoint_state = _MultiRoleCheckpointState(self)
-        self._multirole_checkpoint_state = checkpoint_state
-        self.adapter._multirole_checkpoint_state = checkpoint_state
-        self.accelerator.register_save_state_pre_hook(save_metadata_hook)
-        self.accelerator.register_load_state_pre_hook(load_metadata_hook)
-        self.accelerator.register_for_checkpointing(checkpoint_state)
-        self._multirole_checkpoint_registered = True
 
     def _declare_model_variants(self) -> None:
         """Declare the component variants this algorithm trains, before ``prepare``.
@@ -914,117 +576,6 @@ class BaseTrainer(ABC):
         if isinstance(registry, ComponentVariantRegistry):
             return registry.variant_names
         return (DEFAULT_BASE_VARIANT,)
-
-    def _validate_trainable_parameters_survived_prepare(self) -> None:
-        """Reject a prepared root that no rank can train.
-
-        Ownership is checked before ``prepare``, but a backend can still leave nothing
-        to optimize afterwards. The check must be collective: FSDP shards a flattened
-        unit by byte range, so a rank whose slice covers only frozen weights holds
-        zero-element views of the adapter and is perfectly healthy. Under FSDP1 with
-        LoRA that is the common case -- the frozen base fills the early shards and the
-        whole adapter can land on one rank -- so a rank-local count would reject a run
-        that trains correctly.
-
-        Raises:
-            RuntimeError: If no rank holds a parameter that requires a gradient.
-        """
-        local = sum(
-            parameter.numel()
-            for parameter in self.model_bundle.parameters()
-            if parameter.requires_grad
-        )
-        counts = torch.tensor([float(local)], device=self.accelerator.device)
-        global_trainable = int(self.accelerator.reduce(counts, reduction="sum").item())
-        if global_trainable > 0:
-            return
-        raise RuntimeError(
-            "expected the prepared model to expose trainable parameters under "
-            f"{self.accelerator.distributed_type}, received 0 across all "
-            f"{self.accelerator.num_processes} rank(s). Every parameter was frozen or "
-            "absorbed while wrapping, so an optimizer step would change nothing."
-        )
-
-    def _validate_multirole_backend(self) -> None:
-        """Validate one-root backend semantics for multi-role trainers."""
-        required_roles = self._required_trainable_roles()
-        if len(required_roles) <= 1:
-            return
-
-        algorithm = self.training_args.trainer_type
-        prepared_models = tuple(self.accelerator._models)
-        if len(prepared_models) != 1:
-            raise RuntimeError(
-                f"algorithm {algorithm!r} with roles {required_roles!r} expected exactly "
-                f"one prepared model root, received {len(prepared_models)}"
-            )
-        # Compare through `unwrap_model`: accelerate registers the module in `_models`
-        # before wrapping it, so under DDP the tracked entry is the inner bundle while
-        # `prepare` hands back the DistributedDataParallel around it. Comparing the
-        # wrappers rejected every multi-role DDP run. What has to hold is that the one
-        # tracked root is the one this trainer drives, which the unwrapped identity says.
-        tracked = self.accelerator.unwrap_model(prepared_models[0])
-        driven = self.accelerator.unwrap_model(self.model_bundle)
-        if tracked is not driven:
-            raise RuntimeError(
-                f"algorithm {algorithm!r} with roles {required_roles!r} expected the tracked "
-                "prepared model root to be self.model_bundle, received different identities"
-            )
-
-        prepared_optimizers = tuple(self.accelerator._optimizers)
-        if len(prepared_optimizers) != 1:
-            raise RuntimeError(
-                f"algorithm {algorithm!r} with roles {required_roles!r} expected exactly "
-                f"one prepared optimizer, received {len(prepared_optimizers)}"
-            )
-        if prepared_optimizers[0] is not self.optimizer:
-            raise RuntimeError(
-                f"algorithm {algorithm!r} with roles {required_roles!r} expected the tracked "
-                "prepared optimizer to be self.optimizer, received different identities"
-            )
-
-        prepared_group_roles = tuple(
-            group.get("role_name") for group in self.optimizer.param_groups
-        )
-        if prepared_group_roles != self._unprepared_optimizer_group_roles:
-            raise RuntimeError(
-                f"algorithm {algorithm!r} optimizer group role mapping expected "
-                f"{self._unprepared_optimizer_group_roles!r}, received {prepared_group_roles!r}"
-            )
-
-        deepspeed_plugin = getattr(self.accelerator.state, "deepspeed_plugin", None)
-        if deepspeed_plugin is not None and deepspeed_plugin.zero_stage not in (1, 2):
-            raise ValueError(
-                f"DeepSpeed multi-role algorithm {algorithm!r} with roles "
-                f"{required_roles!r} requires zero_stage in (1, 2), received "
-                f"zero_stage={deepspeed_plugin.zero_stage!r}"
-            )
-
-        fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
-        if fsdp_plugin is None or fsdp_plugin.fsdp_version != 2:
-            return
-        if fsdp_plugin.use_orig_params is False:
-            raise ValueError(
-                f"FSDP2 multi-role algorithm {algorithm!r} with roles {required_roles!r} "
-                "requires use_orig_params=True, received False"
-            )
-        prepared_root_parameter_ids = {
-            id(parameter)
-            for parameter in self.accelerator.unwrap_model(self.model_bundle).parameters()
-        }
-        foreign_parameters = tuple(
-            (group_id, group["role_name"], parameter_index, id(parameter))
-            for group_id, group in enumerate(self.optimizer.param_groups)
-            for parameter_index, parameter in enumerate(group["params"])
-            if id(parameter) not in prepared_root_parameter_ids
-        )
-        if foreign_parameters:
-            raise RuntimeError(
-                "FSDP2 optimizer parameter identity must reference the prepared model root "
-                f"for algorithm {algorithm!r} with roles {required_roles!r}; received foreign "
-                f"(group_id, role_name, parameter_index, parameter_id) entries "
-                f"{foreign_parameters!r}"
-            )
 
     def _load_inference_components(self, trainable_module_names: List[str]):
         """
@@ -1621,41 +1172,12 @@ class BaseTrainer(ABC):
             StackedSampleBatch: a stacked micro-batch (its source samples are at
             ``batch.samples``).
         """
-        device = self.accelerator.device
-        starts = list(range(0, len(samples), per_device_batch_size))
-
-        use_prefetch = (
-            torch.cuda.is_available()
-            and self.training_args.offload_samples_to_cpu
-            and len(starts) > 1
+        yield from iter_prefetched_batches(
+            samples,
+            per_device_batch_size,
+            device=self.accelerator.device,
+            offload_samples_to_cpu=self.training_args.offload_samples_to_cpu,
         )
-        if not use_prefetch:
-            for start in starts:
-                batch_samples = [
-                    sample.to(device) for sample in samples[start : start + per_device_batch_size]
-                ]
-                yield BaseSample.stack(batch_samples)
-            return
-
-        copy_stream = torch.cuda.Stream(device)
-        compute_stream = torch.cuda.current_stream(device)
-
-        def _load(start: int) -> StackedSampleBatch:
-            with torch.cuda.stream(copy_stream):
-                moved = [
-                    sample.to(device, non_blocking=True)
-                    for sample in samples[start : start + per_device_batch_size]
-                ]
-                return BaseSample.stack(moved)
-
-        next_batch = _load(starts[0])
-        for i, _ in enumerate(starts):
-            batch = next_batch
-            compute_stream.wait_stream(copy_stream)  # batch H2D complete before use
-            _record_stream_on_batch(batch, compute_stream)  # keep alive for compute stream
-            if i + 1 < len(starts):
-                next_batch = _load(starts[i + 1])  # prefetch next, overlaps compute
-            yield batch
 
     def sample_batch(
         self,

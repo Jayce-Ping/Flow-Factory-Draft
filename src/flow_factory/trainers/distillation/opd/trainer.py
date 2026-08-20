@@ -69,6 +69,7 @@ from ....samples import (
 from ....utils.logger_utils import setup_logger
 from ....utils.trajectory_collector import compute_trajectory_indices
 from ...abc import BaseTrainer
+from ...common.forward_kwargs import replay_forward_kwargs
 from .common import (
     TARGET_REQUEST_FIELDS,
     compute_structured_distillation_loss,
@@ -458,7 +459,7 @@ class DiffusionOPDTrainer(BaseTrainer):
         Legacy replay unpacked ``batch`` after ``training_args``, so batch-level
         values win on shared keys.
         """
-        return {key: value for key, value in {**self.training_args}.items() if key not in batch}
+        return replay_forward_kwargs(self, batch)
 
     def _forward_step(
         self,

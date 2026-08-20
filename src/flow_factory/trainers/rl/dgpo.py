@@ -50,7 +50,8 @@ from ...samples import BaseSample, ComponentTimes, LatentState, NoisedState, Sta
 from ...utils.base import create_generator, create_generator_by_prompt
 from ...utils.logger_utils import setup_logger
 from ..abc import BaseTrainer
-from ..forward_process import forward_velocity_state, require_latent_state, state_batch_size
+from ..common.state_validation import require_latent_state, state_batch_size
+from ..forward_process import forward_velocity_state
 
 logger = setup_logger(__name__)
 

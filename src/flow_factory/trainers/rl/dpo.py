@@ -46,7 +46,8 @@ from ...utils.dist import gather_samples
 from ...utils.logger_utils import setup_logger
 from ...utils.noise_schedule import TimeSampler
 from ..abc import BaseTrainer
-from ..forward_process import forward_velocity_state, require_latent_state, state_batch_size
+from ..common.state_validation import require_latent_state, state_batch_size
+from ..forward_process import forward_velocity_state
 
 logger = setup_logger(__name__)
 
