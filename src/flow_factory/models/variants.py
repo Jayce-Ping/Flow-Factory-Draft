@@ -484,6 +484,114 @@ class ComponentVariantRegistry:
         self._get_declared_spec(variant_name)
         return tuple(self._parameter_records[variant_name])
 
+    def rebind_parameters(self, bundle_members: Mapping[str, torch.nn.Module]) -> None:
+        """Rebind ownership records after a distributed backend replaces parameters.
+
+        FSDP2 preserves module and parameter names but swaps each original Parameter
+        for a DTensor-backed Parameter during ``prepare``. Variant activation must
+        restore trainability on those live objects, not on the stale pre-prepare
+        identities recorded during materialization.
+
+        Args:
+            bundle_members: Prepared, unwrapped route-to-module mapping.
+
+        Raises:
+            ValueError: If a route/name is missing, duplicated, or changes shape.
+            RuntimeError: If snapshots already exist and would retain stale identities.
+        """
+        if self._snapshots:
+            raise RuntimeError(
+                "cannot rebind component variant parameters after snapshots were created; "
+                f"received snapshots={tuple(self._snapshots)!r}"
+            )
+        expected_routes = set(self._bundle_members)
+        received_routes = set(bundle_members)
+        if received_routes != expected_routes:
+            raise ValueError(
+                "expected prepared bundle routes to match materialized variant routes, "
+                f"missing={tuple(sorted(expected_routes - received_routes))!r}, "
+                f"unexpected={tuple(sorted(received_routes - expected_routes))!r}"
+            )
+
+        named_by_route: Dict[str, Dict[str, torch.nn.Parameter]] = {}
+        for route_name, module in bundle_members.items():
+            canonical_parameters: Dict[str, torch.nn.Parameter] = {}
+            for parameter_name, parameter in module.named_parameters():
+                canonical_name = self._canonical_prepared_parameter_name(parameter_name)
+                if canonical_name in canonical_parameters:
+                    raise ValueError(
+                        f"prepared route {route_name!r} has duplicate canonical parameter "
+                        f"name {canonical_name!r} after removing distributed wrappers"
+                    )
+                canonical_parameters[canonical_name] = parameter
+            named_by_route[route_name] = canonical_parameters
+        rebound_records: Dict[VariantName, List[VariantParameter]] = {
+            variant_name: [] for variant_name in self._specs
+        }
+        rebound_owners: Dict[int, VariantParameter] = {}
+        for variant_name, records in self._parameter_records.items():
+            for record in records:
+                route_name = self.resolve_route(variant_name, record.component_name)
+                named_parameters = named_by_route[route_name]
+                if record.parameter_name not in named_parameters:
+                    lora_candidates = tuple(name for name in named_parameters if "lora_" in name)[:5]
+                    raise ValueError(
+                        f"prepared route {route_name!r} for variant {variant_name!r} "
+                        f"component {record.component_name!r} is missing parameter "
+                        f"{record.parameter_name!r}; first parameter names="
+                        f"{tuple(named_parameters)[:5]!r}, first LoRA names="
+                        f"{lora_candidates!r}"
+                    )
+                parameter = named_parameters[record.parameter_name]
+                if not isinstance(parameter, torch.nn.Parameter):
+                    raise TypeError(
+                        f"expected prepared parameter for {variant_name!r}/"
+                        f"{record.component_name!r}/{record.parameter_name!r} to be "
+                        f"torch.nn.Parameter, received {type(parameter).__name__}"
+                    )
+                if parameter.shape != record.parameter.shape:
+                    raise ValueError(
+                        f"prepared parameter shape changed for {variant_name!r}/"
+                        f"{record.component_name!r}/{record.parameter_name!r}: expected "
+                        f"{tuple(record.parameter.shape)}, received {tuple(parameter.shape)}"
+                    )
+                rebound = VariantParameter(
+                    variant_name=variant_name,
+                    component_name=record.component_name,
+                    parameter_name=record.parameter_name,
+                    parameter=parameter,
+                )
+                existing = rebound_owners.get(id(parameter))
+                if existing is not None:
+                    raise ValueError(
+                        "prepared parameter identity is shared by component variants: "
+                        f"{existing.variant_name!r}/{existing.parameter_name!r} and "
+                        f"{variant_name!r}/{record.parameter_name!r}"
+                    )
+                rebound_records[variant_name].append(rebound)
+                rebound_owners[id(parameter)] = rebound
+
+        self._bundle_members = dict(bundle_members)
+        self._parameter_records = rebound_records
+        self._parameter_owners = rebound_owners
+        self.restore_trainable_parameters()
+
+    @staticmethod
+    def _canonical_prepared_parameter_name(parameter_name: str) -> str:
+        """Remove transparent wrapper path segments introduced during prepare."""
+        if not isinstance(parameter_name, str) or not parameter_name:
+            raise ValueError(
+                "expected non-empty string prepared parameter_name, "
+                f"received {parameter_name!r}"
+            )
+        canonical = parameter_name
+        for wrapper_segment in (
+            "._checkpoint_wrapped_module",
+            "._fsdp_wrapped_module",
+        ):
+            canonical = canonical.replace(wrapper_segment, "")
+        return canonical
+
     def add_snapshot(self, variant_name: VariantName, snapshot_name: str) -> None:
         """Create a detached named parameter snapshot for one trainable variant.
 

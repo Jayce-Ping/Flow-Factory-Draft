@@ -673,6 +673,11 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         prepared = self.accelerator.prepare(model_bundle, self.optimizer, *eval_dataloader_list)
         self.model_bundle = prepared[0]
         self.optimizer = prepared[1]
+        inner_bundle = self.accelerator.unwrap_model(self.model_bundle)
+        # FSDP2 replaces original Parameters with DTensor-backed Parameters while
+        # preserving stable module/parameter names. Rebind the variant registry before
+        # any PEFT adapter switch attempts to restore trainability.
+        variant_registry.rebind_parameters(inner_bundle.members)
         BaseTrainer._init_prepared_role_optimization(self)
         BaseTrainer._validate_multirole_backend(self)
         BaseTrainer._validate_trainable_parameters_survived_prepare(self)
@@ -685,7 +690,6 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         # `self.transformer_2(...)`, ...) dispatch through the prepared root --
         # required for DDP's reducer / FSDP's gather / the DeepSpeed engine --
         # while attribute access delegates to the inner member.
-        inner_bundle = self.accelerator.unwrap_model(self.model_bundle)
         for name in canonical_bundle_names:
             self.adapter.set_component(
                 name,
