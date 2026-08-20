@@ -9,6 +9,11 @@
 
 # 🔥 News
 
+* **[2026-08-20]** Added schema/API-validated MiniMax H3 workflows:
+  [`minimax-h3-t2va`](examples/grpo/lora/minimax_h3_t2va/default.yaml),
+  [`minimax-h3-fl2va`](examples/grpo/lora/minimax_h3_fl2va/default.yaml), and
+  [`minimax-h3-ref2va`](examples/grpo/lora/minimax_h3_ref2va/default.yaml).
+
 * **[2026-04-25]** **LTX-2 Audio-Video** support! Generate synchronized audio-video content with RL fine-tuning. LTX-2 requires the bundled `diffusers` submodule (not yet in the official release):
 ```bash
 git submodule update --init
@@ -82,9 +87,17 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
   <tr><td><a href="https://huggingface.co/Lightricks/LTX-2.3">LTX-2.3</a></td><td>22B</td><td>ltx2_t2av</td></tr>
   <tr><td rowspan="2">Image-to-Audio-Video</td><td><a href="https://huggingface.co/Lightricks/LTX-2">LTX-2</a></td><td>19B</td><td>ltx2_i2av</td></tr>
   <tr><td><a href="https://huggingface.co/Lightricks/LTX-2.3">LTX-2.3</a></td><td>22B</td><td>ltx2_i2av</td></tr>
+  <tr><td>Text-to-Audio-Video</td><td><a href="https://huggingface.co/MiniMaxAI/MiniMax-H3">MiniMax H3 T2VA</a></td><td>61 GB checkpoint</td><td>minimax-h3-t2va</td></tr>
+  <tr><td>First/Last-Frame-to-Audio-Video</td><td><a href="https://huggingface.co/MiniMaxAI/MiniMax-H3">MiniMax H3 FL2VA</a></td><td>61 GB checkpoint</td><td>minimax-h3-fl2va</td></tr>
+  <tr><td>Ordered-Reference-to-Audio-Video</td><td><a href="https://huggingface.co/MiniMaxAI/MiniMax-H3">MiniMax H3 Ref2VA</a></td><td>61 GB checkpoint</td><td>minimax-h3-ref2va</td></tr>
 </table>
 
 > To support new models, see [Guidance/New Model](guidance/new_model.md).
+
+> **MiniMax H3 status:** examples are schema/API and no-weight workflow validated.
+> The 61 GB checkpoint has not yet completed a real-weight GPU training smoke, so no
+> memory-fit, reward-improvement, or numerical-parity claim is made. H3 requires B=1,
+> neutral guidance `1.0`, separate video/audio trajectories, and data-ward velocity.
 
 # 💻 Supported Algorithms
 
@@ -105,7 +118,10 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
 
 See [`Algorithm Guidance`](guidance/algorithms.md) for more information.
 
-> Model and algorithm are fully decoupled in Flow-Factory, enabling all listed model–algorithm combinations to work out of the box. The configurations under `examples/` have been verified to yield measurable performance gains. For unlisted combinations, find the closest (task, algorithm) config and swap in the desired model or algorithm parameters.
+> Models and algorithms are decoupled at the framework interface, but validation levels
+> differ. Training-verified examples carry hardware and reward-trend evidence; MiniMax
+> H3 examples are schema/API validated only. Unlisted combinations require their own
+> compatibility and training evidence.
 
 # 💾 Hardware Requirements
 
@@ -126,6 +142,10 @@ pip install -e .[deepspeed]
 ```
 
 > **Note**: The Bagel adapter requires `flash-attn` (>= 2.5.8) and `opencv-python`. Install them with `pip install -e .[bagel]` (the `[bagel]` extra is intentionally not part of `[all]` because flash-attn is heavy to build).
+
+> **Dependency pin:** MiniMax H3 requires the unreleased modular APIs at diffusers
+> commit `4e0466f3e5260f0d78b5e2b68ffbf27d819cc6db`. PyAV >=18.0.0 decodes ordered
+> video/audio references.
 
 > **Note**: Some models (e.g., LTX-2) require pipeline code not yet released in the official `diffusers` package. For these models, install the bundled diffusers submodule:
 > ```bash

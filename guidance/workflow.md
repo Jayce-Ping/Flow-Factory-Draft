@@ -538,3 +538,19 @@ Epoch N
 ```
 
 *DPO*: form chosen/rejected pairs at the **start** of `optimize()` (after advantages exist), then run the preference loss; there is no pair formation in `prepare_feedback()`.
+
+## Structured multimodal trajectories
+
+`StructuredTrajectory` is authoritative for multimodal adapters; legacy
+`trajectory is None` tensors remain only for backward-compatible single-component
+models. New multimodal adapters emit structured trajectories only.
+
+For T transitions, component state maps have length `T + 1`; log-probability and
+callback maps have length T. An index of `-1` means that coordinate was not collected,
+and an omitted log-probability or callback collection is represented by `None`.
+
+The component order is adapter-owned, for example `("video", "audio")` in MiniMax
+H3. Conditioning is packed and replayed by the adapter; trainers such as GRPO,
+GRPO-Guard, DPPO, DiffusionNFT, AWM, DPO, DGPO, CRD, and DiffusionOPD consume the
+same state interface. H3 accepts neutral guidance `1.0`; framework-interface
+compatibility does not itself establish real-weight numerical parity.
