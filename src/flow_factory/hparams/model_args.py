@@ -17,6 +17,7 @@ import math
 
 # src/flow_factory/hparams/model_args.py
 import os
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any, List, Literal, Optional, Union
 
@@ -34,6 +35,9 @@ dtype_map = {
     "float32": torch.float32,
 }
 
+DTypeName = Literal["fp32", "bf16", "fp16", "float16", "bfloat16", "float32"]
+DTypeValue = Union[DTypeName, torch.dtype]
+
 
 @dataclass
 class ModelArguments(ArgABC):
@@ -50,9 +54,7 @@ class ModelArguments(ArgABC):
         default="full", metadata={"help": "Fine-tuning type. Options are ['full', 'lora']"}
     )
 
-    trainable_parameters_dtype: Union[
-        Literal["fp32", "bf16", "fp16", "float16", "bfloat16", "float32"], torch.dtype
-    ] = field(
+    trainable_parameters_dtype: DTypeValue = field(
         default="bfloat16",
         metadata={
             "help": "Torch dtype for all trainable parameters (`requires_grad=True`) -- i.e. the "
@@ -61,17 +63,14 @@ class ModelArguments(ArgABC):
             "parameter dtype.)"
         },
     )
-    frozen_parameters_dtype: Optional[
-        Union[Literal["fp32", "bf16", "fp16", "float16", "bfloat16", "float32"], torch.dtype]
-    ] = field(
+    frozen_parameters_dtype: Optional[Union[DTypeValue, dict[str, Optional[DTypeValue]]]] = field(
         default=None,
         metadata={
-            "help": "Torch dtype for frozen (`requires_grad=False`) parameters and floating-point "
-            "buffers. `None` (default) preserves each frozen component's original "
-            "`from_pretrained` dtype and never downcasts -- released checkpoints deliberately "
-            "ship components in different dtypes (e.g. Z-Image: transformer fp32, text encoder "
-            "bf16), so forcing one uniform frozen dtype would override those choices. Set an "
-            "explicit dtype (e.g. 'bf16') to cast all frozen params to it, e.g. to save memory."
+            "help": "Frozen-parameter dtype policy. A scalar dtype applies to every frozen "
+            "component for backward compatibility. A mapping supports `default`, component "
+            "groups such as `transformers`, and concrete component names; concrete names "
+            "override groups, which override `default`. `None` or `default: null` preserves "
+            "the checkpoint dtype for unmatched components."
         },
     )
 
@@ -162,7 +161,49 @@ class ModelArguments(ArgABC):
         if isinstance(self.trainable_parameters_dtype, str):
             self.trainable_parameters_dtype = dtype_map[self.trainable_parameters_dtype]
         if isinstance(self.frozen_parameters_dtype, str):
+            if self.frozen_parameters_dtype not in dtype_map:
+                raise ValueError(
+                    "expected model.frozen_parameters_dtype as a known dtype name, "
+                    f"received {self.frozen_parameters_dtype!r}; expected one of "
+                    f"{tuple(dtype_map)}"
+                )
             self.frozen_parameters_dtype = dtype_map[self.frozen_parameters_dtype]
+        elif isinstance(self.frozen_parameters_dtype, Mapping):
+            normalized_policy: dict[str, Optional[torch.dtype]] = {}
+            for selector, configured_dtype in self.frozen_parameters_dtype.items():
+                if not isinstance(selector, str) or not selector:
+                    raise TypeError(
+                        "expected every model.frozen_parameters_dtype selector to be a "
+                        f"non-empty str, received {type(selector).__name__}: {selector!r}"
+                    )
+                if configured_dtype is None:
+                    normalized_policy[selector] = None
+                elif isinstance(configured_dtype, torch.dtype):
+                    normalized_policy[selector] = configured_dtype
+                elif isinstance(configured_dtype, str):
+                    if configured_dtype not in dtype_map:
+                        raise ValueError(
+                            "expected model.frozen_parameters_dtype"
+                            f"[{selector!r}] as a known dtype name or null, received "
+                            f"{configured_dtype!r}; expected one of {tuple(dtype_map)}"
+                        )
+                    normalized_policy[selector] = dtype_map[configured_dtype]
+                else:
+                    raise TypeError(
+                        "expected model.frozen_parameters_dtype"
+                        f"[{selector!r}] as str, torch.dtype, or None, received "
+                        f"{type(configured_dtype).__name__}: {configured_dtype!r}"
+                    )
+            normalized_policy.setdefault("default", None)
+            self.frozen_parameters_dtype = normalized_policy
+        elif self.frozen_parameters_dtype is not None and not isinstance(
+            self.frozen_parameters_dtype, torch.dtype
+        ):
+            raise TypeError(
+                "expected model.frozen_parameters_dtype as a dtype, mapping, or None, "
+                f"received {type(self.frozen_parameters_dtype).__name__}: "
+                f"{self.frozen_parameters_dtype!r}"
+            )
 
         # Normalize target_components to list
         if isinstance(self.target_components, str):
@@ -182,7 +223,14 @@ class ModelArguments(ArgABC):
     def to_dict(self) -> dict[str, Any]:
         d = super().to_dict()
         d["trainable_parameters_dtype"] = str(self.trainable_parameters_dtype).split(".")[-1]
-        if self.frozen_parameters_dtype is not None:
+        if isinstance(self.frozen_parameters_dtype, dict):
+            d["frozen_parameters_dtype"] = {
+                selector: (
+                    None if configured_dtype is None else str(configured_dtype).split(".")[-1]
+                )
+                for selector, configured_dtype in self.frozen_parameters_dtype.items()
+            }
+        elif self.frozen_parameters_dtype is not None:
             d["frozen_parameters_dtype"] = str(self.frozen_parameters_dtype).split(".")[-1]
         return d
 

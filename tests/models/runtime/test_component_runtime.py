@@ -537,6 +537,14 @@ class AcceleratorFake:
         return module
 
 
+class FSDP2AcceleratorFake(AcceleratorFake):
+    """Expose the FSDP2 mixed-precision policy boundary."""
+
+    distributed_type = DistributedType.FSDP
+    is_fsdp2 = True
+    mixed_precision = "bf16"
+
+
 class ExistingStyleAdapterFake(BaseAdapter):
     """Adapter implementing only the existing four abstract methods."""
 
@@ -735,6 +743,92 @@ def test_stage_materialization_applies_explicit_frozen_dtype_policy(
     adapter.on_load_components(["text_encoder"], device=torch.device("cpu"))
 
     assert adapter.pipeline.text_encoder.weight.dtype == torch.float16
+
+
+def test_component_frozen_dtype_policy_applies_to_lazy_modules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "flow_factory.models.abc._load_scheduler",
+        lambda pipeline_scheduler, scheduler_args: pipeline_scheduler,
+    )
+    adapter = DtypeModularAdapterFake(
+        _adapter_config(
+            frozen_parameters_dtype={
+                "default": torch.bfloat16,
+                "text_encoder": torch.float16,
+                "vae": torch.float32,
+            }
+        ),
+        AcceleratorFake(),
+    )
+
+    adapter.on_load_components(["text_encoder", "vae"], device=torch.device("cpu"))
+
+    assert adapter.pipeline.text_encoder.weight.dtype == torch.float16
+    assert adapter.pipeline.vae.weight.dtype == torch.float32
+
+
+def test_concrete_frozen_dtype_overrides_group_and_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "flow_factory.models.abc._load_scheduler",
+        lambda pipeline_scheduler, scheduler_args: pipeline_scheduler,
+    )
+    adapter = DtypeModularAdapterFake(
+        _adapter_config(
+            frozen_parameters_dtype={
+                "default": torch.float32,
+                "transformers": torch.float16,
+                "transformer": torch.bfloat16,
+            }
+        ),
+        AcceleratorFake(),
+    )
+
+    assert adapter._frozen_dtype_for_component("transformer") == torch.bfloat16
+    assert adapter._frozen_dtype_for_component("text_encoder") == torch.float32
+    assert adapter._frozen_dtype_for_component("vae") == torch.float32
+
+
+def test_component_frozen_dtype_policy_rejects_unknown_selector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "flow_factory.models.abc._load_scheduler",
+        lambda pipeline_scheduler, scheduler_args: pipeline_scheduler,
+    )
+
+    with pytest.raises(ValueError, match=r"missing.*transformer.*vae"):
+        DtypeModularAdapterFake(
+            _adapter_config(frozen_parameters_dtype={"missing": torch.float16}),
+            AcceleratorFake(),
+        )
+
+
+def test_fsdp2_keeps_target_original_dtype_uniform_and_applies_frozen_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "flow_factory.models.abc._load_scheduler",
+        lambda pipeline_scheduler, scheduler_args: pipeline_scheduler,
+    )
+    adapter = DtypeModularAdapterFake(
+        _adapter_config(
+            frozen_parameters_dtype={
+                "default": torch.float16,
+                "vae": torch.float32,
+            }
+        ),
+        FSDP2AcceleratorFake(),
+    )
+
+    adapter.on_load_components(["text_encoder", "vae"], device=torch.device("cpu"))
+
+    assert adapter.pipeline.transformer.weight.dtype == torch.float32
+    assert adapter.pipeline.text_encoder.weight.dtype == torch.float16
+    assert adapter.pipeline.vae.weight.dtype == torch.float32
 
 
 def test_bundle_proxy_installation_resolves_through_adapter_runtime(

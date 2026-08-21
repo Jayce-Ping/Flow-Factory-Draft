@@ -451,6 +451,30 @@ DeepSpeed clips inside its own engine and ignores the value handed to
 threshold is published to the plugin through `ACCELERATE_GRADIENT_CLIPPING` before
 the Accelerator is built.
 
+### Frozen Component Precision
+
+`model.frozen_parameters_dtype` accepts either one dtype for every frozen
+component or a selector mapping:
+
+```yaml
+model:
+  frozen_parameters_dtype:
+    default: null       # Preserve checkpoint dtype when no selector matches.
+    transformers: bf16  # Component group override.
+    vae: fp32           # Concrete component override.
+```
+
+Concrete component names take priority over the `transformers` and
+`text_encoders` groups, which take priority over `default`. A null value at any
+level preserves that component's loaded checkpoint dtype. The scalar form
+(`frozen_parameters_dtype: bf16`) remains shorthand for applying one dtype to
+every frozen component.
+
+FSDP2 still gives every trainable component a uniform FP32 original/master dtype;
+its configured mixed-precision policy determines compute dtype. Component
+selectors control non-trainable components under FSDP2 and frozen parameters
+inside target components on backends that preserve original parameters.
+
 ### Variant Memory Placement
 
 Component variants are optimizer-owned live parameters, not disposable model

@@ -1302,7 +1302,7 @@ class BaseAdapter(ABC):
     ) -> None:
         """Apply the configured original-dtype policy to one materialized module."""
         train_dtype = self.model_args.trainable_parameters_dtype
-        frozen_dtype = self.model_args.frozen_parameters_dtype
+        frozen_dtype = self._frozen_dtype_for_component(name)
         if name in self.model_args.target_components:
             if self._is_fsdp2() and self.accelerator.mixed_precision != "no":
                 component.to(dtype=torch.float32)
@@ -1311,6 +1311,56 @@ class BaseAdapter(ABC):
         elif frozen_dtype is not None:
             component.to(dtype=frozen_dtype)
 
+    def _resolved_frozen_component_dtype_policy(
+        self,
+    ) -> tuple[Optional[torch.dtype], dict[str, Optional[torch.dtype]]]:
+        """Resolve scalar or selector-based frozen dtype configuration.
+
+        Concrete component selectors override the two supported component groups,
+        and groups override ``default``. A null value means preserve the loaded
+        checkpoint dtype for that component.
+        """
+        cached = getattr(self, "_frozen_component_dtype_policy_cache", None)
+        if cached is not None:
+            return cached
+
+        configured = getattr(self.model_args, "frozen_parameters_dtype", None)
+        if not isinstance(configured, dict):
+            policy = (configured, {})
+            self._frozen_component_dtype_policy_cache = policy
+            return policy
+
+        default_dtype = configured.get("default")
+        overrides: dict[str, Optional[torch.dtype]] = {}
+        group_selectors = ("transformers", "text_encoders")
+
+        for selector in group_selectors:
+            if selector not in configured:
+                continue
+            for component_name in self._resolve_component_names(selector):
+                overrides[component_name] = configured[selector]
+
+        for selector, component_dtype in configured.items():
+            if selector == "default" or selector in group_selectors:
+                continue
+            component_names = self._resolve_component_names(selector)
+            if len(component_names) != 1 or component_names[0] != selector:
+                raise ValueError(
+                    "expected concrete model.frozen_parameters_dtype selector to "
+                    f"resolve only itself, received selector={selector!r}, "
+                    f"resolved={component_names!r}"
+                )
+            overrides[selector] = component_dtype
+
+        policy = (default_dtype, overrides)
+        self._frozen_component_dtype_policy_cache = policy
+        return policy
+
+    def _frozen_dtype_for_component(self, name: str) -> Optional[torch.dtype]:
+        """Return one component's frozen dtype or ``None`` to preserve it."""
+        default_dtype, overrides = self._resolved_frozen_component_dtype_policy()
+        return overrides[name] if name in overrides else default_dtype
+
     def _mix_precision(self):
         """Set trainable params to ``trainable_parameters_dtype``; by default leave frozen params
         and floating-point buffers at their loaded (``from_pretrained``) dtype.
@@ -1318,11 +1368,10 @@ class BaseAdapter(ABC):
         This is the single place that decides every parameter's *original* dtype before
         ``accelerator.prepare``; the trainer only bundles + prepares.
 
-        Frozen-dtype policy: ``frozen_parameters_dtype=None`` (default) preserves each frozen
-        parameter/buffer's original dtype and never downcasts -- a released checkpoint deliberately
-        ships components in different dtypes (e.g. Z-Image: transformer fp32, text encoder bf16), and
-        forcing one uniform frozen dtype would override those choices. Set an explicit
-        ``frozen_parameters_dtype`` to opt into casting every frozen param to that dtype.
+        Frozen-dtype policy: a scalar ``frozen_parameters_dtype`` applies to every
+        component. A mapping resolves concrete component, component-group, then
+        ``default`` values in descending priority. A null resolved value preserves
+        the component's checkpoint dtype.
 
         FSDP2 caveat: FSDP2 shards each unit with ONE original dtype, and accelerate upcasts the
         trainable params to an fp32 master when ``mixed_precision != 'no'``. So a trained component
@@ -1330,10 +1379,10 @@ class BaseAdapter(ABC):
         is frozen-but-sharded) would otherwise mix fp32/low-precision within a unit and trip FSDP2's
         uniform-dtype assert. We therefore force the TRAINED components to a uniform fp32 original
         dtype here (compute stays low-precision via accelerate's ``MixedPrecisionPolicy``); untrained
-        components are cast to ``frozen_parameters_dtype`` when set, else preserved.
+        components use their resolved frozen dtype when set, else preserve the loaded
+        checkpoint dtype.
         """
         train_dtype = self.model_args.trainable_parameters_dtype
-        frozen_dtype = self.model_args.frozen_parameters_dtype  # None -> preserve loaded dtype
 
         target_set = frozenset(self.model_args.target_components)
         component_names = self._resolve_component_names(None)
@@ -1344,25 +1393,29 @@ class BaseAdapter(ABC):
             for name in merged_names:
                 if name in target_set:
                     self.get_component(name).to(dtype=torch.float32)
-                elif frozen_dtype is not None:
-                    self.get_component(name).to(dtype=frozen_dtype)
+                else:
+                    frozen_dtype = self._frozen_dtype_for_component(name)
+                    if frozen_dtype is not None:
+                        self.get_component(name).to(dtype=frozen_dtype)
                 # else: preserve the untrained component's loaded dtype
+            frozen_policy = {
+                name: self._frozen_dtype_for_component(name)
+                for name in merged_names
+                if name not in target_set
+            }
             logger.info(
-                f"FSDP2: trained components -> fp32 (uniform orig dtype); "
-                f"other components -> {frozen_dtype or 'preserved (loaded dtype)'}"
+                "FSDP2: trained components -> fp32 (uniform orig dtype); "
+                f"frozen component policy -> {frozen_policy}"
             )
-            return
-
-        # Explicit uniform dtype -> a single cast of every component suffices.
-        if frozen_dtype is not None and train_dtype == frozen_dtype:
-            for name in merged_names:
-                self.get_component(name).to(dtype=frozen_dtype)
             return
 
         # Split: trainable -> train_dtype; frozen -> frozen_dtype, or preserved when None.
         trainable_count = 0
+        frozen_policy = {}
         for name in merged_names:
             component = self.get_component(name)
+            frozen_dtype = self._frozen_dtype_for_component(name)
+            frozen_policy[name] = frozen_dtype
             if name in target_set:
                 trainable_count += self._cast_module_mixed_precision(
                     component, train_dtype, frozen_dtype
@@ -1374,7 +1427,7 @@ class BaseAdapter(ABC):
         if trainable_count > 0:
             logger.info(
                 f"Set {trainable_count} trainable parameters to {train_dtype}; "
-                f"frozen params -> {frozen_dtype or 'preserved (loaded dtype)'}"
+                f"frozen component policy -> {frozen_policy}"
             )
 
     # ============================== LoRA Management ==============================
@@ -3162,11 +3215,7 @@ class BaseAdapter(ABC):
         Returns:
             Empty media matching this adapter's ``decode_latents`` return structure.
         """
-        if (
-            not isinstance(batch_size, int)
-            or isinstance(batch_size, bool)
-            or batch_size < 1
-        ):
+        if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
             raise ValueError(
                 f"expected positive int batch_size for empty decoded media, got {batch_size!r}"
             )
