@@ -1,8 +1,5 @@
 # SD3.5-Medium 4-step TDM with official stage-conditional re-noising.
 # TDM is reward-free; OCR is evaluated every 30 epochs for text-rendering quality.
-# Prepare the bundled prompt metadata once:
-#   python scripts/convert_ocr_prompts.py \
-#     --input-dir dataset/ocr --output-dir dataset/ocr_metadata
 
 # Environment
 launcher: "accelerate"
@@ -15,10 +12,10 @@ mixed_precision: "bf16"
 data:
   datasets:
     - name: ocr
-      dataset_dir: "dataset/ocr_metadata"
+      dataset_dir: "dataset/ocr"
       train:
         weight: 1
-        max_dataset_size: 512  # One global batch: 8 GPUs × 16 samples
+        max_dataset_size: 512  # Prompt-pool cap; each epoch draws 128 prompts.
       eval:
         split: test
   preprocessing_batch_size: 8

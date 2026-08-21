@@ -7,140 +7,142 @@
 # produce one fake, one surrogate, and one generator update per epoch.
 # The public code samples two of four boundary indices uniformly. Flow-Factory
 # averages all four, preserving the same uniform objective expectation with lower variance.
+# Provide the main-process address and machine rank through the launcher environment.
 
-launcher: "accelerate"  # Launch through Hugging Face Accelerate.
-config_file: config/deepspeed/deepspeed_zero2.yaml  # Use the requested LoRA + ZeRO-2 backend.
-num_processes: 16  # Use the validated two-node world size.
-main_process_port: 29500  # Rendezvous port; change when occupied.
-mixed_precision: "bf16"  # Match the official mixed-precision setting.
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 16
+num_machines: 2
+main_process_port: 29500
+mixed_precision: "bf16"
 
-data:  # Configure OCR prompt preprocessing and evaluation.
-  datasets:  # Declare the unified OCR source.
-    - name: ocr  # Stable key for metrics and reward routing.
-      dataset_dir: "dataset/ocr_metadata"  # Read converted prompts and visible-text labels.
-      train:  # Enable OCR prompts for reinforcement learning.
-        weight: 1  # Allocate every training batch to OCR.
-        max_dataset_size: 1024  # Bound preprocessing while sampling 48 prompts each epoch.
-      eval:  # Evaluate a small fixed subset at native training resolution.
-        split: test  # Use the held-out OCR split.
-        max_dataset_size: 16  # Limit synchronous PaddleOCR evaluation cost.
-  preprocessing_batch_size: 8  # Encode eight prompts per preprocessing call.
-  dataloader_num_workers: 16  # Parallelize cached prompt loading.
-  force_reprocess: false  # Reuse a compatible prompt embedding cache.
-  cache_dir: "~/.cache/flow_factory/datasets"  # Store Arrow caches per node.
-  preprocess_parallelism: local  # Build one cache independently on each node.
-  sampler_type: "auto"  # Resolve to group_contiguous for the 16-GPU G24 geometry.
+data:
+  datasets:
+    - name: ocr
+      dataset_dir: "dataset/ocr"
+      train:
+        weight: 1
+        max_dataset_size: 1024
+      eval:
+        split: test
+        max_dataset_size: 16
+  preprocessing_batch_size: 8
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  preprocess_parallelism: local
+  sampler_type: "auto"
 
-model:  # Configure the three TDM-R1 LoRA roles.
-  model_type: "sd3-5"  # Select the SD3.5 flow-matching adapter.
-  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"  # Load the official base model.
-  finetune_type: "lora"  # Train generator, fake, and surrogate adapters.
-  lora_rank: 32  # Match all three official LoRA adapters.
-  lora_alpha: 64  # Match the official two-times-rank scaling.
-  target_components: "transformer"  # Attach adapters only to the denoising transformer.
-  target_modules: "default"  # Match the official narrow attention projection list.
-  resume_path: "models/tdm_sd35/ff_adapter"  # Initialize the generator from released TDM weights.
-  resume_type: "lora"  # Load the converted PEFT adapter before declaring other roles.
-  frozen_parameters_dtype:  # Apply validated SD3.5 precision per component.
-    default: null  # Preserve unlisted checkpoint dtypes.
-    transformers: "bf16"  # Keep frozen denoiser parameters in bf16.
-    text_encoders: "bf16"  # Keep frozen prompt encoders in bf16.
-    vae: "bf16"  # Match the validated SD3.5 decode path.
-  trainable_parameters_dtype: "bf16"  # Train all LoRA roles in bf16.
+model:
+  model_type: "sd3-5"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  finetune_type: "lora"
+  lora_rank: 32
+  lora_alpha: 64
+  target_components: "transformer"
+  target_modules: "default"
+  resume_path: "models/tdm_sd35/ff_adapter"
+  resume_type: "lora"
+  frozen_parameters_dtype:
+    default: null
+    transformers: "bf16"
+    text_encoders: "bf16"
+    vae: "bf16"
+  trainable_parameters_dtype: "bf16"
 
-log:  # Configure W&B tracking and model-only checkpoints.
-  run_name: "tdm_r1_official_ocr_fsdp2_long16"  # Identify the official-aligned run.
-  project: "Flow-Factory-TDM-R1"  # Log under the dedicated TDM-R1 project.
-  logging_backend: "wandb"  # Stream reward and per-role metrics to W&B.
-  save_dir: "saves/"  # Write portable checkpoints below the repository.
-  save_freq: 60  # Match the official checkpoint interval.
-  save_model_only: true  # Persist all trainable roles without optimizer state.
+log:
+  run_name: null
+  project: "Flow-Factory-TDM-R1"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 60
+  save_model_only: true
 
-train:  # Configure TDM-R1 fake-surrogate-generator training.
-  trainer_type: "tdm-r1"  # Select the three-role TDM-R1 runtime.
-  max_epochs: 10000  # Match the official long-run horizon.
-  resolution: 512  # Match the official SD3.5 training resolution.
-  num_inference_steps: 4  # Reinforce the four-step deterministic TDM trajectory.
-  guidance_scale: 1.0  # Keep generator rollout CFG-free.
-  real_guidance_scale: 4.5  # Query the frozen teacher at the official CFG scale.
-  cfg_reward_scale: 4.5  # Match the official RL guidance reward scale.
-  per_device_batch_size: 24  # Keep one complete G24 group in each rank-local microbatch.
-  group_size: 24  # Match the official samples-per-prompt value.
-  unique_sample_num_per_epoch: 48  # Match the official unique prompt count.
-  gradient_step_per_epoch: 1  # Update each role exactly once per epoch.
-  gradient_accumulation_steps: 3  # Accumulate all three 16-GPU rollout batches.
-  ttur_fake_updates: 1  # Match one fake update before surrogate and generator.
-  tdm_weight: 0.3  # Mix official CFG reward and learned surrogate reward.
-  surrogate_preference_beta: 10.0  # Map official beta_dpo for OCR.
-  surrogate_reference_beta: 0.001  # Penalize drift from the frozen surrogate reference.
-  surrogate_reference_threshold: 0.05  # Stop samples that drift beyond official reg_threshold.
-  surrogate_clip_range: 1.0e-3  # Match the official PPO-style surrogate clip.
-  surrogate_slow_decay_min: 0.001  # Start the slow surrogate close to the live model.
-  surrogate_slow_decay_max: 0.3  # Cap the lagging surrogate decay.
-  advantage_clip_range: 5.0  # Match official advantage clipping.
-  advantage_aggregation: "gdpo"  # Use group-normalized OCR advantages.
-  use_huber: false  # Match the official squared-error objective.
-  use_time_weighting: true  # Weight later trajectory boundaries more strongly.
-  ema_decay: 0.9  # Maintain the official generator EMA.
-  ema_update_interval: 1  # Update EMA after every generator step.
-  ema_device: "cuda"  # Keep the generator EMA on GPU.
-  enable_gradient_checkpointing: true  # Reduce activation memory at batch 24.
-  offload_samples_to_cpu: true  # Offload 1152 stored trajectories before optimization.
-  latent_storage_dtype: "fp16"  # Compress replay states while retaining validated tolerance.
-  replay_rtol: 0.005  # Accept observed bf16 replay arithmetic error.
-  replay_atol: 0.005  # Match the validated absolute replay tolerance.
-  seed: 42  # Reproduce prompt groups and perturbation draws.
+train:
+  trainer_type: "tdm-r1"
+  max_epochs: 10000
+  resolution: 512
+  num_inference_steps: 4
+  guidance_scale: 1.0
+  real_guidance_scale: 4.5
+  cfg_reward_scale: 4.5
+  per_device_batch_size: 24
+  group_size: 24
+  unique_sample_num_per_epoch: 48
+  gradient_step_per_epoch: 1
+  gradient_accumulation_steps: 3
+  ttur_fake_updates: 1
+  tdm_weight: 0.3
+  surrogate_preference_beta: 10.0
+  surrogate_reference_beta: 0.001
+  surrogate_reference_threshold: 0.05
+  surrogate_clip_range: 1.0e-3
+  surrogate_slow_decay_min: 0.001
+  surrogate_slow_decay_max: 0.3
+  advantage_clip_range: 5.0
+  advantage_aggregation: "gdpo"
+  use_huber: false
+  use_time_weighting: true
+  ema_decay: 0.9
+  ema_update_interval: 1
+  ema_device: "cuda"
+  enable_gradient_checkpointing: true
+  offload_samples_to_cpu: true
+  latent_storage_dtype: "fp16"
+  replay_rtol: 0.005  # Validated bf16 replay tolerance.
+  replay_atol: 0.005
+  seed: 42
 
-scheduler:  # Configure deterministic TDM sampling.
-  dynamics_type: "ODE"  # TDM-R1 requires a deterministic trajectory.
-  seed: 42  # Seed scheduler-controlled boundary draws.
+scheduler:
+  dynamics_type: "ODE"
+  seed: 42
 
-rewards:  # Use the official non-differentiable OCR signal.
-  - name: "ocr"  # Expose OCR as the training reward key.
-    reward_model: "OCR"  # Use Flow-Factory's PaddleOCR scorer.
-    weight: 1.0  # Optimize the unscaled OCR score.
-    batch_size: 1  # Score one generated image per OCR call.
-    device: "cpu"  # Reserve GPUs for three trainable roles.
-    dtype: "float32"  # Use PaddleOCR's supported precision.
-    async_reward: false  # Keep G24 rewards synchronous like the official recipe.
-    num_workers: 1  # Use one stable OCR worker per rank.
-    applicable_datasets: [ocr]  # Route OCR only to the OCR prompt source.
+rewards:
+  - name: "ocr"
+    reward_model: "OCR"
+    weight: 1.0
+    batch_size: 1
+    device: "cpu"
+    dtype: "float32"
+    async_reward: false
+    num_workers: 1
+    applicable_datasets: [ocr]
 
-eval:  # Evaluate the same four-step generator.
-  eval_freq: 60  # Match the official evaluation interval.
-  resolution: 512  # Match training resolution.
-  per_device_batch_size: 8  # Limit synchronous eval memory and OCR latency.
-  guidance_scale: 1.0  # Keep generator evaluation CFG-free.
-  num_inference_steps: 4  # Preserve the four-step trajectory.
-  seed: 42  # Make evaluation images reproducible.
+eval:
+  eval_freq: 60
+  resolution: 512
+  per_device_batch_size: 8
+  guidance_scale: 1.0
+  num_inference_steps: 4
+  seed: 42
 
-eval_rewards:  # Report held-out OCR performance.
-  - name: "ocr"  # Reuse the training metric name.
-    reward_model: "OCR"  # Score held-out rendered text.
-    weight: 1.0  # Report the raw OCR score.
-    batch_size: 1  # Process one image per OCR call.
-    device: "cpu"  # Keep evaluation off training GPUs.
-    dtype: "float32"  # Use PaddleOCR's supported precision.
-    async_reward: false  # Keep evaluation completion deterministic.
-    num_workers: 1  # Use one stable OCR worker per rank.
-    applicable_datasets: [ocr]  # Route only to OCR evaluation prompts.
+eval_rewards:
+  - name: "ocr"
+    reward_model: "OCR"
+    weight: 1.0
+    batch_size: 1
+    device: "cpu"
+    dtype: "float32"
+    async_reward: false
+    num_workers: 1
+    applicable_datasets: [ocr]
 
-optimizers:  # Match the official per-role AdamW settings.
-  - name: "generator"  # Optimize the reinforced TDM generator.
-    learning_rate: 7.5e-5  # Official generator LR equals fake LR divided by four.
-    weight_decay: 1.0e-4  # Match official AdamW regularization.
-    betas: [0.0, 0.999]  # Match official generator first/second moments.
-    eps: 1.0e-8  # Match official numerical epsilon.
-    max_grad_norm: 1.0  # Clip the generator gradient norm.
-  - name: "fake"  # Optimize the fake score model.
-    learning_rate: 3.0e-4  # Match official fake-score learning rate.
-    weight_decay: 1.0e-4  # Match official AdamW regularization.
-    betas: [0.0, 0.999]  # Match official fake-score moments.
-    eps: 1.0e-8  # Match official numerical epsilon.
-    max_grad_norm: 1.0  # Clip the fake-score gradient norm.
-  - name: "surrogate"  # Optimize the DGPO-style surrogate reward.
-    learning_rate: 3.0e-4  # Match official surrogate learning rate.
-    weight_decay: 1.0e-4  # Match official AdamW regularization.
-    betas: [0.9, 0.999]  # Match official RL surrogate moments.
-    eps: 1.0e-8  # Match official numerical epsilon.
-    max_grad_norm: 1.0  # Clip the surrogate gradient norm.
+optimizers:
+  - name: "generator"
+    learning_rate: 7.5e-5
+    weight_decay: 1.0e-4
+    betas: [0.0, 0.999]
+    eps: 1.0e-8
+    max_grad_norm: 1.0
+  - name: "fake"
+    learning_rate: 3.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.0, 0.999]
+    eps: 1.0e-8
+    max_grad_norm: 1.0
+  - name: "surrogate"
+    learning_rate: 3.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    max_grad_norm: 1.0

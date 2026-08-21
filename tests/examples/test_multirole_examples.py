@@ -21,6 +21,7 @@ def test_only_gpu_validated_multirole_examples_are_published() -> None:
 
     dmd2_path = repository_root / "examples" / "dmd2" / "lora" / "sd3_5" / "ocr.yaml"
     dmd2_config = yaml.safe_load(dmd2_path.read_text())
+    assert dmd2_config["data"]["datasets"][0]["dataset_dir"] == "dataset/ocr"
     assert dmd2_config["train"]["trainer_type"] == "dmd2"
     assert dmd2_config["train"]["num_inference_steps"] == 4
     assert dmd2_config["train"]["per_device_batch_size"] == 32
@@ -28,10 +29,14 @@ def test_only_gpu_validated_multirole_examples_are_published() -> None:
     assert dmd2_config["train"]["ttur_fake_updates"] == 5
     assert dmd2_config["train"]["replay_rtol"] == dmd2_config["train"]["replay_atol"] == 0
     assert dmd2_config["scheduler"] == {"dynamics_type": "ODE", "seed": 42}
-    assert [optimizer["name"] for optimizer in dmd2_config["optimizers"]] == ["default"]
+    assert [optimizer["name"] for optimizer in dmd2_config["optimizers"]] == [
+        "generator",
+        "fake",
+    ]
 
     tdm_path = repository_root / "examples" / "tdm" / "lora" / "sd3_5" / "ocr.yaml"
     config = yaml.safe_load(tdm_path.read_text())
+    assert config["data"]["datasets"][0]["dataset_dir"] == "dataset/ocr"
     assert config["train"]["trainer_type"] == "tdm"
     assert config["train"]["num_inference_steps"] == 4
     assert "trajectory_steps" not in config["train"]
@@ -45,6 +50,7 @@ def test_only_gpu_validated_multirole_examples_are_published() -> None:
 
     tdm_r1_path = repository_root / "examples" / "tdm_r1" / "lora" / "sd3_5" / "ocr.yaml"
     tdm_r1_config = yaml.safe_load(tdm_r1_path.read_text())
+    assert tdm_r1_config["data"]["datasets"][0]["dataset_dir"] == "dataset/ocr"
     assert tdm_r1_config["train"]["trainer_type"] == "tdm-r1"
     assert tdm_r1_config["model"]["lora_rank"] == 32
     assert tdm_r1_config["model"]["lora_alpha"] == 64
@@ -72,3 +78,4 @@ def test_only_gpu_validated_multirole_examples_are_published() -> None:
     algorithms = (repository_root / "guidance" / "algorithms.md").read_text()
     assert "ttur_fake_updates" in algorithms
     assert "fake first" in algorithms.lower()
+    assert not (repository_root / "scripts" / "convert_ocr_prompts.py").exists()

@@ -159,9 +159,9 @@ the reward distribution before and after enabling caching on a supported model.
 
 `torch_compile` is model-agnostic and applies to every adapter.
 
-## Multi-role distillation backend contract
+## Multi-role backend contract
 
-DMD2, TDM, and TDM-R1 keep one prepared model root and one physical optimizer.
+DMD2, TDM, and TDM-R1 keep one prepared model root and one optimizer root.
 Roles update in exclusive sequential phases (`fake` × `R`, optional
 `surrogate`, then `generator`). DDP, FSDP2, and DeepSpeed ZeRO-1/2 support that
 program. ZeRO-3 remains globally unsupported.

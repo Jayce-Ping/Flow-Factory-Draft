@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Train a one-step generator with data-free DMD2 distribution matching."""
+"""Train a few-step generator with data-free DMD2 distribution matching."""
 
 from __future__ import annotations
 
@@ -63,7 +63,7 @@ if TYPE_CHECKING:
 
 
 class DMD2Trainer(BaseTrainer):
-    """Optimize a deterministic one-step generator without real training data."""
+    """Optimize a deterministic few-step generator without real training data."""
 
     paradigm: ClassVar[Literal["distillation"]] = "distillation"
 
@@ -152,7 +152,7 @@ class DMD2Trainer(BaseTrainer):
         run_distillation_training_step(self)
 
     def sample(self) -> List[BaseSample]:
-        """Collect the initial state and generated boundary of one fresh rollout."""
+        """Collect every boundary of one fresh rollout."""
         self._validate_generation_schedule()
         self._validate_media_free_rollout()
         with self._without_media_decoding():

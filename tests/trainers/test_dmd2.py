@@ -127,8 +127,8 @@ def test_dmd2_rejects_multiple_generator_inner_epochs_per_rollout() -> None:
         trainer._validate_generation_schedule()
 
 
-def test_dmd2_sample_collects_only_initial_and_generated_boundary() -> None:
-    trainer = _trainer()
+def test_dmd2_sample_collects_all_rollout_boundaries() -> None:
+    trainer = _trainer(num_inference_steps=4)
     calls = []
 
     def generate_samples(**kwargs: Any) -> List[BaseSample]:
@@ -152,7 +152,7 @@ def test_dmd2_sample_collects_only_initial_and_generated_boundary() -> None:
         {
             "reward_buffer": None,
             "compute_log_prob": False,
-            "trajectory_indices": [0, 1],
+            "trajectory_indices": [0, 1, 2, 3, 4],
         }
     ]
 

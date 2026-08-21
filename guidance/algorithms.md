@@ -42,8 +42,11 @@ Flow-Factory provides unified implementations of state-of-the-art RL algorithms 
 At a high level, the supported algorithms fall into three paradigms:
 
 - **Coupled paradigm (GRPO and variants)**: Training timesteps are coupled with the SDE-based sampling dynamics, requiring tractable log-probability computation for policy gradient optimization.
-- **Decoupled paradigm (DPO, DiffusionNFT, AWM, DGPO, CRD)**: Training timesteps are decoupled from the actual sampling dynamics, making them inherently solver-agnostic.
-- **Distillation paradigm (DiffusionOPD, DMD2, TDM, TDM-R1)**: Students match flow-matching targets. DiffusionOPD uses a teacher; DMD2/TDM/TDM-R1 keep a fake score on one model bundle and always update fake first, then the generator.
+- **Decoupled paradigm (DPO, DiffusionNFT, AWM, DGPO, CRD, TDM-R1)**: Training timesteps are decoupled from the actual sampling dynamics, making them inherently solver-agnostic.
+- **Distillation paradigm (DiffusionOPD, DMD2, TDM)**: Students match flow-matching targets. DiffusionOPD uses a teacher; DMD2 and TDM keep a fake score on one model bundle and update it before the generator.
+
+DMD2, TDM, and TDM-R1 update fake first. TDM-R1 then updates the surrogate
+before the generator.
 
 ## GRPO
 
@@ -353,7 +356,7 @@ For a complete runnable setup, see `examples/dgpo/lora/sd3_5/default.yaml`.
 ## DMD2
 
 `dmd2` is a data-free distribution-matching core on one prepared model bundle
-and one physical AdamW. Trainable roles are `generator` and `fake`. Each outer
+and one optimizer root. Trainable roles are `generator` and `fake`. Each outer
 iteration consumes `gradient_accumulation_steps` distinct dataloader batches
 (default auto GAS=1). Distillation does **not** auto-align
 `unique_sample_num_per_epoch` to group-size geometry; set GAS manually for a
@@ -368,9 +371,11 @@ v = ε - x0
 x0̂ = x_t - σ v
 ```
 
-`σ` is drawn uniformly from `perturbation_timestep_range` (default `(0.02, 0.98)`).
-Fake minimizes velocity MSE on detached generated `x0`. Generator uses the
-stop-grad x0 DMD direction against the frozen reference and `fake` scores.
+Each deterministic rollout stores all `num_inference_steps + 1` boundaries. A
+replay unit draws one boundary, then samples `σ` uniformly from
+`perturbation_timestep_range` (default `(0.02, 0.98)`). Fake minimizes velocity
+MSE on detached generated `x0`; generator uses the stop-grad x0 DMD direction
+against the frozen reference and `fake` scores.
 
 The reference score is not a third role. It is the pre-finetune teacher, i.e. the
 same components at an earlier point in time, so it is reached through
@@ -412,8 +417,8 @@ Training rewards remain rejected for `dmd2` and `tdm`: an eval-only signal must 
 become a training signal by accident. `tdm-r1` is the exception, since its generator
 objective is reward-driven and it requires training rewards.
 
-Runnable YAML examples are not published yet. Do not infer adapter support from
-the trainer implementation alone.
+See [`examples/dmd2/lora/sd3_5/ocr.yaml`](../examples/dmd2/lora/sd3_5/ocr.yaml)
+for a validated four-step SD3.5 setup.
 
 ## TDM
 
@@ -428,23 +433,23 @@ generator uses Huber or the same stop-grad x0 surrogate.
 train:
     trainer_type: 'tdm'
     ttur_fake_updates: 5
-    trajectory_steps: 4
+    num_inference_steps: 4
     use_huber: true
     huber_c: 1.0e-3
     tdm_snr_gamma: 5.0
 ```
 
-Runnable YAML examples are not published yet.
+See [`examples/tdm/lora/sd3_5/ocr.yaml`](../examples/tdm/lora/sd3_5/ocr.yaml).
 
 ## TDM-R1
 
 `tdm-r1` adds a learned `surrogate` role on top of TDM's `generator` and `fake`,
 and queries the same frozen pretrained reference through `use_ref_parameters()`.
 Each `optimize()` call is sequential: fake × `R`, one surrogate step, then one
-generator step, over `gradient_accumulation_steps` rank-local microbatches.
-TDM-R1 does not auto-align `unique_sample_num_per_epoch`; it fail-fasts unless
-`per_device_batch_size % group_size == 0` so each microbatch contains complete
-groups. Preference reductions are rank-local (`reduce_across_ranks=False`).
+generator step. With `group_contiguous`, each rank holds complete groups and
+preference reductions stay rank-local. With `group_distributed`, every group is
+split evenly across ranks and preference statistics are reduced globally. Startup
+validation enforces the selected sampler's group geometry.
 Generator preference scores the live replayed boundary and reuses the TDM
 reference query. The surrogate uses `group_preference_loss` on rewards.
 Generator loss keeps the TDM distribution anchor and mixes two reward directions as
@@ -459,9 +464,9 @@ its production LoRA launch uses DeepSpeed ZeRO-2.
 ```yaml
 train:
     trainer_type: 'tdm-r1'
-    ttur_fake_updates: 5
+    ttur_fake_updates: 1
     tdm_weight: 0.3
-    surrogate_preference_beta: 1.0
+    surrogate_preference_beta: 10.0
     advantage_aggregation: 'gdpo'
     advantage_clip_range: 5.0
 ```

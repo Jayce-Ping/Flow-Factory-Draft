@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -38,6 +39,42 @@ def test_ocr_accepts_native_visible_texts_list() -> None:
         "Federal Bank",
         "Policy 2025",
     ]
+
+
+def test_ocr_extracts_targets_from_plain_text_dataset_prompt() -> None:
+    reward = _reward(["OPEN", "EX1T"])
+    scores = reward._compute_scores_batch(
+        prompt=['signs reading "OPEN" and "EXIT"'],
+        image=[np.zeros((8, 8, 3), dtype=np.uint8)],
+    )
+    assert scores == pytest.approx([0.875])
+
+
+def test_ocr_falls_back_to_prompt_when_metadata_has_no_targets() -> None:
+    assert OCRRewardModel._targets_for_sample(
+        prompt='a card reading “OPEN”',
+        metadata=json.dumps({"__source__": "ocr"}),
+        sample_index=2,
+    ) == ["OPEN"]
+
+
+def test_ocr_rejects_prompt_without_quoted_target() -> None:
+    with pytest.raises(ValueError, match="quoted OCR target.*sample 4"):
+        OCRRewardModel._targets_from_prompt("a blank sign", sample_index=4)
+
+
+def test_ocr_rejects_invalid_json_metadata_with_sample_context() -> None:
+    with pytest.raises(ValueError, match="JSON object metadata.*sample 5.*invalid JSON"):
+        OCRRewardModel._parse_metadata("{", sample_index=5)
+
+
+@pytest.mark.parametrize("split", ("train", "test"))
+def test_bundled_ocr_prompts_have_extractable_targets(split: str) -> None:
+    path = Path(__file__).parents[2] / "dataset" / "ocr" / f"{split}.txt"
+    prompts = path.read_text(encoding="utf-8").splitlines()
+    assert prompts
+    for sample_index, prompt in enumerate(prompts):
+        assert OCRRewardModel._targets_from_prompt(prompt, sample_index)
 
 
 @pytest.mark.parametrize(

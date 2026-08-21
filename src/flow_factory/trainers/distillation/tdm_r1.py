@@ -137,9 +137,7 @@ class TDMR1Trainer(TDMTrainer):
                 self._surrogate_boundary_loss,
             ),
         )
-        # The trust region widens as training settles: early on the slow copy tracks the
-        # surrogate closely so the ratio stays meaningful while both move fast, and it is
-        # then allowed to lag, which is what makes the clip bite later.
+        # Increase snapshot lag gradually so the trust-region clip strengthens over time.
         decay = min(
             self.training_args.surrogate_slow_decay_max,
             self.training_args.surrogate_slow_decay_min + 0.001 * self.step,
@@ -148,19 +146,13 @@ class TDMR1Trainer(TDMTrainer):
         record_distillation_metric(self, "train/surrogate_slow_decay", decay)
 
     def _ensure_slow_surrogate(self) -> None:
-        """Create the slow surrogate copy the trust region is measured against.
-
-        Declared on first use rather than at construction because the variant it copies
-        does not exist until the adapter has declared its trainable roles.
-        """
+        """Create the trust-region snapshot after trainable roles exist."""
         if not self.adapter.has_variant_snapshot(SLOW_SURROGATE_SNAPSHOT):
             self.adapter.declare_variant_snapshot("surrogate", SLOW_SURROGATE_SNAPSHOT)
 
     def _surrogate_boundary_loss(self, unit: TDMBoundaryUnit) -> torch.Tensor:
         """Score one stored boundary with the surrogate and apply group preference."""
-        # One draw shared by the live surrogate and its slow copy, so the trust-region
-        # ratio below reflects the step the surrogate took rather than a fresh
-        # perturbation.
+        # Share one perturbation so the ratio measures parameter drift only.
         context = self._boundary_score_context(unit)
         trainable_values, reference_values = self._boundary_preference_values(
             unit,
@@ -168,9 +160,7 @@ class TDMR1Trainer(TDMTrainer):
             context=context,
         )
         preference_batch = self._group_preference_batch(unit, trainable_values)
-        # How far the surrogate density has drifted from its frozen reference. The
-        # preference loss alone cannot distinguish a surrogate that is learning from
-        # one that has run away from the reference and is scoring everything higher.
+        # Track density drift that the preference loss alone cannot distinguish.
         record_distillation_metric(
             self,
             "train/surrogate_value_delta",
@@ -186,9 +176,7 @@ class TDMR1Trainer(TDMTrainer):
             reference_values,
             self.training_args.surrogate_preference_beta,
         )
-        # Without this the surrogate is free to walk away from the frozen model and
-        # score everything higher, which reads as progress in the preference loss while
-        # the guidance it hands the generator becomes meaningless.
+        # Anchor the surrogate so globally inflated scores cannot mimic progress.
         reference_penalty = (trainable_values - reference_values).square().mean()
         record_distillation_metric(self, "train/surrogate_reference_penalty", reference_penalty)
         loss = preference_loss + self.training_args.surrogate_reference_beta * reference_penalty
