@@ -36,6 +36,7 @@ ff-train examples/grpo/lora/flux1/default.yaml
 
 - [`minimax-h3-t2va`](../examples/grpo/lora/minimax_h3_t2va/default.yaml)
 - [`minimax-h3-t2va` real-weight debug recipe](../examples/grpo/lora/minimax_h3_t2va/debug.yaml)
+- [`minimax-h3-t2va` native-quality FSDP2 recipe](../examples/grpo/lora/minimax_h3_t2va/quality_720p_fsdp2.yaml)
 - [`minimax-h3-fl2va`](../examples/grpo/lora/minimax_h3_fl2va/default.yaml)
 - [`minimax-h3-ref2va`](../examples/grpo/lora/minimax_h3_ref2va/default.yaml)
 
@@ -47,6 +48,12 @@ Its 64x96 canvas is intentionally a correctness geometry. The quality-oriented T
 default remains an unverified quality starting point. FL2VA and Ref2VA are
 **Schema/API validated only** rather than claims of training stability or reward
 improvement.
+
+The T2VA `quality_720p_fsdp2.yaml` recipe is the active native-quality path:
+768x1344, 124 frames, 24 denoising steps, LoRA rank 64 / alpha 128, and two
+updates from 48 prompt groups per epoch. Its real-weight FSDP2 initialization,
+checkpoint, native-resolution decode, and CLAP evaluation are validated; a
+completed long-run reward trend is not yet claimed.
 
 ## Contributing
 
