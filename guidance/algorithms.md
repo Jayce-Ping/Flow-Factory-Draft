@@ -453,7 +453,8 @@ Generator loss keeps the TDM distribution anchor and mixes two reward directions
 DeepSpeed ZeRO-1/2 is allowed under sequential phases, the same as DMD2/TDM.
 ZeRO-3 remains globally unsupported. DDP, FSDP1, FSDP2, and ZeRO-2 have real
 SD3.5 backward/checkpoint coverage; the published OCR recipe additionally validates
-the official TDM initialization and all three role updates on 16-GPU FSDP2.
+the official TDM initialization and all three role updates on 16-GPU FSDP2, while
+its production LoRA launch uses DeepSpeed ZeRO-2.
 
 ```yaml
 train:

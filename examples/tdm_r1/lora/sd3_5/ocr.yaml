@@ -9,7 +9,7 @@
 # averages all four, preserving the same uniform objective expectation with lower variance.
 
 launcher: "accelerate"  # Launch through Hugging Face Accelerate.
-config_file: config/accelerate_configs/fsdp2.yaml  # Shard the transformer across sixteen GPUs.
+config_file: config/deepspeed/deepspeed_zero2.yaml  # Use the requested LoRA + ZeRO-2 backend.
 num_processes: 16  # Use the validated two-node world size.
 main_process_port: 29500  # Rendezvous port; change when occupied.
 mixed_precision: "bf16"  # Match the official mixed-precision setting.
