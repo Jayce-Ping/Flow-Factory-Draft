@@ -32,7 +32,12 @@ model:  # Configure the trainable MiniMax-H3 transformer adapter.
   lora_alpha: 128  # Scale LoRA updates by twice the rank.
   target_components: "transformer"  # Adapt only the joint video-audio transformer.
   target_modules: "default"  # Train the validated attention projections.
-  frozen_parameters_dtype: "bf16"  # Keep frozen weights on the bf16 path.
+  frozen_parameters_dtype:  # Apply checkpoint-aware precision per frozen component.
+    default: null  # Preserve any unlisted component's released dtype.
+    transformers: "bf16"  # Keep frozen denoiser parameters on the bf16 path.
+    text_encoders: "bf16"  # Keep frozen prompt encoders in bf16.
+    vae: "fp32"  # Preserve the video decoder's required FP32 weights.
+    audio_vae: "fp32"  # Preserve released audio amplitude and quality.
   trainable_parameters_dtype: "bf16"  # Store LoRA parameters in bf16.
   resume_path: null  # Start from the released base checkpoint.
   resume_type: null  # Infer resume behavior only when a path is supplied.
