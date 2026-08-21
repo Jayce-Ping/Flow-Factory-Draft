@@ -36,6 +36,8 @@ def test_readme_documents_h3_links_pin_and_limits() -> None:
     assert "hardware and reward-trend evidence" in text
     assert "MiniMax H3 T2VA has real-weight LoRA validation" in text
     assert "FL2VA and Ref2VA remain" in text
+    assert "T2VA is real-weight validated on 1 and 16 GPUs" not in text
+    assert text.count("<td>30B</td>") == 3
 
     for model_type, link in zip(
         ("minimax-h3-t2va", "minimax-h3-fl2va", "minimax-h3-ref2va"),
@@ -56,7 +58,7 @@ def test_readme_documents_h3_links_pin_and_limits() -> None:
         "data-ward velocity",
         "N transitions",
         "N + 1 states",
-        "61 GB",
+        "30B",
         "completed long-run reward trend is not claimed",
         "pip install 'diffusers @ git+https://github.com/huggingface/diffusers.git@",
         "[Datasets](guidance/datasets.md)",
