@@ -1,0 +1,108 @@
+# Real-weight validated low-memory debug recipe.
+# Verified on 1 and 16 GPUs. The 64x96 canvas is for correctness debugging,
+# not visual-quality evaluation. H3 requires at least 5 seconds, hence 124 frames.
+
+launcher: accelerate
+config_file: config/accelerate_configs/multi_gpu.yaml
+num_processes: 1
+main_process_port: 29500
+mixed_precision: bf16
+
+data:
+  datasets:
+  - name: minimax_h3_t2va
+    dataset_dir: dataset/minimax_h3_t2va
+    train: {weight: 1, max_dataset_size: 1}
+    eval: {}
+  preprocessing_batch_size: 1
+  dataloader_num_workers: 2
+  force_reprocess: false
+  cache_dir: ~/.cache/flow_factory/datasets
+  sampler_type: auto
+
+model:
+  finetune_type: lora
+  lora_rank: 8
+  lora_alpha: 16
+  target_components: transformer
+  target_modules: default
+  model_name_or_path: MiniMaxAI/MiniMax-H3
+  model_type: minimax-h3-t2va
+  resume_path: null
+  resume_type: null
+  frozen_parameters_dtype:
+    default: null
+    transformers: bf16
+    text_encoders: bf16
+    vae: fp32
+    audio_vae: fp32
+  trainable_parameters_dtype: bf16
+
+log:
+  run_name: null
+  project: Flow-Factory
+  logging_backend: none
+  save_dir: saves/
+  save_freq: 0
+  save_model_only: true
+
+train:
+  trainer_type: grpo
+  max_epochs: 1
+  advantage_aggregation: sum
+  clip_range: 1.0e-4
+  adv_clip_range: 5.0
+  kl_type: v-based
+  kl_beta: 0
+  ref_param_device: cuda
+  resolution: [64, 96]
+  num_frames: 124
+  frame_rate: 24.0
+  num_inference_steps: 2
+  guidance_scale: 1.0
+  per_device_batch_size: 1
+  group_size: 1
+  global_std: true
+  unique_sample_num_per_epoch: 1
+  gradient_step_per_epoch: 1
+  gradient_accumulation_steps: auto
+  shuffle_samples: false
+  ema_decay: 0
+  enable_gradient_checkpointing: true
+  offload_samples_to_cpu: false
+  seed: 42
+
+scheduler:
+  dynamics_type: CPS
+  noise_level: 0.8
+  num_sde_steps: 1
+  sde_steps: [0, 1]
+  seed: 42
+
+eval:
+  eval_freq: 0
+  resolution: [64, 96]
+  num_frames: 124
+  frame_rate: 24.0
+  per_device_batch_size: 1
+  guidance_scale: 1.0
+  num_inference_steps: 2
+  seed: 42
+
+rewards:
+- name: audio_text_alignment
+  reward_model: clap
+  weight: 1.0
+  batch_size: 1
+  device: cpu
+  dtype: float32
+  model_name_or_path: laion/larger_clap_general
+  applicable_datasets: [minimax_h3_t2va]
+
+optimizers:
+- name: default
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  max_grad_norm: 1.0

@@ -816,3 +816,28 @@ Before submitting a new model adapter, verify:
 - [ ] **Sample dataclass** — All fields without batch dimension; `_shared_fields` correctly set; custom field types are consistent (no `Tensor` vs `List[Tensor]` mixing across samples)
 - [ ] **Registry entry** — Added to `_MODEL_ADAPTER_REGISTRY`
 - [ ] **Tested** — Runs at least one epoch of GRPO training without errors
+
+## Component Runtime and Structured Replay
+
+Choose the runtime explicitly in `build_component_runtime()`:
+
+- `ClassicPipelineRuntime` for eagerly materialized diffusers pipelines.
+- `ModularPipelineRuntime` for declared specs whose materialized modules depend on a
+  workflow.
+- `PseudoPipelineRuntime` for adapters assembling components without a diffusers
+  pipeline.
+
+Component membership uses canonical lookup through declared specs, not `hasattr`.
+Keep declared specs distinct from materialized modules; use
+`materialize_components(None)` only when the workflow genuinely needs every
+declaration. A prepared/replacement override must be installed through the runtime so
+`adapter.pipeline`, `adapter.scheduler`, and optimizer identities remain coherent.
+
+Multimodal adapters declare `trajectory_component_order` and one scheduler per
+component in `scheduler_group`. Distributed preparation wraps the resulting
+`ModelBundle`; adapter access after prepare routes through `RoutedComponentProxy`
+rather than replacing registered modules.
+
+MiniMax H3 is the reference for workflow-pruned modular components and separate
+video/audio trajectories. See `src/flow_factory/models/minimax_h3/` and the
+[MiniMax H3 dataset contracts](datasets.md#minimax-h3-datasets).

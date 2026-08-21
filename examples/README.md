@@ -32,6 +32,38 @@ ff-train examples/grpo/lora/flux1/default.yaml
 - [`tdm-r1` SD3.5 OCR recipe](tdm_r1/lora/sd3_5/ocr.yaml) — official G24
   fake-surrogate-generator objective initialized from the released TDM adapter.
 
+## MiniMax H3 examples
+
+- [`minimax-h3-t2va`](../examples/grpo/lora/minimax_h3_t2va/default.yaml)
+- [`minimax-h3-t2va` real-weight debug recipe](../examples/grpo/lora/minimax_h3_t2va/debug.yaml)
+- [`minimax-h3-t2va` native-quality FSDP2 recipe](../examples/grpo/lora/minimax_h3_t2va/quality_720p_fsdp2.yaml)
+- [`minimax-h3-fl2va`](../examples/grpo/lora/minimax_h3_fl2va/default.yaml)
+- [`minimax-h3-ref2va`](../examples/grpo/lora/minimax_h3_ref2va/default.yaml)
+
+The T2VA `debug.yaml` recipe is real-weight validated with the 61 GB checkpoint
+(61.74 GiB transformer):
+1 GPU and 16 GPUs across two nodes completed CPS rollout, video/audio decode,
+CLAP reward, GRPO replay/backward/optimizer step, and LoRA checkpoint save/resume.
+Its 64x96 canvas is intentionally a correctness geometry. The quality-oriented T2VA
+default remains an unverified quality starting point. FL2VA and Ref2VA are
+**Schema/API validated only** rather than claims of training stability or reward
+improvement.
+
+The T2VA `quality_720p_fsdp2.yaml` recipe is the active native-quality path:
+768x1344, 124 frames, 24 denoising steps, LoRA rank 64 / alpha 128, and two
+updates from 48 prompt groups per epoch. Its real-weight FSDP2 initialization,
+checkpoint, native-resolution decode, and CLAP evaluation are validated; a
+completed long-run reward trend is not yet claimed.
+
+FL2VA and Ref2VA use Meta ImageBind for audio-video alignment. Install ImageBind
+and PyTorchVideo from their upstream repositories before running those examples;
+ImageBind is licensed CC-BY-NC-SA 4.0 (NonCommercial).
+
+```bash
+pip install git+https://github.com/facebookresearch/ImageBind.git
+pip install git+https://github.com/facebookresearch/pytorchvideo.git
+```
+
 ## Contributing
 
 We welcome community contributions! Here's what you can contribute and how:
