@@ -52,17 +52,20 @@ def get_parquet_data_paths(data_dir_list, num_sampled_data_paths, rank=0, world_
     return combined_chunks
 
 
-# NOTE: cumtomize this function for your cluster
 def get_hdfs_host():
-    return "hdfs://xxx"
+    host = os.environ.get("FLOW_FACTORY_HDFS_HOST")
+    if not host:
+        raise ValueError(
+            "expected FLOW_FACTORY_HDFS_HOST for a Bagel HDFS parquet path, "
+            f"received {host!r}"
+        )
+    return host
 
 
-# NOTE: cumtomize this function for your cluster
 def get_hdfs_block_size():
     return 134217728
 
 
-# NOTE: cumtomize this function for your cluster
 def get_hdfs_extra_conf():
     return None
 

@@ -96,9 +96,9 @@ from .training_args import MyAlgoTrainingArguments
 ### Step 3 — Create Trainer Class
 
 ```python
-# src/flow_factory/trainers/my_algo.py
-from .abc import BaseTrainer
-from .registry import register_trainer
+# src/flow_factory/trainers/rl/my_algo.py
+from ..abc import BaseTrainer
+from ..registry import register_trainer
 
 @register_trainer('my_algo')
 class MyAlgoTrainer(BaseTrainer):
@@ -137,7 +137,7 @@ class MyAlgoTrainer(BaseTrainer):
 Add to `_TRAINER_REGISTRY` in `src/flow_factory/trainers/registry.py`:
 
 ```python
-'my_algo': 'flow_factory.trainers.my_algo.MyAlgoTrainer',
+'my_algo': 'flow_factory.trainers.rl.my_algo.MyAlgoTrainer',
 ```
 
 ## Phase 4: Configuration & Examples
@@ -154,7 +154,6 @@ model:
 train:
   trainer_type: "my_algo"
   my_specific_param: 0.1
-  learning_rate: 1e-6          # Flat fields configure a single-optimizer run
   group_size: 4
 
   num_inference_steps: 28
@@ -173,20 +172,15 @@ data:
 
 rewards:
   - name: "pickscore"
-
-# An algorithm that trains several variants at once declares one optimizer per
-# variant instead of the flat fields above, and is the only way to select Muon:
-#
-# optimizers:
-#   - name: generator
-#     optimizer: muon
-#     learning_rate: 2e-5
-#   - name: fake
-#     learning_rate: 1e-5
-#     update_frequency: 5
     reward_model: "pickscore"
     weight: 1.0
     batch_size: 16
+
+optimizers:
+  - name: default
+    learning_rate: 1e-6
+    weight_decay: 1e-4
+    max_grad_norm: 1.0
 ```
 
 ## Phase 5: Verification

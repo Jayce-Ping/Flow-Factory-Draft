@@ -891,8 +891,7 @@ def test_role_plan_values_are_immutable_and_validate_ranges() -> None:
 def test_required_roles_fall_back_to_every_declared_variant() -> None:
     """Without a declaration on training_args the registry is the answer.
 
-    This branch had no coverage, which let a stale filter on the removed
-    ``ComponentVariantSpec.trainable`` field survive a full green suite.
+    This guards registry fallback after trainability moved out of variant specs.
     """
     registry = ComponentVariantRegistry(SimpleNamespace(trainable_component_names=("transformer",)))
     registry.declare(

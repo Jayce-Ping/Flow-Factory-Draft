@@ -67,17 +67,6 @@ train:
   unique_sample_num_per_epoch: 48  # Unique samples per group
   gradient_step_per_epoch: 2  # Gradient steps per epoch
   
-  # Optimization
-  # A single-policy run may keep these flat fields; they are translated into one
-  # default AdamW entry. The top-level `optimizers:` section below is the explicit
-  # form, and the only way to configure more than one trainable variant or to
-  # select an optimizer other than AdamW.
-  learning_rate: 3.0e-4  # Initial learning rate
-  adam_weight_decay: 1.0e-4  # AdamW weight decay
-  adam_betas: [0.9, 0.999]  # AdamW betas
-  adam_epsilon: 1.0e-8  # AdamW epsilon
-  max_grad_norm: 1.0  # Max gradient norm for clipping
-
   # EMA
   ema_decay: 0.99  # EMA decay rate (0 to disable)
   ema_update_interval: 4  # EMA update interval (in epochs)
@@ -123,22 +112,12 @@ eval_rewards:
     device: "cuda"
     dtype: bfloat16
 
-# Optimizer Configuration (optional)
-# One entry per trainable variant, resolved by name. Omit this section entirely to
-# use the flat `train.learning_rate` family above, which a single-policy run does.
-# Declaring it here is required to give several variants their own optimizer, and
-# is the only way to select an optimizer other than AdamW.
-#
-# optimizers:
-#   - name: generator         # Trainable variant this configures
-#     optimizer: muon         # "adamw" (default) or "muon"
-#     learning_rate: 2.0e-5
-#     weight_decay: 1.0e-4
-#     max_grad_norm: 1.0
-#     adjust_lr_fn: match_rms_adamw   # Muon only: reuse an AdamW-tuned rate
-#   - name: fake
-#     optimizer: adamw
-#     learning_rate: 1.0e-5
-#     betas: [0.9, 0.999]
-#     eps: 1.0e-8
-#     update_frequency: 5     # Steps of other variants between this one's steps
+# Optimizer Configuration
+optimizers:
+  - name: default
+    optimizer: adamw
+    learning_rate: 3.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    max_grad_norm: 1.0

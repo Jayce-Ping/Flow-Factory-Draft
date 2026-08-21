@@ -506,7 +506,7 @@ class BagelAdapter(BaseAdapter):
 
     def _assert_variable_count_supported(self, condition_images: List[List[Image.Image]]) -> None:
         """Fail fast on condition-image counts that desync collectives under a
-        parameter-sharded ``language_model`` (FSDP FULL/HYBRID, FSDP2, ZeRO-3).
+        parameter-sharded ``language_model`` (FSDP FULL/HYBRID or FSDP2).
 
         The prefill (``_build_gen_context``) issues a *data-dependent* number of
         ``language_model.forward_inference`` calls -- ``2*num_rounds + 2`` where
@@ -534,7 +534,7 @@ class BagelAdapter(BaseAdapter):
             raise RuntimeError(
                 "Bagel batched I2I with a variable per-sample condition-image count "
                 f"(counts={sorted(counts)}) is unsupported under a parameter-sharded "
-                "language_model (FSDP FULL/HYBRID, FSDP2, DeepSpeed ZeRO-3): the prefill "
+                "language_model (FSDP FULL/HYBRID or FSDP2): the prefill "
                 "makes a data-dependent number of all-gathers (2*max_count+2) that "
                 "mismatches across ranks and deadlocks. Use DDP or ZeRO-1/2 for "
                 "variable-count I2I, pad to a uniform count, or gather language_model "

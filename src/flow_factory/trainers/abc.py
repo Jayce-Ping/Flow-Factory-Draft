@@ -215,7 +215,7 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
 
         # If DeepSpeed ZeRO-3 is enabled, the reward model will be somehow sharded.
         # We need to disable ZeRO-3 init context when loading the model to avoid issues
-        # NOTE: This bug persists even with this context manager. DONOT USE ZeRO-3.
+        # This remains unsupported even with the context manager; do not use ZeRO-3.
         # A possible solution: call DeepSpeed's `zero.GatheredParameters` manually inside the
         # reward model's `forward`.
 

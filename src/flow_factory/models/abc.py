@@ -135,10 +135,9 @@ class NamedParametersInfo:
 class CheckpointEntry:
     """One writable/readable artifact inside a checkpoint directory.
 
-    A checkpoint holds one artifact per (component, role) pair: a single-policy
-    algorithm has exactly one, while a multi-role algorithm such as DMD2 also ships
-    its fake score. Save and every load path derive their paths from these entries,
-    so the two can never disagree about where a role's weights live.
+    A checkpoint holds one artifact per (component, role) pair. A base-only run has
+    one; a multi-role run also writes its non-base variants. Save and load paths both
+    derive from these entries.
 
     Attributes:
         component: Target component name, e.g. ``"transformer"``.
@@ -684,9 +683,8 @@ class BaseAdapter(ABC):
 
     # ============================== Component Variants ==============================
     """
-        A single-policy algorithm trains one copy of the trainable components, so
-        `target_module_map` alone describes parameter ownership. Some algorithms need
-        several copies live at the same time, each owning its own optimizer groups. The
+        A base-only run trains one copy of each target component. Multi-role runs keep
+        several copies live at once, each with its own optimizer groups. The
         named-parameter snapshots below are a *temporal* mechanism (one set of weights
         installed at a time); variants are the *spatial* one.
 
@@ -703,14 +701,14 @@ class BaseAdapter(ABC):
         hence the refusal to reconfigure an existing registry.
 
         A frozen reference is not a variant: it is the same weights at another
-        point in time, so an algorithm that needs one asks for
+        point in time, so callers use
         ``use_ref_parameters()`` (the pre-finetune weights) or its own named
         snapshot instead of declaring a copy that would cost a bundle member.
 
         Args:
             trainable_variants: Every trainable variant name, base variant first.
                 The base owns the canonical components and every later variant is
-                layered on it; a single-policy algorithm passes one name.
+                layered on it; a base-only run passes one name.
 
         Raises:
             RuntimeError: If variants are already declared or frozen.
@@ -770,7 +768,7 @@ class BaseAdapter(ABC):
 
         ``_mix_precision`` runs while the adapter is built and only sees the base
         components; these variants are materialized later, from PEFT defaults, so
-        without this a DMD2 fake score would train in fp32 beside a bf16 generator --
+        without this a non-base variant could train in fp32 beside a bf16 base variant:
         twice the memory, a different numerical path, and every RMSNorm it feeds
         falling off the fused kernel because its weight no longer matches the
         activations.
@@ -964,8 +962,7 @@ class BaseAdapter(ABC):
         """Temporarily install a variant-local parameter EMA snapshot.
 
         The caller names the snapshot; this adapter attaches no meaning to the
-        name. An algorithm that keeps an EMA of one variant asks for it here and
-        decides itself when an export should use it.
+        name. The caller decides when an EMA snapshot should be installed or exported.
 
         Args:
             snapshot_name: Snapshot registered through the variant registry.
@@ -1048,9 +1045,8 @@ class BaseAdapter(ABC):
             finally:
                 # A multi-role objective that queries its frozen reference between a
                 # role's forward and its backward would otherwise lose that role's
-                # gradients with no error: measured on TDM-R1, both non-base roles went
-                # from 382 trainable parameters to 0 across this context, and the
-                # optimizer then stepped on nothing.
+                # gradients with no error: both non-base roles can become frozen across
+                # this context, leaving their optimizers with nothing to step.
                 self._restore_variant_trainability()
 
         elif self._ref_ema is not None:
@@ -1064,7 +1060,7 @@ class BaseAdapter(ABC):
     def _restore_variant_trainability(self) -> None:
         """Re-mark every declared variant's own parameters as trainable.
 
-        A no-op for a single-policy algorithm, which declares no variants.
+        A no-op for a base-only run, which declares no variants.
         """
         registry = getattr(self, "component_variant_registry", None)
         if registry is None:
@@ -2194,8 +2190,8 @@ class BaseAdapter(ABC):
 
         A weight-only resume runs while the adapter is being built, before the trainer
         declares the roles it trains, so only the primary artifact can be placed then.
-        This finishes the job: without it a DMD2 resume would carry its generator
-        forward beside an untouched fake score.
+        This finishes the job so a multi-role resume cannot restore the base variant
+        while leaving non-base variants freshly initialized.
 
         Args:
             path: Checkpoint directory to restore from.
@@ -2334,10 +2330,9 @@ class BaseAdapter(ABC):
             safe_serialization: Whether to write safetensors.
             variant: Component variant to write. ``None`` writes the base components,
                 which is what an export ships; naming one restricts the write to it.
-            include_training_roles: Whether to also write the training-only variants
-                (e.g. DMD2's fake score). An export does not want them; a checkpoint
-                a run will resume from does, because a generator restored beside a
-                freshly initialized fake score silently trains something else.
+            include_training_roles: Whether to also write training-only variants.
+                Exports omit them; resumable checkpoints include them so all roles
+                restore together.
             **kwargs: Forwarded to ``accelerator.save_state`` for a training state.
 
         Raises:
