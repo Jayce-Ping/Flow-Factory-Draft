@@ -35,7 +35,11 @@ model:
   lora_rank: 32
   lora_alpha: 64
   target_modules: "default"
-  frozen_parameters_dtype: "bf16"
+  frozen_parameters_dtype:
+    default: null       # Preserve any unlisted component's checkpoint dtype
+    transformers: "bf16"
+    text_encoders: "bf16"
+    vae: "bf16"
   trainable_parameters_dtype: "bf16"
   resume_path: null
   resume_type: null

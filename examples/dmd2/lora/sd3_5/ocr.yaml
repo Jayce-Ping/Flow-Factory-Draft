@@ -34,7 +34,11 @@ model:  # Configure the generator and fake-score LoRA variants.
   lora_alpha: 64  # Scale LoRA updates by twice the rank.
   target_components: "transformer"  # Attach adapters only to the denoising transformer.
   target_modules: "default"  # Use the adapter's validated attention projections.
-  frozen_parameters_dtype: "bf16"  # Keep frozen weights on the fused bf16 path.
+  frozen_parameters_dtype:  # Apply precision by frozen component group.
+    default: null  # Preserve any unlisted component's checkpoint dtype.
+    transformers: "bf16"  # Keep frozen denoiser weights on the bf16 path.
+    text_encoders: "bf16"  # Keep frozen prompt encoders in bf16.
+    vae: "bf16"  # Match the validated SD3.5 VAE precision.
   trainable_parameters_dtype: "bf16"  # Train LoRA weights in bf16.
   resume_path: null  # Start from pretrained weights rather than a prior adapter.
   resume_type: null  # Infer resume behavior only when a path is provided.
