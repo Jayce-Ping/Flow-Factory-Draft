@@ -259,6 +259,22 @@ def _step_fake_role(trainer: TinyTrainer) -> None:
             coordinator.finish_microbatch()
 
 
+def test_ema_tracking_uses_rebound_base_variant_parameters() -> None:
+    adapter = TinyRoleAdapter(Accelerator(cpu=True), "full")
+    adapter.declare_component_variants((BASE_VARIANT,))
+    registry = adapter.component_variant_registry
+    stale_parameter = adapter.get_trainable_parameters()[0]
+
+    replacement = TinyRoleModule()
+    replacement.requires_grad_(False)
+    replacement.target.weight.requires_grad_(True)
+    registry.rebind_parameters({"transformer": replacement})
+    live_parameter = registry.parameters(BASE_VARIANT)[0]
+
+    assert live_parameter is not stale_parameter
+    assert adapter._ema_tracked_parameters() == [live_parameter]
+
+
 @pytest.mark.parametrize("finetune_type", ["lora", "full"])
 def test_accelerate_round_trip_restores_all_roles_one_optimizer_and_counters(
     tmp_path: Path,
@@ -542,6 +558,26 @@ def test_snapshot_swaps_surrogate_weights_and_restores_live_parameters(
     with registry.use_snapshot("old_surrogate"):
         for parameter, old, current in zip(registry.parameters("surrogate"), initial, live):
             torch.testing.assert_close(parameter, old * 0.25 + current * 0.75)
+
+
+def test_snapshot_update_casts_fsdp_upcast_live_parameters_to_storage_dtype() -> None:
+    adapter = TinyRoleAdapter(Accelerator(cpu=True), "full")
+    adapter.declare_component_variants((BASE_VARIANT, "fake", "surrogate"))
+    registry = adapter.component_variant_registry
+    for parameter in registry.parameters("surrogate"):
+        parameter.data = parameter.data.to(torch.bfloat16)
+    registry.add_snapshot("surrogate", "old_surrogate")
+    initial = registry.snapshot_tensors("old_surrogate")
+    for parameter in registry.parameters("surrogate"):
+        parameter.data = (parameter.data.float() + 2.0).to(torch.float32)
+
+    registry.update_snapshot("old_surrogate", decay=0.25)
+    updated = registry.snapshot_tensors("old_surrogate")
+
+    for old, actual in zip(initial, updated):
+        expected = old * 0.25 + (old.float() + 2.0).to(old.dtype) * 0.75
+        assert actual.dtype == torch.bfloat16
+        torch.testing.assert_close(actual, expected)
 
 
 def test_snapshot_state_round_trip_is_exact_and_not_export_metadata() -> None:

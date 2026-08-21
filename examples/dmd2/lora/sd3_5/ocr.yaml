@@ -1,0 +1,111 @@
+# SD3.5-Medium 4-step DMD2 recipe validated on 16 GPUs.
+# Override the launcher topology for other clusters.
+
+launcher: "accelerate"
+config_file: config/accelerate_configs/multi_node.yaml
+num_processes: 16
+num_machines: 2
+main_process_port: 29500
+mixed_precision: "bf16"
+
+data:
+  datasets:
+    - name: ocr
+      dataset_dir: "dataset/ocr"
+      train:
+        weight: 1
+        max_dataset_size: 512
+      eval:
+        split: test
+  preprocessing_batch_size: 8
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  preprocess_parallelism: local
+  sampler_type: "auto"
+
+model:
+  model_type: "sd3-5"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  finetune_type: "lora"
+  lora_rank: 32
+  lora_alpha: 64
+  target_components: "transformer"
+  target_modules: "default"
+  frozen_parameters_dtype:
+    default: null
+    transformers: "bf16"
+    text_encoders: "bf16"
+    vae: "bf16"
+  trainable_parameters_dtype: "bf16"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: null
+  project: "Flow-Factory-DMD2"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 30
+  save_model_only: true
+
+train:
+  trainer_type: "dmd2"
+  max_epochs: 10000
+  resolution: 512
+  num_inference_steps: 4
+  guidance_scale: 1.0
+  real_guidance_scale: 4.0
+  per_device_batch_size: 32
+  group_size: 1
+  unique_sample_num_per_epoch: 512
+  gradient_step_per_epoch: 1
+  gradient_accumulation_steps: "auto"
+  ttur_fake_updates: 5  # Five fake updates per generator update.
+  perturbation_timestep_range: [0.02, 0.98]
+  enable_gradient_checkpointing: true
+  offload_samples_to_cpu: true
+  latent_storage_dtype: "fp16"
+  ema_decay: 0
+  ema_update_interval: 1
+  ema_device: "cuda"
+  replay_rtol: 0  # ODE replay must be bit-exact.
+  replay_atol: 0
+  seed: 42
+
+scheduler:
+  dynamics_type: "ODE"
+  seed: 42
+
+eval:
+  resolution: 512
+  per_device_batch_size: 32
+  guidance_scale: 1.0
+  num_inference_steps: 4
+  eval_freq: 30
+  seed: 42
+
+eval_rewards:
+  - name: "ocr"
+    reward_model: "OCR"
+    weight: 1
+    batch_size: 1
+    device: "cpu"
+    dtype: "float32"
+    async_reward: true
+    num_workers: 1
+    applicable_datasets: [ocr]
+
+optimizers:
+  - name: "generator"
+    learning_rate: 1.0e-5
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    max_grad_norm: 1.0
+  - name: "fake"
+    learning_rate: 1.0e-5
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    max_grad_norm: 1.0

@@ -19,6 +19,12 @@
 
 - [DGPO](#dgpo)
 
+- [DMD2](#dmd2)
+
+- [TDM](#tdm)
+
+- [TDM-R1](#tdm-r1)
+
 - [DiffusionNFT](#diffusionnft)
 
 - [AWM: Advantage Weighted Matching](#awm-advantage-weighted-matching)
@@ -36,8 +42,11 @@ Flow-Factory provides unified implementations of state-of-the-art RL algorithms 
 At a high level, the supported algorithms fall into three paradigms:
 
 - **Coupled paradigm (GRPO and variants)**: Training timesteps are coupled with the SDE-based sampling dynamics, requiring tractable log-probability computation for policy gradient optimization.
-- **Decoupled paradigm (DPO, DiffusionNFT, AWM, DGPO, CRD)**: Training timesteps are decoupled from the actual sampling dynamics, making them inherently solver-agnostic.
-- **Distillation paradigm (DiffusionOPD)**: The student rolls out on-policy trajectories, then matches routed teacher targets without a reward or advantage stage.
+- **Decoupled paradigm (DPO, DiffusionNFT, AWM, DGPO, CRD, TDM-R1)**: Training timesteps are decoupled from the actual sampling dynamics, making them inherently solver-agnostic.
+- **Distillation paradigm (DiffusionOPD, DMD2, TDM)**: Students match flow-matching targets. DiffusionOPD uses a teacher; DMD2 and TDM keep a fake score on one model bundle and update it before the generator.
+
+DMD2, TDM, and TDM-R1 update fake first. TDM-R1 then updates the surrogate
+before the generator.
 
 ## GRPO
 
@@ -272,7 +281,7 @@ train:
     clip_range: 1.0e-5        # PPO clip range (scalar is expanded to (-c, c)).
 ```
 
-Another choice for the reference model in "CFG-free" mode is to use an EMA model as a dynamic reference model, as proposed in TDM-R1 [[12]](#ref12). In this case, dpo_beta is typically set within a larger range of 2000 ~ 5000:
+Another DGPO choice for the loss reference is a dynamic EMA model.
 
 ```yaml
 #  CFG-free in both rollout and training. With dynamic reference model.
@@ -305,7 +314,7 @@ train:
     clip_kl: false            # Optionally clip the KL loss using the same ratio mask.
     clip_range: 1.0e-2        # PPO clip range (scalar is expanded to (-c, c)).
     adv_clip_range: 5.0       # Advantage clipping range.
-    use_ema_ref: false        # If true, use ema_ref (not the frozen ref) as the DGPO loss reference (TDM-R1 dynamic ref).
+    use_ema_ref: false        # If true, use ema_ref instead of the frozen DGPO loss reference.
 
     ema_ref_max_decay: 0.3    # Cap of the adaptive decay.
     ema_ref_ramp_rate: 1.0e-3 # Adaptive decay = min(ema_ref_max_decay, ema_ref_ramp_rate * step).
@@ -343,6 +352,129 @@ DGPO's group-level sigmoid reweighting is only meaningful if every optimizer ste
 **Geometric constraint**: `(num_replicas × per_device_batch_size) % group_size == 0` must hold so that every global micro-batch packs an integer number of complete groups. `Arguments._align_for_group_distributed` auto-adjusts `group_size` (and then `unique_sample_num_per_epoch`) at init time to satisfy this, so no manual tuning is needed.
 
 For a complete runnable setup, see `examples/dgpo/lora/sd3_5/default.yaml`.
+
+## DMD2
+
+`dmd2` is a data-free distribution-matching core on one prepared model bundle
+and one optimizer root. Trainable roles are `generator` and `fake`. Each outer
+iteration consumes `gradient_accumulation_steps` distinct dataloader batches
+(default auto GAS=1). Distillation does **not** auto-align
+`unique_sample_num_per_epoch` to group-size geometry; set GAS manually for a
+larger effective batch. Same-role accumulation only: `optimize()` then runs
+`ttur_fake_updates` fake steps (default 5) before one generator step.
+
+Flow conversions:
+
+```text
+x_t = (1 - σ) x0 + σ ε
+v = ε - x0
+x0̂ = x_t - σ v
+```
+
+Each deterministic rollout stores all `num_inference_steps + 1` boundaries. A
+replay unit draws one boundary, then samples `σ` uniformly from
+`perturbation_timestep_range` (default `(0.02, 0.98)`). Fake minimizes velocity
+MSE on detached generated `x0`; generator uses the stop-grad x0 DMD direction
+against the frozen reference and `fake` scores.
+
+The reference score is not a third role. It is the pre-finetune teacher, i.e. the
+same components at an earlier point in time, so it is reached through
+`adapter.use_ref_parameters()` rather than a declared component variant: it holds
+no gradients and no optimizer state and must not cost a bundle member.
+
+```yaml
+train:
+    trainer_type: 'dmd2'
+    ttur_fake_updates: 5
+    perturbation_timestep_range: [0.02, 0.98]
+optimizers:
+  - name: generator
+    learning_rate: 1.0e-5
+  - name: fake
+    learning_rate: 1.0e-5
+```
+
+Optimizer hyperparameters come from the top-level `optimizers` list, one entry per
+role. Omitting it uses the algorithm's published defaults. A role may select `muon`
+there without the algorithm knowing the optimizer exists.
+
+### Reward monitoring
+
+The distillation loss is reward-free, but image quality is still worth watching.
+Configure `eval_rewards` against an eval dataset and the shared epoch loop scores
+samples on `eval.eval_freq`, exactly as it does for GRPO:
+
+```yaml
+eval:
+  eval_freq: 50
+
+eval_rewards:
+  - name: quality
+    reward_model: pickscore
+```
+
+Training rewards remain rejected for `dmd2` and `tdm`: an eval-only signal must not
+become a training signal by accident. `tdm-r1` is the exception, since its generator
+objective is reward-driven and it requires training rewards.
+
+See [`examples/dmd2/lora/sd3_5/ocr.yaml`](../examples/dmd2/lora/sd3_5/ocr.yaml)
+for a validated four-step SD3.5 setup.
+
+## TDM
+
+`tdm` extends DMD2 to a few-step trajectory. Each outer iteration consumes
+`gradient_accumulation_steps` distinct dataloader batches. For every microbatch,
+K boundary units are averaged in that microbatch only. Chronology is still fake
+first: `R` fake phases, then one generator phase. Interval validation keeps
+interior `σ > 0`. Fake may use importance-weighted x0 MSE (`tdm_snr_gamma`);
+generator uses Huber or the same stop-grad x0 surrogate.
+
+```yaml
+train:
+    trainer_type: 'tdm'
+    ttur_fake_updates: 5
+    num_inference_steps: 4
+    use_huber: true
+    huber_c: 1.0e-3
+    tdm_snr_gamma: 5.0
+```
+
+See [`examples/tdm/lora/sd3_5/ocr.yaml`](../examples/tdm/lora/sd3_5/ocr.yaml).
+
+## TDM-R1
+
+`tdm-r1` adds a learned `surrogate` role on top of TDM's `generator` and `fake`,
+and queries the same frozen pretrained reference through `use_ref_parameters()`.
+Each `optimize()` call is sequential: fake × `R`, one surrogate step, then one
+generator step. With `group_contiguous`, each rank holds complete groups and
+preference reductions stay rank-local. With `group_distributed`, every group is
+split evenly across ranks and preference statistics are reduced globally. Startup
+validation enforces the selected sampler's group geometry.
+Generator preference scores the live replayed boundary and reuses the TDM
+reference query. The surrogate uses `group_preference_loss` on rewards.
+Generator loss keeps the TDM distribution anchor and mixes two reward directions as
+`tdm_weight * cfg_reward + (1 - tdm_weight) * surrogate_reward`.
+
+DeepSpeed ZeRO-1/2 is allowed under sequential phases, the same as DMD2/TDM.
+ZeRO-3 remains globally unsupported. DDP, FSDP1, FSDP2, and ZeRO-2 have real
+SD3.5 backward/checkpoint coverage; the published OCR recipe additionally validates
+the official TDM initialization and all three role updates on 16-GPU FSDP2, while
+its production LoRA launch uses DeepSpeed ZeRO-2.
+
+```yaml
+train:
+    trainer_type: 'tdm-r1'
+    ttur_fake_updates: 1
+    tdm_weight: 0.3
+    surrogate_preference_beta: 10.0
+    advantage_aggregation: 'gdpo'
+    advantage_clip_range: 5.0
+```
+
+See [`examples/tdm_r1/lora/sd3_5/ocr.yaml`](../examples/tdm_r1/lora/sd3_5/ocr.yaml)
+for the official-aligned SD3.5 OCR setup: rank-32 LoRA, G24, 48 prompt groups,
+`beta_dpo=10`, `tdm_weight=0.3`, and one fake/surrogate/generator update per epoch.
+Related work: [[12]](#ref12).
 
 ## DiffusionNFT
 
@@ -603,7 +735,7 @@ Each teacher's `applicable_datasets` must reference declared `data.datasets[*].n
 * <a name="ref9"></a>[9] [**<u>C</u>oefficients-<u>P</u>reserving <u>S</u>ampling** for Reinforcement Learning with Flow Matching](https://arxiv.org/abs/2509.05952)
 * <a name="ref10"></a>[10] [**<u>A</u>dvantage <u>W</u>eighted <u>M</u>atching**: Aligning RL with Pretraining in Diffusion Models](https://arxiv.org/abs/2509.25050)
 * <a name="ref11"></a>[11] [**Diffusion-DPO**: Diffusion Model Alignment Using Direct Preference Optimization](https://arxiv.org/abs/2311.12908)
-* <a name="ref12"></a>[12] [**TDM-R1**: Reinforcing Few-Step Diffusion Models with Non-Differentiable Reward](https://arxiv.org/abs/2510.08425)
+* <a name="ref12"></a>[12] [**TDM-R1**: Reinforcing Few-Step Diffusion Models with Non-Differentiable Reward](https://arxiv.org/abs/2603.07700)
 * <a name="ref13"></a>[13] [**CRD**: Diffusion Reinforcement Learning via Centered Reward Distillation](https://arxiv.org/abs/2603.14128)
 * <a name="ref14"></a>[14] [**DiffusionOPD**: A Unified Perspective of On-Policy Distillation in Diffusion Models](https://arxiv.org/abs/2605.15055)
 * <a name="ref15"></a>[15] [**Flow-DPPO**: Divergence Proximal Policy Optimization for Flow Matching Models](https://arxiv.org/abs/2606.11025) ([Code](https://github.com/Tencent-Hunyuan/UniRL/tree/main/FlowDPPO#readme))

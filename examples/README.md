@@ -10,7 +10,7 @@ examples/{algorithm}/{finetune_type}/{model_type}/{variant}.yaml
 
 | Level | Description | Examples |
 |-------|-------------|---------|
-| `algorithm` | Training algorithm | `grpo`, `dppo`, `nft`, `awm`, `dgpo`, `dpo`, `crd`, `opd` |
+| `algorithm` | Training algorithm | `grpo`, `dppo`, `nft`, `awm`, `dgpo`, `dpo`, `crd`, `opd`, `dmd2`, `tdm`, `tdm_r1` |
 | `finetune_type` | Parameter-efficient or full | `lora`, `full` |
 | `model_type` | Model family (underscore-separated) | `flux1`, `sd3_5`, `wan21`, `ltx2` |
 | `variant` | Config variant | `default.yaml`, `nocfg.yaml`, `t2v.yaml` |
@@ -23,6 +23,14 @@ examples/{algorithm}/{finetune_type}/{model_type}/{variant}.yaml
 ```bash
 ff-train examples/grpo/lora/flux1/default.yaml
 ```
+
+## DMD2 and TDM
+
+- [`dmd2` SD3.5 OCR recipe](dmd2/lora/sd3_5/ocr.yaml) — validated in a
+  distributed OCR training run.
+- [`tdm` SD3.5 OCR recipe](tdm/lora/sd3_5/ocr.yaml) — official conditional-noise objective.
+- [`tdm-r1` SD3.5 OCR recipe](tdm_r1/lora/sd3_5/ocr.yaml) — official G24
+  fake-surrogate-generator objective initialized from the released TDM adapter.
 
 ## Contributing
 

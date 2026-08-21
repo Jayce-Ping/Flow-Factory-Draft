@@ -29,6 +29,7 @@ For other versions of CUDA, please refer to the official documentation of Paddle
 """
 
 import json
+import re
 from typing import Any, Optional
 
 import numpy as np
@@ -41,6 +42,7 @@ from ..utils.logger_utils import setup_logger
 from .abc import GroupwiseRewardModel, PointwiseRewardModel, RewardModelOutput
 
 logger = setup_logger(__name__)
+_QUOTED_TEXT = re.compile(r'["“](.*?)["”]')
 
 try:
     from paddleocr import PaddleOCR
@@ -78,20 +80,25 @@ class OCRRewardModel(PointwiseRewardModel):
         self,
         prompt: list[str],
         image: list[Image.Image],
-        metadata: list[str],
+        metadata: Optional[list[str]] = None,
     ) -> list[float]:
         """Compute mean target-text fidelity for each image."""
-        if len(prompt) != len(image) or len(prompt) != len(metadata):
+        if len(prompt) != len(image) or (
+            metadata is not None and len(prompt) != len(metadata)
+        ):
             raise ValueError(
-                "expected equal OCR batch lengths for prompt, image, and metadata; "
-                f"received prompt={len(prompt)}, image={len(image)}, metadata={len(metadata)}"
+                "expected equal OCR batch lengths for prompt and image, with optional "
+                "metadata matching that length; "
+                f"received prompt={len(prompt)}, image={len(image)}, "
+                f"metadata={None if metadata is None else len(metadata)}"
             )
 
         rewards: list[float] = []
-        for sample_index, (img, meta) in enumerate(zip(image, metadata)):
+        for sample_index, (sample_prompt, img) in enumerate(zip(prompt, image)):
             if isinstance(img, Image.Image):
                 img = np.array(img)
-            targets = self._targets_from_metadata(meta, sample_index)
+            sample_metadata = None if metadata is None else metadata[sample_index]
+            targets = self._targets_for_sample(sample_prompt, sample_metadata, sample_index)
 
             result = self.model.predict(img)
             rec_texts: list[str] = []
@@ -103,19 +110,43 @@ class OCRRewardModel(PointwiseRewardModel):
 
         return rewards
 
+    @classmethod
+    def _targets_for_sample(
+        cls,
+        prompt: str,
+        metadata: Optional[str],
+        sample_index: int,
+    ) -> list[str]:
+        """Prefer explicit metadata; otherwise extract quoted text from the prompt."""
+        if metadata is not None:
+            parsed = cls._parse_metadata(metadata, sample_index)
+            if "visible_texts" in parsed:
+                return cls._targets_from_metadata(metadata, sample_index)
+        return cls._targets_from_prompt(prompt, sample_index)
+
+    @staticmethod
+    def _targets_from_prompt(prompt: str, sample_index: int) -> list[str]:
+        """Extract nonempty straight- or curly-quoted OCR targets."""
+        if not isinstance(prompt, str):
+            raise TypeError(
+                f"expected string prompt for OCR sample {sample_index}, "
+                f"received {type(prompt).__name__}: {prompt!r}"
+            )
+        targets = [
+            target.strip()
+            for target in _QUOTED_TEXT.findall(prompt)
+            if target.strip()
+        ]
+        if not targets:
+            raise ValueError(
+                f"expected quoted OCR target in prompt for sample {sample_index}, "
+                f"received {prompt!r}"
+            )
+        return targets
+
     @staticmethod
     def _targets_from_metadata(metadata: str, sample_index: int) -> list[str]:
-        if not isinstance(metadata, str):
-            raise TypeError(
-                f"expected JSON string metadata for OCR sample {sample_index}, "
-                f"received {type(metadata).__name__}: {metadata!r}"
-            )
-        parsed = json.loads(metadata)
-        if not isinstance(parsed, dict):
-            raise TypeError(
-                f"expected metadata object for OCR sample {sample_index}, "
-                f"received {type(parsed).__name__}: {parsed!r}"
-            )
+        parsed = OCRRewardModel._parse_metadata(metadata, sample_index)
         targets: Any = parsed.get("visible_texts")
         if isinstance(targets, str):
             targets = json.loads(targets)
@@ -132,6 +163,28 @@ class OCRRewardModel(PointwiseRewardModel):
                 f"{sample_index}, received an empty list"
             )
         return targets
+
+    @staticmethod
+    def _parse_metadata(metadata: str, sample_index: int) -> dict[str, Any]:
+        """Parse one metadata object with sample-local diagnostics."""
+        if not isinstance(metadata, str):
+            raise TypeError(
+                f"expected JSON string metadata for OCR sample {sample_index}, "
+                f"received {type(metadata).__name__}: {metadata!r}"
+            )
+        try:
+            parsed = json.loads(metadata)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"expected JSON object metadata for OCR sample {sample_index}, "
+                f"received invalid JSON: {metadata!r}"
+            ) from error
+        if not isinstance(parsed, dict):
+            raise TypeError(
+                f"expected metadata object for OCR sample {sample_index}, "
+                f"received {type(parsed).__name__}: {parsed!r}"
+            )
+        return parsed
 
     @staticmethod
     def _normalize_text(text: str) -> str:
@@ -161,7 +214,7 @@ class OCRRewardModel(PointwiseRewardModel):
         self,
         prompt: list[str],
         video: list[list[Image.Image]],
-        metadata: list[str],
+        metadata: Optional[list[str]],
         batch_size: int,
     ) -> torch.Tensor:
         """
@@ -174,7 +227,11 @@ class OCRRewardModel(PointwiseRewardModel):
         frame_counts = [len(clip) for clip in video]
         flat_images = [frame for clip in video for frame in clip]
         flat_prompts = [p for p, n in zip(prompt, frame_counts) for _ in range(n)]
-        flat_metadata = [m for m, n in zip(metadata, frame_counts) for _ in range(n)]
+        flat_metadata = (
+            None
+            if metadata is None
+            else [m for m, n in zip(metadata, frame_counts) for _ in range(n)]
+        )
 
         # Batched score computation
         all_scores = []
@@ -206,11 +263,6 @@ class OCRRewardModel(PointwiseRewardModel):
             raise ValueError("Only one of image or video can be provided.")
         if image is None and video is None:
             raise ValueError("OCR reward requires image or video input, received neither.")
-        if metadata is None:
-            raise ValueError(
-                "OCR reward requires metadata.visible_texts for every sample, received metadata=None"
-            )
-
         batch_size = getattr(self.config, "batch_size", len(prompt))
 
         if video is not None:

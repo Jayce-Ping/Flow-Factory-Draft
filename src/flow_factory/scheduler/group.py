@@ -136,3 +136,40 @@ class SchedulerGroup(Mapping[str, Any]):
                 f"{type(seed).__name__}: {seed!r}"
             )
         self._dispatch("set_seed", seed)
+
+    def sample_ode_step_index(self, draw_index: int = 0) -> int:
+        """Draw one rank-synchronized ODE transition in component order.
+
+        Every component scheduler receives the same epoch-derived seed through
+        :meth:`set_seed`. Requiring them to return the same index protects a joint
+        trajectory from replaying different component boundaries.
+
+        Args:
+            draw_index: Deterministic draw counter under the current epoch seed.
+
+        Returns:
+            The shared zero-based transition index.
+        """
+        selected = []
+        for name in self._names:
+            scheduler = self._schedulers[name]
+            sampler = getattr(scheduler, "sample_ode_step_index", None)
+            if not callable(sampler):
+                raise TypeError(
+                    f"expected scheduler component {name!r} to provide callable "
+                    "sample_ode_step_index(draw_index)"
+                )
+            index = sampler(draw_index)
+            if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+                raise ValueError(
+                    f"expected scheduler component {name!r} to select a non-negative int "
+                    f"ODE step, received {index!r}"
+                )
+            selected.append(index)
+        if len(set(selected)) != 1:
+            raise ValueError(
+                "expected every scheduler component to select the same ODE replay step "
+                f"for draw_index={draw_index}, received "
+                f"{dict(zip(self._names, selected))!r}"
+            )
+        return selected[0]

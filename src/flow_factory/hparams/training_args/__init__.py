@@ -26,11 +26,14 @@ from ._registry import get_training_args_class, list_registered_training_args
 from .awm import AWMTrainingArguments
 from .crd import CRDTrainingArguments
 from .dgpo import DGPOTrainingArguments
+from .dmd2 import DMD2TrainingArguments
 from .dpo import DPOTrainingArguments
 from .dppo import DPPOTrainingArguments
 from .grpo import GRPOTrainingArguments
 from .nft import NFTTrainingArguments
 from .opd import DiffusionOPDTrainingArguments, TeacherConfig
+from .tdm import TDMTrainingArguments
+from .tdm_r1 import TDMR1TrainingArguments
 
 __all__ = [
     "EvaluationArguments",
@@ -41,6 +44,9 @@ __all__ = [
     "AWMTrainingArguments",
     "DPOTrainingArguments",
     "DGPOTrainingArguments",
+    "DMD2TrainingArguments",
+    "TDMTrainingArguments",
+    "TDMR1TrainingArguments",
     "CRDTrainingArguments",
     "DiffusionOPDTrainingArguments",
     "TeacherConfig",

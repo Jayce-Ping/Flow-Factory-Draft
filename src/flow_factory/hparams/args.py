@@ -26,7 +26,7 @@ import math
 import warnings
 from dataclasses import dataclass, field, fields
 from datetime import datetime
-from typing import Any, Literal, Optional
+from typing import Any, Dict, Literal, Optional
 
 import yaml
 
@@ -42,7 +42,10 @@ from .reward_args import MultiRewardArguments, RewardArguments
 from .scheduler_args import SchedulerArguments
 from .training_args import (
     DiffusionOPDTrainingArguments,
+    DMD2TrainingArguments,
     EvaluationArguments,
+    TDMR1TrainingArguments,
+    TDMTrainingArguments,
     TrainingArguments,
     get_training_args_class,
 )
@@ -195,6 +198,87 @@ class Arguments(ArgABC):
             ]
         )
 
+    def _validate_multirole_training_contract(self) -> None:
+        """Validate reward and dynamics contracts before batch geometry."""
+        training_args = self.training_args
+        if isinstance(training_args, TDMR1TrainingArguments):
+            if not self.reward_args:
+                raise ValueError(
+                    "trainer_type='tdm-r1' requires at least one training reward, "
+                    "but rewards is empty."
+                )
+            if training_args.group_size < 2:
+                raise ValueError(
+                    "trainer_type='tdm-r1' requires complete reward groups with "
+                    f"group_size >= 2, received group_size={training_args.group_size}."
+                )
+        elif isinstance(training_args, DMD2TrainingArguments) and self.reward_args:
+            raise ValueError(
+                f"trainer_type={training_args.trainer_type!r} does not accept training "
+                f"rewards, but received {len(self.reward_args)} reward configuration(s)."
+            )
+
+        if (
+            isinstance(training_args, TDMTrainingArguments)
+            and self.scheduler_args.dynamics_type != "ODE"
+        ):
+            raise ValueError(
+                f"trainer_type={training_args.trainer_type!r} requires "
+                "scheduler.dynamics_type='ODE', received "
+                f"dynamics_type={self.scheduler_args.dynamics_type!r}."
+            )
+
+    def _validate_dmd2_batch_geometry(self) -> None:
+        """Require one generator step per distillation outer iteration."""
+        training_args = self.training_args
+        if not isinstance(training_args, DMD2TrainingArguments):
+            return
+
+        if training_args.gradient_step_per_epoch != 1:
+            raise ValueError(
+                f"{training_args.trainer_type} requires gradient_step_per_epoch=1; "
+                f"received gradient_step_per_epoch={training_args.gradient_step_per_epoch}, "
+                f"num_batches_per_epoch={training_args.num_batches_per_epoch}"
+            )
+        accumulation_steps = training_args.gradient_accumulation_steps
+        if (
+            not isinstance(accumulation_steps, int)
+            or isinstance(accumulation_steps, bool)
+            or accumulation_steps < 1
+        ):
+            raise ValueError(
+                f"{training_args.trainer_type} expected gradient_accumulation_steps >= 1 "
+                "as an int; "
+                f"received gradient_accumulation_steps={accumulation_steps!r}"
+            )
+
+    def _validate_distillation_manual_geometry(self) -> None:
+        """Reject distillation configs that do not tile, without auto-aligning them."""
+        ta = self.training_args
+        world_size = get_world_size()
+        sample_num_per_iteration = world_size * ta.per_device_batch_size
+        total = ta.unique_sample_num_per_epoch * ta.group_size
+        if total % sample_num_per_iteration != 0:
+            raise ValueError(
+                f"{ta.trainer_type} does not auto-align unique_sample_num_per_epoch or "
+                "group_size; expected unique_sample_num_per_epoch"
+                f"({ta.unique_sample_num_per_epoch}) * group_size({ta.group_size}) % "
+                f"(num_replicas({world_size}) * per_device_batch_size"
+                f"({ta.per_device_batch_size})) == 0, received remainder "
+                f"{total % sample_num_per_iteration}"
+            )
+        if not isinstance(ta, TDMR1TrainingArguments):
+            return
+        # Which shapes tile is a property of the resolved sampler, so the geometry is
+        # checked against that one rather than against the strictest of them.
+        sampler_type = self.data_args.sampler_type
+        reason = self._tdm_r1_sampler_support().get(sampler_type)
+        if reason is not None:
+            raise ValueError(
+                f"tdm-r1 does not auto-align its batch geometry, and sampler_type="
+                f"{sampler_type!r} cannot deliver whole reward groups here: {reason}"
+            )
+
     def __post_init__(self):
         if self.log_args.run_name is None:
             time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -231,9 +315,11 @@ class Arguments(ArgABC):
         # (the config schema stays permissive for a future multi-teacher trainer).
         self._validate_teacher_sources()
         self._resolve_scheduler_sde_defaults()
+        self._validate_multirole_training_contract()
         self._resolve_sampler_type()
         self._align_batch_geometry()
         self._adjust_gradient_accumulation()
+        self._validate_dmd2_batch_geometry()
 
     def _assign_source_ids(self) -> None:
         """Stamp each ``data.datasets[*]`` entry with a stable monotonic id.
@@ -577,6 +663,10 @@ class Arguments(ArgABC):
 
         trainer_type = str(ta.trainer_type).lower()
 
+        if trainer_type == "tdm-r1":
+            self.data_args.sampler_type = self._resolve_tdm_r1_sampler_type(user_choice)
+            return
+
         if (
             user_choice in {"distributed_k_repeat", "group_distributed"}
             and self._has_async_rewards
@@ -619,6 +709,116 @@ class Arguments(ArgABC):
             )
             self.data_args.sampler_type = "group_distributed"
 
+    def _tdm_r1_sampler_support(self) -> Dict[str, Optional[str]]:
+        """Report why each sampler can or cannot serve TDM-R1's group preference.
+
+        Returns:
+            Sampler name to the reason it is unusable, or ``None`` when usable.
+        """
+        ta = self.training_args
+        world_size = get_world_size()
+        group_size = ta.group_size
+        batch_size = ta.per_device_batch_size
+        unique_num = ta.unique_sample_num_per_epoch
+
+        contiguous_reason: Optional[str] = None
+        if batch_size % group_size != 0:
+            contiguous_reason = (
+                f"per_device_batch_size({batch_size}) % group_size({group_size}) != 0, so a "
+                "rank-local microbatch would straddle a group boundary"
+            )
+        elif unique_num % world_size != 0:
+            contiguous_reason = (
+                f"unique_sample_num_per_epoch({unique_num}) % num_replicas({world_size}) != 0, "
+                "so complete groups cannot be dealt one rank at a time"
+            )
+
+        distributed_reason: Optional[str] = None
+        if group_size % world_size != 0:
+            distributed_reason = (
+                f"group_size({group_size}) % num_replicas({world_size}) != 0, so a group cannot "
+                "be split evenly across ranks"
+            )
+        elif (world_size * batch_size) % group_size != 0:
+            distributed_reason = (
+                f"num_replicas({world_size}) * per_device_batch_size({batch_size}) % "
+                f"group_size({group_size}) != 0, so a global microbatch would not hold whole groups"
+            )
+
+        return {
+            "group_contiguous": contiguous_reason,
+            "group_distributed": distributed_reason,
+        }
+
+    def _resolve_tdm_r1_sampler_type(self, user_choice: str) -> str:
+        """Pick the sampler whose group layout TDM-R1's preference loss can read.
+
+        TDM-R1 needs each preference microbatch to carry whole reward groups, but that
+        is a property of the sampler rather than a constraint the batch shape has to
+        satisfy: ``group_contiguous`` keeps a whole group on one rank, while
+        ``group_distributed`` gives every rank an equal share of every group and sums
+        the group logits across ranks. Requiring only the former forced
+        ``per_device_batch_size % group_size == 0`` on every run, which rules out the
+        common case of one group per global step.
+
+        Args:
+            user_choice: Configured ``data.sampler_type``, possibly ``"auto"``.
+
+        Returns:
+            The resolved sampler name.
+
+        Raises:
+            ValueError: If the choice cannot deliver whole groups, or if no sampler can.
+        """
+        support = self._tdm_r1_sampler_support()
+
+        # Group-wise async rewards are scored on one rank, so they need the whole group
+        # there regardless of what the preference loss could otherwise handle.
+        if self._has_async_rewards:
+            reason = support["group_contiguous"]
+            if reason is not None:
+                raise ValueError(
+                    "tdm-r1 with async rewards requires sampler_type='group_contiguous', "
+                    f"which this geometry cannot satisfy: {reason}"
+                )
+            if user_choice not in {"auto", "group_contiguous"}:
+                logger.warning(
+                    f"Async rewards require 'group_contiguous' sampler. Overriding "
+                    f"'{user_choice}' -> 'group_contiguous'."
+                )
+            return "group_contiguous"
+
+        if user_choice == "distributed_k_repeat":
+            logger.warning(
+                "TDM-R1 cannot use sampler_type='distributed_k_repeat': it scatters a group's "
+                "members over arbitrary ranks, leaving each rank a different set of partial "
+                "groups and no shared group-id space to sum the preference logits in. "
+                "Selecting a group-preserving sampler instead."
+            )
+            user_choice = "auto"
+
+        if user_choice in support:
+            reason = support[user_choice]
+            if reason is not None:
+                raise ValueError(
+                    f"tdm-r1 cannot use sampler_type={user_choice!r} with this batch geometry: "
+                    f"{reason}"
+                )
+            return user_choice
+
+        # Prefer the rank-local layout: it reads its group logits without a collective.
+        if support["group_contiguous"] is None:
+            return "group_contiguous"
+        if support["group_distributed"] is None:
+            return "group_distributed"
+        raise ValueError(
+            "tdm-r1 needs each microbatch to carry whole reward groups and no sampler can "
+            "deliver that here. 'group_contiguous' is unusable because "
+            f"{support['group_contiguous']}; 'group_distributed' is unusable because "
+            f"{support['group_distributed']}. Set per_device_batch_size to a multiple of "
+            "group_size, or group_size to a multiple of num_replicas."
+        )
+
     def _align_batch_geometry(self) -> None:
         """Align ``unique_sample_num_per_epoch`` (and, for ``group_distributed``,
         ``group_size``) to sampler constraints, then recompute derived batch
@@ -636,6 +836,21 @@ class Arguments(ArgABC):
         one and then updates derived quantities (``num_batches_per_epoch`` +
         ``gradient_accumulation_steps``).
         """
+
+        if isinstance(self.training_args, DMD2TrainingArguments):
+            self._validate_distillation_manual_geometry()
+            # Refusing to auto-align the total is not the same as refusing to say how it
+            # divides between sources. The multi-source loader reads the per-source count
+            # off each training spec, so skipping the write-back left it None and the
+            # dataloader raised "per-source unique_sample_num_per_epoch is missing".
+            # `step=1` makes the shared allocator a pure partition: it distributes the
+            # total the config already validated instead of rounding it up.
+            self._align_unique_sample_num(
+                sampler_name=self.training_args.trainer_type,
+                base_step_func=lambda: 1,
+            )
+            self._recompute_derived_batch_quantities()
+            return
         sampler_type = self.data_args.sampler_type
         if sampler_type == "distributed_k_repeat":
             self._align_for_distributed_k_repeat()
@@ -934,8 +1149,11 @@ class Arguments(ArgABC):
         value is treated as final.
         """
         if not self.training_args._manual_gradient_accumulation_steps:
-            num_train_timesteps = self.training_args.get_num_train_timesteps(self)
-            self.training_args.gradient_accumulation_steps *= num_train_timesteps
+            if isinstance(self.training_args, DMD2TrainingArguments):
+                self.training_args.gradient_accumulation_steps = 1
+            else:
+                num_train_timesteps = self.training_args.get_num_train_timesteps(self)
+                self.training_args.gradient_accumulation_steps *= num_train_timesteps
         else:
             logger.info(
                 f"`gradient_accumulation_steps` manually set to "

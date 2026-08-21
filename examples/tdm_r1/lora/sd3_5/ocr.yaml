@@ -1,0 +1,148 @@
+# SD3.5-Medium TDM-R1 OCR recipe aligned with Luo-Yihong/TDM-R1.
+# Official preset: config/tdmr1_clean.py:general_ocr_sd3_8gpu_G24_4step.
+# Convert the released TDM initializer before launching:
+#   python scripts/convert_tdm_checkpoint.py \
+#     --checkpoint tdm_sd3-5_lora.ckpt --output models/tdm_sd35/ff_adapter
+# Scaling 8 -> 16 GPUs keeps 48 x G24 = 1152 samples: batch24 and GAS3 still
+# produce one fake, one surrogate, and one generator update per epoch.
+# The public code samples two of four boundary indices uniformly. Flow-Factory
+# averages all four, preserving the same uniform objective expectation with lower variance.
+# Provide the main-process address and machine rank through the launcher environment.
+
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 16
+num_machines: 2
+main_process_port: 29500
+mixed_precision: "bf16"
+
+data:
+  datasets:
+    - name: ocr
+      dataset_dir: "dataset/ocr"
+      train:
+        weight: 1
+        max_dataset_size: 1024
+      eval:
+        split: test
+        max_dataset_size: 16
+  preprocessing_batch_size: 8
+  dataloader_num_workers: 16
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  preprocess_parallelism: local
+  sampler_type: "auto"
+
+model:
+  model_type: "sd3-5"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  finetune_type: "lora"
+  lora_rank: 32
+  lora_alpha: 64
+  target_components: "transformer"
+  target_modules: "default"
+  resume_path: "models/tdm_sd35/ff_adapter"
+  resume_type: "lora"
+  frozen_parameters_dtype:
+    default: null
+    transformers: "bf16"
+    text_encoders: "bf16"
+    vae: "bf16"
+  trainable_parameters_dtype: "bf16"
+
+log:
+  run_name: null
+  project: "Flow-Factory-TDM-R1"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 60
+  save_model_only: true
+
+train:
+  trainer_type: "tdm-r1"
+  max_epochs: 10000
+  resolution: 512
+  num_inference_steps: 4
+  guidance_scale: 1.0
+  real_guidance_scale: 4.5
+  cfg_reward_scale: 4.5
+  per_device_batch_size: 24
+  group_size: 24
+  unique_sample_num_per_epoch: 48
+  gradient_step_per_epoch: 1
+  gradient_accumulation_steps: 3
+  ttur_fake_updates: 1
+  tdm_weight: 0.3
+  surrogate_preference_beta: 10.0
+  surrogate_reference_beta: 0.001
+  surrogate_reference_threshold: 0.05
+  surrogate_clip_range: 1.0e-3
+  surrogate_slow_decay_min: 0.001
+  surrogate_slow_decay_max: 0.3
+  advantage_clip_range: 5.0
+  advantage_aggregation: "gdpo"
+  use_huber: false
+  use_time_weighting: true
+  ema_decay: 0.9
+  ema_update_interval: 1
+  ema_device: "cuda"
+  enable_gradient_checkpointing: true
+  offload_samples_to_cpu: true
+  latent_storage_dtype: "fp16"
+  replay_rtol: 0.005  # Validated bf16 replay tolerance.
+  replay_atol: 0.005
+  seed: 42
+
+scheduler:
+  dynamics_type: "ODE"
+  seed: 42
+
+rewards:
+  - name: "ocr"
+    reward_model: "OCR"
+    weight: 1.0
+    batch_size: 1
+    device: "cpu"
+    dtype: "float32"
+    async_reward: false
+    num_workers: 1
+    applicable_datasets: [ocr]
+
+eval:
+  eval_freq: 60
+  resolution: 512
+  per_device_batch_size: 8
+  guidance_scale: 1.0
+  num_inference_steps: 4
+  seed: 42
+
+eval_rewards:
+  - name: "ocr"
+    reward_model: "OCR"
+    weight: 1.0
+    batch_size: 1
+    device: "cpu"
+    dtype: "float32"
+    async_reward: false
+    num_workers: 1
+    applicable_datasets: [ocr]
+
+optimizers:
+  - name: "generator"
+    learning_rate: 7.5e-5
+    weight_decay: 1.0e-4
+    betas: [0.0, 0.999]
+    eps: 1.0e-8
+    max_grad_norm: 1.0
+  - name: "fake"
+    learning_rate: 3.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.0, 0.999]
+    eps: 1.0e-8
+    max_grad_norm: 1.0
+  - name: "surrogate"
+    learning_rate: 3.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    max_grad_norm: 1.0

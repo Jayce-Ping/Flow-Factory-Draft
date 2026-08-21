@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Mapping, Optional, Tuple, cast
 
 import torch
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedType
 
 # Roles are the trainer's vocabulary. The model layer only knows component
 # variants under caller-chosen names; the mapping from a role to a variant is
@@ -114,6 +114,7 @@ class OptimizationRole:
     optimizer_group_ids: Tuple[int, ...]
     step: int = 0
     scheduler: Optional[Any] = None
+    last_grad_norm: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -319,8 +320,71 @@ class RoleOptimizationCoordinator:
                 f"expected scalar loss for role {role_name!r}, "
                 f"received shape {tuple(loss.shape)!r}"
             )
-        self.accelerator.backward(loss)
+        # DeepSpeed performs the optimizer step from inside `backward()` at the GAS
+        # boundary (`DeepSpeedOptimizerWrapper.step()` is intentionally a no-op), so
+        # role isolation has to cover this call as well as the explicit step below.
+        role = self.roles[role_name]
+        with self._active_optimizer_groups_only(role):
+            self.accelerator.backward(loss)
         self._microbatch_backward_count = 1
+
+    @contextmanager
+    def _active_optimizer_groups_only(self, role: OptimizationRole) -> Iterator[None]:
+        """Hide inactive parameter groups for one physical optimizer step.
+
+        Native AdamW skips parameters whose gradients are ``None``. DeepSpeed ZeRO-2
+        materializes partitioned zero gradients instead, so stepping the shared
+        optimizer also advances inactive roles' Adam state and mutates parameters that
+        already have momentum or weight decay. Temporarily emptying inactive groups
+        gives every backend the role-exclusive step this coordinator promises without
+        changing group order, hyperparameters, or checkpoint layout.
+
+        Args:
+            role: Active role whose optimizer groups remain populated.
+
+        Yields:
+            Control while only the active role owns parameters visible to ``step()``.
+        """
+        active_group_ids = set(role.optimizer_group_ids)
+        if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+            # Accelerate wraps DeepSpeedZeroOptimizer, whose step ignores its public
+            # param_groups and iterates internal `bit16_groups`. `_optimizer_step(i)` is
+            # the narrow seam that advances one group's AdamW parameters and state; all
+            # reduction, partition cleanup, and all-gather remain in DeepSpeed.step().
+            zero_optimizer = getattr(self.optimizer, "optimizer", None)
+            optimizer_step = getattr(zero_optimizer, "_optimizer_step", None)
+            if not callable(optimizer_step):
+                raise RuntimeError(
+                    "DeepSpeed multi-role optimization requires a callable "
+                    "DeepSpeedZeroOptimizer._optimizer_step(group_no) to isolate active "
+                    f"role {role.config.role_name!r}; received optimizer wrapper "
+                    f"{type(self.optimizer).__name__} with inner "
+                    f"{type(zero_optimizer).__name__}. This DeepSpeed version cannot "
+                    "guarantee inactive roles remain unchanged."
+                )
+
+            def active_only_optimizer_step(group_no: int) -> None:
+                if group_no in active_group_ids:
+                    optimizer_step(group_no)
+
+            zero_optimizer._optimizer_step = active_only_optimizer_step
+            try:
+                yield
+            finally:
+                zero_optimizer._optimizer_step = optimizer_step
+            return
+
+        hidden: Dict[int, Any] = {}
+        for group_id, group in enumerate(self.optimizer.param_groups):
+            if group_id in active_group_ids:
+                continue
+            hidden[group_id] = group["params"]
+            group["params"] = []
+        try:
+            yield
+        finally:
+            for group_id, parameters in hidden.items():
+                self.optimizer.param_groups[group_id]["params"] = parameters
 
     def finish_microbatch(self) -> bool:
         """Finish one replay unit and step only at a valid sync boundary.
@@ -329,6 +393,8 @@ class RoleOptimizationCoordinator:
             Whether the prepared optimizer applied a parameter update. Returns
             ``False`` for non-sync microbatches and mixed-precision overflow skips.
         """
+        # Both role-gradient assertions below read ``parameter.grad``; see
+        # ``_gradients_reach_parameters`` for why that is not universal.
         role_name = self.active_role_name
         if not self._microbatch_open:
             raise RuntimeError(
@@ -353,25 +419,38 @@ class RoleOptimizationCoordinator:
             )
 
         role = self.roles[role_name]
-        if not any(parameter.grad is not None for parameter in role.parameters):
-            raise RuntimeError(
-                f"active role {role_name!r} expected at least one gradient at the "
-                "sync boundary, received none"
+        if self._gradients_reach_parameters():
+            if not any(parameter.grad is not None for parameter in role.parameters):
+                raise RuntimeError(
+                    f"active role {role_name!r} expected at least one gradient at the sync "
+                    f"boundary, received none. Backend {self.accelerator.distributed_type}; "
+                    f"{self._role_ownership_report()}"
+                )
+            inactive_gradients = tuple(
+                other_name
+                for other_name, other_role in self.roles.items()
+                if other_name != role_name
+                and any(parameter.grad is not None for parameter in other_role.parameters)
             )
-        inactive_gradients = tuple(
-            other_name
-            for other_name, other_role in self.roles.items()
-            if other_name != role_name
-            and any(parameter.grad is not None for parameter in other_role.parameters)
-        )
-        if inactive_gradients:
-            raise RuntimeError(
-                f"inactive role gradients for {inactive_gradients!r} while role "
-                f"{role_name!r} is active; expected every inactive gradient to be None"
-            )
+            if inactive_gradients:
+                raise RuntimeError(
+                    f"inactive role gradients for {inactive_gradients!r} while role "
+                    f"{role_name!r} is active; expected every inactive gradient to be None"
+                )
 
-        self.accelerator.clip_grad_norm_(role.parameters, role.config.max_grad_norm)
-        self.optimizer.step()
+        # Kept so a caller can report it: a role whose gradient norm collapses or spikes
+        # is the first sign that its objective went wrong, and the losses alone do not
+        # show it.
+        clip_parameters = (
+            self.model_bundle.parameters() if self._uses_fsdp1() else role.parameters
+        )
+        grad_norm = self.accelerator.clip_grad_norm_(
+            clip_parameters,
+            role.config.max_grad_norm,
+        )
+        role.last_grad_norm = None if grad_norm is None else float(grad_norm)
+        with self._active_optimizer_groups_only(role):
+            self.optimizer.step()
         step_was_skipped = getattr(self.optimizer, "step_was_skipped", False)
         self.optimizer.zero_grad(set_to_none=True)
         self._phase_step_count = 1
@@ -386,6 +465,72 @@ class RoleOptimizationCoordinator:
         if role.scheduler is not None:
             role.scheduler.step()
         return True
+
+    def _role_ownership_report(self) -> str:
+        """Describe what every role owns right now, for a gradient failure to quote.
+
+        A role that reaches its sync boundary without gradients has either been handed
+        the wrong parameters or had them frozen since its forward, and telling those two
+        apart from the outside is otherwise a guessing game.
+
+        Returns:
+            One clause per role, plus which parameter identities the roles share.
+        """
+        clauses = []
+        for name, role in self.roles.items():
+            total = len(role.parameters)
+            trainable = sum(1 for parameter in role.parameters if parameter.requires_grad)
+            with_grad = sum(1 for parameter in role.parameters if parameter.grad is not None)
+            clauses.append(
+                f"{name}: {total} params, {trainable} require grad, {with_grad} have grad"
+            )
+        identities = {name: {id(p) for p in role.parameters} for name, role in self.roles.items()}
+        names = list(identities)
+        overlaps = [
+            f"{left}/{right} share {len(identities[left] & identities[right])}"
+            for index, left in enumerate(names)
+            for right in names[index + 1 :]
+            if identities[left] & identities[right]
+        ]
+        report = "; ".join(clauses)
+        if overlaps:
+            report = f"{report}; overlapping identities: {', '.join(overlaps)}"
+        return report
+
+    def _gradients_reach_parameters(self) -> bool:
+        """Report whether this backend leaves gradients on ``parameter.grad``.
+
+        DeepSpeed reduces gradients into the engine's own partitioned buffers and clears
+        ``parameter.grad``, so reading it there says nothing about whether a role produced
+        gradients -- the answer is always "none", for every role, always. Asserting on it
+        would reject every correct DeepSpeed run.
+
+        What the per-microbatch assertions guard against, a role that trains nothing, is
+        checked once at setup by the prepared-trainability guard, and DeepSpeed itself
+        raises if asked to step without gradients. So the loss here is narrow.
+
+        Returns:
+            Whether ``parameter.grad`` is authoritative for this backend.
+        """
+        return (
+            self.accelerator.distributed_type != DistributedType.DEEPSPEED
+            and not self._uses_fsdp1()
+        )
+
+    def _uses_fsdp1(self) -> bool:
+        """Return whether gradients live on FSDP1 flattened/sharded storage.
+
+        With ``use_orig_params=True``, an original parameter can expose no local
+        grad on ranks that do not own its shard, while another role's original
+        parameter can expose a non-None zero view into the same FlatParameter.
+        Those views are not authoritative for role ownership. FSDP1 clipping
+        likewise needs the complete prepared root so Accelerate delegates to
+        FSDP's collective norm implementation.
+        """
+        if self.accelerator.distributed_type != DistributedType.FSDP:
+            return False
+        fsdp_plugin = getattr(getattr(self.accelerator, "state", None), "fsdp_plugin", None)
+        return getattr(fsdp_plugin, "fsdp_version", 1) < 2
 
     def state_dict(self) -> Dict[str, Any]:
         """Return closed-phase role counters and optimizer-group ownership."""

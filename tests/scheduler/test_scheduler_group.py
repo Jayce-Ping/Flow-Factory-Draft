@@ -45,6 +45,11 @@ class SchedulerFake:
         """Record seed dispatch."""
         self.calls.append((self.name, "seed", seed))
 
+    def sample_ode_step_index(self, draw_index: int) -> int:
+        """Return the shared deterministic draw for group tests."""
+        self.calls.append((self.name, "ode_step", draw_index))
+        return draw_index % 4
+
 
 def test_scheduler_group_exposes_immutable_ordered_mapping_and_primary() -> None:
     calls: List[Tuple[Any, ...]] = []
@@ -119,3 +124,30 @@ def test_scheduler_group_rejects_invalid_construction(
 ) -> None:
     with pytest.raises(error, match=message):
         SchedulerGroup(schedulers, primary_name=primary_name)
+
+
+def test_scheduler_group_selects_one_shared_ode_boundary() -> None:
+    """Joint components must replay the same transition."""
+    calls: List[Tuple[Any, ...]] = []
+    group = SchedulerGroup(
+        {
+            "video": SchedulerFake("video", calls),
+            "audio": SchedulerFake("audio", calls),
+        },
+        primary_name="video",
+    )
+
+    assert group.sample_ode_step_index(6) == 2
+    assert calls == [("video", "ode_step", 6), ("audio", "ode_step", 6)]
+
+
+def test_scheduler_group_rejects_component_specific_ode_boundaries() -> None:
+    """Mixing different component transitions would corrupt a joint state."""
+    calls: List[Tuple[Any, ...]] = []
+    video = SchedulerFake("video", calls)
+    audio = SchedulerFake("audio", calls)
+    audio.sample_ode_step_index = lambda draw_index: (draw_index + 1) % 4
+    group = SchedulerGroup({"video": video, "audio": audio}, primary_name="video")
+
+    with pytest.raises(ValueError, match="same ODE replay step.*video.*audio"):
+        group.sample_ode_step_index(2)

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
@@ -534,6 +535,45 @@ def test_lora_materialization_uses_named_adapters_and_exact_new_parameter_identi
     _assert_all_owned_role_parameters_trainable(registry)
 
 
+def test_rebind_parameters_tracks_backend_replacements_by_stable_name() -> None:
+    """FSDP2-style replacement must not leave trainability writes on stale tensors."""
+    adapter = _TinyRoleAdapter("lora")
+    adapter.declare_component_variants([BASE_VARIANT, "fake", "surrogate"])
+    registry = adapter.component_variant_registry
+    stale_ids = {
+        id(parameter)
+        for variant_name in registry.variant_names
+        for parameter in registry.parameters(variant_name)
+    }
+    prepared_component = copy.deepcopy(registry.bundle_members()["transformer"])
+    prepared_component.set_adapter("default")
+
+    registry.rebind_parameters({"transformer": prepared_component})
+
+    live_ids = {
+        id(parameter)
+        for variant_name in registry.variant_names
+        for parameter in registry.parameters(variant_name)
+    }
+    assert live_ids.isdisjoint(stale_ids)
+    assert live_ids <= {id(parameter) for parameter in prepared_component.parameters()}
+    _assert_all_owned_role_parameters_trainable(registry)
+    registry.activate("fake")
+    registry.activate(BASE_VARIANT)
+    _assert_all_owned_role_parameters_trainable(registry)
+
+
+def test_rebind_canonicalizes_fully_shard_and_checkpoint_wrapper_names() -> None:
+    """Transparent prepare wrappers must not change logical parameter ownership."""
+    canonical = "base_model.model.blocks.0.attn.to_q.lora_A.fake.weight"
+    wrapped = (
+        "base_model.model.blocks.0._fsdp_wrapped_module.attn."
+        "_checkpoint_wrapped_module.to_q.lora_A.fake.weight"
+    )
+
+    assert ComponentVariantRegistry._canonical_prepared_parameter_name(wrapped) == canonical
+
+
 def test_lora_role_contexts_activate_named_adapters_and_restore_after_exception() -> None:
     adapter = _TinyRoleAdapter("lora")
     adapter.declare_component_variants([BASE_VARIANT, "fake", "surrogate"])
@@ -586,6 +626,12 @@ def test_a_frozen_reference_comes_from_the_adapter_snapshot_not_a_variant() -> N
         for module in component.modules()
         if hasattr(module, "disable_adapters")
     )
+    with adapter.use_component_variant("fake"):
+        with BaseAdapter.use_ref_parameters(adapter):
+            pass
+        assert adapter.component_variant_registry.active_variant == "fake"
+        assert component.active_adapter == "fake"
+        _assert_all_owned_role_parameters_trainable(adapter.component_variant_registry)
 
 
 @pytest.mark.parametrize("required_roles", [None, BASE_VARIANT, b"base", 7, {BASE_VARIANT}])
