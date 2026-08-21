@@ -13,8 +13,7 @@
   [text-to-audio-video](examples/grpo/lora/minimax_h3_t2va/debug.yaml),
   [first/last-frame-to-audio-video](examples/grpo/lora/minimax_h3_fl2va/default.yaml), and
   [ordered-reference-to-audio-video](examples/grpo/lora/minimax_h3_ref2va/default.yaml)
-  workflows with GRPO + LoRA. T2VA is real-weight validated on 1 and 16 GPUs;
-  FL2VA and Ref2VA are schema/API validated. H3 requires a pinned diffusers commit:
+  workflows with GRPO + LoRA. H3 requires a pinned diffusers commit:
 ```bash
 pip install 'diffusers @ git+https://github.com/huggingface/diffusers.git@4e0466f3e5260f0d78b5e2b68ffbf27d819cc6db'
 pip install -e .
@@ -93,9 +92,9 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
   <tr><td><a href="https://huggingface.co/Lightricks/LTX-2.3">LTX-2.3</a></td><td>22B</td><td>ltx2_t2av</td></tr>
   <tr><td rowspan="2">Image-to-Audio-Video</td><td><a href="https://huggingface.co/Lightricks/LTX-2">LTX-2</a></td><td>19B</td><td>ltx2_i2av</td></tr>
   <tr><td><a href="https://huggingface.co/Lightricks/LTX-2.3">LTX-2.3</a></td><td>22B</td><td>ltx2_i2av</td></tr>
-  <tr><td>Text-to-Audio-Video</td><td><a href="https://huggingface.co/MiniMaxAI/MiniMax-H3">MiniMax H3 T2VA</a></td><td>61 GB checkpoint</td><td>minimax-h3-t2va</td></tr>
-  <tr><td>First/Last-Frame-to-Audio-Video</td><td><a href="https://huggingface.co/MiniMaxAI/MiniMax-H3">MiniMax H3 FL2VA</a></td><td>61 GB checkpoint</td><td>minimax-h3-fl2va</td></tr>
-  <tr><td>Ordered-Reference-to-Audio-Video</td><td><a href="https://huggingface.co/MiniMaxAI/MiniMax-H3">MiniMax H3 Ref2VA</a></td><td>61 GB checkpoint</td><td>minimax-h3-ref2va</td></tr>
+  <tr><td>Text-to-Audio-Video</td><td><a href="https://huggingface.co/MiniMaxAI/MiniMax-H3">MiniMax H3 T2VA</a></td><td>30B</td><td>minimax-h3-t2va</td></tr>
+  <tr><td>First/Last-Frame-to-Audio-Video</td><td><a href="https://huggingface.co/MiniMaxAI/MiniMax-H3">MiniMax H3 FL2VA</a></td><td>30B</td><td>minimax-h3-fl2va</td></tr>
+  <tr><td>Ordered-Reference-to-Audio-Video</td><td><a href="https://huggingface.co/MiniMaxAI/MiniMax-H3">MiniMax H3 Ref2VA</a></td><td>30B</td><td>minimax-h3-ref2va</td></tr>
 </table>
 
 > To support new models, see [Guidance/New Model](guidance/new_model.md).
