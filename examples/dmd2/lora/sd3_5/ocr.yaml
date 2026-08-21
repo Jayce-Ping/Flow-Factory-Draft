@@ -1,0 +1,108 @@
+# SD3.5-Medium 4-step DMD2 recipe validated by W&B run uf4dgbgv.
+# The validated launch used 16 H20 GPUs across two nodes; override launcher topology as needed.
+# Prepare the bundled OCR prompt metadata before training:
+#   python scripts/convert_ocr_prompts.py --input-dir dataset/ocr --output-dir dataset/ocr_metadata
+
+launcher: "accelerate"  # Launch through Hugging Face Accelerate.
+config_file: config/accelerate_configs/multi_node.yaml  # Use the validated two-node DDP profile.
+num_processes: 16  # Match the validated global world size.
+num_machines: 2  # Split the validated run across two eight-GPU nodes.
+main_process_port: 29500  # Rendezvous port; change when the port is occupied.
+mixed_precision: "bf16"  # Run model compute in bfloat16.
+
+data:  # Configure OCR prompt preprocessing and sampling.
+  datasets:  # Declare the unified train/eval data source.
+    - name: ocr  # Stable source key used by metrics and reward routing.
+      dataset_dir: "dataset/ocr_metadata"  # Read converted OCR prompt metadata.
+      train:  # Enable this source for DMD2 rollout training.
+        weight: 1  # Allocate all training batches to OCR prompts.
+        max_dataset_size: 512  # Match the validated 512-prompt global batch.
+      eval:  # Reuse this source for periodic OCR evaluation.
+        split: test  # Evaluate against the held-out test split.
+  preprocessing_batch_size: 8  # Encode eight prompts per preprocessing call.
+  dataloader_num_workers: 16  # Use parallel workers for cached sample loading.
+  force_reprocess: false  # Reuse a compatible preprocessing cache when present.
+  cache_dir: "~/.cache/flow_factory/datasets"  # Store Arrow preprocessing caches locally.
+  preprocess_parallelism: local  # Build one cache independently on each node.
+  sampler_type: "auto"  # Resolve the compatible group-contiguous sampler.
+
+model:  # Configure the generator and fake-score LoRA variants.
+  model_type: "sd3-5"  # Select the SD3.5 adapter.
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"  # Load the medium checkpoint.
+  finetune_type: "lora"  # Train parameter-efficient adapters for both roles.
+  lora_rank: 32  # Use the rank validated by uf4dgbgv.
+  lora_alpha: 64  # Scale LoRA updates by twice the rank.
+  target_components: "transformer"  # Attach adapters only to the denoising transformer.
+  target_modules: "default"  # Use the adapter's validated attention projections.
+  frozen_parameters_dtype: "bf16"  # Keep frozen weights on the fused bf16 path.
+  trainable_parameters_dtype: "bf16"  # Train LoRA weights in bf16.
+  resume_path: null  # Start from pretrained weights rather than a prior adapter.
+  resume_type: null  # Infer resume behavior only when a path is provided.
+
+log:  # Configure experiment tracking and model-only checkpoints.
+  run_name: "sd35_dmd2_ddp_ocr_long16"  # Preserve the validated run naming convention.
+  project: "Flow-Factory-DMD2"  # Log metrics under the DMD2 W&B project.
+  logging_backend: "wandb"  # Stream metrics to Weights & Biases.
+  save_dir: "saves/"  # Write portable example checkpoints under the repository.
+  save_freq: 30  # Save every thirty outer epochs.
+  save_model_only: true  # Persist role adapters without optimizer state.
+
+train:  # Configure the multi-role DMD2 objective.
+  trainer_type: "dmd2"  # Select generator/fake distribution matching.
+  max_epochs: 10000  # Permit a long-running distillation experiment.
+  resolution: 512  # Train and decode square 512-pixel images.
+  num_inference_steps: 4  # Roll out four deterministic ODE transitions.
+  guidance_scale: 1.0  # Keep generator and fake-score passes CFG-free.
+  real_guidance_scale: 4.0  # Apply CFG only to the frozen real score.
+  per_device_batch_size: 32  # Match the validated H20 microbatch size.
+  group_size: 1  # Treat every prompt as an independent DMD sample.
+  unique_sample_num_per_epoch: 512  # Form one 512-sample global rollout batch.
+  gradient_step_per_epoch: 1  # Take one generator optimizer step per outer epoch.
+  gradient_accumulation_steps: "auto"  # Derive accumulation from the global batch geometry.
+  ttur_fake_updates: 5  # Run five fake-score updates before one generator update.
+  perturbation_timestep_range: [0.02, 0.98]  # Avoid singular diffusion endpoints.
+  learning_rate: 1.0e-5  # Use the shared role learning rate from uf4dgbgv.
+  adam_weight_decay: 1.0e-4  # Apply light AdamW regularization.
+  adam_betas: [0.9, 0.999]  # Use standard AdamW momentum coefficients.
+  adam_epsilon: 1.0e-8  # Stabilize AdamW denominator updates.
+  max_grad_norm: 1.0  # Clip each active role's gradient norm.
+  enable_gradient_checkpointing: true  # Recompute activations to reduce peak memory.
+  offload_samples_to_cpu: true  # Keep stored rollout trajectories off GPU.
+  latent_storage_dtype: "fp16"  # Compress replay latents while retaining exact round trips.
+  ema_decay: 0  # Disable generator EMA for this DMD2 recipe.
+  ema_update_interval: 1  # Retain a valid interval while EMA is disabled.
+  ema_device: "cuda"  # Define the shadow device if EMA is enabled later.
+  replay_rtol: 0  # Require bit-exact multi-step replay.
+  replay_atol: 0  # Permit no absolute replay discrepancy.
+  seed: 42  # Make rollout boundaries and perturbations reproducible.
+
+scheduler:  # Configure deterministic rollout dynamics.
+  dynamics_type: "ODE"  # Use the validated deterministic four-step trajectory.
+  seed: 42  # Seed scheduler-controlled boundary selection.
+
+eval:  # Evaluate the same four-step unguided generator.
+  resolution: 512  # Match training output resolution.
+  per_device_batch_size: 32  # Evaluate with the validated H20 batch size.
+  guidance_scale: 1.0  # Keep generator evaluation CFG-free.
+  num_inference_steps: 4  # Use the same four ODE transitions.
+  eval_freq: 30  # Evaluate alongside each periodic checkpoint.
+  seed: 42  # Make evaluation samples reproducible.
+
+eval_rewards:  # Score text rendering without changing the reward-free DMD objective.
+  - name: "ocr"  # Expose OCR as the evaluation metric key.
+    reward_model: "OCR"  # Use Flow-Factory's OCR reward implementation.
+    weight: 1  # Report the unscaled OCR score.
+    batch_size: 1  # Process OCR outputs one image at a time.
+    device: "cpu"  # Keep PaddleOCR off the training GPUs.
+    dtype: "float32"  # Run OCR kernels in their supported precision.
+    async_reward: true  # Overlap OCR evaluation with the training process.
+    num_workers: 1  # Use one stable OCR worker process.
+    applicable_datasets: [ocr]  # Route the evaluator only to OCR prompts.
+
+optimizers:  # Define the shared AdamW template used by both DMD2 roles.
+  - name: "default"  # Let role planning clone this template for generator and fake.
+    learning_rate: 1.0e-5  # Match the validated role learning rate.
+    weight_decay: 1.0e-4  # Match the validated AdamW regularization.
+    betas: [0.9, 0.999]  # Match the validated momentum coefficients.
+    eps: 1.0e-8  # Match the validated numerical epsilon.
+    max_grad_norm: 1.0  # Clip each active role at the validated norm.
