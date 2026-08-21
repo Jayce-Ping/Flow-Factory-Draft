@@ -16,10 +16,21 @@ from pathlib import Path
 import yaml
 
 
-def test_only_gpu_validated_multirole_example_is_published() -> None:
+def test_only_gpu_validated_multirole_examples_are_published() -> None:
     repository_root = Path(__file__).parents[2]
-    for example_name in ("dmd2", "tdm_r1"):
-        assert not (repository_root / "examples" / example_name).exists()
+    assert not (repository_root / "examples" / "tdm_r1").exists()
+
+    dmd2_path = repository_root / "examples" / "dmd2" / "lora" / "sd3_5" / "ocr.yaml"
+    dmd2_config = yaml.safe_load(dmd2_path.read_text())
+    assert dmd2_config["train"]["trainer_type"] == "dmd2"
+    assert dmd2_config["train"]["num_inference_steps"] == 4
+    assert dmd2_config["train"]["per_device_batch_size"] == 32
+    assert dmd2_config["train"]["unique_sample_num_per_epoch"] == 512
+    assert dmd2_config["train"]["ttur_fake_updates"] == 5
+    assert dmd2_config["train"]["replay_rtol"] == dmd2_config["train"]["replay_atol"] == 0
+    assert dmd2_config["scheduler"] == {"dynamics_type": "ODE", "seed": 42}
+    assert [optimizer["name"] for optimizer in dmd2_config["optimizers"]] == ["default"]
+
     tdm_path = repository_root / "examples" / "tdm" / "lora" / "sd3_5" / "ocr.yaml"
     config = yaml.safe_load(tdm_path.read_text())
     assert config["train"]["trainer_type"] == "tdm"
