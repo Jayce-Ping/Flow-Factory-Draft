@@ -16,7 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE_LINKS = (
-    "examples/grpo/lora/minimax_h3_t2va/default.yaml",
+    "examples/grpo/lora/minimax_h3_t2va/debug.yaml",
     "examples/grpo/lora/minimax_h3_fl2va/default.yaml",
     "examples/grpo/lora/minimax_h3_ref2va/default.yaml",
 )
@@ -34,7 +34,8 @@ def test_readme_documents_h3_links_pin_and_limits() -> None:
     ) not in text
     assert "Validation status varies by example" in text
     assert "hardware and reward-trend evidence" in text
-    assert "MiniMax H3 examples are schema/API validated only" in text
+    assert "MiniMax H3 T2VA has real-weight LoRA validation" in text
+    assert "FL2VA and Ref2VA remain" in text
 
     for model_type, link in zip(
         ("minimax-h3-t2va", "minimax-h3-fl2va", "minimax-h3-ref2va"),
@@ -56,7 +57,9 @@ def test_readme_documents_h3_links_pin_and_limits() -> None:
         "N transitions",
         "N + 1 states",
         "61 GB",
-        "numerical parity",
+        "completed long-run reward trend is not claimed",
+        "pip install 'diffusers @ git+https://github.com/huggingface/diffusers.git@",
+        "[Datasets](guidance/datasets.md)",
     ):
         assert required in text
 
@@ -71,6 +74,9 @@ def test_examples_readme_links_h3_and_separates_validation_levels() -> None:
     assert "hardware" in text
     assert "reward" in text
     assert "61 GB" in text
+    assert "ImageBind" in text
+    assert "facebookresearch/ImageBind.git" in text
+    assert "NonCommercial" in text
 
 
 def test_new_model_guide_documents_component_runtime_boundaries() -> None:

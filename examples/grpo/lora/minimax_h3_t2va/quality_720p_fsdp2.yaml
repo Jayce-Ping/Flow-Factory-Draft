@@ -1,114 +1,116 @@
-# Native-quality MiniMax-H3 T2VA recipe validated on 16 H20 GPUs across two nodes.
-# MiniMax-H3 requires 5-15 seconds and 17*n+5 frames, so 124 is the minimum valid count.
-# The 768x1344 checkpoint-native canvas exceeds 720p while preserving the required 32-pixel alignment.
+# Native-quality T2VA recipe validated on 16 GPUs with FSDP2.
+# H3 requires B=1, neutral guidance, and 5-15 seconds at 24 fps.
+# 124 is the minimum valid 17*n+5 frame count.
+# Provide the main-process address and machine rank through the launcher environment.
 
-launcher: "accelerate"  # Launch through Hugging Face Accelerate.
-config_file: config/accelerate_configs/fsdp2.yaml  # Shard the 33B transformer with FSDP2.
-num_processes: 16  # Match the validated global world size.
-main_process_port: 29500  # Rendezvous port; change when occupied.
-mixed_precision: "bf16"  # Use bfloat16 model compute.
+launcher: "accelerate"
+config_file: config/accelerate_configs/fsdp2.yaml
+num_processes: 16
+num_machines: 2
+main_process_port: 29500
+mixed_precision: "bf16"
 
-data:  # Configure the LTX2-style video prompt corpus.
-  datasets:  # Declare the unified train/eval source.
-    - name: vid_prompt  # Stable source key for metrics and reward routing.
-      dataset_dir: "dataset/vid_prompt"  # Reuse the large text-to-video prompt dataset.
-      train:  # Enable this source for GRPO sampling.
-        weight: 1  # Allocate every training batch to this source.
-        max_dataset_size: 1024  # Bound preprocessing while retaining prompt diversity.
-      eval:  # Evaluate a representative held-out subset.
-        max_dataset_size: 16  # Limit expensive native-resolution evaluation.
-  preprocessing_batch_size: 1  # MiniMax-H3 requires preprocessing batch size one.
-  dataloader_num_workers: 8  # Parallelize cached prompt loading.
-  force_reprocess: true  # Rebuild caches for this geometry and checkpoint.
-  cache_dir: "~/.cache/flow_factory/datasets"  # Store Arrow preprocessing caches locally.
-  preprocess_parallelism: local  # Build one cache independently per node.
-  sampler_type: "auto"  # Resolve the compatible group-contiguous sampler.
+data:
+  datasets:
+    - name: vid_prompt
+      dataset_dir: "dataset/vid_prompt"
+      train:
+        weight: 1
+        max_dataset_size: 1024
+      eval:
+        max_dataset_size: 16
+  preprocessing_batch_size: 1
+  dataloader_num_workers: 8
+  force_reprocess: true
+  cache_dir: "~/.cache/flow_factory/datasets"
+  preprocess_parallelism: local
+  sampler_type: "auto"
 
-model:  # Configure the trainable MiniMax-H3 transformer adapter.
-  model_type: "minimax-h3-t2va"  # Select the text-to-video-audio workflow.
-  model_name_or_path: "MiniMaxAI/MiniMax-H3"  # Load the released MiniMax-H3 checkpoint.
-  finetune_type: "lora"  # Train a parameter-efficient adapter.
-  lora_rank: 64  # Match the quality run's LoRA capacity.
-  lora_alpha: 128  # Scale LoRA updates by twice the rank.
-  target_components: "transformer"  # Adapt only the joint video-audio transformer.
-  target_modules: "default"  # Train the validated attention projections.
-  frozen_parameters_dtype:  # Apply checkpoint-aware precision per frozen component.
-    default: null  # Preserve any unlisted component's released dtype.
-    transformers: "bf16"  # Keep frozen denoiser parameters on the bf16 path.
-    text_encoders: "bf16"  # Keep frozen prompt encoders in bf16.
-    vae: "fp32"  # Preserve the video decoder's required FP32 weights.
-    audio_vae: "fp32"  # Preserve released audio amplitude and quality.
-  trainable_parameters_dtype: "bf16"  # Store LoRA parameters in bf16.
-  resume_path: null  # Start from the released base checkpoint.
-  resume_type: null  # Infer resume behavior only when a path is supplied.
+model:
+  model_type: "minimax-h3-t2va"
+  model_name_or_path: "MiniMaxAI/MiniMax-H3"
+  finetune_type: "lora"
+  lora_rank: 64
+  lora_alpha: 128
+  target_components: "transformer"
+  target_modules: "default"
+  frozen_parameters_dtype:
+    default: null
+    transformers: "bf16"
+    text_encoders: "bf16"
+    vae: "fp32"  # H3 autoencoders require FP32 weights.
+    audio_vae: "fp32"
+  trainable_parameters_dtype: "bf16"
+  resume_path: null
+  resume_type: null
 
-log:  # Configure tracking and model-only checkpoints.
-  run_name: "minimax_h3_t2va_lora_r64_a128_lr3e4_fsdp2_768x1344_f124_u48_g16_u2"  # Identify the quality recipe.
-  project: "Flow-Factory-MiniMax-H3"  # Log under the MiniMax-H3 W&B project.
-  logging_backend: "wandb"  # Stream training metrics to Weights & Biases.
-  save_dir: "saves/"  # Write portable checkpoints under the repository.
-  save_freq: 30  # Save every thirty outer epochs.
-  save_model_only: true  # Persist LoRA weights without optimizer state.
+log:
+  run_name: null
+  project: "Flow-Factory"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 30
+  save_model_only: true
 
-train:  # Configure native-quality GRPO training.
-  trainer_type: "grpo"  # Optimize the stochastic rollout policy with GRPO.
-  max_epochs: 10000  # Permit a long-running quality experiment.
-  advantage_aggregation: "gdpo"  # Normalize advantages across prompt groups.
-  clip_range: 1.0e-4  # Apply a tight PPO-style policy ratio clip.
-  adv_clip_range: 5.0  # Bound extreme normalized advantages.
-  kl_type: "v-based"  # Measure optional KL in velocity space.
-  kl_beta: 0  # Disable explicit reference KL for this run.
-  ref_param_device: "cuda"  # Keep any enabled reference shadow on GPU.
-  resolution: [768, 1344]  # Use the checkpoint-native canvas above 720p.
-  num_frames: 124  # Generate the minimum valid five-second H3 sequence.
-  frame_rate: 24.0  # Decode video at the checkpoint-native frame rate.
-  num_inference_steps: 24  # Preserve the quality-oriented denoising schedule.
-  guidance_scale: 1.0  # Keep CFG neutral for the guidance-distilled checkpoint.
-  per_device_batch_size: 1  # Respect MiniMax-H3's packed B=1 contract.
-  group_size: 16  # Draw sixteen candidates for each unique prompt.
-  global_std: true  # Normalize GDPO statistics across all ranks.
-  unique_sample_num_per_epoch: 48  # Train on forty-eight unique prompts per epoch.
-  gradient_step_per_epoch: 2  # Take exactly two optimizer updates per epoch.
-  gradient_accumulation_steps: "auto"  # Derive GAS=72 from 48 batches and 3 train steps.
-  shuffle_samples: false  # Preserve rollout/replay pack composition.
-  ema_decay: 0  # Disable the extra 33B EMA shadow.
-  ema_update_interval: 1  # Retain a valid interval while EMA is disabled.
-  ema_device: "cuda"  # Define the shadow device if EMA is enabled later.
-  enable_gradient_checkpointing: true  # Recompute activations to fit native resolution.
-  offload_samples_to_cpu: true  # Keep the 48 stored video trajectories off GPU.
-  seed: 42  # Make prompt groups and stochastic transitions reproducible.
+train:
+  trainer_type: "grpo"
+  max_epochs: 10000
+  advantage_aggregation: "gdpo"
+  clip_range: 1.0e-4
+  adv_clip_range: 5.0
+  kl_type: "v-based"
+  kl_beta: 0
+  ref_param_device: "cuda"
+  resolution: [768, 1344]
+  num_frames: 124
+  frame_rate: 24.0
+  num_inference_steps: 24
+  guidance_scale: 1.0
+  per_device_batch_size: 1
+  group_size: 16
+  global_std: true
+  unique_sample_num_per_epoch: 48
+  gradient_step_per_epoch: 2
+  gradient_accumulation_steps: "auto"
+  shuffle_samples: false
+  ema_decay: 0
+  ema_update_interval: 1
+  ema_device: "cuda"
+  enable_gradient_checkpointing: true
+  offload_samples_to_cpu: true
+  seed: 42
 
-scheduler:  # Configure the quality-oriented coupled sampler.
-  dynamics_type: "CPS"  # Use consistency-preserving stochastic transitions.
-  noise_level: 0.8  # Match the validated H3/LTX2 stochastic scale.
-  num_sde_steps: 3  # Optimize three selected stochastic transitions per sample.
-  sde_steps: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]  # Draw train steps from the early trajectory.
-  seed: 42  # Make stochastic step selection reproducible.
+scheduler:
+  dynamics_type: "CPS"
+  noise_level: 0.8
+  num_sde_steps: 3
+  sde_steps: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  seed: 42
 
-eval:  # Evaluate the same native-quality generation path.
-  eval_freq: 30  # Evaluate alongside each periodic checkpoint.
-  seed: 42  # Make evaluation generations reproducible.
-  resolution: [768, 1344]  # Preserve native training resolution.
-  num_frames: 124  # Preserve the five-second output duration.
-  frame_rate: 24.0  # Preserve the native frame rate.
-  per_device_batch_size: 1  # Respect the packed B=1 inference contract.
-  guidance_scale: 1.0  # Keep CFG neutral during evaluation.
-  num_inference_steps: 24  # Use the full quality-oriented denoising schedule.
+eval:
+  eval_freq: 30
+  seed: 42
+  resolution: [768, 1344]
+  num_frames: 124
+  frame_rate: 24.0
+  per_device_batch_size: 1
+  guidance_scale: 1.0
+  num_inference_steps: 24
 
-rewards:  # Optimize audio-text alignment without an extra video encoder.
-  - name: "audio_text_alignment"  # Expose the CLAP reward metric key.
-    reward_model: "clap"  # Score generated audio against the text prompt.
-    weight: 1.0  # Use the raw CLAP reward as the objective.
-    batch_size: 1  # Process one five-second soundtrack per reward call.
-    device: "cpu"  # Reserve GPU memory for the 33B transformer and VAEs.
-    dtype: "float32"  # Keep CLAP BatchNorm in its supported precision.
-    model_name_or_path: "laion/larger_clap_general"  # Load the validated CLAP checkpoint.
-    applicable_datasets: [vid_prompt]  # Route CLAP only to the video prompt source.
+rewards:
+  - name: "audio_text_alignment"
+    reward_model: "clap"
+    weight: 1.0
+    batch_size: 1
+    device: "cpu"
+    dtype: "float32"
+    model_name_or_path: "laion/larger_clap_general"
+    applicable_datasets: [vid_prompt]
 
-optimizers:  # Configure the MiniMax-H3 LoRA optimizer.
-  - name: "default"  # Optimize the single trainable base role.
-    learning_rate: 3.0e-4  # Match the requested quality-run learning rate.
-    weight_decay: 1.0e-4  # Apply light AdamW regularization.
-    betas: [0.9, 0.999]  # Use standard AdamW momentum coefficients.
-    eps: 1.0e-8  # Stabilize AdamW denominator updates.
-    max_grad_norm: 1.0  # Clip the global LoRA gradient norm.
+optimizers:
+  - name: "default"
+    learning_rate: 3.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    max_grad_norm: 1.0

@@ -2,6 +2,7 @@
 # It has not been run with the 61 GB checkpoint and is not a claim of training quality,
 # memory fit, generated-media parity, numerical parity, or hardware validation.
 # MiniMax H3 requires B=1 and has no CFG; guidance must remain neutral at 1.0.
+# ImageBind reward setup and its NonCommercial license are documented in examples/README.md.
 
 launcher: "accelerate"
 config_file: config/deepspeed/deepspeed_zero2.yaml
@@ -61,9 +62,6 @@ train:
   gradient_step_per_epoch: 2
   gradient_accumulation_steps: "auto"
   seed: 42
-  learning_rate: 1.0e-4
-  adam_weight_decay: 1.0e-4
-  max_grad_norm: 1.0
   enable_gradient_checkpointing: true
   offload_samples_to_cpu: true
 
@@ -90,3 +88,11 @@ rewards:
     device: "cuda"
     dtype: "bfloat16"
     mode: "audio_video"
+
+optimizers:
+  - name: "default"
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    max_grad_norm: 1.0

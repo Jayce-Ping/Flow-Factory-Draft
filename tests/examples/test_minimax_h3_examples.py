@@ -81,6 +81,8 @@ def test_examples_parse_through_production_config_and_registry(
     assert config.training_args.offload_samples_to_cpu is True
     assert len(config.data_args.datasets) == 1
     assert Path(config.data_args.datasets[0].dataset_dir) == expected["dataset"]
+    assert len(config.optimizer_args) == 1
+    assert config.optimizer_args[0].name == "default"
     if directory == "minimax_h3_fl2va":
         assert Path(config.data_args.datasets[0].image_dir) == expected["dataset"]
     assert (ROOT / expected["dataset"]).is_dir()
@@ -91,6 +93,31 @@ def test_examples_parse_through_production_config_and_registry(
     assert "stg_scale" not in yaml_text
     assert "modality_scale" not in yaml_text
     assert "negative_prompt" not in yaml_text
+
+
+@pytest.mark.parametrize(
+    ("filename", "num_processes", "lora_rank", "learning_rate"),
+    (
+        ("debug.yaml", 1, 8, 1.0e-4),
+        ("quality_720p_fsdp2.yaml", 16, 64, 3.0e-4),
+    ),
+)
+def test_t2va_validated_variants_parse(
+    filename: str,
+    num_processes: int,
+    lora_rank: int,
+    learning_rate: float,
+) -> None:
+    path = ROOT / "examples/grpo/lora/minimax_h3_t2va" / filename
+    config = Arguments.load_from_yaml(str(path))
+
+    assert config.model_args.model_type == "minimax-h3-t2va"
+    assert config.model_args.lora_rank == lora_rank
+    assert config.num_processes == num_processes
+    assert config.optimizer_args[0].name == "default"
+    assert config.optimizer_args[0].learning_rate == learning_rate
+    assert config.training_args.per_device_batch_size == 1
+    assert config.training_args.guidance_scale == 1.0
 
 
 def test_t2va_manifests_contain_prompt_only() -> None:

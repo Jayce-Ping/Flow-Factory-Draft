@@ -56,9 +56,11 @@ and lets that boundary stay strict.
 
 ## Verification boundary
 
-The examples and adapters have pinned API/schema/no-weight workflow verification. The 61 GB
-checkpoint was not downloaded. Do not claim real-weight generation/training, GPU/distributed
-execution, memory fit, throughput, reward improvement, convergence, or numerical parity.
+All workflows have pinned API/schema/no-weight verification. T2VA additionally completed
+real-weight LoRA rollout, decode, reward, replay, backward, checkpoint, and resume tests on one
+GPU and with FSDP2 on 16 GPUs. The native-resolution path completed initialization, checkpoint,
+decode, and evaluation. FL2VA and Ref2VA remain no-weight validated. Do not claim long-run reward
+improvement, convergence, or numerical parity.
 
 ## Upgrade checklist
 
@@ -67,7 +69,7 @@ execution, memory fit, throughput, reward improvement, convergence, or numerical
 - [ ] Rerun the real public-symbol and no-weight component-spec/workflow probes.
 - [ ] Run H3 scheduler/runtime/registry/reference tests in the pinned environment.
 - [ ] Parse all H3 examples through `Arguments.load_from_yaml`.
-- [ ] Run a separately documented real-weight smoke before making support or memory claims.
+- [ ] Rerun the documented T2VA real-weight smoke before changing support or memory claims.
 
 ## Cross-refs
 

@@ -136,11 +136,12 @@ MiniMax H3 accepts 5–15 seconds at 24 fps. `num_frames` is rounded up to
 `17*n+5`, so 124 is the smallest explicit frame count that satisfies both the
 duration and VAE chunking contracts.
 
-T2VA `debug.yaml` is real-weight validated on one H20 and 16 H20s across two
-nodes, including LoRA checkpoint save/resume. Its 64x96 canvas validates
-correctness and memory fit, not visual quality or reward improvement. The
-quality-oriented T2VA default and FL2VA/Ref2VA configs remain schema/API-validated
-starting points.
+T2VA `debug.yaml` is real-weight validated on 1 and 16 GPUs, including LoRA
+checkpoint save/resume. Its 64x96 canvas validates
+correctness and memory fit, not visual quality or reward improvement.
+`quality_720p_fsdp2.yaml` has real-weight initialization, checkpoint, native-resolution
+decode, and evaluation coverage; no long-run reward trend is claimed. The default,
+FL2VA, and Ref2VA configs remain schema/API-validated starting points.
 
 ### T2VA: `minimax-h3-t2va`
 

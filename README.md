@@ -9,10 +9,16 @@
 
 # 🔥 News
 
-* **[2026-08-20]** Added schema/API-validated MiniMax H3 workflows:
-  [`minimax-h3-t2va`](examples/grpo/lora/minimax_h3_t2va/default.yaml),
-  [`minimax-h3-fl2va`](examples/grpo/lora/minimax_h3_fl2va/default.yaml), and
-  [`minimax-h3-ref2va`](examples/grpo/lora/minimax_h3_ref2va/default.yaml).
+* **[2026-08-21]** **MiniMax H3 Audio-Video** support! Fine-tune
+  [text-to-audio-video](examples/grpo/lora/minimax_h3_t2va/debug.yaml),
+  [first/last-frame-to-audio-video](examples/grpo/lora/minimax_h3_fl2va/default.yaml), and
+  [ordered-reference-to-audio-video](examples/grpo/lora/minimax_h3_ref2va/default.yaml)
+  workflows with GRPO + LoRA. T2VA is real-weight validated on 1 and 16 GPUs;
+  FL2VA and Ref2VA are schema/API validated. H3 requires a pinned diffusers commit:
+```bash
+pip install 'diffusers @ git+https://github.com/huggingface/diffusers.git@4e0466f3e5260f0d78b5e2b68ffbf27d819cc6db'
+pip install -e .
+```
 
 * **[2026-04-25]** **LTX-2 Audio-Video** support! Generate synchronized audio-video content with RL fine-tuning. LTX-2 requires the bundled `diffusers` submodule (not yet in the official release):
 ```bash
@@ -94,10 +100,12 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
 
 > To support new models, see [Guidance/New Model](guidance/new_model.md).
 
-> **MiniMax H3 status:** examples are schema/API and no-weight workflow validated.
-> The 61 GB checkpoint has not yet completed a real-weight GPU training smoke, so no
-> memory-fit, reward-improvement, or numerical parity claim is made. H3 requires B=1,
-> has no CFG, uses neutral guidance `1.0`, and keeps separate video/audio trajectories.
+> **MiniMax H3 status:** the T2VA debug and
+> [native-quality FSDP2](examples/grpo/lora/minimax_h3_t2va/quality_720p_fsdp2.yaml)
+> paths are real-weight
+> validated; a completed long-run reward trend is not claimed. FL2VA and Ref2VA remain
+> schema/API validated. H3 requires B=1, has no CFG, uses neutral guidance `1.0`, and
+> keeps separate video/audio trajectories.
 > Video uses shift 12, audio uses shift 3, and the model predicts data-ward velocity.
 > `num_inference_steps=N` means N transitions and N + 1 states.
 
@@ -122,8 +130,8 @@ See [`Algorithm Guidance`](guidance/algorithms.md) for more information.
 
 > Models and algorithms are decoupled at the framework interface. Validation status varies by example.
 > Training-verified examples carry hardware and reward-trend evidence.
-> MiniMax H3 examples are schema/API validated only. Unlisted combinations require their own
-> compatibility and training evidence.
+> MiniMax H3 T2VA has real-weight LoRA validation; FL2VA, Ref2VA, and unlisted
+> combinations require separate training evidence.
 
 # 💾 Hardware Requirements
 
@@ -192,6 +200,7 @@ We provide a set of guidance documents to help you understand the framework and 
 | [Workflow](guidance/workflow.md) | End-to-end training pipeline: the overall stages from data preprocessing to policy optimization |
 | [Algorithms](guidance/algorithms.md) | Supported algorithms (GRPO, GRPO-Guard, DPPO, DiffusionNFT, AWM, DPO, DGPO, CRD, DiffusionOPD, DMD2, TDM, TDM-R1) and their configurations |
 | [Rewards](guidance/rewards.md) | Reward model system: built-in models, custom rewards, and remote reward servers |
+| [Datasets](guidance/datasets.md) | Dataset schemas, media paths, and ordered-reference inputs |
 | [New Model](guidance/new_model.md) | How to add support for a new Diffusion/Flow-Matching model |
 
 # 📊 Dataset

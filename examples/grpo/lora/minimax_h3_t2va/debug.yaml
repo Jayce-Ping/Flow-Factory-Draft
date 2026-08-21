@@ -1,7 +1,6 @@
 # Real-weight validated low-memory debug recipe.
-# Verified on one H20 and on 16 H20s (two nodes) with the 2026-08-20 MiniMax-H3
-# revision. The tiny 64x96 canvas is for correctness/throughput debugging, not
-# visual-quality evaluation. H3 requires at least 5 seconds, hence 124 frames.
+# Verified on 1 and 16 GPUs. The 64x96 canvas is for correctness debugging,
+# not visual-quality evaluation. H3 requires at least 5 seconds, hence 124 frames.
 
 launcher: accelerate
 config_file: config/accelerate_configs/multi_gpu.yaml
@@ -40,7 +39,7 @@ model:
   trainable_parameters_dtype: bf16
 
 log:
-  run_name: minimax_h3_t2va_lora_debug
+  run_name: null
   project: Flow-Factory
   logging_backend: none
   save_dir: saves/

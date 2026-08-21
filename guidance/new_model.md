@@ -837,3 +837,7 @@ Multimodal adapters declare `trajectory_component_order` and one scheduler per
 component in `scheduler_group`. Distributed preparation wraps the resulting
 `ModelBundle`; adapter access after prepare routes through `RoutedComponentProxy`
 rather than replacing registered modules.
+
+MiniMax H3 is the reference for workflow-pruned modular components and separate
+video/audio trajectories. See `src/flow_factory/models/minimax_h3/` and the
+[MiniMax H3 dataset contracts](datasets.md#minimax-h3-datasets).

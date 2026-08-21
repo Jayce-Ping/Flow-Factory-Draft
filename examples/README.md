@@ -42,7 +42,7 @@ ff-train examples/grpo/lora/flux1/default.yaml
 
 The T2VA `debug.yaml` recipe is real-weight validated with the 61 GB checkpoint
 (61.74 GiB transformer):
-one H20 and 16 H20s across two nodes both completed CPS rollout, video/audio decode,
+1 GPU and 16 GPUs across two nodes completed CPS rollout, video/audio decode,
 CLAP reward, GRPO replay/backward/optimizer step, and LoRA checkpoint save/resume.
 Its 64x96 canvas is intentionally a correctness geometry. The quality-oriented T2VA
 default remains an unverified quality starting point. FL2VA and Ref2VA are
@@ -54,6 +54,15 @@ The T2VA `quality_720p_fsdp2.yaml` recipe is the active native-quality path:
 updates from 48 prompt groups per epoch. Its real-weight FSDP2 initialization,
 checkpoint, native-resolution decode, and CLAP evaluation are validated; a
 completed long-run reward trend is not yet claimed.
+
+FL2VA and Ref2VA use Meta ImageBind for audio-video alignment. Install ImageBind
+and PyTorchVideo from their upstream repositories before running those examples;
+ImageBind is licensed CC-BY-NC-SA 4.0 (NonCommercial).
+
+```bash
+pip install git+https://github.com/facebookresearch/ImageBind.git
+pip install git+https://github.com/facebookresearch/pytorchvideo.git
+```
 
 ## Contributing
 

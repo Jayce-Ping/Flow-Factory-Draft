@@ -59,9 +59,6 @@ train:
   gradient_step_per_epoch: 2
   gradient_accumulation_steps: "auto"
   seed: 42
-  learning_rate: 1.0e-4
-  adam_weight_decay: 1.0e-4
-  max_grad_norm: 1.0
   enable_gradient_checkpointing: true
   offload_samples_to_cpu: true
 
@@ -87,3 +84,11 @@ rewards:
     batch_size: 1
     device: "cuda"
     model_name_or_path: "laion/larger_clap_general"
+
+optimizers:
+  - name: "default"
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    max_grad_norm: 1.0
