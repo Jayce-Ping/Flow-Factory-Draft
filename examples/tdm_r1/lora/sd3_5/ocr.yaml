@@ -3,6 +3,10 @@
 # Convert the released TDM initializer before launching:
 #   python scripts/convert_tdm_checkpoint.py \
 #     --checkpoint tdm_sd3-5_lora.ckpt --output models/tdm_sd35/ff_adapter
+# Scaling 8 -> 16 GPUs keeps 48 x G24 = 1152 samples: batch24 and GAS3 still
+# produce one fake, one surrogate, and one generator update per epoch.
+# The public code samples two of four boundary indices uniformly. Flow-Factory
+# averages all four, preserving the same uniform objective expectation with lower variance.
 
 launcher: "accelerate"  # Launch through Hugging Face Accelerate.
 config_file: config/accelerate_configs/fsdp2.yaml  # Shard the transformer across sixteen GPUs.
