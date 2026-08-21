@@ -40,6 +40,7 @@ from flow_factory.trainers.role_optimization import (
     RoleOptimizationCoordinator,
     RoleOptimizerConfig,
 )
+from flow_factory.utils.noise_schedule import flow_match_sigma
 
 
 class TinyTDMAdapter(BaseAdapter):
@@ -508,6 +509,38 @@ def test_tdm_sampling_uses_representable_open_interval_bounds(
     assert bool((sampled > terminal_unit.interval_start).all())
     assert bool((sampled < terminal_unit.interval_end).all())
     assert bool((sampled > 0).all())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_tdm_upper_interior_maps_to_sigma_strictly_below_one_on_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = _trainer()
+    interval_start = torch.tensor([900.0], device="cuda", dtype=torch.float32)
+    interval_end = torch.tensor([1000.0], device="cuda", dtype=torch.float32)
+    unit = TDMBoundaryUnit(
+        samples=(_sample(),),
+        boundary_index=1,
+        interval_start=interval_start,
+        interval_end=interval_end,
+    )
+
+    def upper_rand(*shape: Any, **kwargs: Any) -> torch.Tensor:
+        del shape
+        return torch.full(
+            interval_start.shape,
+            torch.nextafter(torch.tensor(1.0), torch.tensor(0.0)).item(),
+            device=kwargs["device"],
+            dtype=kwargs["dtype"],
+        )
+
+    monkeypatch.setattr(torch, "rand", upper_rand)
+    sampled = trainer._sample_perturbation_times(unit)
+    sigma_mid = flow_match_sigma(interval_start)
+    sigma_t = flow_match_sigma(sampled)
+
+    assert bool((sigma_mid < sigma_t).all())
+    assert bool((sigma_t < 1).all())
 
 
 def test_tdm_terminal_generator_score_path_keeps_mapped_sigmas_positive(
