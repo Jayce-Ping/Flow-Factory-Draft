@@ -47,7 +47,14 @@ TIMESTEP_MAX = 1000.0
 
 def flow_match_sigma(t_scheduler: torch.Tensor) -> torch.Tensor:
     """Map scheduler timestep in [0, TIMESTEP_MAX] to σ in [0, 1] for x_t = (1-σ)x0 + σ ε."""
-    return (t_scheduler / TIMESTEP_MAX).clamp(0.0, 1.0)
+    output_dtype = (
+        t_scheduler.dtype if t_scheduler.is_floating_point() else torch.get_default_dtype()
+    )
+    # CUDA float32 division may round the largest representable timestep below
+    # TIMESTEP_MAX back to sigma == 1. Compute the tiny coordinate mapping in
+    # float64, then restore the caller's dtype so strict open intervals remain
+    # strict and CPU/GPU produce the same result.
+    return (t_scheduler.to(torch.float64) / TIMESTEP_MAX).clamp(0.0, 1.0).to(output_dtype)
 
 
 def fraction_range_to_t_bounds(frac_lo: float, frac_hi: float) -> Tuple[float, float]:
