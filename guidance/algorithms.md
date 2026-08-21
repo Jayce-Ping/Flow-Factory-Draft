@@ -447,11 +447,13 @@ TDM-R1 does not auto-align `unique_sample_num_per_epoch`; it fail-fasts unless
 groups. Preference reductions are rank-local (`reduce_across_ranks=False`).
 Generator preference scores the live replayed boundary and reuses the TDM
 reference query. The surrogate uses `group_preference_loss` on rewards.
-Generator loss is the TDM term plus `tdm_weight` times the preference term.
+Generator loss keeps the TDM distribution anchor and mixes two reward directions as
+`tdm_weight * cfg_reward + (1 - tdm_weight) * surrogate_reward`.
 
 DeepSpeed ZeRO-1/2 is allowed under sequential phases, the same as DMD2/TDM.
-ZeRO-3 remains globally unsupported. GPU numerical tests are deferred; CPU
-tests do not constitute GPU evidence.
+ZeRO-3 remains globally unsupported. DDP, FSDP1, FSDP2, and ZeRO-2 have real
+SD3.5 backward/checkpoint coverage; the published OCR recipe additionally validates
+the official TDM initialization and all three role updates on 16-GPU FSDP2.
 
 ```yaml
 train:
@@ -463,7 +465,10 @@ train:
     advantage_clip_range: 5.0
 ```
 
-Runnable YAML examples are not published yet. Related work: [[12]](#ref12).
+See [`examples/tdm_r1/lora/sd3_5/ocr.yaml`](../examples/tdm_r1/lora/sd3_5/ocr.yaml)
+for the official-aligned SD3.5 OCR setup: rank-32 LoRA, G24, 48 prompt groups,
+`beta_dpo=10`, `tdm_weight=0.3`, and one fake/surrogate/generator update per epoch.
+Related work: [[12]](#ref12).
 
 ## DiffusionNFT
 

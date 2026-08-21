@@ -29,6 +29,8 @@ ff-train examples/grpo/lora/flux1/default.yaml
 - [`dmd2` SD3.5 OCR recipe](dmd2/lora/sd3_5/ocr.yaml) — validated by
   [W&B run uf4dgbgv](https://wandb.ai/315229706-xi-an-jiaotong-university-/Flow-Factory-DMD2/runs/uf4dgbgv).
 - [`tdm` SD3.5 OCR recipe](tdm/lora/sd3_5/ocr.yaml) — official conditional-noise objective.
+- [`tdm-r1` SD3.5 OCR recipe](tdm_r1/lora/sd3_5/ocr.yaml) — official G24
+  fake-surrogate-generator objective initialized from the released TDM adapter.
 
 ## Contributing
 

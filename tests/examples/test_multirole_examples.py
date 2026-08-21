@@ -18,7 +18,6 @@ import yaml
 
 def test_only_gpu_validated_multirole_examples_are_published() -> None:
     repository_root = Path(__file__).parents[2]
-    assert not (repository_root / "examples" / "tdm_r1").exists()
 
     dmd2_path = repository_root / "examples" / "dmd2" / "lora" / "sd3_5" / "ocr.yaml"
     dmd2_config = yaml.safe_load(dmd2_path.read_text())
@@ -43,6 +42,33 @@ def test_only_gpu_validated_multirole_examples_are_published() -> None:
         "fake",
     ]
     assert config["scheduler"] == {"dynamics_type": "ODE"}
+
+    tdm_r1_path = repository_root / "examples" / "tdm_r1" / "lora" / "sd3_5" / "ocr.yaml"
+    tdm_r1_config = yaml.safe_load(tdm_r1_path.read_text())
+    assert tdm_r1_config["train"]["trainer_type"] == "tdm-r1"
+    assert tdm_r1_config["model"]["lora_rank"] == 32
+    assert tdm_r1_config["model"]["lora_alpha"] == 64
+    assert tdm_r1_config["train"]["num_inference_steps"] == 4
+    assert tdm_r1_config["train"]["per_device_batch_size"] == 24
+    assert tdm_r1_config["train"]["group_size"] == 24
+    assert tdm_r1_config["train"]["unique_sample_num_per_epoch"] == 48
+    assert tdm_r1_config["train"]["gradient_accumulation_steps"] == 3
+    assert tdm_r1_config["train"]["tdm_weight"] == 0.3
+    assert tdm_r1_config["train"]["surrogate_preference_beta"] == 10.0
+    assert tdm_r1_config["train"]["cfg_reward_scale"] == 4.5
+    assert not tdm_r1_config["rewards"][0]["async_reward"]
+    assert [optimizer["name"] for optimizer in tdm_r1_config["optimizers"]] == [
+        "generator",
+        "fake",
+        "surrogate",
+    ]
+    assert [optimizer["learning_rate"] for optimizer in tdm_r1_config["optimizers"]] == [
+        7.5e-5,
+        3.0e-4,
+        3.0e-4,
+    ]
+    assert tdm_r1_config["scheduler"] == {"dynamics_type": "ODE", "seed": 42}
+
     algorithms = (repository_root / "guidance" / "algorithms.md").read_text()
     assert "ttur_fake_updates" in algorithms
     assert "fake first" in algorithms.lower()
