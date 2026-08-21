@@ -18,11 +18,12 @@ Determine your algorithm's characteristics:
 ## Phase 1: Design
 
 1. **Study existing implementations**:
-   - Coupled example: `trainers/grpo.py` (GRPO)
-   - Decoupled example: `trainers/nft.py` (DiffusionNFT) or `trainers/awm.py` (AWM)
+   - Coupled example: `trainers/rl/grpo.py` (GRPO)
+   - Decoupled example: `trainers/rl/nft.py` (DiffusionNFT) or `trainers/rl/awm.py` (AWM)
 2. **Identify what's shared vs unique** (`constraints.md` #11):
-   - Shared: Data loading, reward computation, `AdvantageProcessor`, adapter interface, checkpoint logic
-   - Unique: `start()` method, loss function, algorithm-specific hyperparameters
+   - Shared: the epoch loop (`BaseTrainer.start`), data loading, reward computation,
+     `AdvantageProcessor`, `prepare_feedback`, `compute_advantages`, adapter interface, checkpoint logic
+   - Unique: the loss function and the algorithm-specific hyperparameters. Never restate the loop
    - Per-epoch hook order: `sample()` → `prepare_feedback()` → `optimize()` (see `guidance/workflow.md`)
 
 ## Phase 2: Configuration
@@ -95,51 +96,30 @@ from .training_args import MyAlgoTrainingArguments
 ### Step 3 — Create Trainer Class
 
 ```python
-# src/flow_factory/trainers/my_algo.py
-from .abc import BaseTrainer
-from .registry import register_trainer
+# src/flow_factory/trainers/rl/my_algo.py
+from ..abc import BaseTrainer
+from ..registry import register_trainer
 
 @register_trainer('my_algo')
 class MyAlgoTrainer(BaseTrainer):
     """My custom RL algorithm trainer."""
 
-    def start(self):
-        """Main training loop — implements the 6-stage pipeline."""
-        # Stage 1: Data & rewards initialized in BaseTrainer.__init__
-        while self.should_continue_training():
-            # Checkpoint & evaluation (standard pattern)
-            if self.log_args.save_freq > 0 and self.epoch % self.log_args.save_freq == 0:
-                self.save_checkpoint(save_dir, epoch=self.epoch)
-            if self.eval_args.eval_freq > 0 and self.epoch % self.eval_args.eval_freq == 0:
-                self.evaluate()
-
-            # Stage 2+3: Sampling & trajectory generation
-            samples = self.sample()
-
-            # Stage 4+5: Finalize rewards and advantages
-            self.prepare_feedback(samples)
-
-            # Stage 6: Policy optimization
-            self.optimize(samples)
-
-            self.adapter.ema_step(step=self.epoch)
-            self.epoch += 1
-
-    # NOTE: evaluate() is a CONCRETE BaseTrainer method (called by the loop above).
-    # Override it only to customize evaluation — it is NOT an abstract method.
+    # Do NOT define start(). BaseTrainer.start() owns the epoch loop: reseed, checkpoint on
+    # save_freq, evaluate on eval_freq, _run_training_step(), ema_step, _after_optimizer_step.
+    # evaluate(), prepare_feedback() and compute_advantages() are likewise CONCRETE base
+    # methods. optimize() is the only abstract one.
+    #
+    # Vary behavior through hooks instead of restating the loop:
+    #   sampling_context()       - wrap the rollout (e.g. install a snapshot's weights)
+    #   _run_training_step()     - replace the sample -> feedback -> optimize middle
+    #   _after_gradient_step()   - run right after each optimizer step
+    #   _after_optimizer_step()  - run once per epoch, after the EMA step
+    #   _declare_model_variants() - declare several trainable copies (see component_variants.md)
 
     def sample(self):
         """Stages 2-3: K-repeat sampling + trajectory generation."""
         # Use self.adapter.inference() for trajectory generation
         pass
-
-    def prepare_feedback(self, samples):
-        """Stages 4-5: Reward buffer finalize and advantages (no policy gradients)."""
-        rewards = self.reward_buffer.finalize(store_to_samples=True, split='all')
-        self.compute_advantages(samples, rewards, store_to_samples=True)
-        adv_metrics = self.advantage_processor.pop_advantage_metrics()
-        if adv_metrics:
-            self.log_data(adv_metrics, step=self.step)
 
     def optimize(self, samples):
         """Stage 6: Policy update."""
@@ -157,7 +137,7 @@ class MyAlgoTrainer(BaseTrainer):
 Add to `_TRAINER_REGISTRY` in `src/flow_factory/trainers/registry.py`:
 
 ```python
-'my_algo': 'flow_factory.trainers.my_algo.MyAlgoTrainer',
+'my_algo': 'flow_factory.trainers.rl.my_algo.MyAlgoTrainer',
 ```
 
 ## Phase 4: Configuration & Examples
@@ -174,7 +154,6 @@ model:
 train:
   trainer_type: "my_algo"
   my_specific_param: 0.1
-  learning_rate: 1e-6
   group_size: 4
 
   num_inference_steps: 28
@@ -196,6 +175,12 @@ rewards:
     reward_model: "pickscore"
     weight: 1.0
     batch_size: 16
+
+optimizers:
+  - name: default
+    learning_rate: 1e-6
+    weight_decay: 1e-4
+    max_grad_norm: 1.0
 ```
 
 ## Phase 5: Verification

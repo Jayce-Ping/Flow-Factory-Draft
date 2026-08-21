@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import dataclass, field
+from typing import Any, List, Literal, Optional
+
 # src/flow_factory/hparams/data_args.py
 import yaml
-from dataclasses import dataclass, field
-from typing import Any, Literal, Optional, List
+
 from .abc import ArgABC
 from .dataset_args import DatasetArguments
 
@@ -23,25 +25,34 @@ from .dataset_args import DatasetArguments
 @dataclass
 class DataArguments(ArgABC):
     r"""Arguments pertaining to data input for training and evaluation."""
+
     dataset_dir: str = field(
         default="data",
         metadata={"help": "Path to the folder containing the datasets."},
     )
     cache_dir: str = field(
         default="~/.cache/flow_factory/datasets",
-        metadata={"help": "Directory for caching preprocessed datasets (fingerprinted by content hash)."},
+        metadata={
+            "help": "Directory for caching preprocessed datasets (fingerprinted by content hash)."
+        },
     )
     image_dir: Optional[str] = field(
         default=None,
-        metadata={"help": "Path to the folder containing conditioning images. Defaults to 'images' subfolder in dataset_dir."},
+        metadata={
+            "help": "Path to the folder containing conditioning images. Defaults to 'images' subfolder in dataset_dir."
+        },
     )
     video_dir: Optional[str] = field(
         default=None,
-        metadata={"help": "Path to the folder containing conditioning videos. Defaults to 'videos' subfolder in dataset_dir."},
+        metadata={
+            "help": "Path to the folder containing conditioning videos. Defaults to 'videos' subfolder in dataset_dir."
+        },
     )
     audio_dir: Optional[str] = field(
         default=None,
-        metadata={"help": "Path to the folder containing audio files. Defaults to 'audios' subfolder in dataset_dir."},
+        metadata={
+            "help": "Path to the folder containing audio files. Defaults to 'audios' subfolder in dataset_dir."
+        },
     )
     preprocessing_batch_size: int = field(
         default=8,
@@ -57,7 +68,9 @@ class DataArguments(ArgABC):
     )
     force_reprocess: bool = field(
         default=True,
-        metadata={"help": "Whether to force reprocessing of the dataset even if cached data exists."},
+        metadata={
+            "help": "Whether to force reprocessing of the dataset even if cached data exists."
+        },
     )
     max_dataset_size: Optional[int] = field(
         default=None,
@@ -171,10 +184,10 @@ class DataArguments(ArgABC):
     @property
     def source_name_to_id(self) -> dict[str, int]:
         """Inverse mapping, cached after first access."""
-        cached = getattr(self, '_source_name_to_id_cache', None)
+        cached = getattr(self, "_source_name_to_id_cache", None)
         if cached is None:
             cached = {n: i for i, n in enumerate(self.source_id_to_name)}
-            object.__setattr__(self, '_source_name_to_id_cache', cached)
+            object.__setattr__(self, "_source_name_to_id_cache", cached)
         return cached
 
     def to_dict(self) -> dict[str, Any]:
@@ -183,7 +196,7 @@ class DataArguments(ArgABC):
     def __str__(self) -> str:
         """Pretty print configuration as YAML."""
         return yaml.dump(self.to_dict(), default_flow_style=False, sort_keys=False, indent=2)
-    
+
     def __repr__(self) -> str:
         """Same as __str__ for consistency."""
         return self.__str__()

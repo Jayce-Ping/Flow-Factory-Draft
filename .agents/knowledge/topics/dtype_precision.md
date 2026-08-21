@@ -16,6 +16,12 @@
 
 Boundaries are set in `BaseAdapter._mix_precision()` (`models/abc.py`) and `BaseTrainer.__init__` (autocast context). Autocast weight-cache invariant + in-place ref/EMA/named swaps: `topics/autocast_param_swap.md` (#20a).
 
+`frozen_parameters_dtype` accepts either one dtype or a selector mapping. Resolution order is
+concrete component, component group (`transformers` / `text_encoders`), then `default`. A null
+result preserves the checkpoint dtype. Under FSDP2 mixed precision, trained components keep
+uniform fp32 original parameters while the resolved policy still applies to fully frozen
+components.
+
 ## `cast_latents()` Contract
 
 `BaseAdapter.cast_latents()` (`models/abc.py`) casts latents to `latent_storage_dtype` for trajectory storage.

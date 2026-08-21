@@ -14,10 +14,10 @@
 
 # src/flow_factory/logger/abc.py
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any, List
+from typing import Any, Dict, List, Optional
 
 from ..hparams import *
-from .formatting import LogFormatter, LogImage, LogVideo, LogTable
+from .formatting import LogFormatter, LogImage, LogTable, LogVideo
 
 
 class Logger(ABC):
@@ -41,17 +41,19 @@ class Logger(ABC):
     ):
         # 1. Process rules (Mean, Paths, wrappers) into IR
         formatted_dict = LogFormatter.format_dict(data)
-        
+
         # 2. Filter keys if requested
         if keys:
-            valid_keys = keys.split(',')
+            valid_keys = keys.split(",")
             formatted_dict = {k: v for k, v in formatted_dict.items() if k in valid_keys}
 
         # 3. Convert IR to Platform Objects
         final_dict = {}
         for k, v in formatted_dict.items():
             converted = self._recursive_convert(v)
-            if isinstance(converted, dict):  # for LogTable conversion returning dict, e.g., SwanlabLogger
+            if isinstance(
+                converted, dict
+            ):  # for LogTable conversion returning dict, e.g., SwanlabLogger
                 final_dict.update(converted)
             else:
                 final_dict[k] = converted
@@ -59,7 +61,7 @@ class Logger(ABC):
         # 4. Actual Logging
         if final_dict:
             self._log_impl(final_dict, step)
-            
+
         # 5. Cleanup temporary files periodically
         if len(self._pending_cleanup) >= self.clean_up_freq:
             first_data = self._pending_cleanup.pop(0)
@@ -67,16 +69,13 @@ class Logger(ABC):
         self._pending_cleanup.append(formatted_dict)
 
     def _recursive_convert(
-        self, 
-        value: Any, 
-        height: Optional[int] = None,
-        width: Optional[int] = None
+        self, value: Any, height: Optional[int] = None, width: Optional[int] = None
     ) -> Any:
         """Recursively convert IR objects to platform objects."""
         if isinstance(value, (list, tuple)):
             return [self._recursive_convert(v, height, width) for v in value if v is not None]
         return self._convert_to_platform(value, height, width)
-    
+
     def _cleanup_temp_files(self, data: Dict):
         for value in data.values():
             if isinstance(value, (LogImage, LogVideo, LogTable)):
@@ -88,19 +87,16 @@ class Logger(ABC):
 
     @abstractmethod
     def _convert_to_platform(
-        self, 
-        value: Any, 
-        height: Optional[int] = None,
-        width: Optional[int] = None
+        self, value: Any, height: Optional[int] = None, width: Optional[int] = None
     ) -> Any:
         """
         Convert a single IR object to platform-specific object.
-        
+
         Args:
             value: IR object (LogImage, LogVideo, LogTable) or pass-through value.
             height: Optional target height for resize (aspect-ratio preserved if width is None).
             width: Optional target width for resize (aspect-ratio preserved if height is None).
-        
+
         Returns:
             Platform-specific object (e.g., wandb.Image, swanlab.Video).
         """

@@ -16,50 +16,84 @@
 import json
 import os
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from contextlib import ExitStack, contextmanager
-from typing import Dict, Any, ClassVar, Optional, Tuple, List, Union, Literal, Iterator
+from dataclasses import dataclass, replace
 from functools import partial
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    Iterator,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Union,
+)
+
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.distributed as dist
-from torch.utils.data import DataLoader
-from dataclasses import dataclass
-from tqdm import tqdm
-from PIL import Image
-from diffusers.utils.outputs import BaseOutput
+import torch.nn as nn
 from accelerate import Accelerator
-from accelerate.utils import set_seed, ProjectConfiguration
+from accelerate.utils import ProjectConfiguration, set_seed
+from diffusers.utils.outputs import BaseOutput
+from PIL import Image
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-from ..hparams import *
-from ..models.abc import BaseAdapter
-from ..models.model_bundle import ModelBundle, RoutedComponentProxy
+from ..acceleration import BaseAccelerator, build_accelerator, validate_accelerator
+from ..advantage import AdvantageProcessor
 from ..data_utils.dataset import METADATA_COLUMN
 from ..data_utils.loader import (
-    get_train_dataloader,
     get_eval_dataloaders,
+    get_train_dataloader,
 )
-from ..rewards import load_reward_model, BaseRewardModel, MultiRewardLoader, RewardProcessor, RewardBuffer
-from ..advantage import AdvantageProcessor
-from ..acceleration import BaseAccelerator, build_accelerator, validate_accelerator
-from ..logger import load_logger, LogFormatter
-from ..samples import BaseSample, StackedSampleBatch
+from ..hparams import *
+from ..hparams.optimizer_args import OptimizerArguments
+from ..logger import LogFormatter, load_logger
+from ..models.abc import BaseAdapter
+from ..models.model_bundle import ModelBundle, RoutedComponentProxy
+from ..models.variants import DEFAULT_BASE_VARIANT, ComponentVariantRegistry
+from ..optimizer import build_optimizer
+from ..rewards import (
+    BaseRewardModel,
+    MultiRewardLoader,
+    RewardBuffer,
+    RewardProcessor,
+    load_reward_model,
+)
+from ..samples import BaseSample, LatentState, NoisedState, StackedSampleBatch
+from ..utils.base import (
+    create_generator,
+    create_generator_by_prompt,
+    filter_kwargs,
+    json_default,
+)
+from ..utils.dist import gather_aligned_floating_tensors, reduce_loss_info
 from ..utils.logger_utils import setup_logger
-from ..utils.base import create_generator, create_generator_by_prompt, filter_kwargs, json_default, visit_tensor_leaves
+from ..utils.noise_schedule import TimeSampler
+from .common.sample_prefetch import iter_prefetched_batches
+from .multirole import (
+    MultiRoleBackendValidationMixin,
+    MultiRoleCheckpointingMixin,
+    configure_deepspeed_micro_batch_size,
+    validate_supported_distributed_plan,
+)
+from .role_optimization import (
+    OptimizationRole,
+    RoleOptimizationCoordinator,
+    RoleOptimizerConfig,
+    RolePhase,
+    RoleUpdatePlan,
+)
 
 logger = setup_logger(__name__)
 
 
-def _record_stream_on_batch(value: Any, stream: "torch.cuda.Stream") -> None:
-    """Record ``stream`` on every CUDA tensor in a stacked batch.
-
-    Required for the copy-stream prefetch: it stops the caching allocator from
-    reusing copy-stream-produced tensors until the consuming stream is done.
-    """
-    visit_tensor_leaves(value, lambda t: t.record_stream(stream) if t.is_cuda else None)
-
-
-class BaseTrainer(ABC):
+class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, ABC):
     """
     Abstract Base Class for Flow-Factory trainers.
     """
@@ -71,11 +105,13 @@ class BaseTrainer(ABC):
     paradigm: ClassVar[Optional[Literal["coupled", "decoupled", "distillation"]]] = None
 
     def __init__(
-            self,
-            accelerator: Accelerator,
-            config : Arguments,
-            adapter : BaseAdapter,
-        ):
+        self,
+        accelerator: Accelerator,
+        config: Arguments,
+        adapter: BaseAdapter,
+    ):
+        validate_supported_distributed_plan(accelerator)
+
         self.accelerator = accelerator
         self.config = config
         self.log_args = config.log_args
@@ -85,13 +121,17 @@ class BaseTrainer(ABC):
         self.eval_args = config.eval_args
 
         self.reward_args = config.reward_args
-        self.eval_reward_args = config.eval_reward_args or config.reward_args # If `eval_reward_args` is not given, use `reward_args`
+        self.eval_reward_args = (
+            config.eval_reward_args or config.reward_args
+        )  # If `eval_reward_args` is not given, use `reward_args`
 
         self.adapter = adapter
         self.epoch = 0
         self.step = 0
 
         self._initialization()
+        self._initialize_snapshots()
+        self._register_multirole_checkpointing()
         self.adapter.post_init()
         # Apply persistent stage='both' accelerators last: after prepare, state-resume,
         # EMA, and reference-parameter setup, so e.g. torch.compile wraps the final
@@ -103,7 +143,7 @@ class BaseTrainer(ABC):
         self.autocast = partial(
             torch.autocast,
             device_type=accelerator.device.type,
-            dtype=torch.float16 if accelerator.mixed_precision == "fp16" else torch.bfloat16
+            dtype=torch.float16 if accelerator.mixed_precision == "fp16" else torch.bfloat16,
         )
 
         if self.accelerator.is_local_main_process:
@@ -113,6 +153,9 @@ class BaseTrainer(ABC):
     def show_progress_bar(self) -> bool:
         """Whether to show tqdm progress bars."""
         return self.log_args.verbose and self.accelerator.is_local_main_process
+
+    def _initialize_snapshots(self) -> None:
+        """Initialize optional trainer-owned parameter snapshots before state resume."""
 
     def should_continue_training(self) -> bool:
         """Outer epoch loop: continue unless a finite ``max_epochs`` has been reached."""
@@ -139,19 +182,26 @@ class BaseTrainer(ABC):
         """Log data using the initialized logger."""
         if self.logger is not None:
             self.logger.log_data(data, step=step)
-        
+
         # Print summary to console
         if self.accelerator.is_local_main_process:
-            metrics = {k: v for k, v in ((k, LogFormatter.to_scalar(v)) for k, v in data.items()) if v is not None}
+            metrics = {
+                k: v
+                for k, v in ((k, LogFormatter.to_scalar(v)) for k, v in data.items())
+                if v is not None
+            }
             if metrics:
                 parts = [f"[Step {step:04d} | Epoch {self.epoch:03d}]"]
                 parts.extend(
-                    f"{k}={int(v)}" if isinstance(v, int) or (isinstance(v, float) and v.is_integer())
-                    else f"{k}={v:.4f}"
+                    (
+                        f"{k}={int(v)}"
+                        if isinstance(v, int) or (isinstance(v, float) and v.is_integer())
+                        else f"{k}={v:.4f}"
+                    )
                     for k, v in metrics.items()
                 )
                 logger.info(" ".join(parts))
-    
+
     def _init_logging_backend(self):
         """Initialize logging backend if specified."""
         if self.accelerator.is_main_process:
@@ -165,8 +215,9 @@ class BaseTrainer(ABC):
 
         # If DeepSpeed ZeRO-3 is enabled, the reward model will be somehow sharded.
         # We need to disable ZeRO-3 init context when loading the model to avoid issues
-        # NOTE: This bug persists even with this context manager. DONOT USE ZeRO-3.
-        # A possible solution: use DeepSpeed GatherParamter manually in the reward_model's `forward`.
+        # This remains unsupported even with the context manager; do not use ZeRO-3.
+        # A possible solution: call DeepSpeed's `zero.GatheredParameters` manually inside the
+        # reward model's `forward`.
 
         # Collect training dataset names so MultiRewardLoader can pre-compute
         # the per-source reward routing used by the runtime reward gate
@@ -196,7 +247,7 @@ class BaseTrainer(ABC):
         # Get training & eval reward models
         self.reward_models = self.reward_loader.get_training_reward_models()
         self.eval_reward_models = self.reward_loader.get_eval_reward_models()
-        train_reward_configs = self.reward_loader.get_reward_configs('train')
+        train_reward_configs = self.reward_loader.get_reward_configs("train")
         # Initialize reward processor (training side only — eval-side
         # processors are per-dataset, built below).
         group_on_same_rank = self.config.data_args.sampler_type == "group_contiguous"
@@ -204,13 +255,14 @@ class BaseTrainer(ABC):
             accelerator=self.accelerator,
             reward_models=self.reward_models,
             reward_configs=train_reward_configs,
-            tokenizer=self.adapter.tokenizer, # For prompt encoding/decoding,
+            tokenizer=self.adapter.tokenizer,  # For prompt encoding/decoding,
             group_on_same_rank=group_on_same_rank,
             verbose=self.log_args.verbose,
         )
         # Initialize the training-side reward buffer.
         self.reward_buffer = RewardBuffer(
-            self.reward_processor, self.training_args.group_size,
+            self.reward_processor,
+            self.training_args.group_size,
         )
 
         # Per-eval-dataset reward processors and buffers.  Eval is now
@@ -238,7 +290,8 @@ class BaseTrainer(ABC):
                     )
                     self.eval_dataset_reward_processors[ed.name] = ds_processor
                     self.eval_dataset_reward_buffers[ed.name] = RewardBuffer(
-                        ds_processor, self.training_args.group_size,
+                        ds_processor,
+                        self.training_args.group_size,
                     )
 
         # Initialize advantage processor.
@@ -246,12 +299,9 @@ class BaseTrainer(ABC):
         # so reward_weights is Dict[reward_name, Dict[dataset_name, float]].
         self.advantage_processor = AdvantageProcessor(
             accelerator=self.accelerator,
-            reward_weights={
-                name: cfg.weight
-                for name, cfg in train_reward_configs.items()
-            },
+            reward_weights={name: cfg.weight for name, cfg in train_reward_configs.items()},
             group_size=self.training_args.group_size,
-            global_std=getattr(self.training_args, 'global_std', True),
+            global_std=getattr(self.training_args, "global_std", True),
             sampler_type=self.config.data_args.sampler_type,
             verbose=self.log_args.verbose,
             source_id_to_name=self.config.data_args.source_id_to_name,
@@ -259,16 +309,19 @@ class BaseTrainer(ABC):
 
         return self.reward_models, self.eval_reward_models
 
-    def _init_dataloader(self) -> Tuple[Optional[Union[DataLoader, "MultiSourceTrainDataLoader"]], Dict[str, DataLoader]]:
+    def _init_dataloader(
+        self,
+    ) -> Tuple[Optional[Union[DataLoader, "MultiSourceTrainDataLoader"]], Dict[str, DataLoader]]:
         """Build train and eval dataloaders.
 
         Returns:
             Tuple of (train_dataloader, eval_dataloaders_by_name).
         """
         self.adapter.on_load_components(
-            components=self.adapter.preprocessing_modules,
-            device=self.accelerator.device
+            components=self.adapter.preprocessing_modules, device=self.accelerator.device
         )
+        if self.adapter.uses_fsdp_cpu_efficient_loading():
+            self._synchronize_frozen_components(self.adapter.preprocessing_modules)
 
         dataloader, train_dataloaders_by_source = get_train_dataloader(
             config=self.config,
@@ -291,54 +344,309 @@ class BaseTrainer(ABC):
         self.accelerator.wait_for_everyone()
 
         return dataloader, eval_dataloaders
-    
+
     def _init_optimizer(self) -> torch.optim.Optimizer:
-        """Initialize optimizer."""
-        self.optimizer = torch.optim.AdamW(
-            self.adapter.get_trainable_parameters(),
-            lr=self.training_args.learning_rate,
-            betas=self.training_args.adam_betas,
-            weight_decay=self.training_args.adam_weight_decay,
-            eps=self.training_args.adam_epsilon,
+        """Build the single optimizer root, its groups ordered and tagged by role.
+
+        All-AdamW runs get one ``torch.optim.AdamW``. A role that selects Muon
+        contributes two groups instead of one, since Muon takes only matrices, and
+        the root becomes a ``CompositeOptimizer``.
+        """
+        registry = self.adapter.component_variant_registry
+        trainable_role_names = registry.variant_names
+        role_configs = self._role_optimizer_configs()
+        configured_role_names = tuple(config.role_name for config in role_configs)
+        if configured_role_names != trainable_role_names:
+            raise ValueError(
+                "expected role optimizer configs to exactly match declared trainable roles "
+                f"{trainable_role_names!r}, received {configured_role_names!r}"
+            )
+
+        optimizer_args = tuple(
+            self._optimizer_args_for_role(config.role_name) for config in role_configs
         )
+        self._validate_optimizer_backend(optimizer_args)
+        parameters_by_name = {}
+        for config in role_configs:
+            parameters = registry.parameters(config.role_name)
+            if not parameters:
+                raise ValueError(
+                    f"expected trainable role {config.role_name!r} to own optimizer "
+                    "parameters, received none"
+                )
+            parameters_by_name[config.role_name] = parameters
+
+        self.optimizer = build_optimizer(optimizer_args, parameters_by_name)
+
+        # Muon splits one role across two groups (its matrices and the AdamW
+        # remainder), so ownership is recorded per role rather than per group.
+        self.optimization_roles = {}
+        group_ids_by_role: Dict[str, List[int]] = {}
+        for group_id, group in enumerate(self.optimizer.param_groups):
+            group_ids_by_role.setdefault(group["role_name"], []).append(group_id)
+        for config in role_configs:
+            self.optimization_roles[config.role_name] = OptimizationRole(
+                config=config,
+                parameters=parameters_by_name[config.role_name],
+                optimizer_group_ids=tuple(group_ids_by_role[config.role_name]),
+            )
         return self.optimizer
+
+    def _optimizer_args_for_role(self, role_name: str) -> OptimizerArguments:
+        """Return the optimizer configuration for one trainable role.
+
+        A single-policy run has one configuration and need not name it, which is
+        what every existing config file relies on.
+
+        Args:
+            role_name: Trainable role to configure.
+
+        Returns:
+            The matching optimizer arguments.
+
+        Raises:
+            ValueError: If no configuration matches and none can be defaulted.
+        """
+        configured = self.config.optimizer_args.get_by_name(role_name)
+        if configured is not None:
+            return configured
+        if len(self.config.optimizer_args) == 1:
+            # The lone entry configures whichever role this run trains, whatever the
+            # file happens to call it. Adopt the role name: `build_optimizer` looks
+            # parameters up by `OptimizerArguments.name`, and that lookup is keyed by
+            # role, so returning the entry unrenamed finds no parameters at all.
+            return replace(self.config.optimizer_args[0], name=role_name)
+        available = tuple(config.name for config in self.config.optimizer_args)
+        raise ValueError(
+            f"expected an optimizer configuration named {role_name!r} under `optimizers`, "
+            f"received {available!r}"
+        )
+
+    def _role_optimizer_configs(self) -> Tuple[RoleOptimizerConfig, ...]:
+        """Build role configs from nested arguments or legacy flat arguments."""
+        required_roles = BaseTrainer._required_trainable_roles(self)
+        if getattr(self.training_args, "role_update_plan", None) is not None:
+            update_plan = BaseTrainer._role_update_plan(self)
+            plan_roles = {phase.role_name for phase in update_plan.phases}
+            if plan_roles != set(required_roles):
+                raise ValueError(
+                    "expected role update plan roles to exactly match required trainable roles "
+                    f"{required_roles!r}, received {tuple(plan_roles)!r}"
+                )
+
+        return tuple(
+            BaseTrainer._role_optimizer_config_from_args(
+                role_name, self._optimizer_args_for_role(role_name)
+            )
+            for role_name in required_roles
+        )
+
+    @staticmethod
+    def _role_optimizer_config_from_args(
+        role_name: str, optimizer_args: OptimizerArguments
+    ) -> RoleOptimizerConfig:
+        """Project one optimizer configuration onto the coordinator's view of a role.
+
+        The coordinator only needs the clip norm and the update cadence; the moment
+        parameters are carried along so a role's configuration stays inspectable in
+        one place. A Muon role reports its AdamW-half moments, which is what its
+        non-matrix parameters actually use.
+        """
+        betas = getattr(optimizer_args, "betas", None)
+        eps = getattr(optimizer_args, "eps", None)
+        if betas is None:
+            betas = getattr(optimizer_args, "fallback_betas")
+            eps = getattr(optimizer_args, "fallback_eps")
+        return RoleOptimizerConfig(
+            role_name=role_name,
+            learning_rate=optimizer_args.learning_rate,
+            adam_betas=betas,
+            adam_weight_decay=optimizer_args.weight_decay,
+            adam_epsilon=eps,
+            max_grad_norm=optimizer_args.max_grad_norm,
+            update_frequency=optimizer_args.update_frequency,
+        )
+
+    def _finish_role_microbatch(self) -> bool:
+        """Finish a role microbatch, advancing the public step for the primary role."""
+        role_name = self.role_optimization.active_role_name
+        stepped = self.role_optimization.finish_microbatch()
+        if stepped and role_name == self._primary_role():
+            self.step += 1
+        return stepped
+
+    def _rebind_prepared_optimization_roles(self) -> None:
+        """Rebuild role ownership from prepared optimizer parameter identities."""
+        optimizer_groups = self.optimizer.param_groups
+        expected_group_ids = tuple(
+            group_id
+            for role in self.optimization_roles.values()
+            for group_id in role.optimizer_group_ids
+        )
+        if tuple(sorted(expected_group_ids)) != tuple(range(len(optimizer_groups))):
+            raise ValueError(
+                "expected optimization roles to exhaust prepared optimizer groups "
+                f"{tuple(range(len(optimizer_groups)))!r}, received {expected_group_ids!r}"
+            )
+
+        rebound_roles = {}
+        for role_name, role in self.optimization_roles.items():
+            prepared_parameters = []
+            for group_id in role.optimizer_group_ids:
+                group = optimizer_groups[group_id]
+                prepared_role_name = group.get("role_name")
+                if prepared_role_name != role_name:
+                    raise ValueError(
+                        f"prepared optimizer group {group_id} expected role_name "
+                        f"{role_name!r}, received {prepared_role_name!r}"
+                    )
+                group_parameters = tuple(group["params"])
+                if not group_parameters:
+                    raise ValueError(
+                        f"prepared optimizer group {group_id} for role {role_name!r} "
+                        "expected at least one parameter, received none"
+                    )
+                prepared_parameters.extend(group_parameters)
+            rebound_roles[role_name] = OptimizationRole(
+                config=role.config,
+                parameters=tuple(prepared_parameters),
+                optimizer_group_ids=role.optimizer_group_ids,
+                step=role.step,
+                scheduler=role.scheduler,
+            )
+        self.optimization_roles = rebound_roles
+
+    def _init_prepared_role_optimization(self) -> None:
+        """Bind prepared identities and construct the role coordinator."""
+        BaseTrainer._rebind_prepared_optimization_roles(self)
+        self.role_optimization = RoleOptimizationCoordinator(
+            accelerator=self.accelerator,
+            model_bundle=self.model_bundle,
+            optimizer=self.optimizer,
+            roles=self.optimization_roles,
+        )
+
+    def _role_update_plan(self) -> RoleUpdatePlan:
+        """Return the ordered role plan used for checkpoint compatibility."""
+        configured_plan_builder = getattr(self.training_args, "role_update_plan", None)
+        if configured_plan_builder is not None:
+            configured_plan = configured_plan_builder()
+            if not isinstance(configured_plan, RoleUpdatePlan):
+                raise TypeError(
+                    "expected training_args.role_update_plan() to return RoleUpdatePlan, "
+                    f"received {type(configured_plan).__name__}: {configured_plan!r}"
+                )
+            return configured_plan
+        return RoleUpdatePlan(
+            phases=tuple(RolePhase(role_name) for role_name in self.optimization_roles)
+        )
+
+    def _declare_model_variants(self) -> None:
+        """Declare the component variants this algorithm trains, before ``prepare``.
+
+        Roles are the trainer's vocabulary, not the adapter's: an algorithm that
+        trains a generator against a fake score names its own variants here and
+        keeps the meaning of those names to itself. A single-policy algorithm needs
+        only the base variant, which is what this default declares.
+        """
+        self.adapter.declare_component_variants(self._required_trainable_roles())
+
+        # A weight-only resume already ran while the adapter was being built, when the
+        # roles did not exist yet and only the primary artifact could be placed. Now
+        # that they do, restore the rest -- a generator resumed beside an untouched fake
+        # score trains against the wrong critic and reports nothing wrong.
+        resume_path = getattr(self.adapter.model_args, "resume_path", None)
+        resume_type = getattr(self.adapter.model_args, "resume_type", None)
+        if resume_path and resume_type != "state":
+            self.adapter.restore_training_roles(resume_path)
+
+    def _required_trainable_roles(self) -> Tuple[str, ...]:
+        """Return every role this run trains, the one owning the base weights first.
+
+        Once variants are declared the adapter is the source of truth, so a trainer
+        that declares them directly is described correctly without also restating
+        them in config. Before declaration the algorithm's ``TrainingArguments``
+        answer; a single-policy algorithm names none and gets one base variant.
+        """
+        training_args = getattr(self, "training_args", None)
+        declared = getattr(training_args, "required_trainable_roles", None)
+        if declared:
+            return tuple(declared)
+        registry = getattr(getattr(self, "adapter", None), "component_variant_registry", None)
+        if isinstance(registry, ComponentVariantRegistry):
+            return registry.variant_names
+        return (DEFAULT_BASE_VARIANT,)
 
     def _load_inference_components(self, trainable_module_names: List[str]):
         """
         Load non-trainable components needed at runtime to the accelerator device.
-        
+
         Trainable modules are already on-device via `accelerator.prepare()`.
         This loads the remaining modules required for inference and,
         when preprocessing is disabled, also loads encoding components
         that would otherwise stay offloaded.
         """
         prepared_names = set(trainable_module_names)
-        
+
         modules_to_load = list(self.adapter.inference_modules)
-        
+
         if not self.config.data_args.enable_preprocess:
             modules_to_load.extend(self.adapter.preprocessing_modules)
-        
+
         # Resolve group names → concrete names, then deduplicate & exclude prepared
         resolved = self.adapter._resolve_component_names(modules_to_load)
         resolved = [m for m in resolved if m not in prepared_names]
-        
+
         if resolved:
             self.adapter.on_load_components(
                 components=resolved,
                 device=self.accelerator.device,
             )
+            if self.adapter.uses_fsdp_cpu_efficient_loading():
+                self._synchronize_frozen_components(resolved)
+
+    def _validate_paradigm_dynamics(self) -> None:
+        """Reject a scheduler whose dynamics the declared paradigm cannot use.
+
+        A coupled algorithm differentiates a stochastic transition, so an ODE
+        scheduler leaves it with no transition density and silently wrong policy
+        gradients (``constraints.md`` #7). Only the coupled path was guarded, and
+        only lazily at the point a transition scale was first needed, which is
+        after a run has already started.
+        """
+        if type(self).paradigm != "coupled":
+            return
+        scheduler_group = getattr(self.adapter, "scheduler_group", None)
+        if scheduler_group is None:
+            return
+        stochastic = ("Flow-SDE", "Dance-SDE", "CPS")
+        for component in scheduler_group.names:
+            dynamics_type = scheduler_group[component].dynamics_type
+            if dynamics_type not in stochastic:
+                raise ValueError(
+                    f"coupled algorithm {type(self).__name__} requires stochastic dynamics, "
+                    f"received dynamics_type={dynamics_type!r} for component {component!r}; "
+                    f"expected one of {stochastic}. Either configure an SDE scheduler or use a "
+                    "decoupled algorithm (see constraints #7)."
+                )
 
     def _initialization(self):
+        self._validate_paradigm_dynamics()
+        configure_deepspeed_micro_batch_size(
+            self.accelerator, self.training_args.per_device_batch_size
+        )
+
         # Fix for FSDP, synchronize frozen components like text encoder & VAE.
         # Otherwise they may be uninitialized on Rank > 0.
-        if self.adapter._is_fsdp_cpu_efficient_loading():
+        if self.adapter.uses_fsdp_cpu_efficient_loading():
             logger.info("FSDP CPU Efficient Loading detected. Synchronizing frozen components...")
             # self.adapter.on_load(self.accelerator.device)
             self._synchronize_frozen_components()
 
-        # Init dataloader and optimizer
+        # Init dataloader, then materialize every live component variant before
+        # optimizer and distributed bundle construction.
         self.dataloader, eval_dataloaders = self._init_dataloader()
+        self._declare_model_variants()
         self.optimizer = self._init_optimizer()
 
         # Bundle ALL target components (trainable + frozen-but-shardable, e.g.
@@ -348,12 +656,13 @@ class BaseTrainer(ABC):
         # one) require this. The optimizer/EMA/ref still operate on the
         # requires_grad subset via `get_trainable_parameters()`; frozen members
         # are sharded for memory but never receive gradient.
-        bundle_names = list(self.adapter.target_module_map.keys())
-        # Bundle the resolved trainable/frozen components. get_component returns the
-        # LoRA PeftModel for LoRA training (apply_lora stores it via set_component,
-        # NOT in-place on the pipeline), matching the pre-refactor membership.
-        bundle_members = {name: self.adapter.get_component(name) for name in bundle_names}
+        canonical_bundle_names = list(self.adapter.target_module_map.keys())
+        variant_registry = self.adapter.component_variant_registry
+        bundle_members = variant_registry.bundle_members()
         model_bundle = ModelBundle(bundle_members)
+        self._unprepared_optimizer_group_roles = tuple(
+            group["role_name"] for group in self.optimizer.param_groups
+        )
 
         eval_dataloader_names = list(eval_dataloaders.keys())
         eval_dataloader_list = [eval_dataloaders[n] for n in eval_dataloader_names]
@@ -364,6 +673,9 @@ class BaseTrainer(ABC):
         prepared = self.accelerator.prepare(model_bundle, self.optimizer, *eval_dataloader_list)
         self.model_bundle = prepared[0]
         self.optimizer = prepared[1]
+        BaseTrainer._init_prepared_role_optimization(self)
+        BaseTrainer._validate_multirole_backend(self)
+        BaseTrainer._validate_trainable_parameters_survived_prepare(self)
         prepared_eval_dataloaders = prepared[2:]
         self.eval_dataloaders: Dict[str, DataLoader] = dict(
             zip(eval_dataloader_names, prepared_eval_dataloaders)
@@ -374,13 +686,19 @@ class BaseTrainer(ABC):
         # required for DDP's reducer / FSDP's gather / the DeepSpeed engine --
         # while attribute access delegates to the inner member.
         inner_bundle = self.accelerator.unwrap_model(self.model_bundle)
-        for name in bundle_names:
+        for name in canonical_bundle_names:
             self.adapter.set_component(
-                name, RoutedComponentProxy(self.model_bundle, name, inner_bundle.members[name])
+                name,
+                RoutedComponentProxy(
+                    self.model_bundle,
+                    name,
+                    variant_registry,
+                    inner_bundle.members,
+                ),
             )
 
         # Load inference modules, excluding all bundle members (already prepared).
-        self._load_inference_components(bundle_names)
+        self._load_inference_components(canonical_bundle_names)
 
         # Build + validate acceleration plugins. Persistent stage='both' accelerators
         # are *applied* later via _apply_shared_acceleration(), after post_init()
@@ -468,19 +786,25 @@ class BaseTrainer(ABC):
                 stack.enter_context(accelerator.rollout_context(self.adapter))
             yield
 
-    def _synchronize_frozen_components(self):
+    def _synchronize_frozen_components(
+        self,
+        components: Optional[Union[str, List[str]]] = None,
+    ):
         if self.accelerator.num_processes <= 1:
             return
-        
+
         # Synchronize all non-prepared components
-        all_names = self.adapter._resolve_component_names()
+        all_names = self.adapter._resolve_component_names(components)
         for name in all_names:
             if self.adapter._should_manage_device(name):
                 comp = self.adapter.get_component(name)
-                if comp is not None:
+                if isinstance(comp, nn.Module):
                     for param in comp.parameters():
                         param.data = param.data.to(self.accelerator.device)
                         dist.broadcast(param.data, src=0)
+                    for buffer in comp.buffers():
+                        buffer.data = buffer.data.to(self.accelerator.device)
+                        dist.broadcast(buffer.data, src=0)
 
         # Barrier to ensure everyone is done
         self.accelerator.wait_for_everyone()
@@ -502,7 +826,7 @@ class BaseTrainer(ABC):
         torch_autocast_dtype fall through to the active torch.autocast state so
         the engine re-enables (rather than disables) autocast during forward.
         """
-        if getattr(accelerator.state, 'deepspeed_plugin', None) is None:
+        if getattr(accelerator.state, "deepspeed_plugin", None) is None:
             return
 
         try:
@@ -511,13 +835,13 @@ class BaseTrainer(ABC):
         except ImportError:
             return
 
-        if getattr(DeepSpeedEngine, '_ff_autocast_patched', False):
+        if getattr(DeepSpeedEngine, "_ff_autocast_patched", False):
             return
 
-        if hasattr(_ds_ac, 'validate_nested_autocast'):
+        if hasattr(_ds_ac, "validate_nested_autocast"):
             _ds_ac.validate_nested_autocast = lambda engine: None
 
-        if hasattr(DeepSpeedEngine, 'torch_autocast_enabled'):
+        if hasattr(DeepSpeedEngine, "torch_autocast_enabled"):
             _orig_enabled = DeepSpeedEngine.torch_autocast_enabled
             _orig_dtype = DeepSpeedEngine.torch_autocast_dtype
 
@@ -534,24 +858,264 @@ class BaseTrainer(ABC):
 
         DeepSpeedEngine._ff_autocast_patched = True
 
-    @abstractmethod
-    def start(self, *args, **kwargs):
-        """Start training process."""
-        pass
+    def start(self) -> None:
+        """Run the training loop until the configured budget is exhausted.
 
-    @abstractmethod
-    def prepare_feedback(self, samples: List[BaseSample]) -> None:
-        """Stages 4--5: finalize rewards, compute advantages, and log metrics (no policy gradients).
-
-        Algorithms that need extra batching before the loss (e.g. DPO chosen/rejected pairs) may
-        perform that work in :meth:`optimize` after advantages are on each sample.
+        Every algorithm drives the same epoch: reseed, save on ``save_freq``,
+        evaluate on ``eval_freq``, then sample, score, optimize, and step EMA.
+        Only the middle of that sequence is algorithm-specific, so the loop lives
+        here and the variation is expressed through
+        :meth:`sampling_context`, :meth:`_run_training_step` and
+        :meth:`_after_optimizer_step` rather than by restating the loop.
         """
-        pass
+        while self.should_continue_training():
+            self.adapter.set_trajectory_seed(self.epoch + self.training_args.seed)
+
+            if (
+                self.log_args.save_freq > 0
+                and self.epoch % self.log_args.save_freq == 0
+                and self.log_args.save_dir
+            ):
+                save_dir = os.path.join(
+                    self.log_args.save_dir,
+                    str(self.log_args.run_name),
+                    "checkpoints",
+                )
+                self.save_checkpoint(save_dir, epoch=self.epoch)
+
+            if self.eval_args.eval_freq > 0 and self.epoch % self.eval_args.eval_freq == 0:
+                self.evaluate()
+
+            self._run_training_step()
+
+            self.adapter.ema_step(step=self.epoch)
+            self._after_optimizer_step()
+            self.epoch += 1
+
+    def _run_training_step(self) -> None:
+        """Run one epoch's rollout, feedback and optimization.
+
+        Every trainer supplies ``sample()``; what it stores follows from the
+        paradigm, since a coupled algorithm needs the full trajectory and its log
+        probabilities while a decoupled one needs only the terminal state.
+        Distillation accumulates several dataloader batches before a single
+        optimizer step, so the grouping is a hook rather than a fixed sequence.
+        """
+        with self.sampling_context():
+            samples = self.sample()
+        self.prepare_feedback(samples)
+        self.optimize(samples)
+
+    @contextmanager
+    def sampling_context(self) -> Iterator[None]:
+        """Parameter scope for rollout generation.
+
+        On-policy sampling needs no swap; algorithms that roll out under EMA, a
+        reference snapshot, or a separate sampling model override this.
+        """
+        yield
+
+    def _after_optimizer_step(self) -> None:
+        """Update algorithm-owned auxiliary weights after the optimizer step.
+
+        EMA is handled by the loop; this is for extra snapshots an algorithm keeps
+        alongside it, such as CRD's old model and sampling model.
+        """
+
+    def prepare_feedback(self, samples: List[BaseSample]) -> None:
+        """Stages 4--5: finalize rewards, compute advantages, and log metrics.
+
+        No policy gradients here. Distillation has no reward signal and overrides
+        this with a no-op; algorithms that need extra batching before the loss
+        (DPO's chosen/rejected pairing) do that work in :meth:`optimize`, after
+        advantages are on each sample.
+        """
+        rewards = self.reward_buffer.finalize(store_to_samples=True, split="all")
+        self.compute_advantages(samples, rewards, store_to_samples=True)
+        adv_metrics = self.advantage_processor.pop_advantage_metrics()
+        if adv_metrics:
+            self.log_data(adv_metrics, step=self.step)
+
+    def compute_advantages(
+        self,
+        samples: List[BaseSample],
+        rewards: Dict[str, torch.Tensor],
+        store_to_samples: bool = True,
+        aggregation_func: Optional[Union[Literal["sum", "gdpo"], Callable]] = None,
+    ) -> torch.Tensor:
+        """Turn per-sample rewards into advantages via the advantage processor.
+
+        Args:
+            samples: Samples this epoch's rewards belong to.
+            rewards: Reward tensors by reward name, aligned with ``samples``.
+            store_to_samples: Whether to write advantages back onto each sample.
+            aggregation_func: Within-group aggregation, defaulting to the
+                configured ``advantage_aggregation``.
+
+        Returns:
+            One advantage per sample.
+        """
+        aggregation_func = aggregation_func or self.training_args.advantage_aggregation
+        return self.advantage_processor.compute_advantages(
+            samples=samples,
+            rewards=rewards,
+            store_to_samples=store_to_samples,
+            aggregation_func=aggregation_func,
+        )
 
     @abstractmethod
     def optimize(self, *args, **kwargs):
         """Update policy model"""
         pass
+
+    def _sample_timesteps(
+        self,
+        batch_size: int,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        """Sample scheduler-scale training timesteps in ``[0, 1000]``.
+
+        Decoupled algorithms draw a training coordinate rather than replaying a
+        stored one, and the strategy is a configuration choice rather than an
+        algorithmic one, so it lives here. An algorithm whose draw is part of its
+        objective (DPO shares one draw across preference arms) overrides this.
+
+        Args:
+            batch_size: Size of the broadcast batch dimension.
+            generator: Optional ``torch.Generator``. When supplied, the draw is
+                deterministic and cross-rank-reproducible for any strategy, which
+                is how a group-based algorithm shares one coordinate across ranks.
+
+        Returns:
+            Tensor of shape ``(num_train_timesteps, batch_size)``.
+
+        Raises:
+            ValueError: If the configured strategy is not recognized.
+        """
+        device = self.accelerator.device
+        strategy = self.time_sampling_strategy.lower()
+        available = [
+            "logit_normal",
+            "uniform",
+            "discrete",
+            "discrete_with_init",
+            "discrete_wo_init",
+        ]
+
+        if strategy == "logit_normal":
+            return TimeSampler.logit_normal_shifted(
+                batch_size=batch_size,
+                num_timesteps=self.num_train_timesteps,
+                timestep_range=self.timestep_range,
+                time_shift=self.time_shift,
+                device=device,
+                stratified=True,
+                generator=generator,
+            )
+        if strategy == "uniform":
+            return TimeSampler.uniform(
+                batch_size=batch_size,
+                num_timesteps=self.num_train_timesteps,
+                timestep_range=self.timestep_range,
+                time_shift=self.time_shift,
+                device=device,
+                generator=generator,
+            )
+        if strategy.startswith("discrete"):
+            discrete_config = {
+                "discrete": (True, False),
+                "discrete_with_init": (True, True),
+                "discrete_wo_init": (False, False),
+            }
+            if strategy not in discrete_config:
+                raise ValueError(
+                    f"Unknown time_sampling_strategy: {strategy!r}. Available: {available}"
+                )
+            include_init, force_init = discrete_config[strategy]
+            return TimeSampler.discrete(
+                batch_size=batch_size,
+                num_train_timesteps=self.num_train_timesteps,
+                scheduler_timesteps=self.adapter.scheduler.timesteps,
+                timestep_range=self.timestep_range,
+                include_init=include_init,
+                force_init=force_init,
+                generator=generator,
+            )
+
+        raise ValueError(f"Unknown time_sampling_strategy: {strategy!r}. Available: {available}")
+
+    def _apply_optimizer_step(
+        self,
+        loss_info: Dict[str, List[torch.Tensor]],
+    ) -> Dict[str, List[torch.Tensor]]:
+        """Clip, step, log the accumulated losses and start a fresh accumulation.
+
+        Call this once ``accelerator.sync_gradients`` is true. Only the loss that
+        reached ``backward`` is algorithm-specific; clipping, stepping and metric
+        reduction are the same for every algorithm.
+
+        Args:
+            loss_info: Per-metric values accumulated since the last optimizer step.
+
+        Returns:
+            An empty accumulator for the next optimizer step.
+        """
+        # Hand over the prepared root's full parameter list, not just the trainable
+        # subset. Accelerate only delegates to FSDP's collective `clip_grad_norm_`
+        # when the list it receives is exactly `model.parameters()`; given a subset it
+        # falls through to the plain utility, which under FSDP1 computes the norm from
+        # this rank's shard alone and clips inconsistently across ranks. Frozen
+        # parameters carry no gradient, so including them changes nothing for the
+        # backends that do not shard.
+        grad_norm = self.accelerator.clip_grad_norm_(
+            self.model_bundle.parameters(),
+            self.training_args.max_grad_norm,
+        )
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+        self._after_gradient_step()
+
+        reduced = reduce_loss_info(self.accelerator, loss_info)
+        reduced["grad_norm"] = grad_norm
+        self.log_data({f"train/{k}": v for k, v in reduced.items()}, step=self.step)
+        self.step += 1
+        return defaultdict(list)
+
+    def _after_gradient_step(self) -> None:
+        """Update per-optimizer-step auxiliary weights before metrics are logged.
+
+        Distinct from :meth:`_after_optimizer_step`, which runs once per epoch;
+        this runs on every optimizer step, which is the cadence DGPO's fast
+        reference EMA needs.
+        """
+
+    def _velocity_kl(
+        self,
+        velocity: LatentState,
+        other_velocity: LatentState,
+        noised: NoisedState,
+    ) -> torch.Tensor:
+        """Compute the per-sample squared velocity gap against another policy.
+
+        Under a fixed forward process the KL between two Gaussian transition
+        kernels reduces to the squared gap between their velocity predictions, so
+        every decoupled algorithm that regularizes towards a reference, an EMA, or
+        an older snapshot needs exactly this quantity. Which policy supplies
+        ``other_velocity`` is the algorithm's choice; the reduction is not.
+
+        Args:
+            velocity: Current-policy velocity per component.
+            other_velocity: Reference, EMA or old-snapshot velocity per component.
+            noised: Forward-noised state supplying per-sample reduction context.
+
+        Returns:
+            Per-sample KL surrogate of shape ``(B,)``.
+        """
+        errors = {
+            name: (velocity.components[name] - other_velocity.components[name]) ** 2
+            for name in self.adapter.trajectory_component_order
+        }
+        return self.adapter.reduce_latent_values(errors, state=noised.state)
 
     def _order_samples_for_optimize(
         self, samples: List[BaseSample], inner_epoch: int
@@ -583,7 +1147,7 @@ class BaseTrainer(ABC):
         if not self.training_args.offload_samples_to_cpu:
             return
         for sample in samples:
-            sample.to('cpu', pin_memory=True)
+            sample.to("cpu", pin_memory=True)
 
     def _iter_prefetched_batches(
         self,
@@ -608,42 +1172,12 @@ class BaseTrainer(ABC):
             StackedSampleBatch: a stacked micro-batch (its source samples are at
             ``batch.samples``).
         """
-        device = self.accelerator.device
-        starts = list(range(0, len(samples), per_device_batch_size))
-
-        use_prefetch = (
-            torch.cuda.is_available()
-            and self.training_args.offload_samples_to_cpu
-            and len(starts) > 1
+        yield from iter_prefetched_batches(
+            samples,
+            per_device_batch_size,
+            device=self.accelerator.device,
+            offload_samples_to_cpu=self.training_args.offload_samples_to_cpu,
         )
-        if not use_prefetch:
-            for start in starts:
-                batch_samples = [
-                    sample.to(device)
-                    for sample in samples[start:start + per_device_batch_size]
-                ]
-                yield BaseSample.stack(batch_samples)
-            return
-
-        copy_stream = torch.cuda.Stream(device)
-        compute_stream = torch.cuda.current_stream(device)
-
-        def _load(start: int) -> StackedSampleBatch:
-            with torch.cuda.stream(copy_stream):
-                moved = [
-                    sample.to(device, non_blocking=True)
-                    for sample in samples[start:start + per_device_batch_size]
-                ]
-                return BaseSample.stack(moved)
-
-        next_batch = _load(starts[0])
-        for i, _ in enumerate(starts):
-            batch = next_batch
-            compute_stream.wait_stream(copy_stream)  # batch H2D complete before use
-            _record_stream_on_batch(batch, compute_stream)  # keep alive for compute stream
-            if i + 1 < len(starts):
-                next_batch = _load(starts[i + 1])  # prefetch next, overlaps compute
-            yield batch
 
     def sample_batch(
         self,
@@ -757,8 +1291,8 @@ class BaseTrainer(ABC):
         # Per-prompt ratio used for both metadata and __source__ broadcasting.
         # Some adapters generate K replicates per prompt (group_size > 1) so
         # one batch row maps to several samples.
-        sources = batch.get('__source__')
-        source_ids = batch.get('__source_id__')
+        sources = batch.get("__source__")
+        source_ids = batch.get("__source_id__")
         metadata_list = batch.get(METADATA_COLUMN)
         if not metadata_list and not sources and not source_ids:
             return
@@ -863,7 +1397,7 @@ class BaseTrainer(ABC):
         with self._rollout_acceleration(), torch.no_grad(), self.autocast():
             for _ in tqdm(
                 range(self.training_args.num_batches_per_epoch),
-                desc=f'Epoch {self.epoch} Sampling',
+                desc=f"Epoch {self.epoch} Sampling",
                 disable=not self.show_progress_bar,
             ):
                 batch = next(data_iter)
@@ -884,10 +1418,7 @@ class BaseTrainer(ABC):
         # fire there. This catches a trainer that overrode generate_samples
         # but bypassed sample_batch / _inject_batch_metadata.
         if len(self.train_dataloaders_by_source) > 1 and samples:
-            missing = [
-                i for i, s in enumerate(samples)
-                if s.source is None
-            ]
+            missing = [i for i, s in enumerate(samples) if s.source is None]
             if missing:
                 raise RuntimeError(
                     f"Multi-source training: {len(missing)} sample(s) at indices "
@@ -927,28 +1458,28 @@ class BaseTrainer(ABC):
             for dataset_name, dataloader in self.eval_dataloaders.items():
                 buffer = self.eval_dataset_reward_buffers.get(dataset_name)
                 if buffer is None:
-                    logger.warning(
-                        f"No reward buffer for eval dataset '{dataset_name}', skipping."
-                    )
+                    logger.warning(f"No reward buffer for eval dataset '{dataset_name}', skipping.")
                     continue
                 buffer.clear()
                 all_samples: List[BaseSample] = []
 
                 # Merge per-dataset eval overrides with shared eval_args
                 ed_config = self._eval_dataset_configs[dataset_name]
-                eval_kwargs = ed_config.eval.get_merged_eval_kwargs(self.eval_args) if ed_config.eval else dict(self.eval_args)
+                eval_kwargs = (
+                    ed_config.eval.get_merged_eval_kwargs(self.eval_args)
+                    if ed_config.eval
+                    else dict(self.eval_args)
+                )
 
                 for batch in tqdm(
                     dataloader,
-                    desc=f'Eval/{dataset_name}',
+                    desc=f"Eval/{dataset_name}",
                     disable=not self.show_progress_bar,
                 ):
                     batch = self._augment_batch_with_source(
                         batch, dataset_name, ed_config.source_id
                     )
-                    generator = create_generator_by_prompt(
-                        batch['prompt'], self.training_args.seed
-                    )
+                    generator = create_generator_by_prompt(batch["prompt"], self.training_args.seed)
                     samples = self.sample_batch(
                         batch,
                         reward_buffer=buffer,
@@ -959,46 +1490,57 @@ class BaseTrainer(ABC):
                     )
                     all_samples.extend(samples)
 
-                rewards = buffer.finalize(store_to_samples=True, split='pointwise')
+                rewards = buffer.finalize(store_to_samples=True, split="pointwise")
 
-                # Gather across ranks
+                # Pack all reward columns so evaluation pays for one gather per
+                # dataset rather than one gather per reward model.
                 rewards_tensors = {
-                    k: torch.as_tensor(v).to(self.accelerator.device)
-                    for k, v in rewards.items()
+                    key: torch.as_tensor(value).to(self.accelerator.device)
+                    for key, value in rewards.items()
                 }
                 gathered_rewards = {
-                    k: self.accelerator.gather(v).cpu().numpy()
-                    for k, v in rewards_tensors.items()
+                    key: value.cpu().numpy()
+                    for key, value in gather_aligned_floating_tensors(
+                        self.accelerator,
+                        rewards_tensors,
+                    ).items()
                 }
 
                 # Log per-dataset immediately to avoid accumulating all samples in memory
                 if self.accelerator.is_main_process:
                     log_data: Dict[str, Any] = {}
                     for k, v in gathered_rewards.items():
-                        log_data[f'eval/{dataset_name}/reward_{k}_mean'] = np.mean(v)
-                        log_data[f'eval/{dataset_name}/reward_{k}_std'] = np.std(v)
-                    log_data[f'eval/{dataset_name}/samples'] = all_samples
+                        log_data[f"eval/{dataset_name}/reward_{k}_mean"] = np.mean(v)
+                        log_data[f"eval/{dataset_name}/reward_{k}_std"] = np.std(v)
+                    log_data[f"eval/{dataset_name}/samples"] = all_samples
                     self.log_data(log_data, step=self.step)
 
         self.accelerator.wait_for_everyone()
 
     def save_checkpoint(self, save_directory: str, epoch: Optional[int] = None):
-        """Save trainer state to a specific path."""
+        """Save trainer state to a specific path.
+
+        A periodic checkpoint exists to be resumed from, so it carries the
+        training-only roles too. A multi-role run that saved just its generator would
+        come back with a freshly initialized fake score and keep training happily
+        against the wrong critic.
+        """
         if epoch is not None:
             save_directory = os.path.join(save_directory, f"checkpoint-{epoch}")
 
         self.adapter.save_checkpoint(
             save_directory=save_directory,
             model_only=self.log_args.save_model_only,
+            include_training_roles=True,
         )
 
         self.accelerator.wait_for_everyone()
 
     def load_checkpoint(
-            self,
-            path: str,
-            resume_type: Optional[Literal['lora', 'full', 'state']] = None,
-        ):
+        self,
+        path: str,
+        resume_type: Optional[Literal["lora", "full", "state"]] = None,
+    ):
         """Load trainer state from a specific path."""
         self.adapter.load_checkpoint(
             path=path,
@@ -1016,11 +1558,11 @@ class BaseTrainer(ABC):
         reclaim all resources including GPU memory.
         """
         # Training-side reward buffer.
-        train_buf = getattr(self, 'reward_buffer', None)
+        train_buf = getattr(self, "reward_buffer", None)
         if train_buf is not None:
             train_buf.shutdown(wait=False, cancel_futures=True)
 
         # Per-eval-dataset reward buffers.
-        for buf in getattr(self, 'eval_dataset_reward_buffers', {}).values():
+        for buf in getattr(self, "eval_dataset_reward_buffers", {}).values():
             if buf is not None:
                 buf.shutdown(wait=False, cancel_futures=True)

@@ -37,20 +37,21 @@ from typing import List, Optional, Tuple, Union
 
 import requests
 import torch
+from accelerate import Accelerator
 from PIL import Image
 
+from flow_factory.hparams import RewardArguments
 from flow_factory.rewards.abc import (
     GroupwiseRewardModel,
     PointwiseRewardModel,
     RewardModelOutput,
 )
-from flow_factory.hparams import RewardArguments
-from accelerate import Accelerator
 
 logger = logging.getLogger(__name__)
 
 
 # ======================== Serialization Helpers ========================
+
 
 def _image_to_b64(img: Union[Image.Image, torch.Tensor]) -> str:
     """Convert PIL Image or Tensor to base64 string."""
@@ -83,16 +84,21 @@ def _build_payload(
         "prompt": prompt,
         "image": [_image_to_b64(img) for img in image] if image else None,
         "video": [_video_to_b64(v) for v in video] if video else None,
-        "condition_images": [
-            [_image_to_b64(img) for img in imgs] for imgs in condition_images
-        ] if condition_images else None,
-        "condition_videos": [
-            [_video_to_b64(v) for v in vs] for vs in condition_videos
-        ] if condition_videos else None,
+        "condition_images": (
+            [[_image_to_b64(img) for img in imgs] for imgs in condition_images]
+            if condition_images
+            else None
+        ),
+        "condition_videos": (
+            [[_video_to_b64(v) for v in vs] for vs in condition_videos]
+            if condition_videos
+            else None
+        ),
     }
 
 
 # ======================== Remote Client ========================
+
 
 class RemoteRewardClient:
     """HTTP client for communicating with a Reward Server."""
@@ -121,15 +127,11 @@ class RemoteRewardClient:
         condition_videos: Optional[List[List]] = None,
     ) -> List[float]:
         """Send compute request and return rewards."""
-        payload = _build_payload(
-            prompt, image, video, condition_images, condition_videos
-        )
+        payload = _build_payload(prompt, image, video, condition_images, condition_videos)
 
         for attempt in range(self.retries):
             try:
-                r = self._session.post(
-                    f"{self.url}/compute", json=payload, timeout=self.timeout
-                )
+                r = self._session.post(f"{self.url}/compute", json=payload, timeout=self.timeout)
                 r.raise_for_status()
                 data = r.json()
                 if data.get("error"):
@@ -145,6 +147,7 @@ class RemoteRewardClient:
 
 # ======================== Reward Model Wrappers ========================
 
+
 class RemotePointwiseRewardModel(PointwiseRewardModel):
     """
     Pointwise reward model that delegates computation to a remote server.
@@ -159,7 +162,10 @@ class RemotePointwiseRewardModel(PointwiseRewardModel):
             retry_attempts: 3    # optional
     """
 
-    required_fields: Tuple[str, ...] = ("prompt", "image") # Corresponds to the expected input kwargs
+    required_fields: Tuple[str, ...] = (
+        "prompt",
+        "image",
+    )  # Corresponds to the expected input kwargs
     use_tensor_inputs: bool = False
 
     def __init__(self, config: RewardArguments, accelerator: Accelerator):
@@ -184,9 +190,15 @@ class RemotePointwiseRewardModel(PointwiseRewardModel):
         self,
         prompt: List[str],
         image: Optional[List[Image.Image]] = None,
-        video: Optional[List[List[Image.Image]]] = None, # If supporting video input, add 'video' to required_fields
-        condition_images: Optional[List[List[Image.Image]]] = None, # If supporting conditional images, add 'condition_images' to required_fields
-        condition_videos: Optional[List[List[List[Image.Image]]]] = None, # If supporting conditional videos, add 'condition_videos' to required_fields
+        video: Optional[
+            List[List[Image.Image]]
+        ] = None,  # If supporting video input, add 'video' to required_fields
+        condition_images: Optional[
+            List[List[Image.Image]]
+        ] = None,  # If supporting conditional images, add 'condition_images' to required_fields
+        condition_videos: Optional[
+            List[List[List[Image.Image]]]
+        ] = None,  # If supporting conditional videos, add 'condition_videos' to required_fields
     ) -> RewardModelOutput:
         rewards = self.client.compute(
             prompt=prompt,
@@ -212,7 +224,10 @@ class RemoteGroupwiseRewardModel(GroupwiseRewardModel):
             batch_size: 16
     """
 
-    required_fields: Tuple[str, ...] = ("prompt", "image") # Corresponds to the expected input kwargs
+    required_fields: Tuple[str, ...] = (
+        "prompt",
+        "image",
+    )  # Corresponds to the expected input kwargs
     use_tensor_inputs: bool = False
 
     def __init__(self, config: RewardArguments, accelerator: Accelerator):
@@ -237,9 +252,15 @@ class RemoteGroupwiseRewardModel(GroupwiseRewardModel):
         self,
         prompt: List[str],
         image: Optional[List[Image.Image]] = None,
-        video: Optional[List[List[Image.Image]]] = None, # If supporting video input, add 'video' to required_fields
-        condition_images: Optional[List[List[Image.Image]]] = None, # If supporting conditional images, add 'condition_images' to required_fields
-        condition_videos: Optional[List[List[List[Image.Image]]]] = None, # If supporting conditional videos, add 'condition_videos' to required_fields
+        video: Optional[
+            List[List[Image.Image]]
+        ] = None,  # If supporting video input, add 'video' to required_fields
+        condition_images: Optional[
+            List[List[Image.Image]]
+        ] = None,  # If supporting conditional images, add 'condition_images' to required_fields
+        condition_videos: Optional[
+            List[List[List[Image.Image]]]
+        ] = None,  # If supporting conditional videos, add 'condition_videos' to required_fields
     ) -> RewardModelOutput:
         rewards = self.client.compute(
             prompt=prompt,

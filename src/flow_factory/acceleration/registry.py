@@ -20,11 +20,11 @@ case-insensitive keys, lazy ``importlib`` resolution, and a direct-python-path
 fallback so users can plug in a custom accelerator without editing this file.
 """
 
-from typing import Any, Dict, Type
 import importlib
+from typing import Any, Dict, Type
 
-from .abc import BaseAccelerator
 from ..utils.logger_utils import setup_logger
+from .abc import BaseAccelerator
 
 logger = setup_logger(__name__)
 
@@ -34,17 +34,17 @@ _ACCELERATOR_REGISTRY: Dict[str, str] = {
     # Persistent stage='both' accelerators applied to rollout and training.
     # `attention_backend` is the single code path for attention-backend selection;
     # add it as a `shared` entry (before `torch_compile`) in the acceleration block.
-    'attention_backend': 'flow_factory.acceleration.attention_backend.AttentionBackendAccelerator',
-    'torch_compile': 'flow_factory.acceleration.torch_compile.CompileAccelerator',
+    "attention_backend": "flow_factory.acceleration.attention_backend.AttentionBackendAccelerator",
+    "torch_compile": "flow_factory.acceleration.torch_compile.CompileAccelerator",
     # Lossy (rollout-only; validator restricts to decoupled / distillation algos).
-    'diffusers_cache': 'flow_factory.acceleration.diffusers_cache.DiffusersCacheAccelerator',
+    "diffusers_cache": "flow_factory.acceleration.diffusers_cache.DiffusersCacheAccelerator",
 }
 _ACCELERATOR_REGISTRY = {k.lower(): v for k, v in _ACCELERATOR_REGISTRY.items()}
 
 # Accelerators that were removed; mapped to an actionable migration message so a
 # config still naming them fails fast with guidance instead of a generic error.
 _REMOVED_ACCELERATORS: Dict[str, str] = {
-    'cache_dit': (
+    "cache_dit": (
         "The 'cache_dit' accelerator was removed. cache-dit only caches inside a "
         "pipeline `__call__` it patches, but Flow-Factory's rollout drives the "
         "transformer directly (adapter.inference()), so it was a silent no-op; its "
@@ -83,7 +83,7 @@ def get_accelerator_class(identifier: str) -> Type[BaseAccelerator]:
         class_path = identifier
 
     try:
-        module_path, class_name = class_path.rsplit('.', 1)
+        module_path, class_name = class_path.rsplit(".", 1)
         module = importlib.import_module(module_path)
         accelerator_class = getattr(module, class_name)
         logger.debug(f"Loaded accelerator: {identifier} -> {class_name}")

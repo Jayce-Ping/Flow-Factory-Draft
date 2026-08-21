@@ -88,6 +88,7 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ..runtime import ComponentRuntime, PseudoPipelineRuntime
 
 # Bagel's LLM attention (qwen2_navit) hard-requires flash-attn's varlen kernel,
 # imported transitively by the `.modeling` imports below. Fail fast here with
@@ -241,6 +242,22 @@ class BagelAdapter(BaseAdapter):
         # vae.decode is unaffected), so this is safe.
         pipeline.vae.reg.sample = False
         return pipeline
+
+    def build_component_runtime(self) -> ComponentRuntime:
+        """Build Bagel's explicit pseudo-pipeline component runtime.
+
+        Returns:
+            Runtime exposing Bagel's model, transformer alias, and VAE.
+        """
+        pipeline = self.load_pipeline()
+        return PseudoPipelineRuntime(
+            pipeline,
+            {
+                "bagel": pipeline.bagel,
+                "vae": pipeline.vae,
+            },
+            aliases={"transformer": pipeline.transformer},
+        )
 
     def load_scheduler(self) -> FlowMatchEulerDiscreteSDEScheduler:
         """
@@ -489,7 +506,7 @@ class BagelAdapter(BaseAdapter):
 
     def _assert_variable_count_supported(self, condition_images: List[List[Image.Image]]) -> None:
         """Fail fast on condition-image counts that desync collectives under a
-        parameter-sharded ``language_model`` (FSDP FULL/HYBRID, FSDP2, ZeRO-3).
+        parameter-sharded ``language_model`` (FSDP FULL/HYBRID or FSDP2).
 
         The prefill (``_build_gen_context``) issues a *data-dependent* number of
         ``language_model.forward_inference`` calls -- ``2*num_rounds + 2`` where
@@ -517,7 +534,7 @@ class BagelAdapter(BaseAdapter):
             raise RuntimeError(
                 "Bagel batched I2I with a variable per-sample condition-image count "
                 f"(counts={sorted(counts)}) is unsupported under a parameter-sharded "
-                "language_model (FSDP FULL/HYBRID, FSDP2, DeepSpeed ZeRO-3): the prefill "
+                "language_model (FSDP FULL/HYBRID or FSDP2): the prefill "
                 "makes a data-dependent number of all-gathers (2*max_count+2) that "
                 "mismatches across ranks and deadlocks. Use DDP or ZeRO-1/2 for "
                 "variable-count I2I, pad to a uniform count, or gather language_model "
@@ -1480,8 +1497,8 @@ class BagelAdapter(BaseAdapter):
         # Gating is shared across the pack, so when CFG is active all samples must be on
         # the same side of cfg_interval. Fail loudly on straddling rather than silently
         # applying the wrong CFG scale / renorm to some samples (a hidden train-inference
-        # inconsistency). Uniform-t schedules (GRPO) never straddle. When CFG is disabled
-        # (scales <= 1.0, e.g. NFT/AWM), gating is a no-op, so skip the check entirely.
+        # inconsistency). A schedule that draws one shared t for the pack never straddles.
+        # When CFG is disabled (scales <= 1.0) gating is a no-op, so skip the check entirely.
         if cfg_text_scale > 1.0 or cfg_img_scale > 1.0:
             sigma_vals = sigma.flatten()
             in_interval = (sigma_vals > cfg_interval[0]) & (sigma_vals <= cfg_interval[1])

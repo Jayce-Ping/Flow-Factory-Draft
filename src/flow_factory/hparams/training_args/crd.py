@@ -13,10 +13,11 @@
 # limitations under the License.
 
 """Training arguments for Centered Reward Distillation (CRD)."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Union, Tuple
+from typing import Any, Literal, Tuple, Union
 
 from ._base import TrainingArguments, _standardize_clip_range, _standardize_timestep_range
 
@@ -35,23 +36,31 @@ class CRDTrainingArguments(TrainingArguments):
         default=True,
         metadata={"help": "Whether to use global std for advantage normalization."},
     )
-    advantage_aggregation: Literal['sum', 'gdpo'] = field(
-        default='gdpo',
-        metadata={"help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo']."},
+    advantage_aggregation: Literal["sum", "gdpo"] = field(
+        default="gdpo",
+        metadata={
+            "help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo']."
+        },
     )
 
     # CRD core
     crd_beta: float = field(
         default=1.0,
-        metadata={"help": "Beta scaling for CRD reward matching loss. Controls implicit vs external reward balance."},
+        metadata={
+            "help": "Beta scaling for CRD reward matching loss. Controls implicit vs external reward balance."
+        },
     )
-    crd_loss_type: Literal['mse', 'bce'] = field(
-        default='mse',
-        metadata={"help": "Loss type for CRD reward distillation. 'mse': squared error, 'bce': binary cross-entropy."},
+    crd_loss_type: Literal["mse", "bce"] = field(
+        default="mse",
+        metadata={
+            "help": "Loss type for CRD reward distillation. 'mse': squared error, 'bce': binary cross-entropy."
+        },
     )
     use_old_for_loss: bool = field(
         default=True,
-        metadata={"help": "Use 'old' model snapshot (instead of ref) for implicit reward estimation."},
+        metadata={
+            "help": "Use 'old' model snapshot (instead of ref) for implicit reward estimation."
+        },
     )
     adaptive_logp: bool = field(
         default=True,
@@ -59,16 +68,22 @@ class CRDTrainingArguments(TrainingArguments):
     )
     weight_temp: float = field(
         default=-1.0,
-        metadata={"help": "Temperature for softmax weighting of advantages in CRD. Negative means uniform (inf temp)."},
+        metadata={
+            "help": "Temperature for softmax weighting of advantages in CRD. Negative means uniform (inf temp)."
+        },
     )
     # Decay schedules for model snapshots
     old_model_decay: str = field(
         default="0-0.25-0.005-0.999",
-        metadata={"help": "Decay schedule for old model blending: 'start_step-start_value-slope-end_value' or preset name."},
+        metadata={
+            "help": "Decay schedule for old model blending: 'start_step-start_value-slope-end_value' or preset name."
+        },
     )
     sampling_model_decay: Union[str, int] = field(
         default="75-0.0-0.0075-0.999",
-        metadata={"help": "Decay schedule for sampling model blending. Same format as old_model_decay, or int preset."},
+        metadata={
+            "help": "Decay schedule for sampling model blending. Same format as old_model_decay, or int preset."
+        },
     )
 
     # Clipping / KL
@@ -76,8 +91,8 @@ class CRDTrainingArguments(TrainingArguments):
         default=(-5.0, 5.0),
         metadata={"help": "Clipping range for advantages."},
     )
-    kl_type: Literal['v-based'] = field(
-        default='v-based',
+    kl_type: Literal["v-based"] = field(
+        default="v-based",
         metadata={"help": "Type of KL divergence. CRD uses 'v-based' (velocity space)."},
     )
     kl_beta: float = field(
@@ -99,18 +114,17 @@ class CRDTrainingArguments(TrainingArguments):
         default=True,
         metadata={"help": "Dynamically adjust KL strength based on reward signal."},
     )
-    ref_param_device: Literal["cpu", "cuda"] = field(
-        default="cuda",
-        metadata={"help": "Device to store reference model parameters."},
-    )
-
     # Timestep control
     num_train_timesteps: int = field(
         default=0,
-        metadata={"help": "Number of training timesteps. 0 = auto from num_inference_steps * timestep_range."},
+        metadata={
+            "help": "Number of training timesteps. 0 = auto from num_inference_steps * timestep_range."
+        },
     )
-    time_sampling_strategy: Literal['uniform', 'logit_normal', 'discrete', 'discrete_with_init', 'discrete_wo_init'] = field(
-        default='discrete',
+    time_sampling_strategy: Literal[
+        "uniform", "logit_normal", "discrete", "discrete_with_init", "discrete_wo_init"
+    ] = field(
+        default="discrete",
         metadata={"help": "Time sampling strategy for training."},
     )
     time_shift: float = field(
@@ -131,11 +145,11 @@ class CRDTrainingArguments(TrainingArguments):
 
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
         if not self.num_train_timesteps or self.num_train_timesteps <= 0:
-            self.num_train_timesteps = max(1, int(
-                self.num_inference_steps * (self.timestep_range[1] - self.timestep_range[0])
-            ))
-        self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, 'adv_clip_range')
-        if self.kl_type not in ['v-based']:
+            self.num_train_timesteps = max(
+                1, int(self.num_inference_steps * (self.timestep_range[1] - self.timestep_range[0]))
+            )
+        self.adv_clip_range = _standardize_clip_range(self.adv_clip_range, "adv_clip_range")
+        if self.kl_type not in ["v-based"]:
             raise ValueError(f"Invalid KL type: {self.kl_type}. Valid options are: ['v-based'].")
 
     @property

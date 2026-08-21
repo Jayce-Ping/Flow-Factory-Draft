@@ -14,13 +14,14 @@
 
 from __future__ import annotations
 
-import yaml
 from dataclasses import dataclass, field
-from typing import Any, Literal, Union, Optional, Tuple
+from typing import Any, Literal, Optional, Tuple, Union
 
-from ..abc import ArgABC
+import yaml
+
 from ...utils.dist import get_world_size
 from ...utils.logger_utils import setup_logger
+from ..abc import ArgABC
 
 logger = setup_logger(__name__, rank_zero_only=True)
 
@@ -68,7 +69,9 @@ class EvaluationArguments(ArgABC):
             if len(self.resolution) == 1:
                 self.resolution = (self.resolution[0], self.resolution[0])
             elif len(self.resolution) > 2:
-                logger.warning(f"`resolution` has {len(self.resolution)} elements, only using the first two: ({self.resolution[0]}, {self.resolution[1]}).")
+                logger.warning(
+                    f"`resolution` has {len(self.resolution)} elements, only using the first two: ({self.resolution[0]}, {self.resolution[1]})."
+                )
                 self.resolution = (self.resolution[0], self.resolution[1])
             else:  # len == 2
                 self.resolution = (self.resolution[0], self.resolution[1])
@@ -100,6 +103,7 @@ class EvaluationArguments(ArgABC):
 # Training Arguments Base Class
 # ============================================================================
 
+
 @dataclass
 class TrainingArguments(ArgABC):
     r"""Base training arguments shared across all algorithms."""
@@ -117,11 +121,15 @@ class TrainingArguments(ArgABC):
     )
     height: Optional[int] = field(
         default=None,
-        metadata={"help": "Height for sampling and training. If None, use the first element of `resolution`."},
+        metadata={
+            "help": "Height for sampling and training. If None, use the first element of `resolution`."
+        },
     )
     width: Optional[int] = field(
         default=None,
-        metadata={"help": "Width for sampling and training. If None, use the second element of `resolution`."},
+        metadata={
+            "help": "Width for sampling and training. If None, use the second element of `resolution`."
+        },
     )
 
     # --- Sampling and training ---
@@ -180,6 +188,14 @@ class TrainingArguments(ArgABC):
         metadata={"help": "Guidance scale for sampling."},
     )
 
+    # Read by `BaseAdapter._init_ref_parameters`, which every algorithm inherits, so it
+    # belongs to every algorithm's arguments. Six of them declared it separately and the
+    # rest crashed on a full-weight run the moment they needed a reference.
+    ref_param_device: Literal["cpu", "cuda"] = field(
+        default="cuda",
+        metadata={"help": "Device to store reference model parameters."},
+    )
+
     # --- Seed ---
     seed: int = field(
         default=42,
@@ -236,32 +252,38 @@ class TrainingArguments(ArgABC):
         default="cuda",
         metadata={"help": "Device to store EMA model."},
     )
-    ema_decay_schedule: Literal["constant", "power", "linear", "piecewise_linear", "cosine", "warmup_cosine"] = field(
+    ema_decay_schedule: Literal[
+        "constant", "power", "linear", "piecewise_linear", "cosine", "warmup_cosine"
+    ] = field(
         default="power",
         metadata={"help": "Decay schedule for EMA."},
     )
 
     # --- Latent storage precision ---
-    latent_storage_dtype: Optional[Literal['bf16', 'fp16', 'fp32']] = field(
-        default='fp16',
-        metadata={"help": (
-            "Dtype for storing latents in trajectory. "
-            "Default fp16 uses `float16`. It's recommended to use fp16 for both precision and memory efficiency. "
-            "Options: bf16, fp16, fp32, None (use model-native dtype)."
-        )},
+    latent_storage_dtype: Optional[Literal["bf16", "fp16", "fp32"]] = field(
+        default="fp16",
+        metadata={
+            "help": (
+                "Dtype for storing latents in trajectory. "
+                "Default fp16 uses `float16`. It's recommended to use fp16 for both precision and memory efficiency. "
+                "Options: bf16, fp16, fp32, None (use model-native dtype)."
+            )
+        },
     )
 
     # --- Optimize-loop sample ordering ---
     shuffle_samples: bool = field(
         default=True,
-        metadata={"help": (
-            "Shuffle samples before each inner optimize epoch. Keep True normally. "
-            "Set False for adapters whose batched forward is pack-composition-dependent "
-            "(e.g. Bagel/NaViT sequence packing): then each training micro-batch packs the "
-            "same samples as its rollout pack, so the bf16 forward is bit-identical between "
-            "rollout and training and the on-policy ratio stays 1. Requires matched sampling "
-            "and training `per_device_batch_size`."
-        )},
+        metadata={
+            "help": (
+                "Shuffle samples before each inner optimize epoch. Keep True normally. "
+                "Set False for adapters whose batched forward is pack-composition-dependent "
+                "(e.g. Bagel/NaViT sequence packing): then each training micro-batch packs the "
+                "same samples as its rollout pack, so the bf16 forward is bit-identical between "
+                "rollout and training and the on-policy ratio stays 1. Requires matched sampling "
+                "and training `per_device_batch_size`."
+            )
+        },
     )
 
     def __post_init__(self):
@@ -273,7 +295,9 @@ class TrainingArguments(ArgABC):
             if len(self.resolution) == 1:
                 self.resolution = (self.resolution[0], self.resolution[0])
             elif len(self.resolution) > 2:
-                logger.warning(f"`resolution` has {len(self.resolution)} elements, only using the first two: ({self.resolution[0]}, {self.resolution[1]}).")
+                logger.warning(
+                    f"`resolution` has {len(self.resolution)} elements, only using the first two: ({self.resolution[0]}, {self.resolution[1]})."
+                )
                 self.resolution = (self.resolution[0], self.resolution[1])
             else:
                 self.resolution = (self.resolution[0], self.resolution[1])
@@ -307,9 +331,8 @@ class TrainingArguments(ArgABC):
         logger.info(f"World Size: {world_size}")
 
         sample_num_per_iteration = world_size * self.per_device_batch_size
-        self.num_batches_per_epoch = (
-            (self.unique_sample_num_per_epoch * self.group_size)
-            // max(1, sample_num_per_iteration)
+        self.num_batches_per_epoch = (self.unique_sample_num_per_epoch * self.group_size) // max(
+            1, sample_num_per_iteration
         )
         if self.gradient_accumulation_steps == "auto":
             self._manual_gradient_accumulation_steps = False
@@ -334,16 +357,19 @@ class TrainingArguments(ArgABC):
         self.max_grad_norm = float(self.max_grad_norm)
 
         if self.learning_rate is None:
-            if 'lora' in self.trainer_type.lower():
+            if "lora" in self.trainer_type.lower():
                 self.learning_rate = 1e-4
             else:
                 self.learning_rate = 1e-5
-            logger.info(f"`learning_rate` is not set, using default {self.learning_rate} for `{self.trainer_type}` training.")
+            logger.info(
+                f"`learning_rate` is not set, using default {self.learning_rate} for `{self.trainer_type}` training."
+            )
         else:
             self.learning_rate = float(self.learning_rate)
 
     def compute_gradient_accumulation_steps(
-        self, num_batches_per_epoch: int,
+        self,
+        num_batches_per_epoch: int,
     ) -> int:
         """Compute gradient accumulation steps (before x num_train_timesteps).
 
@@ -374,7 +400,7 @@ class TrainingArguments(ArgABC):
         algorithms that never use a reference model, or always True for
         algorithms that need one regardless of KL).
         """
-        return getattr(self, 'kl_beta', 0) > 0.0
+        return getattr(self, "kl_beta", 0) > 0.0
 
     def get_preprocess_guidance_scale(self) -> float:
         """Return the guidance_scale for data preprocessing.
@@ -403,6 +429,7 @@ class TrainingArguments(ArgABC):
 # Shared Utilities
 # ============================================================================
 
+
 def _standardize_clip_range(value, name: str) -> tuple[float, float]:
     """Convert a scalar or sequence to a symmetric (lo, hi) tuple.
 
@@ -427,7 +454,7 @@ def _standardize_timestep_range(value: Union[float, Tuple[float, float]]) -> Tup
         result = (0.0, float(value))
     else:
         result = (float(value[0]), float(value[1]))
-    assert 0 <= result[0] < result[1] <= 1.0, (
-        f"`timestep_range` must satisfy 0 <= start < end <= 1, got {result}"
-    )
+    assert (
+        0 <= result[0] < result[1] <= 1.0
+    ), f"`timestep_range` must satisfy 0 <= start < end <= 1, got {result}"
     return result

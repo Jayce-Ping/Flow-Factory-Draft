@@ -102,7 +102,7 @@ Do not commit secrets; use environment variables or your orchestrator's secret s
 | Symptom | Cause | Fix |
 |---|---|---|
 | `nvidia-smi` not found in container | NVIDIA Container Toolkit not installed | [Install the toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) and restart Docker |
-| `CUDA out of memory` | Batch size too large for GPU VRAM | Reduce batch size, enable DeepSpeed ZeRO-3, or use FSDP |
+| `CUDA out of memory` | Batch size too large for GPU VRAM | Reduce batch size, enable DeepSpeed ZeRO-2, or use FSDP |
 | Build fails on `diffusers` install | Submodule not initialized | Run `git submodule update --init --recursive` |
 | Every source change triggers full rebuild | Expected with `COPY . /app` | The Dockerfile uses two-phase COPY for layer caching; ensure `pyproject.toml` is unchanged for cache hits |
 

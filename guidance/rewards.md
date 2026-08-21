@@ -367,7 +367,7 @@ When using multiple rewards, Flow-Factory supports the following aggregation str
 | `sum` | Advantage of the weighted sum of rewards |
 | `gdpo` | Weighted sum of advantages from each reward |
 
-> To use a customized aggregation algorithm, refer to and modify `src/flow_factory/trainers/grpo.py` (`GRPOTrainer.compute_advantages`).
+> To use a customized aggregation algorithm, refer to `advantage/advantage_processor.py`, or override `BaseTrainer.compute_advantages` (`src/flow_factory/trainers/abc.py`).
 
 **Weighted Sum (`sum`):**
 

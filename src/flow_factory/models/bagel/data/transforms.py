@@ -2,14 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import random
-from PIL import Image
 
 import cv2
 import numpy as np
 import torch
+from PIL import Image
 from torchvision import transforms
-from torchvision.transforms import functional as F
 from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as F
 
 
 class MaxLongEdgeMinShortEdgeResize(torch.nn.Module):
@@ -30,13 +30,13 @@ class MaxLongEdgeMinShortEdgeResize(torch.nn.Module):
     """
 
     def __init__(
-        self, 
-        max_size: int, 
-        min_size: int, 
-        stride: int, 
+        self,
+        max_size: int,
+        min_size: int,
+        stride: int,
         max_pixels: int,
-        interpolation=InterpolationMode.BICUBIC, 
-        antialias=True
+        interpolation=InterpolationMode.BICUBIC,
+        antialias=True,
     ):
         super().__init__()
         self.max_size = max_size
@@ -89,24 +89,26 @@ class MaxLongEdgeMinShortEdgeResize(torch.nn.Module):
 
 class ImageTransform:
     def __init__(
-        self, 
-        max_image_size, 
-        min_image_size, 
-        image_stride, 
-        max_pixels=14*14*9*1024,
-        image_mean=[0.5, 0.5, 0.5], 
-        image_std=[0.5, 0.5, 0.5]
+        self,
+        max_image_size,
+        min_image_size,
+        image_stride,
+        max_pixels=14 * 14 * 9 * 1024,
+        image_mean=[0.5, 0.5, 0.5],
+        image_std=[0.5, 0.5, 0.5],
     ):
         self.stride = image_stride
 
         self.resize_transform = MaxLongEdgeMinShortEdgeResize(
-            max_size=max_image_size, 
-            min_size=min_image_size, 
+            max_size=max_image_size,
+            min_size=min_image_size,
             stride=image_stride,
             max_pixels=max_pixels,
         )
         self.to_tensor_transform = transforms.ToTensor()
-        self.normalize_transform = transforms.Normalize(mean=image_mean, std=image_std, inplace=True)
+        self.normalize_transform = transforms.Normalize(
+            mean=image_mean, std=image_std, inplace=True
+        )
 
     def __call__(self, img, img_num=1):
         img = self.resize_transform(img, img_num=img_num)
@@ -116,8 +118,8 @@ class ImageTransform:
 
 
 def decolorization(image):
-    gray_image = image.convert('L')
-    return Image.merge(image.mode, [gray_image] * 3) if image.mode in ('RGB', 'L') else gray_image
+    gray_image = image.convert("L")
+    return Image.merge(image.mode, [gray_image] * 3) if image.mode in ("RGB", "L") else gray_image
 
 
 def downscale(image, scale_factor):
@@ -161,7 +163,9 @@ def motion_blur_opencv(image, kernel_size=15, angle=0):
         # 对于彩色图像，各通道独立卷积
         blurred = np.zeros_like(img)
         for c in range(img.shape[2]):
-            blurred[..., c] = cv2.filter2D(img[..., c], -1, rotated_kernel, borderType=cv2.BORDER_REFLECT)
+            blurred[..., c] = cv2.filter2D(
+                img[..., c], -1, rotated_kernel, borderType=cv2.BORDER_REFLECT
+            )
 
     return Image.fromarray(blurred.astype(np.uint8))
 
@@ -220,14 +224,14 @@ def shuffle_patch(image, num_splits, gap_size=2):
 def inpainting(image, num_splits, blank_ratio=0.3, blank_color=(255, 255, 255)):
     """
     图像分割后随机空白部分patch，用于inpainting任务
-    
+
     参数：
         image: PIL.Image 输入图像（RGB模式）
         h_splits: int 行分割数（垂直方向分割块数）
         w_splits: int 列分割数（水平方向分割块数）
         blank_ratio: float 空白patch的比例（0~1）
         blank_color: tuple 空白区域的颜色（RGB，如白色(255,255,255)）
-    
+
     返回：
         PIL.Image 处理后拼接的图像
     """

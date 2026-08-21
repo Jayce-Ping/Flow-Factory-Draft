@@ -70,11 +70,6 @@ class DPPOTrainingArguments(TrainingArguments):
             "guidance_scale; >1.0 enables CFG on the frozen reference model."
         },
     )
-    ref_param_device: Literal["cpu", "cuda"] = field(
-        default="cuda",
-        metadata={"help": "Device to store reference model parameters."},
-    )
-
     # DPPO trust-region mask.
     kl_mask_type: Literal["v-based", "x-based"] = field(
         default="x-based",

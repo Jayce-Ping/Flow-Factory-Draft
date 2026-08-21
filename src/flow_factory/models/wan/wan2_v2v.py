@@ -15,58 +15,64 @@
 # src/flow_factory/models/wan/wan2_v2v.py
 from __future__ import annotations
 
-import os
-from typing import Union, List, Dict, Any, Optional, Tuple, Literal, ClassVar
-from dataclasses import dataclass
 import logging
+import os
 from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from diffusers.pipelines.wan.pipeline_wan_video2video import WanVideoToVideoPipeline, prompt_clean, retrieve_timesteps
-from PIL import Image
 from accelerate import Accelerator
+from diffusers.pipelines.wan.pipeline_wan_video2video import (
+    WanVideoToVideoPipeline,
+    prompt_clean,
+    retrieve_timesteps,
+)
 from peft import PeftModel
+from PIL import Image
 
-from ..abc import BaseAdapter
-from ...samples import V2VSample
 from ...hparams import *
-from ...scheduler import UniPCMultistepSDESchedulerOutput, UniPCMultistepSDEScheduler
+from ...samples import V2VSample
+from ...scheduler import UniPCMultistepSDEScheduler, UniPCMultistepSDESchedulerOutput
 from ...utils.base import filter_kwargs
+from ...utils.logger_utils import setup_logger
+from ...utils.trajectory_collector import (
+    CallbackCollector,
+    TrajectoryCollector,
+    TrajectoryIndicesType,
+    create_callback_collector,
+    create_trajectory_collector,
+)
 from ...utils.video import (
-    VideoSingle,
-    VideoBatch,
     MultiVideoBatch,
-    is_video,
-    is_video_frame_list,
-    is_video_batch,
+    VideoBatch,
+    VideoSingle,
     is_multi_video_batch,
+    is_video,
+    is_video_batch,
+    is_video_frame_list,
     standardize_video_batch,
 )
-from ...utils.trajectory_collector import (
-    TrajectoryCollector,
-    CallbackCollector,
-    TrajectoryIndicesType,
-    create_trajectory_collector,
-    create_callback_collector,
-)
-from ...utils.logger_utils import setup_logger
+from ..abc import BaseAdapter
 
 logger = setup_logger(__name__)
 
 
 WanPipelineVideoInput = Union[
-    List[Image.Image], # One video as list of PIL images
-    torch.Tensor, # One video as tensor (T, C, H, W) or a batch of videos (B, T, C, H, W)
-    np.ndarray, # One video as numpy array (T, H, W, C) or a batch of videos (B, T, H, W, C)
-    List[Union[torch.Tensor, np.ndarray, List[Image.Image]]] # A list of videos with various sizes
+    List[Image.Image],  # One video as list of PIL images
+    torch.Tensor,  # One video as tensor (T, C, H, W) or a batch of videos (B, T, C, H, W)
+    np.ndarray,  # One video as numpy array (T, H, W, C) or a batch of videos (B, T, H, W, C)
+    List[Union[torch.Tensor, np.ndarray, List[Image.Image]]],  # A list of videos with various sizes
 ]
 
 
 @dataclass
 class WanV2VSample(V2VSample):
     """Sample dataclass for Wan V2V outputs."""
+
     pass
+
 
 class Wan2_V2V_Adapter(BaseAdapter):
     # Wan2.2 trains both transformer and transformer_2 but uses only one per
@@ -74,59 +80,64 @@ class Wan2_V2V_Adapter(BaseAdapter):
     # gradient in a given step. Ignored under DeepSpeed/FSDP.
     ddp_find_unused_parameters = True
 
-    def __init__(self, config: Arguments, accelerator : Accelerator):
+    def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
         self._has_warned_multi_video_input = False
         self.pipeline: WanVideoToVideoPipeline
         self.scheduler: UniPCMultistepSDEScheduler
-    
+
     def load_pipeline(self) -> WanVideoToVideoPipeline:
         return WanVideoToVideoPipeline.from_pretrained(
             self.model_args.model_name_or_path,
         )
-    
+
     def apply_lora(
         self,
         target_modules: Union[str, List[str]],
-        components: Union[str, List[str]] = ['transformer', 'transformer_2'],
+        components: Union[str, List[str]] = ["transformer", "transformer_2"],
         **kwargs,
     ) -> Union[PeftModel, Dict[str, PeftModel]]:
         return super().apply_lora(target_modules=target_modules, components=components, **kwargs)
-    
+
     # ============================ Module Management ============================
     @property
     def default_target_modules(self) -> List[str]:
         """Default LoRA target modules for Wan transformer."""
         return [
             # --- Self Attention ---
-            "attn1.to_q", "attn1.to_k", "attn1.to_v", "attn1.to_out.0",
-            
+            "attn1.to_q",
+            "attn1.to_k",
+            "attn1.to_v",
+            "attn1.to_out.0",
             # --- Cross Attention ---
-            "attn2.to_q", "attn2.to_k", "attn2.to_v", "attn2.to_out.0",
-
+            "attn2.to_q",
+            "attn2.to_k",
+            "attn2.to_v",
+            "attn2.to_out.0",
             # --- Feed Forward Network ---
-            "ffn.net.0.proj", "ffn.net.2"
+            "ffn.net.0.proj",
+            "ffn.net.2",
         ]
-    
+
     @property
     def inference_modules(self) -> List[str]:
         """Modules that are required for inference and forward"""
         if self.pipeline.config.boundary_ratio is None or self.pipeline.config.boundary_ratio <= 0:
-            return ['transformer', 'vae']
+            return ["transformer", "vae"]
 
         if self.pipeline.config.boundary_ratio >= 1:
-            return ['transformer_2', 'vae']
+            return ["transformer_2", "vae"]
 
-        return ['transformer', 'transformer_2', 'vae']
-    
+        return ["transformer", "transformer_2", "vae"]
+
     # ======================== Component Getters & Setters ========================
     @property
     def transformer_2(self) -> torch.nn.Module:
-        return self.get_component('transformer_2')
+        return self.get_component("transformer_2")
 
     @transformer_2.setter
     def transformer_2(self, module: torch.nn.Module):
-        self.set_component('transformer_2', module)
+        self.set_component("transformer_2", module)
 
     # ============================ Encoding & Decoding ============================
     # --------------------------- Prompt Encoding --------------------------
@@ -156,11 +167,17 @@ class Wan2_V2V_Adapter(BaseAdapter):
         text_input_ids, mask = text_inputs.input_ids, text_inputs.attention_mask
         seq_lens = mask.gt(0).sum(dim=1).long()
 
-        prompt_embeds = self.pipeline.text_encoder(text_input_ids.to(device), mask.to(device)).last_hidden_state
+        prompt_embeds = self.pipeline.text_encoder(
+            text_input_ids.to(device), mask.to(device)
+        ).last_hidden_state
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
         prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
         prompt_embeds = torch.stack(
-            [torch.cat([u, u.new_zeros(max_sequence_length - u.size(0), u.size(1))]) for u in prompt_embeds], dim=0
+            [
+                torch.cat([u, u.new_zeros(max_sequence_length - u.size(0), u.size(1))])
+                for u in prompt_embeds
+            ],
+            dim=0,
         )
 
         return text_input_ids, prompt_embeds
@@ -206,15 +223,21 @@ class Wan2_V2V_Adapter(BaseAdapter):
         )
 
         results = {
-            'prompt_ids': prompt_ids,
-            'prompt_embeds': prompt_embeds,
+            "prompt_ids": prompt_ids,
+            "prompt_embeds": prompt_embeds,
         }
 
         if do_classifier_free_guidance:
             negative_prompt = negative_prompt or ""
-            negative_prompt = [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
-            negative_prompt = negative_prompt * (len(prompt) // len(negative_prompt)) # Expand to match batch size
-            assert len(negative_prompt) == len(prompt), "The number of negative prompts must match the number of prompts."
+            negative_prompt = (
+                [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+            )
+            negative_prompt = negative_prompt * (
+                len(prompt) // len(negative_prompt)
+            )  # Expand to match batch size
+            assert len(negative_prompt) == len(
+                prompt
+            ), "The number of negative prompts must match the number of prompts."
 
             negative_prompt_ids, negative_prompt_embeds = self._get_t5_prompt_embeds(
                 prompt=negative_prompt,
@@ -222,16 +245,20 @@ class Wan2_V2V_Adapter(BaseAdapter):
                 device=device,
                 dtype=dtype,
             )
-            results.update({
-                "negative_prompt_ids": negative_prompt_ids,
-                "negative_prompt_embeds": negative_prompt_embeds
-            })
+            results.update(
+                {
+                    "negative_prompt_ids": negative_prompt_ids,
+                    "negative_prompt_embeds": negative_prompt_embeds,
+                }
+            )
 
         return results
+
     # --------------------------- Image Encoding --------------------------
     def encode_image(self, images: Union[Image.Image, torch.Tensor, List[torch.Tensor]]) -> None:
         """Skip this for Wan V2V as the pipeline handles encoding internally."""
         pass
+
     # --------------------------- Video Encoding --------------------------
     def encode_video(self, videos: Union[torch.Tensor, List[torch.Tensor]]) -> None:
         """Skip this for Wan V2V as the pipeline handles encoding internally."""
@@ -240,7 +267,7 @@ class Wan2_V2V_Adapter(BaseAdapter):
     def _standardize_video_input(
         self,
         videos: Union[VideoSingle, VideoBatch, MultiVideoBatch],
-        output_type: Literal['np', 'pt', 'pil'] = 'pt',
+        output_type: Literal["np", "pt", "pil"] = "pt",
     ) -> VideoBatch:
         """Convert a batch/list of videos into the target format."""
         if is_video_frame_list(videos):
@@ -262,7 +289,9 @@ class Wan2_V2V_Adapter(BaseAdapter):
         return standardized_videos
 
     # --------------------------- Video Decoding --------------------------
-    def decode_latents(self, latents: torch.Tensor, output_type: Literal['pt', 'pil', 'np'] = 'pil') -> torch.Tensor:
+    def decode_latents(
+        self, latents: torch.Tensor, output_type: Literal["pt", "pil", "np"] = "pil"
+    ) -> torch.Tensor:
         """Decode the latents using the VAE decoder."""
         latents = latents.float()
         latents_mean = (
@@ -270,15 +299,14 @@ class Wan2_V2V_Adapter(BaseAdapter):
             .view(1, self.pipeline.vae.config.z_dim, 1, 1, 1)
             .to(latents.device, latents.dtype)
         )
-        latents_std = 1.0 / torch.tensor(self.pipeline.vae.config.latents_std).view(1, self.pipeline.vae.config.z_dim, 1, 1, 1).to(
-            latents.device, latents.dtype
-        )
+        latents_std = 1.0 / torch.tensor(self.pipeline.vae.config.latents_std).view(
+            1, self.pipeline.vae.config.z_dim, 1, 1, 1
+        ).to(latents.device, latents.dtype)
         latents = latents / latents_std + latents_mean
         video = self.pipeline.vae.decode(latents, return_dict=False)[0]
 
         video = self.pipeline.video_processor.postprocess_video(video, output_type=output_type)
         return video
-    
 
     # ============================ Inference ============================
     @torch.no_grad()
@@ -304,14 +332,22 @@ class Wan2_V2V_Adapter(BaseAdapter):
         attention_kwargs: Optional[Dict[str, Any]] = None,
         max_sequence_length: int = 512,
         extra_call_back_kwargs: List[str] = [],
-        trajectory_indices: TrajectoryIndicesType = 'all',
+        trajectory_indices: TrajectoryIndicesType = "all",
     ) -> List[WanV2VSample]:
         # 1. Setup args
         device = self.device
         dtype = self.pipeline.transformer.dtype
         do_classifier_free_guidance = guidance_scale > 1.0
-        height = height or self.pipeline.transformer.config.sample_height * self.pipeline.vae_scale_factor_spatial
-        width = width or self.pipeline.transformer.config.sample_width * self.pipeline.vae_scale_factor_spatial
+        height = (
+            height
+            or self.pipeline.transformer.config.sample_height
+            * self.pipeline.vae_scale_factor_spatial
+        )
+        width = (
+            width
+            or self.pipeline.transformer.config.sample_width
+            * self.pipeline.vae_scale_factor_spatial
+        )
 
         # 2. Encode prompt
         if prompt_embeds is None or negative_prompt_embeds is None:
@@ -334,17 +370,21 @@ class Wan2_V2V_Adapter(BaseAdapter):
         batch_size = prompt_embeds.shape[0]
 
         # 3. Set timesteps
-        input_inference_steps = num_inference_steps # 50
-        timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device) # [1000, ..., 0], 50
-        timesteps, num_inference_steps = self.pipeline.get_timesteps(num_inference_steps, timesteps, strength, device) # strength=0.8, [800, ..., 0], 40
+        input_inference_steps = num_inference_steps  # 50
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler, num_inference_steps, device
+        )  # [1000, ..., 0], 50
+        timesteps, num_inference_steps = self.pipeline.get_timesteps(
+            num_inference_steps, timesteps, strength, device
+        )  # strength=0.8, [800, ..., 0], 40
         latent_timestep = timesteps[:1].repeat(batch_size)
         self.pipeline._num_timesteps = len(timesteps)
 
         # 4. Prepare latents
-        videos = self._standardize_video_input(videos, output_type='pt')
-        videos = self.pipeline.video_processor.preprocess_video(videos, height=height, width=width).to(
-            device, dtype=dtype
-        )
+        videos = self._standardize_video_input(videos, output_type="pt")
+        videos = self.pipeline.video_processor.preprocess_video(
+            videos, height=height, width=width
+        ).to(device, dtype=dtype)
 
         num_channels_latents = self.pipeline.transformer.config.in_channels
         latents = self.pipeline.prepare_latents(
@@ -368,13 +408,17 @@ class Wan2_V2V_Adapter(BaseAdapter):
         latents = self.cast_latents(latents)
         latent_collector.collect(latents, step_idx=0)
         if compute_log_prob:
-            log_prob_collector = create_trajectory_collector(trajectory_indices, num_inference_steps)
+            log_prob_collector = create_trajectory_collector(
+                trajectory_indices, num_inference_steps
+            )
         callback_collector = create_callback_collector(trajectory_indices, num_inference_steps)
 
         for i, t in enumerate(timesteps):
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
             t_next = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
-            return_kwargs = list(set(['next_latents', 'log_prob', 'velocity'] + extra_call_back_kwargs))
+            return_kwargs = list(
+                set(["next_latents", "log_prob", "velocity"] + extra_call_back_kwargs)
+            )
             current_compute_log_prob = compute_log_prob and current_noise_level > 0
 
             output = self.forward(
@@ -399,28 +443,35 @@ class Wan2_V2V_Adapter(BaseAdapter):
                 step_idx=i,
                 output=output,
                 keys=extra_call_back_kwargs,
-                capturable={'noise_level': current_noise_level},
+                capturable={"noise_level": current_noise_level},
             )
 
-        
         self._current_timestep = None
 
         # 7. Decode latents to videos (list of pil images)
-        decoded_videos = self.decode_latents(latents, output_type='pt')
+        decoded_videos = self.decode_latents(latents, output_type="pt")
 
         # 8. Prepare output samples
-        extra_call_back_res = callback_collector.get_result()          # (B, len(trajectory_indices), ...)
-        callback_index_map = callback_collector.get_index_map()        # (T,) LongTensor
-        all_latents = latent_collector.get_result()                    # List[torch.Tensor(B, ...)]
-        latent_index_map = latent_collector.get_index_map()            # (T+1,) LongTensor
+        extra_call_back_res = callback_collector.get_result()  # (B, len(trajectory_indices), ...)
+        callback_index_map = callback_collector.get_index_map()  # (T,) LongTensor
+        all_latents = latent_collector.get_result()  # List[torch.Tensor(B, ...)]
+        latent_index_map = latent_collector.get_index_map()  # (T+1,) LongTensor
         all_log_probs = log_prob_collector.get_result() if compute_log_prob else None
         log_prob_index_map = log_prob_collector.get_index_map() if compute_log_prob else None
         samples = [
             WanV2VSample(
                 # Denoising trajectory
                 timesteps=timesteps,
-                all_latents=torch.stack([lat[b] for lat in all_latents], dim=0) if all_latents is not None else None,
-                log_probs=torch.stack([lp[b] for lp in all_log_probs], dim=0) if all_log_probs is not None else None,
+                all_latents=(
+                    torch.stack([lat[b] for lat in all_latents], dim=0)
+                    if all_latents is not None
+                    else None
+                ),
+                log_probs=(
+                    torch.stack([lp[b] for lp in all_log_probs], dim=0)
+                    if all_log_probs is not None
+                    else None
+                ),
                 latent_index_map=latent_index_map,
                 log_prob_index_map=log_prob_index_map,
                 # Generated video & metadata
@@ -432,15 +483,21 @@ class Wan2_V2V_Adapter(BaseAdapter):
                 prompt_ids=prompt_ids[b],
                 prompt_embeds=prompt_embeds[b],
                 # Negative prompt info
-                negative_prompt=negative_prompt[b] if isinstance(negative_prompt, list) else negative_prompt,
-                negative_prompt_ids=negative_prompt_ids[b] if negative_prompt_ids is not None else None,
-                negative_prompt_embeds=negative_prompt_embeds[b] if negative_prompt_embeds is not None else None,
+                negative_prompt=(
+                    negative_prompt[b] if isinstance(negative_prompt, list) else negative_prompt
+                ),
+                negative_prompt_ids=(
+                    negative_prompt_ids[b] if negative_prompt_ids is not None else None
+                ),
+                negative_prompt_embeds=(
+                    negative_prompt_embeds[b] if negative_prompt_embeds is not None else None
+                ),
                 # Condition Video
                 condition_videos=videos[b],
                 # Extra kwargs
                 extra_kwargs={
                     **{k: v[b] for k, v in extra_call_back_res.items()},
-                    'callback_index_map': callback_index_map,
+                    "callback_index_map": callback_index_map,
                 },
             )
             for b in range(batch_size)
@@ -449,7 +506,7 @@ class Wan2_V2V_Adapter(BaseAdapter):
         self.pipeline.maybe_free_model_hooks()
 
         return samples
-    
+
     # =========================== Forward ===========================
     def forward(
         self,
@@ -466,7 +523,14 @@ class Wan2_V2V_Adapter(BaseAdapter):
         noise_level: Optional[float] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
-        return_kwargs: List[str] = ['velocity', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
+        return_kwargs: List[str] = [
+            "velocity",
+            "next_latents",
+            "next_latents_mean",
+            "std_dev_t",
+            "dt",
+            "log_prob",
+        ],
     ) -> UniPCMultistepSDESchedulerOutput:
         """
         Core forward pass for V2V generation.
@@ -497,9 +561,7 @@ class Wan2_V2V_Adapter(BaseAdapter):
                 "Passed `guidance_scale` > 1.0, but no `negative_prompt_embeds` provided. "
                 "Classifier-free guidance will be disabled."
             )
-        do_classifier_free_guidance = (
-            negative_prompt_embeds is not None and guidance_scale > 1.0
-        )
+        do_classifier_free_guidance = negative_prompt_embeds is not None and guidance_scale > 1.0
 
         # 2. Prepare timestep
         timestep = t.expand(batch_size)

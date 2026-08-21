@@ -10,7 +10,12 @@ from typing import List, Optional, Union
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput
 from transformers.processing_utils import ProcessorMixin
-from transformers.tokenization_utils_base import PaddingStrategy, PreTokenizedInput, TextInput, TruncationStrategy
+from transformers.tokenization_utils_base import (
+    PaddingStrategy,
+    PreTokenizedInput,
+    TextInput,
+    TruncationStrategy,
+)
 from transformers.utils import TensorType
 
 
@@ -95,7 +100,11 @@ class SiglipProcessor(ProcessorMixin):
 
         if text is not None:
             encoding = self.tokenizer(
-                text, return_tensors=return_tensors, padding=padding, truncation=truncation, max_length=max_length
+                text,
+                return_tensors=return_tensors,
+                padding=padding,
+                truncation=truncation,
+                max_length=max_length,
             )
 
         if images is not None:

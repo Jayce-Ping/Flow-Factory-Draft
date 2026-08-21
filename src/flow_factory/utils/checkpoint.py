@@ -16,30 +16,33 @@
 """
 Utility functions for handling checkpoint management.
 """
-import os
-import re
+
 import glob
 import json
-import torch
-from typing import Dict, Optional, List, Tuple, Literal
+import os
+import re
+from typing import Dict, List, Literal, Optional, Tuple
 
-from safetensors.torch import save_file, load_file
+import torch
 from huggingface_hub import snapshot_download
+from safetensors.torch import load_file, save_file
+
 
 def mapping_lora_state_dict(
-        state_dict: Dict[str, torch.Tensor],
-        adapter_name: str = "default"
-    ) -> Dict[str, torch.Tensor]:
+    state_dict: Dict[str, torch.Tensor], adapter_name: str = "default"
+) -> Dict[str, torch.Tensor]:
     """
     Map LoRA state_dict keys to PeftModel format.
     Converts 'xxx.lora_A.weight' -> 'base_model.model.xxx.lora_A.default.weight'
     """
     new_state_dict = {}
     for key, value in state_dict.items():
-        if not key.startswith('base_model.model'):
-            key = 'base_model.model.' + key
+        if not key.startswith("base_model.model"):
+            key = "base_model.model." + key
         if "lora_A.weight" in key or "lora_B.weight" in key:
-            new_key = key.replace("lora_A.weight", f"lora_A.{adapter_name}.weight").replace("lora_B.weight", f"lora_B.{adapter_name}.weight")
+            new_key = key.replace("lora_A.weight", f"lora_A.{adapter_name}.weight").replace(
+                "lora_B.weight", f"lora_B.{adapter_name}.weight"
+            )
             new_state_dict[new_key] = value
         else:
             # Keep other keys as-is
@@ -51,13 +54,13 @@ def mapping_lora_state_dict(
 def infer_lora_rank(state_dict: Dict[str, torch.Tensor]) -> int:
     """
     Infer LoRA rank from state dict.
-    
+
     Args:
         state_dict: LoRA state dictionary
-    
+
     Returns:
         Inferred rank value
-    
+
     Raises:
         ValueError: If no lora_A/lora_B weights found
     """
@@ -65,40 +68,42 @@ def infer_lora_rank(state_dict: Dict[str, torch.Tensor]) -> int:
     for key, tensor in state_dict.items():
         if "lora_A" in key and "weight" in key:
             return tensor.shape[0]
-    
+
     # Fallback to lora_B (shape: [out_features, rank])
     for key, tensor in state_dict.items():
         if "lora_B" in key and "weight" in key:
             return tensor.shape[1]
-    
+
     raise ValueError("Cannot infer rank: no lora_A or lora_B weights found")
 
 
-def infer_lora_alpha(state_dict: Dict[str, torch.Tensor], default_rank: Optional[int] = None) -> int:
+def infer_lora_alpha(
+    state_dict: Dict[str, torch.Tensor], default_rank: Optional[int] = None
+) -> int:
     """
     Infer LoRA alpha from state dict, defaulting to rank.
-    
+
     Args:
         state_dict: LoRA state dictionary
         default_rank: Fallback if alpha not found (uses inferred rank if None)
-    
+
     Returns:
         Inferred or default alpha value
     """
     for key, tensor in state_dict.items():
         if "lora_alpha" in key.lower() or "scaling" in key.lower():
             return int(tensor.item())
-    
+
     return default_rank or infer_lora_rank(state_dict)
 
 
 def infer_lora_config(state_dict: Dict[str, torch.Tensor]) -> Tuple[int, int]:
     """
     Infer both rank and alpha from state dict.
-    
+
     Args:
         state_dict: LoRA state dictionary
-    
+
     Returns:
         Tuple of (rank, alpha)
     """
@@ -113,11 +118,11 @@ def infer_target_modules(
 ) -> List[str]:
     """
     Infer full module paths from state dict (for precise LoRA targeting).
-    
+
     Args:
         state_dict: LoRA state dictionary
         prefix: Optional prefix to strip from paths
-    
+
     Returns:
         Sorted list of full module paths
     """
@@ -131,13 +136,13 @@ def infer_target_modules(
 
     prefix_pattern = f"^(?:{re.escape(prefix)}\\.)?" if prefix else "^"
     module_pattern = re.compile(prefix_pattern + r"(.*)\.lora_[AB](?:\.[^.]+)?\.weight$")
-    
+
     target_modules = set()
     for key in state_dict.keys():
         match = module_pattern.match(key)
         if match:
             target_modules.add(match.group(1))
-    
+
     return sorted(target_modules)
 
 
@@ -166,11 +171,9 @@ def parse_hf_checkpoint_path(path: str) -> Tuple[str, Optional[str], Optional[st
         ValueError: If the spec lacks the ``owner/repo`` form (at minimum two path segments).
     """
     if not isinstance(path, str):
-        raise TypeError(
-            f"expected str for path, got {type(path).__name__}: {path!r}"
-        )
+        raise TypeError(f"expected str for path, got {type(path).__name__}: {path!r}")
 
-    spec = path[len(HF_PATH_PREFIX):] if path.startswith(HF_PATH_PREFIX) else path
+    spec = path[len(HF_PATH_PREFIX) :] if path.startswith(HF_PATH_PREFIX) else path
 
     # Split off optional @revision (revision token cannot contain '/' or '@').
     revision: Optional[str] = None
@@ -231,9 +234,7 @@ def download_hf_checkpoint(
         Absolute local directory path containing the snapshot (with ``subfolder`` appended when set).
     """
     if not isinstance(repo_id, str) or "/" not in repo_id:
-        raise ValueError(
-            f"expected 'owner/repo' for repo_id, got {repo_id!r}"
-        )
+        raise ValueError(f"expected 'owner/repo' for repo_id, got {repo_id!r}")
 
     allow_patterns: Optional[List[str]] = None
     if subfolder:

@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased — `feature/structured-trajectory-runtime`
+
+- Added structured multi-component trajectories, ordered heterogeneous references,
+  component variants, named snapshots, and role-aware checkpoints.
+- Added explicit per-variant optimizer configuration, including AdamW and Muon.
+- Split shared trainer, coupled replay, decoupled replay, and multi-role backend
+  responsibilities into focused runtime modules.
+- Added packed distributed metric/sample collectives with benchmark-gated fallbacks.
+- Added scalar or selector-based `frozen_parameters_dtype` policies.
+
+### Breaking changes
+
+- Multi-role configurations use top-level `optimizers:` entries keyed by variant name.
+- ZeRO-3 is unsupported; use DDP, ZeRO-1/2, FSDP1, or FSDP2 as documented.
+- Structured trajectories replace single-tensor trajectory assumptions in adapter hooks.
+
+---
+
 ## Unreleased — `feature/opd-loss-targets`
 
 - Added `train.loss_target` with `xt`, `v`, and `x0` target spaces for
@@ -281,7 +299,7 @@ and SDE** dynamics.
 ### Added (Part B)
 
 - **`trainer_type: diffusion-opd`** — `DiffusionOPDTrainer`
-  (`trainers/opd/trainer.py`), registered in `trainers/registry.py`. Two-pass
+  (`trainers/distillation/opd/trainer.py`), registered in `trainers/registry.py`. Two-pass
   `optimize()`: PASS 1 (`no_grad`) caches each teacher's `mu_T` with one weight
   swap per teacher; PASS 2 student-only gradient loop matching `mu_S` to cached
   `mu_T`. Rewards used only for eval monitoring. Logs `train/kl_div_{teacher_name}`
@@ -294,7 +312,7 @@ and SDE** dynamics.
   one teacher may list several datasets; `DiffusionOPDTrainer` rejects overlap.
 - **`SDESchedulerMixin.get_kl_divergence_denominator(std_dev_t, dt)`**
   (`scheduler/abc.py`): dynamics-agnostic transition variance for the KL denominator.
-- **`trainers/opd/common.py`** — `load_teachers`: named-parameter snapshots for
+- **`trainers/distillation/opd/common.py`** — `load_teachers`: named-parameter snapshots for
   teacher LoRAs (architecture must match student LoRA slot).
 - **`Arguments._validate_teacher_sources`** (`hparams/args.py`, OPD-only):
   (1) every teacher `applicable_datasets` entry is a declared training dataset;

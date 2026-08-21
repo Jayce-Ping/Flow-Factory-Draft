@@ -13,8 +13,8 @@ import logging
 
 import torch
 from torch import nn
-
 from transformers.activations import ACT2FN
+
 from ..siglip.configuration_siglip import SiglipVisionConfig as _SiglipVisionConfig
 from ..siglip.modeling_siglip import SiglipAttention, SiglipPreTrainedModel
 
@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 # ── Optional flash-attn ─────────────────────────────────────────────────────
 try:
     from flash_attn import flash_attn_varlen_func
+
     FLASH_ATTN_AVAILABLE = True
 except ImportError:
     FLASH_ATTN_AVAILABLE = False
@@ -33,6 +34,7 @@ except ImportError:
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
 
 def _sdpa_varlen(
     query: torch.Tensor,
@@ -55,7 +57,7 @@ def _sdpa_varlen(
         k = key[s:e].transpose(0, 1).unsqueeze(0)
         v = value[s:e].transpose(0, 1).unsqueeze(0)
         o = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=False)
-        chunks.append(o.squeeze(0).transpose(0, 1))   # → (seq, H, D)
+        chunks.append(o.squeeze(0).transpose(0, 1))  # → (seq, H, D)
     return torch.cat(chunks, dim=0)
 
 
@@ -135,8 +137,9 @@ class SiglipVisionConfig(_SiglipVisionConfig):
             hidden_act=hidden_act,
             layer_norm_eps=layer_norm_eps,
             attention_dropout=attention_dropout,
-            **kwargs)
-        
+            **kwargs,
+        )
+
         self.rope = rope
 
 
@@ -144,7 +147,7 @@ class RotaryEmbedding2D(torch.nn.Module):
     def __init__(self, dim, max_h, max_w, base=10000):
         super().__init__()
         freq = torch.arange(0, dim, 2, dtype=torch.int64).float() / dim
-        inv_freq = 1.0 / (base ** freq)
+        inv_freq = 1.0 / (base**freq)
 
         grid_h = torch.arange(0, max_h)
         grid_h = grid_h.to(inv_freq.dtype)
@@ -208,14 +211,14 @@ class SiglipVisionEmbeddings(nn.Module):
     def convert_conv2d_to_linear(self, config, meta=False):
         if meta:
             linear_patch_embedding = nn.Linear(
-                config.num_channels * self.patch_size ** 2, self.embed_dim, bias=True, device='meta'
+                config.num_channels * self.patch_size**2, self.embed_dim, bias=True, device="meta"
             )
         else:
             linear_patch_embedding = nn.Linear(
-                config.num_channels * self.patch_size ** 2, self.embed_dim, bias=True
+                config.num_channels * self.patch_size**2, self.embed_dim, bias=True
             )
         W = self.patch_embedding.weight.permute(0, 2, 3, 1).reshape(
-            self.embed_dim, config.num_channels * self.patch_size ** 2
+            self.embed_dim, config.num_channels * self.patch_size**2
         )
         linear_patch_embedding.weight.data = W
         linear_patch_embedding.bias.data = self.patch_embedding.bias.data
@@ -223,9 +226,9 @@ class SiglipVisionEmbeddings(nn.Module):
         self.patch_embedding = linear_patch_embedding
 
     def forward(
-        self, 
-        packed_pixel_values: torch.FloatTensor, 
-        packed_flattened_position_ids: torch.LongTensor
+        self,
+        packed_pixel_values: torch.FloatTensor,
+        packed_flattened_position_ids: torch.LongTensor,
     ) -> torch.Tensor:
 
         patch_embeds = self.patch_embedding(packed_pixel_values)
@@ -269,8 +272,11 @@ class SiglipFlashAttention2(SiglipAttention):
         value_states = value_states.view(total_q_len, self.num_heads, self.head_dim)
 
         if self.config.rope:
-            qh, qw = query_states[:, :, :self.head_dim // 2], query_states[:, :, self.head_dim // 2:] 
-            kh, kw = key_states[:, :, :self.head_dim // 2], key_states[:, :, self.head_dim // 2:]
+            qh, qw = (
+                query_states[:, :, : self.head_dim // 2],
+                query_states[:, :, self.head_dim // 2 :],
+            )
+            kh, kw = key_states[:, :, : self.head_dim // 2], key_states[:, :, self.head_dim // 2 :]
             qh, kh = apply_rotary_pos_emb(qh, kh, cos_h, sin_h)
             qw, kw = apply_rotary_pos_emb(qw, kw, cos_w, sin_w)
             query_states = torch.cat([qh, qw], dim=-1)
@@ -289,7 +295,9 @@ class SiglipFlashAttention2(SiglipAttention):
             )
         else:
             attn_output = _sdpa_varlen(
-                query_states, key_states, value_states,
+                query_states,
+                key_states,
+                value_states,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
             )
@@ -330,7 +338,7 @@ class SiglipEncoderLayer(nn.Module):
         cos_h: torch.Tensor = None,
         sin_h: torch.Tensor = None,
         cos_w: torch.Tensor = None,
-        sin_w: torch.Tensor = None
+        sin_w: torch.Tensor = None,
     ) -> torch.Tensor:
         residual = hidden_states
 
@@ -342,7 +350,7 @@ class SiglipEncoderLayer(nn.Module):
             cos_h=cos_h,
             sin_h=sin_h,
             cos_w=cos_w,
-            sin_w=sin_w
+            sin_w=sin_w,
         )
         hidden_states = residual + hidden_states
 
@@ -375,8 +383,15 @@ class SiglipEncoder(nn.Module):
 
         hidden_states = inputs_embeds
         for encoder_layer in self.layers:
-            hidden_states = encoder_layer(hidden_states, cu_seqlens, max_seqlen,
-                                          cos_h=cos_h, sin_h=sin_h, cos_w=cos_w, sin_w=sin_w)
+            hidden_states = encoder_layer(
+                hidden_states,
+                cu_seqlens,
+                max_seqlen,
+                cos_h=cos_h,
+                sin_h=sin_h,
+                cos_w=cos_w,
+                sin_w=sin_w,
+            )
 
         return hidden_states
 
@@ -404,22 +419,24 @@ class SiglipVisionTransformer(nn.Module):
         max_seqlen: int,
     ) -> torch.Tensor:
         hidden_states = self.embeddings(
-            packed_pixel_values=packed_pixel_values, 
-            packed_flattened_position_ids=packed_flattened_position_ids
+            packed_pixel_values=packed_pixel_values,
+            packed_flattened_position_ids=packed_flattened_position_ids,
         )
 
         extra_inputs = {}
         if self.config.rope:
             extra_inputs.update(
-                cos_h = self.rope.cos_h[packed_flattened_position_ids],
-                sin_h = self.rope.sin_h[packed_flattened_position_ids],
-                cos_w = self.rope.cos_w[packed_flattened_position_ids],
-                sin_w = self.rope.sin_w[packed_flattened_position_ids]
+                cos_h=self.rope.cos_h[packed_flattened_position_ids],
+                sin_h=self.rope.sin_h[packed_flattened_position_ids],
+                cos_w=self.rope.cos_w[packed_flattened_position_ids],
+                sin_w=self.rope.sin_w[packed_flattened_position_ids],
             )
 
         last_hidden_state = self.encoder(
-            inputs_embeds=hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, 
-            **extra_inputs
+            inputs_embeds=hidden_states,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            **extra_inputs,
         )
         last_hidden_state = self.post_layernorm(last_hidden_state)
         return last_hidden_state

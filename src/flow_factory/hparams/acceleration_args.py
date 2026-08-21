@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/hparams/acceleration_args.py
-import yaml
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Union
+
+# src/flow_factory/hparams/acceleration_args.py
+import yaml
 
 from .abc import ArgABC
 

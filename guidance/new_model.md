@@ -533,7 +533,7 @@ model:
 
 ## Advanced: Custom `preprocess_func`
 
-The default `preprocess_func` calls `encode_prompt`, `encode_image`, and `encode_video` independently. Override it when your model requires **cross-modal preprocessing** — for example, FLUX.2 uses its text encoder to "upsample" (rewrite) prompts based on input images before encoding ([here](https://github.com/X-GenGroup/Flow-Factory/blob/main/src/flow_factory/models/flux/flux2.py#L371)):
+The default `preprocess_func` calls `encode_prompt`, `encode_image`, `encode_video` and `encode_audio` independently. Override it when your model requires **cross-modal preprocessing** — for example, FLUX.2 uses its text encoder to "upsample" (rewrite) prompts based on input images before encoding ([here](https://github.com/X-GenGroup/Flow-Factory/blob/main/src/flow_factory/models/flux/flux2.py#L371)):
 
 ```python
 # src/flow_factory/models/flux/flux2.py — Flux2Adapter.preprocess_func()
@@ -574,6 +574,17 @@ def preprocess_func(
 | Prompt rewriting that depends on input images | Yes |
 | Joint text-image encoding (e.g., interleaved tokens) | Yes |
 | Custom normalization or augmentation during preprocessing | Yes |
+
+If the override accepts semantic inputs only through `**kwargs`, declare every
+output-affecting key in `preprocess_cache_fields`. Set `preprocess_cache_version`
+and bump it whenever helper behavior changes without changing the wrapper source.
+Adapters that consume the ordered Ref2VA-style `references` column must also set
+`supports_ordered_references = True`.
+
+For flow models whose predicted velocity points from noise toward clean data
+(`clean - noise`) instead of the default noise-ward direction, set
+`flow_velocity_direction = "data"`. Trainers use this declaration when projecting
+velocity predictions to `x0`; do not duplicate the sign convention inside a trainer.
 
 
 ## Advanced: Pseudo-Pipeline for Non-Diffusers Models
@@ -793,6 +804,9 @@ Before submitting a new model adapter, verify:
 - [ ] **`default_target_modules`** — Lists attention and FFN layer names matching your transformer architecture
 - [ ] **`preprocessing_modules`** — Includes all components needed for encoding (text encoders, VAE, image encoders)
 - [ ] **`inference_modules`** — Includes all components needed during the training loop
+- [ ] **Preprocessing cache contract** — `**kwargs`-hidden semantic fields are listed in `preprocess_cache_fields`; helper-only behavior changes bump `preprocess_cache_version`
+- [ ] **Ordered references** — Set `supports_ordered_references = True` only when the adapter consumes the validated heterogeneous `references` array
+- [ ] **Velocity direction** — Set `flow_velocity_direction = "data"` when the model predicts `clean - noise`; otherwise keep the default `"noise"`
 - [ ] **`encode_prompt()`** — Override only if your model needs text conditioning; returns dict with at least `prompt_ids` and `prompt_embeds` (text/image/video/audio-only models inherit the no-op default)
 - [ ] **`encode_image()`** — Override only if your model consumes images; handles `MultiImageBatch` input format (text-only models inherit the no-op default)
 - [ ] **`encode_video()`** — Override only if your model consumes videos; handles `MultiVideoBatch` input format

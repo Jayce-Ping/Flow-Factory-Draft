@@ -15,45 +15,54 @@
 # src/flow_factory/models/flux/flux2.py
 from __future__ import annotations
 
-import os
-from typing import Union, List, Dict, Any, Optional, Tuple, Literal, ClassVar
-from dataclasses import dataclass
-from PIL import Image
-from collections import defaultdict
-import numpy as np
-from accelerate import Accelerator
-import torch
-from diffusers.pipelines.flux2.pipeline_flux2 import Flux2Pipeline, format_input, compute_empirical_mu
-from diffusers.pipelines.flux2.system_messages import SYSTEM_MESSAGE, SYSTEM_MESSAGE_UPSAMPLING_T2I, SYSTEM_MESSAGE_UPSAMPLING_I2I
 import logging
+import os
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
 
-from ..abc import BaseAdapter
-from ...samples import I2ISample
+import numpy as np
+import torch
+from accelerate import Accelerator
+from diffusers.pipelines.flux2.pipeline_flux2 import (
+    Flux2Pipeline,
+    compute_empirical_mu,
+    format_input,
+)
+from diffusers.pipelines.flux2.system_messages import (
+    SYSTEM_MESSAGE,
+    SYSTEM_MESSAGE_UPSAMPLING_I2I,
+    SYSTEM_MESSAGE_UPSAMPLING_T2I,
+)
+from PIL import Image
+
 from ...hparams import *
+from ...samples import I2ISample
 from ...scheduler import (
     FlowMatchEulerDiscreteSDEScheduler,
     FlowMatchEulerDiscreteSDESchedulerOutput,
     SDESchedulerOutput,
-    set_scheduler_timesteps
+    set_scheduler_timesteps,
 )
 from ...utils.base import filter_kwargs
 from ...utils.image import (
-    ImageSingle,
     ImageBatch,
+    ImageSingle,
     MultiImageBatch,
     is_image,
     is_image_batch,
     is_multi_image_batch,
     standardize_image_batch,
 )
-from ...utils.trajectory_collector import (
-    TrajectoryCollector,
-    CallbackCollector,
-    TrajectoryIndicesType, 
-    create_trajectory_collector,
-    create_callback_collector,
-)
 from ...utils.logger_utils import setup_logger
+from ...utils.trajectory_collector import (
+    CallbackCollector,
+    TrajectoryCollector,
+    TrajectoryIndicesType,
+    create_callback_collector,
+    create_trajectory_collector,
+)
+from ..abc import BaseAdapter
 
 logger = setup_logger(__name__)
 
@@ -61,31 +70,32 @@ logger = setup_logger(__name__)
 @dataclass
 class Flux2Sample(I2ISample):
     """Output class for Flux2Adapter models."""
+
     # Class vars
     _shared_fields: ClassVar[frozenset[str]] = frozenset({})
     # Obj vars
-    latent_ids : Optional[torch.Tensor] = None
-    text_ids : Optional[torch.Tensor] = None
-    image_latents : Optional[torch.Tensor] = None
-    image_latent_ids : Optional[torch.Tensor] = None
+    latent_ids: Optional[torch.Tensor] = None
+    text_ids: Optional[torch.Tensor] = None
+    image_latents: Optional[torch.Tensor] = None
+    image_latent_ids: Optional[torch.Tensor] = None
 
 
 CONDITION_IMAGE_SIZE = (1024, 1024)
 
-class Flux2Adapter(BaseAdapter):    
-    def __init__(self, config: Arguments, accelerator : Accelerator):
+
+class Flux2Adapter(BaseAdapter):
+    def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
         self.pipeline: Flux2Pipeline
         self.scheduler: FlowMatchEulerDiscreteSDEScheduler
-        
+
         self._has_warned_inference_fallback = False
         self._has_warned_forward_fallback = False
         self._has_warned_preprocess_fallback = False
-    
+
     def load_pipeline(self) -> Flux2Pipeline:
         return Flux2Pipeline.from_pretrained(
-            self.model_args.model_name_or_path,
-            low_cpu_mem_usage=False
+            self.model_args.model_name_or_path, low_cpu_mem_usage=False
         )
 
     @property
@@ -93,14 +103,21 @@ class Flux2Adapter(BaseAdapter):
         """Default LoRA target modules for Flux.2 DiT."""
         return [
             # --- Double Stream Block Targets ---
-            "attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0",
-            "attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj", "attn.to_add_out",
-            "ff.linear_in", "ff.linear_out", 
-            "ff_context.linear_in", "ff_context.linear_out",
-            
+            "attn.to_q",
+            "attn.to_k",
+            "attn.to_v",
+            "attn.to_out.0",
+            "attn.add_q_proj",
+            "attn.add_k_proj",
+            "attn.add_v_proj",
+            "attn.to_add_out",
+            "ff.linear_in",
+            "ff.linear_out",
+            "ff_context.linear_in",
+            "ff_context.linear_out",
             # --- Single Stream Block Targets ---
-            "attn.to_qkv_mlp_proj", 
-            "attn.to_out.0"
+            "attn.to_qkv_mlp_proj",
+            "attn.to_out.0",
         ]
 
     # ======================== Encoding & Decoding ========================
@@ -152,10 +169,12 @@ class Flux2Adapter(BaseAdapter):
         out = out.to(dtype=dtype, device=device)
 
         batch_size, num_channels, seq_len, hidden_dim = out.shape
-        prompt_embeds = out.permute(0, 2, 1, 3).reshape(batch_size, seq_len, num_channels * hidden_dim)
+        prompt_embeds = out.permute(0, 2, 1, 3).reshape(
+            batch_size, seq_len, num_channels * hidden_dim
+        )
 
         return input_ids, prompt_embeds
-    
+
     def encode_prompt(
         self,
         prompt: Union[str, List[str]],
@@ -182,9 +201,9 @@ class Flux2Adapter(BaseAdapter):
         text_ids = self.pipeline._prepare_text_ids(prompt_embeds)
         text_ids = text_ids.to(device)
         return {
-            'prompt_ids': prompt_ids,
-            'prompt_embeds': prompt_embeds,
-            'text_ids': text_ids,
+            "prompt_ids": prompt_ids,
+            "prompt_embeds": prompt_embeds,
+            "text_ids": text_ids,
         }
 
     # ------------------------- Image Encoding ------------------------
@@ -198,18 +217,18 @@ class Flux2Adapter(BaseAdapter):
     ) -> Dict[str, Union[List[List[torch.Tensor]], List[torch.Tensor]]]:
         """
         Encode input condition image(s) into latent representations using the Flux.2 image encoder.
-        
+
         Supports both single batch and nested batch inputs:
         - Single batch: Image.Image, List[Image.Image], torch.Tensor, np.ndarray
         - Nested batch: List[List[Image.Image]], List[torch.Tensor(4D)], torch.Tensor(5D)
-        
+
         Args:
             images: Input images in various formats
             condition_image_size: Target size for condition images
             device: Device to place tensors on
             dtype: Data type for tensors
             generator: Random generator for encoding (not used, kept for API consistency)
-        
+
         Returns:
             Dictionary containing:
             - condition_images: List[List[torch.Tensor(3, H, W)]]
@@ -221,19 +240,20 @@ class Flux2Adapter(BaseAdapter):
 
         # Check if input is a batch of condition image lists (nested batch)
         # Wrap single batch into nested structure
-        images = [images] if not self._is_multi_images_batch(images) else images 
-        
+        images = [images] if not self._is_multi_images_batch(images) else images
+
         # Standardize each batch to PIL format
-        images = [self._standardize_image_input(imgs, output_type='pil') for imgs in images]
-        
+        images = [self._standardize_image_input(imgs, output_type="pil") for imgs in images]
+
         # Resize all condition images
         condition_image_tensors: List[List[torch.Tensor]] = [
             self._resize_condition_images(
                 condition_images=imgs,
                 condition_image_size=condition_image_size,
-            ) for imgs in images
+            )
+            for imgs in images
         ]
-        
+
         # Encode each batch separately
         image_latents_list = []
         image_latent_ids_list = []
@@ -247,26 +267,26 @@ class Flux2Adapter(BaseAdapter):
             )
             image_latents_list.append(image_latents.squeeze(0))
             image_latent_ids_list.append(image_latent_ids.squeeze(0))
-        
+
         # Convert back to [0, 1] range tensors for storage
         condition_image_tensors: List[List[torch.Tensor]] = [
             [
-                self.pipeline.image_processor.postprocess(img, output_type='pt')[0].to(device)
+                self.pipeline.image_processor.postprocess(img, output_type="pt")[0].to(device)
                 for img in cond_img_tensors
             ]
             for cond_img_tensors in condition_image_tensors
         ]
-        
+
         return {
-            'condition_images': condition_image_tensors,  # List[List[torch.Tensor(3, H, W)]]
-            'image_latents': image_latents_list,          # List[torch.Tensor(seq_len, C)]
-            'image_latent_ids': image_latent_ids_list,    # List[torch.Tensor(seq_len, 3)]
+            "condition_images": condition_image_tensors,  # List[List[torch.Tensor(3, H, W)]]
+            "image_latents": image_latents_list,  # List[torch.Tensor(seq_len, C)]
+            "image_latent_ids": image_latent_ids_list,  # List[torch.Tensor(seq_len, 3)]
         }
-    
+
     def _resize_condition_images(
         self,
         condition_images: Union[Image.Image, List[Image.Image]],
-        condition_image_size : Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
+        condition_image_size: Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
     ) -> List[torch.Tensor]:
         """Preprocess condition images for Flux.2 model."""
         if isinstance(condition_image_size, int):
@@ -277,7 +297,7 @@ class Flux2Adapter(BaseAdapter):
 
         condition_images = self._standardize_image_input(
             condition_images,
-            output_type='pil',
+            output_type="pil",
         )
 
         max_area = condition_image_size[0] * condition_image_size[1]
@@ -292,73 +312,85 @@ class Flux2Adapter(BaseAdapter):
             multiple_of = self.pipeline.vae_scale_factor * 2
             image_width = (image_width // multiple_of) * multiple_of
             image_height = (image_height // multiple_of) * multiple_of
-            img = self.pipeline.image_processor.preprocess(img, height=image_height, width=image_width, resize_mode="crop")
+            img = self.pipeline.image_processor.preprocess(
+                img, height=image_height, width=image_width, resize_mode="crop"
+            )
             condition_image_tensors.append(img)
 
         return condition_image_tensors
 
     @staticmethod
-    def _is_multi_images_batch(images : Union[ImageBatch, MultiImageBatch]):
+    def _is_multi_images_batch(images: Union[ImageBatch, MultiImageBatch]):
         return is_multi_image_batch(images)
 
     @staticmethod
-    def _is_ragged_multi_image_batch(images : Union[ImageBatch, MultiImageBatch]):
+    def _is_ragged_multi_image_batch(images: Union[ImageBatch, MultiImageBatch]):
         is_ragged_batch = (
-            ( isinstance(images, list) and len(images) > 0 and isinstance(images[0], list) ) # List[List[Image]]
-            or
-            ( isinstance(images, list) and len(images) > 0 and isinstance(images[0], (np.ndarray, torch.Tensor)) and images[0].ndim == 4 ) # List[torch.Tensor : ndim=4]
-        )
+            isinstance(images, list) and len(images) > 0 and isinstance(images[0], list)
+        ) or (  # List[List[Image]]
+            isinstance(images, list)
+            and len(images) > 0
+            and isinstance(images[0], (np.ndarray, torch.Tensor))
+            and images[0].ndim == 4
+        )  # List[torch.Tensor : ndim=4]
         return is_ragged_batch
-    
+
     @staticmethod
     def _is_multi_image_latents(image_latents: Union[torch.Tensor, List[torch.Tensor]]):
         is_ragged_image_latents = (
-            (
-                isinstance(image_latents, list) and len(image_latents) > 0
-                and isinstance(image_latents[0], torch.Tensor) and image_latents[0].ndim == 2
-            ) # List[torch.Tensor : ndim=2 (seq_len, C)]
-            or (
-                isinstance(image_latents, torch.Tensor) and image_latents.ndim == 3
-             ) # torch.Tensor : ndim=3 (B, seq_len, C)
-        )
+            isinstance(image_latents, list)
+            and len(image_latents) > 0
+            and isinstance(image_latents[0], torch.Tensor)
+            and image_latents[0].ndim == 2
+        ) or (  # List[torch.Tensor : ndim=2 (seq_len, C)]
+            isinstance(image_latents, torch.Tensor) and image_latents.ndim == 3
+        )  # torch.Tensor : ndim=3 (B, seq_len, C)
         return is_ragged_image_latents
 
     @staticmethod
     def _is_ragged_multi_image_latents(image_latents: Union[torch.Tensor, List[torch.Tensor]]):
         is_ragged_image_latents = (
-            isinstance(image_latents, list) and len(image_latents) > 0
-            and isinstance(image_latents[0], torch.Tensor) and image_latents[0].ndim == 2
-        ) # List[torch.Tensor : ndim=2 (seq_len, C)]
+            isinstance(image_latents, list)
+            and len(image_latents) > 0
+            and isinstance(image_latents[0], torch.Tensor)
+            and image_latents[0].ndim == 2
+        )  # List[torch.Tensor : ndim=2 (seq_len, C)]
         return is_ragged_image_latents
-    
+
     def _standardize_image_input(
         self,
         images: Union[ImageSingle, ImageBatch],
-        output_type: Literal['pil', 'pt', 'np'] = 'pil',
+        output_type: Literal["pil", "pt", "np"] = "pil",
     ) -> ImageBatch:
         """
         Standardize image input to desired output type.
         """
         if isinstance(images, Image.Image):
             images = [images]
-        
+
         return standardize_image_batch(
             images,
             output_type=output_type,
         )
+
     # ------------------------- Video Encoding ------------------------
     def encode_video(self, videos: Any) -> None:
         """Flux.2 does not support video encoding."""
         pass
 
     # ------------------------- Latent Decoding ------------------------
-    def decode_latents(self, latents: torch.Tensor, latent_ids, output_type: Literal['pil', 'pt', 'np'] = 'pil') -> Union[List[Image.Image], torch.Tensor, np.ndarray]:
+    def decode_latents(
+        self, latents: torch.Tensor, latent_ids, output_type: Literal["pil", "pt", "np"] = "pil"
+    ) -> Union[List[Image.Image], torch.Tensor, np.ndarray]:
         latents = self.pipeline._unpack_latents_with_ids(latents, latent_ids)
 
-        latents_bn_mean = self.pipeline.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
-        latents_bn_std = torch.sqrt(self.pipeline.vae.bn.running_var.view(1, -1, 1, 1) + self.pipeline.vae.config.batch_norm_eps).to(
+        latents_bn_mean = self.pipeline.vae.bn.running_mean.view(1, -1, 1, 1).to(
             latents.device, latents.dtype
         )
+        latents_bn_std = torch.sqrt(
+            self.pipeline.vae.bn.running_var.view(1, -1, 1, 1)
+            + self.pipeline.vae.config.batch_norm_eps
+        ).to(latents.device, latents.dtype)
         latents = latents * latents_bn_std + latents_bn_mean
         latents = self.pipeline._unpatchify_latents(latents)
 
@@ -397,7 +429,9 @@ class Flux2Adapter(BaseAdapter):
         # 1. Normalize images to List[List[Image | None]]
         if images is not None:
             assert len(prompt) == len(images), "Prompts and images must have same batch size"
-            if isinstance(images, list) and all(isinstance(img, Image.Image) or img is None for img in images):
+            if isinstance(images, list) and all(
+                isinstance(img, Image.Image) or img is None for img in images
+            ):
                 images = [[img] for img in images]
 
             has_images = any(img is not None for img_list in images for img in img_list)
@@ -446,7 +480,7 @@ class Flux2Adapter(BaseAdapter):
     def _inference(
         self,
         # Ordinary arguments
-        images: Optional[Union[ImageBatch, MultiImageBatch]] = None, # A batch of condition images
+        images: Optional[Union[ImageBatch, MultiImageBatch]] = None,  # A batch of condition images
         prompt: Union[str, List[str]] = None,
         height: int = 1024,
         width: int = 1024,
@@ -462,7 +496,7 @@ class Flux2Adapter(BaseAdapter):
         image_latents: Optional[torch.Tensor] = None,
         image_latent_ids: Optional[torch.Tensor] = None,
         # Other arguments
-        condition_image_size : Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
+        condition_image_size: Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         max_sequence_length: int = 512,
         text_encoder_out_layers: Tuple[int, ...] = (10, 20, 30),
@@ -470,7 +504,7 @@ class Flux2Adapter(BaseAdapter):
         compute_log_prob: bool = False,
         # Extra callback arguments
         extra_call_back_kwargs: List[str] = [],
-        trajectory_indices: TrajectoryIndicesType = 'all',
+        trajectory_indices: TrajectoryIndicesType = "all",
     ) -> List[Flux2Sample]:
         """
         Inference method for Flux.2 model for a single sample.
@@ -480,12 +514,13 @@ class Flux2Adapter(BaseAdapter):
         device = self.device
         if isinstance(prompt, str):
             prompt = [prompt]
-        
-        images = [images] if images is not None and not self._is_multi_images_batch(images) else images
 
-        if (
-            (prompt is not None and (prompt_embeds is None or text_ids is None))
-            or (images is not None and (image_latents is None or image_latent_ids is None))
+        images = (
+            [images] if images is not None and not self._is_multi_images_batch(images) else images
+        )
+
+        if (prompt is not None and (prompt_embeds is None or text_ids is None)) or (
+            images is not None and (image_latents is None or image_latent_ids is None)
         ):
             encode_dict = self.preprocess_func(
                 prompt=prompt,
@@ -496,23 +531,23 @@ class Flux2Adapter(BaseAdapter):
                 caption_upsample_temperature=caption_upsample_temperature,
                 condition_image_size=condition_image_size,
             )
-            prompt_ids = encode_dict['prompt_ids']
-            prompt_embeds = encode_dict['prompt_embeds']
-            text_ids = encode_dict['text_ids']
+            prompt_ids = encode_dict["prompt_ids"]
+            prompt_embeds = encode_dict["prompt_embeds"]
+            text_ids = encode_dict["text_ids"]
             # Potential issue: the following stack relies on uniform size of input condition images
             condition_images = (
-                encode_dict['condition_images'] # List[List[torch.Tensor(3, H, W)]] with len B
-                if encode_dict.get('condition_images', None) is not None
+                encode_dict["condition_images"]  # List[List[torch.Tensor(3, H, W)]] with len B
+                if encode_dict.get("condition_images", None) is not None
                 else None
             )
             image_latents = (
-                torch.stack(encode_dict['image_latents'], dim=0) # torch.Tensor(B, seq_len, C)
-                if encode_dict.get('image_latents', None) is not None
+                torch.stack(encode_dict["image_latents"], dim=0)  # torch.Tensor(B, seq_len, C)
+                if encode_dict.get("image_latents", None) is not None
                 else None
             )
             image_latent_ids = (
-                torch.stack(encode_dict['image_latent_ids'], dim=0) # torch.Tensor(B, seq_len, 3)
-                if encode_dict.get('image_latent_ids', None) is not None
+                torch.stack(encode_dict["image_latent_ids"], dim=0)  # torch.Tensor(B, seq_len, 3)
+                if encode_dict.get("image_latent_ids", None) is not None
                 else None
             )
         else:
@@ -545,20 +580,24 @@ class Flux2Adapter(BaseAdapter):
             device=device,
             mu=mu,
         )
-        
+
         # 4. Run diffusion process
         latent_collector = create_trajectory_collector(trajectory_indices, num_inference_steps)
         latents = self.cast_latents(latents, default_dtype=dtype)
         latent_collector.collect(latents, step_idx=0)
         if compute_log_prob:
-            log_prob_collector = create_trajectory_collector(trajectory_indices, num_inference_steps)
+            log_prob_collector = create_trajectory_collector(
+                trajectory_indices, num_inference_steps
+            )
         callback_collector = create_callback_collector(trajectory_indices, num_inference_steps)
 
         # Inside denoising loop in _inference, replace the inline transformer call with:
         for i, t in enumerate(timesteps):
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
             t_next = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
-            return_kwargs = list(set(['next_latents', 'log_prob', 'velocity'] + extra_call_back_kwargs))
+            return_kwargs = list(
+                set(["next_latents", "log_prob", "velocity"] + extra_call_back_kwargs)
+            )
             current_compute_log_prob = compute_log_prob and current_noise_level > 0
 
             output = self._forward(
@@ -586,26 +625,34 @@ class Flux2Adapter(BaseAdapter):
                 step_idx=i,
                 output=output,
                 keys=extra_call_back_kwargs,
-                capturable={'noise_level': current_noise_level},
+                capturable={"noise_level": current_noise_level},
             )
 
         # 5. Decode latents to images
-        decoded_images = self.decode_latents(latents, latent_ids, output_type='pt')
+        decoded_images = self.decode_latents(latents, latent_ids, output_type="pt")
         # decoded_condition_images = self.decode_latents(image_latents, image_latent_ids, output_type='pt') if image_latents is not None else None
 
         # 6. Create samples
-        extra_call_back_res = callback_collector.get_result()          # (B, len(trajectory_indices), ...)
-        callback_index_map = callback_collector.get_index_map()        # (T,) LongTensor
-        all_latents = latent_collector.get_result()                    # List[torch.Tensor(B, ...)]
-        latent_index_map = latent_collector.get_index_map()            # (T+1,) LongTensor
+        extra_call_back_res = callback_collector.get_result()  # (B, len(trajectory_indices), ...)
+        callback_index_map = callback_collector.get_index_map()  # (T,) LongTensor
+        all_latents = latent_collector.get_result()  # List[torch.Tensor(B, ...)]
+        latent_index_map = latent_collector.get_index_map()  # (T+1,) LongTensor
         all_log_probs = log_prob_collector.get_result() if compute_log_prob else None
         log_prob_index_map = log_prob_collector.get_index_map() if compute_log_prob else None
         samples = [
             Flux2Sample(
                 # Denoising trajectory
                 timesteps=timesteps,
-                all_latents=torch.stack([lat[b] for lat in all_latents], dim=0) if all_latents is not None else None,
-                log_probs=torch.stack([lp[b] for lp in all_log_probs], dim=0) if all_log_probs is not None else None,
+                all_latents=(
+                    torch.stack([lat[b] for lat in all_latents], dim=0)
+                    if all_latents is not None
+                    else None
+                ),
+                log_probs=(
+                    torch.stack([lp[b] for lp in all_log_probs], dim=0)
+                    if all_log_probs is not None
+                    else None
+                ),
                 latent_index_map=latent_index_map,
                 log_prob_index_map=log_prob_index_map,
                 # Generated image & metadata
@@ -619,20 +666,26 @@ class Flux2Adapter(BaseAdapter):
                 prompt_embeds=prompt_embeds[b],
                 text_ids=text_ids[b],
                 # Condition images & latents
-                condition_images=condition_images[b] if condition_images is not None else None, # The condition images are shared and without batch dimension
-                image_latents=image_latents[b] if image_latents is not None else None, # If not None, it has batch dim 1
-                image_latent_ids=image_latent_ids[b] if image_latent_ids is not None else None, # If not None, it has batch dim 1
+                condition_images=(
+                    condition_images[b] if condition_images is not None else None
+                ),  # The condition images are shared and without batch dimension
+                image_latents=(
+                    image_latents[b] if image_latents is not None else None
+                ),  # If not None, it has batch dim 1
+                image_latent_ids=(
+                    image_latent_ids[b] if image_latent_ids is not None else None
+                ),  # If not None, it has batch dim 1
                 # Extra kwargs
                 extra_kwargs={
                     **{k: v[b] for k, v in extra_call_back_res.items()},
-                    'callback_index_map': callback_index_map,
+                    "callback_index_map": callback_index_map,
                 },
             )
             for b in range(batch_size)
         ]
 
         self.pipeline.maybe_free_model_hooks()
-        
+
         return samples
 
     @torch.no_grad()
@@ -661,7 +714,7 @@ class Flux2Adapter(BaseAdapter):
         # Other arguments
         compute_log_prob: bool = False,
         extra_call_back_kwargs: List[str] = [],
-        trajectory_indices: TrajectoryIndicesType = 'all',
+        trajectory_indices: TrajectoryIndicesType = "all",
     ) -> List[Flux2Sample]:
         """Batch inference for Flux2"""
         if isinstance(prompt, str):
@@ -674,7 +727,7 @@ class Flux2Adapter(BaseAdapter):
         # Approach 2: Fallback for all I2I, this is good for asynchronization among processes
         is_nested_images = self._is_multi_images_batch(images)
         is_nested_image_latents = self._is_multi_image_latents(image_latents)
-        fall_back = (is_nested_images or is_nested_image_latents)
+        fall_back = is_nested_images or is_nested_image_latents
         if not fall_back:
             # batched T2I or uniformed I2I
             return self._inference(
@@ -703,7 +756,7 @@ class Flux2Adapter(BaseAdapter):
                 extra_call_back_kwargs=extra_call_back_kwargs,
                 trajectory_indices=trajectory_indices,
             )
-    
+
         # Ragged case: per-sample fallback
         if not self._has_warned_inference_fallback:
             logger.warning(
@@ -720,13 +773,23 @@ class Flux2Adapter(BaseAdapter):
             # Prompt
             this_prompt = prompt[idx] if prompt is not None else None
             this_prompt_ids = prompt_ids[idx].unsqueeze(0) if prompt_ids is not None else None
-            this_prompt_embeds = prompt_embeds[idx].unsqueeze(0) if prompt_embeds is not None else None
+            this_prompt_embeds = (
+                prompt_embeds[idx].unsqueeze(0) if prompt_embeds is not None else None
+            )
             this_text_ids = text_ids[idx].unsqueeze(0) if text_ids is not None else None
             # Image
-            this_images=images[idx] if images is not None else None # No batch dimension for `images`
-            this_condition_images=condition_images[idx:idx+1] if condition_images is not None else None
-            this_image_latents=image_latents[idx].unsqueeze(0) if image_latents is not None else None
-            this_image_latent_ids=image_latent_ids[idx].unsqueeze(0) if image_latent_ids is not None else None
+            this_images = (
+                images[idx] if images is not None else None
+            )  # No batch dimension for `images`
+            this_condition_images = (
+                condition_images[idx : idx + 1] if condition_images is not None else None
+            )
+            this_image_latents = (
+                image_latents[idx].unsqueeze(0) if image_latents is not None else None
+            )
+            this_image_latent_ids = (
+                image_latent_ids[idx].unsqueeze(0) if image_latent_ids is not None else None
+            )
             sample = self._inference(
                 # Ordinary args
                 images=this_images,
@@ -737,7 +800,7 @@ class Flux2Adapter(BaseAdapter):
                 guidance_scale=guidance_scale,
                 generator=generator[idx] if isinstance(generator, list) else generator,
                 # Encoded prompt
-                prompt_ids=this_prompt_ids, # Keep batch dim as 1
+                prompt_ids=this_prompt_ids,  # Keep batch dim as 1
                 prompt_embeds=this_prompt_embeds,
                 text_ids=this_text_ids,
                 # Encoded image
@@ -774,7 +837,14 @@ class Flux2Adapter(BaseAdapter):
         guidance_scale: float = 4.0,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
-        return_kwargs: List[str] = ['velocity', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
+        return_kwargs: List[str] = [
+            "velocity",
+            "next_latents",
+            "next_latents_mean",
+            "std_dev_t",
+            "dt",
+            "log_prob",
+        ],
         noise_level: Optional[float] = None,
     ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
         """
@@ -799,10 +869,12 @@ class Flux2Adapter(BaseAdapter):
         Returns:
             SDESchedulerOutput containing requested outputs.
         """
-        # 1. Prepare variables        
+        # 1. Prepare variables
         batch_size = latents.shape[0]
 
-        guidance = torch.full([batch_size], guidance_scale, device=latents.device, dtype=torch.float32)
+        guidance = torch.full(
+            [batch_size], guidance_scale, device=latents.device, dtype=torch.float32
+        )
 
         # Prepare model input (concatenate condition latents for I2I)
         latent_model_input = latents.to(torch.float32)
@@ -825,7 +897,7 @@ class Flux2Adapter(BaseAdapter):
         )[0]
 
         # Extract only target latent predictions (exclude condition image part)
-        velocity = velocity[:, :latents.shape[1]]
+        velocity = velocity[:, : latents.shape[1]]
 
         # Scheduler step
         output = self.scheduler.step(
@@ -859,7 +931,14 @@ class Flux2Adapter(BaseAdapter):
         noise_level: Optional[float] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
-        return_kwargs: List[str] = ['velocity', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
+        return_kwargs: List[str] = [
+            "velocity",
+            "next_latents",
+            "next_latents_mean",
+            "std_dev_t",
+            "dt",
+            "log_prob",
+        ],
     ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
         """
         General forward method handling both T2I and I2I, including ragged I2I batches.
@@ -909,13 +988,21 @@ class Flux2Adapter(BaseAdapter):
             # Latents
             single_latents = latents[idx].unsqueeze(0)
             single_latent_ids = latent_ids[idx].unsqueeze(0)
-            single_next_latents = next_latents[idx].unsqueeze(0) if next_latents is not None else None
+            single_next_latents = (
+                next_latents[idx].unsqueeze(0) if next_latents is not None else None
+            )
             # Prompt
             single_prompt_embeds = prompt_embeds[idx].unsqueeze(0)
             single_text_ids = text_ids[idx].unsqueeze(0)
             # Condtion Images
-            single_image_latents = image_latents[idx].unsqueeze(0) if image_latents[idx] is not None else None
-            single_image_latent_ids = image_latent_ids[idx].unsqueeze(0) if image_latent_ids is not None and image_latent_ids[idx] is not None else None
+            single_image_latents = (
+                image_latents[idx].unsqueeze(0) if image_latents[idx] is not None else None
+            )
+            single_image_latent_ids = (
+                image_latent_ids[idx].unsqueeze(0)
+                if image_latent_ids is not None and image_latent_ids[idx] is not None
+                else None
+            )
 
             out = self._forward(
                 t=single_t,
@@ -937,7 +1024,13 @@ class Flux2Adapter(BaseAdapter):
 
         # Concatenate outputs along batch dimension
         outputs_dict = [o.to_dict() for o in outputs]
-        return FlowMatchEulerDiscreteSDESchedulerOutput.from_dict({
-            k: torch.cat([o[k] for o in outputs_dict], dim=0) if outputs_dict[0][k] is not None else None
-            for k in outputs_dict[0].keys()
-        })
+        return FlowMatchEulerDiscreteSDESchedulerOutput.from_dict(
+            {
+                k: (
+                    torch.cat([o[k] for o in outputs_dict], dim=0)
+                    if outputs_dict[0][k] is not None
+                    else None
+                )
+                for k in outputs_dict[0].keys()
+            }
+        )

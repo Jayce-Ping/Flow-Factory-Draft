@@ -2,26 +2,25 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
-from typing import List, Tuple, Optional, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.nn.attention.flex_attention import create_block_mask
+from tqdm import tqdm
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 
 from ...data.data_utils import (
-    create_sparse_mask, 
-    get_flattened_position_ids_extrapolate, 
+    create_sparse_mask,
+    get_flattened_position_ids_extrapolate,
     get_flattened_position_ids_interpolate,
-    patchify, 
+    patchify,
 )
-from .qwen2_navit import NaiveCache
-from .modeling_utils import MLPconnector, TimestepEmbedder, PositionEmbedding
 from ..cache_utils.taylorseer import cache_init
-
-from tqdm import tqdm
+from .modeling_utils import MLPconnector, PositionEmbedding, TimestepEmbedder
+from .qwen2_navit import NaiveCache
 
 
 class BagelConfig(PretrainedConfig):
@@ -38,7 +37,7 @@ class BagelConfig(PretrainedConfig):
         connector_act="gelu_pytorch_tanh",
         interpolate_pos=False,
         timestep_shift=1.0,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs)
         self.visual_gen = visual_gen
@@ -56,10 +55,10 @@ class BagelConfig(PretrainedConfig):
 
 class Bagel(PreTrainedModel):
     config_class = BagelConfig
-    base_model_prefix = 'bagel'
+    base_model_prefix = "bagel"
 
     def __init__(self, language_model, vit_model, config: BagelConfig):
-        super().__init__(config)    
+        super().__init__(config)
         self.language_model = language_model
         self.hidden_size = config.llm_config.hidden_size
         self.use_moe = "Mo" in config.llm_config.layer_module
@@ -71,7 +70,7 @@ class Bagel(PreTrainedModel):
             self.latent_downsample = config.vae_config.downsample * config.latent_patch_size
             self.max_latent_size = config.max_latent_size
             self.latent_channel = config.vae_config.z_channels
-            self.patch_latent_dim = self.latent_patch_size ** 2 * self.latent_channel
+            self.patch_latent_dim = self.latent_patch_size**2 * self.latent_channel
             self.time_embedder = TimestepEmbedder(self.hidden_size)
             self.vae2llm = nn.Linear(self.patch_latent_dim, self.hidden_size)
             self.llm2vae = nn.Linear(self.hidden_size, self.patch_latent_dim)
@@ -82,8 +81,12 @@ class Bagel(PreTrainedModel):
             self.vit_patch_size = config.vit_config.patch_size
             self.vit_max_num_patch_per_side = config.vit_max_num_patch_per_side
             self.vit_hidden_size = config.vit_config.hidden_size
-            self.connector = MLPconnector(self.vit_hidden_size, self.hidden_size, config.connector_act)
-            self.vit_pos_embed = PositionEmbedding(self.vit_max_num_patch_per_side, self.hidden_size)
+            self.connector = MLPconnector(
+                self.vit_hidden_size, self.hidden_size, config.connector_act
+            )
+            self.vit_pos_embed = PositionEmbedding(
+                self.vit_max_num_patch_per_side, self.hidden_size
+            )
 
         if config.interpolate_pos:
             self.get_flattened_position_ids = get_flattened_position_ids_interpolate
@@ -129,7 +132,7 @@ class Bagel(PreTrainedModel):
             packed_text_ids: 1-D int tensor, packed text token ids.
             packed_text_indexes: 1-D int tensor, packed text token indexes in sequence.
             sample_lens: A list of N ints, length of each sample in packed_sequence.
-            nested_attention_masks: A list of N 2-D float tensor,  where 0.0 means attention and 
+            nested_attention_masks: A list of N 2-D float tensor,  where 0.0 means attention and
                 -inf means ignore.
             packed_position_ids: packed 1-D positions, an image has only one global position shared
                 by all latent tokens.
@@ -153,11 +156,19 @@ class Bagel(PreTrainedModel):
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
         if nested_attention_masks is None:
-            sparse_mask = create_sparse_mask(sample_lens, split_lens, attn_modes, packed_text_embedding.device)
+            sparse_mask = create_sparse_mask(
+                sample_lens, split_lens, attn_modes, packed_text_embedding.device
+            )
             seqlen = sum(sample_lens)
             block_mask = create_block_mask(
-                sparse_mask, B=1, H=self.num_heads, Q_LEN=seqlen, KV_LEN=seqlen, 
-                device=packed_text_embedding.device, BLOCK_SIZE=128, _compile=True
+                sparse_mask,
+                B=1,
+                H=self.num_heads,
+                Q_LEN=seqlen,
+                KV_LEN=seqlen,
+                device=packed_text_embedding.device,
+                BLOCK_SIZE=128,
+                _compile=True,
             )
             attention_mask = block_mask
         else:
@@ -168,7 +179,7 @@ class Bagel(PreTrainedModel):
             cu_seqlens = cu_seqlens.to(torch.int32)
             max_seqlen = torch.max(vit_token_seqlens).item()
             packed_vit_token_embed = self.vit_model(
-                packed_pixel_values=packed_vit_tokens, 
+                packed_pixel_values=packed_vit_tokens,
                 packed_flattened_position_ids=packed_vit_position_ids,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
@@ -182,25 +193,37 @@ class Bagel(PreTrainedModel):
             p = self.latent_patch_size
             packed_latent = []
             for latent, (h, w) in zip(padded_latent, patchified_vae_latent_shapes):
-                latent = latent[:, :h * p, :w * p].reshape(self.latent_channel, h, p, w, p)
-                latent = torch.einsum("chpwq->hwpqc", latent).reshape(-1, p * p * self.latent_channel)
+                latent = latent[:, : h * p, : w * p].reshape(self.latent_channel, h, p, w, p)
+                latent = torch.einsum("chpwq->hwpqc", latent).reshape(
+                    -1, p * p * self.latent_channel
+                )
                 packed_latent.append(latent)
             packed_latent_clean = torch.cat(packed_latent, dim=0)
 
             noise = torch.randn_like(packed_latent_clean)
             packed_timesteps = torch.sigmoid(packed_timesteps)
-            packed_timesteps = self.timestep_shift * packed_timesteps / (1 + (self.timestep_shift - 1) * packed_timesteps)
-            packed_latent = (1 - packed_timesteps[:, None]) * packed_latent_clean + packed_timesteps[:, None] * noise
+            packed_timesteps = (
+                self.timestep_shift
+                * packed_timesteps
+                / (1 + (self.timestep_shift - 1) * packed_timesteps)
+            )
+            packed_latent = (
+                1 - packed_timesteps[:, None]
+            ) * packed_latent_clean + packed_timesteps[:, None] * noise
             packed_timestep_embeds = self.time_embedder(packed_timesteps)
             latent_token_pos_emb = self.latent_pos_embed(packed_latent_position_ids)
-            packed_latent = self.vae2llm(packed_latent) + packed_timestep_embeds + latent_token_pos_emb
+            packed_latent = (
+                self.vae2llm(packed_latent) + packed_timestep_embeds + latent_token_pos_emb
+            )
             packed_sequence[packed_vae_token_indexes] = packed_latent
 
         extra_inputs = {}
         if self.use_moe:
             packed_und_token_indexes = packed_text_indexes
             if packed_vit_token_indexes is not None:
-                packed_und_token_indexes=torch.cat([packed_text_indexes, packed_vit_token_indexes], dim=0)
+                packed_und_token_indexes = torch.cat(
+                    [packed_text_indexes, packed_vit_token_indexes], dim=0
+                )
             extra_inputs.update(
                 packed_und_token_indexes=packed_und_token_indexes,
                 packed_gen_token_indexes=packed_vae_token_indexes,
@@ -217,7 +240,9 @@ class Bagel(PreTrainedModel):
         mse = None
         if self.config.visual_gen:
             packed_mse_preds = self.llm2vae(last_hidden_state[mse_loss_indexes])
-            target = noise - packed_latent_clean # NOTE: v_t=dx_t/dt=x_1-x_0, pointing from data to noise
+            target = (
+                noise - packed_latent_clean
+            )  # NOTE: v_t=dx_t/dt=x_1-x_0, pointing from data to noise
             has_mse = packed_timesteps > 0
             mse = (packed_mse_preds - target[has_mse]) ** 2
 
@@ -227,7 +252,6 @@ class Bagel(PreTrainedModel):
             ce = F.cross_entropy(packed_ce_preds, packed_label_ids, reduction="none")
 
         return dict(mse=mse, ce=ce)
-
 
     def prepare_prompts(self, curr_kvlens, curr_rope, prompts, tokenizer, new_token_ids):
         packed_text_ids = list()
@@ -243,10 +267,12 @@ class Bagel(PreTrainedModel):
             curr += curr_kvlen
 
             text_ids = tokenizer.encode(prompt)
-            text_ids = [new_token_ids['bos_token_id']] + text_ids + [new_token_ids['eos_token_id']]
+            text_ids = [new_token_ids["bos_token_id"]] + text_ids + [new_token_ids["eos_token_id"]]
             text_token_lens.append(len(text_ids))
             packed_text_ids.extend(text_ids)
-            packed_text_position_ids.extend(range(curr_position_id, curr_position_id + len(text_ids)))
+            packed_text_position_ids.extend(
+                range(curr_position_id, curr_position_id + len(text_ids))
+            )
             packed_text_indexes.extend(range(curr, curr + len(text_ids)))
             newlens.append(curr_kvlen + len(text_ids))
             new_rope.append(curr_position_id + len(text_ids))
@@ -321,7 +347,7 @@ class Bagel(PreTrainedModel):
             packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
             curr += curr_kvlen
 
-            packed_text_ids.append(new_token_ids['start_of_image'])
+            packed_text_ids.append(new_token_ids["start_of_image"])
             packed_text_indexes.append(_curr)
             packed_indexes.append(curr)
             curr += 1
@@ -329,9 +355,10 @@ class Bagel(PreTrainedModel):
 
             image_tensor = transforms(image)
             vit_position_ids = self.get_flattened_position_ids(
-                image_tensor.size(1), image_tensor.size(2), 
-                self.vit_patch_size, 
-                max_num_patches_per_side=self.vit_max_num_patch_per_side
+                image_tensor.size(1),
+                image_tensor.size(2),
+                self.vit_patch_size,
+                max_num_patches_per_side=self.vit_max_num_patch_per_side,
             )
             vit_tokens = patchify(image_tensor, self.vit_patch_size)
             packed_vit_tokens.append(vit_tokens)
@@ -343,7 +370,7 @@ class Bagel(PreTrainedModel):
             curr += num_img_tokens
             _curr += num_img_tokens
 
-            packed_text_ids.append(new_token_ids['end_of_image'])
+            packed_text_ids.append(new_token_ids["end_of_image"])
             packed_text_indexes.append(_curr)
             packed_indexes.append(curr)
             curr += 1
@@ -394,7 +421,7 @@ class Bagel(PreTrainedModel):
         cu_seqlens = cu_seqlens.to(torch.int32)
         max_seqlen = torch.max(vit_token_seqlens).item()
         packed_vit_token_embed = self.vit_model(
-            packed_pixel_values=packed_vit_tokens, 
+            packed_pixel_values=packed_vit_tokens,
             packed_flattened_position_ids=packed_vit_position_ids,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
@@ -426,7 +453,9 @@ class Bagel(PreTrainedModel):
 
         return past_key_values
 
-    def prepare_vae_images(self, curr_kvlens, curr_rope, images, transforms, new_token_ids, timestep=0):
+    def prepare_vae_images(
+        self, curr_kvlens, curr_rope, images, transforms, new_token_ids, timestep=0
+    ):
         patchified_vae_latent_shapes, packed_vae_position_ids = list(), list()
         packed_vae_token_indexes = list()
         packed_text_ids, packed_text_indexes = list(), list()
@@ -452,7 +481,7 @@ class Bagel(PreTrainedModel):
             packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
             curr += curr_kvlen
 
-            packed_text_ids.append(new_token_ids['start_of_image'])
+            packed_text_ids.append(new_token_ids["start_of_image"])
             packed_text_indexes.append(_curr)
             packed_indexes.append(curr)
             curr += 1
@@ -461,9 +490,10 @@ class Bagel(PreTrainedModel):
             image_tensor = transforms(image)
             vae_image_tensors.append(image_tensor)
             vae_posiiton_ids = self.get_flattened_position_ids(
-                image_tensor.size(1), image_tensor.size(2),
-                self.latent_downsample, 
-                max_num_patches_per_side=self.max_latent_size
+                image_tensor.size(1),
+                image_tensor.size(2),
+                self.latent_downsample,
+                max_num_patches_per_side=self.max_latent_size,
             )
             packed_vae_position_ids.append(vae_posiiton_ids)
             H, W = image_tensor.shape[1:]
@@ -477,7 +507,7 @@ class Bagel(PreTrainedModel):
             curr += num_img_tokens
             _curr += num_img_tokens
 
-            packed_text_ids.append(new_token_ids['end_of_image'])
+            packed_text_ids.append(new_token_ids["end_of_image"])
             packed_text_indexes.append(_curr)
             packed_indexes.append(curr)
             curr += 1
@@ -492,7 +522,7 @@ class Bagel(PreTrainedModel):
         max_image_size = [max(item) for item in list(zip(*image_sizes))]
         padded_images = torch.zeros(size=(len(vae_image_tensors), *max_image_size))
         for i, image_tensor in enumerate(vae_image_tensors):
-            padded_images[i, :, :image_tensor.shape[1], :image_tensor.shape[2]] = image_tensor
+            padded_images[i, :, : image_tensor.shape[1], : image_tensor.shape[2]] = image_tensor
 
         generation_input = {
             "padded_images": padded_images,
@@ -538,7 +568,7 @@ class Bagel(PreTrainedModel):
         p = self.latent_patch_size
         packed_latent = list()
         for latent, (h, w) in zip(padded_latent, patchified_vae_latent_shapes):
-            latent = latent[:, :h * p, :w * p].reshape(self.latent_channel, h, p, w, p)
+            latent = latent[:, : h * p, : w * p].reshape(self.latent_channel, h, p, w, p)
             latent = torch.einsum("chpwq->hwpqc", latent).reshape(-1, p * p * self.latent_channel)
             packed_latent.append(latent)
         packed_latent = torch.cat(packed_latent, dim=0)
@@ -554,7 +584,7 @@ class Bagel(PreTrainedModel):
             extra_inputs = {
                 "mode": "gen",
                 "packed_vae_token_indexes": packed_vae_token_indexes,
-                "packed_text_indexes": packed_text_indexes
+                "packed_text_indexes": packed_text_indexes,
             }
 
         output = self.language_model.forward_inference(
@@ -573,10 +603,16 @@ class Bagel(PreTrainedModel):
 
         return past_key_values
 
-    def prepare_vae_latent(self, curr_kvlens, curr_rope, image_sizes, new_token_ids, device=None,generator=None):
+    def prepare_vae_latent(
+        self, curr_kvlens, curr_rope, image_sizes, new_token_ids, device=None, generator=None
+    ):
         device = device or torch.device("cpu")
         packed_text_ids, packed_text_indexes = list(), list()
-        packed_vae_position_ids, packed_vae_token_indexes, packed_init_noises = list(), list(), list()
+        packed_vae_position_ids, packed_vae_token_indexes, packed_init_noises = (
+            list(),
+            list(),
+            list(),
+        )
         packed_position_ids, packed_seqlens, packed_indexes = list(), list(), list()
         packed_key_value_indexes = list()
 
@@ -584,34 +620,36 @@ class Bagel(PreTrainedModel):
             generator = [generator] * len(image_sizes)
 
         query_curr = curr = 0
-        for (H, W), curr_kvlen, curr_position_id, gen in zip(image_sizes, curr_kvlens, curr_rope, generator):
+        for (H, W), curr_kvlen, curr_position_id, gen in zip(
+            image_sizes, curr_kvlens, curr_rope, generator
+        ):
             packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
             curr += curr_kvlen
 
-            packed_text_ids.append(new_token_ids['start_of_image'])
+            packed_text_ids.append(new_token_ids["start_of_image"])
             packed_text_indexes.append(query_curr)
             packed_indexes.append(curr)
             curr += 1
             query_curr += 1
 
             vae_posiiton_ids = self.get_flattened_position_ids(
-                H, W,
-                self.latent_downsample, 
-                max_num_patches_per_side=self.max_latent_size
+                H, W, self.latent_downsample, max_num_patches_per_side=self.max_latent_size
             )
             packed_vae_position_ids.append(vae_posiiton_ids)
 
             h, w = H // self.latent_downsample, W // self.latent_downsample
             num_image_tokens = h * w
             packed_init_noises.append(
-                torch.randn(num_image_tokens, self.latent_channel * self.latent_patch_size ** 2, generator=gen)
+                torch.randn(
+                    num_image_tokens, self.latent_channel * self.latent_patch_size**2, generator=gen
+                )
             )
             packed_vae_token_indexes.extend(range(query_curr, query_curr + num_image_tokens))
             packed_indexes.extend(range(curr, curr + num_image_tokens))
             curr += num_image_tokens
             query_curr += num_image_tokens
 
-            packed_text_ids.append(new_token_ids['end_of_image'])
+            packed_text_ids.append(new_token_ids["end_of_image"])
             packed_text_indexes.append(query_curr)
             packed_indexes.append(curr)
             curr += 1
@@ -622,15 +660,23 @@ class Bagel(PreTrainedModel):
 
         generation_input = {
             "packed_text_ids": torch.tensor(packed_text_ids, dtype=torch.long, device=device),
-            "packed_text_indexes": torch.tensor(packed_text_indexes, dtype=torch.long, device=device),
+            "packed_text_indexes": torch.tensor(
+                packed_text_indexes, dtype=torch.long, device=device
+            ),
             "packed_init_noises": torch.cat(packed_init_noises, dim=0).to(device=device),
             "packed_vae_position_ids": torch.cat(packed_vae_position_ids, dim=0).to(device=device),
-            "packed_vae_token_indexes": torch.tensor(packed_vae_token_indexes, dtype=torch.long, device=device),
+            "packed_vae_token_indexes": torch.tensor(
+                packed_vae_token_indexes, dtype=torch.long, device=device
+            ),
             "packed_seqlens": torch.tensor(packed_seqlens, dtype=torch.int, device=device),
-            "packed_position_ids": torch.tensor(packed_position_ids, dtype=torch.long, device=device),
+            "packed_position_ids": torch.tensor(
+                packed_position_ids, dtype=torch.long, device=device
+            ),
             "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int, device=device),
             "packed_indexes": torch.tensor(packed_indexes, dtype=torch.long, device=device),
-            "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long, device=device),
+            "packed_key_value_indexes": torch.tensor(
+                packed_key_value_indexes, dtype=torch.long, device=device
+            ),
         }
 
         return generation_input
@@ -661,10 +707,16 @@ class Bagel(PreTrainedModel):
             packed_position_ids.extend([curr_position_id] * (num_image_tokens + 2))
 
         generation_input = {
-            "cfg_packed_position_ids": torch.tensor(packed_position_ids, dtype=torch.long, device=device),
+            "cfg_packed_position_ids": torch.tensor(
+                packed_position_ids, dtype=torch.long, device=device
+            ),
             "cfg_key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int, device=device),
-            "cfg_packed_query_indexes": torch.tensor(packed_indexes, dtype=torch.long, device=device),
-            "cfg_packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long, device=device),
+            "cfg_packed_query_indexes": torch.tensor(
+                packed_indexes, dtype=torch.long, device=device
+            ),
+            "cfg_packed_key_value_indexes": torch.tensor(
+                packed_key_value_indexes, dtype=torch.long, device=device
+            ),
         }
 
         return generation_input
@@ -716,12 +768,12 @@ class Bagel(PreTrainedModel):
             model_pred_cache_dic, model_pred_current = None, None
             model_pred_text_cache_dic, model_pred_text_current = None, None
             model_pred_img_cache_dic, model_pred_img_current = None, None
-    
+
         x_t = packed_init_noises
 
         timesteps = torch.linspace(1, 0, num_timesteps, device=x_t.device)
         timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
-        dts =  timesteps[:-1] - timesteps[1:]
+        dts = timesteps[:-1] - timesteps[1:]
         timesteps = timesteps[:-1]
 
         for i, t in tqdm(enumerate(timesteps), total=len(timesteps)):
@@ -735,7 +787,7 @@ class Bagel(PreTrainedModel):
                 cfg_img_scale_ = 1.0
             v_t = self._forward_flow(
                 x_t=x_t,
-                timestep=timestep, 
+                timestep=timestep,
                 packed_vae_token_indexes=packed_vae_token_indexes,
                 packed_vae_position_ids=packed_vae_position_ids,
                 packed_text_ids=packed_text_ids,
@@ -772,8 +824,8 @@ class Bagel(PreTrainedModel):
                 model_pred_img_current=model_pred_img_current,
             )
 
-            x_t = x_t - v_t.to(x_t.device) * dts[i] # velocity pointing from data to noise
-        
+            x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
+
         if enable_taylorseer:
             del model_pred_cache_dic, model_pred_current
             del model_pred_text_cache_dic, model_pred_text_current
@@ -839,9 +891,9 @@ class Bagel(PreTrainedModel):
             extra_inputs = {
                 "mode": "gen",
                 "packed_vae_token_indexes": packed_vae_token_indexes,
-                "packed_text_indexes": packed_text_indexes
+                "packed_text_indexes": packed_text_indexes,
             }
-        
+
         if getattr(self.language_model.model, "enable_taylorseer", False):
             self.language_model.model.cache_dic = model_pred_cache_dic
             self.language_model.model.current = model_pred_current
@@ -912,7 +964,7 @@ class Bagel(PreTrainedModel):
                     v_t = v_t_text
             else:
                 v_t_text_ = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
-                
+
                 if cfg_img_scale > 1.0:
                     v_t_ = cfg_img_v_t + cfg_img_scale * (v_t_text_ - cfg_img_v_t)
                 else:
@@ -942,7 +994,7 @@ class Bagel(PreTrainedModel):
         curr = 0
         for curr_kvlen, curr_position_id in zip(curr_kvlens, curr_rope):
             packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
-            packed_start_tokens.append(new_token_ids['bos_token_id'])
+            packed_start_tokens.append(new_token_ids["bos_token_id"])
             packed_query_position_ids.append(curr_position_id)
             curr += curr_kvlen
 
@@ -976,9 +1028,7 @@ class Bagel(PreTrainedModel):
             packed_text_embedding = self.language_model.model.embed_tokens(curr_tokens)
             query_lens = torch.ones_like(curr_tokens)
             packed_query_indexes = torch.cumsum(key_values_lens, dim=0) + torch.arange(
-                0, len(key_values_lens), 
-                device=key_values_lens.device, 
-                dtype=key_values_lens.dtype
+                0, len(key_values_lens), device=key_values_lens.device, dtype=key_values_lens.dtype
             )
 
             uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
@@ -1015,14 +1065,15 @@ class Bagel(PreTrainedModel):
             uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
             for i in range(len(uppacked)):
                 uppacked[i] = torch.cat(
-                    [uppacked[i], torch.tensor([uppacked[i][-1] + 1], device=uppacked[i].device)], dim=0
+                    [uppacked[i], torch.tensor([uppacked[i][-1] + 1], device=uppacked[i].device)],
+                    dim=0,
                 )
             packed_key_value_indexes = torch.cat(uppacked, dim=0)
             key_values_lens = key_values_lens + 1
             packed_query_position_ids = packed_query_position_ids + 1
             step += 1
 
-            if end_token_id is not None and curr_tokens[0] == end_token_id: # only support batch=1
+            if end_token_id is not None and curr_tokens[0] == end_token_id:  # only support batch=1
                 break
 
         output_device = generated_sequence[0].device
@@ -1059,8 +1110,8 @@ class Bagel(PreTrainedModel):
         for image in images:
             generation_input, newlens, new_rope = self.prepare_vit_images(
                 curr_kvlens=newlens,
-                curr_rope=new_rope, 
-                images=[image], 
+                curr_rope=new_rope,
+                images=[image],
                 transforms=image_transform,
                 new_token_ids=new_token_ids,
             )
@@ -1073,9 +1124,9 @@ class Bagel(PreTrainedModel):
         # add text
         generation_input, newlens, new_rope = self.prepare_prompts(
             curr_kvlens=newlens,
-            curr_rope=new_rope, 
+            curr_rope=new_rope,
             prompts=[prompt],
-            tokenizer=tokenizer, 
+            tokenizer=tokenizer,
             new_token_ids=new_token_ids,
         )
         for k, v in generation_input.items():
@@ -1095,10 +1146,10 @@ class Bagel(PreTrainedModel):
                 max_length=max_length,
                 do_sample=do_sample,
                 temperature=temperature,
-                end_token_id=new_token_ids['eos_token_id'],
+                end_token_id=new_token_ids["eos_token_id"],
                 **generation_input,
             )
-        output = tokenizer.decode(unpacked_latent[:,0])
-        output = output.split('<|im_end|>')[0].split('<|im_start|>')[1]
+        output = tokenizer.decode(unpacked_latent[:, 0])
+        output = output.split("<|im_end|>")[0].split("<|im_start|>")[1]
 
         return output

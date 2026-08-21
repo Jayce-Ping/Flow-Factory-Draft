@@ -36,8 +36,8 @@ from diffusers.hooks import (
     TaylorSeerCacheConfig,
 )
 
-from .abc import BaseAccelerator
 from ..utils.logger_utils import setup_logger
+from .abc import BaseAccelerator
 
 if TYPE_CHECKING:
     import torch

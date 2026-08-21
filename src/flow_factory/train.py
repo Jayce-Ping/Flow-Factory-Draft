@@ -12,14 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/train.py
-import os
 import argparse
 import logging
+
+# src/flow_factory/train.py
+import os
+
 from .hparams import Arguments
 from .trainers import load_trainer
 
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')
+logging.basicConfig(
+    level=logging.INFO, format="[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s"
+)
 logger = logging.getLogger("flow_factory.train")
 
 
@@ -32,15 +36,15 @@ def parse_args():
 
 def main():
     args, unknown = parse_args()
-    
+
     # Load configuration
     config = Arguments.load_from_yaml(args.config)
-    
+
     # Log distributed setup info (only from rank 0)
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    
+
     if local_rank == 0:
         logger.info("=" * 100)
         logger.info("Flow-Factory Training Initialized")
@@ -49,7 +53,7 @@ def main():
         logger.info(f"Config: {args.config}")
         logger.info(f"\n{config}")
         logger.info("=" * 100)
-    
+
     # Launch trainer
     trainer = None
     try:

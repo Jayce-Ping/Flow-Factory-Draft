@@ -13,13 +13,14 @@
 # limitations under the License.
 
 """Training arguments for Diffusion-DPO (Direct Preference Optimization)."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Union, Tuple
+from typing import Any, Literal, Tuple, Union
 
-from ._base import TrainingArguments, _standardize_timestep_range
 from ...utils.dist import get_world_size
+from ._base import TrainingArguments, _standardize_timestep_range
 
 
 @dataclass
@@ -36,24 +37,21 @@ class DPOTrainingArguments(TrainingArguments):
         default=2000.0,
         metadata={"help": "DPO temperature parameter controlling preference sharpness."},
     )
-    ref_param_device: Literal["cpu", "cuda"] = field(
-        default="cuda",
-        metadata={"help": "Device to store reference model parameters."},
-    )
-
     # Advantage / pair formation
     global_std: bool = field(
         default=True,
         metadata={"help": "Whether to use global std for advantage normalization."},
     )
-    advantage_aggregation: Literal['sum', 'gdpo'] = field(
-        default='gdpo',
-        metadata={"help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo']."},
+    advantage_aggregation: Literal["sum", "gdpo"] = field(
+        default="gdpo",
+        metadata={
+            "help": "Method to aggregate advantages within each group. Options: ['sum', 'gdpo']."
+        },
     )
 
     # Timestep sampling
-    weighting_scheme: Literal['logit_normal', 'uniform'] = field(
-        default='logit_normal',
+    weighting_scheme: Literal["logit_normal", "uniform"] = field(
+        default="logit_normal",
         metadata={"help": "Timestep sampling distribution for DPO training."},
     )
     logit_mean: float = field(
@@ -68,7 +66,9 @@ class DPOTrainingArguments(TrainingArguments):
     # Timestep control (multi-timestep training)
     num_train_timesteps: int = field(
         default=1,
-        metadata={"help": "Total number of training timesteps per pair. 0 or None defaults to `int(num_inference_steps * (timestep_range[1] - timestep_range[0]))`."},
+        metadata={
+            "help": "Total number of training timesteps per pair. 0 or None defaults to `int(num_inference_steps * (timestep_range[1] - timestep_range[0]))`."
+        },
     )
     time_shift: float = field(
         default=1.0,
@@ -76,16 +76,18 @@ class DPOTrainingArguments(TrainingArguments):
     )
     timestep_range: Union[float, Tuple[float, float]] = field(
         default=0.99,
-        metadata={"help": "Timestep range for training. Float for [0, value], tuple for [start, end]."},
+        metadata={
+            "help": "Timestep range for training. Float for [0, value], tuple for [start, end]."
+        },
     )
 
     def __post_init__(self):
         super().__post_init__()
         self.timestep_range = _standardize_timestep_range(self.timestep_range)
         if not self.num_train_timesteps or self.num_train_timesteps <= 0:
-            self.num_train_timesteps = max(1, int(
-                self.num_inference_steps * (self.timestep_range[1] - self.timestep_range[0])
-            ))
+            self.num_train_timesteps = max(
+                1, int(self.num_inference_steps * (self.timestep_range[1] - self.timestep_range[0]))
+            )
 
     @property
     def requires_ref_model(self) -> bool:
@@ -93,7 +95,8 @@ class DPOTrainingArguments(TrainingArguments):
         return True
 
     def compute_gradient_accumulation_steps(
-        self, num_batches_per_epoch: int,
+        self,
+        num_batches_per_epoch: int,
     ) -> int:
         """DPO forms M pairs from M*K samples, distributed evenly across ranks.
 

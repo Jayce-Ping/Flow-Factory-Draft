@@ -15,31 +15,39 @@
 # src/flow_factory/logger/formatting.py
 from __future__ import annotations
 
+import math
 import os
 import tempfile
-import math
+from dataclasses import asdict, dataclass, field, is_dataclass
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-import torch
-import numpy as np
-from PIL import Image
 import imageio
-from typing import Any, Dict, List, Union, Optional, Tuple
-from dataclasses import dataclass, is_dataclass, asdict, field
-from ..samples import BaseSample, T2ISample, T2VSample, T2AVSample, I2ISample, I2VSample, I2AVSample, V2VSample
-from ..utils.base import (
-    # Image utils
-    numpy_to_pil_image,
-    tensor_to_pil_image,
-    tensor_list_to_pil_image,
-    numpy_list_to_pil_image,
-    normalize_to_uint8,
-    # Video utils
+import numpy as np
+import torch
+from PIL import Image
+
+from ..samples import (
+    BaseSample,
+    I2AVSample,
+    I2ISample,
+    I2VSample,
+    T2AVSample,
+    T2ISample,
+    T2VSample,
+    V2VSample,
+)
+from ..utils.base import (  # Image utils; Video utils
     is_video_frame_list,
+    normalize_to_uint8,
+    normalize_video_to_uint8,
+    numpy_list_to_pil_image,
+    numpy_to_pil_image,
+    numpy_to_video_frames,
+    tensor_list_to_pil_image,
+    tensor_to_pil_image,
+    tensor_to_video_frames,
     video_frames_to_numpy,
     video_frames_to_tensor,
-    tensor_to_video_frames,
-    numpy_to_video_frames,
-    normalize_video_to_uint8,
 )
 from ..utils.logger_utils import setup_logger
 
@@ -55,25 +63,32 @@ def _compute_optimal_grid(n: int) -> Tuple[int, int]:
     rows = math.ceil(n / cols)
     return (rows, cols)
 
+
 def _concat_images_grid(images: List[Image.Image]) -> Image.Image:
     """Concatenate images into optimal grid layout."""
     if not images:
         raise ValueError("Empty image list")
     if len(images) == 1:
         return images[0]
-    
+
     rows, cols = _compute_optimal_grid(len(images))
-    
+
     # Resize all to match last image
     w, h = images[-1].size
-    resized = [img.resize((w, h), Image.Resampling.LANCZOS) if img.size != (w, h) else img for img in images]
-    
-    grid = Image.new('RGB', (cols * w, rows * h))
+    resized = [
+        img.resize((w, h), Image.Resampling.LANCZOS) if img.size != (w, h) else img
+        for img in images
+    ]
+
+    grid = Image.new("RGB", (cols * w, rows * h))
     for idx, img in enumerate(resized):
-        grid.paste(img.convert('RGB'), ((idx % cols) * w, (idx // cols) * h))
+        grid.paste(img.convert("RGB"), ((idx % cols) * w, (idx // cols) * h))
     return grid
 
-def _to_pil_list(images: Union[Image.Image, List[Image.Image], torch.Tensor, np.ndarray, None]) -> List[Image.Image]:
+
+def _to_pil_list(
+    images: Union[Image.Image, List[Image.Image], torch.Tensor, np.ndarray, None],
+) -> List[Image.Image]:
     """Convert various image types to List[PIL.Image]."""
     if images is None:
         return []
@@ -94,15 +109,16 @@ def _to_pil_list(images: Union[Image.Image, List[Image.Image], torch.Tensor, np.
 
     return []
 
+
 def _to_video_list(
-    videos: Union[str, np.ndarray, torch.Tensor, List[Image.Image], List[Any], None]
+    videos: Union[str, np.ndarray, torch.Tensor, List[Image.Image], List[Any], None],
 ) -> List[Union[str, np.ndarray, torch.Tensor, List[Image.Image]]]:
     """
     Convert various video types to List of videos.
-    
+
     Handles the ambiguity where List[PIL.Image] represents a single video (frames),
     not multiple videos.
-    
+
     Args:
         videos: Single video or list of videos. Supported formats:
             - str: Video file path (single video)
@@ -110,10 +126,10 @@ def _to_video_list(
             - torch.Tensor: Shape (T,C,H,W) or (B,T,C,H,W)
             - List[PIL.Image]: Single video as frame list
             - List[Video]: Multiple videos
-    
+
     Returns:
         List of videos, each in its original format.
-    
+
     Example:
         >>> frames = [Image.new('RGB', (64, 64)) for _ in range(16)]
         >>> _to_video_list(frames)  # Single video -> wrapped in list
@@ -121,28 +137,28 @@ def _to_video_list(
         >>> _to_video_list([frames, frames])  # Multiple videos -> as-is
         [[PIL.Image, ...], [PIL.Image, ...]]
     """
-    
+
     if videos is None:
         return []
-    
+
     # Single video: str path
     if isinstance(videos, str):
         return [videos]
-    
+
     # Single video: tensor (T,C,H,W) or batch (B,T,C,H,W)
     if isinstance(videos, torch.Tensor):
         if videos.ndim == 4:  # (T,C,H,W) single video
             return [videos]
         elif videos.ndim == 5:  # (B,T,C,H,W) batch -> split
             return list(videos.unbind(0))
-    
+
     # Single video: numpy (T,H,W,C) or batch (B,T,H,W,C)
     if isinstance(videos, np.ndarray):
         if videos.ndim == 4:  # (T,H,W,C) single video
             return [videos]
         elif videos.ndim == 5:  # (B,T,H,W,C) batch -> split
             return [videos[i] for i in range(videos.shape[0])]
-    
+
     # List types
     if isinstance(videos, list) and len(videos) > 0:
         # List[PIL.Image] = single video as frames
@@ -150,14 +166,15 @@ def _to_video_list(
             return [videos]
         # List[List[PIL.Image]] or List[tensor/ndarray/str] = multiple videos
         return videos
-    
+
     return []
 
-def _build_sample_caption(sample : BaseSample, max_length: Optional[int] = None) -> str:
+
+def _build_sample_caption(sample: BaseSample, max_length: Optional[int] = None) -> str:
     """Build caption from reward and prompt."""
     parts = []
-    if 'rewards' in sample.extra_kwargs:
-        rewards = sample.extra_kwargs['rewards']
+    if "rewards" in sample.extra_kwargs:
+        rewards = sample.extra_kwargs["rewards"]
         if isinstance(rewards, float):
             parts.append(f"{rewards:.2f}")
         elif isinstance(rewards, (list, tuple)) and rewards:
@@ -171,27 +188,29 @@ def _build_sample_caption(sample : BaseSample, max_length: Optional[int] = None)
             else:
                 parts.append(", ".join(f"{k}: {v:.2f}" for k, v in rewards.items()))
     if sample.prompt:
-        parts.append(sample.prompt[:max_length] + "..." if (max_length is not None and len(sample.prompt) > max_length) else sample.prompt)
+        parts.append(
+            sample.prompt[:max_length] + "..."
+            if (max_length is not None and len(sample.prompt) > max_length)
+            else sample.prompt
+        )
     return " | ".join(parts)
 
+
 def _compute_resize_dims(
-    orig_h: int, 
-    orig_w: int, 
-    target_h: Optional[int] = None, 
-    target_w: Optional[int] = None
+    orig_h: int, orig_w: int, target_h: Optional[int] = None, target_w: Optional[int] = None
 ) -> Tuple[int, int]:
     """
     Compute resize dimensions while preserving aspect ratio.
-    
+
     Args:
         orig_h: Original height.
         orig_w: Original width.
         target_h: Target height. If only this is specified, width is computed to preserve aspect ratio.
         target_w: Target width. If only this is specified, height is computed to preserve aspect ratio.
-    
+
     Returns:
         Tuple of (new_height, new_width).
-    
+
     Examples:
         >>> _compute_resize_dims(1080, 1920, target_h=540)  # -> (540, 960)
         >>> _compute_resize_dims(1080, 1920, target_w=960)  # -> (540, 960)
@@ -209,32 +228,34 @@ def _compute_resize_dims(
 
 # ------------------------------------------- LogImage & LogVideo Classes -------------------------------------------
 
+
 @dataclass
 class LogImage:
     """
     Intermediate representation for an image with compression and resize support.
-    
+
     Supports lazy loading, automatic compression to JPEG, and aspect-ratio-preserving resize.
     Temporary files are cached by (height, width) and cleaned up on exit or manual cleanup().
-    
+
     Args:
         _value: Source image - can be file path, PIL Image, numpy array, or torch Tensor.
         caption: Optional caption for logging platforms.
         compress: Whether to compress output to JPEG (default: True).
         quality: JPEG quality when compress=True (default: 85).
-    
+
     Example:
         >>> img = LogImage(tensor, caption="generated")
         >>> path = img.get_value(height=512)  # aspect-ratio preserved resize
         >>> img.cleanup()  # remove temp files
     """
+
     _value: Union[str, Image.Image, np.ndarray, torch.Tensor] = field(repr=False)
     _img: Optional[Image.Image] = field(default=None, init=False, repr=False)
     caption: Optional[str] = None
     compress: bool = True
     quality: int = 85
     _temp_paths: Dict[Tuple, str] = field(default_factory=dict, init=False, repr=False)
-    
+
     @classmethod
     def to_pil(cls, value: Union[str, Image.Image, np.ndarray, torch.Tensor]) -> Image.Image:
         """Convert various input types to PIL Image."""
@@ -245,7 +266,7 @@ class LogImage:
         elif isinstance(value, np.ndarray):
             return numpy_to_pil_image(value)[0]
         elif isinstance(value, str) and os.path.exists(value):
-            return Image.open(value).convert('RGB')
+            return Image.open(value).convert("RGB")
         else:
             raise ValueError(f"Unsupported image type: {type(value)}")
 
@@ -260,44 +281,42 @@ class LogImage:
         return self.get_pil().size[1], self.get_pil().size[0]
 
     def get_value(
-        self, 
-        height: Optional[int] = None, 
-        width: Optional[int] = None
+        self, height: Optional[int] = None, width: Optional[int] = None
     ) -> Union[str, Image.Image]:
         """
         Get image as compressed file path or PIL Image, optionally resized.
-        
+
         Args:
             height: Target height. If only height is specified, width is computed to preserve aspect ratio.
             width: Target width. If only width is specified, height is computed to preserve aspect ratio.
-        
+
         Returns:
             File path (str) if compress=True, otherwise PIL Image.
-        
+
         Note:
             Results are cached by (height, width) tuple. Call cleanup() to remove temp files.
         """
         cache_key = (height, width)
         if cache_key in self._temp_paths:
             return self._temp_paths[cache_key]
-        
+
         # If already a path with no resize needed, return as-is
         if isinstance(self._value, str) and height is None and width is None:
             return self._value
-        
+
         img = self.get_pil()
-        
+
         # Resize if dimensions specified
         if height is not None or width is not None:
-            new_h, new_w  = _compute_resize_dims(img.size[1], img.size[0], height, width)
+            new_h, new_w = _compute_resize_dims(img.size[1], img.size[0], height, width)
             img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-        
+
         # Save to temp file if compression enabled
         if self.compress:
-            fd, path = tempfile.mkstemp(suffix='.jpg')
+            fd, path = tempfile.mkstemp(suffix=".jpg")
             try:
-                with os.fdopen(fd, 'wb') as f:
-                    img.convert('RGB').save(f, format='JPEG', quality=self.quality)
+                with os.fdopen(fd, "wb") as f:
+                    img.convert("RGB").save(f, format="JPEG", quality=self.quality)
                 self._temp_paths[cache_key] = path
             except Exception as e:
                 if os.path.exists(path):
@@ -311,14 +330,14 @@ class LogImage:
     def value(self) -> Union[str, Image.Image]:
         """Get image at original size (shorthand for get_value())."""
         return self.get_value()
-    
+
     @value.setter
     def value(self, val: Union[str, Image.Image, np.ndarray, torch.Tensor]):
         """Set new source value and reset all cached state."""
         self.cleanup()
         self._value = val
         self._img = None
-    
+
     def cleanup(self):
         """Remove all temporary files created by get_value()."""
         for path in self._temp_paths.values():
@@ -343,24 +362,25 @@ class LogImage:
 class LogVideo:
     """
     Intermediate representation for a video with format conversion and resize support.
-    
+
     Supports lazy loading, format conversion (mp4/gif), and aspect-ratio-preserving resize.
     When ``audio`` and ``audio_sample_rate`` are provided, MP4 output is muxed with an
     AAC audio track via PyAV (same approach as diffusers' ``encode_video``).
     Temporary files are cached by (format, height, width) and cleaned up on exit or manual cleanup().
-    
+
     Args:
         _value: Source video - can be file path, numpy array (T,H,W,C), torch Tensor, or List[PIL.Image].
         caption: Optional caption for logging platforms.
         fps: Frames per second for output video (default: 8).
         audio: Optional audio waveform tensor, shape (C, T) or (T,), float32 in [-1, 1].
         audio_sample_rate: Sample rate of the audio waveform in Hz (e.g. 24000).
-    
+
     Example:
         >>> vid = LogVideo(frames, caption="generated", fps=24)
         >>> path = vid.get_value('gif', height=256)  # convert to gif, resized
         >>> vid.cleanup()  # remove temp files
     """
+
     _value: Union[str, np.ndarray, torch.Tensor, List[Image.Image]] = field(repr=False)
     caption: Optional[str] = None
     fps: int = 8
@@ -373,19 +393,19 @@ class LogVideo:
     def format(self) -> str:
         """Get source video format extension (without dot). Defaults to 'mp4' for non-file sources."""
         if isinstance(self._value, str):
-            return os.path.splitext(self._value)[1].lstrip('.').lower() or 'mp4'
-        return 'mp4'
-    
+            return os.path.splitext(self._value)[1].lstrip(".").lower() or "mp4"
+        return "mp4"
+
     @classmethod
     def to_numpy(cls, value: Union[np.ndarray, torch.Tensor, List[Image.Image]]) -> np.ndarray:
         """Convert various input types to numpy array (T, H, W, C), uint8."""
         if isinstance(value, str):
             raise ValueError("Cannot convert path to numpy directly, use get_numpy() instead")
-        
+
         # List[PIL.Image] -> use video_frames_to_numpy
         if isinstance(value, list) and value and isinstance(value[0], Image.Image):
             return video_frames_to_numpy(value)
-        
+
         # torch.Tensor -> normalize and convert
         if isinstance(value, torch.Tensor):
             arr = normalize_video_to_uint8(value).cpu().numpy()
@@ -393,7 +413,7 @@ class LogVideo:
             if arr.ndim == 4 and arr.shape[1] in (1, 3, 4) and arr.shape[1] < arr.shape[2]:
                 arr = np.transpose(arr, (0, 2, 3, 1))
             return arr
-        
+
         # np.ndarray -> normalize
         if isinstance(value, np.ndarray):
             arr = normalize_video_to_uint8(value)
@@ -401,9 +421,9 @@ class LogVideo:
             if arr.ndim == 4 and arr.shape[1] in (1, 3, 4) and arr.shape[1] < arr.shape[2]:
                 arr = np.transpose(arr, (0, 2, 3, 1))
             return arr
-        
+
         raise ValueError(f"Unsupported video type: {type(value)}")
-    
+
     def get_numpy(self) -> np.ndarray:
         """Get video as numpy array (T, H, W, C), lazily loaded and cached."""
         if self._arr is None:
@@ -491,37 +511,39 @@ class LogVideo:
         container.close()
 
     def get_value(
-        self, 
-        format: str = 'mp4', 
-        height: Optional[int] = None, 
-        width: Optional[int] = None
+        self, format: str = "mp4", height: Optional[int] = None, width: Optional[int] = None
     ) -> str:
         """
         Get video file path in specified format, optionally resized.
-        
+
         Args:
             format: Output format, either 'mp4' or 'gif' (default: 'mp4').
             height: Target height. If only height is specified, width is computed to preserve aspect ratio.
             width: Target width. If only width is specified, height is computed to preserve aspect ratio.
-        
+
         Returns:
             Path to the video file (temporary file if conversion/resize needed).
-        
+
         Note:
             Results are cached by (format, height, width) tuple. Call cleanup() to remove temp files.
         """
-        format = format.lower().lstrip('.')
+        format = format.lower().lstrip(".")
         cache_key = (format, height, width)
-        
+
         if cache_key in self._temp_paths:
             return self._temp_paths[cache_key]
-        
+
         # If source is file with matching format and no resize, return directly
-        if isinstance(self._value, str) and self.format == format and height is None and width is None:
+        if (
+            isinstance(self._value, str)
+            and self.format == format
+            and height is None
+            and width is None
+        ):
             return self._value
-        
+
         arr = self.get_numpy()
-        
+
         # Resize frames if dimensions specified
         if height is not None or width is not None:
             orig_h, orig_w = arr.shape[1], arr.shape[2]
@@ -531,25 +553,31 @@ class LogVideo:
                 img = Image.fromarray(frame).resize((new_w, new_h), Image.Resampling.LANCZOS)
                 resized.append(np.array(img))
             arr = np.stack(resized, axis=0)
-        
+
         # Write to temp file
-        fd, path = tempfile.mkstemp(suffix=f'.{format}')
+        fd, path = tempfile.mkstemp(suffix=f".{format}")
         try:
             os.close(fd)
-            if format == 'mp4' and self.audio is not None and self.audio_sample_rate is not None:
+            if format == "mp4" and self.audio is not None and self.audio_sample_rate is not None:
                 self._write_mp4_with_audio(path, arr, self.fps, self.audio, self.audio_sample_rate)
-            elif format == 'gif':
-                imageio.mimwrite(path, arr, fps=self.fps, format='GIF', loop=0)
+            elif format == "gif":
+                imageio.mimwrite(path, arr, fps=self.fps, format="GIF", loop=0)
             else:
-                imageio.mimwrite(path, arr, fps=self.fps, format='FFMPEG', codec='libx264', pixelformat='yuv420p')
+                imageio.mimwrite(
+                    path, arr, fps=self.fps, format="FFMPEG", codec="libx264", pixelformat="yuv420p"
+                )
             self._temp_paths[cache_key] = path
         except ImportError:
-            logger.warning("PyAV (av) not installed; writing video without audio. Install with: pip install av")
+            logger.warning(
+                "PyAV (av) not installed; writing video without audio. Install with: pip install av"
+            )
             if os.path.exists(path):
                 os.unlink(path)
-            fd2, path = tempfile.mkstemp(suffix=f'.{format}')
+            fd2, path = tempfile.mkstemp(suffix=f".{format}")
             os.close(fd2)
-            imageio.mimwrite(path, arr, fps=self.fps, format='FFMPEG', codec='libx264', pixelformat='yuv420p')
+            imageio.mimwrite(
+                path, arr, fps=self.fps, format="FFMPEG", codec="libx264", pixelformat="yuv420p"
+            )
             self._temp_paths[cache_key] = path
         except Exception:
             if os.path.exists(path):
@@ -560,7 +588,7 @@ class LogVideo:
     @property
     def value(self) -> str:
         """Get video as mp4 at original size (shorthand for get_value())."""
-        return self.get_value('mp4')
+        return self.get_value("mp4")
 
     @value.setter
     def value(self, val: Union[str, np.ndarray, torch.Tensor, List[Image.Image]]):
@@ -588,74 +616,76 @@ class LogVideo:
     def __exit__(self, *_):
         self.cleanup()
 
+
 @dataclass
 class LogTable:
     """
     Table structure for conditional generation logging: [cond_1, ..., cond_n, generation].
-    
-    Used for I2V (image-to-video) and V2V (video-to-video) samples where conditions 
+
+    Used for I2V (image-to-video) and V2V (video-to-video) samples where conditions
     and generations should be displayed side-by-side with unified dimensions.
-    
+
     Args:
         columns: Column names for the table.
         rows: List of rows, each containing LogImage/LogVideo items.
         target_height: Unified height for all items (derived from first generation).
-    
+
     Example:
         >>> table = LogTable.from_i2v_samples(samples)
         >>> for row in table.rows:
         ...     for item in row:
         ...         path = item.get_value(height=table.target_height)
     """
+
     columns: List[str] = field(default_factory=list)
     rows: List[List[Optional[Union[LogImage, LogVideo]]]] = field(default_factory=list)
     target_height: Optional[int] = None
-    
+
     @classmethod
-    def from_i2v_samples(cls, samples: List[I2VSample]) -> Optional['LogTable']:
+    def from_i2v_samples(cls, samples: List[I2VSample]) -> Optional["LogTable"]:
         """
         Build table from I2V samples: [condition_images...] -> video.
-        
+
         Sets `target_height` from the **first valid generation's height** for unified display.
         """
-        if not samples or not hasattr(samples[0], 'condition_images'):
+        if not samples or not hasattr(samples[0], "condition_images"):
             return None
-        
+
         first_conds = _to_pil_list(samples[0].condition_images)
         n_conds = len(first_conds)
         columns = [f"condition_image_{i}" for i in range(n_conds)] + ["generation"]
-        
+
         rows = []
         target_height = None
-        
+
         for s in samples:
             # Skip samples with no generation
             if s.video is None:
                 continue
             conds = _to_pil_list(s.condition_images)[:n_conds]
-            
+
             caption = _build_sample_caption(s)
             gen_video = LogVideo(s.video, caption=caption)
-            
+
             # Use first generation's height as target for unified display
             if target_height is None:
                 target_height, _ = gen_video.get_size()
-            
+
             # Build row with None padding for missing conditions
             cond_items: List[Optional[LogImage]] = [LogImage(c) for c in conds]
             row = cond_items + [None] * (n_conds - len(conds)) + [gen_video]
             rows.append(row)
-        
+
         return cls(columns=columns, rows=rows, target_height=target_height) if rows else None
 
     @classmethod
-    def from_i2av_samples(cls, samples: List[I2AVSample]) -> Optional['LogTable']:
+    def from_i2av_samples(cls, samples: List[I2AVSample]) -> Optional["LogTable"]:
         """Build table from I2AV samples: [condition_images...] -> audio-video.
 
         Combines the I2V table layout (condition image columns + generation column)
         with the T2AV audio-muxed LogVideo (fps, audio, audio_sample_rate).
         """
-        if not samples or not hasattr(samples[0], 'condition_images'):
+        if not samples or not hasattr(samples[0], "condition_images"):
             return None
 
         first_conds = _to_pil_list(samples[0].condition_images)
@@ -671,10 +701,13 @@ class LogTable:
             conds = _to_pil_list(s.condition_images)[:n_conds]
 
             caption = _build_sample_caption(s)
-            fps = getattr(s, 'frame_rate', None) or 24
+            fps = getattr(s, "frame_rate", None) or 24
             gen_video = LogVideo(
-                s.video, caption=caption, fps=int(fps),
-                audio=s.audio, audio_sample_rate=s.audio_sample_rate,
+                s.video,
+                caption=caption,
+                fps=int(fps),
+                audio=s.audio,
+                audio_sample_rate=s.audio_sample_rate,
             )
 
             if target_height is None:
@@ -687,46 +720,47 @@ class LogTable:
         return cls(columns=columns, rows=rows, target_height=target_height) if rows else None
 
     @classmethod
-    def from_v2v_samples(cls, samples: List[V2VSample]) -> Optional['LogTable']:
+    def from_v2v_samples(cls, samples: List[V2VSample]) -> Optional["LogTable"]:
         """
         Build table from V2V samples: [condition_videos...] -> video.
-        
+
         Sets `target_height` from the **first valid generation's height** for unified display.
         """
-        if not samples or not hasattr(samples[0], 'condition_videos'):
+        if not samples or not hasattr(samples[0], "condition_videos"):
             return None
-        
+
         first_conds = _to_video_list(samples[0].condition_videos)
         n_conds = len(first_conds)
         columns = [f"condition_video_{i}" for i in range(n_conds)] + ["generation"]
-        
+
         rows = []
         target_height = None
-        
+
         for s in samples:
             if s.video is None:
                 continue
             conds = _to_video_list(s.condition_videos)[:n_conds]
-            
+
             caption = _build_sample_caption(s)
             gen_video = LogVideo(s.video, caption=caption)
-            
+
             if target_height is None:
                 target_height, _ = gen_video.get_size()
-            
+
             # Build row with None padding for missing conditions
             cond_items: List[Optional[LogVideo]] = [LogVideo(c) for c in conds]
             row = cond_items + [None] * (n_conds - len(conds)) + [gen_video]
             rows.append(row)
-        
+
         return cls(columns=columns, rows=rows, target_height=target_height) if rows else None
-    
+
     def cleanup(self):
         """Remove all temporary files from contained LogImage/LogVideo items."""
         for row in self.rows:
             for item in row:
-                if item is not None and hasattr(item, 'cleanup'):
+                if item is not None and hasattr(item, "cleanup"):
                     item.cleanup()
+
 
 # ----------------------------------- LogFormatter Class -----------------------------------
 class LogFormatter:
@@ -737,9 +771,9 @@ class LogFormatter:
     2. List[Number/Tensor/Array] -> Mean value (float)
     3. PIL Image -> LogImage
     """
-    
-    IMG_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp')
-    VID_EXTENSIONS = ('.mp4', '.gif', '.mov', '.avi', '.webm')
+
+    IMG_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp")
+    VID_EXTENSIONS = (".mp4", ".gif", ".mov", ".avi", ".webm")
 
     @classmethod
     def format_dict(cls, data: Union[Dict, Any]) -> Dict[str, Any]:
@@ -747,18 +781,20 @@ class LogFormatter:
         if is_dataclass(data):
             # Shallow conversion is usually enough, but deep conversion ensures lists are accessible
             data = asdict(data)
-            
+
         if not isinstance(data, dict):
             raise ValueError(f"LogFormatter expects a dict or dataclass, got {type(data)}")
 
         clean_data = {}
         for k, v in data.items():
             clean_data[k] = cls._process_value(v)
-        
+
         return clean_data
 
     @classmethod
-    def _process_sample_list(cls, samples: List[BaseSample]) -> Union[List[Union[LogImage, LogVideo]], LogTable]:
+    def _process_sample_list(
+        cls, samples: List[BaseSample]
+    ) -> Union[List[Union[LogImage, LogVideo]], LogTable]:
         """Dispatch to appropriate handler based on sample type."""
         # If there are inherit relationships, order matters - more specific types should come first
         sample_cls_to_handler = {
@@ -787,22 +823,26 @@ class LogFormatter:
         return result
 
     @classmethod
-    def _process_base_samples(cls, samples: List[BaseSample]) -> List[Union[LogImage, LogVideo, None]]:
+    def _process_base_samples(
+        cls, samples: List[BaseSample]
+    ) -> List[Union[LogImage, LogVideo, None]]:
         """Handle basic sample with single generated image."""
+
         def _process_single_base_sample(s: BaseSample) -> Optional[Union[LogImage, LogVideo]]:
             if s.image is not None:
                 return LogImage(s.image, caption=_build_sample_caption(s))
             elif s.video is not None:
                 return LogVideo(s.video, caption=_build_sample_caption(s))
             return None
-        
+
         results = [_process_single_base_sample(s) for s in samples]
 
         return results
-    
+
     @classmethod
     def _process_t2i_samples(cls, samples: List[T2ISample]) -> List[Union[LogImage, None]]:
         """Handle text-to-image sample with generated image."""
+
         def _process_single_t2i_sample(sample: T2ISample) -> Optional[LogImage]:
             if sample.image is None:
                 return None
@@ -810,10 +850,11 @@ class LogFormatter:
 
         results = [_process_single_t2i_sample(s) for s in samples]
         return results
-        
+
     @classmethod
     def _process_t2v_samples(cls, samples: List[T2VSample]) -> List[Union[LogVideo, None]]:
         """Handle text-to-video sample with generated video."""
+
         def _process_single_t2v_sample(sample: T2VSample) -> Optional[LogVideo]:
             if sample.video is None:
                 return None
@@ -825,10 +866,11 @@ class LogFormatter:
     @classmethod
     def _process_t2av_samples(cls, samples: List[T2AVSample]) -> List[Union[LogVideo, None]]:
         """Handle text-to-audio-video sample: mux video + audio into a single MP4."""
+
         def _process_single(sample: T2AVSample) -> Optional[LogVideo]:
             if sample.video is None:
                 return None
-            fps = getattr(sample, 'frame_rate', None) or 24
+            fps = getattr(sample, "frame_rate", None) or 24
             return LogVideo(
                 sample.video,
                 caption=_build_sample_caption(sample),
@@ -836,6 +878,7 @@ class LogFormatter:
                 audio=sample.audio,
                 audio_sample_rate=sample.audio_sample_rate,
             )
+
         return [_process_single(s) for s in samples]
 
     @classmethod
@@ -846,26 +889,27 @@ class LogFormatter:
     @classmethod
     def _process_i2i_samples(cls, samples: List[I2ISample]) -> List[Union[LogImage, None]]:
         """Handle sample with condition images + generated image, concatenated in grid."""
+
         def _process_single_i2i_sample(sample: I2ISample) -> Optional[LogImage]:
             cond_imgs = _to_pil_list(sample.condition_images)
             gen_imgs = _to_pil_list(sample.image)
             all_imgs = cond_imgs + gen_imgs
-            
+
             if not all_imgs:
                 return None
-        
+
             grid = _concat_images_grid(all_imgs) if len(all_imgs) > 1 else all_imgs[0]
             return LogImage(grid, caption=_build_sample_caption(sample))
-        
+
         results = [_process_single_i2i_sample(s) for s in samples]
         return results
-    
+
     @classmethod
     def _process_i2v_samples(cls, samples: List[I2VSample]) -> Union[LogTable, None]:
         """Handle sample with condition images + generated video, as LogTable."""
         table = LogTable.from_i2v_samples(samples)
         return table
-    
+
     @classmethod
     def _process_v2v_samples(cls, samples: List[V2VSample]) -> Union[LogTable, None]:
         """Handle sample with condition videos + generated video, as LogTable."""
@@ -903,8 +947,8 @@ class LogFormatter:
 
         # Handle single Tensors/Numpy arrays that aren't images
         if isinstance(value, (torch.Tensor, np.ndarray)):
-             if value.ndim == 0 or (value.ndim == 1 and value.shape[0] == 1):
-                 return cls._compute_mean(value)
+            if value.ndim == 0 or (value.ndim == 1 and value.shape[0] == 1):
+                return cls._compute_mean(value)
 
         return value
 
@@ -912,7 +956,8 @@ class LogFormatter:
     def _is_sample_collection(cls, value: Any) -> bool:
         """Checks if value is a list/tuple of BaseSample."""
         if isinstance(value, (list, tuple)):
-            if len(value) == 0: return False
+            if len(value) == 0:
+                return False
             first = value[0]
             return isinstance(first, BaseSample)
         return False
@@ -927,7 +972,7 @@ class LogFormatter:
         if isinstance(value, np.ndarray) and value.ndim == 0:
             return True
         return False
-    
+
     @classmethod
     def is_numerical_collection(cls, value: Any) -> bool:
         """Checks if value is a list/tuple of numbers, arrays, or tensors."""
@@ -967,18 +1012,18 @@ class LogFormatter:
                 else:
                     # Simple python numbers
                     return float(sum(value) / len(value))
-            
+
             # Handle Direct Tensor
             if isinstance(value, torch.Tensor):
                 return value.detach().cpu().float().mean().item()
-            
+
             # Handle Direct Numpy
             if isinstance(value, np.ndarray):
                 return float(value.mean())
-                
+
         except Exception as e:
             # Fallback if computation fails
             logger.warning("Failed to compute mean for value: %s", e)
             return 0.0
-            
+
         return float(value)

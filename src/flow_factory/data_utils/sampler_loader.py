@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # src/flow_factory/data_utils/sampler_loader.py
-from torch.utils.data import Sampler, Dataset
+from torch.utils.data import Dataset, Sampler
 
 from .sampler import (
     DistributedKRepeatSampler,

@@ -14,17 +14,17 @@
 
 # src/flow_factory/ema/__init__.py
 
+from .ema import EMAModuleWrapper
 from .ema_utils import (
     DecayFn,
     constant_decay,
-    power_warmup_decay,
+    cosine_decay,
+    create_decay_fn,
     linear_warmup_decay,
     piecewise_linear_decay,
-    cosine_decay,
+    power_warmup_decay,
     warmup_cosine_decay,
-    create_decay_fn,
 )
-from .ema import EMAModuleWrapper
 
 __all__ = [
     "DecayFn",

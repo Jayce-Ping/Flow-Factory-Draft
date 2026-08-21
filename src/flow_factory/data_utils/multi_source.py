@@ -129,6 +129,11 @@ class MultiSourceTrainDataLoader:
         self._iters: Dict[str, Iterator] = {}
 
     @property
+    def batch_size(self) -> Optional[int]:
+        """Expose the fixed batch size expected by Accelerate/DeepSpeed."""
+        return self._batch_size
+
+    @property
     def dataloaders_by_source(self) -> Dict[str, DataLoader]:
         """Public access for OPD-style consumers."""
         return self._loaders_by_source

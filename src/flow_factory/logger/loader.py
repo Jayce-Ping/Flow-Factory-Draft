@@ -17,7 +17,9 @@
 Logger Loader
 Factory function using registry pattern for extensibility.
 """
+
 from typing import Optional
+
 from .abc import Logger
 from .registry import get_logger_class, list_registered_loggers
 
@@ -25,47 +27,47 @@ from .registry import get_logger_class, list_registered_loggers
 def load_logger(config) -> Optional[Logger]:
     """
     Load and initialize the appropriate logger backend based on configuration.
-    
+
     Uses a registry pattern for automatic logger discovery and loading.
     Supports both built-in loggers and custom backends via python paths.
-    
+
     Args:
         config: Arguments object containing log_args.logging_backend
-    
+
     Returns:
         Logger instance or None if logging is disabled
-    
+
     Raises:
         ImportError: If the logger backend is not registered or cannot be imported
-    
+
     Examples:
         # Using built-in logger
         config.log_args.logging_backend = "wandb"
         logger = load_logger(config)
-        
+
         # Using custom logger
         config.log_args.logging_backend = "my_package.loggers.CustomLogger"
         logger = load_logger(config)
-        
+
         # Disabling logging
         config.log_args.logging_backend = "none"
         logger = load_logger(config)  # Returns None
     """
     logging_backend = config.log_args.logging_backend
-    
+
     try:
         # Get logger class from registry or direct import
         logger_class = get_logger_class(logging_backend)
-        
+
         # Return None if logging is disabled
         if logger_class is None:
             return None
-        
+
         # Instantiate logger
         logger_instance = logger_class(config=config)
-        
+
         return logger_instance
-        
+
     except ImportError as e:
         registered_loggers = list(list_registered_loggers().keys())
         raise ImportError(

@@ -35,6 +35,64 @@ All adapters that support CFG must follow a consistent two-stage pattern. Guidan
 | LTX2 | x0-space multi-guidance (CFG + STG + Modality Isolation) | CFG delta computed in x0-space, not velocity-space |
 | SD3.5 | Requires `negative_pooled_prompt_embeds` in addition to `negative_prompt_embeds` | Two embedding checks in forward |
 
+### If an algorithm ever needs the separate CFG branches
+
+Some distillation objectives want the conditional and unconditional velocities on
+their own rather than only the combined one. There is no such consumer today, so no
+API exists. An earlier attempt shipped one anyway, with overrides in SD3.5 and
+Z-Image and no caller, and it is not being ported. Build it this way when the
+objective lands.
+
+**Derive the guided branch arithmetically.** `guided == uncond + scale * (cond - uncond)`
+by definition, so it costs no forward. The earlier attempt queried all three through
+`forward()`, and because the third call ran its own batched CFG internally it spent
+four transformer evaluations to produce two evaluations' worth of information.
+
+**Declare branches as substitutions, not as a conditioning list.** A flat
+"positive kwarg to negative kwarg" map only covers prompts. Real conditioning also
+carries masks, and editing models carry image latents that may or may not differ
+between branches. Declaring each branch as the set of kwargs that *change* relative
+to the conditional one handles all three cases: named kwargs are substituted,
+unnamed ones pass through unchanged, and a model with more than two branches simply
+declares more entries.
+
+```python
+class SD3_5Adapter(BaseAdapter):
+    guidance_branches = {
+        "unconditional": {
+            "prompt_embeds": "negative_prompt_embeds",
+            "pooled_prompt_embeds": "negative_pooled_prompt_embeds",
+        },
+    }
+
+class QwenImageEditPlusAdapter(BaseAdapter):
+    guidance_branches = {
+        "unconditional": {
+            "prompt_embeds": "negative_prompt_embeds",
+            "prompt_embeds_mask": "negative_prompt_embeds_mask",
+            # Name image latents only when the branches genuinely differ; an editing
+            # model that conditions both branches on the same reference omits them
+            # and they pass through.
+            "image_latents": "negative_image_latents",
+        },
+    }
+```
+
+**Keep resolution and the separate strategy shared; keep combination per adapter.**
+Substituting kwargs and issuing one `forward(..., guidance_scale=1.0)` per branch
+needs nothing model-specific beyond the declaration above, so SD3.5 and Z-Image need
+no method at all; the earlier attempt cost them a few hundred lines each. Combining
+the branches is model-specific and stays a hook: the default is the CFG formula,
+LTX2 combines in x0-space, Z-Image applies truncation and normalization afterwards,
+and Qwen-Image rescales the norm.
+
+**Make the batched variant an opt-in override.** Concatenating along the batch axis
+turns N passes into one at N times the activations. Which kwargs may be concatenated
+and which must be repeated is genuinely model knowledge - a scalar, a list of image
+shapes and a latent tensor each behave differently - so it belongs in an adapter
+hook rather than in a generic batcher. Select between the two with a parameter,
+defaulting to separate.
+
 ## `forward()` as the Consistency Boundary
 
 `adapter.forward()` is the atomic unit for train-inference consistency (-> `train_inference_consistency.md`).
@@ -114,6 +172,7 @@ LTX2 packs `[video|audio]` into one `(B, Seq, C)` sequence, so it resolves as PA
 9. **Image columns persist via HF Image feature (variable-size/count I2I)** — preprocessing stores image data as PIL via the HF `Image` feature, not raw tensors; ragged tensor columns (multi-reference images of varying size/count) are NOT Arrow-serializable and otherwise crash in `Dataset.map` with `TypeError: a bytes-like object is required, not 'Tensor'` / `OverflowError`. The raw `images` column is always stored this way; an `encode_image` output is stored this way only when its name is listed in the adapter's `python_format_columns` ClassVar (default empty — opt in for RGB images only, e.g. Bagel `condition_images`). These columns **read back as PIL** (`List[List[PIL.Image]]`); the `torch` format excludes them (`_apply_torch_format` in `dataset.py`), and `collate_fn` keeps them as a `MultiImageBatch`. To keep PIL end-to-end on the **sample** (not just the cache), the adapter's `ImageConditionSample` subclass must also set `condition_images_as_pil=True` (else `ImageConditionSample.__post_init__` re-canonicalizes to `List[Tensor(C,H,W)]` [0,1]); e.g. `BagelI2ISample`. Bump `_PREPROCESS_FORMAT_VERSION` if the on-disk image format changes again.
 10. **Latent geometry override is rarely needed** — `resolve_latent_axes` infers axis roles from latent ndim (3=packed, 4=conv, 5=video), correct for all 14 adapters. Set the `LATENT_AXES` ClassVar only for a genuinely non-standard rank/channel layout. LTX2's packed `[video|audio]` resolves as PACKED; its modality split lives in the adapter `forward` (`video_seq_len`), not the geometry layer. See "Latent Geometry".
 11. **Diffusers cache readiness is explicit** — set `supports_diffusers_cache = True` only when every transformer forward branch, including CFG/STG variants and every transformer in a multi-transformer adapter, runs inside `cache_context`. The rollout accelerator rejects the default `False` before enabling any component. See `guidance/acceleration.md` "Model cache-readiness".
+12. **LTX2 rollouts publish structured trajectories only** — `LTX2_T2AV_Adapter` / `LTX2_I2AV_Adapter` `inference()` fill `BaseSample.trajectory` with one `StructuredTrajectory` per sample (per-component states, full per-component schedules, joint + per-component log probabilities, and the latent-shaped callbacks in `LTX2_STRUCTURED_CALLBACK_FIELDS`) and leave every legacy field (`timesteps`, `all_latents`, `latent_index_map`, `log_probs`, `log_prob_index_map`) `None`. Non-latent callbacks (e.g. `std_dev_t`, `noise_level`) stay in `extra_kwargs` with their `callback_index_map`, which is present only when such a callback was actually collected. Trainers must read the trajectory through the adapter bridge (`get_terminal_state`, `get_replay_step`, `get_replay_callback`), never by indexing the legacy fields. I2AV additionally carries a video `active_mask` derived from `~conditioning_mask`, so the conditioning frame is excluded from every reduction, log-prob weighting and forward-process noising.
 
 ## Cross-refs
 

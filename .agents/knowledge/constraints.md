@@ -9,19 +9,30 @@ These constraints MUST NOT be violated. Consult this file before making any code
 ## Registry & Loading (1–5)
 
 ### 1. Registry Path Accuracy
-The three registries (`_TRAINER_REGISTRY`, `_MODEL_ADAPTER_REGISTRY`, `_REWARD_MODEL_REGISTRY`) map string identifiers to **fully qualified Python class paths** for lazy import. If you move, rename, or restructure a class, the corresponding registry entry MUST be updated, or `ImportError` will occur at runtime.
+The four registries (`_TRAINER_REGISTRY`, `_MODEL_ADAPTER_REGISTRY`, `_REWARD_MODEL_REGISTRY`, `_ACCELERATOR_REGISTRY`) map string identifiers to **fully qualified Python class paths** for lazy import. If you move, rename, or restructure a class, the corresponding registry entry MUST be updated, or `ImportError` will occur at runtime.
 
 ### 2. Registry Identifier Convention
 Registry keys are **case-insensitive** (lowered at lookup). Model adapter keys use lowercase with hyphens (e.g., `flux1-kontext`). Trainer keys use lowercase (e.g., `grpo-guard`). Reward keys use lowercase (e.g., `pickscore`). New entries must follow the same convention.
 
 ### 3. Dynamic Import Fallback
-All three registries support a **direct Python path** fallback (e.g., `my_package.models.CustomAdapter`). If an identifier is not found in the registry, it is treated as a fully qualified import path. Do not break this two-mode resolution logic.
+All four registries support a **direct Python path** fallback (e.g., `my_package.models.CustomAdapter`). If an identifier is not found in the registry, it is treated as a fully qualified import path. Do not break this two-mode resolution logic.
 
 ### 4. Decorator Registration
 `@register_trainer` and `@register_reward_model` decorators exist for convenience but the canonical entries are the static dicts. If you use the decorator, ensure the static dict is also updated if the class should be discoverable by default.
 
-### 5. Adapter `load_pipeline()` Must Return a DiffusionPipeline
-Every `BaseAdapter` subclass's `load_pipeline()` must return a `diffusers.DiffusionPipeline` (or compatible object). The base class's `__init__` immediately accesses `.scheduler` on the returned object.
+### 5. Adapter Component Runtime Contract
+Existing `BaseAdapter` subclasses keep implementing `load_pipeline()` and use the default
+`ClassicPipelineRuntime`. Adapters backed by lazy modular pipelines or explicit pseudo-pipeline
+containers override the concrete `build_component_runtime()` hook instead; they must retain
+`adapter.pipeline` as the backend compatibility alias and ensure the canonical scheduler is
+materialized before scheduler construction. Trainer stage lifecycle must call the adapter's public
+component methods, preserving model-specific override points. Runtime-wide device and dtype
+enumeration includes only materialized canonical `torch.nn.Module` entries; declared lazy specs,
+optional `None` entries, and pseudo-pipeline aliases are not implicitly loaded or moved.
+`materialize_components(None)` means already-materialized modules, never all declared specs.
+Text-encoder/transformer role groups include non-`None` declarations/specs only.
+The canonical scheduler remains `adapter.scheduler`; `adapter.scheduler_group` owns ordered mode
+and seed dispatch, and its immutable names must equal `trajectory_component_order`.
 
 ---
 
@@ -50,14 +61,14 @@ All target components (trainable **and** frozen-but-shardable) are bundled into 
 Checkpoints are written and read for **trainable members only** — components whose `target_module_map[name]` is non-empty (`adapter.trainable_component_names`). Frozen-but-shardable bundle members (e.g. Wan2.2's `transformer_2`, kept in `target_components` only to be FSDP-sharded for memory; see #9) map to `None` and are skipped by both `save_checkpoint` and `_load_lora`/`_load_full_model`. Loaders MUST iterate `trainable_component_names`, not `target_components`, or resume logs a spurious error for a per-component subdir that was never written. `resume_type='state'` restores via `accelerator.load_state` into the prepared bundle root and is therefore keyed to bundle membership — resuming into a different `target_components` / bundle composition will mismatch.
 
 ### 10. DeepSpeed ZeRO-3 Is Unsupported
-Reward model sharding under ZeRO-3 is broken even with `GatherParameter` context manager (see the ZeRO-3 guard comment in `trainers/abc.py`). Only ZeRO-1 and ZeRO-2 are safe. Document this if users ask.
+Supported distributed plans are DDP, FSDP, and DeepSpeed ZeRO-1/2. Reward model sharding under ZeRO-3 is broken even with DeepSpeed's own `zero.GatheredParameters` context manager, and parameter sharding also breaks frozen-component synchronization. `validate_supported_distributed_plan` (`trainers/abc.py`) rejects it at `BaseTrainer.__init__`, before any weights load, and `config/deepspeed/` ships no ZeRO-3 profile. Multi-role training narrows this further: `_validate_multirole_backend` requires ZeRO-1/2 and, under FSDP2, `use_orig_params=True`.
 
 ---
 
 ## Base Class Interfaces (11–14)
 
 ### 11. BaseTrainer Abstract Contract
-`BaseTrainer.__init__` expects `(accelerator, config, adapter)`. Subclasses must implement the three abstract methods `start()`, `prepare_feedback()`, and `optimize()`. `evaluate()` is a **concrete** base method — override only to customize evaluation. The `_initialization()` method handles dataloader, optimizer, accelerator preparation, reward model loading, and `AdvantageProcessor` instantiation — do not duplicate this logic.
+`BaseTrainer.__init__` expects `(accelerator, config, adapter)`. `optimize()` is the only abstract method subclasses must implement. `start()` (the shared epoch loop), `prepare_feedback()`, `compute_advantages()` and `evaluate()` are **concrete** base methods — override only to customize, and prefer the hooks (`sampling_context`, `_run_training_step`, `_after_gradient_step`, `_after_optimizer_step`) over restating the loop. The `_initialization()` method handles dataloader, optimizer, accelerator preparation, reward model loading, and `AdvantageProcessor` instantiation — do not duplicate this logic.
 
 **Per-epoch hook order**: `sample()` (Stages 2–3) → `prepare_feedback()` (Stages 4–5) → `optimize()` (Stage 6). `DPOTrainer` forms chosen/rejected pairs at the **start** of `optimize()` (not in `prepare_feedback()`).
 
@@ -65,7 +76,8 @@ Reward model sharding under ZeRO-3 is broken even with `GatherParameter` context
 
 ### 12. BaseAdapter Abstract Methods
 Subclasses of `BaseAdapter` MUST implement these **4 abstract methods**:
-- `load_pipeline()` → returns a DiffusionPipeline
+- `load_pipeline()` → returns the adapter backend pipeline/container (the default runtime expects
+  a DiffusionPipeline-compatible eager object)
 - `decode_latents()` → latents → pixels
 - `inference()` → full multi-step denoising (corresponds to pipeline `__call__`)
 - `forward()` → single-step denoising for training loss computation
@@ -93,6 +105,10 @@ The `RewardProcessor` dispatches differently based on the model type. Do not cha
 
 **Two-layer hierarchy**: Task-level samples (`T2ISample`, `I2VSample`, `I2AVSample`, ...) are defined in `samples/samples.py` and inherit from `BaseSample` or its condition mixins (`ImageConditionSample`, `VideoConditionSample`). Model-specific samples (`LTX2Sample`, `LTX2I2AVSample`, ...) MUST inherit from the appropriate task-level sample — never from another model-specific sample across files. This mirrors the flat adapter hierarchy: `LTX2I2AVSample(I2AVSample)`, NOT `LTX2I2AVSample(LTX2Sample)`.
 
+Legacy trajectory fields remain authoritative when `BaseSample.trajectory is None`. Structured
+trajectory collation requires identical ordered component keys and shared state/log-prob index maps;
+component mapping iteration never defines scheduler RNG order.
+
 ---
 
 ## Configuration System (15–17)
@@ -117,10 +133,10 @@ Config keys must exactly match Pydantic field names. Typos fail silently with de
 `accelerator.wait_for_everyone()` must be called at critical synchronization points (after preprocessing, before/after evaluation, checkpoint saving). Missing barriers cause deadlocks or race conditions.
 
 ### 19. FSDP CPU Efficient Loading
-When using FSDP with CPU offloading, frozen components (text encoder, VAE) may be uninitialized on Rank > 0. The `_synchronize_frozen_components()` method handles this. Do not remove or bypass it.
+When using FSDP with CPU offloading, frozen components (text encoder, VAE) may be uninitialized on Rank > 0. The `_synchronize_frozen_components()` method handles this. Do not remove or bypass it. Lazy components must be materialized before synchronization: both preprocessing and inference stages load and synchronize their explicit component sets before first use. Synchronize module parameters and buffers; skip non-module declarations such as tokenizers and processors.
 
 ### 20. Mixed Precision Consistency
-The adapter sets inference dtype for frozen components and training dtype for trainable parameters in `_mix_precision()`. Autocast context is configured in `BaseTrainer.__init__`. Do not manually cast tensors unless you understand the precision boundary. Details: `topics/dtype_precision.md`.
+The adapter sets inference dtype for frozen components and training dtype for trainable parameters in `_mix_precision()`. Components materialized later must receive the same policy through `on_load_components()`; laziness must not bypass an explicit `frozen_parameters_dtype`. Autocast context is configured in `BaseTrainer.__init__`. Do not manually cast tensors unless you understand the precision boundary. Details: `topics/dtype_precision.md`.
 
 ### 20a. Autocast Weight Cache Must Not Span a Forward
 `torch.autocast`'s weight cache (keyed by tensor `data_ptr`) serves **stale** casts after any in-place weight change — `optimizer.step()` or a `use_ref/ema/named_parameters` swap (`param.data.copy_`). So wrap **each** forward (and its KL) in its own `with self.autocast():`; never one autocast around the optimize loop. Active for fp32 trainable weights (`trainable_parameters_dtype: fp32`), dormant for the bf16 default, LoRA `disable_adapter()` safe. Details + DDP/DeepSpeed caveat: `topics/autocast_param_swap.md`.

@@ -27,15 +27,18 @@ yum install -y mesa-libGL glib2
 ```
 For other versions of CUDA, please refer to the official documentation of PaddleOCR.
 """
-from typing import Optional
+
+import json
+from typing import Any, Optional
+
+import numpy as np
+import torch
 from accelerate import Accelerator
 from PIL import Image
-import torch
-import numpy as np
 
-from .abc import PointwiseRewardModel, GroupwiseRewardModel, RewardModelOutput
 from ..hparams import *
 from ..utils.logger_utils import setup_logger
+from .abc import GroupwiseRewardModel, PointwiseRewardModel, RewardModelOutput
 
 logger = setup_logger(__name__)
 
@@ -47,76 +50,123 @@ except ImportError:
 try:
     from Levenshtein import distance
 except ImportError:
-    raise ImportError("python-Levenshtein is required for OCR reward. Install with: pip install python-Levenshtein")
+    raise ImportError(
+        "python-Levenshtein is required for OCR reward. Install with: pip install python-Levenshtein"
+    )
+
 
 class OCRRewardModel(PointwiseRewardModel):
-    required_fields = ("prompt", "image", "video")
+    required_fields = ("prompt", "image", "metadata")
+
     def __init__(self, config: RewardArguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
 
         device_index = self.accelerator.local_process_index
-
-        # Initialize PP-OCRv5 reader with new API
+        use_cuda = "cuda" in str(self.device)
+        # The CPU Paddle build in the Flow-Factory environment cannot execute
+        # PaddleOCR's oneDNN PIR graph (ConvertPirAttribute2RuntimeAttribute).
+        # Keep oneDNN disabled for CPU rewards; CUDA builds do not use this path.
         self.model = PaddleOCR(
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
-            device=f"gpu:{device_index}" if "cuda" in str(self.device) else "cpu"
+            device=f"gpu:{device_index}" if use_cuda else "cpu",
+            enable_mkldnn=use_cuda,
         )
 
     def _compute_scores_batch(
         self,
         prompt: list[str],
         image: list[Image.Image],
-    ) -> torch.Tensor:
-        """Compute OCR reward for a batch of image-prompt pairs."""
-        rewards = []
-        for img, p in zip(image, prompt):
-            # Convert image format to np.ndarray
+        metadata: list[str],
+    ) -> list[float]:
+        """Compute mean target-text fidelity for each image."""
+        if len(prompt) != len(image) or len(prompt) != len(metadata):
+            raise ValueError(
+                "expected equal OCR batch lengths for prompt, image, and metadata; "
+                f"received prompt={len(prompt)}, image={len(image)}, metadata={len(metadata)}"
+            )
+
+        rewards: list[float] = []
+        for sample_index, (img, meta) in enumerate(zip(image, metadata)):
             if isinstance(img, Image.Image):
                 img = np.array(img)
+            targets = self._targets_from_metadata(meta, sample_index)
 
-            # Extract quoted target text (e.g. 'a sign saying "Hello World"' -> 'Hello World')
-            parts = p.split('"')
-            target_text = parts[1] if len(parts) >= 2 else p
+            result = self.model.predict(img)
+            rec_texts: list[str] = []
+            for res in result:
+                rec_texts.extend(res["rec_texts"])
 
-            try:
-                # OCR recognition using PP-OCRv5 predict API
-                result = self.model.predict(img)
-                # Extract recognized text from PP-OCRv5 result
-                recognized_text = ''
-                for res in result:
-                    recognized_text += ''.join(res['rec_texts'])
-
-                recognized_text = recognized_text.replace(' ', '').lower()
-                target_text = target_text.replace(' ', '').lower()
-                if target_text in recognized_text:
-                    dist = 0
-                else:
-                    dist = distance(recognized_text, target_text)
-                # Recognized many unrelated characters, only add one character penalty
-                if dist > len(target_text):
-                    dist = len(target_text)
-
-            except Exception as e:
-                # Error handling (e.g., OCR parsing failure)
-                logger.error(f"OCR processing failed: {str(e)}")
-                dist = len(target_text)  # Maximum penalty
-            
-            reward = 1 - dist / (len(target_text))
-            rewards.append(reward)
+            target_scores = [self._target_similarity(target, rec_texts) for target in targets]
+            rewards.append(float(np.mean(target_scores)))
 
         return rewards
+
+    @staticmethod
+    def _targets_from_metadata(metadata: str, sample_index: int) -> list[str]:
+        if not isinstance(metadata, str):
+            raise TypeError(
+                f"expected JSON string metadata for OCR sample {sample_index}, "
+                f"received {type(metadata).__name__}: {metadata!r}"
+            )
+        parsed = json.loads(metadata)
+        if not isinstance(parsed, dict):
+            raise TypeError(
+                f"expected metadata object for OCR sample {sample_index}, "
+                f"received {type(parsed).__name__}: {parsed!r}"
+            )
+        targets: Any = parsed.get("visible_texts")
+        if isinstance(targets, str):
+            targets = json.loads(targets)
+        if not isinstance(targets, list) or any(
+            not isinstance(target, str) or not target.strip() for target in targets
+        ):
+            raise ValueError(
+                f"expected nonempty metadata.visible_texts list[str] for OCR sample "
+                f"{sample_index}, received {targets!r}"
+            )
+        if not targets:
+            raise ValueError(
+                f"expected at least one metadata.visible_texts target for OCR sample "
+                f"{sample_index}, received an empty list"
+            )
+        return targets
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        return "".join(character for character in text.lower() if not character.isspace())
+
+    @classmethod
+    def _target_similarity(cls, target: str, recognized_parts: list[str]) -> float:
+        normalized_target = cls._normalize_text(target)
+        normalized_parts = [
+            normalized for part in recognized_parts if (normalized := cls._normalize_text(part))
+        ]
+        if not normalized_parts:
+            return 0.0
+
+        recognized_text = "".join(normalized_parts)
+        if normalized_target in recognized_text:
+            return 1.0
+
+        candidates = [*normalized_parts, recognized_text]
+        normalized_distance = min(
+            distance(normalized_target, candidate) / max(len(normalized_target), len(candidate))
+            for candidate in candidates
+        )
+        return max(0.0, 1.0 - normalized_distance)
 
     def _compute_video_scores(
         self,
         prompt: list[str],
         video: list[list[Image.Image]],
+        metadata: list[str],
         batch_size: int,
     ) -> torch.Tensor:
         """
         Compute mean PickScore across all frames for each video.
-        
+
         Uses flat-reconstruct strategy to handle variable frame counts
         while maintaining efficient batched computation.
         """
@@ -124,17 +174,19 @@ class OCRRewardModel(PointwiseRewardModel):
         frame_counts = [len(clip) for clip in video]
         flat_images = [frame for clip in video for frame in clip]
         flat_prompts = [p for p, n in zip(prompt, frame_counts) for _ in range(n)]
-        
+        flat_metadata = [m for m, n in zip(metadata, frame_counts) for _ in range(n)]
+
         # Batched score computation
         all_scores = []
         for i in range(0, len(flat_images), batch_size):
             batch_scores = self._compute_scores_batch(
-                flat_prompts[i:i + batch_size],
-                flat_images[i:i + batch_size],
+                flat_prompts[i : i + batch_size],
+                flat_images[i : i + batch_size],
+                flat_metadata[i : i + batch_size],
             )
-            all_scores.append(batch_scores)
+            all_scores.append(torch.tensor(batch_scores, dtype=torch.float32))
         flat_scores = torch.cat(all_scores, dim=0)
-        
+
         # Reconstruct: mean pooling per video
         scores = flat_scores.split(frame_counts)
         scores = torch.stack([s.mean() for s in scores])
@@ -146,24 +198,35 @@ class OCRRewardModel(PointwiseRewardModel):
         prompt: list[str],
         image: Optional[list[Image.Image]] = None,
         video: Optional[list[list[Image.Image]]] = None,
+        metadata: Optional[list[str]] = None,
     ) -> RewardModelOutput:
         if not isinstance(prompt, list):
             prompt = [prompt]
         if image is not None and video is not None:
             raise ValueError("Only one of image or video can be provided.")
-        
-        batch_size = getattr(self.config, 'batch_size', len(prompt))
-        
+        if image is None and video is None:
+            raise ValueError("OCR reward requires image or video input, received neither.")
+        if metadata is None:
+            raise ValueError(
+                "OCR reward requires metadata.visible_texts for every sample, received metadata=None"
+            )
+
+        batch_size = getattr(self.config, "batch_size", len(prompt))
+
         if video is not None:
-            scores = self._compute_video_scores(prompt, video, batch_size)
+            scores = self._compute_video_scores(prompt, video, metadata, batch_size)
         else:
-            scores = self._compute_scores_batch(prompt, image)
-        
+            scores = self._compute_scores_batch(prompt, image, metadata)
+
         return RewardModelOutput(rewards=scores, extra_info={})
 
+
 def download_model():
-    ocr = PaddleOCR(use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False)
-    logger.info('PaddleOCR initialized successfully')
+    ocr = PaddleOCR(
+        use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False
+    )
+    logger.info("PaddleOCR initialized successfully")
+
 
 if __name__ == "__main__":
     download_model()

@@ -162,7 +162,7 @@ Configured via the `acceleration:` block (`hparams/acceleration_args.py`): two o
 
 - **New model adapter**: `guidance/new_model.md`, skill `/ff-new-model`, conventions `topics/adapter_conventions.md`
 - **New reward model**: `guidance/rewards.md`, skill `/ff-new-reward`
-- **New algorithm**: `guidance/algorithms.md`, skill `/ff-new-algorithm`
+- **New algorithm**: `guidance/algorithms.md`, skill `/ff-new-algorithm`. `BaseTrainer` owns the epoch loop (`start`), timestep sampling, feedback/advantages, the optimizer step and the velocity KL; only `optimize()` is abstract. Vary behavior through `sampling_context`, `_run_training_step`, `_after_gradient_step` and `_after_optimizer_step` rather than by restating the loop. An algorithm that trains several model copies declares them in `_declare_model_variants()` (`topics/component_variants.md`).
 - **New accelerator**: subclass `acceleration/abc.py::BaseAccelerator` (declare `safety`/`stage`), register in `acceleration/registry.py`
 
 ---
@@ -188,8 +188,94 @@ Details: `topics/adapter_conventions.md`
 ### Sample Dataclass Hierarchy
 Two-layer structure (constraint #14): task-level samples (`T2ISample`, `I2VSample`, `I2AVSample`, ...) live in `samples/samples.py` and inherit from `BaseSample` or condition mixins. Model-specific samples (`LTX2Sample`, `LTX2I2AVSample`, ...) inherit from the matching task-level sample — never from another model-specific sample.
 
+`BaseSample.trajectory` is the opt-in structured path for independently shaped/timed latent
+components; legacy trajectory fields remain unchanged and authoritative when it is `None`.
+LTX2 T2AV/I2AV rollouts are the first adapters to opt in: they publish an authoritative
+`StructuredTrajectory` and leave every legacy trajectory field `None`
+(see `topics/adapter_conventions.md` gotcha #12).
+
 ### Component Management
-`BaseAdapter` discovers pipeline components and manages lifecycle: freezing, LoRA, offloading, mode switching (`train`/`eval`/`rollout`).
+`BaseAdapter` delegates component discovery, canonical access, runtime overrides, lazy
+materialization, and stage-device lifecycle to `models/runtime/`. Runtime overrides include
+prepared/proxied modules and LoRA/checkpoint replacements; all are excluded from manual device
+management. Declared lazy specs are separate from materialized module enumeration, so stage-wide
+operations and `materialize_components(None)` never materialize tokenizers, schedulers, processors,
+or configs implicitly. Explicit names are required to materialize a lazy spec. Role groups retain
+non-`None` modular specs but exclude absent classic optional components. The default
+`ClassicPipelineRuntime` preserves eager DiffusionPipeline behavior;
+`ModularPipelineRuntime` materializes selected lazy component specs; and
+`PseudoPipelineRuntime` manages explicit containers and non-enumerated aliases such as Bagel's
+`transformer -> bagel.language_model`. `adapter.pipeline` remains the backend compatibility alias,
+while `ModelBundle` and `RoutedComponentProxy` remain the sole distributed preparation runtime.
+`SchedulerGroup` separately provides immutable component names and ordered scheduler mode/seed
+dispatch; its primary scheduler remains available through `adapter.scheduler`.
+
+Component membership resolves through the runtime, never through `hasattr(adapter, name)`:
+`has_component` asks whether a name is declared, and `_require_component` fetches a module a
+lifecycle loop cannot proceed without. Details: `topics/component_runtime.md`.
+
+### Component Variants
+`BaseAdapter` is infrastructure: it supplies mechanisms and holds no algorithm vocabulary. Two
+mechanisms cover parameter ownership. Named parameter snapshots (`add_named_parameters` /
+`use_named_parameters`) are temporal, one set of weights installed at a time, and cover references,
+EMAs and old snapshots. `ComponentVariantRegistry` (`models/variants.py`) is spatial: several
+trainable copies live at once, each with its own optimizer group, storage (`lora` or `full`) and
+`component_routes`. Variant names are caller-chosen and the base variant is positional, so the
+model layer never learns what a "generator" is. `RoutedComponentProxy` resolves a canonical
+component name through the active variant, so adapter code is unchanged.
+
+A variant is always a live trainable copy. A frozen reference is the same weights at another point
+in time, so it belongs to the temporal mechanism: `use_ref_parameters()` for the pre-finetune
+weights, or a named snapshot. Only the trainable copy carries gradients and optimizer state, which
+is what forces it into the prepared bundle in the first place.
+
+Roles are the trainer's vocabulary. `RoleOptimizationCoordinator`
+(`trainers/role_optimization.py`) is a utility a trainer composes to drive disjoint role updates
+through one physical optimizer, and `BaseTrainer._validate_multirole_backend` rejects the
+distributed layouts multi-role cannot support. Algorithms may duplicate their own small role
+helpers rather than share an abstraction that would push their vocabulary down a layer.
+Details: `topics/component_variants.md`.
+
+#### Component runtime enumeration boundaries
+- **Date**: 2026-08-10
+- **Symptom**: Lazy stage-wide operations could materialize non-module specs, Bagel's nested
+  transformer could be moved twice, and trainers bypassed adapter lifecycle overrides.
+- **Root Cause**: The first runtime abstraction conflated declared specs, materialized modules,
+  aliases, and prepared/replacement overrides under one component-name path.
+- **Fix**: Split declared and materialized discovery, added non-enumerated pseudo aliases and
+  generic device-excluded overrides, and restored trainer routing through adapter lifecycle APIs.
+- **Lesson**: Discovery for explicit lookup and enumeration for lifecycle operations require
+  separate contracts; aliases and overrides must remain addressable without becoming lifecycle
+  roots.
+- **Related Constraint**: #5.
+
+#### Optional role discovery and lazy default materialization
+- **Date**: 2026-08-10
+- **Symptom**: A declared classic `transformer_2=None` entered the transformer role group and
+  adapter freezing called `requires_grad_` on `None`; separately, `materialize_components(None)`
+  eagerly loaded every modular spec.
+- **Root Cause**: Role discovery filtered names rather than non-`None` values, and the default
+  materialization request expanded declared names instead of materialized modules.
+- **Fix**: Role discovery now excludes `None` values while retaining non-`None` modular specs;
+  default materialization uses already-materialized module names, and normal canonical lookup
+  returns direct materialized attributes before consulting the expensive declared component map.
+- **Lesson**: Optional declarations are valid for explicit compatibility lookup but cannot imply
+  role membership, and an omitted lazy-materialization selection must never mean "load all."
+- **Related Constraint**: #5.
+
+#### Structured trajectory bridge ownership boundaries
+- **Date**: 2026-08-10
+- **Symptom**: Batch-level state arguments could be forwarded twice, partial active-count
+  overrides were rejected, and a plain mapping with structured trajectory data raised an
+  incidental attribute error.
+- **Root Cause**: The legacy bridge did not separate bridge-owned forward arguments from
+  batch conditioning, and treated optional component metadata as a complete mapping.
+- **Fix**: The bridge now strips state-owned batch keys, accepts ordered partial active-count
+  overrides while rejecting unknown components, and validates the structured batch type before
+  accessing batch metadata.
+- **Lesson**: Bridge-owned values must have one authoritative source; optional component
+  metadata should be consumed in authoritative component order without requiring every key.
+- **Related Constraint**: #5, #26.
 
 ### Reward Processing
 `RewardProcessor` dispatches by model type:
@@ -209,6 +295,8 @@ Arguments (top-level)
 ├── SchedulerArguments    # dynamics_type, timestep_range, num_inference_steps
 ├── DataArguments         # dataset, preprocessing, resolution, sampler_type
 ├── MultiRewardArguments  # reward_model configs (list of RewardArguments)
+├── MultiOptimizerArguments  # YAML `optimizers:`, one entry per variant (AdamW or Muon)
+├── AccelerationArguments # YAML `acceleration:`, compile / attention backend / caching
 ├── LogArguments          # logger type, verbose, project name
 └── EvaluationArguments   # evaluation settings
 ```

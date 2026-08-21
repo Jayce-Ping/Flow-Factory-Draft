@@ -24,13 +24,13 @@ Supported backends:
 - SwanLab
 """
 
-from .abc import Logger, LogImage, LogVideo, LogTable
+from .abc import Logger, LogImage, LogTable, LogVideo
+from .formatting import LogFormatter
+from .loader import load_logger
 from .registry import (
     get_logger_class,
     list_registered_loggers,
 )
-from .formatting import LogFormatter
-from .loader import load_logger
 
 __all__ = [
     # Core classes
@@ -39,11 +39,9 @@ __all__ = [
     "LogVideo",
     "LogTable",
     "LogFormatter",
-    
     # Registry functions
     "get_logger_class",
     "list_registered_loggers",
-    
     # Factory function
     "load_logger",
 ]

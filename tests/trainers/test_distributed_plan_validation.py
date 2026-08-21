@@ -1,0 +1,215 @@
+# Copyright 2026 Jayce-Ping
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+from accelerate.utils import DistributedType
+
+from flow_factory.trainers.abc import (
+    configure_deepspeed_micro_batch_size,
+    validate_supported_distributed_plan,
+)
+
+
+def _accelerator(distributed_type: DistributedType, zero_stage: object = None) -> SimpleNamespace:
+    plugin = None if zero_stage is None else SimpleNamespace(zero_stage=zero_stage)
+    return SimpleNamespace(
+        distributed_type=distributed_type,
+        state=SimpleNamespace(deepspeed_plugin=plugin),
+    )
+
+
+def test_zero_three_is_rejected_before_any_weights_load() -> None:
+    """The backend validator rejects parameter-sharded DeepSpeed."""
+    accelerator = _accelerator(DistributedType.DEEPSPEED, zero_stage=3)
+
+    with pytest.raises(ValueError, match="ZeRO-3 is not supported"):
+        validate_supported_distributed_plan(accelerator)
+
+
+def test_loader_rejects_zero_three_before_loading_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The trainer factory must reject ZeRO-3 before constructing an adapter."""
+    from flow_factory.trainers import loader
+
+    accelerator = _accelerator(DistributedType.DEEPSPEED, zero_stage=3)
+    model_load_attempted = False
+
+    class Adapter:
+        ddp_find_unused_parameters = False
+
+    def unexpected_model_load(**kwargs: object) -> None:
+        del kwargs
+        nonlocal model_load_attempted
+        model_load_attempted = True
+        raise AssertionError("load_model must not run for DeepSpeed ZeRO-3")
+
+    config = SimpleNamespace(
+        mixed_precision="bf16",
+        model_args=SimpleNamespace(model_type="test"),
+        log_args=SimpleNamespace(save_dir="/tmp", run_name="zero3-rejection-test"),
+        training_args=SimpleNamespace(
+            gradient_accumulation_steps=1,
+            max_grad_norm=1.0,
+            seed=42,
+        ),
+    )
+    monkeypatch.setattr(loader, "get_model_adapter_class", lambda model_type: Adapter)
+    monkeypatch.setattr(loader, "Accelerator", lambda **kwargs: accelerator)
+    monkeypatch.setattr(loader, "load_model", unexpected_model_load)
+
+    with pytest.raises(ValueError, match="ZeRO-3 is not supported"):
+        loader.load_trainer(config)
+
+    assert model_load_attempted is False
+
+
+@pytest.mark.parametrize("zero_stage", [1, 2])
+def test_supported_deepspeed_stages_pass(zero_stage: int) -> None:
+    """ZeRO-1 and ZeRO-2 are the supported DeepSpeed configurations."""
+    validate_supported_distributed_plan(_accelerator(DistributedType.DEEPSPEED, zero_stage))
+
+
+@pytest.mark.parametrize(
+    "distributed_type",
+    [DistributedType.NO, DistributedType.MULTI_GPU, DistributedType.FSDP],
+)
+def test_non_deepspeed_plans_pass(distributed_type: DistributedType) -> None:
+    """DDP and FSDP carry no DeepSpeed plugin and are supported unchanged."""
+    validate_supported_distributed_plan(_accelerator(distributed_type))
+
+
+def test_deepspeed_without_a_plugin_is_not_rejected() -> None:
+    """A DeepSpeed distributed type with no plugin has no stage to reject."""
+    validate_supported_distributed_plan(_accelerator(DistributedType.DEEPSPEED))
+
+
+def test_deepspeed_micro_batch_size_is_set_for_custom_train_loader() -> None:
+    accelerator = _accelerator(DistributedType.DEEPSPEED, zero_stage=2)
+    accelerator.state.deepspeed_plugin.deepspeed_config = {}
+
+    configure_deepspeed_micro_batch_size(accelerator, per_device_batch_size=3)
+
+    assert (
+        accelerator.state.deepspeed_plugin.deepspeed_config["train_micro_batch_size_per_gpu"] == 3
+    )
+
+
+def test_muon_with_deepspeed_is_rejected_as_unverified() -> None:
+    """Muon runs inside a composite; DeepSpeed rebuilds its own optimizer wrapper."""
+    from flow_factory.hparams.optimizer_args import (
+        AdamWOptimizerArguments,
+        MuonOptimizerArguments,
+    )
+    from flow_factory.trainers.abc import BaseTrainer
+
+    trainer = SimpleNamespace(accelerator=_accelerator(DistributedType.DEEPSPEED, zero_stage=2))
+
+    with pytest.raises(ValueError, match="Muon with DeepSpeed is not verified"):
+        BaseTrainer._validate_optimizer_backend(trainer, (MuonOptimizerArguments(name="base"),))
+
+    # AdamW is unaffected, and Muon is fine on the backends that preserve parameter rank.
+    BaseTrainer._validate_optimizer_backend(trainer, (AdamWOptimizerArguments(name="base"),))
+    fsdp2_trainer = SimpleNamespace(accelerator=_fsdp_accelerator(fsdp_version=2))
+    BaseTrainer._validate_optimizer_backend(fsdp2_trainer, (MuonOptimizerArguments(name="base"),))
+
+
+def _fsdp_accelerator(fsdp_version: int) -> SimpleNamespace:
+    """Accelerator reporting an FSDP plan of the requested major version."""
+    accelerator = _accelerator(DistributedType.FSDP)
+    accelerator.state.fsdp_plugin = SimpleNamespace(fsdp_version=fsdp_version)
+    return accelerator
+
+
+def test_muon_with_fsdp1_is_rejected_before_a_rollout_is_paid_for() -> None:
+    """FSDP1 flattens to 1D, so Muon would only fail after the first full rollout."""
+    from flow_factory.hparams.optimizer_args import (
+        AdamWOptimizerArguments,
+        MuonOptimizerArguments,
+    )
+    from flow_factory.trainers.abc import BaseTrainer
+
+    trainer = SimpleNamespace(accelerator=_fsdp_accelerator(fsdp_version=1))
+
+    with pytest.raises(ValueError, match="Muon with FSDP1 does not work"):
+        BaseTrainer._validate_optimizer_backend(trainer, (MuonOptimizerArguments(name="base"),))
+
+    # FSDP1 stays available to every optimizer that accepts a flattened parameter.
+    BaseTrainer._validate_optimizer_backend(trainer, (AdamWOptimizerArguments(name="base"),))
+
+
+def test_no_zero_three_profile_is_shipped() -> None:
+    """A shipped profile would invite a configuration the trainer refuses."""
+    config_dir = Path(__file__).resolve().parents[2] / "config" / "deepspeed"
+
+    assert config_dir.is_dir()
+    assert not (config_dir / "deepspeed_zero3.yaml").exists()
+
+
+def test_deepspeed_gradient_clipping_is_wired_from_the_configured_norm() -> None:
+    """DeepSpeed clips inside its engine and ignores the value passed at the call site.
+
+    accelerate reads the threshold from this environment variable when building the
+    plugin, so leaving it unset ships an unresolved "auto" and max_grad_norm never
+    takes effect on that backend.
+    """
+    import inspect
+
+    from flow_factory.trainers import loader
+
+    source = inspect.getsource(loader.load_trainer)
+    assert "ACCELERATE_GRADIENT_CLIPPING" in source
+    assert source.index("ACCELERATE_GRADIENT_CLIPPING") < source.index("accelerator = Accelerator(")
+
+
+def _prepared_trainer(distributed_type: DistributedType, local: int, others: int = 0):
+    """Trainer stub owning ``local`` trainable elements, with ``others`` on the peers.
+
+    ``reduce`` stands in for the collective: the guard asks whether ANY rank holds
+    trainable elements, so the stub adds what the peers would report.
+    """
+    from flow_factory.trainers.abc import BaseTrainer
+
+    accelerator = _accelerator(distributed_type)
+    accelerator.device = torch.device("cpu")
+    accelerator.num_processes = 2
+    accelerator.reduce = lambda tensor, reduction="sum": tensor + float(others)
+    parameter = torch.nn.Parameter(torch.zeros(local or 1))
+    parameter.requires_grad = local > 0
+    return (
+        SimpleNamespace(
+            accelerator=accelerator,
+            model_bundle=SimpleNamespace(parameters=lambda: iter([parameter])),
+        ),
+        BaseTrainer,
+    )
+
+
+def test_a_prepared_root_no_rank_can_train_is_rejected() -> None:
+    """Nothing anywhere requires a gradient, so an optimizer step would change nothing."""
+    trainer, BaseTrainer = _prepared_trainer(DistributedType.FSDP, local=0, others=0)
+
+    with pytest.raises(RuntimeError, match="received 0 across all 2 rank"):
+        BaseTrainer._validate_trainable_parameters_survived_prepare(trainer)
+
+
+def test_a_rank_holding_no_shard_of_the_adapter_is_accepted() -> None:
+    """FSDP splits by byte range: a rank can own none of a small adapter and be healthy."""
+    trainer, BaseTrainer = _prepared_trainer(DistributedType.FSDP, local=0, others=2048)
+    BaseTrainer._validate_trainable_parameters_survived_prepare(trainer)
+
+    trainer, BaseTrainer = _prepared_trainer(DistributedType.DEEPSPEED, local=8)
+    BaseTrainer._validate_trainable_parameters_survived_prepare(trainer)

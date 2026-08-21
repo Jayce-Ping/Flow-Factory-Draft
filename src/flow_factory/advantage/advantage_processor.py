@@ -28,14 +28,16 @@ on the resolved sampler type:
   select between plain NumPy (post-gather global arrays) and ``utils.dist``
   reductions (local shards) so logging always reflects global statistics.
 """
-from typing import List, Dict, Optional, Union, Literal, Callable, Tuple, Any
+
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
+
 import numpy as np
 import torch
 from accelerate import Accelerator
 
-from ..samples import BaseSample
 from ..rewards import RewardProcessor
-from ..utils.dist import global_zero_std_ratio, global_tensor_stats_batch
+from ..samples import BaseSample
+from ..utils.dist import global_tensor_stats_batch
 from ..utils.logger_utils import setup_logger
 
 logger = setup_logger(__name__)
@@ -191,11 +193,14 @@ class AdvantageProcessor:
             reward_keys = list(rewards.keys())
             device = self.accelerator.device
             unique_ids = torch.tensor(
-                [s.unique_id for s in samples], dtype=torch.int64, device=device,
+                [s.unique_id for s in samples],
+                dtype=torch.int64,
+                device=device,
             )
             local_source_ids = torch.tensor(
                 [s.source_id if s.source_id is not None else -1 for s in samples],
-                dtype=torch.int64, device=device,
+                dtype=torch.int64,
+                device=device,
             )
             # Pack: [reward_0, ..., reward_{N-1}, unique_id, source_id]
             columns = [rewards[k].view(-1).float() for k in reward_keys]
@@ -205,9 +210,7 @@ class AdvantageProcessor:
 
             gathered = self.accelerator.gather(packed).cpu().numpy()  # (W*B, N+2)
 
-            collected_rewards = {
-                key: gathered[:, i] for i, key in enumerate(reward_keys)
-            }
+            collected_rewards = {key: gathered[:, i] for i, key in enumerate(reward_keys)}
             gathered_ids = gathered[:, -2].astype(np.int64)
             _unique_ids, group_indices = np.unique(gathered_ids, return_inverse=True)
             source_ids = gathered[:, -1].astype(np.int64)
@@ -247,7 +250,7 @@ class AdvantageProcessor:
                     local_mask[:, j] = True
                 else:
                     for i, name in enumerate(reward_keys):
-                        local_mask[i, j] = (name in applicable)
+                        local_mask[i, j] = name in applicable
             sources = [s.source for s in samples]
             weight_matrix = self._weights_from_sources(reward_keys, sources)
             return local_mask, weight_matrix
@@ -265,7 +268,7 @@ class AdvantageProcessor:
             else:
                 for i, key in enumerate(reward_keys):
                     per_ds = self.reward_weights[key]
-                    applicable[i, j] = (src in per_ds)
+                    applicable[i, j] = src in per_ds
 
         weight_matrix = self._weights_from_sources(reward_keys, source_names)
         return applicable, weight_matrix
@@ -300,9 +303,13 @@ class AdvantageProcessor:
         to this rank's portion.
         """
         if not self.group_on_same_rank:
-            values = torch.as_tensor(values).reshape(
-                self.accelerator.num_processes, -1, *values.shape[1:]
-            )[self.accelerator.process_index].to(self.accelerator.device)
+            values = (
+                torch.as_tensor(values)
+                .reshape(self.accelerator.num_processes, -1, *values.shape[1:])[
+                    self.accelerator.process_index
+                ]
+                .to(self.accelerator.device)
+            )
         else:
             values = torch.as_tensor(values).to(self.accelerator.device)
         return values
@@ -318,13 +325,13 @@ class AdvantageProcessor:
         """
         if self.group_on_same_rank:
             t = torch.tensor(
-                [float(len(values)), float(np.sum(values)), float(np.sum(values ** 2))],
+                [float(len(values)), float(np.sum(values)), float(np.sum(values**2))],
                 device=self.accelerator.device,
             )
             t = self.accelerator.reduce(t, reduction="sum")  # 1 call, 3 scalars
             n, s, ss = t[0].item(), t[1].item(), t[2].item()
             mean = s / n
-            std = max((ss / n - mean ** 2) ** 0.5, 1e-6)
+            std = max((ss / n - mean**2) ** 0.5, 1e-6)
         else:
             mean = float(np.mean(values))
             std = max(float(np.std(values)), 1e-6)
@@ -334,9 +341,7 @@ class AdvantageProcessor:
     # Batched metric reduction (mode-aware)
     # ------------------------------------------------------------------
 
-    def _batch_reduce_stats(
-        self, arrays: Dict[str, np.ndarray]
-    ) -> Dict[str, Dict[str, float]]:
+    def _batch_reduce_stats(self, arrays: Dict[str, np.ndarray]) -> Dict[str, Dict[str, float]]:
         """Compute global ``{min, max, mean, std}`` for each named array.
 
         When ``group_on_same_rank`` the arrays are local shards and require
@@ -348,8 +353,7 @@ class AdvantageProcessor:
         """
         if self.group_on_same_rank:
             tensors = {
-                k: torch.from_numpy(np.asarray(v, dtype=np.float64))
-                for k, v in arrays.items()
+                k: torch.from_numpy(np.asarray(v, dtype=np.float64)) for k, v in arrays.items()
             }
             return global_tensor_stats_batch(self.accelerator, tensors)
 
@@ -366,14 +370,6 @@ class AdvantageProcessor:
                     "std": max(float(np.std(v)), 1e-8),
                 }
         return out
-
-    def _metric_zero_std_ratio(
-        self, rewards: np.ndarray, group_indices: np.ndarray
-    ) -> float:
-        """Fraction of groups with near-zero std — global-reduced when ``group_on_same_rank``."""
-        if self.group_on_same_rank:
-            return global_zero_std_ratio(self.accelerator, rewards, group_indices)
-        return RewardProcessor.compute_group_zero_std_ratio(rewards, group_indices)
 
     @staticmethod
     def _group_normalize(
@@ -406,7 +402,7 @@ class AdvantageProcessor:
         means = sums / safe_counts
 
         residuals = np.where(mask, values - means[group_indices], 0.0)
-        sq_sums = np.bincount(group_indices, weights=residuals ** 2, minlength=num_groups)
+        sq_sums = np.bincount(group_indices, weights=residuals**2, minlength=num_groups)
         stds = np.sqrt(sq_sums / safe_counts)
         stds = np.maximum(stds, eps)
 
@@ -507,8 +503,13 @@ class AdvantageProcessor:
             advantages = self._group_normalize(aggregated_rewards, group_indices)
 
         self._pending_advantage_metrics = self._build_weighted_sum_log_data(
-            gathered_rewards, group_indices, aggregated_rewards, advantages, samples,
-            applicable=applicable, reward_keys=reward_keys,
+            gathered_rewards,
+            group_indices,
+            aggregated_rewards,
+            advantages,
+            samples,
+            applicable=applicable,
+            reward_keys=reward_keys,
         )
 
         # Scatter & store
@@ -565,9 +566,7 @@ class AdvantageProcessor:
         )
 
         # Bug-detection: NaN at applicable position == reward-model bug.
-        stack = np.stack(
-            [gathered_rewards[k].astype(np.float64) for k in reward_keys], axis=0
-        )
+        stack = np.stack([gathered_rewards[k].astype(np.float64) for k in reward_keys], axis=0)
         nan_mask = ~np.isfinite(stack)
         bug_positions = nan_mask & applicable
         if bug_positions.any():
@@ -583,9 +582,7 @@ class AdvantageProcessor:
         for r_idx, key in enumerate(reward_keys):
             reward_array = gathered_rewards[key].astype(np.float64)
             r_applicable = applicable[r_idx]
-            reward_adv = self._group_normalize(
-                reward_array, group_indices, mask=r_applicable
-            )
+            reward_adv = self._group_normalize(reward_array, group_indices, mask=r_applicable)
             all_reward_advantages.append(reward_adv * weight_matrix[r_idx])
 
         # Combine and batch normalise.
@@ -603,8 +600,14 @@ class AdvantageProcessor:
         advantages = (combined_advantages - bn_mean) / bn_std
 
         self._pending_advantage_metrics = self._build_gdpo_log_data(
-            gathered_rewards, group_indices, advantages, bn_mean, bn_std, samples,
-            applicable=applicable, reward_keys=reward_keys,
+            gathered_rewards,
+            group_indices,
+            advantages,
+            bn_mean,
+            bn_std,
+            samples,
+            applicable=applicable,
+            reward_keys=reward_keys,
         )
 
         # Scatter & store
@@ -684,7 +687,7 @@ class AdvantageProcessor:
         applicable: Optional[np.ndarray] = None,
         reward_keys: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        stat_arrays, r_applicable = self._build_base_log_stats(
+        stat_arrays, _ = self._build_base_log_stats(
             gathered_rewards, group_indices, applicable, reward_keys
         )
 
@@ -694,6 +697,7 @@ class AdvantageProcessor:
         )
         stat_arrays["reward_agg_g_stds"] = agg_group_stds
         stat_arrays["reward_agg_g_means"] = agg_group_means
+        stat_arrays["reward_agg_zero_std_flags"] = (agg_group_stds < 1e-6).astype(np.float64)
         stat_arrays["adv"] = advantages
         stat_arrays["adv_abs"] = np.abs(advantages)
 
@@ -709,10 +713,9 @@ class AdvantageProcessor:
         _log_data["train/reward_group_std_max"] = agg_group_std_stats["max"]
         _log_data["train/reward_group_mean_std"] = agg_group_mean_stats["std"]
 
-        # Zero-std ratio (count-based; requires a separate all-reduce)
-        _log_data["train/reward_zero_std_ratio"] = self._metric_zero_std_ratio(
-            aggregated_rewards, group_indices
-        )
+        _log_data["train/reward_zero_std_ratio"] = all_stats[
+            "reward_agg_zero_std_flags"
+        ]["mean"]
 
         # Unpack advantage stats
         adv_stats = all_stats["adv"]
@@ -734,31 +737,37 @@ class AdvantageProcessor:
         applicable: Optional[np.ndarray] = None,
         reward_keys: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        stat_arrays, r_applicable = self._build_base_log_stats(
+        stat_arrays, _ = self._build_base_log_stats(
             gathered_rewards, group_indices, applicable, reward_keys
         )
 
         stat_arrays["adv"] = advantages
         stat_arrays["adv_abs"] = np.abs(advantages)
+        keys_sorted = sorted(gathered_rewards.keys())
+        for key in keys_sorted:
+            group_stds = stat_arrays[f"reward_{key}_g_stds"]
+            stat_arrays[f"reward_{key}_zero_std_flags"] = (group_stds < 1e-6).astype(
+                np.float64
+            )
 
         all_stats = self._batch_reduce_stats(stat_arrays)
 
         _log_data = self._unpack_per_reward_log_data(all_stats, gathered_rewards)
 
-        keys_sorted = sorted(gathered_rewards.keys())
         for key in keys_sorted:
-            mask_k = r_applicable[key]
-            _log_data[f"train/reward_{key}_zero_std_ratio"] = self._metric_zero_std_ratio(
-                gathered_rewards[key][mask_k], group_indices[mask_k]
-            )
+            _log_data[f"train/reward_{key}_zero_std_ratio"] = all_stats[
+                f"reward_{key}_zero_std_flags"
+            ]["mean"]
 
         adv_stats = all_stats["adv"]
-        _log_data.update({
-            "train/batch_norm_mean": bn_mean,
-            "train/batch_norm_std": bn_std,
-            "train/adv_min": adv_stats["min"],
-            "train/adv_max": adv_stats["max"],
-            "train/adv_abs_mean": all_stats["adv_abs"]["mean"],
-            "train_samples": samples[:30],
-        })
+        _log_data.update(
+            {
+                "train/batch_norm_mean": bn_mean,
+                "train/batch_norm_std": bn_std,
+                "train/adv_min": adv_stats["min"],
+                "train/adv_max": adv_stats["max"],
+                "train/adv_abs_mean": all_stats["adv_abs"]["mean"],
+                "train_samples": samples[:30],
+            }
+        )
         return _log_data

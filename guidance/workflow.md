@@ -32,20 +32,29 @@ Flow-Factory follows an **online RL** training paradigm for diffusion/flow-match
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The high-level training loop (shared by all algorithms) is defined in each trainer's `start()` method:
+The high-level training loop lives once in `BaseTrainer.start()`; no algorithm restates it:
 
 ```python
-# src/flow_factory/trainers/grpo.py — GRPOTrainer.start()
+# src/flow_factory/trainers/abc.py — BaseTrainer.start()
 def start(self):
     while self.should_continue_training():
-        # Checkpoint & Evaluation (omitted for brevity)
-        samples = self.sample()            # Stages 2 + 3
-        self.prepare_feedback(samples)     # Stages 4 + 5 (rewards + advantages)
-        self.optimize(samples)             # Stage 6 (DPO: pair formation + loss here)
+        # Reseed, checkpoint on save_freq, evaluate on eval_freq (omitted for brevity)
+        self._run_training_step()      # Stages 2-6, the algorithm-specific middle
+        self.adapter.ema_step(step=self.epoch)
+        self._after_optimizer_step()
         self.epoch += 1
 ```
 
-> **Note**: Stage 1 (preprocessing) runs *once* before training begins and is cached to disk. Stages 2–6 repeat every epoch. The three methods above map directly to those stages: `sample` → trajectory rollouts; `prepare_feedback` → finalize rewards from the buffer and compute advantages; `optimize` → policy update (DPO additionally forms chosen/rejected pairs at the start of `optimize` before the loss).
+The default `_run_training_step` is the familiar three-stage sequence, so a reward-based
+algorithm only implements `optimize()`:
+
+```python
+samples = self.sample()            # Stages 2 + 3
+self.prepare_feedback(samples)     # Stages 4 + 5 (rewards + advantages)
+self.optimize(samples)             # Stage 6 (DPO: pair formation + loss here)
+```
+
+> **Note**: Stage 1 (preprocessing) runs *once* before training begins and is cached to disk. Stages 2–6 repeat every epoch. The three methods above map directly to those stages: `sample` → trajectory rollouts; `prepare_feedback` → finalize rewards from the buffer and compute advantages; `optimize` → policy update (DPO additionally forms chosen/rejected pairs at the start of `optimize` before the loss). `optimize()` is the only abstract one; vary the rest through `sampling_context`, `_run_training_step` and `_after_optimizer_step`.
 
 
 ## Stage 1: Data Preprocessing
@@ -136,10 +145,14 @@ def __iter__(self):
         indices = torch.randperm(len(self.dataset), generator=g)[:self.m].tolist()
         # 2. Repeat each prompt K times → M*K total samples
         repeated = [idx for idx in indices for _ in range(self.k)]
-        # 3. Distribute evenly across all GPUs
-        per_rank = chunk(repeated, self.num_replicas)[self.rank]
-        # 4. Yield batches of size `per_device_batch_size`
-        yield from chunk(per_rank, self.batch_size)
+        # 3. Shuffle, so a group's K copies spread across ranks instead of
+        #    landing contiguously on one
+        order = torch.randperm(len(repeated), generator=g).tolist()
+        shuffled = [repeated[i] for i in order]
+        # 4. Each iteration hands every rank one contiguous slice of the shuffle
+        for i in range(self.num_batches_per_epoch):
+            start = i * self.sample_num_per_iteration + self.rank * self.batch_size
+            yield shuffled[start : start + self.batch_size]
 ```
 
 ### Key Points
@@ -176,10 +189,10 @@ train:
 The trainer's `sample()` method switches the adapter to rollout mode and runs inference:
 
 ```python
-# src/flow_factory/trainers/grpo.py — GRPOTrainer.sample()
+# src/flow_factory/trainers/rl/grpo.py — GRPOTrainer.sample()
 def sample(self) -> List[BaseSample]:
     trajectory_indices = compute_trajectory_indices(
-        train_timestep_indices=self.adapter.scheduler.train_timesteps,
+        train_timestep_indices=self.adapter.get_train_step_indices(),
         num_inference_steps=self.training_args.num_inference_steps,
     )
     # generate_samples() (BaseTrainer) switches the adapter to rollout mode,
@@ -296,7 +309,7 @@ rewards:
 ### How It Works
 
 ```python
-# src/flow_factory/trainers/grpo.py — GRPOTrainer.compute_advantages()
+# src/flow_factory/trainers/abc.py — BaseTrainer.compute_advantages()
 def compute_advantages(self, samples, rewards, store_to_samples=True, aggregation_func=None):
     # Thin wrapper: resolve the aggregation strategy, then delegate to
     # AdvantageProcessor (advantage/advantage_processor.py). The processor is
@@ -351,7 +364,8 @@ train:
 Stages 4–5 run in `prepare_feedback()` (reward buffer finalize, then `AdvantageProcessor`). Stage 6 is `optimize()` only:
 
 ```python
-# Stages 4–5 — src/flow_factory/trainers/grpo.py — GRPOTrainer.prepare_feedback()
+# Stages 4-5 - src/flow_factory/trainers/abc.py - BaseTrainer.prepare_feedback()
+# (concrete; a distillation trainer such as diffusion-opd overrides it to a no-op)
 def prepare_feedback(self, samples):
     rewards = self.reward_buffer.finalize(store_to_samples=True, split='all')
     self.compute_advantages(samples, rewards, store_to_samples=True)
@@ -399,6 +413,117 @@ def optimize(self, samples):
 | **DGPO** | Samples fresh timesteps via `TimeSampler`; applies group-level preference objective with optional PPO clipping and EMA-reference KL |
 | **CRD** | Samples fresh timesteps; reward distillation against CFG-guided teacher with adaptive KL; old/sampling model snapshots and centered advantages |
 | **DPO** | Preference loss on chosen/rejected pairs; pairs formed at the start of `optimize` after advantages |
+
+### Optimizer Configuration
+
+One optimizer root is built for the whole run, with one parameter group per trainable
+variant. Declare them in the top-level `optimizers:` section, one entry per variant,
+resolved by name; a single-policy algorithm has exactly one, which every shipped
+example writes as `name: default`:
+
+```yaml
+optimizers:
+  - name: generator
+    optimizer: muon
+    learning_rate: 2.0e-5
+  - name: fake
+    optimizer: adamw
+    learning_rate: 1.0e-5
+    update_frequency: 5
+```
+
+Omitting the section entirely still works: the flat `train.learning_rate`,
+`adam_betas`, `adam_weight_decay` and `adam_epsilon` fields are translated once, in
+`Arguments.__post_init__`, into the same single default entry. That shorthand is kept
+for backward compatibility, but new configs should be explicit.
+
+`max_grad_norm` belongs to the optimizer entry, not to `train:`. It is a property of
+one optimization problem: roles already take different learning rates, and nothing
+requires their clip budgets to match. A single-policy run is the N=1 case where the
+two spellings coincide. When `optimizers:` is declared the entry owns the value and
+it is mirrored onto `training_args.max_grad_norm`, so the shared gradient step reads
+one resolved number and the two can never disagree.
+
+Backends honor it differently, which is worth knowing when a clip appears to have no
+effect. DDP applies it per call. FSDP2 applies it through DTensor-aware clipping.
+DeepSpeed clips inside its own engine and ignores the value handed to
+`accelerator.clip_grad_norm_`, which only reports the resulting norm, so the
+threshold is published to the plugin through `ACCELERATE_GRADIENT_CLIPPING` before
+the Accelerator is built.
+
+### Frozen Component Precision
+
+`model.frozen_parameters_dtype` accepts either one dtype for every frozen
+component or a selector mapping:
+
+```yaml
+model:
+  frozen_parameters_dtype:
+    default: null       # Preserve checkpoint dtype when no selector matches.
+    transformers: bf16  # Component group override.
+    vae: fp32           # Concrete component override.
+```
+
+Concrete component names take priority over the `transformers` and
+`text_encoders` groups, which take priority over `default`. A null value at any
+level preserves that component's loaded checkpoint dtype. The scalar form
+(`frozen_parameters_dtype: bf16`) remains shorthand for applying one dtype to
+every frozen component.
+
+FSDP2 still gives every trainable component a uniform FP32 original/master dtype;
+its configured mixed-precision policy determines compute dtype. Component
+selectors control non-trainable components under FSDP2 and frozen parameters
+inside target components on backends that preserve original parameters.
+
+### Variant Memory Placement
+
+Component variants are optimizer-owned live parameters, not disposable model
+copies. Once `accelerator.prepare()` has run, do **not** call `.to("cpu")`,
+`off_load_components()`, or a custom offload/onload routine on an individual
+trainable variant:
+
+- DDP reducer hooks are bound to the prepared parameter devices.
+- FSDP1 `FlatParameter` and FSDP2 `DTensor` placement belong to the sharded root.
+- DeepSpeed ZeRO owns parameter partitions and optimizer state placement.
+
+This also applies while a role is inactive in a multi-role phase. “Inactive” only
+means that its optimizer groups and gradients are hidden for that phase; its
+parameters still belong to the prepared root. Flow-Factory intentionally exposes no
+`offload_variant()` / `onload_variant()` API because moving those parameters would
+invalidate reducer hooks, optimizer identities, or shards.
+
+The supported memory controls are:
+
+| State | Supported placement |
+|---|---|
+| Text/image/audio encoders and VAE outside the prepared root | `on_load_components()` / `off_load_components()` lifecycle |
+| Legacy named parameter snapshots | `add_named_parameters(..., device="cpu")`; copied into live parameters only inside their use context |
+| Sampling EMA | `train.ema_device: cpu` or `cuda` |
+| Variant-local EMA snapshots | Kept on the owning variant's device; no manual move API |
+| Rollout samples | `train.offload_samples_to_cpu: true` |
+| Prepared full/LoRA variants and optimizer state | Backend-managed DDP/FSDP/ZeRO placement only |
+
+For whole-root CPU offload, configure the FSDP or DeepSpeed backend rather than
+moving one role manually. CPU snapshots reduce persistent VRAM but add a synchronous
+copy whenever installed; use them for infrequent teacher/reference passes, not as a
+per-layer streaming mechanism.
+
+`optimizer` selects both the
+implementation and the argument schema (`hparams/optimizer_args/`), so AdamW and Muon
+hyperparameters never share a class:
+
+| Optimizer | Own fields |
+|---|---|
+| `adamw` | `betas`, `eps` |
+| `muon` | `momentum`, `nesterov`, `ns_coefficients`, `ns_steps`, `adjust_lr_fn`, `fallback_betas`, `fallback_eps` |
+
+`torch.optim.Muon` orthogonalizes matrices and rejects any parameter that is not 2D,
+so a Muon variant is driven by two algorithms at once: Muon for its matrices and
+AdamW for its biases, normalization scales and embeddings, which the `fallback_`
+fields configure. `optimizer/loader.py` wraps that pair in a `CompositeOptimizer` so
+the framework still prepares exactly one root. An all-AdamW run gets a plain
+`torch.optim.AdamW`, unchanged. Muon combined with DeepSpeed is refused at startup as
+unverified; use DDP or FSDP.
 
 ### Key Points
 

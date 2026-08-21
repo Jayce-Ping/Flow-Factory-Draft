@@ -15,59 +15,63 @@
 # src/flow_factory/models/qwen_image/qwen_image_edit_plus.py
 from __future__ import annotations
 
-import os
-from typing import Union, List, Dict, Any, Optional, Tuple, Literal, ClassVar
-from dataclasses import dataclass
 import logging
 import math
+import os
 from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
-from PIL import Image
 import torch
-from torch.nn.utils.rnn import pad_sequence
 from accelerate import Accelerator
-import diffusers
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus import QwenImageEditPlusPipeline
 from diffusers.utils.torch_utils import randn_tensor
+from PIL import Image
+from torch.nn.utils.rnn import pad_sequence
 
-from ..abc import BaseAdapter
-from ._utils import _pad_seq_dim
-from ...samples import I2ISample
+import diffusers
+
 from ...hparams import *
+from ...samples import I2ISample
 from ...scheduler import (
     FlowMatchEulerDiscreteSDEScheduler,
     FlowMatchEulerDiscreteSDESchedulerOutput,
     SDESchedulerOutput,
-    set_scheduler_timesteps
+    set_scheduler_timesteps,
 )
-from ...utils.logger_utils import setup_logger
 from ...utils.base import filter_kwargs
-from ...utils.imports import is_version_at_least
 from ...utils.image import (
-    ImageSingle,
     ImageBatch,
+    ImageSingle,
     MultiImageBatch,
     is_image,
     is_image_batch,
     is_multi_image_batch,
     standardize_image_batch,
 )
+from ...utils.imports import is_version_at_least
+from ...utils.logger_utils import setup_logger
 from ...utils.trajectory_collector import (
-    TrajectoryCollector,
     CallbackCollector,
-    TrajectoryIndicesType, 
-    create_trajectory_collector,
+    TrajectoryCollector,
+    TrajectoryIndicesType,
     create_callback_collector,
+    create_trajectory_collector,
 )
+from ..abc import BaseAdapter
+from ._utils import _pad_seq_dim
+
 logger = setup_logger(__name__)
 
 CONDITION_IMAGE_SIZE = (1024, 1024)
 CONDITION_IMAGE_SIZE_FOR_ENCODE = (384, 384)
 
+
 @dataclass
 class QwenImageEditPlusSample(I2ISample):
     """Output class for Qwen-Image-Edit Plus model"""
+
     # Class vars
     _shared_fields: ClassVar[frozenset[str]] = frozenset({})
     # Obj vars
@@ -76,8 +80,11 @@ class QwenImageEditPlusSample(I2ISample):
     img_shapes: Optional[List[Tuple[int, int, int]]] = None
     image_latents: Optional[torch.Tensor] = None
 
+
 def retrieve_latents(
-    encoder_output: torch.Tensor, generator: Optional[torch.Generator] = None, sample_mode: str = "sample"
+    encoder_output: torch.Tensor,
+    generator: Optional[torch.Generator] = None,
+    sample_mode: str = "sample",
 ):
     if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
         return encoder_output.latent_dist.sample(generator)
@@ -99,6 +106,7 @@ def calculate_dimensions(target_area, ratio):
 
     return width, height
 
+
 class QwenImageEditPlusAdapter(BaseAdapter):
     """Adapter for Qwen-Image-Edit Plus text-to-image models."""
 
@@ -107,7 +115,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
     ddp_find_unused_parameters = True
     supports_diffusers_cache = True
 
-    def __init__(self, config: Arguments, accelerator : Accelerator):
+    def __init__(self, config: Arguments, accelerator: Accelerator):
         if not is_version_at_least("diffusers", "0.37.0"):
             raise ImportError(
                 "QwenImageEditPlusAdapter requires diffusers>=0.37.0 (the "
@@ -126,24 +134,30 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         self._has_warned_forward_fallback = False
         self._has_warned_preprocess_fallback = False
         self._has_warned_inference_auto_resize = False
-    
+
     def load_pipeline(self) -> QwenImageEditPlusPipeline:
         return QwenImageEditPlusPipeline.from_pretrained(
-            self.model_args.model_name_or_path,
-            low_cpu_mem_usage=False
+            self.model_args.model_name_or_path, low_cpu_mem_usage=False
         )
-    
+
     @property
     def default_target_modules(self) -> List[str]:
         """Default LoRA target modules for Qwen-Image-Edit-Plus transformer."""
         return [
             # Attention
-            "to_q", "to_k", "to_v", "to_out.0",
-            "add_q_proj", "add_k_proj", "add_v_proj", "to_add_out",
+            "to_q",
+            "to_k",
+            "to_v",
+            "to_out.0",
+            "add_q_proj",
+            "add_k_proj",
+            "add_v_proj",
+            "to_add_out",
             # MLP
-            "net.0.proj", "net.2"
+            "net.0.proj",
+            "net.2",
         ]
-    
+
     # ================================= Encoding and Decoding Methods ================================= #
 
     # ---------------------------------- Text Encoding ---------------------------------- #
@@ -151,14 +165,14 @@ class QwenImageEditPlusAdapter(BaseAdapter):
     def _standardize_image_input(
         self,
         images: Union[ImageSingle, ImageBatch],
-        output_type: Literal['pil', 'pt', 'np'] = 'pil',
+        output_type: Literal["pil", "pt", "np"] = "pil",
     ):
         """
         Standardize image input to desired output type.
         """
         if isinstance(images, Image.Image):
             images = [images]
-        
+
         images = standardize_image_batch(
             images,
             output_type=output_type,
@@ -177,7 +191,9 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         dtype = dtype or self.pipeline.text_encoder.dtype
         prompt = [prompt] if isinstance(prompt, str) else prompt
         img_prompt_template = "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
-        images = self._standardize_image_input(images, output_type='pil') if images is not None else None
+        images = (
+            self._standardize_image_input(images, output_type="pil") if images is not None else None
+        )
         if isinstance(images, list):
             base_img_prompt = ""
             for i, img in enumerate(images):
@@ -209,12 +225,19 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         )
 
         hidden_states = outputs.hidden_states[-1]
-        split_hidden_states = self.pipeline._extract_masked_hidden(hidden_states, model_inputs.attention_mask)
+        split_hidden_states = self.pipeline._extract_masked_hidden(
+            hidden_states, model_inputs.attention_mask
+        )
         split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
-        attn_mask_list = [torch.ones(e.size(0), dtype=torch.long, device=e.device) for e in split_hidden_states]
+        attn_mask_list = [
+            torch.ones(e.size(0), dtype=torch.long, device=e.device) for e in split_hidden_states
+        ]
         max_seq_len = max([e.size(0) for e in split_hidden_states])
         prompt_embeds = torch.stack(
-            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))]) for u in split_hidden_states]
+            [
+                torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))])
+                for u in split_hidden_states
+            ]
         )
         encoder_attention_mask = torch.stack(
             [torch.cat([u, u.new_zeros(max_seq_len - u.size(0))]) for u in attn_mask_list]
@@ -222,17 +245,16 @@ class QwenImageEditPlusAdapter(BaseAdapter):
 
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
 
-        input_ids = input_ids[:, drop_idx:] # Extract only user input ids
+        input_ids = input_ids[:, drop_idx:]  # Extract only user input ids
 
         return input_ids, prompt_embeds, encoder_attention_mask
-    
 
     def encode_prompt(
         self,
         prompt: Union[str, List[str]],
         negative_prompt: Optional[Union[str, List[str]]] = None,
         guidance_scale: float = 4.0,
-        images : Optional[Union[ImageSingle, ImageBatch]] = None,
+        images: Optional[Union[ImageSingle, ImageBatch]] = None,
         max_sequence_length: int = 1024,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
@@ -251,7 +273,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
             images=images,
             device=device,
             dtype=dtype,
-            max_sequence_length=max_sequence_length
+            max_sequence_length=max_sequence_length,
         )
         prompt_embeds = prompt_embeds[:, :max_sequence_length]
         prompt_embeds_mask = prompt_embeds_mask[:, :max_sequence_length]
@@ -264,34 +286,46 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         # Encode negative prompt
         if do_classifier_free_guidance:
             negative_prompt = negative_prompt or ""
-            negative_prompt = [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
-            negative_prompt = negative_prompt * (len(prompt) // len(negative_prompt)) # Expand to match batch size
-            assert len(negative_prompt) == len(prompt), "The number of negative prompts must match the number of prompts."
-            negative_prompt_ids, negative_prompt_embeds, negative_prompt_embeds_mask = self._get_qwen_prompt_embeds(
-                prompt=negative_prompt,
-                images=images,
-                device=device,
-                dtype=dtype,
-                max_sequence_length=max_sequence_length
+            negative_prompt = (
+                [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
             )
-            results.update({
-                "negative_prompt_ids": negative_prompt_ids,
-                "negative_prompt_embeds": negative_prompt_embeds[:, :max_sequence_length],
-                "negative_prompt_embeds_mask": negative_prompt_embeds_mask[:, :max_sequence_length],
-            })
+            negative_prompt = negative_prompt * (
+                len(prompt) // len(negative_prompt)
+            )  # Expand to match batch size
+            assert len(negative_prompt) == len(
+                prompt
+            ), "The number of negative prompts must match the number of prompts."
+            negative_prompt_ids, negative_prompt_embeds, negative_prompt_embeds_mask = (
+                self._get_qwen_prompt_embeds(
+                    prompt=negative_prompt,
+                    images=images,
+                    device=device,
+                    dtype=dtype,
+                    max_sequence_length=max_sequence_length,
+                )
+            )
+            results.update(
+                {
+                    "negative_prompt_ids": negative_prompt_ids,
+                    "negative_prompt_embeds": negative_prompt_embeds[:, :max_sequence_length],
+                    "negative_prompt_embeds_mask": negative_prompt_embeds_mask[
+                        :, :max_sequence_length
+                    ],
+                }
+            )
 
         return results
-    
+
     # ---------------------------------------- Image Encoding ---------------------------------- #
 
     def _preprocess_condition_images(
         self,
         images: Union[ImageBatch, List[ImageBatch]],
-        condition_image_size : Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
-        generator : Optional[torch.Generator] = None,
+        condition_image_size: Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
+        generator: Optional[torch.Generator] = None,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
-    ) -> Dict[str, Union[torch.Tensor, List[torch.Tensor], List[Tuple[int, int]]]]: 
+    ) -> Dict[str, Union[torch.Tensor, List[torch.Tensor], List[Tuple[int, int]]]]:
         """
         Preprocess condition images and prepare image latents.
         The input requires `multiple condition images` used to generate one image.
@@ -316,8 +350,10 @@ class QwenImageEditPlusAdapter(BaseAdapter):
             condition_image_size = (condition_image_size, condition_image_size)
 
         condition_image_max_area = condition_image_size[0] * condition_image_size[1]
-        condition_image_for_encode_max_area = CONDITION_IMAGE_SIZE_FOR_ENCODE[0] * CONDITION_IMAGE_SIZE_FOR_ENCODE[1]
-        images = self._standardize_image_input(images, output_type='pil')
+        condition_image_for_encode_max_area = (
+            CONDITION_IMAGE_SIZE_FOR_ENCODE[0] * CONDITION_IMAGE_SIZE_FOR_ENCODE[1]
+        )
+        images = self._standardize_image_input(images, output_type="pil")
 
         condition_image_sizes = []
         condition_images = []
@@ -337,10 +373,16 @@ class QwenImageEditPlusAdapter(BaseAdapter):
             )
             condition_image_sizes.append((condition_width, condition_height))
             vae_image_sizes.append((vae_width, vae_height))
-            condition_image = self.pipeline.image_processor.resize(img, condition_height, condition_width)
-            condition_image = self._standardize_image_input(condition_image, output_type='pt')[0] # Convert to tensor (C, H, W)
+            condition_image = self.pipeline.image_processor.resize(
+                img, condition_height, condition_width
+            )
+            condition_image = self._standardize_image_input(condition_image, output_type="pt")[
+                0
+            ]  # Convert to tensor (C, H, W)
             condition_images.append(condition_image)
-            vae_images.append(self.pipeline.image_processor.preprocess(img, vae_height, vae_width).unsqueeze(2)) # (1, C, 1, H, W)
+            vae_images.append(
+                self.pipeline.image_processor.preprocess(img, vae_height, vae_width).unsqueeze(2)
+            )  # (1, C, 1, H, W)
 
         num_channels_latents = self.pipeline.transformer.config.in_channels // 4
         image_latents = self.prepare_image_latents(
@@ -352,18 +394,18 @@ class QwenImageEditPlusAdapter(BaseAdapter):
             generator=generator,
         )
         return {
-            "condition_images": condition_images, # List[tensor(C, H, W)]
-            "condition_image_sizes": condition_image_sizes, # List[Tuple[int, int]]
-            "vae_images": vae_images, # List[tensor(1, C, 1, H, W)]
-            "vae_image_sizes": vae_image_sizes, # List[Tuple[int, int]]
-            'image_latents': image_latents, # tensor(1, seq_len_total, C)
+            "condition_images": condition_images,  # List[tensor(C, H, W)]
+            "condition_image_sizes": condition_image_sizes,  # List[Tuple[int, int]]
+            "vae_images": vae_images,  # List[tensor(1, C, 1, H, W)]
+            "vae_image_sizes": vae_image_sizes,  # List[Tuple[int, int]]
+            "image_latents": image_latents,  # tensor(1, seq_len_total, C)
         }
-        
+
     def encode_image(
         self,
         images: Union[ImageBatch, List[ImageBatch]],
-        condition_image_size : Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
-        generator : Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        condition_image_size: Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
     ) -> Dict[str, List[Union[torch.Tensor, List[torch.Tensor], List[Tuple[int, int]]]]]:
@@ -403,14 +445,14 @@ class QwenImageEditPlusAdapter(BaseAdapter):
 
     def prepare_image_latents(
         self,
-        images : Union[ImageSingle, ImageBatch],
-        batch_size : int,
-        num_channels_latents : int,
-        dtype : torch.dtype,
-        device : torch.device,
-        generator : Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        images: Union[ImageSingle, ImageBatch],
+        batch_size: int,
+        num_channels_latents: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
     ) -> torch.Tensor:
-        images = self._standardize_image_input(images, 'pt')
+        images = self._standardize_image_input(images, "pt")
 
         all_image_latents = []
         for image in images:
@@ -432,25 +474,28 @@ class QwenImageEditPlusAdapter(BaseAdapter):
 
             image_latent_height, image_latent_width = image_latents.shape[3:]
             image_latents = self.pipeline._pack_latents(
-                image_latents, batch_size, num_channels_latents, image_latent_height, image_latent_width
+                image_latents,
+                batch_size,
+                num_channels_latents,
+                image_latent_height,
+                image_latent_width,
             )
             all_image_latents.append(image_latents)
         image_latents = torch.cat(all_image_latents, dim=1)
         return image_latents
 
-
     def prepare_latents(
         self,
-        batch_size : int,
-        num_channels_latents : int,
-        height : int,
-        width : int,
-        dtype : torch.dtype,
-        device : torch.device,
-        generator : Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        latents : Optional[torch.Tensor] = None,
-        images : Optional[Union[ImageSingle, ImageBatch]] = None,
-        image_latents : Optional[torch.Tensor] = None,
+        batch_size: int,
+        num_channels_latents: int,
+        height: int,
+        width: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents: Optional[torch.Tensor] = None,
+        images: Optional[Union[ImageSingle, ImageBatch]] = None,
+        image_latents: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # VAE applies 8x compression on images but we must also account for packing which requires
         # latent height and width to be divisible by 2.
@@ -476,7 +521,9 @@ class QwenImageEditPlusAdapter(BaseAdapter):
             )
         if latents is None:
             latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-            latents = self.pipeline._pack_latents(latents, batch_size, num_channels_latents, height, width)
+            latents = self.pipeline._pack_latents(
+                latents, batch_size, num_channels_latents, height, width
+            )
         else:
             latents = latents.to(device=device, dtype=dtype)
 
@@ -488,19 +535,27 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         pass
 
     # ---------------------------------------- Image Decoding ---------------------------------- #
-    def decode_latents(self, latents: torch.Tensor, height: int, width: int, output_type: Literal['pil', 'pt', 'np'] = 'pil') -> List[Image.Image]:
+    def decode_latents(
+        self,
+        latents: torch.Tensor,
+        height: int,
+        width: int,
+        output_type: Literal["pil", "pt", "np"] = "pil",
+    ) -> List[Image.Image]:
         """Decode latents to images using VAE."""
-        
-        latents = self.pipeline._unpack_latents(latents, height, width, self.pipeline.vae_scale_factor)
+
+        latents = self.pipeline._unpack_latents(
+            latents, height, width, self.pipeline.vae_scale_factor
+        )
         latents = latents.to(self.pipeline.vae.dtype)
         latents_mean = (
             torch.tensor(self.pipeline.vae.config.latents_mean)
             .view(1, self.pipeline.vae.config.z_dim, 1, 1, 1)
             .to(latents.device, latents.dtype)
         )
-        latents_std = 1.0 / torch.tensor(self.pipeline.vae.config.latents_std).view(1, self.pipeline.vae.config.z_dim, 1, 1, 1).to(
-            latents.device, latents.dtype
-        )
+        latents_std = 1.0 / torch.tensor(self.pipeline.vae.config.latents_std).view(
+            1, self.pipeline.vae.config.z_dim, 1, 1, 1
+        ).to(latents.device, latents.dtype)
         latents = latents / latents_std + latents_mean
         images = self.pipeline.vae.decode(latents, return_dict=False)[0][:, :, 0]
         images = self.pipeline.image_processor.postprocess(images, output_type=output_type)
@@ -513,9 +568,9 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         prompt: List[str],
         images: MultiImageBatch,
         negative_prompt: Optional[List[str]] = None,
-        condition_image_size : Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
+        condition_image_size: Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
         max_sequence_length: int = 1024,
-        generator : Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
     ) -> Dict[str, List[Any]]:
         """Preprocess data samples for Qwen-Image-Edit Plus model training or evaluation.
 
@@ -527,7 +582,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         batch_size = len(prompt)
         is_nested_batch = is_multi_image_batch(images)
         if not is_nested_batch:
-            images = [images] * batch_size # Duplicate for each prompt
+            images = [images] * batch_size  # Duplicate for each prompt
 
         results = defaultdict(list)
         encoded_images = self.encode_image(
@@ -541,29 +596,30 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         for i in range(batch_size):
             encoded_prompts = self.encode_prompt(
                 prompt=prompt[i],
-                negative_prompt=negative_prompt[i] if isinstance(negative_prompt, list) else negative_prompt,
-                images=results['condition_images'][i],
+                negative_prompt=(
+                    negative_prompt[i] if isinstance(negative_prompt, list) else negative_prompt
+                ),
+                images=results["condition_images"][i],
                 max_sequence_length=max_sequence_length,
             )
             for k, v in encoded_prompts.items():
                 if isinstance(v, torch.Tensor):
-                    v = list(v.unbind(0)) # Convert to a list for ragged case
+                    v = list(v.unbind(0))  # Convert to a list for ragged case
                 results[k].extend(v)
 
         return results
 
-
     # ======================== Padding Utilities ========================
     def _standardize_data(
         self,
-        data : Union[None, torch.Tensor, List[torch.Tensor]],
-        padding_value : Union[int, float],
+        data: Union[None, torch.Tensor, List[torch.Tensor]],
+        padding_value: Union[int, float],
         device: Optional[torch.device] = None,
         max_len: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
-        if data is None: 
+        if data is None:
             return None
-        
+
         # If data is a list (ragged), pad it into a batch tensor first
         if isinstance(data, list):
             # Ensure data is on the correct device before padding
@@ -572,7 +628,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
             data = pad_sequence(data, batch_first=True, padding_value=padding_value)
         else:
             data = data.to(device)
-        
+
         return data[:, :max_len] if data.shape[1] > max_len else data
 
     def _pad_batch_prompt(
@@ -580,7 +636,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         prompt_embeds_mask: Union[List[torch.Tensor], torch.Tensor],
         prompt_embeds: Optional[Union[List[torch.Tensor], torch.Tensor]] = None,
         prompt_ids: Optional[Union[List[torch.Tensor], torch.Tensor]] = None,
-        device : Optional[torch.device] = None,
+        device: Optional[torch.device] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         if isinstance(prompt_embeds_mask, list):
             device = device or prompt_embeds_mask[0].device
@@ -590,7 +646,11 @@ class QwenImageEditPlusAdapter(BaseAdapter):
             max_pos_len = max(1, int(prompt_embeds_mask.sum(dim=1).max()))
 
         if prompt_ids is not None:
-            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+            pad_token_id = (
+                self.tokenizer.pad_token_id
+                if self.tokenizer.pad_token_id is not None
+                else self.tokenizer.eos_token_id
+            )
             padded_prompt_ids = self._standardize_data(
                 prompt_ids,
                 padding_value=pad_token_id,
@@ -617,7 +677,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
             max_len=max_pos_len,
         )
         return padded_prompt_embeds_mask, padded_prompt_embeds, padded_prompt_ids
-    
+
     # ======================== Sampling / Inference ========================
     # Handle one sample
     @torch.no_grad()
@@ -628,7 +688,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         prompt: Optional[Union[List[str], str]] = None,
         negative_prompt: Optional[Union[List[str], str]] = None,
         num_inference_steps: int = 50,
-        guidance_scale: float = 4.0, # Corresponds to `true_cfg_scale` in Qwen-Image-Edit-Plus-Pipeline.
+        guidance_scale: float = 4.0,  # Corresponds to `true_cfg_scale` in Qwen-Image-Edit-Plus-Pipeline.
         height: int = 1024,
         width: int = 1024,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -638,7 +698,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         prompt_embeds_mask: Optional[torch.Tensor] = None,
         negative_prompt_ids: Optional[torch.Tensor] = None,
         negative_prompt_embeds: Optional[torch.Tensor] = None,
-        negative_prompt_embeds_mask: Optional[torch.Tensor] = None,        
+        negative_prompt_embeds_mask: Optional[torch.Tensor] = None,
         # Image encoding arguments
         condition_images: Optional[Union[ImageSingle, ImageBatch]] = None,
         condition_image_sizes: Optional[List[Tuple[int, int]]] = None,
@@ -646,25 +706,33 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         vae_image_sizes: Optional[List[Tuple[int, int]]] = None,
         image_latents: Optional[torch.Tensor] = None,
         # Other arguments
-        condition_image_size : Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
+        condition_image_size: Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
         attention_kwargs: Optional[Dict[str, Any]] = {},
         max_sequence_length: int = 1024,
         compute_log_prob: bool = False,
-        auto_resize : bool = True,
+        auto_resize: bool = True,
         # Callback arguments
         extra_call_back_kwargs: List[str] = [],
-        trajectory_indices: TrajectoryIndicesType = 'all',
+        trajectory_indices: TrajectoryIndicesType = "all",
     ) -> List[QwenImageEditPlusSample]:
         """Generate images using Qwen-Image-Edit Plus model."""
         # 1. Set up
         # Determine height and width. Encoded `condition_images` is prioritized than raw input `images`
         detemine_size_images = condition_images if condition_images is not None else images
-        detemine_size_images = self._standardize_image_input(detemine_size_images, output_type='pil') if detemine_size_images is not None else None
+        detemine_size_images = (
+            self._standardize_image_input(detemine_size_images, output_type="pil")
+            if detemine_size_images is not None
+            else None
+        )
         if detemine_size_images is not None and auto_resize:
             # Auto resize the output image to fit the input image's aspect ratio (use the last condition image)
             image_size = detemine_size_images[-1].size
-            calculated_width, calculated_height = calculate_dimensions(height * width, image_size[1] / image_size[0])
-            if (calculated_height != height or calculated_width != width) and not self._has_warned_inference_auto_resize:
+            calculated_width, calculated_height = calculate_dimensions(
+                height * width, image_size[1] / image_size[0]
+            )
+            if (
+                calculated_height != height or calculated_width != width
+            ) and not self._has_warned_inference_auto_resize:
                 self._has_warned_inference_auto_resize = True
                 logger.warning(
                     f"Auto-resizing output from ({height}, {width}) to ({calculated_height}, {calculated_width}) "
@@ -699,9 +767,11 @@ class QwenImageEditPlusAdapter(BaseAdapter):
             )
 
         # 2. Preprocess images
-        if (
-            images is not None
-            and (condition_images is None or vae_images is None or condition_image_sizes is None or vae_image_sizes is None)
+        if images is not None and (
+            condition_images is None
+            or vae_images is None
+            or condition_image_sizes is None
+            or vae_image_sizes is None
         ):
             # Process multiple condition images
             encoded_images = self._preprocess_condition_images(
@@ -715,18 +785,22 @@ class QwenImageEditPlusAdapter(BaseAdapter):
             condition_image_sizes = encoded_images["condition_image_sizes"]
             vae_images = encoded_images["vae_images"]
             vae_image_sizes = encoded_images["vae_image_sizes"]
-            image_latents = encoded_images['image_latents']
+            image_latents = encoded_images["image_latents"]
         else:
-            condition_images = self._standardize_image_input(condition_images, output_type='pt') if condition_images is not None else None
+            condition_images = (
+                self._standardize_image_input(condition_images, output_type="pt")
+                if condition_images is not None
+                else None
+            )
             if isinstance(vae_images, torch.Tensor):
                 vae_images = list(vae_images.unbind(0))
             vae_images = [img.to(device) for img in vae_images]
             image_latents = image_latents.to(device) if image_latents is not None else None
-        
+
         # 3. Encode prompts
-        if (
-            (prompt is not None and (prompt_embeds is None or prompt_embeds_mask is None))
-            or (negative_prompt is not None and (negative_prompt_embeds is None or negative_prompt_embeds_mask is None))
+        if (prompt is not None and (prompt_embeds is None or prompt_embeds_mask is None)) or (
+            negative_prompt is not None
+            and (negative_prompt_embeds is None or negative_prompt_embeds_mask is None)
         ):
             encoded = self.encode_prompt(
                 prompt=prompt,
@@ -743,16 +817,31 @@ class QwenImageEditPlusAdapter(BaseAdapter):
             negative_prompt_embeds = encoded.get("negative_prompt_embeds", None)
             negative_prompt_embeds_mask = encoded.get("negative_prompt_embeds_mask", None)
         else:
-            prompt_embeds = [p.to(device) for p in prompt_embeds] if isinstance(prompt_embeds, list) else prompt_embeds.to(device)
-            prompt_embeds_mask = [p.to(device) for p in prompt_embeds_mask] if isinstance(prompt_embeds_mask, list) else prompt_embeds_mask.to(device)
+            prompt_embeds = (
+                [p.to(device) for p in prompt_embeds]
+                if isinstance(prompt_embeds, list)
+                else prompt_embeds.to(device)
+            )
+            prompt_embeds_mask = (
+                [p.to(device) for p in prompt_embeds_mask]
+                if isinstance(prompt_embeds_mask, list)
+                else prompt_embeds_mask.to(device)
+            )
             if negative_prompt_embeds is not None:
-                negative_prompt_embeds = [p.to(device) for p in negative_prompt_embeds] if isinstance(negative_prompt_embeds, list) else negative_prompt_embeds.to(device)
+                negative_prompt_embeds = (
+                    [p.to(device) for p in negative_prompt_embeds]
+                    if isinstance(negative_prompt_embeds, list)
+                    else negative_prompt_embeds.to(device)
+                )
             if negative_prompt_embeds_mask is not None:
-                negative_prompt_embeds_mask = [p.to(device) for p in negative_prompt_embeds_mask] if isinstance(negative_prompt_embeds_mask, list) else negative_prompt_embeds_mask.to(device)
-
+                negative_prompt_embeds_mask = (
+                    [p.to(device) for p in negative_prompt_embeds_mask]
+                    if isinstance(negative_prompt_embeds_mask, list)
+                    else negative_prompt_embeds_mask.to(device)
+                )
 
         batch_size = len(prompt_embeds)
-        
+
         # 4. Prepare latents
         num_channels_latents = self.pipeline.transformer.config.in_channels // 4
         latents, image_latents = self.prepare_latents(
@@ -768,14 +857,21 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         )
         img_shapes = [
             [
-                (1, height // self.pipeline.vae_scale_factor // 2, width // self.pipeline.vae_scale_factor // 2),
+                (
+                    1,
+                    height // self.pipeline.vae_scale_factor // 2,
+                    width // self.pipeline.vae_scale_factor // 2,
+                ),
                 *[
-                    (1, vae_height // self.pipeline.vae_scale_factor // 2, vae_width // self.pipeline.vae_scale_factor // 2)
+                    (
+                        1,
+                        vae_height // self.pipeline.vae_scale_factor // 2,
+                        vae_width // self.pipeline.vae_scale_factor // 2,
+                    )
                     for vae_width, vae_height in vae_image_sizes
                 ],
             ]
         ] * batch_size
-
 
         # 5. Set scheduler timesteps
         timesteps = set_scheduler_timesteps(
@@ -790,13 +886,17 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         latents = self.cast_latents(latents, default_dtype=dtype)
         latent_collector.collect(latents, step_idx=0)
         if compute_log_prob:
-            log_prob_collector = create_trajectory_collector(trajectory_indices, num_inference_steps)
+            log_prob_collector = create_trajectory_collector(
+                trajectory_indices, num_inference_steps
+            )
         callback_collector = create_callback_collector(trajectory_indices, num_inference_steps)
 
         for i, t in enumerate(timesteps):
             current_noise_level = self.scheduler.get_noise_level_for_timestep(t)
             t_next = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
-            return_kwargs = list(set(['next_latents', 'log_prob', 'velocity'] + extra_call_back_kwargs))
+            return_kwargs = list(
+                set(["next_latents", "log_prob", "velocity"] + extra_call_back_kwargs)
+            )
             current_compute_log_prob = compute_log_prob and current_noise_level > 0
 
             output = self._forward(
@@ -825,32 +925,42 @@ class QwenImageEditPlusAdapter(BaseAdapter):
                 step_idx=i,
                 output=output,
                 keys=extra_call_back_kwargs,
-                capturable={'noise_level': current_noise_level},
+                capturable={"noise_level": current_noise_level},
             )
 
         # 7. Post-process results
-        generated_images = self.decode_latents(latents, height, width, output_type='pt')
+        generated_images = self.decode_latents(latents, height, width, output_type="pt")
 
         # 8. Collect results for each sample in the batch
-        extra_call_back_res = callback_collector.get_result()          # (B, len(trajectory_indices), ...)
-        callback_index_map = callback_collector.get_index_map()        # (T,) LongTensor
-        all_latents = latent_collector.get_result()                    # List[torch.Tensor(B, ...)]
-        latent_index_map = latent_collector.get_index_map()            # (T+1,) LongTensor
+        extra_call_back_res = callback_collector.get_result()  # (B, len(trajectory_indices), ...)
+        callback_index_map = callback_collector.get_index_map()  # (T,) LongTensor
+        all_latents = latent_collector.get_result()  # List[torch.Tensor(B, ...)]
+        latent_index_map = latent_collector.get_index_map()  # (T+1,) LongTensor
         all_log_probs = log_prob_collector.get_result() if compute_log_prob else None
         log_prob_index_map = log_prob_collector.get_index_map() if compute_log_prob else None
         samples = [
             QwenImageEditPlusSample(
                 # Denoising trajectory
                 timesteps=timesteps,
-                all_latents=torch.stack([lat[b] for lat in all_latents], dim=0) if all_latents is not None else None,
-                log_probs=torch.stack([lp[b] for lp in all_log_probs], dim=0) if all_log_probs is not None else None,
+                all_latents=(
+                    torch.stack([lat[b] for lat in all_latents], dim=0)
+                    if all_latents is not None
+                    else None
+                ),
+                log_probs=(
+                    torch.stack([lp[b] for lp in all_log_probs], dim=0)
+                    if all_log_probs is not None
+                    else None
+                ),
                 latent_index_map=latent_index_map,
                 log_prob_index_map=log_prob_index_map,
                 # Generated image
                 image=generated_images[b],
                 # Condition images
                 image_latents=image_latents[b] if image_latents is not None else None,
-                condition_images=condition_images if condition_images is not None else None, # No Batch dimension yet
+                condition_images=(
+                    condition_images if condition_images is not None else None
+                ),  # No Batch dimension yet
                 img_shapes=img_shapes[b],
                 # Prompt
                 prompt=prompt[b] if isinstance(prompt, list) else prompt,
@@ -858,14 +968,24 @@ class QwenImageEditPlusAdapter(BaseAdapter):
                 prompt_embeds=prompt_embeds[b],
                 prompt_embeds_mask=prompt_embeds_mask[b],
                 # Negative Prompt
-                negative_prompt=negative_prompt[b] if isinstance(negative_prompt, list) else negative_prompt,
-                negative_prompt_ids=negative_prompt_ids[b] if negative_prompt_ids is not None else None,
-                negative_prompt_embeds=negative_prompt_embeds[b] if negative_prompt_embeds is not None else None,
-                negative_prompt_embeds_mask=negative_prompt_embeds_mask[b] if negative_prompt_embeds_mask is not None else None,
+                negative_prompt=(
+                    negative_prompt[b] if isinstance(negative_prompt, list) else negative_prompt
+                ),
+                negative_prompt_ids=(
+                    negative_prompt_ids[b] if negative_prompt_ids is not None else None
+                ),
+                negative_prompt_embeds=(
+                    negative_prompt_embeds[b] if negative_prompt_embeds is not None else None
+                ),
+                negative_prompt_embeds_mask=(
+                    negative_prompt_embeds_mask[b]
+                    if negative_prompt_embeds_mask is not None
+                    else None
+                ),
                 # Extra kwargs
                 extra_kwargs={
                     **{k: v[b] for k, v in extra_call_back_res.items()},
-                    'callback_index_map': callback_index_map,
+                    "callback_index_map": callback_index_map,
                 },
             )
             for b in range(batch_size)
@@ -883,7 +1003,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         prompt: Optional[List[str]] = None,
         negative_prompt: Optional[List[str]] = None,
         num_inference_steps: int = 50,
-        guidance_scale: float = 4.0, # Corresponds to `true_cfg_scale` in Qwen-Image-Edit-Plus-Pipeline.
+        guidance_scale: float = 4.0,  # Corresponds to `true_cfg_scale` in Qwen-Image-Edit-Plus-Pipeline.
         height: int = 1024,
         width: int = 1024,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -893,32 +1013,49 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         prompt_embeds_mask: Optional[Union[List[torch.Tensor], torch.Tensor]] = None,
         negative_prompt_ids: Optional[Union[List[torch.Tensor], torch.Tensor]] = None,
         negative_prompt_embeds: Optional[Union[List[torch.Tensor], torch.Tensor]] = None,
-        negative_prompt_embeds_mask: Optional[Union[List[torch.Tensor], torch.Tensor]] = None,        
+        negative_prompt_embeds_mask: Optional[Union[List[torch.Tensor], torch.Tensor]] = None,
         # Image encoding arguments
-        condition_images: Optional[MultiImageBatch] = None, # A batch of condition image lists
-        condition_image_sizes: Optional[List[List[Tuple[int, int]]]] = None, # A batch of condition image size lists
-        vae_images: Optional[MultiImageBatch] = None, # A batch of VAE image lists
-        vae_image_sizes: Optional[List[List[Tuple[int, int]]]] = None, # A batch of VAE image size lists
-        image_latents: Optional[List[torch.Tensor]] = None, # A batch of image latents
+        condition_images: Optional[MultiImageBatch] = None,  # A batch of condition image lists
+        condition_image_sizes: Optional[
+            List[List[Tuple[int, int]]]
+        ] = None,  # A batch of condition image size lists
+        vae_images: Optional[MultiImageBatch] = None,  # A batch of VAE image lists
+        vae_image_sizes: Optional[
+            List[List[Tuple[int, int]]]
+        ] = None,  # A batch of VAE image size lists
+        image_latents: Optional[List[torch.Tensor]] = None,  # A batch of image latents
         # Other arguments
-        condition_image_size : Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
+        condition_image_size: Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
         attention_kwargs: Optional[Dict[str, Any]] = {},
         max_sequence_length: int = 1024,
         compute_log_prob: bool = False,
-        auto_resize : bool = True,
+        auto_resize: bool = True,
         extra_call_back_kwargs: List[str] = [],
-        trajectory_indices: TrajectoryIndicesType = 'all',
+        trajectory_indices: TrajectoryIndicesType = "all",
     ):
         """
         Batch inference, the input must be in the batch format
         """
         batch_size = (
-            len(images) if images is not None else
-            len(prompt) if prompt is not None else
-            len(prompt_ids) if prompt_ids is not None else 
-            len(prompt_embeds) if prompt_embeds is not None else
-            len(condition_images) if condition_images is not None else
-            len(vae_images) if vae_images is not None else 1
+            len(images)
+            if images is not None
+            else (
+                len(prompt)
+                if prompt is not None
+                else (
+                    len(prompt_ids)
+                    if prompt_ids is not None
+                    else (
+                        len(prompt_embeds)
+                        if prompt_embeds is not None
+                        else (
+                            len(condition_images)
+                            if condition_images is not None
+                            else len(vae_images) if vae_images is not None else 1
+                        )
+                    )
+                )
+            )
         )
 
         if batch_size > 1:
@@ -935,23 +1072,39 @@ class QwenImageEditPlusAdapter(BaseAdapter):
                 # Ordinary Args
                 images=images[b],
                 prompt=prompt[b] if isinstance(prompt, list) else prompt,
-                negative_prompt=negative_prompt[b] if isinstance(negative_prompt, list) else negative_prompt,
+                negative_prompt=(
+                    negative_prompt[b] if isinstance(negative_prompt, list) else negative_prompt
+                ),
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
                 height=height,
                 width=width,
                 generator=generator[b] if isinstance(generator, List) else generator,
                 # Encoded prompt
-                prompt_ids=prompt_ids[b:b+1] if prompt_ids is not None else None,
-                prompt_embeds=prompt_embeds[b:b+1] if prompt_embeds is not None else None,
-                prompt_embeds_mask=prompt_embeds_mask[b:b+1] if prompt_embeds_mask is not None else None,
+                prompt_ids=prompt_ids[b : b + 1] if prompt_ids is not None else None,
+                prompt_embeds=prompt_embeds[b : b + 1] if prompt_embeds is not None else None,
+                prompt_embeds_mask=(
+                    prompt_embeds_mask[b : b + 1] if prompt_embeds_mask is not None else None
+                ),
                 # Encoded negative prompt
-                negative_prompt_ids=negative_prompt_ids[b:b+1] if negative_prompt_ids is not None else None,
-                negative_prompt_embeds=negative_prompt_embeds[b:b+1] if negative_prompt_embeds is not None else None,
-                negative_prompt_embeds_mask=negative_prompt_embeds_mask[b:b+1] if negative_prompt_embeds_mask is not None else None,
+                negative_prompt_ids=(
+                    negative_prompt_ids[b : b + 1] if negative_prompt_ids is not None else None
+                ),
+                negative_prompt_embeds=(
+                    negative_prompt_embeds[b : b + 1]
+                    if negative_prompt_embeds is not None
+                    else None
+                ),
+                negative_prompt_embeds_mask=(
+                    negative_prompt_embeds_mask[b : b + 1]
+                    if negative_prompt_embeds_mask is not None
+                    else None
+                ),
                 # Encoded images
                 condition_images=condition_images[b] if condition_images is not None else None,
-                condition_image_sizes=condition_image_sizes[b] if condition_image_sizes is not None else None,
+                condition_image_sizes=(
+                    condition_image_sizes[b] if condition_image_sizes is not None else None
+                ),
                 vae_images=vae_images[b] if vae_images is not None else None,
                 vae_image_sizes=vae_image_sizes[b] if vae_image_sizes is not None else None,
                 image_latents=image_latents[b] if image_latents is not None else None,
@@ -989,7 +1142,14 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         noise_level: Optional[float] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
-        return_kwargs: List[str] = ['velocity', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
+        return_kwargs: List[str] = [
+            "velocity",
+            "next_latents",
+            "next_latents_mean",
+            "std_dev_t",
+            "dt",
+            "log_prob",
+        ],
     ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
         """
         Core forward pass handling both T2I and I2I.
@@ -1019,8 +1179,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         batch_size = latents.shape[0]
         timestep = t.expand(batch_size).to(latents.dtype)
         has_negative_prompt = (
-            negative_prompt_embeds is not None
-            and negative_prompt_embeds_mask is not None
+            negative_prompt_embeds is not None and negative_prompt_embeds_mask is not None
         )
         if guidance_scale > 1.0 and not has_negative_prompt:
             logger.warning(
@@ -1034,16 +1193,14 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         # batch. diffusers (>=0.38) derives the per-sample text length from
         # encoder_hidden_states_mask, so the deprecated txt_seq_lens is not passed.
         prompt_embeds_mask, prompt_embeds, _ = self._pad_batch_prompt(
-            prompt_embeds_mask=prompt_embeds_mask,
-            prompt_embeds=prompt_embeds,
-            device=device
+            prompt_embeds_mask=prompt_embeds_mask, prompt_embeds=prompt_embeds, device=device
         )
 
         if do_classifier_free_guidance:
             negative_prompt_embeds_mask, negative_prompt_embeds, _ = self._pad_batch_prompt(
                 prompt_embeds_mask=negative_prompt_embeds_mask,
                 prompt_embeds=negative_prompt_embeds,
-                device=device
+                device=device,
             )
 
         # Prepare model input (concatenate condition latents for I2I)
@@ -1065,9 +1222,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
             prompt_embeds = _pad_seq_dim(prompt_embeds, seq_len, 0.0)
             prompt_embeds_mask = _pad_seq_dim(prompt_embeds_mask, seq_len, 0)
             negative_prompt_embeds = _pad_seq_dim(negative_prompt_embeds, seq_len, 0.0)
-            negative_prompt_embeds_mask = _pad_seq_dim(
-                negative_prompt_embeds_mask, seq_len, 0
-            )
+            negative_prompt_embeds_mask = _pad_seq_dim(negative_prompt_embeds_mask, seq_len, 0)
 
             with self.pipeline.transformer.cache_context("cond_uncond"):
                 both_pred = self.transformer(
@@ -1077,14 +1232,12 @@ class QwenImageEditPlusAdapter(BaseAdapter):
                     encoder_hidden_states_mask=torch.cat(
                         [prompt_embeds_mask, negative_prompt_embeds_mask], dim=0
                     ),
-                    encoder_hidden_states=torch.cat(
-                        [prompt_embeds, negative_prompt_embeds], dim=0
-                    ),
+                    encoder_hidden_states=torch.cat([prompt_embeds, negative_prompt_embeds], dim=0),
                     img_shapes=img_shapes * 2,
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
                 )[0]
-            both_pred = both_pred[:, :latents.size(1)]
+            both_pred = both_pred[:, : latents.size(1)]
             velocity, neg_velocity = both_pred.chunk(2, dim=0)
 
             comb_pred = neg_velocity + guidance_scale * (velocity - neg_velocity)
@@ -1106,7 +1259,7 @@ class QwenImageEditPlusAdapter(BaseAdapter):
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
                 )[0]
-            velocity = velocity[:, :latents.size(1)]
+            velocity = velocity[:, : latents.size(1)]
 
         # 3. Scheduler step
         output = self.scheduler.step(
@@ -1142,7 +1295,14 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         noise_level: Optional[float] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         compute_log_prob: bool = True,
-        return_kwargs: List[str] = ['velocity', 'next_latents', 'next_latents_mean', 'std_dev_t', 'dt', 'log_prob'],
+        return_kwargs: List[str] = [
+            "velocity",
+            "next_latents",
+            "next_latents_mean",
+            "std_dev_t",
+            "dt",
+            "log_prob",
+        ],
     ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
         """
         General forward method handling both T2I and I2I, including ragged I2I batches.
@@ -1206,13 +1366,25 @@ class QwenImageEditPlusAdapter(BaseAdapter):
             single_latents = latents[idx].unsqueeze(0)
             single_prompt_embeds = prompt_embeds[idx].unsqueeze(0)
             single_prompt_embeds_mask = prompt_embeds_mask[idx].unsqueeze(0)
-            
-            single_negative_prompt_embeds = negative_prompt_embeds[idx].unsqueeze(0) if negative_prompt_embeds is not None else None
-            single_negative_prompt_embeds_mask = negative_prompt_embeds_mask[idx].unsqueeze(0) if negative_prompt_embeds_mask is not None else None
-            
+
+            single_negative_prompt_embeds = (
+                negative_prompt_embeds[idx].unsqueeze(0)
+                if negative_prompt_embeds is not None
+                else None
+            )
+            single_negative_prompt_embeds_mask = (
+                negative_prompt_embeds_mask[idx].unsqueeze(0)
+                if negative_prompt_embeds_mask is not None
+                else None
+            )
+
             single_img_shapes = [img_shapes[idx]] if img_shapes is not None else None
-            single_image_latents = image_latents[idx].unsqueeze(0) if image_latents[idx] is not None else None
-            single_next_latents = next_latents[idx].unsqueeze(0) if next_latents is not None else None
+            single_image_latents = (
+                image_latents[idx].unsqueeze(0) if image_latents[idx] is not None else None
+            )
+            single_next_latents = (
+                next_latents[idx].unsqueeze(0) if next_latents is not None else None
+            )
 
             out = self._forward(
                 t=t,
@@ -1235,7 +1407,13 @@ class QwenImageEditPlusAdapter(BaseAdapter):
 
         # Concatenate outputs along batch dimension
         outputs_dict = [o.to_dict() for o in outputs]
-        return FlowMatchEulerDiscreteSDESchedulerOutput.from_dict({
-            k: torch.cat([o[k] for o in outputs_dict], dim=0) if outputs_dict[0][k] is not None else None
-            for k in outputs_dict[0].keys()
-        })
+        return FlowMatchEulerDiscreteSDESchedulerOutput.from_dict(
+            {
+                k: (
+                    torch.cat([o[k] for o in outputs_dict], dim=0)
+                    if outputs_dict[0][k] is not None
+                    else None
+                )
+                for k in outputs_dict[0].keys()
+            }
+        )

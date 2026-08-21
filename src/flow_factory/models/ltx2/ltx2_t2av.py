@@ -16,18 +16,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Optional, Union
+from typing import Any, ClassVar, Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
 from accelerate import Accelerator
-
 from diffusers.pipelines.ltx2.pipeline_ltx2 import LTX2Pipeline, rescale_noise_cfg
 
 from ...hparams import *
-from ...samples import T2AVSample
+from ...samples import (
+    ComponentTimes,
+    LatentState,
+    MultiModalStepOutput,
+    NoisedState,
+    StackedSampleBatch,
+    T2AVSample,
+)
 from ...scheduler import (
     FlowMatchEulerDiscreteSDEScheduler,
     FlowMatchEulerDiscreteSDESchedulerOutput,
+    SchedulerGroup,
     set_scheduler_timesteps,
 )
 from ...scheduler.flow_match_euler_discrete import calculate_shift
@@ -39,7 +46,21 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
-from ._common import combine_modality_log_prob
+from ._common import (
+    LTX2_COMPONENT_ORDER,
+    attach_ltx2_state_masks,
+    build_ltx2_component_step_output,
+    build_ltx2_full_component_schedule,
+    build_ltx2_joint_forward_kwargs,
+    build_ltx2_legacy_callback_view,
+    build_ltx2_rollout_log_probs,
+    build_ltx2_structured_trajectories,
+    build_ltx2_training_component_times,
+    combine_modality_log_prob,
+    draw_ltx2_forward_process_noise,
+    split_ltx2_callback_results,
+    validate_ltx2_forward_state_inputs,
+)
 
 logger = setup_logger(__name__)
 
@@ -133,20 +154,22 @@ class LTX2Sample(T2AVSample):
 
 class LTX2_T2AV_Adapter(BaseAdapter):
     """
-    Adapter for LTX2 text-to-audio-video generation with video-only SDE optimization.
+    Adapter for LTX2 text-to-audio-video generation with a joint video+audio policy.
 
-    Audio is generated jointly via the transformer's cross-modal attention but uses
-    deterministic ODE sampling (no log_prob, no RL gradient). Only the video pathway
-    receives stochastic SDE treatment for policy gradient training.
+    Video and audio are generated jointly through the transformer's cross-modal
+    attention and stepped by two twin SDE schedulers, so each denoising transition
+    produces a per-modality log_prob. The element-weighted combination of both
+    log_probs is the joint policy log_prob that drives policy gradient training.
     """
 
     supports_diffusers_cache = True
+    trajectory_component_order: ClassVar[Tuple[str, ...]] = LTX2_COMPONENT_ORDER
 
     def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
         self.pipeline: LTX2Pipeline
         self.scheduler: FlowMatchEulerDiscreteSDEScheduler
-        self.audio_scheduler: FlowMatchEulerDiscreteSDEScheduler = self._create_audio_scheduler()
+        self.audio_scheduler: FlowMatchEulerDiscreteSDEScheduler
 
     # ============================== Pipeline Loading ==============================
 
@@ -156,19 +179,27 @@ class LTX2_T2AV_Adapter(BaseAdapter):
             low_cpu_mem_usage=False,  # Required for FSDP compatibility
         )
 
-    def _create_audio_scheduler(self) -> FlowMatchEulerDiscreteSDEScheduler:
-        """Create a twin of the video scheduler for the audio modality.
+    def build_scheduler_group(self) -> SchedulerGroup:
+        """Build the ordered video/audio scheduler group and its audio twin.
 
         Audio is sampled with the same SDE dynamics as video so that both
-        modalities form a single joint policy whose per-step log_prob feeds the
-        GRPO objective. A dedicated instance is still required because
+        modalities form a single joint policy with one per-step log_prob over
+        both. A dedicated instance is still required because
         scheduler.step() mutates internal state (step_index), which would
         conflict if shared with the video scheduler. ``load_scheduler`` rebuilds
         an independent scheduler from the same pipeline scheduler + scheduler
-        args used for ``self.scheduler`` (which ``super().__init__`` has already
-        built at this point).
+        args used for ``self.scheduler`` (which ``BaseAdapter.__init__`` has
+        already installed when it calls this hook).
+
+        Returns:
+            Scheduler group whose primary ``"video"`` component is the canonical
+            pipeline scheduler.
         """
-        return self.load_scheduler()
+        self.audio_scheduler = self.load_scheduler()
+        return SchedulerGroup(
+            {"video": self.scheduler, "audio": self.audio_scheduler},
+            primary_name="video",
+        )
 
     # ============================== Module Properties ==============================
 
@@ -674,8 +705,10 @@ class LTX2_T2AV_Adapter(BaseAdapter):
         return_kwargs: List[str] = ["next_latents", "log_prob", "velocity"],
         # LTX-2.3 compatibility
         use_cross_timestep: bool = False,
+        # Component-return mode, owned by ``_forward_state``
+        _return_components: bool = False,
         **kwargs,
-    ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
+    ) -> Union[FlowMatchEulerDiscreteSDESchedulerOutput, MultiModalStepOutput]:
         """Single denoising step with unified video+audio latents and x0-space multi-guidance.
 
         Accepts concatenated latents (B, video_seq + audio_seq, C) on the sequence dim.
@@ -694,6 +727,11 @@ class LTX2_T2AV_Adapter(BaseAdapter):
             6. Combine: x0_guided = x0_cond + cfg_delta + stg_delta + modality_delta
             7. Guidance rescale in x0-space
             8. Convert back to velocity for scheduler step
+
+        The default return concatenates both modalities into one legacy
+        ``SDESchedulerOutput``. ``_return_components`` is reserved for
+        :meth:`_forward_state`, which needs the per-modality latents, statistics
+        and log-probs captured before that concatenation.
 
         Note:
             The unified concatenation relies on video and audio packed latents sharing
@@ -727,7 +765,9 @@ class LTX2_T2AV_Adapter(BaseAdapter):
         audio_modality_scale = audio_modality_scale or modality_scale
         audio_guidance_rescale = audio_guidance_rescale or guidance_rescale
 
-        if (guidance_scale > 1.0 or audio_guidance_scale > 1.0) and negative_connector_prompt_embeds is None:
+        if (
+            guidance_scale > 1.0 or audio_guidance_scale > 1.0
+        ) and negative_connector_prompt_embeds is None:
             logger.warning(
                 "Passed `guidance_scale` > 1.0, but no `negative_connector_prompt_embeds` provided. "
                 "Classifier-free guidance will be disabled."
@@ -942,7 +982,20 @@ class LTX2_T2AV_Adapter(BaseAdapter):
             noise_level=noise_level,
         )
 
-        # --- 10. Concatenate back into unified latents ---
+        # --- 10. Component view, captured before the legacy concatenation mutates it ---
+        if _return_components:
+            return build_ltx2_component_step_output(
+                self,
+                video_output=video_output,
+                audio_output=audio_output,
+                video_velocity=video_pred,
+                audio_velocity=audio_pred,
+                n_video=video_latents[0].numel(),
+                n_audio=audio_latents[0].numel(),
+                compute_log_prob=compute_log_prob,
+            )
+
+        # --- 11. Concatenate back into unified latents ---
         if video_output.next_latents is not None and audio_output.next_latents is not None:
             video_output.next_latents = torch.cat(
                 [video_output.next_latents, audio_output.next_latents],
@@ -962,7 +1015,7 @@ class LTX2_T2AV_Adapter(BaseAdapter):
                 dim=1,
             )
 
-        # --- 11. Combine per-step log_prob across modalities ---
+        # --- 12. Combine per-step log_prob across modalities ---
         # Joint transition p(v,a|z_t) = p(v|z_t) p(a|z_t); the element-weighted mean
         # reproduces what a single scheduler over the concatenated [video|audio] latent
         # would return, keeping the log_prob scale consistent with the video-only path.
@@ -979,6 +1032,87 @@ class LTX2_T2AV_Adapter(BaseAdapter):
             )
 
         return video_output
+
+    # ============================== Trajectory Hooks ==============================
+
+    def build_training_component_times(
+        self,
+        primary_timesteps: torch.Tensor,
+        *,
+        batch: Optional[StackedSampleBatch] = None,
+    ) -> ComponentTimes:
+        """Mirror one sampled coordinate onto the twin video/audio schedules.
+
+        Args:
+            primary_timesteps: Primary scheduler coordinates of shape ``(B,)``.
+            batch: Unused; both components share the primary coordinate.
+
+        Returns:
+            Video/audio timesteps and sigmas in authoritative component order.
+        """
+        return build_ltx2_training_component_times(self, primary_timesteps)
+
+    def add_forward_process_noise(
+        self,
+        clean_state: LatentState,
+        times: ComponentTimes,
+        *,
+        generator: Optional[torch.Generator] = None,
+    ) -> NoisedState:
+        """Draw video noise then audio noise, then apply both deterministically.
+
+        Args:
+            clean_state: Clean latent state in authoritative component order.
+            times: Component times including each component's current sigma.
+            generator: Optional generator shared by both ordered draws.
+
+        Returns:
+            Noised state, target velocity, and the sampled noise.
+        """
+        return draw_ltx2_forward_process_noise(self, clean_state, times, generator=generator)
+
+    def _forward_state(
+        self,
+        *,
+        batch: StackedSampleBatch,
+        state: LatentState,
+        times: ComponentTimes,
+        next_state: Optional[LatentState],
+        compute_log_prob: bool,
+        return_fields: Tuple[str, ...],
+        noise_level: Optional[float],
+        forward_kwargs: Mapping[str, Any],
+    ) -> MultiModalStepOutput:
+        """Pack the ordered video/audio state for ``forward`` and unpack components.
+
+        Args:
+            batch: Collated batch supplying conditioning and ``video_seq_len``.
+            state: Current state in authoritative component order.
+            times: Current and next times in authoritative component order.
+            next_state: Optional stored next state in authoritative component order.
+            compute_log_prob: Whether to compute transition log probabilities.
+            return_fields: Scheduler output fields requested from ``forward``.
+            noise_level: Scheduler noise-level override.
+            forward_kwargs: Model-conditioning arguments resolved by the wrapper.
+
+        Returns:
+            Ordered component step output carrying the input active masks.
+        """
+        validate_ltx2_forward_state_inputs(self, state=state, times=times, next_state=next_state)
+        output = self.forward(
+            **build_ltx2_joint_forward_kwargs(
+                self,
+                batch=batch,
+                state=state,
+                times=times,
+                next_state=next_state,
+                compute_log_prob=compute_log_prob,
+                return_fields=return_fields,
+                noise_level=noise_level,
+                forward_kwargs=forward_kwargs,
+            )
+        )
+        return attach_ltx2_state_masks(state, output)
 
     # ============================== Inference ==============================
 
@@ -1183,15 +1317,17 @@ class LTX2_T2AV_Adapter(BaseAdapter):
             log_prob_collector = create_trajectory_collector(
                 trajectory_indices, num_inference_steps
             )
+            component_log_prob_collectors = {
+                name: create_trajectory_collector(trajectory_indices, num_inference_steps)
+                for name in LTX2_COMPONENT_ORDER
+            }
         callback_collector = create_callback_collector(trajectory_indices, num_inference_steps)
 
         # 7. Denoising loop
         for i, t in enumerate(timesteps):
             noise_level = self.scheduler.get_noise_level_for_timestep(t)
             t_next = timesteps[i + 1] if i + 1 < len(timesteps) else torch.tensor(0, device=device)
-            return_kw = list(
-                set(["next_latents", "log_prob", "velocity"] + extra_call_back_kwargs)
-            )
+            return_kw = list(set(["next_latents", "log_prob", "velocity"] + extra_call_back_kwargs))
             current_compute_log_prob: bool = compute_log_prob and noise_level > 0
 
             output = self.forward(
@@ -1225,15 +1361,21 @@ class LTX2_T2AV_Adapter(BaseAdapter):
                 compute_log_prob=current_compute_log_prob,
                 return_kwargs=return_kw,
                 use_cross_timestep=use_cross_timestep,
+                _return_components=True,
             )
 
-            latents = self.cast_latents(output.next_latents)
+            # The component output is authoritative; the concatenated view only
+            # advances the loop state and feeds the legacy callback collector.
+            legacy_view = build_ltx2_legacy_callback_view(self, output)
+            latents = self.cast_latents(legacy_view.next_latents)
             latent_collector.collect(latents, i + 1)
             if current_compute_log_prob:
                 log_prob_collector.collect(output.log_prob, i)
+                for name in LTX2_COMPONENT_ORDER:
+                    component_log_prob_collectors[name].collect(output.component_log_probs[name], i)
             callback_collector.collect_step(
                 step_idx=i,
-                output=output,
+                output=legacy_view,
                 keys=extra_call_back_kwargs,
                 capturable={"noise_level": noise_level},
             )
@@ -1254,26 +1396,41 @@ class LTX2_T2AV_Adapter(BaseAdapter):
             generator=generator,
         )
 
-        # 9. Construct samples (per-batch, NO batch dimension)
-        all_lats = latent_collector.get_result()
-        lat_map = latent_collector.get_index_map()
-        all_log_probs = log_prob_collector.get_result() if compute_log_prob else None
-        lp_map = log_prob_collector.get_index_map() if compute_log_prob else None
-        cb_res = callback_collector.get_result()
+        # 9. Split the concatenated rollout into authoritative component trajectories
+        collected_states = latent_collector.get_result()
+        structured_callbacks, legacy_callbacks = split_ltx2_callback_results(
+            self, callback_collector.get_result()
+        )
         callback_index_map = callback_collector.get_index_map()
+        trajectories = (
+            build_ltx2_structured_trajectories(
+                self,
+                states=torch.stack(collected_states, dim=1),
+                state_index_map=latent_collector.get_index_map(),
+                video_seq_len=video_seq_len,
+                schedule=build_ltx2_full_component_schedule(self, timesteps),
+                callbacks=structured_callbacks,
+                callback_index_map=callback_index_map if structured_callbacks else None,
+                **build_ltx2_rollout_log_probs(
+                    self,
+                    log_prob_collector=log_prob_collector if compute_log_prob else None,
+                    component_log_prob_collectors=(
+                        component_log_prob_collectors if compute_log_prob else None
+                    ),
+                    num_transitions=num_inference_steps,
+                ),
+            )
+            if collected_states
+            else None
+        )
 
+        # 10. Construct samples (per-batch, NO batch dimension)
         prompt_list = prompt if isinstance(prompt, list) else [prompt] * batch_size
 
         samples = [
             LTX2Sample(
-                # Unified trajectory (video + audio concatenated on seq dim)
-                timesteps=timesteps,
-                all_latents=torch.stack([l[b] for l in all_lats], dim=0) if all_lats else None,
-                log_probs=(
-                    torch.stack([l[b] for l in all_log_probs], dim=0) if all_log_probs else None
-                ),
-                latent_index_map=lat_map,
-                log_prob_index_map=lp_map,
+                # Authoritative video/audio trajectory; legacy fields stay unset.
+                trajectory=None if trajectories is None else trajectories[b],
                 # Generated media
                 video=video[b],
                 audio=audio_waveform[b] if audio_waveform is not None else None,
@@ -1311,8 +1468,8 @@ class LTX2_T2AV_Adapter(BaseAdapter):
                     else None
                 ),
                 extra_kwargs={
-                    **{k: v[b] for k, v in cb_res.items()},
-                    "callback_index_map": callback_index_map,
+                    **{k: v[b] for k, v in legacy_callbacks.items()},
+                    **({"callback_index_map": callback_index_map} if legacy_callbacks else {}),
                     "duration_s": duration_s,
                 },
             )

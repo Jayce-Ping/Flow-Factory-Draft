@@ -12,20 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/cli.py
-import sys
+import argparse
+import logging
 import os
 import signal
 import subprocess
-import argparse
-import logging
+
+# src/flow_factory/cli.py
+import sys
+
 import torch
 import yaml
 
 from .utils.env_utils import ENV_VAR_MAPPINGS, env_lookup
 
-
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s')
+logging.basicConfig(
+    level=logging.INFO, format="[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 
@@ -84,24 +87,28 @@ def parse_args():
     parser.add_argument("config", type=str, help="Path to YAML config")
 
     # Multi-node override arguments (CLI > ENV > YAML)
-    parser.add_argument("--num_processes", type=int, default=None,
-                        help="Total number of processes (overrides YAML and env)")
-    parser.add_argument("--num_machines", type=int, default=None,
-                        help="Number of nodes")
-    parser.add_argument("--machine_rank", type=int, default=None,
-                        help="Rank of the current node")
-    parser.add_argument("--main_process_ip", type=str, default=None,
-                        help="IP address of the master node")
-    parser.add_argument("--main_process_port", type=int, default=None,
-                        help="Port of the master node")
+    parser.add_argument(
+        "--num_processes",
+        type=int,
+        default=None,
+        help="Total number of processes (overrides YAML and env)",
+    )
+    parser.add_argument("--num_machines", type=int, default=None, help="Number of nodes")
+    parser.add_argument("--machine_rank", type=int, default=None, help="Rank of the current node")
+    parser.add_argument(
+        "--main_process_ip", type=str, default=None, help="IP address of the master node"
+    )
+    parser.add_argument(
+        "--main_process_port", type=int, default=None, help="Port of the master node"
+    )
     return parser.parse_known_args()
 
 
 def train_cli():
     # 1. Parse known args and keep the rest in 'unknown'
     args, unknown = parse_args()
-    config = yaml.safe_load(open(args.config, 'r'))
-    config_file = config.get('config_file')
+    config = yaml.safe_load(open(args.config, "r"))
+    config_file = config.get("config_file")
 
     # 2. Three-layer config merging: YAML (baseline) -> ENV (auto-detect) -> CLI (highest priority)
     env_overrides = resolve_multinode_env()
@@ -149,12 +156,18 @@ def train_cli():
     else:
         # Launch via accelerate
         cmd = [
-            "accelerate", "launch",
-            "--num_processes", str(num_procs),
-            "--num_machines", str(num_machines),
-            "--machine_rank", str(machine_rank),
-            "--main_process_port", str(main_process_port),
-            "--mixed_precision", str(mixed_precision),
+            "accelerate",
+            "launch",
+            "--num_processes",
+            str(num_procs),
+            "--num_machines",
+            str(num_machines),
+            "--machine_rank",
+            str(machine_rank),
+            "--main_process_port",
+            str(main_process_port),
+            "--mixed_precision",
+            str(mixed_precision),
         ]
 
         # Multi-node requires main_process_ip

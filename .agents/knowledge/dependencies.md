@@ -42,7 +42,7 @@ The authoritative list is `pyproject.toml` `[project.dependencies]` (20+ package
 | `torchvision` | >= 0.19.0 | Vision utilities |
 | `torchaudio` | >= 2.4.0 | Audio I/O (audio / audio-video models, CLAP) |
 | `transformers` | >= 4.57.1 | Text encoders, tokenizers |
-| `diffusers` | >= 0.36.0 | Diffusion pipelines, schedulers |
+| `diffusers` | >= 0.37.0 | Diffusion pipelines, schedulers |
 | `accelerate` | >= 1.11.0 | Distributed training, mixed precision |
 | `peft` | >= 0.17.0 | LoRA, parameter-efficient fine-tuning |
 | `datasets` | >= 3.3.2 | Dataset loading |

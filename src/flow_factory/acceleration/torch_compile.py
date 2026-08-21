@@ -20,8 +20,8 @@ from typing import TYPE_CHECKING, Any, Dict
 
 import torch
 
-from .abc import BaseAccelerator
 from ..utils.logger_utils import setup_logger
+from .abc import BaseAccelerator
 
 if TYPE_CHECKING:
     from ..models.abc import BaseAdapter

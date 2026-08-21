@@ -67,7 +67,7 @@ The distributed groupwise path (`_compute_groupwise_distributed`) needs no chang
 
 ## NFT / AWM Precompute Interleave
 
-`optimize()` in `trainers/nft.py` and `trainers/awm.py` follows a per-batch interleave layout (matches the official DiffusionNFT / AWM implementations):
+`optimize()` in `trainers/rl/nft.py` and `trainers/rl/awm.py` follows a per-batch interleave layout (matches the official DiffusionNFT / AWM implementations):
 
 ```
 for each micro-batch:
@@ -75,15 +75,15 @@ for each micro-batch:
   2. precompute under sampling policy:
        adapter.rollout()
        with sampling_context():
-         compute (_all_timesteps, _all_random_noise,
-                  _old_v_pred_list / _old_log_probs) for THIS batch only
+         compute NFTPrecomputedStep / AWMPrecomputedStep
+         (times, noised, velocity | log_prob) for THIS batch only
   3. train under current policy:
        adapter.train()
        per-timestep: each forward (and KL) in its OWN `with self.autocast():`
                      (constraint #20a); backward / optimizer step outside autocast
 ```
 
-Compared with the previous "eager precompute over ALL batches, then train all batches" design, this caps the precompute footprint to a single batch (`_old_v_pred_list` was 5+ GB on FLUX1 1024² 32-batch in the eager design; tens of GB on Wan).
+Compared with the previous "eager precompute over ALL batches, then train all batches" design, this caps the precompute footprint to a single batch (the precomputed velocities were 5+ GB on FLUX1 1024² 32-batch in the eager design; tens of GB on Wan).
 
 Train-inference consistency invariant is preserved: `ema_step()` runs once per outer epoch in `start()`, so all batches within a single `optimize()` call see the same EMA snapshot regardless of interleave timing. RNG consumption order changes (per-batch vs upfront), so noise sequences are not bit-identical to the eager design — regression tests must use statistical metrics rather than numeric diffs.
 

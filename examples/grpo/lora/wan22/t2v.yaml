@@ -81,11 +81,6 @@ train:
   
   # Optimization
   seed: 42  # Random seed
-  learning_rate: 1.0e-4  # Initial learning rate
-  adam_weight_decay: 1.0e-4  # AdamW weight decay
-  adam_betas: [0.9, 0.999]  # AdamW betas
-  adam_epsilon: 1.0e-8  # AdamW epsilon
-  max_grad_norm: 1.0  # Max gradient norm for clipping
 
   # EMA
   ema_decay: 0.9  # EMA decay rate (0 to disable)
@@ -132,3 +127,14 @@ rewards:
 #     batch_size: 16
 #     device: "cuda"
 #     dtype: bfloat16
+
+
+# Optimizer Configuration
+# One entry per trainable variant. A single-policy run has exactly one.
+optimizers:
+  - name: default
+    learning_rate: 1.0e-4  # Initial learning rate
+    weight_decay: 1.0e-4  # AdamW weight decay
+    betas: [0.9, 0.999]  # AdamW betas
+    eps: 1.0e-8  # AdamW epsilon
+    max_grad_norm: 1.0  # Max gradient norm for clipping

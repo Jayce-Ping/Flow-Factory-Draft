@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# src/flow_factory/utils/reward_utils.py
-from typing import List, Dict, Any, Optional, Union, Tuple
-from itertools import permutations
 import re
+from itertools import permutations
+
+# src/flow_factory/utils/reward_utils.py
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 import numpy as np
 from PIL import Image
+
 
 # -------------------------------------Grid Utils-------------------------------------
 def divide_prompt(prompt: str) -> List[str]:
@@ -26,12 +29,13 @@ def divide_prompt(prompt: str) -> List[str]:
     seps = match_sep.findall(prompt)
     # Add '.' for each sentence
     sub_prompts = [
-        p + '.' if p.strip()[-1] != '.' else p
-        for p in re.split('|'.join(map(re.escape, seps)), prompt)
+        p + "." if p.strip()[-1] != "." else p
+        for p in re.split("|".join(map(re.escape, seps)), prompt)
     ]
     return sub_prompts
 
-def divide_image(image, grid_info : tuple[int, int]) -> List[Image.Image]:
+
+def divide_image(image, grid_info: tuple[int, int]) -> List[Image.Image]:
     assert len(grid_info) == 2, "grid_info must be a tuple of two integers (a, b)"
 
     a, b = grid_info
@@ -61,22 +65,24 @@ def divide_image(image, grid_info : tuple[int, int]) -> List[Image.Image]:
 
     return grid_cells
 
-def extract_grid_info(prompt : str) -> tuple[int, int]:
+
+def extract_grid_info(prompt: str) -> tuple[int, int]:
     # Grid can be represented as int x int, or int ⨉ int. ⨉ has unicode \u2a09
-    match = re.findall(r'(\d+)\s*[x⨉]\s*(\d+)', prompt)
+    match = re.findall(r"(\d+)\s*[x⨉]\s*(\d+)", prompt)
     if len(match) == 0:
         return (1, 1)
 
     return (int(match[0][0]), int(match[0][1]))
 
+
 # -------------------------------------Reward Computation Utils---------------------------------------
 def is_symmetric_matrix(matrix: np.ndarray) -> bool:
     """
-        Check if the matrix is symmetric
-        Args:
-            matrix (np.ndarray): square numpy array
-        Returns:
-            bool: True if symmetric, False otherwise
+    Check if the matrix is symmetric
+    Args:
+        matrix (np.ndarray): square numpy array
+    Returns:
+        bool: True if symmetric, False otherwise
     """
     matrix = np.array(matrix)
     if matrix.shape[0] != matrix.shape[1]:
@@ -85,14 +91,15 @@ def is_symmetric_matrix(matrix: np.ndarray) -> bool:
 
     return np.all(matrix == matrix.T)
 
+
 def is_antisymmetric_matrix(matrix: np.ndarray, diagonal_zero=True) -> bool:
     """
-        Check if the matrix is anti-symmetric
-        Args:
-            matrix (np.ndarray): square numpy array
-            diagonal_zero (bool): if True, check if diagonal elements are zero, else ignore diagonal
-        Returns:
-            bool: True if anti-symmetric, False otherwise
+    Check if the matrix is anti-symmetric
+    Args:
+        matrix (np.ndarray): square numpy array
+        diagonal_zero (bool): if True, check if diagonal elements are zero, else ignore diagonal
+    Returns:
+        bool: True if anti-symmetric, False otherwise
     """
     matrix = np.array(matrix)
     n = matrix.shape[0]
@@ -112,34 +119,36 @@ def is_antisymmetric_matrix(matrix: np.ndarray, diagonal_zero=True) -> bool:
 
     return True
 
-def is_transitive_matrix(matrix: np.ndarray, return_violations=False) -> Union[bool, tuple[bool, List[tuple[int, int, int]]]]:
+
+def is_transitive_matrix(
+    matrix: np.ndarray, return_violations=False
+) -> Union[bool, tuple[bool, List[tuple[int, int, int]]]]:
     """
-        Check if the matrix is transitive
-        Args:
-            matrix (np.ndarray): square numpy array with binary values (0 or 1)
-        Returns:
-            bool: True if transitive, False otherwise
+    Check if the matrix is transitive
+    Args:
+        matrix (np.ndarray): square numpy array with binary values (0 or 1)
+    Returns:
+        bool: True if transitive, False otherwise
     """
     matrix = np.array(matrix)
     n = len(matrix)
     if matrix.shape[0] != matrix.shape[1]:
         # Must be square
         return False
-    
+
     if not np.all(np.isin(matrix, [0, 1])):
         # Must be binary
         raise ValueError("`transitiveMatrixQ` requires matrix must be binary (0 or 1)")
 
     # Check transitivity: if A[i][j] == 1 and A[j][k] == 1, then A[i][k] must be 1
     violations = []
-    for i,j,k in permutations(range(n), 3):
+    for i, j, k in permutations(range(n), 3):
         # Check all 3-tuples
         if matrix[i][j] == 1 and matrix[j][k] == 1 and matrix[i][k] != 1:
             if not return_violations:
                 return False
 
-            violations.append((i,j,k))
-
+            violations.append((i, j, k))
 
     if return_violations:
         return len(violations) == 0, violations

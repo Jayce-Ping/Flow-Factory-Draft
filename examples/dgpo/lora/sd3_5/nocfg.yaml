@@ -111,11 +111,6 @@ train:
   num_inner_epochs: 1               # base: train.num_inner_epochs = 1
 
   # ---------- Optimization (base config) ----------
-  learning_rate: 3.0e-4    # base: train.learning_rate = 3e-4
-  adam_weight_decay: 1.0e-4  # base: train.adam_weight_decay = 1e-4
-  adam_betas: [0.9, 0.999]   # base: train.adam_beta1/2
-  adam_epsilon: 1.0e-8       # base: train.adam_epsilon = 1e-8
-  max_grad_norm: 1.0         # base: train.max_grad_norm = 1.0
 
   # ---------- Gradient Checkpointing ----------
   enable_gradient_checkpointing: false
@@ -152,3 +147,14 @@ eval_rewards:
     batch_size: 32
     device: "cuda"
     dtype: bfloat16
+
+
+# Optimizer Configuration
+# One entry per trainable variant. A single-policy run has exactly one.
+optimizers:
+  - name: default
+    learning_rate: 3.0e-4  # base: train.learning_rate = 3e-4
+    weight_decay: 1.0e-4  # base: train.adam_weight_decay = 1e-4
+    betas: [0.9, 0.999]  # base: train.adam_beta1/2
+    eps: 1.0e-8  # base: train.adam_epsilon = 1e-8
+    max_grad_norm: 1.0  # base: train.max_grad_norm = 1.0
