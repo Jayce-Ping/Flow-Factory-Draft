@@ -357,7 +357,7 @@ class LTX2_T2AV_Adapter(BaseAdapter):
         input_ids = tok_out.input_ids.to(device)
         attention_mask = tok_out.attention_mask.to(device)
 
-        enc_out = self.pipeline.text_encoder(
+        enc_out = self.pipeline.text_encoder.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,
