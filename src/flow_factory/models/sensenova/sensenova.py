@@ -1,0 +1,656 @@
+# Copyright 2026 Jayce-Ping
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Flow-Factory adapter for SenseNova-U1 1.0 and 1.5 checkpoints."""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
+
+import numpy as np
+import torch
+from PIL import Image
+
+from diffusers.utils.torch_utils import randn_tensor
+
+from ...samples import T2ISample
+from ...scheduler import (
+    FlowMatchEulerDiscreteSDEScheduler,
+    FlowMatchEulerDiscreteSDESchedulerOutput,
+)
+from ...utils.trajectory_collector import (
+    TrajectoryIndicesType,
+    create_callback_collector,
+    create_trajectory_collector,
+)
+from ..abc import BaseAdapter
+from ..runtime import ComponentRuntime, PseudoPipelineRuntime
+from .modeling.neo_unify.modeling_neo_chat import (
+    SYSTEM_MESSAGE_FOR_GEN,
+    clear_flash_kv_cache,
+    optimized_scale,
+    prepare_flash_kv_cache,
+)
+from .pipeline import SenseNovaPseudoPipeline
+
+
+@dataclass
+class SenseNovaSample(T2ISample):
+    """T2I rollout sample shared by SenseNova-U1 1.0 and 1.5."""
+
+    _shared_fields: ClassVar[frozenset[str]] = frozenset()
+
+
+class SenseNovaAdapter(BaseAdapter):
+    """Support SenseNova-U1 1.0 and U1.5 text-to-image generation.
+
+    The two checkpoints use the same NEO-Unify backbone and differ primarily in
+    their flow-matching output head.  The vendored model reads ``use_pixel_head``
+    from the checkpoint config, so no model-specific branch is needed here.
+
+    This first integration deliberately supports T2I.  SenseNova's official
+    checkpoint also exposes image-editing and multimodal paths, but those require
+    a separate image-prefill/cache contract and are kept out of the initial RL
+    adapter until they have parity tests.
+    """
+
+    ddp_find_unused_parameters = True
+    flow_velocity_direction: ClassVar[Literal["noise", "data"]] = "noise"
+
+    def load_pipeline(self) -> SenseNovaPseudoPipeline:
+        """Load the custom Transformers checkpoint and tokenizer."""
+        return SenseNovaPseudoPipeline.from_pretrained(
+            self.model_args.model_name_or_path,
+            low_cpu_mem_usage=False,
+            **self.model_args.extra_kwargs,
+        )
+
+    def build_component_runtime(self) -> ComponentRuntime:
+        """Expose the differentiable generation wrapper as the sole component."""
+        pipeline = self.load_pipeline()
+        return PseudoPipelineRuntime(pipeline, {"transformer": pipeline.transformer})
+
+    def load_scheduler(self) -> FlowMatchEulerDiscreteSDEScheduler:
+        """Create Flow-Factory's SDE scheduler for the native clean-noise flow."""
+        scheduler_kwargs = {"num_train_timesteps": 1000, "shift": 1.0}
+        scheduler_args = getattr(self.config, "scheduler_args", None)
+        if scheduler_args:
+            scheduler_kwargs.update(scheduler_args.to_dict())
+        return FlowMatchEulerDiscreteSDEScheduler(**scheduler_kwargs)
+
+    @property
+    def default_target_modules(self) -> List[str]:
+        """Default LoRA targets for NEO-Unify generation branches and heads."""
+        return [
+            "q_proj_mot_gen",
+            "k_proj_mot_gen",
+            "v_proj_mot_gen",
+            "o_proj_mot_gen",
+            "mlp_mot_gen.gate_proj",
+            "mlp_mot_gen.up_proj",
+            "mlp_mot_gen.down_proj",
+            # U1.0's MLP flow head.
+            "fm_head.0",
+            "fm_head.2",
+            # U1.5's pixel flow head.
+            "fm_head.conv1",
+            "fm_head.conv2",
+            "timestep_embedder.mlp.0",
+            "timestep_embedder.mlp.2",
+            "noise_scale_embedder.mlp.0",
+            "noise_scale_embedder.mlp.2",
+        ]
+
+    @property
+    def preprocessing_modules(self) -> List[str]:
+        """SenseNova tokenizes lazily while building its KV cache."""
+        return []
+
+    @property
+    def inference_modules(self) -> List[str]:
+        return ["transformer"]
+
+    def encode_prompt(self, prompt: Union[str, List[str]], **kwargs: Any) -> Dict[str, Any]:
+        """Persist raw prompts; official NEO tokenization is cache-dependent."""
+        return {"prompt": [prompt] if isinstance(prompt, str) else prompt}
+
+    def encode_image(self, images: Any, **kwargs: Any) -> None:
+        """Image editing is intentionally deferred until the I2I contract lands."""
+
+    def encode_video(self, videos: Any, **kwargs: Any) -> None:
+        """SenseNova-U1 has no video input in this adapter."""
+
+    def decode_latents(
+        self,
+        latents: torch.Tensor,
+        output_type: Literal["pil", "pt", "np"] = "pil",
+    ) -> Union[torch.Tensor, np.ndarray, List[Image.Image]]:
+        """Map SenseNova's normalized pixel output to the requested image type."""
+        single = latents.ndim == 3
+        if single:
+            latents = latents.unsqueeze(0)
+        images = (latents.float() * 0.5 + 0.5).clamp(0, 1)
+        if output_type == "pt":
+            return images
+        if output_type == "np":
+            return images.permute(0, 2, 3, 1).cpu().numpy()
+        if output_type != "pil":
+            raise ValueError(f"unsupported output_type={output_type!r}")
+        return [
+            Image.fromarray((image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
+            for image in images
+        ]
+
+    # ============================== Context and schedule ==============================
+
+    def _base_model(self):
+        """Return the unwrapped official NEO model for no-grad prefix work."""
+        component = self._unwrap(self.transformer)
+        if hasattr(component, "get_base_model"):
+            component = component.get_base_model()
+        return component.model
+
+    @staticmethod
+    def _as_batch_values(value: Any, batch_size: int, name: str) -> List[Any]:
+        """Normalize a scalar or per-sample sequence to a batch list."""
+        if isinstance(value, (list, tuple)):
+            if len(value) == 1:
+                return list(value) * batch_size
+            if len(value) != batch_size:
+                raise ValueError(
+                    f"SenseNova forward `{name}` has {len(value)} values; expected 1 or "
+                    f"batch_size={batch_size}."
+                )
+            return list(value)
+        return [value] * batch_size
+
+    @staticmethod
+    def _normalize_batch_tensor(
+        value: torch.Tensor,
+        batch_size: int,
+        device: torch.device,
+        name: str,
+    ) -> torch.Tensor:
+        """Normalize scalar or one-dimensional timesteps to ``(B,)``."""
+        values = value.float().reshape(-1).to(device=device)
+        if values.numel() == 1:
+            return values.expand(batch_size)
+        if values.numel() != batch_size:
+            raise ValueError(
+                f"SenseNova forward `{name}` has {values.numel()} values; expected 1 or "
+                f"batch_size={batch_size}."
+            )
+        return values
+
+    def _image_shape(
+        self,
+        height: Optional[int],
+        width: Optional[int],
+        image_shape: Optional[Tuple[int, int]],
+    ) -> Tuple[int, int]:
+        if image_shape is not None:
+            height, width = image_shape
+        if height is None or width is None:
+            raise ValueError(
+                "SenseNova requires `height` and `width` in the sample batch; refusing to "
+                "silently choose a resolution that may not match the stored trajectory."
+            )
+        height, width = int(height), int(width)
+        model = self._base_model()
+        divisor = model.patch_size * int(1 / model.downsample_ratio)
+        if height % divisor or width % divisor:
+            raise ValueError(
+                f"SenseNova image dimensions must be divisible by patch merge factor {divisor}; "
+                f"received height={height}, width={width}."
+            )
+        return height, width
+
+    def _noise_scale(self, image_size: Tuple[int, int]) -> float:
+        """Match the official resolution-dependent initialization scale."""
+        model = self._base_model()
+        height, width = image_size
+        merge_size = int(1 / model.downsample_ratio)
+        grid_h = height // model.patch_size
+        grid_w = width // model.patch_size
+        noise_scale = float(model.noise_scale)
+        if model.noise_scale_mode in ("resolution", "dynamic", "dynamic_sqrt"):
+            base = float(model.noise_scale_base_image_seq_len)
+            noise_scale = math.sqrt((grid_h * grid_w) / (merge_size**2) / base) * noise_scale
+            if model.noise_scale_mode == "dynamic_sqrt":
+                noise_scale = math.sqrt(noise_scale)
+        return min(noise_scale, float(model.noise_scale_max_value))
+
+    def _build_context(
+        self,
+        prompt: str,
+        image_size: Tuple[int, int],
+        guidance_scale: float,
+    ) -> Dict[str, Any]:
+        """Build and flash-prepare condition/uncondition prefix caches."""
+        model = self._base_model()
+        device = self.device
+        merge_size = int(1 / model.downsample_ratio)
+        token_h = image_size[1] // (model.patch_size * merge_size)
+        token_w = image_size[0] // (model.patch_size * merge_size)
+        append_text = "<think>\n\n</think>\n\n<img>"
+        query = model._build_t2i_query(
+            prompt,
+            system_message=SYSTEM_MESSAGE_FOR_GEN,
+            append_text=append_text,
+        )
+        input_ids, indexes, attention_mask = model._build_t2i_text_inputs(self.tokenizer, query)
+        uncond_ids = uncond_indexes = uncond_attention_mask = uncond_cache = None
+        if guidance_scale > 1:
+            uncond_query = model._build_t2i_query("", append_text="<img>")
+            uncond_ids, uncond_indexes, uncond_attention_mask = model._build_t2i_text_inputs(
+                self.tokenizer, uncond_query
+            )
+
+        with torch.no_grad():
+            cache, _ = model._t2i_prefix_forward(input_ids, indexes, attention_mask)
+            if uncond_ids is not None:
+                uncond_cache, _ = model._t2i_prefix_forward(
+                    uncond_ids, uncond_indexes, uncond_attention_mask
+                )
+
+        indexes_image = model._build_t2i_image_indexes(
+            token_h, token_w, indexes.shape[1], device=device
+        )
+        uncond_indexes_image = (
+            model._build_t2i_image_indexes(token_h, token_w, uncond_indexes.shape[1], device=device)
+            if uncond_indexes is not None
+            else None
+        )
+        prepare_flash_kv_cache(cache, current_len=token_h * token_w, batch_size=1)
+        if uncond_cache is not None:
+            prepare_flash_kv_cache(uncond_cache, current_len=token_h * token_w, batch_size=1)
+
+        return {
+            "past_key_values": cache,
+            "indexes_image": indexes_image,
+            "attention_mask": {"full_attention": None},
+            "uncond_past_key_values": uncond_cache,
+            "uncond_indexes_image": uncond_indexes_image,
+            "uncond_attention_mask": {"full_attention": None},
+        }
+
+    def _clear_context(self, context: Dict[str, Any]) -> None:
+        clear_flash_kv_cache(context.get("past_key_values"))
+        clear_flash_kv_cache(context.get("uncond_past_key_values"))
+
+    @staticmethod
+    def _cfg_velocity(
+        condition: torch.Tensor,
+        uncondition: torch.Tensor,
+        scale: float,
+        cfg_norm: str,
+        step_index: Optional[int],
+    ) -> torch.Tensor:
+        """Apply official SenseNova classifier-free guidance and renorm."""
+        if cfg_norm == "cfg_zero_star":
+            alpha = optimized_scale(condition.flatten(1), uncondition.flatten(1))
+            alpha = alpha.view(condition.shape[0], *([1] * (condition.ndim - 1)))
+            alpha = alpha.to(condition.dtype)
+            if step_index is not None and step_index <= 0:
+                return condition * 0
+            return uncondition * alpha + scale * (condition - uncondition * alpha)
+
+        velocity = uncondition + scale * (condition - uncondition)
+        if cfg_norm == "global":
+            norm_condition = torch.norm(condition, dim=(1, 2), keepdim=True)
+            norm_cfg = torch.norm(velocity, dim=(1, 2), keepdim=True)
+            velocity = velocity * (norm_condition / (norm_cfg + 1e-8)).clamp(min=0, max=1.0)
+        elif cfg_norm == "channel":
+            norm_condition = torch.norm(condition, dim=-1, keepdim=True)
+            norm_cfg = torch.norm(velocity, dim=-1, keepdim=True)
+            velocity = velocity * (norm_condition / (norm_cfg + 1e-8)).clamp(min=0, max=1.0)
+        elif cfg_norm != "none":
+            raise ValueError(
+                f"unsupported cfg_norm={cfg_norm!r}; expected 'none', 'global', 'channel', "
+                "or 'cfg_zero_star'."
+            )
+        return velocity
+
+    def _native_timestep(self, timestep: torch.Tensor) -> torch.Tensor:
+        """Convert scheduler's descending [0, 1000] time to native [0, 1] time."""
+        return (1.0 - timestep.float() / 1000.0).clamp(0, 1)
+
+    def _patch_velocity_to_pixels(
+        self, velocity: torch.Tensor, image_size: Tuple[int, int]
+    ) -> torch.Tensor:
+        """Convert NEO's patch velocity to the pixel-space scheduler state."""
+        model = self._base_model()
+        return model.unpatchify(
+            velocity,
+            model.patch_size * int(1 / model.downsample_ratio),
+            image_size[1],
+            image_size[0],
+        )
+
+    # ============================== Forward ==============================
+
+    def forward(
+        self,
+        t: torch.Tensor,
+        latents: torch.Tensor,
+        prompt: Optional[Union[str, List[str]]] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        image_shape: Optional[Tuple[int, int]] = None,
+        guidance_scale: Optional[float] = None,
+        cfg_scale: float = 4.0,
+        cfg_norm: str = "none",
+        cfg_interval: Tuple[float, float] = (0.0, 1.0),
+        timestep_shift: float = 3.0,
+        t_next: Optional[torch.Tensor] = None,
+        next_latents: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Any] = None,
+        indexes_image: Optional[torch.Tensor] = None,
+        attention_mask: Optional[Dict[str, Any]] = None,
+        uncond_past_key_values: Optional[Any] = None,
+        uncond_indexes_image: Optional[torch.Tensor] = None,
+        uncond_attention_mask: Optional[Dict[str, Any]] = None,
+        noise_level: Optional[Union[float, torch.Tensor]] = None,
+        compute_log_prob: bool = True,
+        return_kwargs: Optional[List[str]] = None,
+        step_index: Optional[int] = None,
+        **kwargs: Any,
+    ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
+        """Predict one transition and evaluate its SDE log probability."""
+        if return_kwargs is None:
+            return_kwargs = [
+                "velocity",
+                "next_latents",
+                "next_latents_mean",
+                "std_dev_t",
+                "dt",
+                "log_prob",
+            ]
+        if latents.ndim == 3:
+            latents = latents.unsqueeze(0)
+        if latents.ndim != 4:
+            raise ValueError(
+                f"SenseNovaAdapter.forward expects latents of rank 4, got {tuple(latents.shape)}"
+            )
+        batch_size = latents.shape[0]
+        if guidance_scale is not None:
+            cfg_scale = guidance_scale
+        prompts = self._as_batch_values(prompt, batch_size, "prompt") if prompt is not None else []
+        shape = self._image_shape(height, width, image_shape)
+        times = self._normalize_batch_tensor(t, batch_size, latents.device, "t")
+        next_times = (
+            self._normalize_batch_tensor(t_next, batch_size, latents.device, "t_next")
+            if t_next is not None
+            else None
+        )
+        if next_latents is not None and next_latents.ndim == 3:
+            next_latents = next_latents.unsqueeze(0)
+        if next_latents is not None and next_latents.shape != latents.shape:
+            raise ValueError(
+                "SenseNovaAdapter.forward requires `next_latents` to match `latents`; "
+                f"received {tuple(next_latents.shape)} vs {tuple(latents.shape)}."
+            )
+
+        outputs: List[FlowMatchEulerDiscreteSDESchedulerOutput] = []
+        for batch_index in range(batch_size):
+            owns_context = past_key_values is None
+            if owns_context:
+                if not prompts:
+                    raise ValueError(
+                        "SenseNovaAdapter.forward requires raw `prompt` when no prebuilt "
+                        "prefix cache is supplied."
+                    )
+                context = self._build_context(prompts[batch_index], shape, cfg_scale)
+            else:
+                context = {
+                    "past_key_values": past_key_values,
+                    "indexes_image": indexes_image,
+                    "attention_mask": attention_mask or {"full_attention": None},
+                    "uncond_past_key_values": uncond_past_key_values,
+                    "uncond_indexes_image": uncond_indexes_image,
+                    "uncond_attention_mask": uncond_attention_mask or {"full_attention": None},
+                }
+
+            try:
+                native_t = self._native_timestep(times[batch_index])
+                noise_scale = self._noise_scale(shape)
+                velocity_native = self.transformer(
+                    latents=latents[batch_index : batch_index + 1],
+                    timestep=native_t,
+                    past_key_values=context["past_key_values"],
+                    indexes_image=context["indexes_image"],
+                    attention_mask=context["attention_mask"],
+                    image_size=shape,
+                    noise_scale=noise_scale,
+                )
+                use_cfg = (
+                    cfg_scale > 1
+                    and context["uncond_past_key_values"] is not None
+                    and native_t >= cfg_interval[0]
+                    and native_t <= cfg_interval[1]
+                )
+                if use_cfg:
+                    velocity_uncond = self.transformer(
+                        latents=latents[batch_index : batch_index + 1],
+                        timestep=native_t,
+                        past_key_values=context["uncond_past_key_values"],
+                        indexes_image=context["uncond_indexes_image"],
+                        attention_mask=context["uncond_attention_mask"],
+                        image_size=shape,
+                        noise_scale=noise_scale,
+                    )
+                    velocity_native = self._cfg_velocity(
+                        velocity_native,
+                        velocity_uncond,
+                        cfg_scale,
+                        cfg_norm,
+                        step_index,
+                    )
+
+                # The official model predicts clean-minus-noise while the
+                # Flow-Factory scheduler integrates descending sigma and expects
+                # noise-minus-clean.
+                velocity_flow = -self._patch_velocity_to_pixels(velocity_native, shape)
+                current_noise_level = noise_level
+                if isinstance(noise_level, torch.Tensor) and noise_level.ndim > 0:
+                    current_noise_level = noise_level.reshape(-1)[batch_index]
+                output = self.scheduler.step(
+                    velocity=velocity_flow,
+                    timestep=times[batch_index],
+                    latents=latents[batch_index : batch_index + 1],
+                    timestep_next=None if next_times is None else next_times[batch_index],
+                    next_latents=(
+                        None
+                        if next_latents is None
+                        else next_latents[batch_index : batch_index + 1]
+                    ),
+                    compute_log_prob=compute_log_prob,
+                    return_dict=True,
+                    return_kwargs=return_kwargs,
+                    noise_level=current_noise_level,
+                )
+                outputs.append(output)
+            finally:
+                if owns_context:
+                    self._clear_context(context)
+
+        merged: Dict[str, torch.Tensor] = {}
+        for field in (
+            "next_latents",
+            "next_latents_mean",
+            "std_dev_t",
+            "dt",
+            "log_prob",
+            "velocity",
+        ):
+            values = [getattr(output, field) for output in outputs]
+            if all(value is not None for value in values):
+                merged[field] = torch.cat(values, dim=0)
+        return FlowMatchEulerDiscreteSDESchedulerOutput.from_dict(merged)
+
+    # ============================== Inference ==============================
+
+    @torch.no_grad()
+    def inference(
+        self,
+        prompt: Optional[Union[str, List[str]]] = None,
+        height: int = 1024,
+        width: int = 1024,
+        num_inference_steps: int = 50,
+        cfg_scale: float = 4.0,
+        guidance_scale: Optional[float] = None,
+        cfg_norm: str = "none",
+        cfg_interval: Tuple[float, float] = (0.0, 1.0),
+        timestep_shift: float = 3.0,
+        enable_timestep_shift: bool = True,
+        compute_log_prob: bool = True,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        extra_call_back_kwargs: Optional[List[str]] = None,
+        trajectory_indices: TrajectoryIndicesType = "all",
+        **kwargs: Any,
+    ) -> List[SenseNovaSample]:
+        """Generate T2I samples with official NEO-Unify timesteps."""
+        if prompt is None:
+            raise ValueError("SenseNovaAdapter.inference requires `prompt`.")
+        prompts = [prompt] if isinstance(prompt, str) else list(prompt)
+        if guidance_scale is not None:
+            cfg_scale = guidance_scale
+        if num_inference_steps < 1:
+            raise ValueError("num_inference_steps must be positive")
+        shape = self._image_shape(height, width, None)
+        device = self.device
+        dtype = self.transformer.dtype
+        callbacks = extra_call_back_kwargs or []
+        model = self._base_model()
+        merge_size = int(1 / model.downsample_ratio)
+        token_h = height // (model.patch_size * merge_size)
+        token_w = width // (model.patch_size * merge_size)
+        image_token_num = token_h * token_w
+
+        native_timesteps = torch.linspace(0.0, 1.0, num_inference_steps + 1, device=device)
+        if enable_timestep_shift:
+            native_timesteps = model._apply_time_schedule(
+                native_timesteps, image_token_num, timestep_shift
+            )
+        flow_timesteps = 1000.0 * (1.0 - native_timesteps[:-1])
+        self.scheduler.set_timesteps(timesteps=flow_timesteps, device=device)
+        timesteps = self.scheduler.timesteps
+
+        samples: List[SenseNovaSample] = []
+        for sample_index, sample_prompt in enumerate(prompts):
+            context = self._build_context(sample_prompt, shape, cfg_scale)
+            try:
+                sample_generator = (
+                    generator[sample_index] if isinstance(generator, list) else generator
+                )
+                noise = randn_tensor(
+                    (1, 3, height, width),
+                    generator=sample_generator,
+                    device=device,
+                    dtype=dtype,
+                )
+                latents = self.cast_latents(noise * self._noise_scale(shape), default_dtype=dtype)
+                latent_collector = create_trajectory_collector(
+                    trajectory_indices, num_inference_steps
+                )
+                latent_collector.collect(latents, step_idx=0)
+                log_prob_collector = (
+                    create_trajectory_collector(trajectory_indices, num_inference_steps)
+                    if compute_log_prob
+                    else None
+                )
+                callback_collector = create_callback_collector(
+                    trajectory_indices, num_inference_steps
+                )
+
+                for step_index, timestep in enumerate(timesteps):
+                    timestep_next = (
+                        timesteps[step_index + 1]
+                        if step_index + 1 < len(timesteps)
+                        else torch.tensor(0.0, device=device)
+                    )
+                    current_noise_level = self.scheduler.get_noise_level_for_timestep(timestep)
+                    current_compute_log_prob = compute_log_prob and current_noise_level > 0
+                    output = self.forward(
+                        t=timestep,
+                        t_next=timestep_next,
+                        latents=latents,
+                        prompt=sample_prompt,
+                        height=height,
+                        width=width,
+                        cfg_scale=cfg_scale,
+                        cfg_norm=cfg_norm,
+                        cfg_interval=cfg_interval,
+                        timestep_shift=timestep_shift,
+                        past_key_values=context["past_key_values"],
+                        indexes_image=context["indexes_image"],
+                        attention_mask=context["attention_mask"],
+                        uncond_past_key_values=context["uncond_past_key_values"],
+                        uncond_indexes_image=context["uncond_indexes_image"],
+                        uncond_attention_mask=context["uncond_attention_mask"],
+                        noise_level=current_noise_level,
+                        compute_log_prob=current_compute_log_prob,
+                        return_kwargs=list(
+                            set(["velocity", "next_latents", "log_prob"] + callbacks)
+                        ),
+                        step_index=step_index,
+                    )
+                    latents = self.cast_latents(output.next_latents, default_dtype=dtype)
+                    latent_collector.collect(latents, step_idx=step_index + 1)
+                    if current_compute_log_prob and log_prob_collector is not None:
+                        log_prob_collector.collect(output.log_prob, step_idx=step_index)
+                    callback_collector.collect_step(
+                        step_idx=step_index,
+                        output=output,
+                        keys=callbacks,
+                        capturable={"noise_level": current_noise_level},
+                    )
+
+                images = self.decode_latents(latents, output_type="pt")
+                all_latents = latent_collector.get_result()
+                all_log_probs = log_prob_collector.get_result() if log_prob_collector else None
+                callback_results = callback_collector.get_result() or {}
+                samples.append(
+                    SenseNovaSample(
+                        timesteps=timesteps,
+                        all_latents=(
+                            torch.stack([value[0] for value in all_latents], dim=0)
+                            if all_latents is not None
+                            else None
+                        ),
+                        latent_index_map=latent_collector.get_index_map(),
+                        log_probs=(
+                            torch.stack([value[0] for value in all_log_probs], dim=0)
+                            if all_log_probs is not None
+                            else None
+                        ),
+                        log_prob_index_map=(
+                            log_prob_collector.get_index_map() if log_prob_collector else None
+                        ),
+                        height=height,
+                        width=width,
+                        image=images[0],
+                        prompt=sample_prompt,
+                        extra_kwargs={
+                            **{key: value for key, value in callback_results.items()},
+                            "callback_index_map": callback_collector.get_index_map(),
+                        },
+                    )
+                )
+            finally:
+                self._clear_context(context)
+        self.pipeline.maybe_free_model_hooks()
+        return samples
