@@ -422,7 +422,7 @@ for a validated four-step SD3.5 setup.
 
 ## TDM
 
-`tdm` extends DMD2 to a few-step trajectory. Each outer iteration consumes
+`tdm` extends Diff-Instruct (https://arxiv.org/abs/2305.18455) to a few-step deterministic trajectory by aligning student trajectory and teacher trajectory at the distribution level. Each outer iteration consumes
 `gradient_accumulation_steps` distinct dataloader batches. For every microbatch,
 K boundary units are averaged in that microbatch only. Chronology is still fake
 first: `R` fake phases, then one generator phase. Interval validation keeps
@@ -443,7 +443,7 @@ See [`examples/tdm/lora/sd3_5/ocr.yaml`](../examples/tdm/lora/sd3_5/ocr.yaml).
 
 ## TDM-R1
 
-`tdm-r1` adds a learned `surrogate` role on top of TDM's `generator` and `fake`,
+`tdm-r1` focuses on reinforcing the few-step generator via universal reward. It adds a learned `surrogate` role on top of TDM's `generator` and `fake`,
 and queries the same frozen pretrained reference through `use_ref_parameters()`.
 Each `optimize()` call is sequential: fake × `R`, one surrogate step, then one
 generator step. With `group_contiguous`, each rank holds complete groups and
