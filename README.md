@@ -122,7 +122,7 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
 | CRD            | crd            | [Centered Reward Distillation](https://arxiv.org/abs/2603.14128) ([Blog (Chinese)](https://mp.weixin.qq.com/s/fpTi7PPi3APSNJQ2kXN3Dw))|
 | DiffusionOPD   | diffusion-opd  | [DiffusionOPD](https://arxiv.org/abs/2605.15055) |
 | DMD2           | dmd2           | [DMD2](https://arxiv.org/abs/2405.14867) |
-| TDM            | tdm            | Trajectory distribution matching |
+| TDM            | tdm            | [Trajectory Distribution Matching](https://arxiv.org/abs/2503.06674) |
 | TDM-R1         | tdm-r1         | [TDM-R1](https://arxiv.org/abs/2603.07700) |
 
 See [`Algorithm Guidance`](guidance/algorithms.md) for more information.
