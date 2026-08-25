@@ -15,6 +15,12 @@
 """SenseNova-U1 model adapter for Flow-Factory."""
 
 from .pipeline import SenseNovaDenoiser, SenseNovaPseudoPipeline
-from .sensenova import SenseNovaAdapter, SenseNovaSample
+from .sensenova import SenseNovaAdapter, SenseNovaI2ISample, SenseNovaSample
 
-__all__ = ["SenseNovaAdapter", "SenseNovaDenoiser", "SenseNovaPseudoPipeline", "SenseNovaSample"]
+__all__ = [
+    "SenseNovaAdapter",
+    "SenseNovaDenoiser",
+    "SenseNovaPseudoPipeline",
+    "SenseNovaSample",
+    "SenseNovaI2ISample",
+]

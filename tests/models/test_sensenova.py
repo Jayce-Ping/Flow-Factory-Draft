@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
+from PIL import Image
 
 from flow_factory.models.registry import get_model_adapter_class
+from flow_factory.models.sensenova import sensenova as sensenova_module
 from flow_factory.models.sensenova.modeling.neo_unify.configuration_neo_chat import NEOChatConfig
 from flow_factory.models.sensenova.modeling.neo_unify.modeling_neo_chat import (
     NEOChatModel,
@@ -24,7 +28,8 @@ from flow_factory.models.sensenova.modeling.neo_unify.modeling_neo_chat import (
     prepare_flash_kv_cache,
 )
 from flow_factory.models.sensenova.pipeline import SenseNovaDenoiser
-from flow_factory.models.sensenova.sensenova import SenseNovaAdapter
+from flow_factory.models.sensenova.sensenova import SenseNovaAdapter, SenseNovaI2ISample
+from flow_factory.scheduler import FlowMatchEulerDiscreteSDEScheduler
 
 
 def _tiny_config(use_pixel_head: bool) -> NEOChatConfig:
@@ -122,3 +127,141 @@ def test_sensenova_denoiser_supports_u1_heads(use_pixel_head: bool):
         assert torch.isfinite(velocity).all()
     finally:
         clear_flash_kv_cache(cache)
+
+
+class _FakeTokenizer:
+    """Minimal tokenizer preserving the visual-token counts used by NEO-Unify."""
+
+    def convert_tokens_to_ids(self, token):
+        return {"<IMG_CONTEXT>": 5, "<img>": 6, "</img>": 7}.get(token, 2)
+
+    def __call__(self, text, return_tensors="pt"):
+        ids = [2]
+        ids.extend([6] * text.count("<img>"))
+        ids.extend([5] * text.count("<IMG_CONTEXT>"))
+        ids.extend([7] * text.count("</img>"))
+        ids.append(2)
+        return {"input_ids": torch.tensor([ids], dtype=torch.long)}
+
+
+class _TinySenseNovaAdapter(SenseNovaAdapter):
+    """Adapter shell for CPU tests without constructing the full training runtime."""
+
+    @property
+    def tokenizer(self):
+        return self._test_tokenizer
+
+    @tokenizer.setter
+    def tokenizer(self, value):
+        self._test_tokenizer = value
+
+    @property
+    def transformer(self):
+        return self._test_transformer
+
+    @transformer.setter
+    def transformer(self, value):
+        self._test_transformer = value
+
+    @property
+    def device(self):
+        return torch.device("cpu")
+
+    def _unwrap(self, model):
+        return model
+
+
+def test_sensenova_multi_reference_prefill(monkeypatch):
+    """Official image-prefill supports ordered multi-reference images and CFG branches."""
+    model = NEOChatModel(_tiny_config(use_pixel_head=True)).eval()
+    adapter = _TinySenseNovaAdapter.__new__(_TinySenseNovaAdapter)
+    adapter.transformer = SenseNovaDenoiser(model)
+    adapter.tokenizer = _FakeTokenizer()
+
+    def fake_load_image_native(image, **kwargs):
+        del image, kwargs
+        return torch.zeros(4, 3 * 16 * 16), torch.tensor([[2, 2]], dtype=torch.long)
+
+    monkeypatch.setattr(sensenova_module, "load_image_native", fake_load_image_native)
+    references = [Image.new("RGB", (32, 32), color=(index * 40, 0, 0)) for index in range(2)]
+    context = adapter._build_context(
+        "Combine the references into one image.",
+        (32, 32),
+        guidance_scale=3.0,
+        img_cfg_scale=2.0,
+        condition_images=references,
+    )
+    try:
+        assert context["is_i2i"] is True
+        assert context["img_past_key_values"] is not None
+        assert context["uncond_past_key_values"] is not None
+        velocity = adapter.transformer(
+            latents=torch.randn(1, 3, 32, 32),
+            timestep=torch.tensor(0.2),
+            past_key_values=context["past_key_values"],
+            indexes_image=context["indexes_image"],
+            attention_mask=context["attention_mask"],
+            image_size=(32, 32),
+            noise_scale=1.0,
+        )
+        image_velocity = adapter.transformer(
+            latents=torch.randn(1, 3, 32, 32),
+            timestep=torch.tensor(0.2),
+            past_key_values=context["img_past_key_values"],
+            indexes_image=context["img_indexes_image"],
+            attention_mask=context["img_attention_mask"],
+            image_size=(32, 32),
+            noise_scale=1.0,
+        )
+        assert velocity.shape == image_velocity.shape == (1, 1, 3072)
+        assert torch.isfinite(velocity).all()
+        assert torch.isfinite(image_velocity).all()
+        uncond_velocity = adapter.transformer(
+            latents=torch.randn(1, 3, 32, 32),
+            timestep=torch.tensor(0.2),
+            past_key_values=context["uncond_past_key_values"],
+            indexes_image=context["uncond_indexes_image"],
+            attention_mask=context["uncond_attention_mask"],
+            image_size=(32, 32),
+            noise_scale=1.0,
+        )
+        assert uncond_velocity.shape == velocity.shape
+        assert torch.isfinite(uncond_velocity).all()
+
+        adapter.pipeline = SimpleNamespace(
+            scheduler=FlowMatchEulerDiscreteSDEScheduler(dynamics_type="ODE")
+        )
+        adapter.scheduler.set_timesteps(num_inference_steps=2, device="cpu")
+        output = adapter.forward(
+            t=torch.tensor(1000.0),
+            t_next=torch.tensor(500.0),
+            latents=torch.randn(1, 3, 32, 32),
+            prompt="Combine the references into one image.",
+            height=32,
+            width=32,
+            cfg_scale=3.0,
+            img_cfg_scale=2.0,
+            past_key_values=context["past_key_values"],
+            indexes_image=context["indexes_image"],
+            attention_mask=context["attention_mask"],
+            img_past_key_values=context["img_past_key_values"],
+            img_indexes_image=context["img_indexes_image"],
+            img_attention_mask=context["img_attention_mask"],
+            uncond_past_key_values=context["uncond_past_key_values"],
+            uncond_indexes_image=context["uncond_indexes_image"],
+            uncond_attention_mask=context["uncond_attention_mask"],
+            compute_log_prob=False,
+        )
+        assert output.next_latents.shape == (1, 3, 32, 32)
+    finally:
+        adapter._clear_context(context)
+
+    sample = SenseNovaI2ISample(condition_images=references)
+    assert sample.condition_images_as_pil is True
+    assert len(sample.condition_images) == 2
+    encoded = adapter.encode_image([references, [references[0]]])
+    assert [len(images) for images in encoded["condition_images"]] == [2, 1]
+    stacked = SenseNovaI2ISample.stack(
+        [sample, SenseNovaI2ISample(condition_images=[references[0]])]
+    )
+    assert [len(images) for images in stacked["condition_images"]] == [2, 1]

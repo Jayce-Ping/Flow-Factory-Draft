@@ -23,9 +23,27 @@ through `SenseNovaDenoiser`. Prefix KV-cache construction is deterministic and
 no-gradient, while the denoising prediction and SDE transition are shared by
 rollout and replay.
 
-The initial integration supports text-to-image training and evaluation. Official
-image-editing/multimodal generation requires a different image-prefill and cache
-contract, so it is intentionally not exposed by this adapter yet.
+The adapter supports T2I and I2I training/evaluation. I2I accepts an ordered
+`List[List[PIL.Image]]` condition batch, so each sample may carry multiple reference
+images. The official image-prefill path expands each `<image>` marker into its
+visual-token block and prepares separate text+image, image-only, and optional
+unconditional KV caches. `cfg_scale` controls text guidance and `img_cfg_scale`
+controls image guidance; the default `img_cfg_scale: 1.0` follows the official
+edit configuration.
+
+Example I2I data shape:
+
+```python
+condition_images = [
+    [reference_a, reference_b],  # sample 0: two ordered references
+    [reference_c],                # sample 1: one reference
+]
+```
+
+Reference images are persisted through the HF Image feature as PIL images, allowing
+variable reference-image counts and spatial sizes to survive dataset caching and
+sample replay. This integration covers the official local image-editing contract;
+other multimodal/interleaved tasks remain outside the adapter scope.
 
 Recommended starting points are:
 

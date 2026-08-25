@@ -42,10 +42,11 @@ ff-train examples/grpo/lora/flux1/default.yaml
 
 ## SenseNova-U1 examples
 
-- [`sensenova` U1.5 T2I](../examples/grpo/lora/sensenova/default.yaml)
+- [`sensenova` U1.5 T2I/I2I](../examples/grpo/lora/sensenova/default.yaml)
 
 Change `model.model_name_or_path` to `sensenova/SenseNova-U1-8B-MoT` for U1.0.
-The adapter currently covers T2I; image-editing/multimodal paths are not enabled.
+For I2I, provide `images` as an ordered list per sample; multiple reference images
+are supported and are persisted as PIL images through the HF Image feature.
 
 The T2VA `debug.yaml` recipe is real-weight validated with the 61 GB checkpoint
 (61.74 GiB transformer):

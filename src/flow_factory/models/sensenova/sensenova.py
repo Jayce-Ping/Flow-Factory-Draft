@@ -26,11 +26,12 @@ from PIL import Image
 
 from diffusers.utils.torch_utils import randn_tensor
 
-from ...samples import T2ISample
+from ...samples import I2ISample, T2ISample
 from ...scheduler import (
     FlowMatchEulerDiscreteSDEScheduler,
     FlowMatchEulerDiscreteSDESchedulerOutput,
 )
+from ...utils.image import MultiImageBatch, is_multi_image_batch, standardize_image_batch
 from ...utils.trajectory_collector import (
     TrajectoryIndicesType,
     create_callback_collector,
@@ -41,6 +42,7 @@ from ..runtime import ComponentRuntime, PseudoPipelineRuntime
 from .modeling.neo_unify.modeling_neo_chat import (
     SYSTEM_MESSAGE_FOR_GEN,
     clear_flash_kv_cache,
+    load_image_native,
     optimized_scale,
     prepare_flash_kv_cache,
 )
@@ -54,19 +56,32 @@ class SenseNovaSample(T2ISample):
     _shared_fields: ClassVar[frozenset[str]] = frozenset()
 
 
+@dataclass
+class SenseNovaI2ISample(I2ISample):
+    """Image-to-image sample with ordered, variable-count reference images."""
+
+    _shared_fields: ClassVar[frozenset[str]] = frozenset()
+    # Reference images are persisted by the HF Image feature and must stay PIL on
+    # the sample so ragged image sizes/counts survive the rollout/replay boundary.
+    condition_images_as_pil: ClassVar[bool] = True
+
+
 class SenseNovaAdapter(BaseAdapter):
-    """Support SenseNova-U1 1.0 and U1.5 text-to-image generation.
+    """Support SenseNova-U1 1.0 and U1.5 text/image-to-image generation.
 
     The two checkpoints use the same NEO-Unify backbone and differ primarily in
     their flow-matching output head.  The vendored model reads ``use_pixel_head``
     from the checkpoint config, so no model-specific branch is needed here.
 
-    This first integration deliberately supports T2I.  SenseNova's official
-    checkpoint also exposes image-editing and multimodal paths, but those require
-    a separate image-prefill/cache contract and are kept out of the initial RL
-    adapter until they have parity tests.
+    The adapter follows the official NEO-Unify image-prefill contract for I2I:
+    each ordered reference image is inserted into the prompt as a visual-token
+    block, then the generated image is denoised against text+image, image-only,
+    and optional unconditional KV caches.
     """
 
+    # Reference images have variable spatial sizes/counts and are re-encoded at
+    # rollout/replay time. Persist them through the HF Image feature as PIL.
+    python_format_columns: ClassVar[frozenset[str]] = frozenset({"condition_images"})
     ddp_find_unused_parameters = True
     flow_velocity_direction: ClassVar[Literal["noise", "data"]] = "noise"
 
@@ -127,8 +142,18 @@ class SenseNovaAdapter(BaseAdapter):
         """Persist raw prompts; official NEO tokenization is cache-dependent."""
         return {"prompt": [prompt] if isinstance(prompt, str) else prompt}
 
-    def encode_image(self, images: Any, **kwargs: Any) -> None:
-        """Image editing is intentionally deferred until the I2I contract lands."""
+    def encode_image(
+        self, images: MultiImageBatch, **kwargs: Any
+    ) -> Optional[Dict[str, List[List[Image.Image]]]]:
+        """Normalize one or more reference images per sample to RGB PIL images.
+
+        Vision preprocessing is intentionally deferred to context construction so
+        the same exact reference bytes are used by rollout and replay. Returning
+        a nested list is required for ragged multi-reference Arrow columns.
+        """
+        if images is None:
+            return None
+        return {"condition_images": self._normalize_condition_images(images)}
 
     def encode_video(self, videos: Any, **kwargs: Any) -> None:
         """SenseNova-U1 has no video input in this adapter."""
@@ -233,13 +258,226 @@ class SenseNovaAdapter(BaseAdapter):
                 noise_scale = math.sqrt(noise_scale)
         return min(noise_scale, float(model.noise_scale_max_value))
 
+    @staticmethod
+    def _normalize_condition_images(
+        condition_images: Optional[MultiImageBatch],
+        batch_size: Optional[int] = None,
+    ) -> List[List[Image.Image]]:
+        """Normalize condition images to ordered per-sample RGB PIL lists.
+
+        The dataset contract uses ``List[List[Image]]`` for ragged multi-reference
+        batches, while direct callers often pass ``List[Image]`` for one sample.
+        Empty inner lists are preserved so a batch can mix I2I and T2I samples.
+        """
+        if condition_images is None:
+            return [[] for _ in range(batch_size or 0)]
+
+        if isinstance(condition_images, list) and (
+            not condition_images
+            or any(isinstance(value, (list, tuple)) for value in condition_images)
+        ):
+            per_sample: List[Any] = list(condition_images)
+        elif is_multi_image_batch(condition_images):
+            if isinstance(condition_images, torch.Tensor):
+                per_sample = list(condition_images.unbind(0))
+            else:
+                per_sample = list(condition_images)
+        else:
+            per_sample = [condition_images]
+
+        if batch_size is not None and len(per_sample) != batch_size:
+            raise ValueError(
+                "SenseNova `condition_images` must contain one image list per sample; "
+                f"received {len(per_sample)} lists for batch_size={batch_size}."
+            )
+
+        normalized: List[List[Image.Image]] = []
+        for images in per_sample:
+            if images is None:
+                normalized.append([])
+                continue
+            if isinstance(images, (list, tuple)) and len(images) == 0:
+                normalized.append([])
+                continue
+            normalized.append(list(standardize_image_batch(images, output_type="pil")))
+        return normalized
+
+    def _prepare_reference_images(
+        self, condition_images: List[Image.Image]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply the official NEO-Unify image preprocessing to all references."""
+        if not condition_images:
+            raise ValueError("SenseNova I2I requires at least one condition image.")
+        model = self._base_model()
+        pixel_values: List[torch.Tensor] = []
+        grid_hw: List[torch.Tensor] = []
+        max_pixels = min(2048 * 2048, (4096 * 4096) // len(condition_images))
+        for image in condition_images:
+            current_pixels, current_grid = load_image_native(
+                image,
+                patch_size=model.patch_size,
+                downsample_ratio=model.downsample_ratio,
+                min_pixels=512 * 512,
+                max_pixels=max_pixels,
+                upscale=False,
+            )
+            pixel_values.append(current_pixels.to(device=self.device, dtype=self.transformer.dtype))
+            grid_hw.append(current_grid.to(device=self.device))
+        return torch.cat(pixel_values, dim=0), torch.cat(grid_hw, dim=0)
+
+    @staticmethod
+    def _insert_missing_image_placeholders(prompt: str, image_count: int) -> str:
+        """Match the official prompt convention for omitted ``<image>`` markers."""
+        image_token_count = prompt.count("<image>")
+        if image_count < image_token_count:
+            raise ValueError(
+                f"SenseNova prompt contains {image_token_count} `<image>` placeholders but "
+                f"only {image_count} condition images were provided."
+            )
+        if image_count > image_token_count:
+            if image_token_count == 0 and image_count > 1:
+                prefix = "".join(f"Image-{index + 1}:<image>\n" for index in range(image_count))
+                prompt = prefix + prompt
+            else:
+                prompt = "<image>\n" * (image_count - image_token_count) + prompt
+        return prompt
+
+    def _replace_image_placeholders(self, query: str, grid_hw: torch.Tensor) -> str:
+        """Expand each logical image marker to the official visual-token block."""
+        model = self._base_model()
+        for grid in grid_hw:
+            num_patch_tokens = int(grid[0].item() * grid[1].item() * model.downsample_ratio**2)
+            image_tokens = "<img>" + "<IMG_CONTEXT>" * num_patch_tokens + "</img>"
+            if "<image>" not in query:
+                raise ValueError("SenseNova image-token expansion ran out of `<image>` markers.")
+            query = query.replace("<image>", image_tokens, 1)
+        return query
+
+    def _build_it2i_branch(
+        self,
+        query: str,
+        pixel_values: torch.Tensor,
+        grid_hw: torch.Tensor,
+        image_size: Tuple[int, int],
+    ) -> Dict[str, Any]:
+        """Build one official image-prefilled generation branch."""
+        model = self._base_model()
+        model.img_context_token_id = self.tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
+        model.img_start_token_id = self.tokenizer.convert_tokens_to_ids("<img>")
+        query = self._replace_image_placeholders(query, grid_hw)
+        with torch.no_grad():
+            input_embeds, indexes, attention_mask = model._build_it2i_inputs(
+                self.tokenizer, query, pixel_values, grid_hw
+            )
+            cache, _ = model._it2i_prefix_forward(input_embeds, indexes, attention_mask)
+
+        merge_size = int(1 / model.downsample_ratio)
+        token_h = image_size[1] // (model.patch_size * merge_size)
+        token_w = image_size[0] // (model.patch_size * merge_size)
+        indexes_image = model._build_t2i_image_indexes(
+            token_h,
+            token_w,
+            int(indexes[0].max().item()) + 1,
+            device=self.device,
+        )
+        prepare_flash_kv_cache(cache, current_len=token_h * token_w, batch_size=1)
+        return {
+            "past_key_values": cache,
+            "indexes_image": indexes_image,
+            "attention_mask": {"full_attention": None},
+        }
+
+    def _build_i2i_context(
+        self,
+        prompt: str,
+        image_size: Tuple[int, int],
+        cfg_scale: float,
+        img_cfg_scale: float,
+        condition_images: List[Image.Image],
+    ) -> Dict[str, Any]:
+        """Build text+image, image-only, and optional unconditional caches."""
+        if not condition_images:
+            raise ValueError("SenseNova I2I context construction needs condition images.")
+        if cfg_scale < 0 or img_cfg_scale < 0:
+            raise ValueError("SenseNova CFG scales must be non-negative.")
+        pixel_values, grid_hw = self._prepare_reference_images(condition_images)
+        prompt = self._insert_missing_image_placeholders(prompt, len(condition_images))
+        model = self._base_model()
+        condition_query = model._build_t2i_query(
+            prompt,
+            system_message=SYSTEM_MESSAGE_FOR_GEN,
+            append_text="<think>\n\n</think>\n\n<img>",
+        )
+        image_query = model._build_t2i_query("<image>" * len(condition_images), append_text="<img>")
+        unconditional_query = model._build_t2i_query("", append_text="<img>")
+
+        condition_branch = self._build_it2i_branch(
+            condition_query, pixel_values, grid_hw, image_size
+        )
+        needs_guidance = not (cfg_scale == 1 and img_cfg_scale == 1)
+        needs_image_branch = needs_guidance and (img_cfg_scale == 1 or cfg_scale != img_cfg_scale)
+        needs_unconditional = needs_guidance and img_cfg_scale != 1
+        image_branch = (
+            self._build_it2i_branch(image_query, pixel_values, grid_hw, image_size)
+            if needs_image_branch
+            else {"past_key_values": None, "indexes_image": None, "attention_mask": None}
+        )
+        unconditional_branch = {
+            "past_key_values": None,
+            "indexes_image": None,
+            "attention_mask": None,
+        }
+        # The unconditional branch has no reference pixels, but it still uses the
+        # official image-aware index builder so the terminal ``<img>`` token keeps
+        # the same positional contract as the image-prefilled branches.
+        if needs_unconditional:
+            model.img_context_token_id = self.tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
+            model.img_start_token_id = self.tokenizer.convert_tokens_to_ids("<img>")
+            input_embeds, indexes, attention_mask = model._build_it2i_inputs(
+                self.tokenizer, unconditional_query
+            )
+            with torch.no_grad():
+                cache, _ = model._it2i_prefix_forward(input_embeds, indexes, attention_mask)
+            merge_size = int(1 / model.downsample_ratio)
+            token_h = image_size[1] // (model.patch_size * merge_size)
+            token_w = image_size[0] // (model.patch_size * merge_size)
+            unconditional_branch = {
+                "past_key_values": cache,
+                "indexes_image": model._build_t2i_image_indexes(
+                    token_h, token_w, indexes.shape[1], device=self.device
+                ),
+                "attention_mask": {"full_attention": None},
+            }
+            prepare_flash_kv_cache(cache, current_len=token_h * token_w, batch_size=1)
+
+        return {
+            **condition_branch,
+            "img_past_key_values": image_branch["past_key_values"],
+            "img_indexes_image": image_branch["indexes_image"],
+            "img_attention_mask": image_branch["attention_mask"],
+            "uncond_past_key_values": unconditional_branch["past_key_values"],
+            "uncond_indexes_image": unconditional_branch["indexes_image"],
+            "uncond_attention_mask": unconditional_branch["attention_mask"],
+            "is_i2i": True,
+        }
+
     def _build_context(
         self,
         prompt: str,
         image_size: Tuple[int, int],
         guidance_scale: float,
+        img_cfg_scale: float = 1.0,
+        condition_images: Optional[List[Image.Image]] = None,
     ) -> Dict[str, Any]:
         """Build and flash-prepare condition/uncondition prefix caches."""
+        if condition_images:
+            return self._build_i2i_context(
+                prompt,
+                image_size,
+                guidance_scale,
+                img_cfg_scale,
+                condition_images,
+            )
         model = self._base_model()
         device = self.device
         merge_size = int(1 / model.downsample_ratio)
@@ -282,14 +520,26 @@ class SenseNovaAdapter(BaseAdapter):
             "past_key_values": cache,
             "indexes_image": indexes_image,
             "attention_mask": {"full_attention": None},
+            "img_past_key_values": None,
+            "img_indexes_image": None,
+            "img_attention_mask": None,
             "uncond_past_key_values": uncond_cache,
             "uncond_indexes_image": uncond_indexes_image,
             "uncond_attention_mask": {"full_attention": None},
+            "is_i2i": False,
         }
 
     def _clear_context(self, context: Dict[str, Any]) -> None:
-        clear_flash_kv_cache(context.get("past_key_values"))
-        clear_flash_kv_cache(context.get("uncond_past_key_values"))
+        cleared = set()
+        for key in (
+            "past_key_values",
+            "img_past_key_values",
+            "uncond_past_key_values",
+        ):
+            cache = context.get(key)
+            if cache is not None and id(cache) not in cleared:
+                clear_flash_kv_cache(cache)
+                cleared.add(id(cache))
 
     @staticmethod
     def _cfg_velocity(
@@ -321,6 +571,57 @@ class SenseNovaAdapter(BaseAdapter):
             raise ValueError(
                 f"unsupported cfg_norm={cfg_norm!r}; expected 'none', 'global', 'channel', "
                 "or 'cfg_zero_star'."
+            )
+        return velocity
+
+    @staticmethod
+    def _i2i_cfg_velocity(
+        condition: torch.Tensor,
+        image_condition: Optional[torch.Tensor],
+        uncondition: Optional[torch.Tensor],
+        cfg_scale: float,
+        img_cfg_scale: float,
+        cfg_norm: str,
+        step_index: Optional[int],
+    ) -> torch.Tensor:
+        """Apply the official two-scale text/image CFG combination."""
+        if image_condition is None and uncondition is None:
+            return condition
+        if image_condition is None:
+            return SenseNovaAdapter._cfg_velocity(
+                condition, uncondition, cfg_scale, cfg_norm, step_index
+            )
+        if cfg_norm == "cfg_zero_star":
+            raise ValueError("SenseNova I2I supports cfg_norm='none', 'global', or 'channel'.")
+
+        if cfg_scale == 1 and img_cfg_scale == 1:
+            velocity = condition
+        elif img_cfg_scale == 1:
+            velocity = image_condition + cfg_scale * (condition - image_condition)
+        elif cfg_scale == img_cfg_scale:
+            if uncondition is None:
+                raise ValueError("SenseNova I2I image CFG requires an unconditional cache.")
+            velocity = uncondition + cfg_scale * (condition - uncondition)
+        else:
+            if uncondition is None:
+                raise ValueError("SenseNova I2I dual CFG requires an unconditional cache.")
+            velocity = (
+                uncondition
+                + cfg_scale * (condition - image_condition)
+                + img_cfg_scale * (image_condition - uncondition)
+            )
+
+        if cfg_norm == "global":
+            norm_condition = torch.norm(condition, dim=(1, 2), keepdim=True)
+            norm_cfg = torch.norm(velocity, dim=(1, 2), keepdim=True)
+            velocity = velocity * (norm_condition / (norm_cfg + 1e-8)).clamp(min=0, max=1.0)
+        elif cfg_norm == "channel":
+            norm_condition = torch.norm(condition, dim=-1, keepdim=True)
+            norm_cfg = torch.norm(velocity, dim=-1, keepdim=True)
+            velocity = velocity * (norm_condition / (norm_cfg + 1e-8)).clamp(min=0, max=1.0)
+        elif cfg_norm != "none":
+            raise ValueError(
+                f"unsupported I2I cfg_norm={cfg_norm!r}; expected 'none', 'global', or 'channel'."
             )
         return velocity
 
@@ -367,6 +668,11 @@ class SenseNovaAdapter(BaseAdapter):
         compute_log_prob: bool = True,
         return_kwargs: Optional[List[str]] = None,
         step_index: Optional[int] = None,
+        img_cfg_scale: float = 1.0,
+        img_past_key_values: Optional[Any] = None,
+        img_indexes_image: Optional[torch.Tensor] = None,
+        img_attention_mask: Optional[Dict[str, Any]] = None,
+        condition_images: Optional[MultiImageBatch] = None,
         **kwargs: Any,
     ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
         """Predict one transition and evaluate its SDE log probability."""
@@ -389,6 +695,11 @@ class SenseNovaAdapter(BaseAdapter):
         if guidance_scale is not None:
             cfg_scale = guidance_scale
         prompts = self._as_batch_values(prompt, batch_size, "prompt") if prompt is not None else []
+        condition_batch = (
+            self._normalize_condition_images(condition_images, batch_size)
+            if condition_images is not None
+            else [[] for _ in range(batch_size)]
+        )
         shape = self._image_shape(height, width, image_shape)
         times = self._normalize_batch_tensor(t, batch_size, latents.device, "t")
         next_times = (
@@ -413,7 +724,13 @@ class SenseNovaAdapter(BaseAdapter):
                         "SenseNovaAdapter.forward requires raw `prompt` when no prebuilt "
                         "prefix cache is supplied."
                     )
-                context = self._build_context(prompts[batch_index], shape, cfg_scale)
+                context = self._build_context(
+                    prompts[batch_index],
+                    shape,
+                    cfg_scale,
+                    img_cfg_scale,
+                    condition_batch[batch_index],
+                )
             else:
                 context = {
                     "past_key_values": past_key_values,
@@ -422,6 +739,10 @@ class SenseNovaAdapter(BaseAdapter):
                     "uncond_past_key_values": uncond_past_key_values,
                     "uncond_indexes_image": uncond_indexes_image,
                     "uncond_attention_mask": uncond_attention_mask or {"full_attention": None},
+                    "img_past_key_values": img_past_key_values,
+                    "img_indexes_image": img_indexes_image,
+                    "img_attention_mask": img_attention_mask,
+                    "is_i2i": img_past_key_values is not None,
                 }
 
             try:
@@ -436,13 +757,47 @@ class SenseNovaAdapter(BaseAdapter):
                     image_size=shape,
                     noise_scale=noise_scale,
                 )
+                guidance_requested = (
+                    (cfg_scale != 1 or img_cfg_scale != 1) if context["is_i2i"] else cfg_scale > 1
+                )
                 use_cfg = (
-                    cfg_scale > 1
-                    and context["uncond_past_key_values"] is not None
+                    guidance_requested
                     and native_t >= cfg_interval[0]
                     and native_t <= cfg_interval[1]
                 )
-                if use_cfg:
+                if use_cfg and context["is_i2i"]:
+                    velocity_img = None
+                    velocity_uncond = None
+                    if context["img_past_key_values"] is not None:
+                        velocity_img = self.transformer(
+                            latents=latents[batch_index : batch_index + 1],
+                            timestep=native_t,
+                            past_key_values=context["img_past_key_values"],
+                            indexes_image=context["img_indexes_image"],
+                            attention_mask=context["img_attention_mask"],
+                            image_size=shape,
+                            noise_scale=noise_scale,
+                        )
+                    if context["uncond_past_key_values"] is not None:
+                        velocity_uncond = self.transformer(
+                            latents=latents[batch_index : batch_index + 1],
+                            timestep=native_t,
+                            past_key_values=context["uncond_past_key_values"],
+                            indexes_image=context["uncond_indexes_image"],
+                            attention_mask=context["uncond_attention_mask"],
+                            image_size=shape,
+                            noise_scale=noise_scale,
+                        )
+                    velocity_native = self._i2i_cfg_velocity(
+                        velocity_native,
+                        velocity_img,
+                        velocity_uncond,
+                        cfg_scale,
+                        img_cfg_scale,
+                        cfg_norm,
+                        step_index,
+                    )
+                elif use_cfg and context["uncond_past_key_values"] is not None:
                     velocity_uncond = self.transformer(
                         latents=latents[batch_index : batch_index + 1],
                         timestep=native_t,
@@ -520,12 +875,19 @@ class SenseNovaAdapter(BaseAdapter):
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         extra_call_back_kwargs: Optional[List[str]] = None,
         trajectory_indices: TrajectoryIndicesType = "all",
+        condition_images: Optional[MultiImageBatch] = None,
+        img_cfg_scale: float = 1.0,
         **kwargs: Any,
-    ) -> List[SenseNovaSample]:
-        """Generate T2I samples with official NEO-Unify timesteps."""
+    ) -> List[Union[SenseNovaSample, SenseNovaI2ISample]]:
+        """Generate T2I, I2I, or ordered multi-reference I2I samples."""
         if prompt is None:
             raise ValueError("SenseNovaAdapter.inference requires `prompt`.")
         prompts = [prompt] if isinstance(prompt, str) else list(prompt)
+        condition_batch = (
+            self._normalize_condition_images(condition_images, len(prompts))
+            if condition_images is not None
+            else [[] for _ in prompts]
+        )
         if guidance_scale is not None:
             cfg_scale = guidance_scale
         if num_inference_steps < 1:
@@ -549,9 +911,16 @@ class SenseNovaAdapter(BaseAdapter):
         self.scheduler.set_timesteps(timesteps=flow_timesteps, device=device)
         timesteps = self.scheduler.timesteps
 
-        samples: List[SenseNovaSample] = []
+        samples: List[Union[SenseNovaSample, SenseNovaI2ISample]] = []
         for sample_index, sample_prompt in enumerate(prompts):
-            context = self._build_context(sample_prompt, shape, cfg_scale)
+            sample_condition_images = condition_batch[sample_index]
+            context = self._build_context(
+                sample_prompt,
+                shape,
+                cfg_scale,
+                img_cfg_scale,
+                sample_condition_images,
+            )
             try:
                 sample_generator = (
                     generator[sample_index] if isinstance(generator, list) else generator
@@ -592,6 +961,7 @@ class SenseNovaAdapter(BaseAdapter):
                         height=height,
                         width=width,
                         cfg_scale=cfg_scale,
+                        img_cfg_scale=img_cfg_scale,
                         cfg_norm=cfg_norm,
                         cfg_interval=cfg_interval,
                         timestep_shift=timestep_shift,
@@ -601,6 +971,9 @@ class SenseNovaAdapter(BaseAdapter):
                         uncond_past_key_values=context["uncond_past_key_values"],
                         uncond_indexes_image=context["uncond_indexes_image"],
                         uncond_attention_mask=context["uncond_attention_mask"],
+                        img_past_key_values=context["img_past_key_values"],
+                        img_indexes_image=context["img_indexes_image"],
+                        img_attention_mask=context["img_attention_mask"],
                         noise_level=current_noise_level,
                         compute_log_prob=current_compute_log_prob,
                         return_kwargs=list(
@@ -623,33 +996,35 @@ class SenseNovaAdapter(BaseAdapter):
                 all_latents = latent_collector.get_result()
                 all_log_probs = log_prob_collector.get_result() if log_prob_collector else None
                 callback_results = callback_collector.get_result() or {}
-                samples.append(
-                    SenseNovaSample(
-                        timesteps=timesteps,
-                        all_latents=(
-                            torch.stack([value[0] for value in all_latents], dim=0)
-                            if all_latents is not None
-                            else None
-                        ),
-                        latent_index_map=latent_collector.get_index_map(),
-                        log_probs=(
-                            torch.stack([value[0] for value in all_log_probs], dim=0)
-                            if all_log_probs is not None
-                            else None
-                        ),
-                        log_prob_index_map=(
-                            log_prob_collector.get_index_map() if log_prob_collector else None
-                        ),
-                        height=height,
-                        width=width,
-                        image=images[0],
-                        prompt=sample_prompt,
-                        extra_kwargs={
-                            **{key: value for key, value in callback_results.items()},
-                            "callback_index_map": callback_collector.get_index_map(),
-                        },
-                    )
-                )
+                sample_cls = SenseNovaI2ISample if sample_condition_images else SenseNovaSample
+                sample_kwargs: Dict[str, Any] = {
+                    "timesteps": timesteps,
+                    "all_latents": (
+                        torch.stack([value[0] for value in all_latents], dim=0)
+                        if all_latents is not None
+                        else None
+                    ),
+                    "latent_index_map": latent_collector.get_index_map(),
+                    "log_probs": (
+                        torch.stack([value[0] for value in all_log_probs], dim=0)
+                        if all_log_probs is not None
+                        else None
+                    ),
+                    "log_prob_index_map": (
+                        log_prob_collector.get_index_map() if log_prob_collector else None
+                    ),
+                    "height": height,
+                    "width": width,
+                    "image": images[0],
+                    "prompt": sample_prompt,
+                    "extra_kwargs": {
+                        **{key: value for key, value in callback_results.items()},
+                        "callback_index_map": callback_collector.get_index_map(),
+                    },
+                }
+                if sample_condition_images:
+                    sample_kwargs["condition_images"] = sample_condition_images
+                samples.append(sample_cls(**sample_kwargs))
             finally:
                 self._clear_context(context)
         self.pipeline.maybe_free_model_hooks()

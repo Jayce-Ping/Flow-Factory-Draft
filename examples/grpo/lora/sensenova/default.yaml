@@ -56,6 +56,7 @@ train:
   num_inference_steps: 10  # Number of timesteps
   # SenseNova-U1 generation params (passed to inference/forward via **training_args)
   cfg_scale: 1.0  # Options: any non-negative float; 1.0 disables CFG
+  img_cfg_scale: 1.0  # Options: any non-negative float; image guidance scale for I2I
   cfg_norm: none  # Options: none, global, channel, cfg_zero_star
   cfg_interval: [0.0, 1.0]  # Options: [start, end] normalized to [0.0, 1.0]
   timestep_shift: 3.0  # Options: positive float; 3.0 matches the official examples
@@ -99,6 +100,7 @@ eval:
   eval_freq: 20  # Eval frequency in epochs (0 to disable)
   seed: 42  # Eval seed (defaults to training seed)
   cfg_scale: 4.0  # Options: any non-negative float; 1.0 disables CFG
+  img_cfg_scale: 1.0  # Options: any non-negative float; image guidance scale for I2I
   cfg_norm: none  # Options: none, global, channel, cfg_zero_star
   cfg_interval: [0.0, 1.0]  # Options: [start, end] normalized to [0.0, 1.0]
   timestep_shift: 3.0  # Options: positive float; 3.0 matches the official examples
