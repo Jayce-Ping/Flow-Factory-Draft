@@ -918,7 +918,10 @@ class SenseNovaAdapter(BaseAdapter):
                 native_timesteps, image_token_num, timestep_shift
             )
         flow_timesteps = 1000.0 * (1.0 - native_timesteps[:-1])
-        self.scheduler.set_timesteps(timesteps=flow_timesteps, device=device)
+        # diffusers scheduler converts timesteps via np.array(); must be host-side.
+        self.scheduler.set_timesteps(
+            timesteps=flow_timesteps.detach().cpu().tolist(), device=device
+        )
         timesteps = self.scheduler.timesteps
 
         samples: List[Union[SenseNovaSample, SenseNovaI2ISample]] = []

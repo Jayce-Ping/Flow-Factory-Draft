@@ -194,7 +194,10 @@ class SenseNovaPseudoPipeline:
         model = NEOChatModel.from_pretrained(
             model_path,
             low_cpu_mem_usage=low_cpu_mem_usage,
+            trust_remote_code=True,
             **kwargs,
         )
-        tokenizer = AutoTokenizer.from_pretrained(model_path, **tokenizer_kwargs)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=True, **tokenizer_kwargs
+        )
         return cls(model=model, tokenizer=tokenizer)
