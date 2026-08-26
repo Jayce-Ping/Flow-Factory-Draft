@@ -391,14 +391,14 @@ class SenseNovaAdapter(BaseAdapter):
         self,
         prompt: str,
         image_size: Tuple[int, int],
-        cfg_scale: float,
-        img_cfg_scale: float,
+        guidance_scale: float,
+        image_guidance_scale: float,
         condition_images: List[Image.Image],
     ) -> Dict[str, Any]:
         """Build text+image, image-only, and optional unconditional caches."""
         if not condition_images:
             raise ValueError("SenseNova I2I context construction needs condition images.")
-        if cfg_scale < 0 or img_cfg_scale < 0:
+        if guidance_scale < 0 or image_guidance_scale < 0:
             raise ValueError("SenseNova CFG scales must be non-negative.")
         pixel_values, grid_hw = self._prepare_reference_images(condition_images)
         prompt = self._insert_missing_image_placeholders(prompt, len(condition_images))
@@ -414,9 +414,11 @@ class SenseNovaAdapter(BaseAdapter):
         condition_branch = self._build_it2i_branch(
             condition_query, pixel_values, grid_hw, image_size
         )
-        needs_guidance = not (cfg_scale == 1 and img_cfg_scale == 1)
-        needs_image_branch = needs_guidance and (img_cfg_scale == 1 or cfg_scale != img_cfg_scale)
-        needs_unconditional = needs_guidance and img_cfg_scale != 1
+        needs_guidance = not (guidance_scale == 1 and image_guidance_scale == 1)
+        needs_image_branch = needs_guidance and (
+            image_guidance_scale == 1 or guidance_scale != image_guidance_scale
+        )
+        needs_unconditional = needs_guidance and image_guidance_scale != 1
         image_branch = (
             self._build_it2i_branch(image_query, pixel_values, grid_hw, image_size)
             if needs_image_branch
@@ -466,7 +468,7 @@ class SenseNovaAdapter(BaseAdapter):
         prompt: str,
         image_size: Tuple[int, int],
         guidance_scale: float,
-        img_cfg_scale: float = 1.0,
+        image_guidance_scale: float = 1.0,
         condition_images: Optional[List[Image.Image]] = None,
     ) -> Dict[str, Any]:
         """Build and flash-prepare T2I or I2I prefix caches."""
@@ -475,7 +477,7 @@ class SenseNovaAdapter(BaseAdapter):
                 prompt,
                 image_size,
                 guidance_scale,
-                img_cfg_scale,
+                image_guidance_scale,
                 condition_images,
             )
         model = self._base_model()
@@ -579,8 +581,8 @@ class SenseNovaAdapter(BaseAdapter):
         condition: torch.Tensor,
         image_condition: Optional[torch.Tensor],
         uncondition: Optional[torch.Tensor],
-        cfg_scale: float,
-        img_cfg_scale: float,
+        guidance_scale: float,
+        image_guidance_scale: float,
         cfg_norm: str,
         step_index: Optional[int],
     ) -> torch.Tensor:
@@ -589,26 +591,26 @@ class SenseNovaAdapter(BaseAdapter):
             return condition
         if image_condition is None:
             return SenseNovaAdapter._cfg_velocity(
-                condition, uncondition, cfg_scale, cfg_norm, step_index
+                condition, uncondition, guidance_scale, cfg_norm, step_index
             )
         if cfg_norm == "cfg_zero_star":
             raise ValueError("SenseNova I2I supports cfg_norm='none', 'global', or 'channel'.")
 
-        if cfg_scale == 1 and img_cfg_scale == 1:
+        if guidance_scale == 1 and image_guidance_scale == 1:
             velocity = condition
-        elif img_cfg_scale == 1:
-            velocity = image_condition + cfg_scale * (condition - image_condition)
-        elif cfg_scale == img_cfg_scale:
+        elif image_guidance_scale == 1:
+            velocity = image_condition + guidance_scale * (condition - image_condition)
+        elif guidance_scale == image_guidance_scale:
             if uncondition is None:
                 raise ValueError("SenseNova I2I image CFG requires an unconditional cache.")
-            velocity = uncondition + cfg_scale * (condition - uncondition)
+            velocity = uncondition + guidance_scale * (condition - uncondition)
         else:
             if uncondition is None:
                 raise ValueError("SenseNova I2I dual CFG requires an unconditional cache.")
             velocity = (
                 uncondition
-                + cfg_scale * (condition - image_condition)
-                + img_cfg_scale * (image_condition - uncondition)
+                + guidance_scale * (condition - image_condition)
+                + image_guidance_scale * (image_condition - uncondition)
             )
 
         if cfg_norm == "global":
@@ -651,8 +653,7 @@ class SenseNovaAdapter(BaseAdapter):
         height: Optional[int] = None,
         width: Optional[int] = None,
         image_shape: Optional[Tuple[int, int]] = None,
-        guidance_scale: Optional[float] = None,
-        cfg_scale: float = 4.0,
+        guidance_scale: float = 4.0,
         cfg_norm: str = "none",
         cfg_interval: Tuple[float, float] = (0.0, 1.0),
         timestep_shift: float = 3.0,
@@ -668,19 +669,14 @@ class SenseNovaAdapter(BaseAdapter):
         compute_log_prob: bool = True,
         return_kwargs: Optional[List[str]] = None,
         step_index: Optional[int] = None,
-        img_cfg_scale: float = 1.0,
+        image_guidance_scale: float = 1.0,
         img_past_key_values: Optional[Any] = None,
         img_indexes_image: Optional[torch.Tensor] = None,
         img_attention_mask: Optional[Dict[str, Any]] = None,
         condition_images: Optional[MultiImageBatch] = None,
         **kwargs: Any,
     ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
-        """Predict one transition and optionally evaluate its SDE log probability.
-
-        ``guidance_scale`` is Flow-Factory's canonical name for SenseNova's
-        official ``cfg_scale``. When both names are supplied, ``guidance_scale``
-        takes precedence.
-        """
+        """Predict one transition and optionally evaluate its SDE log probability."""
         if return_kwargs is None:
             return_kwargs = [
                 "velocity",
@@ -697,8 +693,6 @@ class SenseNovaAdapter(BaseAdapter):
                 f"SenseNovaAdapter.forward expects latents of rank 4, got {tuple(latents.shape)}"
             )
         batch_size = latents.shape[0]
-        if guidance_scale is not None:
-            cfg_scale = guidance_scale
         prompts = self._as_batch_values(prompt, batch_size, "prompt") if prompt is not None else []
         condition_batch = (
             self._normalize_condition_images(condition_images, batch_size)
@@ -732,8 +726,8 @@ class SenseNovaAdapter(BaseAdapter):
                 context = self._build_context(
                     prompts[batch_index],
                     shape,
-                    cfg_scale,
-                    img_cfg_scale,
+                    guidance_scale,
+                    image_guidance_scale,
                     condition_batch[batch_index],
                 )
             else:
@@ -763,7 +757,9 @@ class SenseNovaAdapter(BaseAdapter):
                     noise_scale=noise_scale,
                 )
                 guidance_requested = (
-                    (cfg_scale != 1 or img_cfg_scale != 1) if context["is_i2i"] else cfg_scale > 1
+                    (guidance_scale != 1 or image_guidance_scale != 1)
+                    if context["is_i2i"]
+                    else guidance_scale > 1
                 )
                 use_cfg = (
                     guidance_requested
@@ -797,8 +793,8 @@ class SenseNovaAdapter(BaseAdapter):
                         velocity_native,
                         velocity_img,
                         velocity_uncond,
-                        cfg_scale,
-                        img_cfg_scale,
+                        guidance_scale,
+                        image_guidance_scale,
                         cfg_norm,
                         step_index,
                     )
@@ -815,7 +811,7 @@ class SenseNovaAdapter(BaseAdapter):
                     velocity_native = self._cfg_velocity(
                         velocity_native,
                         velocity_uncond,
-                        cfg_scale,
+                        guidance_scale,
                         cfg_norm,
                         step_index,
                     )
@@ -870,8 +866,7 @@ class SenseNovaAdapter(BaseAdapter):
         height: int = 1024,
         width: int = 1024,
         num_inference_steps: int = 50,
-        cfg_scale: float = 4.0,
-        guidance_scale: Optional[float] = None,
+        guidance_scale: float = 4.0,
         cfg_norm: str = "none",
         cfg_interval: Tuple[float, float] = (0.0, 1.0),
         timestep_shift: float = 3.0,
@@ -881,14 +876,13 @@ class SenseNovaAdapter(BaseAdapter):
         extra_call_back_kwargs: Optional[List[str]] = None,
         trajectory_indices: TrajectoryIndicesType = "all",
         condition_images: Optional[MultiImageBatch] = None,
-        img_cfg_scale: float = 1.0,
+        image_guidance_scale: float = 1.0,
         **kwargs: Any,
     ) -> List[Union[SenseNovaSample, SenseNovaI2ISample]]:
         """Generate T2I or ordered multi-reference I2I samples.
 
-        ``guidance_scale`` is Flow-Factory's canonical name for SenseNova's
-        official ``cfg_scale``. ``condition_images`` is a nested per-sample
-        batch, and each inner list may contain one or more reference images.
+        ``condition_images`` is a nested per-sample batch, and each inner list
+        may contain one or more reference images.
         """
         if prompt is None:
             raise ValueError("SenseNovaAdapter.inference requires `prompt`.")
@@ -898,8 +892,6 @@ class SenseNovaAdapter(BaseAdapter):
             if condition_images is not None
             else [[] for _ in prompts]
         )
-        if guidance_scale is not None:
-            cfg_scale = guidance_scale
         if num_inference_steps < 1:
             raise ValueError("num_inference_steps must be positive")
         shape = self._image_shape(height, width, None)
@@ -930,8 +922,8 @@ class SenseNovaAdapter(BaseAdapter):
             context = self._build_context(
                 sample_prompt,
                 shape,
-                cfg_scale,
-                img_cfg_scale,
+                guidance_scale,
+                image_guidance_scale,
                 sample_condition_images,
             )
             try:
@@ -973,8 +965,8 @@ class SenseNovaAdapter(BaseAdapter):
                         prompt=sample_prompt,
                         height=height,
                         width=width,
-                        cfg_scale=cfg_scale,
-                        img_cfg_scale=img_cfg_scale,
+                        guidance_scale=guidance_scale,
+                        image_guidance_scale=image_guidance_scale,
                         cfg_norm=cfg_norm,
                         cfg_interval=cfg_interval,
                         timestep_shift=timestep_shift,

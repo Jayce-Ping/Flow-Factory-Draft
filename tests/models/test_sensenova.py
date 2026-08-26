@@ -115,7 +115,12 @@ def test_sensenova_example_uses_adapter_generation_parameters():
     config_path = Path(__file__).parents[2] / "examples/grpo/lora/sensenova/default.yaml"
     config = Arguments.load_from_yaml(str(config_path))
     accepted = set(signature(SenseNovaAdapter.inference).parameters)
-    model_specific = {"img_cfg_scale", "cfg_norm", "cfg_interval", "timestep_shift"}
+    model_specific = {
+        "image_guidance_scale",
+        "cfg_norm",
+        "cfg_interval",
+        "timestep_shift",
+    }
 
     assert config.training_args.guidance_scale == 1.0
     assert config.eval_args.guidance_scale == 4.0
@@ -124,6 +129,8 @@ def test_sensenova_example_uses_adapter_generation_parameters():
     assert model_specific <= set(config.eval_args.extra_kwargs)
     assert "cfg_scale" not in config.training_args.extra_kwargs
     assert "cfg_scale" not in config.eval_args.extra_kwargs
+    assert "img_cfg_scale" not in config.training_args.extra_kwargs
+    assert "img_cfg_scale" not in config.eval_args.extra_kwargs
 
 
 @pytest.mark.parametrize("use_pixel_head", [False, True])
@@ -207,7 +214,7 @@ def test_sensenova_multi_reference_prefill(monkeypatch):
         "Combine the references into one image.",
         (32, 32),
         guidance_scale=3.0,
-        img_cfg_scale=2.0,
+        image_guidance_scale=2.0,
         condition_images=references,
     )
     try:
@@ -258,8 +265,8 @@ def test_sensenova_multi_reference_prefill(monkeypatch):
             prompt="Combine the references into one image.",
             height=32,
             width=32,
-            cfg_scale=3.0,
-            img_cfg_scale=2.0,
+            guidance_scale=3.0,
+            image_guidance_scale=2.0,
             past_key_values=context["past_key_values"],
             indexes_image=context["indexes_image"],
             attention_mask=context["attention_mask"],
