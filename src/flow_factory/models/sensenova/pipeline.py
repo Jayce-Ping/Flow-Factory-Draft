@@ -33,7 +33,7 @@ from .modeling.neo_unify.modeling_neo_chat import NEOChatModel
 
 
 class SenseNovaDenoiser(nn.Module):
-    """Expose SenseNova's T2I flow-matching prediction as one trainable module."""
+    """Expose SenseNova's image flow-matching prediction as one trainable module."""
 
     def __init__(self, model: NEOChatModel):
         super().__init__()

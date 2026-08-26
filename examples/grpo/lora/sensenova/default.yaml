@@ -55,9 +55,9 @@ train:
   resolution: 512  # Can be int or [height, width]
   num_inference_steps: 10  # Number of timesteps
   # SenseNova-U1 generation params (passed to inference/forward via **training_args)
-  cfg_scale: 1.0  # Options: any non-negative float; 1.0 disables CFG
+  guidance_scale: 1.0  # Official SenseNova cfg_scale; any non-negative float; 1.0 disables text CFG
   img_cfg_scale: 1.0  # Options: any non-negative float; image guidance scale for I2I
-  cfg_norm: none  # Options: none, global, channel, cfg_zero_star
+  cfg_norm: none  # Options: none, global, channel; cfg_zero_star is T2I-only
   cfg_interval: [0.0, 1.0]  # Options: [start, end] normalized to [0.0, 1.0]
   timestep_shift: 3.0  # Options: positive float; 3.0 matches the official examples
 
@@ -95,13 +95,12 @@ scheduler:
 eval:
   resolution: 512  # Evaluation resolution
   per_device_batch_size: 2  # Eval batch size
-  guidance_scale: 4.0  # Guidance scale for sampling
+  guidance_scale: 4.0  # Official SenseNova cfg_scale; 1.0 disables text CFG
   num_inference_steps: 50  # Number of eval timesteps
   eval_freq: 20  # Eval frequency in epochs (0 to disable)
   seed: 42  # Eval seed (defaults to training seed)
-  cfg_scale: 4.0  # Options: any non-negative float; 1.0 disables CFG
   img_cfg_scale: 1.0  # Options: any non-negative float; image guidance scale for I2I
-  cfg_norm: none  # Options: none, global, channel, cfg_zero_star
+  cfg_norm: none  # Options: none, global, channel; cfg_zero_star is T2I-only
   cfg_interval: [0.0, 1.0]  # Options: [start, end] normalized to [0.0, 1.0]
   timestep_shift: 3.0  # Options: positive float; 3.0 matches the official examples
 

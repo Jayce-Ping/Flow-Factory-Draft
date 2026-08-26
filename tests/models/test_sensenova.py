@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from inspect import signature
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 from PIL import Image
 
+from flow_factory.hparams.args import Arguments
 from flow_factory.models.registry import get_model_adapter_class
 from flow_factory.models.sensenova import sensenova as sensenova_module
 from flow_factory.models.sensenova.modeling.neo_unify.configuration_neo_chat import NEOChatConfig
@@ -105,6 +108,22 @@ def _prefix_cache(model: NEOChatModel):
 def test_sensenova_registry_entry():
     """The public key resolves to the new adapter."""
     assert get_model_adapter_class("sensenova") is SenseNovaAdapter
+
+
+def test_sensenova_example_uses_adapter_generation_parameters():
+    """The example uses the adapter's canonical guidance and I2I parameters."""
+    config_path = Path(__file__).parents[2] / "examples/grpo/lora/sensenova/default.yaml"
+    config = Arguments.load_from_yaml(str(config_path))
+    accepted = set(signature(SenseNovaAdapter.inference).parameters)
+    model_specific = {"img_cfg_scale", "cfg_norm", "cfg_interval", "timestep_shift"}
+
+    assert config.training_args.guidance_scale == 1.0
+    assert config.eval_args.guidance_scale == 4.0
+    assert {"guidance_scale", *model_specific} <= accepted
+    assert model_specific <= set(config.training_args.extra_kwargs)
+    assert model_specific <= set(config.eval_args.extra_kwargs)
+    assert "cfg_scale" not in config.training_args.extra_kwargs
+    assert "cfg_scale" not in config.eval_args.extra_kwargs
 
 
 @pytest.mark.parametrize("use_pixel_head", [False, True])

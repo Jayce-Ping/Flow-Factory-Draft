@@ -131,7 +131,7 @@ class SenseNovaAdapter(BaseAdapter):
 
     @property
     def preprocessing_modules(self) -> List[str]:
-        """SenseNova tokenizes lazily while building its KV cache."""
+        """Tokenize prompts and encode reference images lazily during KV-cache building."""
         return []
 
     @property
@@ -469,7 +469,7 @@ class SenseNovaAdapter(BaseAdapter):
         img_cfg_scale: float = 1.0,
         condition_images: Optional[List[Image.Image]] = None,
     ) -> Dict[str, Any]:
-        """Build and flash-prepare condition/uncondition prefix caches."""
+        """Build and flash-prepare T2I or I2I prefix caches."""
         if condition_images:
             return self._build_i2i_context(
                 prompt,
@@ -675,7 +675,12 @@ class SenseNovaAdapter(BaseAdapter):
         condition_images: Optional[MultiImageBatch] = None,
         **kwargs: Any,
     ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
-        """Predict one transition and evaluate its SDE log probability."""
+        """Predict one transition and optionally evaluate its SDE log probability.
+
+        ``guidance_scale`` is Flow-Factory's canonical name for SenseNova's
+        official ``cfg_scale``. When both names are supplied, ``guidance_scale``
+        takes precedence.
+        """
         if return_kwargs is None:
             return_kwargs = [
                 "velocity",
@@ -879,7 +884,12 @@ class SenseNovaAdapter(BaseAdapter):
         img_cfg_scale: float = 1.0,
         **kwargs: Any,
     ) -> List[Union[SenseNovaSample, SenseNovaI2ISample]]:
-        """Generate T2I, I2I, or ordered multi-reference I2I samples."""
+        """Generate T2I or ordered multi-reference I2I samples.
+
+        ``guidance_scale`` is Flow-Factory's canonical name for SenseNova's
+        official ``cfg_scale``. ``condition_images`` is a nested per-sample
+        batch, and each inner list may contain one or more reference images.
+        """
         if prompt is None:
             raise ValueError("SenseNovaAdapter.inference requires `prompt`.")
         prompts = [prompt] if isinstance(prompt, str) else list(prompt)
