@@ -154,7 +154,7 @@ for unsupported adapters.
 
 Cache-ready adapters are FLUX.2-Klein, Qwen-Image, Qwen-Image-Edit-Plus, Wan T2V/I2V, and
 LTX2 T2AV/I2AV. Qwen merged CFG uses a shared `cond_uncond` context; no-CFG uses `cond`.
-FLUX.1/Kontext, FLUX.2, SD3.5, Z-Image, Wan V2V, and Bagel are not cache-ready. Validate
+FLUX.1/Kontext, FLUX.2, SD3.5, Z-Image, and Bagel are not cache-ready. Validate
 the reward distribution before and after enabling caching on a supported model.
 
 `torch_compile` is model-agnostic and applies to every adapter.

@@ -98,7 +98,6 @@ class ModelArguments(ArgABC):
         "z-image",
         "wan2_t2v",
         "wan2_i2v",
-        "wan2_v2v",
         "bagel",
         "ltx2_t2av",
         "ltx2_i2av",

@@ -38,7 +38,6 @@ _MODEL_ADAPTER_REGISTRY: Dict[str, str] = {
     "z-image": "flow_factory.models.z_image.z_image.ZImageAdapter",
     "wan2_i2v": "flow_factory.models.wan.wan2_i2v.Wan2_I2V_Adapter",
     "wan2_t2v": "flow_factory.models.wan.wan2_t2v.Wan2_T2V_Adapter",
-    "wan2_v2v": "flow_factory.models.wan.wan2_v2v.Wan2_V2V_Adapter",
     "bagel": "flow_factory.models.bagel.bagel.BagelAdapter",
     "sensenova": "flow_factory.models.sensenova.sensenova.SenseNovaAdapter",
     "ltx2_t2av": "flow_factory.models.ltx2.ltx2_t2av.LTX2_T2AV_Adapter",

@@ -41,7 +41,7 @@ Three tiers, intentionally deviating from the strict ALL-YAML rule in `.cursor/r
 
 | Tier | Models | YAML field | Rationale |
 |------|--------|------------|-----------|
-| T1 | Wan video (T2V / I2V / V2V) + LTX2 (T2AV / I2AV) | explicit `true` | per-sample tensors are GB-scale; `sample()`/`optimize()` OOMs without offload |
+| T1 | Wan video (T2V / I2V) + LTX2 (T2AV / I2AV) | explicit `true` | per-sample tensors are GB-scale; `sample()`/`optimize()` OOMs without offload |
 | T2 | Flux2 / Flux2-Klein / Qwen-Image-Edit-Plus (+ OPD SD3.5) | explicit `false` + multi-line pros/cons comment | moderate VRAM pressure; user-decision point with documentation co-located |
 | T3 | FLUX1 / SD3 / Qwen-Image / Z-Image / DPO / template | not added; relies on code default `False` | low pressure; zero-migration cost |
 

@@ -47,7 +47,6 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
 - [Dataset](#-dataset)
   - [Text-to-Image & Text-to-Video](#text-to-image--text-to-video)
   - [Image-to-Image & Image-to-Video](#image-to-image--image-to-video)
-  - [Video-to-Video](#video-to-video)
 - [Reward Model](#-reward-model)
 - [Acknowledgements](#-acknowledgements)
 
@@ -85,9 +84,6 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
   <tr><td><a href="https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-720P-Diffusers">Wan2.1-I2V-14B-720P</a></td><td>14B</td><td>wan2_i2v</td></tr>
   <tr><td><a href="https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers">Wan2.2-TI2V-5B</a></td><td>5B</td><td>wan2_i2v</td></tr>
   <tr><td><a href="https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B-Diffusers">Wan2.2-I2V-A14B</a></td><td>A14B</td><td>wan2_i2v</td></tr>
-
-  <tr><td rowspan="2">Video-to-Video</td><td><a href="https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers">Wan2.1-T2V-1.3B</a></td><td>1.3B</td><td>wan2_v2v</td></tr>
-  <tr><td><a href="https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers">Wan2.1-T2V-14B</a></td><td>14B</td><td>wan2_v2v</td></tr>
 
   <tr><td rowspan="2">Text-to-Audio-Video</td><td><a href="https://huggingface.co/Lightricks/LTX-2">LTX-2</a></td><td>19B</td><td>ltx2_t2av</td></tr>
   <tr><td><a href="https://huggingface.co/Lightricks/LTX-2.3">LTX-2.3</a></td><td>22B</td><td>ltx2_t2av</td></tr>
@@ -276,13 +272,6 @@ multiple conditioning images, use the `images` key with an ordered list of image
 ```jsonl
 {"prompt": "A hill in a sunset.", "images": ["path/to/condition_image_1_1.png", "path/to/condition_image_1_2.png"]}
 {"prompt": "An astronaut riding a horse on Mars.", "images": ["path/to/condition_image_2_1.png", "path/to/condition_image_2_2.png"]}
-```
-
-## Video-to-Video
-
-```jsonl
-{"prompt": "A hill in a sunset.", "video": "path/to/video1.mp4"}
-{"prompt": "An astronaut riding a horse on Mars.", "videos": ["path/to/video2.mp4", "path/to/video3.mp4"]}
 ```
 
 # 💯 Reward Model

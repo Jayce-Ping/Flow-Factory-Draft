@@ -14,7 +14,6 @@
 
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -25,9 +24,7 @@ def _text(path: str) -> str:
 def test_main_readme_lists_sensenova_as_t2i_and_multi_reference_i2i() -> None:
     readme = _text("README.md")
     t2i_start = readme.index('<tr><td rowspan="6">Text-to-Image</td>')
-    combined_start = readme.index(
-        '<tr><td rowspan="8">Text-to-Image & Image(s)-to-Image</td>'
-    )
+    combined_start = readme.index('<tr><td rowspan="8">Text-to-Image & Image(s)-to-Image</td>')
     video_start = readme.index('<tr><td rowspan="4">Text-to-Video</td>')
 
     t2i_only_rows = readme[t2i_start:combined_start]
@@ -74,7 +71,7 @@ def test_internal_docs_distinguish_sensenova_from_bagel_packing() -> None:
     assert "rather than Bagel-style NaViT packing" in architecture
     assert "SenseNova ragged I2I is per-sample, not NaViT-packed" in conventions
     assert "SenseNovaI2ISample" in conventions
-    assert "all 15 adapters" in conventions
+    assert "all 14 adapters" in conventions
     assert "SD3.5, Z-Image, SenseNova" in conventions
 
 
