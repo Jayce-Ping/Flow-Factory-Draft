@@ -83,12 +83,20 @@ class PeftModelEquivalentFake(TransformerFake):
 
 
 class WorkflowPipelineFake:
-    """Match pinned ModularPipeline spec and materialized-value separation."""
+    """Match released ModularPipeline spec and materialized-value separation."""
 
     calls: ClassVar[List[tuple[str, str]]] = []
     component_overrides: ClassVar[Dict[str, Any]] = {}
 
-    def __init__(self, workflow: str) -> None:
+    def __init__(
+        self,
+        *,
+        blocks: Any,
+        pretrained_model_name_or_path: str,
+        workflow: str,
+    ) -> None:
+        assert blocks is not None
+        self.calls.append((pretrained_model_name_or_path, workflow))
         transformer_name = "transformer_ref" if workflow == "ref2va" else "transformer"
         self.workflow = workflow
         self.pretrained_specs = {
@@ -132,18 +140,6 @@ class WorkflowPipelineFake:
     def get_component_spec(self, name: str) -> Any:
         return deepcopy({**self.pretrained_specs, **self.config_specs}[name])
 
-    @classmethod
-    def from_pretrained(
-        cls,
-        model_name_or_path: str,
-        *,
-        blocks: Any,
-        workflow: str,
-    ) -> "WorkflowPipelineFake":
-        assert blocks is not None
-        cls.calls.append((model_name_or_path, workflow))
-        return cls(workflow)
-
     def load_components(self, names: List[str]) -> None:
         self.load_calls.append(list(names))
         for name in names:
@@ -185,7 +181,16 @@ def test_local_workflow_rebinds_pretrained_component_specs(
     )
 
     class LocalPipeline:
-        def __init__(self) -> None:
+        def __init__(
+            self,
+            *,
+            blocks: Any,
+            pretrained_model_name_or_path: str,
+            workflow: str,
+        ) -> None:
+            assert blocks is not None
+            assert pretrained_model_name_or_path == str(tmp_path)
+            assert workflow == "t2va"
             self.pretrained_component_names = list(required)
             self.config_component_names = []
             self.specs = {
@@ -196,13 +201,6 @@ def test_local_workflow_rebinds_pretrained_component_specs(
                 for name in required
             }
             self._component_specs = self.specs
-
-        @classmethod
-        def from_pretrained(cls, path: str, *, blocks: Any, workflow: str):
-            assert path == str(tmp_path)
-            assert blocks is not None
-            assert workflow == "t2va"
-            return cls()
 
         def get_component_spec(self, name: str):
             return self.specs[name]

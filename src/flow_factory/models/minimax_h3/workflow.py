@@ -86,9 +86,9 @@ def load_h3_workflow_pipeline(
 ) -> Any:
     """Load and validate one workflow-pruned MiniMax H3 pipeline."""
     symbols = require_minimax_h3_support()
-    pipeline = symbols.MiniMaxH3ModularPipeline.from_pretrained(
-        model_name_or_path,
+    pipeline = symbols.MiniMaxH3ModularPipeline(
         blocks=symbols.MiniMaxH3Blocks(),
+        pretrained_model_name_or_path=model_name_or_path,
         workflow=workflow,
     )
     if os.path.isdir(model_name_or_path):
