@@ -33,6 +33,21 @@ def test_forward_kwargs_preserve_batch_precedence_and_explicit_reference_overrid
     }
 
 
+def test_forward_kwargs_accept_plain_condition_mapping():
+    """Offline conditions need mapping semantics without a rollout sample wrapper."""
+    trainer = SimpleNamespace(training_args={"guidance_scale": 3.0, "height": 512})
+    condition = {"guidance_scale": 1.0, "prompt_embeds": torch.ones(2, 4)}
+
+    assert training_forward_kwargs(trainer, condition) == {"height": 512}
+
+
+def test_forward_kwargs_reject_non_mapping_condition():
+    trainer = SimpleNamespace(training_args={"height": 512})
+
+    with pytest.raises(TypeError, match="conditioning mapping"):
+        training_forward_kwargs(trainer, ["not", "a", "mapping"])
+
+
 def test_move_and_stack_samples_keeps_moved_sources_on_batch():
     samples = [
         BaseSample(prompt="a", prompt_embeds=torch.tensor([1.0])),

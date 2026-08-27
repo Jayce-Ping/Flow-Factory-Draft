@@ -20,6 +20,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import torch
+
 from diffusers.utils.torch_utils import randn_tensor
 
 from ...samples import (
@@ -27,7 +28,6 @@ from ...samples import (
     LatentState,
     MultiModalStepOutput,
     NoisedState,
-    StackedSampleBatch,
     StructuredTrajectory,
     unstack_structured_trajectories,
 )
@@ -831,7 +831,7 @@ def _validate_ltx2_video_active_mask(
 def build_ltx2_joint_forward_kwargs(
     adapter: Any,
     *,
-    batch: StackedSampleBatch,
+    batch: Mapping[str, Any],
     state: LatentState,
     times: ComponentTimes,
     next_state: Optional[LatentState],
@@ -1067,7 +1067,7 @@ def attach_ltx2_state_masks(
 def validate_i2av_forward_state_inputs(
     adapter: Any,
     *,
-    batch: StackedSampleBatch,
+    batch: Mapping[str, Any],
     state: LatentState,
     times: ComponentTimes,
     next_state: Optional[LatentState],

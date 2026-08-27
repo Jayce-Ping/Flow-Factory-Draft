@@ -12,16 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 import torch
+
 from diffusers.utils.torch_utils import randn_tensor
 
 from ...samples import (
     ComponentTimes,
     LatentState,
     NoisedState,
-    StackedSampleBatch,
 )
 from ...utils.base import to_broadcast_tensor
 from ...utils.noise_schedule import flow_match_sigma
@@ -32,7 +32,7 @@ def build_training_component_times(
     adapter: Any,
     primary_timesteps: torch.Tensor,
     *,
-    batch: Optional[StackedSampleBatch],
+    batch: Optional[Mapping[str, Any]],
 ) -> ComponentTimes:
     if not isinstance(primary_timesteps, torch.Tensor):
         raise TypeError(

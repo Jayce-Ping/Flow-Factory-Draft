@@ -16,11 +16,11 @@ import glob
 import hashlib
 import json
 import logging
-import shutil
 
 # src/flow_factory/models/abc.py
 import os
 import re
+import shutil
 from abc import ABC, abstractmethod
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, fields
@@ -60,15 +60,16 @@ from accelerate.utils import (
 from accelerate.utils.modeling import (
     get_state_dict_offloaded_model,
 )
-from diffusers.models.modeling_utils import ModelMixin
-from diffusers.pipelines.pipeline_utils import DiffusionPipeline
-from diffusers.schedulers.scheduling_utils import SchedulerMixin
-from diffusers.utils.outputs import BaseOutput
 from huggingface_hub import split_torch_state_dict_into_shards
 from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
 from peft import LoraConfig, PeftModel, get_peft_model
 from PIL import Image
 from safetensors.torch import load_file, save_file
+
+from diffusers.models.modeling_utils import ModelMixin
+from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+from diffusers.schedulers.scheduling_utils import SchedulerMixin
+from diffusers.utils.outputs import BaseOutput
 
 from ..ema import EMAModuleWrapper
 from ..hparams import *
@@ -3483,7 +3484,7 @@ class BaseAdapter(ABC):
         self,
         primary_timesteps: torch.Tensor,
         *,
-        batch: Optional[StackedSampleBatch] = None,
+        batch: Optional[Mapping[str, Any]] = None,
     ) -> ComponentTimes:
         """Map one primary scheduler coordinate onto every component's times.
 
@@ -3494,7 +3495,7 @@ class BaseAdapter(ABC):
 
         Args:
             primary_timesteps: Primary scheduler coordinates of shape ``(B,)``.
-            batch: Optional collated batch supplying per-component geometry.
+            batch: Optional conditioning mapping supplying per-component geometry.
 
         Returns:
             Component times whose sigma follows the flow-matching schedule.
@@ -3617,7 +3618,7 @@ class BaseAdapter(ABC):
     def forward_state(
         self,
         *,
-        batch: StackedSampleBatch,
+        batch: Mapping[str, Any],
         state: LatentState,
         times: ComponentTimes,
         next_state: Optional[LatentState] = None,
@@ -3640,7 +3641,8 @@ class BaseAdapter(ABC):
           from the batch by the bridge and never forwarded to the model.
 
         Args:
-            batch: Collated sample batch supplying conditioning arguments.
+            batch: Model-conditioning mapping. Online replay supplies a
+                ``StackedSampleBatch``; offline training supplies a plain mapping.
             state: Current state in ``trajectory_component_order``.
             times: Current and next times in ``trajectory_component_order``.
             next_state: Optional stored next state in ``trajectory_component_order``.
@@ -3666,7 +3668,7 @@ class BaseAdapter(ABC):
     def _forward_state(
         self,
         *,
-        batch: StackedSampleBatch,
+        batch: Mapping[str, Any],
         state: LatentState,
         times: ComponentTimes,
         next_state: Optional[LatentState],
@@ -3685,8 +3687,8 @@ class BaseAdapter(ABC):
         may forward it as-is (after the usual signature filtering).
 
         Args:
-            batch: Collated sample batch, for conditioning an override needs to
-                derive per component; storage fields must not be forwarded.
+            batch: Model-conditioning mapping an override may use to derive
+                per-component fields; storage fields must not be forwarded.
             state: Current state in ``trajectory_component_order``.
             times: Current and next times in ``trajectory_component_order``.
             next_state: Optional stored next state in ``trajectory_component_order``.

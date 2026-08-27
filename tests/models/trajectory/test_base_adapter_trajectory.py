@@ -390,6 +390,36 @@ def test_legacy_forward_state_preserves_arguments_and_wraps_output() -> None:
     assert torch.equal(output.log_prob, torch.tensor([0.75, 0.75]))
 
 
+def test_forward_state_accepts_plain_condition_mapping() -> None:
+    """Offline algorithms can bind cached conditions without synthetic samples."""
+    adapter = _adapter()
+    condition = {"prompt_embeds": torch.tensor([[4.0], [5.0]])}
+    state = LatentState({"latent": torch.tensor([[1.0], [2.0]])})
+    times = adapter.build_training_component_times(
+        torch.tensor([700.0, 300.0]),
+        batch=condition,
+    )
+
+    output = adapter.forward_state(
+        batch=condition,
+        state=state,
+        times=times,
+        return_fields=("velocity",),
+    )
+
+    assert adapter.forward_kwargs["prompt_embeds"] is condition["prompt_embeds"]
+    assert torch.equal(output.velocity.components["latent"], state.components["latent"] + 3)
+
+
+def test_forward_state_rejects_non_mapping_condition() -> None:
+    adapter = _adapter()
+    state = LatentState({"latent": torch.tensor([[1.0]])})
+    times = adapter.build_training_component_times(torch.tensor([500.0]))
+
+    with pytest.raises(TypeError, match="conditioning mapping"):
+        adapter.forward_state(batch=["invalid"], state=state, times=times)
+
+
 def test_forward_state_removes_batch_level_state_owned_keys() -> None:
     adapter = _adapter()
     batch = _legacy_batch()

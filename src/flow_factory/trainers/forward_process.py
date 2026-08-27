@@ -20,9 +20,9 @@ state instead of a stored rollout transition, so they share one velocity-only
 forward contract rather than the coupled replay contract in ``grpo.py``.
 """
 
-from typing import Any
+from typing import Any, Mapping
 
-from ..samples import ComponentTimes, LatentState, StackedSampleBatch
+from ..samples import ComponentTimes, LatentState
 from .common.forward_kwargs import training_forward_kwargs
 from .common.state_validation import (
     require_component_sigmas,
@@ -34,7 +34,7 @@ from .common.state_validation import (
 
 def forward_velocity_state(
     trainer: Any,
-    batch: StackedSampleBatch,
+    batch: Mapping[str, Any],
     state: LatentState,
     times: ComponentTimes,
     *,
@@ -50,7 +50,8 @@ def forward_velocity_state(
 
     Args:
         trainer: Trainer supplying the adapter and training arguments.
-        batch: Collated sample batch supplying conditioning arguments.
+        batch: Model-conditioning mapping. Online paths may supply a collated
+            sample batch; offline paths supply cached conditions directly.
         state: Forward-noised latent state to evaluate.
         times: Component times for the noised state.
         source: Pass identifier reported by validation errors.

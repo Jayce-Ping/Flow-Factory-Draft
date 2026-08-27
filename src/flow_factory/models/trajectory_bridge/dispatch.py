@@ -20,7 +20,6 @@ from ...samples import (
     ComponentTimes,
     LatentState,
     MultiModalStepOutput,
-    StackedSampleBatch,
 )
 from ...scheduler import SDESchedulerOutput
 from ...utils.base import filter_kwargs
@@ -57,7 +56,7 @@ _STATE_OWNED_FORWARD_KEYS = {
 
 def build_forward_state_kwargs(
     adapter: Any,
-    batch: StackedSampleBatch,
+    batch: Mapping[str, Any],
     kwargs: Mapping[str, Any],
 ) -> Dict[str, Any]:
     """Resolve the forward arguments every ``forward_state`` override may pass on.
@@ -69,6 +68,11 @@ def build_forward_state_kwargs(
     already carries before calling, which reproduces the legacy precedence of
     ``forward(**training_args, **batch)``.
     """
+    if not isinstance(batch, Mapping):
+        raise TypeError(
+            "expected a conditioning mapping for forward_state batch, "
+            f"received {type(batch).__name__}: {batch!r}"
+        )
     collisions = tuple(name for name in _STATE_OWNED_FORWARD_KEYS if name in kwargs)
     if collisions:
         raise ValueError(
@@ -93,7 +97,7 @@ def build_forward_state_kwargs(
 def default_forward_state(
     adapter: Any,
     *,
-    batch: StackedSampleBatch,
+    batch: Mapping[str, Any],
     state: LatentState,
     times: ComponentTimes,
     next_state: Optional[LatentState],

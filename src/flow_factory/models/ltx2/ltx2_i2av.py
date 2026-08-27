@@ -20,11 +20,12 @@ from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple,
 
 import torch
 from accelerate import Accelerator
+from PIL import Image
+
 from diffusers.pipelines.ltx2.pipeline_ltx2_image2video import (
     LTX2ImageToVideoPipeline,
     rescale_noise_cfg,
 )
-from PIL import Image
 
 from ...hparams import *
 from ...samples import (
@@ -33,7 +34,6 @@ from ...samples import (
     LatentState,
     MultiModalStepOutput,
     NoisedState,
-    StackedSampleBatch,
 )
 from ...scheduler import (
     FlowMatchEulerDiscreteSDEScheduler,
@@ -1157,7 +1157,7 @@ class LTX2_I2AV_Adapter(BaseAdapter):
         self,
         primary_timesteps: torch.Tensor,
         *,
-        batch: Optional[StackedSampleBatch] = None,
+        batch: Optional[Mapping[str, Any]] = None,
     ) -> ComponentTimes:
         """Mirror one sampled coordinate onto the twin video/audio schedules.
 
@@ -1195,7 +1195,7 @@ class LTX2_I2AV_Adapter(BaseAdapter):
     def _forward_state(
         self,
         *,
-        batch: StackedSampleBatch,
+        batch: Mapping[str, Any],
         state: LatentState,
         times: ComponentTimes,
         next_state: Optional[LatentState],

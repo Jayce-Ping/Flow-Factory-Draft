@@ -23,7 +23,6 @@ from ...samples import (
     LatentState,
     MultiModalStepOutput,
     NoisedState,
-    StackedSampleBatch,
 )
 from ...scheduler import MiniMaxH3SDEScheduler, SchedulerGroup
 from ..abc import BaseAdapter
@@ -93,7 +92,7 @@ class _MiniMaxH3WorkflowAdapter:
         self,
         primary_timesteps: torch.Tensor,
         *,
-        batch: Optional[StackedSampleBatch] = None,
+        batch: Optional[Mapping[str, Any]] = None,
     ) -> ComponentTimes:
         return map_h3_training_component_times(self, primary_timesteps)
 
@@ -119,11 +118,7 @@ class _MiniMaxH3WorkflowAdapter:
 
     def empty_decoded_media(self, batch_size: int) -> Any:
         """Preserve H3's video/audio/sample-rate decode structure without decoding."""
-        if (
-            not isinstance(batch_size, int)
-            or isinstance(batch_size, bool)
-            or batch_size < 1
-        ):
+        if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
             raise ValueError(
                 f"MiniMax H3 expected positive int batch_size, received {batch_size!r}"
             )
@@ -135,7 +130,7 @@ class _MiniMaxH3WorkflowAdapter:
     def _forward_state(
         self,
         *,
-        batch: StackedSampleBatch,
+        batch: Mapping[str, Any],
         state: LatentState,
         times: ComponentTimes,
         next_state: Optional[LatentState],
