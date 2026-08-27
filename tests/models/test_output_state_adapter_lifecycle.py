@@ -1,0 +1,357 @@
+# Copyright 2026 Jayce-Ping
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Lightweight tests for the BaseAdapter output-state codec lifecycle seam."""
+
+from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import Any, Mapping, Optional, Tuple
+
+import pytest
+import torch
+
+from flow_factory.contracts import (
+    BatchCapability,
+    GeometrySource,
+    InputMediaBinding,
+    InputMediaOrder,
+    InputMediaSpec,
+    MediaFormat,
+    MediaType,
+    NegativePromptPolicy,
+    OutputMediaSequence,
+    PipelineIOContract,
+    RateRequirement,
+)
+from flow_factory.models.abc import BaseAdapter
+from flow_factory.models.output_state import (
+    DecodedMediaBatch,
+    EncodedOutputState,
+    GeometrySignature,
+    MediaGeometrySignature,
+)
+from flow_factory.samples import LatentState
+
+IMAGE_CONTRACT = PipelineIOContract(
+    input_media=InputMediaSpec(
+        rules=(),
+        binding=InputMediaBinding.GROUPED_BY_TYPE,
+        order=InputMediaOrder.INSENSITIVE,
+    ),
+    negative_prompt=NegativePromptPolicy.OPTIONAL,
+    output_media=OutputMediaSequence(
+        items=(
+            MediaFormat(
+                type=MediaType.IMAGE,
+                fps=RateRequirement.NOT_APPLICABLE,
+                sample_rate=RateRequirement.NOT_APPLICABLE,
+            ),
+        )
+    ),
+    geometry_source=GeometrySource.CONFIGURED,
+    batch_capability=BatchCapability.UNIFORM,
+)
+
+
+@dataclass(frozen=True)
+class _DecodedMedia:
+    type: str
+    payload: Any
+    fps: Optional[float] = None
+    sample_rate: Optional[int] = None
+
+
+class _Scheduler:
+    def step(self) -> None:
+        """Provide the scheduler-like surface required by SchedulerGroup."""
+
+
+def _config(latent_storage_dtype: Optional[str] = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        model_args=SimpleNamespace(
+            resume_path=None,
+            resume_type=None,
+            finetune_type="full",
+        ),
+        training_args=SimpleNamespace(
+            enable_gradient_checkpointing=False,
+            latent_storage_dtype=latent_storage_dtype,
+        ),
+        eval_args=SimpleNamespace(),
+    )
+
+
+def _image_batch(batch_size: int = 2) -> DecodedMediaBatch:
+    return tuple(
+        (_DecodedMedia(type="image", payload=torch.zeros(3, 8, 8)),) for _ in range(batch_size)
+    )
+
+
+def _encoded_image_batch(
+    batch_size: int,
+    *,
+    component_name: str = "latent",
+    tensor: Optional[torch.Tensor] = None,
+) -> EncodedOutputState:
+    if tensor is None:
+        tensor = torch.ones(batch_size, 2, dtype=torch.float32)
+    signature = GeometrySignature(
+        media=(
+            MediaGeometrySignature(
+                type=MediaType.IMAGE,
+                height=8,
+                width=8,
+            ),
+        )
+    )
+    return EncodedOutputState(
+        clean_state=LatentState({component_name: tensor}),
+        forward_context={},
+        decode_context={"height": 8, "width": 8},
+        geometry_signatures=tuple(signature for _ in range(batch_size)),
+    )
+
+
+class _Codec:
+    def __init__(
+        self,
+        required_components: Tuple[str, ...] = ("vae",),
+        result: Optional[EncodedOutputState] = None,
+    ) -> None:
+        self.required_components = required_components
+        self.result = result
+        self.calls = 0
+        self.grad_enabled: Optional[bool] = None
+        self.received: Optional[Tuple[Any, ...]] = None
+
+    def encode_output_state(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Mapping[str, Any],
+        generator: Optional[torch.Generator] = None,
+    ) -> EncodedOutputState:
+        self.calls += 1
+        self.grad_enabled = torch.is_grad_enabled()
+        self.received = (media_batch, condition, generator)
+        return self.result or _encoded_image_batch(len(media_batch))
+
+
+class _LifecycleAdapter(BaseAdapter):
+    pipeline_io_contract = IMAGE_CONTRACT
+
+    def __init__(
+        self,
+        codec: Optional[_Codec],
+        *,
+        latent_storage_dtype: Optional[str] = None,
+    ) -> None:
+        self._codec_to_build = codec
+        self.codec_build_context: Optional[Tuple[bool, bool, bool]] = None
+        self.geometry_validation: Optional[Tuple[Any, ...]] = None
+        super().__init__(
+            _config(latent_storage_dtype),
+            SimpleNamespace(device=torch.device("cpu")),
+        )
+
+    def build_component_runtime(self) -> Any:
+        scheduler = _Scheduler()
+        return SimpleNamespace(
+            pipeline=SimpleNamespace(scheduler=scheduler),
+            declared_component_names=("scheduler", "vae"),
+            override_components={},
+        )
+
+    def load_pipeline(self) -> Any:
+        raise AssertionError("build_component_runtime owns this test pipeline")
+
+    def load_scheduler(self) -> Any:
+        return self.pipeline.scheduler
+
+    def build_output_state_codec(self) -> Optional[_Codec]:
+        self.codec_build_context = (
+            hasattr(self, "component_runtime"),
+            hasattr(self, "pipeline"),
+            hasattr(self, "scheduler_group"),
+        )
+        return self._codec_to_build
+
+    def _validate_encoded_output_geometry(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Mapping[str, Any],
+        encoded: EncodedOutputState,
+    ) -> None:
+        self.geometry_validation = (media_batch, condition, encoded)
+
+    def _init_target_module_map(self) -> Any:
+        return {}
+
+    def _freeze_components(self) -> None:
+        pass
+
+    def _mix_precision(self) -> None:
+        pass
+
+    def decode_latents(self, latents: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        return latents
+
+    def inference(self, **kwargs: Any) -> Any:
+        return []
+
+    def forward(self, **kwargs: Any) -> Any:
+        return None
+
+
+class _OnlineOnlyAdapter(_LifecycleAdapter):
+    pipeline_io_contract = None
+
+
+class _DefaultGeometryAdapter(_LifecycleAdapter):
+    _validate_encoded_output_geometry = BaseAdapter._validate_encoded_output_geometry
+
+
+def test_codec_build_runs_after_component_and_scheduler_lifecycle() -> None:
+    codec = _Codec()
+
+    adapter = _LifecycleAdapter(codec)
+
+    assert adapter.codec_build_context == (True, True, True)
+    assert adapter.output_state_codec is codec
+    assert adapter.output_state_encoding_modules == ("vae",)
+
+
+def test_contract_without_codec_preserves_online_adapter_construction() -> None:
+    adapter = _LifecycleAdapter(None)
+
+    assert adapter.output_state_codec is None
+    assert adapter.output_state_encoding_modules == ()
+    with pytest.raises(RuntimeError, match=r"does not provide an output-state codec"):
+        adapter.encode_output_state(_image_batch(1), {})
+
+
+def test_online_only_adapter_fails_clearly_when_encoding_is_requested() -> None:
+    adapter = _OnlineOnlyAdapter(None)
+
+    with pytest.raises(RuntimeError, match=r"does not declare pipeline_io_contract"):
+        adapter.encode_output_state(_image_batch(1), {})
+
+
+def test_codec_without_pipeline_contract_fails_during_init() -> None:
+    with pytest.raises(ValueError, match=r"codec without declaring pipeline_io_contract"):
+        _OnlineOnlyAdapter(_Codec())
+
+
+def test_invalid_pipeline_contract_type_fails_during_init() -> None:
+    class InvalidContractAdapter(_LifecycleAdapter):
+        pipeline_io_contract = "image"  # type: ignore[assignment]
+
+    with pytest.raises(TypeError, match=r"PipelineIOContract or None.*str"):
+        InvalidContractAdapter(None)
+
+
+def test_codec_required_components_must_exist_in_runtime() -> None:
+    with pytest.raises(ValueError, match=r"unavailable adapter components.*missing"):
+        _LifecycleAdapter(_Codec(required_components=("missing",)))
+
+
+def test_public_output_state_wrapper_cannot_be_overridden() -> None:
+    with pytest.raises(TypeError, match=r"must not override BaseAdapter.encode_output_state"):
+
+        class InvalidAdapter(_LifecycleAdapter):
+            def encode_output_state(self, *args: Any, **kwargs: Any) -> Any:
+                return None
+
+
+def test_encode_output_state_validates_invokes_no_grad_and_applies_storage_dtype() -> None:
+    codec = _Codec()
+    adapter = _LifecycleAdapter(codec, latent_storage_dtype="fp16")
+    media_batch = _image_batch(2)
+    condition = {"prompt_embeds": torch.zeros(2, 4)}
+    generator = torch.Generator().manual_seed(7)
+
+    encoded = adapter.encode_output_state(media_batch, condition, generator)
+
+    assert codec.calls == 1
+    assert codec.grad_enabled is False
+    assert codec.received is not None
+    assert codec.received[0] is media_batch
+    assert codec.received[1] is condition
+    assert codec.received[2] is generator
+    assert encoded.clean_state.components["latent"].dtype is torch.float16
+    assert adapter.geometry_validation is not None
+    assert adapter.geometry_validation[0] is media_batch
+    assert adapter.geometry_validation[1] is condition
+    assert adapter.geometry_validation[2] is encoded
+
+
+def test_encode_output_state_rejects_candidate_before_invoking_codec() -> None:
+    codec = _Codec()
+    adapter = _LifecycleAdapter(codec)
+    wrong_type = ((_DecodedMedia(type="video", payload=torch.zeros(1)),),)
+
+    with pytest.raises(ValueError, match=r"expected.*type 'image'.*'video'"):
+        adapter.encode_output_state(wrong_type, {})
+
+    assert codec.calls == 0
+    assert adapter.geometry_validation is None
+
+
+@pytest.mark.parametrize(
+    ("condition", "generator", "message"),
+    [
+        ([], None, r"condition to be Mapping"),
+        ({}, object(), r"generator to be torch.Generator or None"),
+    ],
+)
+def test_encode_output_state_rejects_invalid_wrapper_arguments(
+    condition: Any,
+    generator: Any,
+    message: str,
+) -> None:
+    codec = _Codec()
+    adapter = _LifecycleAdapter(codec)
+
+    with pytest.raises(TypeError, match=message):
+        adapter.encode_output_state(_image_batch(1), condition, generator)
+
+    assert codec.calls == 0
+
+
+def test_encode_output_state_validates_codec_result_before_geometry_hook() -> None:
+    codec = _Codec(result=_encoded_image_batch(1, component_name="other"))
+    adapter = _LifecycleAdapter(codec)
+
+    with pytest.raises(ValueError, match=r"component order \('latent',\).+\('other',\)"):
+        adapter.encode_output_state(_image_batch(1), {})
+
+    assert adapter.geometry_validation is None
+
+
+def test_encode_output_state_does_not_hide_attached_codec_tensor_during_cast() -> None:
+    attached = torch.ones(1, 2, requires_grad=True)
+    codec = _Codec(result=_encoded_image_batch(1, tensor=attached))
+    adapter = _LifecycleAdapter(codec, latent_storage_dtype="fp16")
+
+    with pytest.raises(ValueError, match=r"detached.*clean_state component 'latent'"):
+        adapter.encode_output_state(_image_batch(1), {})
+
+
+def test_default_geometry_hook_rejects_self_reported_codec_geometry() -> None:
+    adapter = _DefaultGeometryAdapter(_Codec())
+
+    with pytest.raises(
+        NotImplementedError,
+        match=r"must override _validate_encoded_output_geometry.*configured",
+    ):
+        adapter.encode_output_state(_image_batch(1), {})
