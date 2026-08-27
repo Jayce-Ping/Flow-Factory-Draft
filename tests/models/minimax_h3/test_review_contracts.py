@@ -295,6 +295,25 @@ def test_trajectory_schedule_validation_is_complete(
         )
 
 
+def test_trajectory_schedule_accepts_one_ulp_coordinate_rounding() -> None:
+    timestep = torch.tensor([990.4219970703125, 0.0], dtype=torch.float32)
+    sigma = torch.tensor([0.9904220700263977, 0.0], dtype=torch.float32)
+
+    trajectories = minimax_core.build_structured_trajectories(
+        states={
+            "video": torch.zeros(1, 2, 2, 96),
+            "audio": torch.zeros(1, 2, 3, 32),
+        },
+        state_index_map=torch.tensor([0, 1]),
+        schedule={
+            "video": (timestep, sigma),
+            "audio": (timestep.clone(), sigma.clone()),
+        },
+    )
+
+    assert len(trajectories) == 1
+
+
 def test_real_bridge_replays_dense_and_sparse_collected_positions() -> None:
     adapter = object.__new__(BridgeAdapter)
     dense = _build_batch(torch.tensor([0, 1, 2, 3]), torch.tensor([0, 1, 2]))

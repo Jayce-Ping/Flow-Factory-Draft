@@ -29,6 +29,11 @@ from ...samples import (
     unstack_structured_trajectories,
 )
 from ...scheduler import SDESchedulerOutput
+from ...utils.noise_schedule import (
+    TIMESTEP_MAX,
+    flow_match_coordinates_close,
+    flow_match_sigma,
+)
 from ..component_reduction import reduce_component_log_probs
 
 MINIMAX_H3_COMPONENT_ORDER: Tuple[str, ...] = ("video", "audio")
@@ -116,7 +121,7 @@ def build_training_component_times(
             "expected primary_video_timesteps shaped (B,), received "
             f"{tuple(primary_video_timesteps.shape)}"
         )
-    video_sigma = primary_video_timesteps / 1000
+    video_sigma = flow_match_sigma(primary_video_timesteps)
     _validate_unit_interval_tensor(video_sigma, "primary video sigma")
     base_quantile = inverse_shift_sigma(video_sigma, video_shift)
     audio_sigma = shift_sigma(base_quantile, audio_shift)
@@ -125,7 +130,7 @@ def build_training_component_times(
     return ComponentTimes(
         timestep={
             "video": primary_video_timesteps,
-            "audio": audio_sigma * 1000,
+            "audio": audio_sigma * TIMESTEP_MAX,
         },
         next_timestep={"video": zero_timestep, "audio": zero_timestep.clone()},
         sigma={"video": video_sigma, "audio": audio_sigma},
@@ -687,19 +692,14 @@ def _validate_component_times(times: ComponentTimes, state: LatentState) -> None
                     f"{'[0, 1]' if 'sigma' in field else '[0, 1000]'}, "
                     f"received {coordinate.tolist()}"
                 )
-            upper = 1.0 if "sigma" in field else 1000.0
+            upper = 1.0 if "sigma" in field else TIMESTEP_MAX
             if bool((coordinate < 0).any()) or bool((coordinate > upper).any()):
                 raise ValueError(
                     f"expected ComponentTimes.{field}[{component!r}] in [0, {upper:g}], "
                     f"received {coordinate.tolist()}"
                 )
     for component in MINIMAX_H3_COMPONENT_ORDER:
-        if not torch.allclose(
-            times.timestep[component].float(),
-            times.sigma[component].float() * 1000,
-            rtol=0,
-            atol=1e-5,
-        ):
+        if not flow_match_coordinates_close(times.timestep[component], times.sigma[component]):
             raise ValueError(
                 f"expected ComponentTimes.timestep[{component!r}] == "
                 f"sigma[{component!r}] * 1000, received "
@@ -766,7 +766,7 @@ def _validate_schedule_entry(
             f"expected component {component!r} sigmas strictly decreasing in [0, 1], "
             f"received {sigmas.tolist()}"
         )
-    if not torch.allclose(timesteps, sigmas * 1000, rtol=0, atol=1e-5):
+    if not flow_match_coordinates_close(timesteps, sigmas):
         raise ValueError(
             f"expected component {component!r} timesteps == sigmas * 1000, "
             f"received timesteps={timesteps.tolist()} and sigmas={sigmas.tolist()}"
