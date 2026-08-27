@@ -16,8 +16,8 @@ log:
 # Data Configuration
 data:
   datasets:
-    - name: default  # Unique identifier (used in metrics, caching, reward routing)
-      dataset_dir: "dataset/pickscore"  # Folder with train.jsonl / test.jsonl
+    - name: ocr  # Unique identifier (used in metrics, caching, reward routing)
+      dataset_dir: "dataset/ocr"  # OCR prompt dataset
       train:
         weight: 1  # Mixing weight (integer); ratio with other sources determines batch allocation
         max_dataset_size: 1024  # Cap on number of training samples for this source
@@ -106,21 +106,23 @@ eval:
 
 # Reward Model Configuration
 rewards:
-  - name: "pickscore" # Training based on rankings
-    reward_model: "PickScore"
+  - name: "ocr"
+    reward_model: "OCR"
     weight: 1.0  # Weight of this reward model
     batch_size: 16
     device: "cuda"
     dtype: bfloat16
+    applicable_datasets: [ocr]
 
 # Optional Evaluation Reward Models
 eval_rewards:
-  name: "pickscore" # Eval with original model
-  reward_model: "PickScore"
-  weight: 1.0  # Weight of this reward model
-  batch_size: 16
-  device: "cuda"
-  dtype: bfloat16
+  - name: "ocr"
+    reward_model: "OCR"
+    weight: 1.0  # Weight of this reward model
+    batch_size: 16
+    device: "cuda"
+    dtype: bfloat16
+    applicable_datasets: [ocr]
 
 
 # Optimizer Configuration
