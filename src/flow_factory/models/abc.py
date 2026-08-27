@@ -2899,18 +2899,26 @@ class BaseAdapter(ABC):
 
     # ============================== Freezing Components ==============================
     def _freeze_text_encoders(self):
-        """Freeze all text encoders."""
-        for i, encoder in enumerate(self.text_encoders):
+        """Freeze every text encoder declared by the component runtime."""
+        for encoder in self.text_encoders:
+            if encoder is None:
+                continue
             encoder.requires_grad_(False)
             encoder.eval()
 
     def _freeze_vae(self):
-        """Freeze video VAE and audio VAE (if present)."""
-        self.vae.requires_grad_(False)
-        self.vae.eval()
-        if self.audio_vae is not None:
-            self.audio_vae.requires_grad_(False)
-            self.audio_vae.eval()
+        """Freeze declared video and audio VAEs when materialized."""
+        if self.has_component("vae"):
+            vae = self.get_component("vae")
+            if vae is not None:
+                vae.requires_grad_(False)
+                vae.eval()
+
+        if self.has_component("audio_vae"):
+            audio_vae = self.get_component("audio_vae")
+            if audio_vae is not None:
+                audio_vae.requires_grad_(False)
+                audio_vae.eval()
 
     def _freeze_transformers(self):
         """Freeze transformer components (e.g., UNet, ControlNets)."""

@@ -40,6 +40,14 @@ ff-train examples/grpo/lora/flux1/default.yaml
 - [`minimax-h3-fl2va`](../examples/grpo/lora/minimax_h3_fl2va/default.yaml)
 - [`minimax-h3-ref2va`](../examples/grpo/lora/minimax_h3_ref2va/default.yaml)
 
+## SenseNova-U1 examples
+
+- [`sensenova` U1.5 T2I/I2I](../examples/grpo/lora/sensenova/default.yaml)
+
+Change `model.model_name_or_path` to `sensenova/SenseNova-U1-8B-MoT` for U1.0.
+For I2I, provide `images` as an ordered list per sample; multiple reference images
+are supported and are persisted as PIL images through the HF Image feature.
+
 The T2VA `debug.yaml` recipe is real-weight validated with the 61 GB checkpoint
 (61.74 GiB transformer):
 1 GPU and 16 GPUs across two nodes completed CPS rollout, video/audio decode,
