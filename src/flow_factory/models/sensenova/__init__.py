@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SenseNova-U1 model adapter for Flow-Factory."""
+"""SenseNova-U1 1.0/1.5 adapters for T2I and ordered multi-reference I2I."""
 
 from .pipeline import SenseNovaDenoiser, SenseNovaPseudoPipeline
 from .sensenova import SenseNovaAdapter, SenseNovaI2ISample, SenseNovaSample

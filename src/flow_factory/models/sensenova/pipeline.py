@@ -14,11 +14,12 @@
 
 """SenseNova's explicit pseudo-pipeline and differentiable denoiser wrapper.
 
-SenseNova-U1 is distributed as a custom Transformers composite model rather than
-as a diffusers pipeline.  The wrapper below keeps the official model intact while
-making the image-generation path an explicit Flow-Factory component.  In
-particular, the wrapper owns the gradient-bearing denoising forward so the
-component runtime can route it through DDP/FSDP/DeepSpeed and PEFT.
+SenseNova-U1 1.0/1.5 are distributed as custom Transformers composite models
+rather than diffusers pipelines. The wrapper keeps the official NEO-Unify model
+intact while making its image-generation path an explicit Flow-Factory component.
+Tokenization and vision encoding live inside the composite model; there is no
+standalone Flow-Factory text encoder or VAE. The checkpoint config selects the
+U1.0 MLP flow head or U1.5 pixel head automatically.
 """
 
 from __future__ import annotations
@@ -67,9 +68,10 @@ class SenseNovaDenoiser(nn.Module):
     ) -> torch.Tensor:
         """Predict the native SenseNova clean-minus-noise velocity.
 
-        The Flow-Factory adapter calls this with a single image at a time.  The
-        single-image contract keeps the official variable-length text cache
-        semantics exact and avoids padding-dependent changes to the RoPE indexes.
+        The Flow-Factory adapter calls this for one generated sample at a time.
+        That sample may carry multiple ordered reference images in its prefix.
+        Keeping independent samples separate preserves each variable-length KV
+        cache and avoids padding-dependent changes to the RoPE indexes.
         """
         if latents.ndim != 4 or latents.shape[0] != 1:
             raise ValueError(
@@ -153,7 +155,7 @@ class SenseNovaDenoiser(nn.Module):
 
 
 class SenseNovaPseudoPipeline:
-    """Diffusers-like container for the custom SenseNova checkpoint."""
+    """Component container for a custom SenseNova-U1 1.0/1.5 checkpoint."""
 
     def __init__(
         self,
@@ -189,7 +191,7 @@ class SenseNovaPseudoPipeline:
         low_cpu_mem_usage: bool = False,
         **kwargs: Any,
     ) -> "SenseNovaPseudoPipeline":
-        """Load a SenseNova-U1 checkpoint from the Hub or a local directory."""
+        """Load a SenseNova-U1 1.0/1.5 checkpoint from the Hub or a local directory."""
         tokenizer_kwargs = kwargs.pop("tokenizer_kwargs", {}) or {}
         model = NEOChatModel.from_pretrained(
             model_path,

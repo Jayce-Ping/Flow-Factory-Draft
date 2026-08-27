@@ -22,6 +22,7 @@ from PIL import Image
 
 from flow_factory.hparams.args import Arguments
 from flow_factory.models.registry import get_model_adapter_class
+from flow_factory.models.runtime import PseudoPipelineRuntime
 from flow_factory.models.sensenova import sensenova as sensenova_module
 from flow_factory.models.sensenova.modeling.neo_unify.configuration_neo_chat import NEOChatConfig
 from flow_factory.models.sensenova.modeling.neo_unify.modeling_neo_chat import (
@@ -110,6 +111,21 @@ def test_sensenova_registry_entry():
     assert get_model_adapter_class("sensenova") is SenseNovaAdapter
 
 
+def test_sensenova_declares_unified_component_layout():
+    """SenseNova has one model component and no standalone VAE/text encoder."""
+    adapter = SenseNovaAdapter.__new__(SenseNovaAdapter)
+    runtime = PseudoPipelineRuntime(
+        SimpleNamespace(),
+        {"transformer": torch.nn.Identity()},
+    )
+
+    assert adapter.preprocessing_modules == []
+    assert adapter.inference_modules == ["transformer"]
+    assert runtime.declared_component_names == ["transformer"]
+    assert runtime.text_encoder_names == []
+    assert "vae" not in runtime.declared_component_names
+
+
 def test_sensenova_example_uses_adapter_generation_parameters():
     """The example uses the adapter's canonical guidance and I2I parameters."""
     config_path = Path(__file__).parents[2] / "examples/grpo/lora/sensenova/default.yaml"
@@ -131,6 +147,24 @@ def test_sensenova_example_uses_adapter_generation_parameters():
     assert "cfg_scale" not in config.eval_args.extra_kwargs
     assert "img_cfg_scale" not in config.training_args.extra_kwargs
     assert "img_cfg_scale" not in config.eval_args.extra_kwargs
+
+
+def test_sensenova_multi_reference_example_uses_ordered_i2i_parameters():
+    """The I2I recipe uses canonical dual guidance and the multi-ref dataset."""
+    config_path = (
+        Path(__file__).parents[2]
+        / "examples/grpo/lora/sensenova/multi_reference_image.yaml"
+    )
+    config = Arguments.load_from_yaml(str(config_path))
+    dataset = config.data_args.datasets[0]
+
+    assert dataset.name == "multi_reference_image"
+    assert dataset.dataset_dir == "dataset/multi_ref_image"
+    assert config.training_args.guidance_scale == 1.0
+    assert config.training_args.extra_kwargs["image_guidance_scale"] == 1.0
+    assert config.eval_args.guidance_scale == 3.0
+    assert config.eval_args.extra_kwargs["image_guidance_scale"] == 1.5
+    assert config.eval_args.extra_kwargs["cfg_norm"] == "global"
 
 
 @pytest.mark.parametrize("use_pixel_head", [False, True])

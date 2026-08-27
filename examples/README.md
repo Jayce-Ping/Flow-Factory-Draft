@@ -42,11 +42,30 @@ ff-train examples/grpo/lora/flux1/default.yaml
 
 ## SenseNova-U1 examples
 
-- [`sensenova` U1.5 T2I/I2I](../examples/grpo/lora/sensenova/default.yaml)
+- [`sensenova` U1.5 T2I + OCR GRPO](../examples/grpo/lora/sensenova/default.yaml)
+- [`sensenova` U1.5 ordered multi-reference I2I + PickScore GRPO](../examples/grpo/lora/sensenova/multi_reference_image.yaml)
 
-Change `model.model_name_or_path` to `sensenova/SenseNova-U1-8B-MoT` for U1.0.
-For I2I, provide `images` as an ordered list per sample; multiple reference images
-are supported and are persisted as PIL images through the HF Image feature.
+Both recipes support U1.0 and U1.5; change `model.model_name_or_path` to
+`sensenova/SenseNova-U1-8B-MoT` for U1.0. For I2I, provide the dataset JSONL
+column `images` as an ordered list per sample. Preprocessing maps it to the
+adapter's `condition_images`; variable-size/count references remain PIL through
+the HF Image feature.
+Prepare the example's 2–3-image dataset with
+`python dataset/multi_ref_image/prepare.py` before launching the multi-reference recipe.
+
+<details>
+<summary>U1.5 T2I OCR GRPO validation curves (4 nodes × 8 GPUs)</summary>
+
+These curves validate the default T2I OCR recipe only; they are not evidence for
+the multi-reference I2I recipe.
+
+![SenseNova OCR train reward](../docs/assets/sensenova-u15-ocr-train-reward-ocr-mean.png)
+![SenseNova OCR eval reward](../docs/assets/sensenova-u15-ocr-eval-reward-ocr-mean.png)
+![SenseNova OCR train ratio](../docs/assets/sensenova-u15-ocr-train-ratio-mean.png)
+
+</details>
+
+## MiniMax H3 validation status
 
 The T2VA `debug.yaml` recipe is real-weight validated with the 61 GB checkpoint
 (61.74 GiB transformer):

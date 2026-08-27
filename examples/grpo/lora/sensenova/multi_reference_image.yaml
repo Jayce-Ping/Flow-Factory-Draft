@@ -1,4 +1,4 @@
-# SenseNova-U1.5 multi-reference image generation with GRPO.
+# SenseNova-U1 1.0/1.5 ordered multi-reference I2I with GRPO.
 # Prepare the dataset first:
 #   python dataset/multi_ref_image/prepare.py
 

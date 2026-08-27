@@ -102,7 +102,7 @@ class MyModelSample(T2ISample):
 
 > **Key**: The `_shared_fields` class variable declares fields that are identical across a batch (e.g., `height`, `width`, `latent_index_map`). During `BaseSample.stack()`, shared fields take the first element instead of stacking.
 
-> **Type determinism for `gather_samples`**: `ImageConditionSample.__post_init__` and `VideoConditionSample.__post_init__` canonicalize to a deterministic per-sample type across all samples and ranks — `List[Tensor]` by default, or `List[PIL.Image]` / `List[List[PIL.Image]]` when the subclass sets `condition_images_as_pil` / `condition_videos_as_pil` (adapters that persist condition media as PIL via `python_format_columns`, e.g. Bagel). When defining custom sample fields that will be gathered across ranks (via `gather_samples`), ensure each field has a **consistent type** on every sample — mixing `Tensor` on some samples and `List[Tensor]` on others will cause `gather_samples` to fall through to slow pickle-based `gather_object`. Prefer `List[Tensor]` for variable-length sequences.
+> **Type determinism for `gather_samples`**: `ImageConditionSample.__post_init__` and `VideoConditionSample.__post_init__` canonicalize to a deterministic per-sample type across all samples and ranks — `List[Tensor]` by default, or `List[PIL.Image]` / `List[List[PIL.Image]]` when the subclass sets `condition_images_as_pil` / `condition_videos_as_pil` (adapters that persist condition media as PIL via `python_format_columns`, e.g. Bagel and SenseNova). When defining custom sample fields that will be gathered across ranks (via `gather_samples`), ensure each field has a **consistent type** on every sample — mixing `Tensor` on some samples and `List[Tensor]` on others will cause `gather_samples` to fall through to slow pickle-based `gather_object`. Prefer `List[Tensor]` for variable-length sequences.
 
 
 ### Step 2: Create Adapter Class
@@ -255,7 +255,7 @@ def encode_image(
     """
 ```
 
-> **Important**: The `images` input follows the **multi-image batch** convention: `List[List[Image.Image]]`. Each sample can have zero, one, or multiple condition images. See [Data Format Conventions](#data-format-conventions) for details. Adapters that persist a returned image column as PIL (declare it in `python_format_columns`, e.g. Bagel's `condition_images`) may keep it as PIL; the dataset stores those columns via the HF Image feature and reads them back as PIL.
+> **Important**: The `images` input follows the **multi-image batch** convention: `List[List[Image.Image]]`. Each sample can have zero, one, or multiple condition images. See [Data Format Conventions](#data-format-conventions) for details. Adapters that persist a returned image column as PIL (declare it in `python_format_columns`, e.g. Bagel and SenseNova `condition_images`) may keep it as PIL; the dataset stores those columns via the HF Image feature and reads them back as PIL.
 
 #### `encode_video`
 
@@ -589,22 +589,30 @@ velocity predictions to `x0`; do not duplicate the sign convention inside a trai
 
 ## Advanced: Pseudo-Pipeline for Non-Diffusers Models
 
-Not all models have a diffusers pipeline. For models like [Bagel](https://github.com/ByteDance-Seed/Bagel) — a unified multimodal foundation model that combines LLM, ViT, and VAE in a single architecture — you can create a **pseudo-pipeline** that mimics the diffusers `Pipeline` interface just enough for `BaseAdapter` to work.
+Not all models have a diffusers pipeline. Unified Transformers models such as
+[Bagel](https://github.com/ByteDance-Seed/Bagel) and
+[SenseNova-U1](https://github.com/OpenSenseNova/SenseNova-U1) can use a
+**pseudo-pipeline** as an explicit component container.
 
-> **Reference implementation**: See [`src/flow_factory/models/bagel/`](../src/flow_factory/models/bagel) (registered as `bagel`) for the complete working example of a non-diffusers pseudo-pipeline adapter.
+> **Reference implementations**:
+> - [`src/flow_factory/models/bagel/`](../src/flow_factory/models/bagel) (`bagel`) exposes the unified Bagel model plus its VAE and tokenizer.
+> - [`src/flow_factory/models/sensenova/`](../src/flow_factory/models/sensenova) (`sensenova`) exposes one `SenseNovaDenoiser` component while NEO-Unify owns tokenization, vision encoding, and pixel-space flow matching.
 
 ### Why a Pseudo-Pipeline?
 
-`BaseAdapter` accesses model components via `getattr(self.pipeline, name)`. It expects a pipeline object with:
+`BaseAdapter` resolves model components through `ComponentRuntime`, not through
+Python attribute probing. A pseudo-pipeline supplies:
 
-1. **Named component attributes** — e.g., `.transformer`, `.vae`, `.scheduler`
+1. **Explicit canonical components** — declared by `PseudoPipelineRuntime`; only components that actually exist are listed
 2. **A `from_pretrained()` class method** — for weight loading
 
-A pseudo-pipeline satisfies these requirements without inheriting from `DiffusionPipeline`. It serves as a **component container** that exposes the right attribute names for `BaseAdapter`'s component management to work.
+A pseudo-pipeline satisfies these requirements without inheriting from
+`DiffusionPipeline`. Do not declare absent components as placeholders: SenseNova,
+for example, has no standalone Flow-Factory VAE or text encoder.
 
 ### Design Pattern
 
-Many non-diffusers models (e.g., Bagel) are a **single composite `nn.Module`** that internally contains sub-modules (LLM, ViT, projectors, etc.). Unlike diffusers pipelines where components are independent top-level objects, these models have a deeply nested structure.
+Many non-diffusers models (e.g., Bagel and SenseNova) are a **single composite `nn.Module`** that internally contains sub-modules (LLM, ViT, projectors, etc.). Unlike diffusers pipelines where components are independent top-level objects, these models have a deeply nested structure.
 
 The key design pattern is to store the **full composite model** on the pipeline while creating **aliases** to its key sub-modules that `BaseAdapter` needs to manage (freeze, LoRA, prepare with accelerator):
 
@@ -741,9 +749,9 @@ For a detailed walkthrough of how `inference()` and `forward()` fit into the six
 >
 > `condition_images` at the method level is **model-dependent** — there is no single canonical batch type:
 > - Single condition image per sample with uniform shape (e.g. Flux1-Kontext): batched `Tensor(B, C, H, W)`. `condition_images[b]` yields `Tensor(C,H,W)`, which `ImageConditionSample.__post_init__` unbinds to `[Tensor(C,H,W)]`.
-> - Multiple condition images per sample, or variable shapes (e.g. Flux2, Qwen-Image-Edit): `List[List[Tensor(C,H,W)]]` of length `B`. `condition_images[b]` yields `List[Tensor(C,H,W)]` directly.
+> - Multiple condition images per sample, or variable shapes (e.g. Flux2, Qwen-Image-Edit, Bagel, SenseNova): `List[List[Tensor(C,H,W)]]` of length `B`. `condition_images[b]` yields `List[Tensor(C,H,W)]` directly.
 >
-> The value stored on `sample.condition_images` after `inference()` is per-sample (no batch dimension); its element type is set by `ImageConditionSample.condition_images_as_pil` — `List[Tensor(C,H,W)]` in `[0,1]` by default, or `List[PIL.Image]` when the adapter persists condition_images via the HF Image feature (declares them in `python_format_columns` and sets `condition_images_as_pil=True` on its sample, e.g. Bagel). `condition_videos` follows the same model-dependent pattern.
+> The value stored on `sample.condition_images` after `inference()` is per-sample (no batch dimension); its element type is set by `ImageConditionSample.condition_images_as_pil` — `List[Tensor(C,H,W)]` in `[0,1]` by default, or `List[PIL.Image]` when the adapter persists condition_images via the HF Image feature (declares them in `python_format_columns` and sets `condition_images_as_pil=True` on its sample, e.g. Bagel and SenseNova). `condition_videos` follows the same model-dependent pattern.
 >
 > Fields stored on `BaseSample` (and subclass) instances are **per-sample** — the batch dimension is stripped. `sample.condition_images` is one sample's images (`List[Tensor(C,H,W)]`, or `List[PIL.Image]` when `condition_images_as_pil=True`), not the full batch. This is enforced at construction time when `inference()` slices `condition_images[b]` for each `b` in `range(batch_size)`.
 
@@ -762,7 +770,7 @@ All encoding methods and `inference()`/`forward()` receive **batched** inputs. H
 | Parameter | Format | Description |
 |---|---|---|
 | `images` | `List[List[Image.Image]]` | **Multi-image batch**: `images[i]` is a list of condition images for sample `i`. Each inner list can have 0, 1, or N images. |
-| `condition_images` | `List[List[Tensor(C,H,W)]]` in `[0,1]` (or `List[List[PIL.Image]]` for `python_format_columns` adapters, e.g. Bagel) | Resized/preprocessed version of above |
+| `condition_images` | `List[List[Tensor(C,H,W)]]` in `[0,1]` (or `List[List[PIL.Image]]` for `python_format_columns` adapters, e.g. Bagel and SenseNova) | Resized/preprocessed version of above |
 | `image_latents` | `List[Tensor(seq,C)]` or `Tensor(B,seq,C)` | VAE-encoded latents. Use `List` for variable-length sequences, `Tensor` when all samples share the same sequence length. |
 
 > The multi-image batch convention (`List[List[...]]`) is critical for models that support varying numbers of condition images per sample. Always normalize your input to this format in `encode_image()`.

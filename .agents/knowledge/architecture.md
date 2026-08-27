@@ -129,7 +129,7 @@ All four registries map string keys → lazy import paths. Resolution: registry 
 | `ltx2_t2av` | `LTX2_T2AV_Adapter` | Text-to-Audio-Video |
 | `ltx2_i2av` | `LTX2_I2AV_Adapter` | Image-to-Audio-Video |
 | `bagel` | `BagelAdapter` | Text-to-Image & Image(s)-to-Image (T2I & I2I both batched via NaViT packing; subset-round packing handles variable I2I reference-image count, no per-sample fallback — see `topics/adapter_conventions.md`) |
-| `sensenova` | `SenseNovaAdapter` | Text-to-Image & Image(s)-to-Image (SenseNova-U1 1.0/1.5; official image-prefill supports ordered multi-reference images) |
+| `sensenova` | `SenseNovaAdapter` | Text-to-Image & Image(s)-to-Image (SenseNova-U1 1.0/1.5; ordered variable-count references; independent samples use B=1 prefixes rather than Bagel-style NaViT packing) |
 
 **Reward Models** (`rewards/registry.py`):
 | Key | Class | Type |
@@ -206,7 +206,8 @@ non-`None` modular specs but exclude absent classic optional components. The def
 `ClassicPipelineRuntime` preserves eager DiffusionPipeline behavior;
 `ModularPipelineRuntime` materializes selected lazy component specs; and
 `PseudoPipelineRuntime` manages explicit containers and non-enumerated aliases such as Bagel's
-`transformer -> bagel.language_model`. `adapter.pipeline` remains the backend compatibility alias,
+`transformer -> bagel.language_model`, as well as direct canonical components such as SenseNova's
+`transformer -> SenseNovaDenoiser`. `adapter.pipeline` remains the backend compatibility alias,
 while `ModelBundle` and `RoutedComponentProxy` remain the sole distributed preparation runtime.
 `SchedulerGroup` separately provides immutable component names and ordered scheduler mode/seed
 dispatch; its primary scheduler remains available through `adapter.scheduler`.

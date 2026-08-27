@@ -62,7 +62,7 @@ train:
   timestep_shift: 3.0  # Options: positive float; 3.0 matches the official examples
 
   # Batch and sampling
-  per_device_batch_size: 2  # SenseNova T2I prompts are handled as independent cache calls.
+  per_device_batch_size: 2  # T2I/I2I samples run sequentially with independent B=1 prefix caches; no NaViT packing.
   shuffle_samples: true
   group_size: 16  # Group size for GRPO sampling
   global_std: true  # Use global std for advantage normalization

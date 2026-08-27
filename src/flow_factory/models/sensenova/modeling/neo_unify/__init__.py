@@ -55,9 +55,9 @@ _REGISTERED = False
 def register() -> None:
     """Register NEO-Unify types with ``transformers.Auto*``.
 
-    After calling this (or simply ``import sensenova_u1``), users can load a
-    SenseNova-U1 checkpoint via plain ``AutoConfig.from_pretrained`` /
-    ``AutoModel.from_pretrained``.
+    Importing ``flow_factory.models.sensenova.modeling.neo_unify`` calls this
+    registration hook, after which SenseNova-U1 1.0/1.5 checkpoints can be loaded
+    through ``AutoConfig.from_pretrained`` / ``AutoModel.from_pretrained``.
     """
     global _REGISTERED
     if _REGISTERED:
