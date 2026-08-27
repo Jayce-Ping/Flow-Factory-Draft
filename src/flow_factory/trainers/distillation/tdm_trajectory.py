@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 
@@ -14,16 +13,42 @@ from ...samples import (
     StackedSampleBatch,
     StructuredTrajectory,
 )
+from ...utils.noise_schedule import validate_flow_match_coordinates
+
+_SCORE_QUERY_SAMPLE_ATTEMPTS = 8
+
+
+class _TDMCoordinateContainmentError(ValueError):
+    """Signal a representational endpoint collision that may be resampled."""
 
 
 @dataclass(frozen=True)
 class TDMBoundaryUnit:
-    """Store one replay batch and its primary half-open perturbation interval."""
+    """Store one replay batch, its exact lower boundary, and perturbation interval."""
 
     samples: tuple[BaseSample, ...]
     boundary_index: int
-    interval_start: torch.Tensor
-    interval_end: torch.Tensor
+    primary_name: str
+    times: ComponentTimes
+    mid_times: ComponentTimes
+
+    @property
+    def interval_start(self) -> torch.Tensor:
+        """Return the authoritative primary lower-boundary timestep.
+
+        Returns:
+            Stored primary ``next_timestep`` for this transition.
+        """
+        return self.times.next_timestep[self.primary_name]
+
+    @property
+    def interval_end(self) -> torch.Tensor:
+        """Return the authoritative primary upper-boundary timestep.
+
+        Returns:
+            Stored primary current ``timestep`` for this transition.
+        """
+        return self.times.timestep[self.primary_name]
 
 
 class TDMTrajectoryRuntimeMixin:
@@ -67,7 +92,7 @@ class TDMTrajectoryRuntimeMixin:
         replay_samples = tuple(samples)
         batch = self._stack_replay_unit(replay_samples)
         self._validate_sample_boundaries(replay_samples, batch)
-        previous_interval_start: torch.Tensor | None = None
+        previous_times: ComponentTimes | None = None
         for boundary_index in range(1, self.training_args.num_inference_steps + 1):
             replay_step = self.adapter.get_replay_step(
                 batch,
@@ -79,25 +104,23 @@ class TDMTrajectoryRuntimeMixin:
                 replay_step.times,
                 len(replay_samples),
             )
-            interval_end = times.timestep[primary_name]
-            interval_start = times.next_timestep[primary_name]
-            self._validate_interval(
+            mid_times = self._validate_interval(
                 batch,
                 times,
                 boundary_index=boundary_index,
-                interval_start=interval_start,
-                interval_end=interval_end,
-                previous_interval_start=previous_interval_start,
+                previous_times=previous_times,
             )
+            stored_times = TDMTrajectoryRuntimeMixin._clone_component_times(times)
             units.append(
                 TDMBoundaryUnit(
                     samples=replay_samples,
                     boundary_index=boundary_index,
-                    interval_start=interval_start.detach().clone(),
-                    interval_end=interval_end.detach().clone(),
+                    primary_name=primary_name,
+                    times=stored_times,
+                    mid_times=mid_times,
                 )
             )
-            previous_interval_start = interval_start
+            previous_times = stored_times
         return units
 
     def _normalize_replay_times(
@@ -106,18 +129,16 @@ class TDMTrajectoryRuntimeMixin:
         batch_size: int,
     ) -> ComponentTimes:
         """Return one real coordinate per sample for every component of a transition."""
-        reference = next(iter(times.timestep.values()))
 
         def widen(
             mapping: Mapping[str, torch.Tensor] | None,
-        ) -> dict[str, Any] | None:
+        ) -> dict[str, torch.Tensor] | None:
             if mapping is None:
                 return None
             return {
                 name: TDMTrajectoryRuntimeMixin._as_per_sample_coordinate(
                     value,
                     batch_size,
-                    like=reference,
                 )
                 for name, value in mapping.items()
             }
@@ -133,7 +154,6 @@ class TDMTrajectoryRuntimeMixin:
     def _as_per_sample_coordinate(
         coordinate: torch.Tensor,
         batch_size: int,
-        like: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return a scheduler coordinate as one real value per sample."""
         if coordinate.ndim == 0:
@@ -143,8 +163,6 @@ class TDMTrajectoryRuntimeMixin:
                 f"expected a scalar or ({batch_size},) scheduler coordinate, "
                 f"received shape {tuple(coordinate.shape)}"
             )
-        if like is not None and coordinate.dtype != like.dtype:
-            coordinate = coordinate.to(dtype=like.dtype, device=like.device)
         return coordinate
 
     def _validate_sample_boundaries(
@@ -248,59 +266,9 @@ class TDMTrajectoryRuntimeMixin:
         stored_times: ComponentTimes,
         *,
         boundary_index: int,
-        interval_start: torch.Tensor,
-        interval_end: torch.Tensor,
-        previous_interval_start: torch.Tensor | None,
-    ) -> None:
-        """Validate one descending transition as a half-open shared component interval."""
-        if interval_start.shape != interval_end.shape or interval_start.ndim != 1:
-            raise ValueError(
-                f"TDM boundary_index={boundary_index} expected interval tensors shaped (B,), "
-                f"received start={tuple(interval_start.shape)}, end={tuple(interval_end.shape)}"
-            )
-        self._validate_coordinate(
-            interval_start,
-            field="primary interval_start timestep",
-            boundary_index=boundary_index,
-        )
-        self._validate_coordinate(
-            interval_end,
-            field="primary interval_end timestep",
-            boundary_index=boundary_index,
-        )
-        if not bool((interval_start < interval_end).all().item()):
-            raise ValueError(
-                f"TDM boundary_index={boundary_index} received reversed or empty interval "
-                f"[{interval_start.tolist()}, {interval_end.tolist()})"
-            )
-        if previous_interval_start is not None and not self._coordinates_equal(
-            interval_end,
-            previous_interval_start,
-        ):
-            comparison_end, comparison_previous = self._normalize_coordinates(
-                interval_end,
-                previous_interval_start,
-            )
-            topology = (
-                "overlap" if bool((comparison_end > comparison_previous).any().item()) else "gap"
-            )
-            raise ValueError(
-                f"TDM boundary_index={boundary_index} interval has an exact {topology}; "
-                f"previous_start={previous_interval_start.tolist()}, "
-                f"current_end={interval_end.tolist()}"
-            )
-        if (
-            boundary_index == self.training_args.num_inference_steps
-            and not self._coordinates_equal(
-                interval_start,
-                torch.zeros_like(interval_start),
-            )
-        ):
-            raise ValueError(
-                "TDM terminal interval must end at exact scheduler coordinate zero; "
-                f"received terminal start={interval_start.tolist()}"
-            )
-
+        previous_times: ComponentTimes | None,
+    ) -> ComponentTimes:
+        """Validate exact stored topology and return authoritative lower-boundary times."""
         expected_order = self.adapter.trajectory_component_order
         for field_name in ("timestep", "next_timestep", "sigma", "next_sigma"):
             coordinates = getattr(stored_times, field_name)
@@ -318,100 +286,194 @@ class TDMTrajectoryRuntimeMixin:
                     component=name,
                     boundary_index=boundary_index,
                 )
-
-        mapped_end = self.adapter.build_training_component_times(interval_end, batch=batch)
-        mapped_start = self.adapter.build_training_component_times(interval_start, batch=batch)
-        for mapped_name, mapped in (
-            ("interval_end", mapped_end),
-            ("interval_start", mapped_start),
-        ):
-            if tuple(mapped.timestep) != expected_order:
-                raise ValueError(
-                    f"TDM {mapped_name} expected mapped component order {expected_order}, "
-                    f"received {tuple(mapped.timestep)} at boundary_index={boundary_index}"
-                )
-        for name in expected_order:
-            self._validate_coordinate(
-                mapped_end.timestep[name],
-                field="mapped interval_end timestep",
-                component=name,
-                boundary_index=boundary_index,
+        if (stored_times.sigma is None) != (stored_times.next_sigma is None):
+            raise ValueError(
+                "TDM stored sigma and next_sigma must be provided together; "
+                f"received sigma={stored_times.sigma is not None} and "
+                f"next_sigma={stored_times.next_sigma is not None} at "
+                f"boundary_index={boundary_index}"
             )
-            self._validate_coordinate(
-                mapped_start.timestep[name],
-                field="mapped interval_start timestep",
-                component=name,
-                boundary_index=boundary_index,
-            )
-        if stored_times.sigma is not None:
-            if mapped_end.sigma is None or mapped_start.sigma is None:
-                raise ValueError(
-                    "TDM shared interval mapping omitted component sigmas while the stored "
-                    f"trajectory provides them at boundary_index={boundary_index}"
-                )
-            for name in expected_order:
-                self._validate_coordinate(
-                    mapped_end.sigma[name],
-                    field="mapped interval_end sigma",
-                    component=name,
-                    boundary_index=boundary_index,
-                )
-                self._validate_coordinate(
-                    mapped_start.sigma[name],
-                    field="mapped interval_start sigma",
-                    component=name,
-                    boundary_index=boundary_index,
-                )
 
         for name in expected_order:
-            self._require_matching_coordinate(
-                mapped_end.timestep[name],
-                stored_times.timestep[name],
+            current_timestep = stored_times.timestep[name]
+            next_timestep = stored_times.next_timestep[name]
+            self._validate_descending_coordinate_pair(
+                current_timestep,
+                next_timestep,
+                field="timestep",
                 component=name,
-                endpoint="interval_end",
-                boundary_index=boundary_index,
-            )
-            self._require_matching_coordinate(
-                mapped_start.timestep[name],
-                stored_times.next_timestep[name],
-                component=name,
-                endpoint="interval_start",
                 boundary_index=boundary_index,
             )
             if stored_times.sigma is not None:
-                self._require_matching_coordinate(
-                    mapped_end.sigma[name],
+                validate_flow_match_coordinates(
+                    current_timestep,
                     stored_times.sigma[name],
-                    component=name,
-                    endpoint="interval_end sigma",
-                    boundary_index=boundary_index,
+                    identifier=(
+                        f"TDM stored timestep/sigma for component {name!r} at "
+                        f"boundary_index={boundary_index}"
+                    ),
                 )
-                self._require_matching_coordinate(
-                    mapped_start.sigma[name],
+                validate_flow_match_coordinates(
+                    next_timestep,
                     stored_times.next_sigma[name],
+                    identifier=(
+                        f"TDM stored next_timestep/next_sigma for component {name!r} at "
+                        f"boundary_index={boundary_index}"
+                    ),
+                )
+                self._validate_descending_coordinate_pair(
+                    stored_times.sigma[name],
+                    stored_times.next_sigma[name],
+                    field="sigma",
                     component=name,
-                    endpoint="interval_start sigma",
                     boundary_index=boundary_index,
                 )
+            if previous_times is not None:
+                self._validate_adjacent_coordinate(
+                    current_timestep,
+                    previous_times.next_timestep[name],
+                    field="timestep",
+                    component=name,
+                    boundary_index=boundary_index,
+                )
+                if stored_times.sigma is not None:
+                    if previous_times.next_sigma is None:
+                        raise ValueError(
+                            "TDM adjacent transitions must preserve stored sigma topology; "
+                            f"component={name!r}, boundary_index={boundary_index}"
+                        )
+                    self._validate_adjacent_coordinate(
+                        stored_times.sigma[name],
+                        previous_times.next_sigma[name],
+                        field="sigma",
+                        component=name,
+                        boundary_index=boundary_index,
+                    )
+            if boundary_index == self.training_args.num_inference_steps:
+                terminal_coordinates = [("next_timestep", next_timestep)]
+                if stored_times.next_sigma is not None:
+                    terminal_coordinates.append(("next_sigma", stored_times.next_sigma[name]))
+                for field, coordinate in terminal_coordinates:
+                    if not self._coordinates_equal(coordinate, torch.zeros_like(coordinate)):
+                        raise ValueError(
+                            "TDM terminal interval must end at exact coordinate zero; "
+                            f"component={name!r}, field={field!r}, "
+                            f"received={coordinate.tolist()}"
+                        )
+        return self._authoritative_mid_times(
+            batch,
+            stored_times,
+            boundary_index=boundary_index,
+        )
 
-    def _require_matching_coordinate(
+    def _authoritative_mid_times(
         self,
-        mapped: torch.Tensor,
-        stored: torch.Tensor,
+        batch: StackedSampleBatch,
+        stored_times: ComponentTimes,
         *,
+        boundary_index: int,
+    ) -> ComponentTimes:
+        """Use stored lower-boundary coordinates, falling back only when absent."""
+        current_sigma = stored_times.next_sigma
+        if current_sigma is None:
+            primary_name = self.adapter.trajectory_component_order[0]
+            mapped = self.adapter.build_training_component_times(
+                stored_times.next_timestep[primary_name],
+                batch=batch,
+            )
+            current_sigma = mapped.sigma
+        if current_sigma is None:
+            raise ValueError(
+                "TDM lower-boundary mapping expected component sigmas, received None at "
+                f"boundary_index={boundary_index}"
+            )
+        expected_order = self.adapter.trajectory_component_order
+        if tuple(current_sigma) != expected_order:
+            raise ValueError(
+                f"TDM lower-boundary sigma expected component order {expected_order}, "
+                f"received {tuple(current_sigma)} at boundary_index={boundary_index}"
+            )
+        for name in expected_order:
+            self._validate_coordinate(
+                current_sigma[name],
+                field="lower-boundary sigma",
+                component=name,
+                boundary_index=boundary_index,
+            )
+
+        timestep = self._clone_mapping(stored_times.next_timestep)
+        sigma = self._clone_mapping(current_sigma)
+        return ComponentTimes(
+            timestep=timestep,
+            next_timestep={name: torch.zeros_like(value) for name, value in timestep.items()},
+            sigma=sigma,
+            next_sigma={name: torch.zeros_like(value) for name, value in sigma.items()},
+        )
+
+    @classmethod
+    def _clone_component_times(cls, times: ComponentTimes) -> ComponentTimes:
+        return ComponentTimes(
+            timestep=cls._clone_mapping(times.timestep),
+            next_timestep=cls._clone_mapping(times.next_timestep),
+            sigma=None if times.sigma is None else cls._clone_mapping(times.sigma),
+            next_sigma=(None if times.next_sigma is None else cls._clone_mapping(times.next_sigma)),
+        )
+
+    @staticmethod
+    def _clone_mapping(values: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return {name: value.detach().clone() for name, value in values.items()}
+
+    @classmethod
+    def _validate_descending_coordinate_pair(
+        cls,
+        current: torch.Tensor,
+        following: torch.Tensor,
+        *,
+        field: str,
         component: str,
-        endpoint: str,
         boundary_index: int,
     ) -> None:
-        """Require adapter mapping to reproduce one stored component endpoint."""
-        if mapped.shape != stored.shape or not self._coordinates_equal(mapped, stored):
+        if current.shape != following.shape or current.ndim != 1:
             raise ValueError(
-                "TDM component schedules cannot define a shared interval through "
-                "adapter.build_training_component_times with exact endpoints; "
-                f"component={component!r}, exact endpoint={endpoint!r}, "
-                f"boundary_index={boundary_index}, mapped={mapped.tolist()}, "
-                f"stored={stored.tolist()}"
+                f"TDM component={component!r}, boundary_index={boundary_index} expected "
+                f"{field} interval tensors shaped (B,), received "
+                f"current={tuple(current.shape)} and next={tuple(following.shape)}"
             )
+        normalized_current, normalized_following = cls._normalize_coordinates(
+            current,
+            following,
+        )
+        if not bool((normalized_following < normalized_current).all().item()):
+            raise ValueError(
+                f"TDM component={component!r}, boundary_index={boundary_index} received "
+                f"reversed or empty {field} interval "
+                f"[{following.tolist()}, {current.tolist()})"
+            )
+
+    @classmethod
+    def _validate_adjacent_coordinate(
+        cls,
+        current: torch.Tensor,
+        previous_next: torch.Tensor,
+        *,
+        field: str,
+        component: str,
+        boundary_index: int,
+    ) -> None:
+        if cls._coordinates_equal(current, previous_next):
+            return
+        normalized_current, normalized_previous = cls._normalize_coordinates(
+            current,
+            previous_next,
+        )
+        topology = (
+            "overlap" if bool((normalized_current > normalized_previous).any().item()) else "gap"
+        )
+        raise ValueError(
+            f"TDM component={component!r}, boundary_index={boundary_index} {field} "
+            f"interval has an exact {topology}; previous_next={previous_next.tolist()}, "
+            f"current={current.tolist()}"
+        )
 
     def _sample_perturbation_times(self, unit: TDMBoundaryUnit) -> torch.Tensor:
         """Sample strictly inside one primary scheduler interval."""
@@ -446,14 +508,44 @@ class TDMTrajectoryRuntimeMixin:
         sampled = unit.interval_start + (unit.interval_end - unit.interval_start) * random_fraction
         return torch.minimum(torch.maximum(sampled, open_start), open_end)
 
-    def _validate_score_query_sigmas(
+    def _sample_score_query_times(
+        self,
+        unit: TDMBoundaryUnit,
+        batch: StackedSampleBatch,
+    ) -> ComponentTimes:
+        """Map a random primary time whose every component has an open interior value."""
+        last_error: _TDMCoordinateContainmentError | None = None
+        for _ in range(_SCORE_QUERY_SAMPLE_ATTEMPTS):
+            primary_times = self._sample_perturbation_times(unit)
+            times = self.adapter.build_training_component_times(primary_times, batch=batch)
+            try:
+                self._validate_score_query_coordinates(
+                    times,
+                    primary_times,
+                    unit=unit,
+                )
+            except _TDMCoordinateContainmentError as error:
+                # A mathematically interior primary value can round onto a secondary
+                # endpoint after a nonlinear component-time transform. Redraw the
+                # primary value instead of mutating the adapter's mapped coordinates.
+                last_error = error
+                continue
+            return times
+        raise ValueError(
+            "TDM could not sample a jointly representable open component-time interval "
+            f"after {_SCORE_QUERY_SAMPLE_ATTEMPTS} attempts at "
+            f"boundary_index={unit.boundary_index}"
+        ) from last_error
+
+    def _validate_score_query_coordinates(
         self,
         times: ComponentTimes,
         primary_times: torch.Tensor,
         *,
-        boundary_index: int,
+        unit: TDMBoundaryUnit,
     ) -> None:
-        """Require finite positive component sigmas before score queries."""
+        """Require every mapped continuous coordinate inside its stored interval."""
+        boundary_index = unit.boundary_index
         component_order = self.adapter.trajectory_component_order
         if times.sigma is None:
             raise ValueError(
@@ -461,31 +553,96 @@ class TDMTrajectoryRuntimeMixin:
                 f"boundary_index={boundary_index}, component={component_order[0]!r}, "
                 f"tau={primary_times.tolist()}, received sigma=None"
             )
-        if tuple(times.sigma) != component_order:
+        if tuple(times.timestep) != component_order or tuple(times.sigma) != component_order:
             raise ValueError(
-                "TDM score-query sigma validation expected component order "
+                "TDM score-query coordinate validation expected component order "
                 f"{component_order}; boundary_index={boundary_index}, "
-                f"tau={primary_times.tolist()}, received sigma components={tuple(times.sigma)}"
+                f"tau={primary_times.tolist()}, received timestep components="
+                f"{tuple(times.timestep)} and sigma components={tuple(times.sigma)}"
             )
         for name in component_order:
+            timestep = times.timestep[name]
             sigma = times.sigma[name]
-            if not isinstance(sigma, torch.Tensor) or not sigma.is_floating_point():
-                received = (
-                    f"dtype={sigma.dtype}, values={sigma.tolist()}"
-                    if isinstance(sigma, torch.Tensor)
-                    else f"{type(sigma).__name__}: {sigma!r}"
+            validate_flow_match_coordinates(
+                timestep,
+                sigma,
+                identifier=(
+                    f"TDM mapped continuous timestep/sigma for component {name!r} at "
+                    f"boundary_index={boundary_index}"
+                ),
+            )
+            self._validate_contained_coordinate(
+                timestep,
+                lower=unit.times.next_timestep[name],
+                upper=unit.times.timestep[name],
+                field="timestep",
+                component=name,
+                boundary_index=boundary_index,
+            )
+            if unit.times.sigma is not None:
+                self._validate_contained_coordinate(
+                    sigma,
+                    lower=unit.times.next_sigma[name],
+                    upper=unit.times.sigma[name],
+                    field="sigma",
+                    component=name,
+                    boundary_index=boundary_index,
                 )
-                raise TypeError(
-                    "TDM score-query sigma validation expected a floating tensor; "
-                    f"boundary_index={boundary_index}, component={name!r}, "
-                    f"tau={primary_times.tolist()}, received sigma={received}"
+            else:
+                lower_sigma = unit.mid_times.sigma[name]
+                normalized_sigma, normalized_lower = self._normalize_coordinates(
+                    sigma,
+                    lower_sigma,
                 )
-            if not bool((torch.isfinite(sigma) & (sigma > 0)).all().item()):
-                raise ValueError(
-                    f"TDM score-query sigma validation boundary_index={boundary_index}, "
-                    f"component={name!r}, tau={primary_times.tolist()} expected finite and "
-                    f"strictly positive values, received sigma={sigma.tolist()}"
-                )
+                if not bool(
+                    ((normalized_sigma > normalized_lower) & (normalized_sigma < 1)).all().item()
+                ):
+                    raise _TDMCoordinateContainmentError(
+                        "TDM mapped continuous sigma must be above its lower boundary and "
+                        "strictly below one; "
+                        f"component={name!r}, boundary_index={boundary_index}, "
+                        f"lower={lower_sigma.tolist()}, mapped={sigma.tolist()}"
+                    )
+
+    @classmethod
+    def _validate_contained_coordinate(
+        cls,
+        coordinate: torch.Tensor,
+        *,
+        lower: torch.Tensor,
+        upper: torch.Tensor,
+        field: str,
+        component: str,
+        boundary_index: int,
+    ) -> None:
+        if coordinate.shape != lower.shape or coordinate.shape != upper.shape:
+            raise ValueError(
+                f"TDM mapped {field} expected stored interval shape {tuple(lower.shape)} for "
+                f"component={component!r}, received mapped={tuple(coordinate.shape)} and "
+                f"upper={tuple(upper.shape)} at boundary_index={boundary_index}"
+            )
+        normalized_coordinate, normalized_lower = cls._normalize_coordinates(
+            coordinate,
+            lower,
+        )
+        normalized_coordinate, normalized_upper = cls._normalize_coordinates(
+            normalized_coordinate,
+            upper,
+        )
+        if not bool(
+            (
+                (normalized_coordinate > normalized_lower)
+                & (normalized_coordinate < normalized_upper)
+            )
+            .all()
+            .item()
+        ):
+            raise _TDMCoordinateContainmentError(
+                f"TDM mapped continuous {field} must lie strictly inside the stored "
+                f"component interval; component={component!r}, "
+                f"boundary_index={boundary_index}, lower={lower.tolist()}, "
+                f"mapped={coordinate.tolist()}, upper={upper.tolist()}"
+            )
 
     @staticmethod
     def _validate_coordinate(

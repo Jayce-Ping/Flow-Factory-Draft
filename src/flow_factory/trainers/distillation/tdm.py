@@ -26,6 +26,7 @@ from accelerate import Accelerator
 from ...hparams import Arguments, TDMTrainingArguments
 from ...hparams.training_args.dmd2 import DMD2_DEFAULT_OPTIMIZERS
 from ...models.abc import BaseAdapter
+from ...models.trajectory_bridge import resolve_replay_projection_times
 from ...samples import (
     BaseSample,
     ComponentTimes,
@@ -34,7 +35,6 @@ from ...samples import (
     StackedSampleBatch,
 )
 from ..abc import BaseTrainer
-from .dmd2 import DMD2Trainer
 from .distillation_runtime import (
     as_role_microbatches,
     detach_state,
@@ -57,6 +57,7 @@ from .distribution_matching import (
     tdm_fake_loss,
     tdm_generator_loss,
 )
+from .dmd2 import DMD2Trainer
 from .tdm_trajectory import TDMBoundaryUnit, TDMTrajectoryRuntimeMixin
 
 
@@ -204,19 +205,12 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
         with torch.no_grad():
             batch, clean_state, model_noise = self._replay_generator_prediction(unit)
         detached_clean = detach_state(clean_state)
-        mid_times = self.adapter.build_training_component_times(unit.interval_start, batch=batch)
-        primary_times = self._sample_perturbation_times(unit)
-        times = self.adapter.build_training_component_times(primary_times, batch=batch)
-        self._validate_score_query_sigmas(
-            times,
-            primary_times,
-            boundary_index=unit.boundary_index,
-        )
+        times = self._sample_score_query_times(unit, batch)
         noised, importance = tdm_conditional_renoise(
             self.adapter,
             detached_clean,
             detach_state(model_noise),
-            mid_times=mid_times,
+            mid_times=unit.mid_times,
             target_times=times,
             importance_clip=self.training_args.tdm_importance_clip,
         )
@@ -253,19 +247,12 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
     def _generator_score_terms(self, unit: TDMBoundaryUnit) -> TDMGeneratorScoreTerms:
         """Replay a live clean prediction and query scores on conditional stage noise."""
         batch, clean_state, model_noise = self._replay_generator_prediction(unit)
-        mid_times = self.adapter.build_training_component_times(unit.interval_start, batch=batch)
-        primary_times = self._sample_perturbation_times(unit)
-        times = self.adapter.build_training_component_times(primary_times, batch=batch)
-        self._validate_score_query_sigmas(
-            times,
-            primary_times,
-            boundary_index=unit.boundary_index,
-        )
+        times = self._sample_score_query_times(unit, batch)
         noised, _ = tdm_conditional_renoise(
             self.adapter,
             detach_state(clean_state),
             detach_state(model_noise),
-            mid_times=mid_times,
+            mid_times=unit.mid_times,
             target_times=times,
             importance_clip=self.training_args.tdm_importance_clip,
         )
@@ -342,9 +329,10 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
                     **self._replay_forward_kwargs(batch),
                 )
         velocity = require_velocity(output, algorithm_name="TDM", role_name="generator")
-        primary_name = self.adapter.trajectory_component_order[0]
-        projection_times = self.adapter.build_training_component_times(
-            replay_step.times.timestep[primary_name],
+        projection_times = self._normalize_replay_times(replay_step.times, len(unit.samples))
+        projection_times = resolve_replay_projection_times(
+            self.adapter,
+            projection_times,
             batch=batch,
         )
         clean_state = self.adapter.project_velocity_to_clean_state(
