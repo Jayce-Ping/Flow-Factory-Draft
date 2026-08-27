@@ -15,10 +15,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Literal, Mapping, Optional, Tuple, Union
 
 import yaml
 
+from ...contracts.execution import ONLINE_EXECUTION_CONTRACT, ExecutionContract
 from ...utils.dist import get_world_size
 from ...utils.logger_utils import setup_logger
 from ..abc import ArgABC
@@ -107,6 +108,8 @@ class EvaluationArguments(ArgABC):
 @dataclass
 class TrainingArguments(ArgABC):
     r"""Base training arguments shared across all algorithms."""
+
+    execution_contract: ClassVar[ExecutionContract] = ONLINE_EXECUTION_CONTRACT
 
     # --- Trainer type ---
     trainer_type: str = field(
@@ -414,6 +417,23 @@ class TrainingArguments(ArgABC):
         encoded when any stage might require them.
         """
         return self.guidance_scale
+
+    @classmethod
+    def from_dict(cls, args_dict: Mapping[str, Any]):
+        """Parse user fields while keeping algorithm execution semantics immutable."""
+        if not isinstance(args_dict, Mapping):
+            raise TypeError(
+                "expected training arguments as a mapping, "
+                f"received {type(args_dict).__name__}: {args_dict!r}"
+            )
+        explicit_extras = args_dict.get("extra_kwargs")
+        if "execution_contract" in args_dict or (
+            isinstance(explicit_extras, Mapping) and "execution_contract" in explicit_extras
+        ):
+            raise ValueError(
+                "train.execution_contract is selected by trainer_type and cannot be configured"
+            )
+        return super().from_dict(dict(args_dict))
 
     def to_dict(self) -> dict[str, Any]:
         return super().to_dict()

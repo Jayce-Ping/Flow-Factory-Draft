@@ -77,6 +77,22 @@ def load_trainer(config: Arguments) -> BaseTrainer:
         config.training_args.trainer_type = "my_package.trainers.PPOTrainer"
         trainer = load_trainer(config)
     """
+    trainer_type = config.training_args.trainer_type
+    try:
+        trainer_cls = get_trainer_class(trainer_type)
+    except ImportError as e:
+        registered_trainers = list(list_registered_trainers().keys())
+        raise ImportError(
+            f"Failed to load trainer '{trainer_type}'. "
+            f"Available trainers: {registered_trainers}"
+        ) from e
+    if not isinstance(trainer_cls, type) or not issubclass(trainer_cls, BaseTrainer):
+        raise TypeError(
+            f"trainer {trainer_type!r} must resolve to a BaseTrainer subclass, "
+            f"got {trainer_cls!r}"
+        )
+    trainer_cls.validate_training_arguments_contract(config.training_args)
+
     # Resolve DDP find_unused_parameters from the adapter class (opt-in per
     # model). Resolving via the registry imports only the class (no
     # instantiation). This kwarg only affects the DDP backend; FSDP/DeepSpeed
@@ -115,18 +131,6 @@ def load_trainer(config: Arguments) -> BaseTrainer:
 
     # Initialize model adapter
     adapter = load_model(config=config, accelerator=accelerator)
-
-    # Get trainer class from registry
-    trainer_type = config.training_args.trainer_type
-
-    try:
-        trainer_cls = get_trainer_class(trainer_type)
-    except ImportError as e:
-        registered_trainers = list(list_registered_trainers().keys())
-        raise ImportError(
-            f"Failed to load trainer '{trainer_type}'. "
-            f"Available trainers: {registered_trainers}"
-        ) from e
 
     return trainer_cls(
         config=config,

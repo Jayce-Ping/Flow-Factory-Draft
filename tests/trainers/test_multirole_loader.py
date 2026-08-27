@@ -21,8 +21,10 @@ import pytest
 import yaml
 from accelerate.utils import DistributedType
 
+from flow_factory.contracts.execution import ONLINE_EXECUTION_CONTRACT
 from flow_factory.hparams.training_args import TrainingArguments
 from flow_factory.trainers import loader
+from flow_factory.trainers.abc import BaseTrainer
 from flow_factory.trainers.loader import _requires_ddp_unused_parameter_detection
 
 
@@ -36,6 +38,12 @@ class UnusedParameterAdapter:
     """Represent an adapter that explicitly enables unused-parameter detection."""
 
     ddp_find_unused_parameters = True
+
+
+class StubTrainingArguments(SimpleNamespace):
+    """Minimal runtime arguments that still declare algorithm execution semantics."""
+
+    execution_contract = ONLINE_EXECUTION_CONTRACT
 
 
 @dataclass
@@ -53,7 +61,7 @@ def _config(
     return SimpleNamespace(
         mixed_precision="no",
         model_args=SimpleNamespace(model_type="tiny"),
-        training_args=SimpleNamespace(
+        training_args=StubTrainingArguments(
             trainer_type=trainer_type,
             required_trainable_roles=required_trainable_roles,
             gradient_accumulation_steps=1,
@@ -125,7 +133,7 @@ def test_loader_builds_ddp_handler_before_one_accelerator(
         def __init__(self, **kwargs: object) -> None:
             events.append(("accelerator", kwargs["kwargs_handlers"]))
 
-    class FakeTrainer:
+    class FakeTrainer(BaseTrainer):
         def __init__(self, **kwargs: object) -> None:
             self.kwargs = kwargs
 

@@ -19,6 +19,7 @@ import pytest
 import torch
 from accelerate.utils import DistributedType
 
+from flow_factory.hparams import TrainingArguments
 from flow_factory.trainers.abc import (
     configure_deepspeed_micro_batch_size,
     validate_supported_distributed_plan,
@@ -61,15 +62,7 @@ def test_loader_rejects_zero_three_before_loading_model(monkeypatch: pytest.Monk
         mixed_precision="bf16",
         model_args=SimpleNamespace(model_type="test"),
         log_args=SimpleNamespace(save_dir="/tmp", run_name="zero3-rejection-test"),
-        training_args=SimpleNamespace(
-            gradient_accumulation_steps=1,
-            max_grad_norm=1.0,
-            seed=42,
-            # Read before the Accelerator exists, to size DDP's unused-parameter
-            # detection from the algorithm's role count.
-            trainer_type="grpo",
-            required_trainable_roles=None,
-        ),
+        training_args=TrainingArguments(),
     )
     monkeypatch.setattr(loader, "get_model_adapter_class", lambda model_type: Adapter)
     monkeypatch.setattr(loader, "Accelerator", lambda **kwargs: accelerator)
@@ -233,9 +226,7 @@ def test_tdm_r1_fsdp1_disables_incompatible_activation_checkpointing() -> None:
             trainer_type="tdm-r1",
             enable_gradient_checkpointing=True,
         ),
-        adapter=SimpleNamespace(
-            disable_gradient_checkpointing=lambda: disabled.append(True)
-        ),
+        adapter=SimpleNamespace(disable_gradient_checkpointing=lambda: disabled.append(True)),
     )
 
     BaseTrainer._apply_backend_checkpointing_constraints(trainer)

@@ -39,10 +39,11 @@ import torch.distributed as dist
 import torch.nn as nn
 from accelerate import Accelerator
 from accelerate.utils import DistributedType, ProjectConfiguration, set_seed
-from diffusers.utils.outputs import BaseOutput
 from PIL import Image
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+from diffusers.utils.outputs import BaseOutput
 
 from ..acceleration import BaseAccelerator, build_accelerator, validate_accelerator
 from ..advantage import AdvantageProcessor
@@ -130,6 +131,8 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
 
         self.training_args = config.training_args
         self.eval_args = config.eval_args
+
+        self._validate_execution_contract()
 
         self.reward_args = config.reward_args
         self.eval_reward_args = (
@@ -229,6 +232,33 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         ):
             raise TypeError(
                 f"offline trainer {type(self).__name__} must override optimize_batch(batch)"
+            )
+
+    def _validate_execution_contract(self) -> None:
+        """Require trainer runtime and algorithm arguments to declare one execution mode."""
+        type(self).validate_training_arguments_contract(self.training_args)
+
+    @classmethod
+    def validate_training_arguments_contract(cls, training_args: Any) -> None:
+        """Validate one argument class before model or trainer initialization."""
+        trainer_contract = cls.execution_contract
+        arguments_contract = getattr(type(training_args), "execution_contract", None)
+        if not isinstance(trainer_contract, ExecutionContract):
+            raise TypeError(
+                f"trainer {cls.__name__}.execution_contract must be ExecutionContract, "
+                f"got {type(trainer_contract).__name__}: {trainer_contract!r}"
+            )
+        if not isinstance(arguments_contract, ExecutionContract):
+            raise TypeError(
+                f"training arguments {type(training_args).__name__}.execution_contract "
+                f"must be ExecutionContract, got {type(arguments_contract).__name__}: "
+                f"{arguments_contract!r}"
+            )
+        if trainer_contract != arguments_contract:
+            raise ValueError(
+                f"execution contract mismatch for trainer {cls.__name__} and "
+                f"training arguments {type(training_args).__name__}: "
+                f"trainer={trainer_contract!r}, arguments={arguments_contract!r}"
             )
 
     def _initialize_snapshots(self) -> None:
