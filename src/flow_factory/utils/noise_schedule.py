@@ -163,6 +163,44 @@ class TimeSampler:
         return t.unsqueeze(1).expand(num_timesteps, batch_size)
 
     @staticmethod
+    def independent_logit_normal_shifted(
+        batch_size: int,
+        num_timesteps: int,
+        timestep_range: Union[float, Tuple[float, float]],
+        logit_mean: float = 0.0,
+        logit_std: float = 1.0,
+        time_shift: float = 1.0,
+        device: torch.device = torch.device("cpu"),
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        """Draw an independent logit-normal coordinate for every ``(time, sample)``.
+
+        The legacy :meth:`logit_normal_shifted` intentionally draws one coordinate
+        per time row and expands it across the batch. Offline objectives instead
+        require every sample to receive its own Monte Carlo draw while still
+        averaging ``num_timesteps`` loss terms inside one dataloader microstep.
+
+        Returns:
+            Scheduler-scale timesteps with materialized shape
+            ``(num_timesteps, batch_size)``.
+        """
+        _require_positive_int(batch_size, "batch_size")
+        _require_positive_int(num_timesteps, "num_timesteps")
+        output_device = torch.device(device)
+        rng_device = _rng_device(generator, output_device)
+        u_standard = torch.randn(
+            (num_timesteps, batch_size),
+            generator=generator,
+            device=rng_device,
+        )
+        raw = torch.sigmoid(u_standard * logit_std + logit_mean)
+        raw = time_shift * raw / (1 + (time_shift - 1) * raw)
+        raw = torch.clamp(raw, min=0.01, max=1.0 - 1e-6)
+        frac_lo, frac_hi = _normalize_timestep_range(timestep_range)
+        frac = frac_lo + raw * (frac_hi - frac_lo)
+        return (TIMESTEP_MAX * (1.0 - frac)).to(output_device)
+
+    @staticmethod
     def uniform(
         batch_size: int,
         num_timesteps: int,
@@ -189,6 +227,40 @@ class TimeSampler:
             f = time_shift * f / (1 + (time_shift - 1) * f)
         t = TIMESTEP_MAX * (1.0 - f)
         return t.to(device).unsqueeze(1).expand(-1, batch_size)
+
+    @staticmethod
+    def independent_uniform(
+        batch_size: int,
+        num_timesteps: int,
+        timestep_range: Union[float, Tuple[float, float]],
+        time_shift: float = 1.0,
+        device: torch.device = torch.device("cpu"),
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        """Draw an independent uniform coordinate for every ``(time, sample)``.
+
+        Unlike the legacy stratified sampler, this method does not expand one
+        time coordinate across all batch items. It is the explicit offline
+        flow-matching API and leaves online RNG/order semantics unchanged.
+
+        Returns:
+            Scheduler-scale timesteps with materialized shape
+            ``(num_timesteps, batch_size)``.
+        """
+        _require_positive_int(batch_size, "batch_size")
+        _require_positive_int(num_timesteps, "num_timesteps")
+        output_device = torch.device(device)
+        rng_device = _rng_device(generator, output_device)
+        frac_lo, frac_hi = _normalize_timestep_range(timestep_range)
+        f = torch.rand(
+            (num_timesteps, batch_size),
+            generator=generator,
+            device=rng_device,
+        )
+        f = frac_lo + f * (frac_hi - frac_lo)
+        if abs(time_shift - 1.0) > 1e-6:
+            f = time_shift * f / (1 + (time_shift - 1) * f)
+        return (TIMESTEP_MAX * (1.0 - f)).to(output_device)
 
     @staticmethod
     def discrete(
@@ -266,3 +338,13 @@ class TimeSampler:
         lower, upper = boundaries[:-1].long(), boundaries[1:].long()
         rand_u = torch.rand(num_samples, generator=generator, device=rng_device).to(device)
         return lower + (rand_u * (upper - lower)).long()
+
+
+def _require_positive_int(value: object, field_name: str) -> None:
+    """Require a positive exact integer for newly materialized sampler shapes."""
+    if type(value) is not int:
+        raise TypeError(
+            f"expected {field_name} to be int, received {type(value).__name__}: {value!r}"
+        )
+    if value < 1:
+        raise ValueError(f"expected {field_name} >= 1, received {value}")
