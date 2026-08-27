@@ -271,7 +271,7 @@ def test_encoded_output_state_freezes_outer_contexts_without_copying_tensor_leav
         "return_fields",
         "record_ids",
         "target_media",
-        "generator",
+        "clean_state",
     ],
 )
 def test_encoded_output_state_rejects_reserved_forward_context_keys(key: str) -> None:
@@ -315,7 +315,7 @@ def test_validate_encoded_output_state_checks_component_order_batch_and_dtype() 
             device="cpu",
         )
     integer_state = _encoded_image_batch(component=torch.zeros(2, 4, dtype=torch.int64))
-    with pytest.raises(TypeError, match="expected floating"):
+    with pytest.raises(TypeError, match="expected float16, bfloat16, or float32"):
         validate_encoded_output_state(
             integer_state,
             contract=_contract(IMAGE_FORMAT),
@@ -444,7 +444,7 @@ def test_validate_encoded_output_state_checks_signatures_and_uniform_geometry() 
             expected_batch_size=2,
             device="cpu",
         )
-    assert (
+    with pytest.raises(ValueError, match="require active masks"):
         validate_encoded_output_state(
             encoded,
             contract=_contract(IMAGE_FORMAT, batch_capability=BatchCapability.RAGGED),
@@ -452,8 +452,39 @@ def test_validate_encoded_output_state_checks_signatures_and_uniform_geometry() 
             expected_batch_size=2,
             device="cpu",
         )
-        is encoded
+
+    masked = EncodedOutputState(
+        clean_state=LatentState(
+            {"latent": encoded.clean_state.components["latent"]},
+            active_masks={"latent": torch.ones(2, 1, 1, 1, dtype=torch.bool)},
+        ),
+        forward_context=encoded.forward_context,
+        decode_context=encoded.decode_context,
+        geometry_signatures=encoded.geometry_signatures,
     )
+    assert (
+        validate_encoded_output_state(
+            masked,
+            contract=_contract(IMAGE_FORMAT, batch_capability=BatchCapability.RAGGED),
+            expected_component_order=("latent",),
+            expected_batch_size=2,
+            device="cpu",
+        )
+        is masked
+    )
+
+
+def test_validate_encoded_output_state_rejects_float64_components() -> None:
+    encoded = _encoded_image_batch(component=torch.zeros(2, 4, dtype=torch.float64))
+
+    with pytest.raises(TypeError, match="expected float16, bfloat16, or float32"):
+        validate_encoded_output_state(
+            encoded,
+            contract=_contract(IMAGE_FORMAT),
+            expected_component_order=("latent",),
+            expected_batch_size=2,
+            device="cpu",
+        )
 
 
 def test_geometry_signature_must_match_exact_output_types_and_rate_policy() -> None:

@@ -30,6 +30,9 @@ from .output_state import (
     GeometrySignature,
     MediaGeometrySignature,
     OutputStateCodec,
+    validate_codec_required_components,
+    validate_encoded_output_state,
+    validate_output_candidate_batch,
 )
 from .registry import (
     get_model_adapter_class,
@@ -45,6 +48,9 @@ __all__ = [
     "GeometrySignature",
     "MediaGeometrySignature",
     "OutputStateCodec",
+    "validate_codec_required_components",
+    "validate_encoded_output_state",
+    "validate_output_candidate_batch",
     # Latent geometry
     "LatentAxes",
     "LatentLayout",

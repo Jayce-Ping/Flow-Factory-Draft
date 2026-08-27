@@ -138,3 +138,17 @@ def test_online_dispatch_and_offline_binding_share_the_non_model_firewall() -> N
     forwarded = build_forward_state_kwargs(object(), batch, {})
 
     assert tuple(forwarded) == ("prompt_embeds",)
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["generator", "loss_weight", "noise", "schema_version", "timestep"],
+)
+def test_algorithm_vocabulary_does_not_close_the_model_condition_namespace(key: str) -> None:
+    marker = object()
+
+    bound = bind_output_forward_context({key: marker}, {})
+    forwarded = build_forward_state_kwargs(object(), {key: marker}, {})
+
+    assert bound[key] is marker
+    assert forwarded[key] is marker

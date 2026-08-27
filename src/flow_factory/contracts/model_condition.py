@@ -55,40 +55,6 @@ ROLLOUT_STORAGE_KEYS = frozenset(
 
 TRAINER_METADATA_KEYS = frozenset({"advantage"})
 
-ALGORITHM_STATE_KEYS = frozenset(
-    {
-        "_unique_id",
-        "active_masks",
-        "advantages",
-        "applicable_rewards",
-        "callbacks",
-        "clean_state",
-        "component_log_probs",
-        "decode_context",
-        "dt",
-        "forward_context",
-        "generator",
-        "geometry_signature",
-        "geometry_signatures",
-        "loss",
-        "loss_weight",
-        "next_sigma",
-        "next_state_mean",
-        "next_timestep",
-        "noise",
-        "reward",
-        "rewards",
-        "schema_version",
-        "sigma",
-        "state_index_map",
-        "std_dev_t",
-        "supervision",
-        "target_velocity",
-        "timestep",
-        "velocity",
-    }
-)
-
 OFFLINE_PROVENANCE_KEYS = frozenset(
     {
         "__offline_condition_id__",
@@ -118,12 +84,10 @@ NON_MODEL_CONDITION_KEYS = (
     | FORWARD_STATE_OWNED_KEYS
     | ROLLOUT_STORAGE_KEYS
     | TRAINER_METADATA_KEYS
-    | ALGORITHM_STATE_KEYS
     | OFFLINE_PROVENANCE_KEYS
 )
 
 __all__ = [
-    "ALGORITHM_STATE_KEYS",
     "FORWARD_STATE_BOUNDARY_KEYS",
     "FORWARD_STATE_OWNED_KEYS",
     "NON_MODEL_CONDITION_KEYS",

@@ -46,7 +46,15 @@ from ..samples import LatentState
 DecodedMediaBatch = Tuple[Tuple[DecodedMediaLike, ...], ...]
 
 
-OUTPUT_FORWARD_CONTEXT_RESERVED_KEYS = NON_MODEL_CONDITION_KEYS
+OUTPUT_STATE_OWNED_KEYS = frozenset(
+    {
+        "clean_state",
+        "decode_context",
+        "forward_context",
+        "geometry_signatures",
+    }
+)
+OUTPUT_FORWARD_CONTEXT_RESERVED_KEYS = NON_MODEL_CONDITION_KEYS | OUTPUT_STATE_OWNED_KEYS
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,9 +346,10 @@ def validate_encoded_output_state(
                 f"expected clean_state component {name!r} to use batch size "
                 f"{expected_batch_size}, received shape {tuple(component.shape)}"
             )
-        if not component.is_floating_point():
+        if component.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             raise TypeError(
-                f"expected floating clean_state component {name!r}, received {component.dtype}"
+                "expected float16, bfloat16, or float32 clean_state component "
+                f"{name!r}, received {component.dtype}"
             )
         _validate_tensor_runtime(
             component,
@@ -388,12 +397,22 @@ def validate_encoded_output_state(
         )
     for sample_index, signature in enumerate(encoded.geometry_signatures):
         _validate_geometry_signature(signature, contract, sample_index)
-    if contract.batch_capability is BatchCapability.UNIFORM and any(
+    has_different_geometry = any(
         signature != encoded.geometry_signatures[0] for signature in encoded.geometry_signatures[1:]
-    ):
+    )
+    if contract.batch_capability is BatchCapability.UNIFORM and has_different_geometry:
         raise ValueError(
             "uniform pipeline expected identical geometry signatures across the encoded batch, "
             f"received {encoded.geometry_signatures}"
+        )
+    if (
+        contract.batch_capability is BatchCapability.RAGGED
+        and has_different_geometry
+        and clean_state.active_masks is None
+    ):
+        raise ValueError(
+            "ragged encoded batches with different geometry signatures require active masks "
+            "so padded latent elements cannot contribute to the objective"
         )
     if contract.batch_capability is BatchCapability.SINGLE_SAMPLE and expected_batch_size != 1:
         raise ValueError(
@@ -669,6 +688,7 @@ __all__ = [
     "GeometrySignature",
     "MediaGeometrySignature",
     "OUTPUT_FORWARD_CONTEXT_RESERVED_KEYS",
+    "OUTPUT_STATE_OWNED_KEYS",
     "OutputStateCodec",
     "validate_codec_required_components",
     "validate_encoded_output_state",
