@@ -12,85 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Execution contracts and progress counters shared by online and offline trainers."""
+"""Runtime drivers and progress counters for online and offline trainers.
+
+Pure execution declarations live in :mod:`flow_factory.contracts.execution` so
+configuration code can select semantics without importing the trainer package.
+They are re-exported here to preserve the existing public import path.
+"""
 
 from dataclasses import dataclass, replace
-from enum import Enum
 from typing import Any, Protocol
 
 from torch.utils.data import DataLoader, DistributedSampler
 
-
-class AcquisitionMode(str, Enum):
-    """Describe how a trainer acquires optimization examples."""
-
-    ROLLOUT = "rollout"
-    DATASET = "dataset"
-
-
-class CycleUnit(str, Enum):
-    """Describe the unit that bounds one outer training cycle."""
-
-    ROLLOUT_ITERATION = "rollout_iteration"
-    DATA_EPOCH = "data_epoch"
-
-
-class FeedbackMode(str, Enum):
-    """Describe whether execution requires reward feedback."""
-
-    REWARD = "reward"
-    NONE = "none"
-
-
-class LoaderKind(str, Enum):
-    """Distinguish custom rollout samplers from PyTorch distributed epoch loading."""
-
-    GROUPED_ROLLOUT = "grouped_rollout"
-    DISTRIBUTED_EPOCH = "distributed_epoch"
-
-
-@dataclass(frozen=True)
-class ExecutionContract:
-    """Declare the data acquisition and cycle semantics of a trainer."""
-
-    acquisition: AcquisitionMode
-    cycle_unit: CycleUnit
-    feedback: FeedbackMode
-    loader_kind: LoaderKind
-
-    def __post_init__(self) -> None:
-        """Validate field types and coherent execution semantics."""
-        _require_enum(self.acquisition, AcquisitionMode, "acquisition")
-        _require_enum(self.cycle_unit, CycleUnit, "cycle_unit")
-        _require_enum(self.feedback, FeedbackMode, "feedback")
-        _require_enum(self.loader_kind, LoaderKind, "loader_kind")
-
-        expected_cycle_unit, expected_loader_kind = {
-            AcquisitionMode.ROLLOUT: (
-                CycleUnit.ROLLOUT_ITERATION,
-                LoaderKind.GROUPED_ROLLOUT,
-            ),
-            AcquisitionMode.DATASET: (
-                CycleUnit.DATA_EPOCH,
-                LoaderKind.DISTRIBUTED_EPOCH,
-            ),
-        }[self.acquisition]
-        if (
-            self.cycle_unit is not expected_cycle_unit
-            or self.loader_kind is not expected_loader_kind
-        ):
-            raise ValueError(
-                f"expected acquisition={self.acquisition.value!r} to use "
-                f"cycle_unit={expected_cycle_unit.value!r} and "
-                f"loader_kind={expected_loader_kind.value!r}, received "
-                f"cycle_unit={self.cycle_unit.value!r} and "
-                f"loader_kind={self.loader_kind.value!r}"
-            )
-        if self.acquisition is AcquisitionMode.DATASET and self.feedback is FeedbackMode.REWARD:
-            raise ValueError(
-                "dataset acquisition does not support runtime reward feedback; offline SFT and "
-                "preference training must consume supervision from each dataset batch"
-            )
+from ..contracts.execution import (
+    OFFLINE_EXECUTION_CONTRACT,
+    ONLINE_EXECUTION_CONTRACT,
+    ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT,
+    AcquisitionMode,
+    CycleUnit,
+    ExecutionContract,
+    FeedbackMode,
+    LoaderKind,
+)
 
 
 @dataclass(frozen=True)
@@ -116,7 +59,7 @@ class TrainingProgress:
         Returns:
             Number of completed cycles for the requested unit.
         """
-        _require_enum(cycle_unit, CycleUnit, "cycle_unit")
+        _require_cycle_unit(cycle_unit, "cycle_unit")
         if cycle_unit is CycleUnit.ROLLOUT_ITERATION:
             return self.rollout_iteration
         return self.data_epoch
@@ -135,7 +78,7 @@ class TrainingProgress:
             RuntimeError: If the cycle did not complete. An offline data epoch is complete only
                 after its finite dataloader is exhausted.
         """
-        _require_enum(cycle_unit, CycleUnit, "cycle_unit")
+        _require_cycle_unit(cycle_unit, "cycle_unit")
         if type(completed) is not bool:
             raise TypeError(
                 f"expected completed to be bool, received {type(completed).__name__}: {completed!r}"
@@ -338,12 +281,11 @@ def build_execution_driver(contract: ExecutionContract) -> ExecutionDriver:
     )
 
 
-def _require_enum(value: object, enum_type: type[Enum], field_name: str) -> None:
+def _require_cycle_unit(value: object, field_name: str) -> None:
     """Require one exact enum member for an execution-contract field."""
-    if not isinstance(value, enum_type):
+    if not isinstance(value, CycleUnit):
         raise TypeError(
-            f"expected {field_name} to be {enum_type.__name__}, received "
-            f"{type(value).__name__}: {value!r}"
+            f"expected {field_name} to be CycleUnit, received " f"{type(value).__name__}: {value!r}"
         )
 
 
@@ -395,28 +337,6 @@ def _require_progress(progress: object) -> None:
             f"expected progress to be TrainingProgress, received "
             f"{type(progress).__name__}: {progress!r}"
         )
-
-
-ONLINE_EXECUTION_CONTRACT = ExecutionContract(
-    acquisition=AcquisitionMode.ROLLOUT,
-    cycle_unit=CycleUnit.ROLLOUT_ITERATION,
-    feedback=FeedbackMode.REWARD,
-    loader_kind=LoaderKind.GROUPED_ROLLOUT,
-)
-
-ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT = ExecutionContract(
-    acquisition=AcquisitionMode.ROLLOUT,
-    cycle_unit=CycleUnit.ROLLOUT_ITERATION,
-    feedback=FeedbackMode.NONE,
-    loader_kind=LoaderKind.GROUPED_ROLLOUT,
-)
-
-OFFLINE_EXECUTION_CONTRACT = ExecutionContract(
-    acquisition=AcquisitionMode.DATASET,
-    cycle_unit=CycleUnit.DATA_EPOCH,
-    feedback=FeedbackMode.NONE,
-    loader_kind=LoaderKind.DISTRIBUTED_EPOCH,
-)
 
 
 __all__ = [
