@@ -107,6 +107,7 @@ def _create_or_load_dataset(
         preprocess_func=kwargs.get("preprocess_func"),
         preprocess_kwargs=kwargs.get("preprocess_kwargs"),
         extra_hash_strs=kwargs.get("extra_hash_strs", []),
+        source_hash_override=kwargs.get("source_hash_override"),
     )
 
     if os.path.exists(merged_cache_path) and not base_kwargs.get("force_reprocess", False):

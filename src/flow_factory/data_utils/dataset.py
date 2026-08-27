@@ -21,7 +21,7 @@ import math
 import os
 import shutil
 from dataclasses import asdict
-from typing import Any, Callable, Dict, List, Optional, Protocol, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Union
 
 import imageio.v3 as iio
 import numpy as np
@@ -34,7 +34,7 @@ from datasets.utils.logging import disable_progress_bar
 from PIL import Image
 from torch.utils.data import Dataset
 
-from ..samples.references import canonicalize_reference_manifest
+from ..samples.references import canonicalize_reference_manifest, parse_reference_manifest
 from ..utils.audio import load_audio
 from ..utils.base import (
     filter_kwargs,
@@ -149,6 +149,9 @@ class GeneralDataset(Dataset):
         video_dir: Optional[str] = None,
         audio_dir: Optional[str] = None,
         target_arrow_path: Optional[str] = None,
+        raw_dataset: Optional[HFDataset] = None,
+        source_hash_override: Optional[str] = None,
+        passthrough_columns: Optional[Sequence[str]] = None,
         **kwargs,
     ):
         """
@@ -183,6 +186,17 @@ class GeneralDataset(Dataset):
                 the main rank can metadata-merge them without re-serialization.
                 When ``None``, HF falls back to its default cache path under
                 ``~/.cache/huggingface/datasets`` (single-process / legacy).
+            raw_dataset: Optional in-memory HuggingFace dataset. When provided,
+                file discovery is skipped and ``source_hash_override`` is required.
+                This is intended for narrow projections such as offline input-only
+                condition caches, not for passing a complete source manifest.
+            source_hash_override: Stable source-content identity used in place of
+                hashing ``{dataset_dir}/{split}.jsonl`` or ``.txt``. Required with
+                ``raw_dataset`` so unrelated in-memory datasets cannot share a cache.
+            passthrough_columns: Raw columns that must survive preprocessing at the
+                top level unchanged. They are never forwarded to ``preprocess_func``
+                or copied into ``metadata``. A preprocess result using one of these
+                names is rejected as a collision.
             **kwargs: Additional arguments (ignored)
 
         Note:
@@ -203,37 +217,58 @@ class GeneralDataset(Dataset):
         self.video_dir = video_dir
         self.audio_dir = audio_dir
         self._uses_ordered_references = _supports_ordered_references(preprocess_func)
+        self._source_hash_override = _validate_source_hash_override(source_hash_override)
+        self._passthrough_columns = _normalize_passthrough_columns(passthrough_columns)
 
         if self.shard_index is not None and self.shard_index > 0:
             disable_progress_bar()
 
-        raw_dataset = self._load_raw_dataset()
+        if raw_dataset is None:
+            loaded_raw_dataset = self._load_raw_dataset()
+        else:
+            if not isinstance(raw_dataset, HFDataset):
+                raise TypeError(
+                    "raw_dataset must be a datasets.Dataset, " f"got {type(raw_dataset).__name__}"
+                )
+            if self._source_hash_override is None:
+                raise ValueError("source_hash_override is required when raw_dataset is provided")
+            loaded_raw_dataset = raw_dataset
 
-        if max_dataset_size is not None and len(raw_dataset) > max_dataset_size:
-            raw_dataset = raw_dataset.select(range(max_dataset_size))
+        missing_passthrough_columns = set(self._passthrough_columns) - set(
+            loaded_raw_dataset.column_names
+        )
+        if missing_passthrough_columns:
+            raise ValueError(
+                "passthrough columns are missing from the raw dataset: "
+                f"{sorted(missing_passthrough_columns)!r}"
+            )
+
+        if max_dataset_size is not None and len(loaded_raw_dataset) > max_dataset_size:
+            loaded_raw_dataset = loaded_raw_dataset.select(range(max_dataset_size))
             logger.info(f"Dataset size limited to {max_dataset_size} samples.")
 
         self._ordered_reference_source_hash = ""
         if self._uses_ordered_references:
-            if "references" not in raw_dataset.column_names:
+            if "references" not in loaded_raw_dataset.column_names:
                 raise ValueError(
                     "ordered-reference preprocessing requires a references column, "
-                    f"got columns={raw_dataset.column_names!r} in {self.data_root!r}"
+                    f"got columns={loaded_raw_dataset.column_names!r} in {self.data_root!r}"
                 )
             canonical_manifests = [
-                canonicalize_reference_manifest(references, row_index=row_index)
-                for row_index, references in enumerate(raw_dataset["references"])
+                _canonicalize_ordered_reference_value(references, row_index=row_index)
+                for row_index, references in enumerate(loaded_raw_dataset["references"])
             ]
             self._ordered_reference_source_hash = hashlib.sha256(
                 "\n".join(canonical_manifests).encode("utf-8")
             ).hexdigest()
-            extra_hash_strs = list(extra_hash_strs or []) + [
-                self._ordered_reference_source_hash
-            ]
+            if self._source_hash_override is None:
+                extra_hash_strs = list(extra_hash_strs or []) + [
+                    self._ordered_reference_source_hash
+                ]
 
         if enable_preprocess:
             self.processed_dataset = self._preprocess_dataset(
-                raw_dataset=raw_dataset,
+                raw_dataset=loaded_raw_dataset,
                 preprocess_func=preprocess_func,
                 preprocess_kwargs=preprocess_kwargs or {},
                 preprocessing_batch_size=preprocessing_batch_size,
@@ -241,9 +276,10 @@ class GeneralDataset(Dataset):
                 max_dataset_size=max_dataset_size,
                 extra_hash_strs=extra_hash_strs,
                 target_arrow_path=target_arrow_path,
+                source_hash_override=self._source_hash_override,
             )
         else:
-            self.processed_dataset = raw_dataset
+            self.processed_dataset = loaded_raw_dataset
             self.merged_cache_path = None
 
     def _load_raw_dataset(self) -> HFDataset:
@@ -285,6 +321,7 @@ class GeneralDataset(Dataset):
         max_dataset_size: Optional[int],
         extra_hash_strs: Optional[List[str]] = None,
         target_arrow_path: Optional[str] = None,
+        source_hash_override: Optional[str] = None,
     ) -> HFDataset:
         """Apply preprocessing to raw dataset with caching.
 
@@ -308,6 +345,7 @@ class GeneralDataset(Dataset):
             preprocess_func=preprocess_func,
             preprocess_kwargs=preprocess_kwargs,
             extra_hash_strs=extra_hash_strs,
+            source_hash_override=source_hash_override,
         )
 
         if self.num_shards and self.num_shards > 1:
@@ -333,7 +371,7 @@ class GeneralDataset(Dataset):
 
         os.makedirs(self.cache_dir, exist_ok=True)
         if target_arrow_path is not None:
-            os.makedirs(os.path.dirname(target_arrow_path), exist_ok=True)
+            os.makedirs(os.path.dirname(os.path.abspath(target_arrow_path)), exist_ok=True)
 
         processed_dataset = raw_dataset.map(
             self._preprocess_batch,
@@ -432,6 +470,7 @@ class GeneralDataset(Dataset):
         # The columns that are used in preprocess and maintained in the final results.
         PREPROCESS_COLUMNS = ("prompt", "negative_prompt", "images", "videos", "audios")
         metadata_excluded_columns = set(PREPROCESS_COLUMNS)
+        metadata_excluded_columns.update(self._passthrough_columns)
         if self._uses_ordered_references:
             metadata_excluded_columns.update({"references", "reference_manifest"})
 
@@ -492,8 +531,7 @@ class GeneralDataset(Dataset):
                         video_paths = [video_paths]
 
                     videos = [
-                        load_video_frames(_resolve_path(video_dir, video_path))
-                        for video_path in video_paths
+                        _load_grouped_video(video_dir, video_spec) for video_spec in video_paths
                     ]
                     video_pts = [pil_image_to_tensor(video) for video in videos]
                     video_args["videos"].append(videos)
@@ -519,8 +557,7 @@ class GeneralDataset(Dataset):
                     if isinstance(audio_paths, str):
                         audio_paths = [audio_paths]
                     audios = [
-                        load_audio(_resolve_path(audio_dir, audio_path))
-                        for audio_path in audio_paths
+                        _load_grouped_audio(audio_dir, audio_spec) for audio_spec in audio_paths
                     ]
                     # Always store as List[Tensor] (no single-audio unwrap) so
                     # downstream encode_audio sees a uniform type within the batch.
@@ -534,7 +571,10 @@ class GeneralDataset(Dataset):
             canonical_manifests = []
             for row_offset, references in enumerate(raw_references):
                 row_index = indices[row_offset]
-                manifest = canonicalize_reference_manifest(references, row_index=row_index)
+                manifest = _canonicalize_ordered_reference_value(
+                    references,
+                    row_index=row_index,
+                )
                 canonical_manifests.append(manifest)
                 loaded_reference_batch.append(
                     [
@@ -561,6 +601,12 @@ class GeneralDataset(Dataset):
         }
         filtered_args = filter_kwargs(self._preprocess_func, **input_args)
         preprocess_res = self._preprocess_func(**filtered_args)
+        passthrough_collisions = set(preprocess_res) & set(self._passthrough_columns)
+        if passthrough_collisions:
+            raise ValueError(
+                "preprocess result collides with passthrough columns: "
+                f"{sorted(passthrough_collisions)!r}"
+            )
 
         # 6. Process results - move tensors to CPU for caching.
         # Image-valued adapter outputs (declared via `python_format_columns`)
@@ -606,11 +652,7 @@ class GeneralDataset(Dataset):
         # Complex values (nested lists/dicts) in the source JSONL must already be
         # stored as JSON strings for Arrow compatibility.
         batch_dict[METADATA_COLUMN] = [
-            {
-                k: v[idx]
-                for k, v in batch.items()
-                if k not in metadata_excluded_columns
-            }
+            {k: v[idx] for k, v in batch.items() if k not in metadata_excluded_columns}
             for idx in range(len(batch["prompt"]))
         ]
 
@@ -646,6 +688,7 @@ class GeneralDataset(Dataset):
         preprocess_func: Optional[Callable],
         preprocess_kwargs: Optional[Dict[str, Any]],
         extra_hash_strs: Optional[List[str]] = None,
+        source_hash_override: Optional[str] = None,
         digits: int = 32,
     ) -> str:
         """Compute merged cache path by hashing all components.
@@ -670,19 +713,26 @@ class GeneralDataset(Dataset):
         """
         dataset_root = os.path.abspath(os.path.expanduser(dataset_dir))
         dataset_name = os.path.basename(dataset_root)
-        source_candidates = (
-            os.path.join(dataset_root, f"{split}.jsonl"),
-            os.path.join(dataset_root, f"{split}.txt"),
-        )
-        source_path = next((path for path in source_candidates if os.path.isfile(path)), None)
-        if source_path is None:
-            source_hash = "missing"
+        validated_source_hash_override = _validate_source_hash_override(source_hash_override)
+        if validated_source_hash_override is not None:
+            source_hash = validated_source_hash_override
         else:
-            hasher = hashlib.sha256()
-            with open(source_path, "rb") as source_file:
-                for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
-                    hasher.update(chunk)
-            source_hash = hasher.hexdigest()
+            source_candidates = (
+                os.path.join(dataset_root, f"{split}.jsonl"),
+                os.path.join(dataset_root, f"{split}.txt"),
+            )
+            source_path = next(
+                (path for path in source_candidates if os.path.isfile(path)),
+                None,
+            )
+            if source_path is None:
+                source_hash = "missing"
+            else:
+                hasher = hashlib.sha256()
+                with open(source_path, "rb") as source_file:
+                    for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
+                        hasher.update(chunk)
+                source_hash = hasher.hexdigest()
         cutoff_str = str(max_dataset_size) if max_dataset_size else "full"
         funcs_hash = _compute_encode_funcs_hash(preprocess_func, digits=16)
         hashable_kwargs = _select_cache_relevant_kwargs(preprocess_func, preprocess_kwargs)
@@ -921,6 +971,41 @@ class GeneralDataset(Dataset):
 # ========================================================================================
 
 
+def _validate_source_hash_override(value: Optional[str]) -> Optional[str]:
+    """Validate an optional caller-owned source-content identity."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(
+            "source_hash_override must be a non-empty string or None, "
+            f"got {type(value).__name__}"
+        )
+    if not value.strip():
+        raise ValueError("source_hash_override must be a non-empty string")
+    return value
+
+
+def _normalize_passthrough_columns(columns: Optional[Sequence[str]]) -> tuple[str, ...]:
+    """Return validated passthrough column names in caller-declared order."""
+    if columns is None:
+        return ()
+    if isinstance(columns, (str, bytes)):
+        raise TypeError("passthrough_columns must be a sequence of column names, not a string")
+    normalized = tuple(columns)
+    for column in normalized:
+        if not isinstance(column, str) or not column:
+            raise ValueError(
+                "passthrough column names must be non-empty strings, " f"got {column!r}"
+            )
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"passthrough_columns contains duplicates: {normalized!r}")
+    if METADATA_COLUMN in normalized:
+        raise ValueError(
+            f"{METADATA_COLUMN!r} is owned by GeneralDataset and cannot be a " "passthrough column"
+        )
+    return normalized
+
+
 def _supports_ordered_references(preprocess_func: Optional[Callable]) -> bool:
     """Return whether a bound preprocessor explicitly opts into ordered references."""
     if preprocess_func is None:
@@ -930,6 +1015,74 @@ def _supports_ordered_references(preprocess_func: Optional[Callable]) -> bool:
         getattr(preprocess_func, "supports_ordered_references", False)
         or getattr(owner, "supports_ordered_references", False)
     )
+
+
+def _canonicalize_ordered_reference_value(value: Any, row_index: int) -> str:
+    """Canonicalize either a legacy reference list or an opaque Arrow string."""
+    if isinstance(value, str):
+        references = parse_reference_manifest(value, row_index=row_index)
+    else:
+        references = value
+    return canonicalize_reference_manifest(references, row_index=row_index)
+
+
+def _load_grouped_video(base_dir: str, spec: Any) -> List[Image.Image]:
+    """Decode one grouped video path, honoring an optional FPS override."""
+    path, fps = _parse_grouped_media_spec(
+        spec,
+        media_type="video",
+        rate_name="fps",
+    )
+    return load_video_frames(_resolve_path(base_dir, path), fps=fps)
+
+
+def _load_grouped_audio(base_dir: str, spec: Any) -> torch.Tensor:
+    """Decode one grouped audio path, honoring an optional sample-rate override."""
+    path, sample_rate = _parse_grouped_media_spec(
+        spec,
+        media_type="audio",
+        rate_name="sample_rate",
+    )
+    if sample_rate is not None and not isinstance(sample_rate, int):
+        raise TypeError(
+            "grouped audio entry requires an integer sample_rate, " f"got {sample_rate!r}"
+        )
+    return load_audio(_resolve_path(base_dir, path), sample_rate=sample_rate)
+
+
+def _parse_grouped_media_spec(
+    spec: Any,
+    *,
+    media_type: str,
+    rate_name: str,
+) -> tuple[str, Optional[Union[int, float]]]:
+    """Normalize a legacy path string or a V2 projected path/rate mapping."""
+    if isinstance(spec, str):
+        return spec, None
+    if not isinstance(spec, Mapping):
+        raise TypeError(
+            f"expected grouped {media_type} entry to be a path string or mapping, "
+            f"got {type(spec).__name__}: {spec!r}"
+        )
+    unknown_keys = set(spec) - {"path", rate_name}
+    if unknown_keys:
+        raise ValueError(f"grouped {media_type} entry has unknown keys: {sorted(unknown_keys)!r}")
+    path = spec.get("path")
+    if not isinstance(path, str) or not path:
+        raise ValueError(
+            f"grouped {media_type} entry requires a non-empty path string, got {path!r}"
+        )
+    rate = spec.get(rate_name)
+    if rate is not None and (
+        isinstance(rate, bool)
+        or not isinstance(rate, (int, float))
+        or not math.isfinite(rate)
+        or rate <= 0
+    ):
+        raise ValueError(
+            f"grouped {media_type} entry requires finite positive {rate_name}, got {rate!r}"
+        )
+    return path, rate
 
 
 def _load_ordered_reference(
@@ -1006,8 +1159,7 @@ def _load_ordered_reference(
             loaded["sample_rate"] = effective_sample_rate
         else:
             raise ValueError(
-                "expected ordered reference kind in ('image', 'video', 'audio'), "
-                f"got {kind!r}"
+                "expected ordered reference kind in ('image', 'video', 'audio'), " f"got {kind!r}"
             )
     except (FileNotFoundError, ImportError, OSError, RuntimeError, ValueError) as error:
         raise ValueError(
@@ -1056,19 +1208,14 @@ def _decode_ordered_video(
         if not container.streams.video:
             raise ValueError(f"expected a video stream in {video_path!r}, got none")
         video_stream = container.streams.video[0]
-        frames = [
-            frame.to_ndarray(format="rgb24")
-            for frame in container.decode(video_stream)
-        ]
+        frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(video_stream)]
         reported_frame_rate = video_stream.average_rate or video_stream.guessed_rate
         frame_rate = None if reported_frame_rate is None else float(reported_frame_rate)
         audio = None
         sample_rate = None
         if container.streams.audio:
             container.seek(0)
-            audio, sample_rate = _decode_av_audio_stream(
-                container, container.streams.audio[0]
-            )
+            audio, sample_rate = _decode_av_audio_stream(container, container.streams.audio[0])
     if not frames:
         raise ValueError(f"expected video frames in {video_path!r}, decoded none")
     return np.stack(frames), frame_rate, audio, sample_rate
@@ -1096,12 +1243,10 @@ def _decode_av_audio_stream(container: Any, stream: Any) -> tuple[torch.Tensor, 
     chunks = []
     for frame in container.decode(stream):
         chunks.extend(
-            torch.from_numpy(resampled.to_ndarray())
-            for resampled in resampler.resample(frame)
+            torch.from_numpy(resampled.to_ndarray()) for resampled in resampler.resample(frame)
         )
     chunks.extend(
-        torch.from_numpy(resampled.to_ndarray())
-        for resampled in resampler.resample(None)
+        torch.from_numpy(resampled.to_ndarray()) for resampled in resampler.resample(None)
     )
     if not chunks:
         raise ValueError("expected decoded audio samples, got none")
@@ -1220,7 +1365,7 @@ def _resolve_path(base_dir: str, path: str) -> str:
     return path if os.path.isabs(path) else os.path.join(base_dir, path)
 
 
-def load_video_frames(video_path: str, fps: Optional[int] = None) -> List[Image.Image]:
+def load_video_frames(video_path: str, fps: Optional[float] = None) -> List[Image.Image]:
     """
     Load video frames using imageio (diffusers standard).
 
