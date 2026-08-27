@@ -31,7 +31,7 @@ from flow_factory.models.minimax_h3 import (
     unpack_video_latents,
     validate_target_state,
 )
-from flow_factory.samples import LatentState
+from flow_factory.samples import ComponentTimes, LatentState
 from flow_factory.scheduler import SDESchedulerOutput
 
 ORACLE_COMMIT = "huggingface/diffusers@f53d552036a0d1bd5570782a39cd40cfabf112bc"
@@ -100,8 +100,31 @@ def test_forward_noising_uses_video_audio_draw_order_and_data_ward_sign() -> Non
         clean = state.components[name]
         sigma = times.sigma[name].reshape(1, 1, 1)
         assert torch.equal(result.noise.components[name], expected_noise)
-        assert torch.equal(result.state.components[name], (1 - sigma) * clean + sigma * expected_noise)
+        assert torch.equal(
+            result.state.components[name], (1 - sigma) * clean + sigma * expected_noise
+        )
         assert torch.equal(result.target_velocity.components[name], clean - expected_noise)
+
+
+def test_forward_noising_accepts_one_ulp_timestep_sigma_rounding() -> None:
+    """Equivalent float32 time coordinates may differ after the 1000x scale change."""
+    state = _state(batch_size=1)
+    timestep = torch.tensor([990.4219970703125], dtype=torch.float32)
+    sigma = torch.tensor([0.9904220700263977], dtype=torch.float32)
+    times = ComponentTimes(
+        timestep={"video": timestep, "audio": timestep.clone()},
+        next_timestep={"video": torch.zeros_like(timestep), "audio": torch.zeros_like(timestep)},
+        sigma={"video": sigma, "audio": sigma.clone()},
+        next_sigma={"video": torch.zeros_like(sigma), "audio": torch.zeros_like(sigma)},
+    )
+
+    result = draw_forward_process_noise(
+        state,
+        times,
+        generator=torch.Generator().manual_seed(9),
+    )
+
+    assert result.state.component_names == MINIMAX_H3_COMPONENT_ORDER
 
 
 def test_video_pack_unpack_exact_round_trip_and_geometry_validation() -> None:

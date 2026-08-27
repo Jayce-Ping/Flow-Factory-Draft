@@ -243,6 +243,19 @@ def test_explicit_coordinates_reject_nonfinite_values(kwargs: dict[str, float], 
         )
 
 
+@pytest.mark.parametrize("timestep", [-1.0, 1001.0])
+def test_explicit_timesteps_reject_out_of_range_values(timestep: float) -> None:
+    scheduler = MiniMaxH3SDEScheduler(dynamics_type="ODE")
+
+    with pytest.raises(ValueError, match=r"t_scheduler.*\[0, 1000\]"):
+        scheduler.step(
+            torch.ones(1, 1),
+            timestep,
+            torch.zeros(1, 1),
+            timestep_next=900.0,
+        )
+
+
 @pytest.mark.parametrize("dynamics_type", ["Flow-SDE", "Dance-SDE", "CPS"])
 def test_sde_formula_oracle_is_independent_and_complete(dynamics_type: str) -> None:
     noise_level = 0.35

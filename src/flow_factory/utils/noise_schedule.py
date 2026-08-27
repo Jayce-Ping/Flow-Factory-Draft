@@ -46,7 +46,32 @@ TIMESTEP_MAX = 1000.0
 
 
 def flow_match_sigma(t_scheduler: torch.Tensor) -> torch.Tensor:
-    """Map scheduler timestep in [0, TIMESTEP_MAX] to σ in [0, 1] for x_t = (1-σ)x0 + σ ε."""
+    """Map a valid scheduler timestep to flow-matching sigma.
+
+    Args:
+        t_scheduler: Scheduler-scale tensor in ``[0, TIMESTEP_MAX]``.
+
+    Returns:
+        Sigma in ``[0, 1]`` with the caller's floating dtype, or the default
+        floating dtype for integer inputs.
+
+    Raises:
+        TypeError: If ``t_scheduler`` is not a tensor.
+        ValueError: If any timestep is non-finite or outside the public range.
+    """
+    if not isinstance(t_scheduler, torch.Tensor):
+        raise TypeError(
+            "expected torch.Tensor t_scheduler, received "
+            f"{type(t_scheduler).__name__}: {t_scheduler!r}"
+        )
+    if (
+        not bool(torch.isfinite(t_scheduler).all())
+        or bool((t_scheduler < 0).any())
+        or bool((t_scheduler > TIMESTEP_MAX).any())
+    ):
+        raise ValueError(
+            f"expected t_scheduler in [0, {TIMESTEP_MAX:g}], received " f"{t_scheduler.tolist()}"
+        )
     output_dtype = (
         t_scheduler.dtype if t_scheduler.is_floating_point() else torch.get_default_dtype()
     )
@@ -55,6 +80,76 @@ def flow_match_sigma(t_scheduler: torch.Tensor) -> torch.Tensor:
     # float64, then restore the caller's dtype so strict open intervals remain
     # strict and CPU/GPU produce the same result.
     return (t_scheduler.to(torch.float64) / TIMESTEP_MAX).clamp(0.0, 1.0).to(output_dtype)
+
+
+def flow_match_coordinates_close(
+    t_scheduler: torch.Tensor,
+    sigma: torch.Tensor,
+) -> bool:
+    """Return whether redundant flow-matching coordinates agree within one ULP.
+
+    ``t_scheduler`` and ``sigma`` may be rounded independently when one is
+    materialized as ``sigma * TIMESTEP_MAX``. Comparing in sigma space with the
+    larger native unit in the last place (ULP) accepts that representation noise
+    without hiding a semantic schedule mismatch.
+
+    Args:
+        t_scheduler: Scheduler-scale timesteps in ``[0, TIMESTEP_MAX]``.
+        sigma: Flow-matching sigma coordinates in ``[0, 1]``.
+
+    Returns:
+        ``True`` when every coordinate pair differs by at most one native ULP.
+
+    Raises:
+        TypeError: If either coordinate is not a floating tensor.
+        ValueError: If the coordinates have different shapes or devices.
+    """
+    for field, values in (("t_scheduler", t_scheduler), ("sigma", sigma)):
+        if not isinstance(values, torch.Tensor) or not values.is_floating_point():
+            raise TypeError(
+                f"expected floating torch.Tensor {field}, received "
+                f"{type(values).__name__}/{getattr(values, 'dtype', None)}"
+            )
+    if t_scheduler.shape != sigma.shape:
+        raise ValueError(
+            "expected flow-matching coordinate shapes to match, received "
+            f"t_scheduler={tuple(t_scheduler.shape)} and sigma={tuple(sigma.shape)}"
+        )
+    if t_scheduler.device != sigma.device:
+        raise ValueError(
+            "expected flow-matching coordinate devices to match, received "
+            f"t_scheduler={t_scheduler.device} and sigma={sigma.device}"
+        )
+    if not bool(torch.isfinite(t_scheduler).all()) or not bool(torch.isfinite(sigma).all()):
+        return False
+    if (
+        bool((t_scheduler < 0).any())
+        or bool((t_scheduler > TIMESTEP_MAX).any())
+        or bool((sigma < 0).any())
+        or bool((sigma > 1).any())
+    ):
+        return False
+
+    expected_sigma = flow_match_sigma(t_scheduler)
+    expected_float64 = expected_sigma.to(torch.float64)
+    sigma_float64 = sigma.to(torch.float64)
+    sigma_is_higher = sigma_float64 >= expected_float64
+    expected_ulp = _native_ulp_toward(expected_sigma, higher=sigma_is_higher)
+    sigma_ulp = _native_ulp_toward(sigma, higher=~sigma_is_higher)
+    difference = (expected_float64 - sigma_float64).abs()
+    return bool((difference <= torch.maximum(expected_ulp, sigma_ulp)).all())
+
+
+def _native_ulp_toward(values: torch.Tensor, *, higher: torch.Tensor) -> torch.Tensor:
+    """Return the adjacent representable spacing in the requested direction."""
+    direction = torch.where(
+        higher,
+        torch.full_like(values, float("inf")),
+        torch.full_like(values, -float("inf")),
+    )
+    values_float64 = values.to(torch.float64)
+    adjacent = torch.nextafter(values, direction).to(torch.float64)
+    return (adjacent - values_float64).abs()
 
 
 def fraction_range_to_t_bounds(frac_lo: float, frac_hi: float) -> Tuple[float, float]:
