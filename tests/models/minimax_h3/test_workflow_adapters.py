@@ -133,7 +133,14 @@ class WorkflowPipelineFake:
         return deepcopy({**self.pretrained_specs, **self.config_specs}[name])
 
     @classmethod
-    def from_pretrained(cls, model_name_or_path: str, *, workflow: str) -> "WorkflowPipelineFake":
+    def from_pretrained(
+        cls,
+        model_name_or_path: str,
+        *,
+        blocks: Any,
+        workflow: str,
+    ) -> "WorkflowPipelineFake":
+        assert blocks is not None
         cls.calls.append((model_name_or_path, workflow))
         return cls(workflow)
 
@@ -191,8 +198,9 @@ def test_local_workflow_rebinds_pretrained_component_specs(
             self._component_specs = self.specs
 
         @classmethod
-        def from_pretrained(cls, path: str, *, workflow: str):
+        def from_pretrained(cls, path: str, *, blocks: Any, workflow: str):
             assert path == str(tmp_path)
+            assert blocks is not None
             assert workflow == "t2va"
             return cls()
 
@@ -201,7 +209,10 @@ def test_local_workflow_rebinds_pretrained_component_specs(
 
     monkeypatch.setattr(
         "flow_factory.models.minimax_h3.workflow.require_minimax_h3_support",
-        lambda: SimpleNamespace(MiniMaxH3ModularPipeline=LocalPipeline),
+        lambda: SimpleNamespace(
+            MiniMaxH3ModularPipeline=LocalPipeline,
+            MiniMaxH3Blocks=lambda: object(),
+        ),
     )
 
     pipeline = load_h3_workflow_pipeline(
@@ -252,7 +263,10 @@ def _fake_dependency(monkeypatch: pytest.MonkeyPatch) -> None:
     TransformerFake.loaded_paths.clear()
     monkeypatch.setattr(
         "flow_factory.models.minimax_h3.workflow.require_minimax_h3_support",
-        lambda: SimpleNamespace(MiniMaxH3ModularPipeline=WorkflowPipelineFake),
+        lambda: SimpleNamespace(
+            MiniMaxH3ModularPipeline=WorkflowPipelineFake,
+            MiniMaxH3Blocks=lambda: object(),
+        ),
     )
 
 

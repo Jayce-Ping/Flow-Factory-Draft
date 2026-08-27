@@ -88,6 +88,7 @@ def load_h3_workflow_pipeline(
     symbols = require_minimax_h3_support()
     pipeline = symbols.MiniMaxH3ModularPipeline.from_pretrained(
         model_name_or_path,
+        blocks=symbols.MiniMaxH3Blocks(),
         workflow=workflow,
     )
     if os.path.isdir(model_name_or_path):
