@@ -15,20 +15,36 @@
 # src/flow_factory/models/stable_diffusion/sd3_5.py
 from __future__ import annotations
 
+import math
 import os
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
+from numbers import Real
+from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import torch
 from accelerate import Accelerator
+from PIL import Image
+
 from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import (
     StableDiffusion3Pipeline,
 )
-from PIL import Image
 
+from ...contracts import (
+    BatchCapability,
+    GeometrySource,
+    InputMediaBinding,
+    InputMediaOrder,
+    InputMediaSpec,
+    MediaFormat,
+    MediaType,
+    NegativePromptPolicy,
+    OutputMediaSequence,
+    PipelineIOContract,
+    RateRequirement,
+)
 from ...hparams import *
-from ...samples import BaseSample
+from ...samples import BaseSample, LatentState
 from ...scheduler import (
     FlowMatchEulerDiscreteSDEScheduler,
     FlowMatchEulerDiscreteSDESchedulerOutput,
@@ -45,8 +61,36 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ..output_state import (
+    DecodedMediaBatch,
+    EncodedOutputState,
+    GeometrySignature,
+    MediaGeometrySignature,
+    OutputStateCodec,
+)
 
 logger = setup_logger(__name__)
+
+
+_SD3_5_PIPELINE_IO_CONTRACT = PipelineIOContract(
+    input_media=InputMediaSpec(
+        rules=(),
+        binding=InputMediaBinding.GROUPED_BY_TYPE,
+        order=InputMediaOrder.INSENSITIVE,
+    ),
+    negative_prompt=NegativePromptPolicy.OPTIONAL,
+    output_media=OutputMediaSequence(
+        items=(
+            MediaFormat(
+                type=MediaType.IMAGE,
+                fps=RateRequirement.NOT_APPLICABLE,
+                sample_rate=RateRequirement.NOT_APPLICABLE,
+            ),
+        )
+    ),
+    geometry_source=GeometrySource.CONFIGURED,
+    batch_capability=BatchCapability.UNIFORM,
+)
 
 
 @dataclass
@@ -60,8 +104,143 @@ class SD3_5Sample(BaseSample):
     negative_pooled_prompt_embeds: Optional[torch.Tensor] = None
 
 
+@dataclass(frozen=True, slots=True)
+class _SD3_5OutputStateCodec:
+    """Encode decoded target images into deterministic SD3.5 clean latents."""
+
+    adapter: "SD3_5Adapter"
+    required_components: ClassVar[Tuple[str, ...]] = ("vae",)
+
+    def encode_output_state(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Mapping[str, Any],
+        generator: Optional[torch.Generator] = None,
+    ) -> EncodedOutputState:
+        """Preprocess and VAE-encode one target batch without caching latents."""
+        del condition, generator  # Posterior mode is deterministic and consumes no RNG.
+        height, width = self.adapter._configured_output_geometry()
+        images = []
+        for sample_index, candidate in enumerate(media_batch):
+            if len(candidate) != 1:
+                raise ValueError(
+                    "SD3.5 output codec expected one image per sample, "
+                    f"received {len(candidate)} for sample {sample_index}"
+                )
+            image = candidate[0].payload
+            if not isinstance(image, Image.Image):
+                raise TypeError(
+                    "SD3.5 output codec expected decoded PIL.Image targets, "
+                    f"received {type(image).__name__} for sample {sample_index}"
+                )
+            images.append(image)
+
+        pixel_values = self.adapter.pipeline.image_processor.preprocess(
+            images,
+            height=height,
+            width=width,
+        )
+        if not isinstance(pixel_values, torch.Tensor):
+            raise TypeError(
+                "SD3.5 image_processor.preprocess expected torch.Tensor output, "
+                f"received {type(pixel_values).__name__}"
+            )
+        if pixel_values.ndim != 4:
+            raise ValueError(
+                "SD3.5 image_processor.preprocess expected rank-4 BCHW output, "
+                f"received shape {tuple(pixel_values.shape)}"
+            )
+        if pixel_values.shape[0] != len(images):
+            raise ValueError(
+                "SD3.5 image_processor.preprocess changed target batch size: "
+                f"expected {len(images)}, received shape {tuple(pixel_values.shape)}"
+            )
+        if tuple(pixel_values.shape[-2:]) != (height, width):
+            raise ValueError(
+                "SD3.5 image_processor.preprocess did not produce configured geometry "
+                f"{(height, width)}, received shape {tuple(pixel_values.shape)}"
+            )
+
+        vae = self.adapter.vae
+        vae_dtype = getattr(vae, "dtype", None)
+        if not isinstance(vae_dtype, torch.dtype) or not vae_dtype.is_floating_point:
+            raise TypeError(
+                "SD3.5 output codec expected VAE to expose a floating dtype, "
+                f"received {vae_dtype!r}"
+            )
+        pixel_values = pixel_values.to(device=self.adapter.device, dtype=vae_dtype)
+        encoder_output = vae.encode(pixel_values)
+        latent_dist = self._resolve_latent_distribution(encoder_output)
+        mode = getattr(latent_dist, "mode", None)
+        latents = mode() if callable(mode) else mode
+        if not isinstance(latents, torch.Tensor):
+            raise TypeError(
+                "SD3.5 VAE latent_dist.mode expected torch.Tensor, "
+                f"received {type(latents).__name__}"
+            )
+
+        shift_factor, scaling_factor = self._normalization_factors(vae)
+        latents = (latents - shift_factor) * scaling_factor
+        signature = GeometrySignature(
+            media=(
+                MediaGeometrySignature(
+                    type=MediaType.IMAGE,
+                    height=height,
+                    width=width,
+                ),
+            )
+        )
+        return EncodedOutputState(
+            clean_state=LatentState({"latent": latents}),
+            forward_context={},
+            decode_context={"height": height, "width": width},
+            geometry_signatures=tuple(signature for _ in images),
+        )
+
+    @staticmethod
+    def _resolve_latent_distribution(encoder_output: Any) -> Any:
+        """Resolve current and tuple-style diffusers VAE encoder outputs."""
+        latent_dist = getattr(encoder_output, "latent_dist", None)
+        if latent_dist is not None:
+            return latent_dist
+        if isinstance(encoder_output, (tuple, list)) and len(encoder_output) == 1:
+            candidate = encoder_output[0]
+            return getattr(candidate, "latent_dist", candidate)
+        if getattr(encoder_output, "mode", None) is not None:
+            return encoder_output
+        raise TypeError(
+            "SD3.5 VAE encode expected an output exposing latent_dist or a single "
+            f"latent-distribution tuple, received {type(encoder_output).__name__}"
+        )
+
+    @staticmethod
+    def _normalization_factors(vae: Any) -> Tuple[float, float]:
+        """Return finite SD3 VAE shift and positive scale factors."""
+        config = getattr(vae, "config", None)
+        shift_factor = getattr(config, "shift_factor", None)
+        scaling_factor = getattr(config, "scaling_factor", None)
+        for name, value in (
+            ("shift_factor", shift_factor),
+            ("scaling_factor", scaling_factor),
+        ):
+            if isinstance(value, bool) or not isinstance(value, Real):
+                raise TypeError(
+                    f"SD3.5 VAE config expected numeric {name}, "
+                    f"received {type(value).__name__}: {value!r}"
+                )
+            if not math.isfinite(float(value)):
+                raise ValueError(f"SD3.5 VAE config expected finite {name}, received {value!r}")
+        if scaling_factor <= 0:
+            raise ValueError(
+                f"SD3.5 VAE config expected scaling_factor > 0, received {scaling_factor!r}"
+            )
+        return float(shift_factor), float(scaling_factor)
+
+
 class SD3_5Adapter(BaseAdapter):
     """Concrete implementation for Stable Diffusion 3 medium."""
+
+    pipeline_io_contract = _SD3_5_PIPELINE_IO_CONTRACT
 
     def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
@@ -92,6 +271,72 @@ class SD3_5Adapter(BaseAdapter):
     @property
     def tokenizer(self) -> Any:
         return self.pipeline.tokenizer_3
+
+    def build_output_state_codec(self) -> OutputStateCodec:
+        """Build the deterministic on-the-fly SD3.5 target-image encoder."""
+        self._configured_output_geometry()
+        return _SD3_5OutputStateCodec(self)
+
+    def _configured_output_geometry(self) -> Tuple[int, int]:
+        """Return strictly validated configured training image geometry."""
+        geometry = []
+        for name in ("height", "width"):
+            value = getattr(self.training_args, name, None)
+            if type(value) is not int:
+                raise TypeError(
+                    f"SD3.5 output geometry expected training_args.{name} to be int, "
+                    f"received {type(value).__name__}: {value!r}"
+                )
+            if value <= 0:
+                raise ValueError(
+                    f"SD3.5 output geometry expected training_args.{name} > 0, received {value}"
+                )
+            geometry.append(value)
+        return geometry[0], geometry[1]
+
+    def _validate_encoded_output_geometry(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Mapping[str, Any],
+        encoded: EncodedOutputState,
+    ) -> None:
+        """Verify every codec signature and decode field against configured H/W."""
+        del condition
+        height, width = self._configured_output_geometry()
+        expected_signature = GeometrySignature(
+            media=(
+                MediaGeometrySignature(
+                    type=MediaType.IMAGE,
+                    height=height,
+                    width=width,
+                ),
+            )
+        )
+        if len(encoded.geometry_signatures) != len(media_batch):
+            raise ValueError(
+                "SD3.5 output geometry expected one signature per target sample, "
+                f"received {len(encoded.geometry_signatures)} for batch size {len(media_batch)}"
+            )
+        for sample_index, signature in enumerate(encoded.geometry_signatures):
+            if signature != expected_signature:
+                raise ValueError(
+                    "SD3.5 encoded output geometry disagrees with configured "
+                    f"height/width {(height, width)} for sample {sample_index}: {signature!r}"
+                )
+        decode_context = encoded.decode_context
+        expected_decode_context = {"height": height, "width": width}
+        has_exact_decode_geometry = (
+            set(decode_context) == set(expected_decode_context)
+            and type(decode_context["height"]) is int
+            and type(decode_context["width"]) is int
+            and decode_context["height"] == height
+            and decode_context["width"] == width
+        )
+        if not has_exact_decode_geometry:
+            raise ValueError(
+                "SD3.5 decode_context must exactly match configured output geometry "
+                f"{expected_decode_context}, received {dict(decode_context)!r}"
+            )
 
     # ============================ Encoding & Decoding ============================
     def encode_prompt(
