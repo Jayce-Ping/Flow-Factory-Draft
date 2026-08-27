@@ -17,8 +17,8 @@ import torch
 
 from flow_factory.utils.noise_schedule import (
     TIMESTEP_MAX,
-    flow_match_coordinates_close,
     flow_match_sigma,
+    validate_flow_match_coordinates,
 )
 
 
@@ -53,23 +53,26 @@ def test_flow_match_coordinates_accept_one_ulp_but_reject_two() -> None:
     one_ulp = torch.nextafter(expected, direction)
     two_ulps = torch.nextafter(one_ulp, direction)
 
-    assert flow_match_coordinates_close(timestep, one_ulp)
-    assert not flow_match_coordinates_close(timestep, two_ulps)
+    validate_flow_match_coordinates(timestep, one_ulp)
+    with pytest.raises(ValueError, match=r"within one native ULP"):
+        validate_flow_match_coordinates(timestep, two_ulps)
 
     binade_timestep = torch.tensor([500.0], dtype=torch.float32)
     binade_sigma = torch.tensor([0.5], dtype=torch.float32)
     lower = torch.full_like(binade_sigma, -float("inf"))
     one_ulp_down = torch.nextafter(binade_sigma, lower)
     two_ulps_down = torch.nextafter(one_ulp_down, lower)
-    assert flow_match_coordinates_close(binade_timestep, one_ulp_down)
-    assert not flow_match_coordinates_close(binade_timestep, two_ulps_down)
+    validate_flow_match_coordinates(binade_timestep, one_ulp_down)
+    with pytest.raises(ValueError, match=r"within one native ULP"):
+        validate_flow_match_coordinates(binade_timestep, two_ulps_down)
 
 
 def test_flow_match_coordinates_reject_clamped_out_of_range_values() -> None:
     endpoint = torch.tensor([TIMESTEP_MAX], dtype=torch.float32)
     outside = torch.nextafter(endpoint, torch.full_like(endpoint, float("inf")))
 
-    assert not flow_match_coordinates_close(outside, torch.ones_like(outside))
+    with pytest.raises(ValueError, match=r"timestep.*\[0, 1000\].*sigma.*\[0, 1\]"):
+        validate_flow_match_coordinates(outside, torch.ones_like(outside))
 
 
 @pytest.mark.parametrize(
@@ -85,6 +88,11 @@ def test_flow_match_sigma_rejects_invalid_scheduler_coordinates(
 ) -> None:
     with pytest.raises(ValueError, match=r"t_scheduler.*\[0, 1000\]"):
         flow_match_sigma(timesteps)
+
+
+def test_flow_match_sigma_rejects_non_tensor_input() -> None:
+    with pytest.raises(TypeError, match=r"torch.Tensor t_scheduler"):
+        flow_match_sigma(500.0)  # type: ignore[arg-type]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

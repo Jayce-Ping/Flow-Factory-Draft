@@ -26,6 +26,7 @@ from ...samples import (
     StackedSampleBatch,
     StructuredTrajectory,
 )
+from ...utils.precision import native_ulp_spacing
 from .masks import _active_element_counts, _expand_active_mask
 
 _SIGNED_INTEGER_DTYPES = {
@@ -784,20 +785,8 @@ def replay_generator_boundary(
             # promotion would describe float32 spacing even when the stored trajectory
             # was quantized to fp16/bf16, overstating the discrepancy by orders of
             # magnitude.
-            stored_ulp = (
-                torch.nextafter(
-                    stored_source_value,
-                    recomputed_source_value.to(stored_source_value.dtype),
-                )
-                - stored_source_value
-            ).abs()
-            recomputed_ulp = (
-                torch.nextafter(
-                    recomputed_source_value,
-                    stored_source_value.to(recomputed_source_value.dtype),
-                )
-                - recomputed_source_value
-            ).abs()
+            stored_ulp = native_ulp_spacing(stored_source_value, recomputed_source_value)
+            recomputed_ulp = native_ulp_spacing(recomputed_source_value, stored_source_value)
             stored_ulp_ratio = (
                 max_abs / stored_ulp.to(max_abs.dtype)
                 if bool(torch.isfinite(stored_ulp).item()) and float(stored_ulp.item()) > 0
@@ -805,8 +794,7 @@ def replay_generator_boundary(
             )
             recomputed_ulp_ratio = (
                 max_abs / recomputed_ulp.to(max_abs.dtype)
-                if bool(torch.isfinite(recomputed_ulp).item())
-                and float(recomputed_ulp.item()) > 0
+                if bool(torch.isfinite(recomputed_ulp).item()) and float(recomputed_ulp.item()) > 0
                 else torch.full_like(max_abs, float("nan"))
             )
             effective_tolerance = validated_atol + validated_rtol * stored_value.abs()

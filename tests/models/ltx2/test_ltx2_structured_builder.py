@@ -358,11 +358,41 @@ def test_the_builder_rejects_a_sigma_schedule_of_a_different_length() -> None:
         _build(schedule=schedule)
 
 
+def test_the_builder_accepts_one_ulp_coordinate_materialization_noise() -> None:
+    schedule = _schedule()
+    timesteps, sigmas = schedule["video"]
+    perturbed = sigmas.clone()
+    perturbed[1] = torch.nextafter(
+        perturbed[1],
+        torch.full_like(perturbed[1], float("inf")),
+    )
+    schedule["video"] = (timesteps, perturbed)
+
+    trajectories = _build(schedule=schedule)
+
+    assert len(trajectories) == BATCH_SIZE
+
+
+def test_the_builder_rejects_two_ulp_coordinate_materialization_drift() -> None:
+    schedule = _schedule()
+    timesteps, sigmas = schedule["audio"]
+    one_ulp = torch.nextafter(sigmas[1], torch.full_like(sigmas[1], float("inf")))
+    perturbed = sigmas.clone()
+    perturbed[1] = torch.nextafter(one_ulp, torch.full_like(one_ulp, float("inf")))
+    schedule["audio"] = (timesteps, perturbed)
+
+    with pytest.raises(ValueError, match=r"audio.*timestep.*sigma.*1000.*one native ULP"):
+        _build(schedule=schedule)
+
+
 @pytest.mark.parametrize("component", ["video", "audio"])
 def test_the_builder_rejects_a_schedule_without_the_terminal_zero(component: str) -> None:
     schedule = _schedule()
     timesteps, sigmas = schedule[component]
-    schedule[component] = (timesteps + 1.0, sigmas)
+    bad_timesteps = timesteps.clone()
+    bad_timesteps[-1] = 1.0
+    bad_sigmas = flow_match_sigma(bad_timesteps)
+    schedule[component] = (bad_timesteps, bad_sigmas)
 
     with pytest.raises(ValueError, match=rf"component {component!r}.*terminal.*zero"):
         _build(schedule=schedule)

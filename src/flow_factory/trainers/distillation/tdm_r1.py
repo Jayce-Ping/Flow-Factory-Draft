@@ -342,7 +342,9 @@ class TDMR1Trainer(TDMTrainer):
             active_masks=terms.boundary_state.active_masks,
         )
 
-    def _surrogate_reward_direction(self, batch: Any, terms: Any) -> tuple[LatentState, LatentState]:
+    def _surrogate_reward_direction(
+        self, batch: Any, terms: Any
+    ) -> tuple[LatentState, LatentState]:
         """Return the surrogate's guided direction against its frozen reference.
 
         The surrogate is queried with guidance so its learned preference is amplified the
@@ -431,13 +433,7 @@ class TDMR1Trainer(TDMTrainer):
         batch = self._stack_replay_unit(unit.samples)
         replay_step = self.adapter.get_replay_step(batch, unit.boundary_index - 1)
         boundary_state = detach_state(replay_step.next_state)
-        primary_times = self._sample_perturbation_times(unit)
-        times = self.adapter.build_training_component_times(primary_times, batch=batch)
-        self._validate_score_query_sigmas(
-            times,
-            primary_times,
-            boundary_index=unit.boundary_index,
-        )
+        times = self._sample_score_query_times(unit, batch)
         return batch, self.adapter.add_forward_process_noise(boundary_state, times), times
 
     def _boundary_preference_values(
@@ -454,13 +450,7 @@ class TDMR1Trainer(TDMTrainer):
         batch = self._stack_replay_unit(unit.samples)
         replay_step = self.adapter.get_replay_step(batch, unit.boundary_index - 1)
         boundary_state = detach_state(replay_step.next_state)
-        primary_times = self._sample_perturbation_times(unit)
-        times = self.adapter.build_training_component_times(primary_times, batch=batch)
-        self._validate_score_query_sigmas(
-            times,
-            primary_times,
-            boundary_index=unit.boundary_index,
-        )
+        times = self._sample_score_query_times(unit, batch)
         noised = self.adapter.add_forward_process_noise(boundary_state, times)
         return self._score_boundary_values(batch, noised, times, trainable_role)
 

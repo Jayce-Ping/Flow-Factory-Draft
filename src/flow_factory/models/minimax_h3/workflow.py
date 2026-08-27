@@ -28,7 +28,6 @@ from ...samples import (
     StructuredTrajectory,
 )
 from ...scheduler import MiniMaxH3SDEScheduler, SchedulerGroup
-from ...utils.noise_schedule import TIMESTEP_MAX
 from ..runtime import ModularPipelineRuntime
 from ._common import (
     build_structured_trajectories,
@@ -197,73 +196,10 @@ def map_h3_training_component_times(
     adapter: Any, primary_timesteps: torch.Tensor
 ) -> ComponentTimes:
     """Map primary video coordinates onto the independent audio shift."""
-    times = build_h3_component_times(
+    return build_h3_component_times(
         primary_timesteps,
         video_shift=adapter.scheduler.shift,
         audio_shift=adapter.audio_scheduler.shift,
-    )
-    return _snap_h3_component_times_to_scheduler_grid(
-        times,
-        primary_timesteps,
-        video_sigmas=getattr(adapter.scheduler, "sigmas", None),
-        audio_sigmas=getattr(adapter.audio_scheduler, "sigmas", None),
-    )
-
-
-def _snap_h3_component_times_to_scheduler_grid(
-    times: ComponentTimes,
-    primary_timesteps: torch.Tensor,
-    *,
-    video_sigmas: Optional[torch.Tensor],
-    audio_sigmas: Optional[torch.Tensor],
-) -> ComponentTimes:
-    """Reuse independently rounded scheduler coordinates at exact grid points."""
-    if (
-        not isinstance(video_sigmas, torch.Tensor)
-        or not isinstance(audio_sigmas, torch.Tensor)
-        or video_sigmas.ndim != 1
-        or audio_sigmas.ndim != 1
-        or video_sigmas.shape != audio_sigmas.shape
-        or times.sigma is None
-    ):
-        return times
-
-    video_grid_timesteps = video_sigmas * TIMESTEP_MAX
-    audio_grid_timesteps = audio_sigmas * TIMESTEP_MAX
-    video_grid_for_match = video_grid_timesteps.to(primary_timesteps)
-    matches = primary_timesteps.unsqueeze(-1) == video_grid_for_match.unsqueeze(0)
-    matched_rows = matches.any(dim=-1)
-    if not bool(matched_rows.any()):
-        return times
-
-    indices = matches.to(torch.int64).argmax(dim=-1)
-    scheduler_sigmas = {"video": video_sigmas, "audio": audio_sigmas}
-    scheduler_timesteps = {
-        "video": video_grid_timesteps,
-        "audio": audio_grid_timesteps,
-    }
-    exact_sigmas: Dict[str, torch.Tensor] = {}
-    exact_timesteps: Dict[str, torch.Tensor] = {}
-    for component in _COMPONENT_ORDER:
-        component_indices = indices.to(scheduler_sigmas[component].device)
-        exact_sigmas[component] = scheduler_sigmas[component][component_indices]
-        exact_timesteps[component] = scheduler_timesteps[component][component_indices]
-    timestep = dict(times.timestep)
-    sigma = dict(times.sigma)
-    for component in _COMPONENT_ORDER:
-        component_mask = matched_rows.to(sigma[component].device)
-        exact_sigma = exact_sigmas[component].to(sigma[component])
-        sigma[component] = torch.where(component_mask, exact_sigma, sigma[component])
-        timestep[component] = torch.where(
-            component_mask,
-            exact_timesteps[component].to(timestep[component]),
-            timestep[component],
-        )
-    return ComponentTimes(
-        timestep=timestep,
-        next_timestep=times.next_timestep,
-        sigma=sigma,
-        next_sigma=times.next_sigma,
     )
 
 

@@ -31,8 +31,8 @@ from ...samples import (
 from ...scheduler import SDESchedulerOutput
 from ...utils.noise_schedule import (
     TIMESTEP_MAX,
-    flow_match_coordinates_close,
     flow_match_sigma,
+    validate_flow_match_coordinates,
 )
 from ..component_reduction import reduce_component_log_probs
 
@@ -663,48 +663,30 @@ def _validate_component_times(times: ComponentTimes, state: LatentState) -> None
         if values is None:
             raise ValueError(f"expected ComponentTimes.{field}, received None")
         _require_component_order(values, f"ComponentTimes.{field}")
-        for component in MINIMAX_H3_COMPONENT_ORDER:
-            coordinate = values[component]
-            if not isinstance(coordinate, torch.Tensor):
+    for component in MINIMAX_H3_COMPONENT_ORDER:
+        validate_flow_match_coordinates(
+            times.timestep[component],
+            times.sigma[component],
+            identifier=(f"MiniMax H3 ComponentTimes timestep/sigma for component {component!r}"),
+        )
+        reference = state.components[component]
+        for field in ("timestep", "next_timestep", "sigma", "next_sigma"):
+            coordinate = getattr(times, field)[component]
+            if not isinstance(coordinate, torch.Tensor) or not coordinate.is_floating_point():
                 raise TypeError(
-                    f"expected torch.Tensor ComponentTimes.{field}[{component!r}], "
-                    f"received {type(coordinate).__name__}: {coordinate!r}"
-                )
-            if not coordinate.is_floating_point():
-                raise TypeError(
-                    f"expected floating ComponentTimes.{field}[{component!r}], "
-                    f"received dtype {coordinate.dtype}"
+                    f"expected floating ComponentTimes.{field}[{component!r}], received "
+                    f"{type(coordinate).__name__}/{getattr(coordinate, 'dtype', None)}"
                 )
             if coordinate.shape != (batch_size,):
                 raise ValueError(
                     f"expected ComponentTimes.{field}[{component!r}] shape ({batch_size},), "
                     f"received {tuple(coordinate.shape)}"
                 )
-            reference = state.components[component]
             if coordinate.device != reference.device:
                 raise ValueError(
                     f"expected ComponentTimes.{field}[{component!r}] device to match "
                     f"state {reference.device}, received {coordinate.device}"
                 )
-            if not bool(torch.isfinite(coordinate).all()):
-                raise ValueError(
-                    f"expected ComponentTimes.{field}[{component!r}] finite in "
-                    f"{'[0, 1]' if 'sigma' in field else '[0, 1000]'}, "
-                    f"received {coordinate.tolist()}"
-                )
-            upper = 1.0 if "sigma" in field else TIMESTEP_MAX
-            if bool((coordinate < 0).any()) or bool((coordinate > upper).any()):
-                raise ValueError(
-                    f"expected ComponentTimes.{field}[{component!r}] in [0, {upper:g}], "
-                    f"received {coordinate.tolist()}"
-                )
-    for component in MINIMAX_H3_COMPONENT_ORDER:
-        if not flow_match_coordinates_close(times.timestep[component], times.sigma[component]):
-            raise ValueError(
-                f"expected ComponentTimes.timestep[{component!r}] == "
-                f"sigma[{component!r}] * 1000, received "
-                f"{times.timestep[component].tolist()} and {times.sigma[component].tolist()}"
-            )
         for field in ("next_timestep", "next_sigma"):
             if bool((getattr(times, field)[component] != 0).any()):
                 raise ValueError(
@@ -736,16 +718,6 @@ def _validate_schedule_entry(
             f"expected torch.Tensor schedule entries for component {component!r}, "
             f"received timesteps={type(timesteps).__name__}, sigmas={type(sigmas).__name__}"
         )
-    for field, values in (("timesteps", timesteps), ("sigmas", sigmas)):
-        if not values.is_floating_point():
-            raise TypeError(
-                f"expected component {component!r} {field} with floating dtype, "
-                f"received {values.dtype}"
-            )
-        if not bool(torch.isfinite(values).all()):
-            raise ValueError(
-                f"expected component {component!r} {field} finite, received {values.tolist()}"
-            )
     if (
         timesteps.ndim != 1
         or sigmas.ndim != 1
@@ -757,19 +729,15 @@ def _validate_schedule_entry(
             f"received timesteps={getattr(timesteps, 'shape', None)} and "
             f"sigmas={getattr(sigmas, 'shape', None)}"
         )
-    if (
-        bool((sigmas < 0).any())
-        or bool((sigmas > 1).any())
-        or not bool((sigmas[1:] < sigmas[:-1]).all())
-    ):
+    validate_flow_match_coordinates(
+        timesteps,
+        sigmas,
+        identifier=f"component {component!r} schedule timesteps/sigmas",
+    )
+    if not bool((sigmas[1:] < sigmas[:-1]).all()):
         raise ValueError(
             f"expected component {component!r} sigmas strictly decreasing in [0, 1], "
             f"received {sigmas.tolist()}"
-        )
-    if not flow_match_coordinates_close(timesteps, sigmas):
-        raise ValueError(
-            f"expected component {component!r} timesteps == sigmas * 1000, "
-            f"received timesteps={timesteps.tolist()} and sigmas={sigmas.tolist()}"
         )
     if timesteps[-1].item() != 0.0 or sigmas[-1].item() != 0.0:
         raise ValueError(

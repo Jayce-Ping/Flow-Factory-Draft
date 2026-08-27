@@ -29,7 +29,6 @@ from flow_factory.samples import (
     StackedSampleBatch,
     StructuredTrajectory,
 )
-from flow_factory.scheduler import MiniMaxH3SDEScheduler
 
 
 def _adapter(adapter_class: type, transformer: Any = None) -> Any:
@@ -201,52 +200,6 @@ def test_training_times_map_primary_video_coordinate_to_audio_shift(
     assert times.timestep["audio"].item() != pytest.approx(500.0)
     assert times.next_timestep["video"].item() == 0
     assert times.next_timestep["audio"].item() == 0
-
-
-@pytest.mark.parametrize("primary_dtype", [torch.float32, torch.float64])
-def test_training_times_reuse_exact_independent_scheduler_grid_coordinates(
-    primary_dtype: torch.dtype,
-) -> None:
-    adapter = _adapter(MiniMaxH3T2VAAdapter)
-    adapter.scheduler = MiniMaxH3SDEScheduler(shift=12.0)
-    adapter.audio_scheduler = MiniMaxH3SDEScheduler(shift=3.0)
-    adapter.scheduler.set_timesteps(4)
-    adapter.audio_scheduler.set_timesteps(4)
-    primary_timesteps = (adapter.scheduler.sigmas * 1000).to(primary_dtype)
-
-    times = adapter.build_training_component_times(primary_timesteps)
-
-    for component, scheduler in (
-        ("video", adapter.scheduler),
-        ("audio", adapter.audio_scheduler),
-    ):
-        assert torch.equal(times.sigma[component], scheduler.sigmas.to(primary_dtype))
-        assert torch.equal(
-            times.timestep[component],
-            (scheduler.sigmas * 1000).to(primary_dtype),
-        )
-
-
-def test_training_times_do_not_snap_nearby_float64_interior_coordinates() -> None:
-    adapter = _adapter(MiniMaxH3T2VAAdapter)
-    adapter.scheduler = MiniMaxH3SDEScheduler(shift=12.0)
-    adapter.audio_scheduler = MiniMaxH3SDEScheduler(shift=3.0)
-    adapter.scheduler.set_timesteps(4)
-    adapter.audio_scheduler.set_timesteps(4)
-    grid_timestep = (adapter.scheduler.sigmas * 1000)[1:2].to(torch.float64)
-    primary_timesteps = grid_timestep + 1e-6
-    assert torch.equal(primary_timesteps.to(torch.float32), grid_timestep.to(torch.float32))
-
-    times = adapter.build_training_component_times(primary_timesteps)
-
-    assert not torch.equal(
-        times.sigma["video"],
-        adapter.scheduler.sigmas[1:2].to(torch.float64),
-    )
-    assert not torch.equal(
-        times.timestep["audio"],
-        (adapter.audio_scheduler.sigmas * 1000)[1:2].to(torch.float64),
-    )
 
 
 def test_inference_collects_structured_target_only_trajectory(monkeypatch) -> None:
