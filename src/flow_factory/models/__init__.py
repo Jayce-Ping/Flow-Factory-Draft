@@ -24,6 +24,13 @@ from .abc import BaseAdapter
 from .latent_geometry import LatentAxes, LatentLayout, infer_latent_axes
 from .loader import load_model
 from .model_bundle import ModelBundle, RoutedComponentProxy
+from .output_state import (
+    DecodedMediaBatch,
+    EncodedOutputState,
+    GeometrySignature,
+    MediaGeometrySignature,
+    OutputStateCodec,
+)
 from .registry import (
     get_model_adapter_class,
     list_registered_models,
@@ -32,6 +39,12 @@ from .registry import (
 __all__ = [
     # Core classes
     "BaseAdapter",
+    # Offline target encoding
+    "DecodedMediaBatch",
+    "EncodedOutputState",
+    "GeometrySignature",
+    "MediaGeometrySignature",
+    "OutputStateCodec",
     # Latent geometry
     "LatentAxes",
     "LatentLayout",
