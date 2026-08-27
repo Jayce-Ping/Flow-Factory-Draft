@@ -16,6 +16,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 
 import torch
 
+from ...contracts import FORWARD_STATE_OWNED_KEYS, NON_MODEL_CONDITION_KEYS
 from ...samples import (
     ComponentTimes,
     LatentState,
@@ -23,35 +24,6 @@ from ...samples import (
 )
 from ...scheduler import SDESchedulerOutput
 from ...utils.base import filter_kwargs
-
-_STORAGE_KEYS = {
-    "trajectory",
-    "timesteps",
-    "all_latents",
-    "latent_index_map",
-    "log_probs",
-    "log_prob_index_map",
-}
-
-
-# Trainer-owned batch fields: written by the feedback stage for the loss, never a
-# model conditioning argument. Adapters that accept ``**kwargs`` would otherwise
-# receive them, which legacy trainers never did.
-_TRAINER_METADATA_KEYS = {"advantage"}
-
-
-_BRIDGE_OWNED_BATCH_KEYS = _STORAGE_KEYS | _TRAINER_METADATA_KEYS
-
-
-_STATE_OWNED_FORWARD_KEYS = {
-    "t",
-    "t_next",
-    "latents",
-    "next_latents",
-    "compute_log_prob",
-    "return_kwargs",
-    "noise_level",
-}
 
 
 def build_forward_state_kwargs(
@@ -73,22 +45,20 @@ def build_forward_state_kwargs(
             "expected a conditioning mapping for forward_state batch, "
             f"received {type(batch).__name__}: {batch!r}"
         )
-    collisions = tuple(name for name in _STATE_OWNED_FORWARD_KEYS if name in kwargs)
+    collisions = tuple(sorted(name for name in FORWARD_STATE_OWNED_KEYS if name in kwargs))
     if collisions:
         raise ValueError(
             f"explicit forward_state kwargs collide with state-owned arguments {collisions}"
         )
-    owned = tuple(sorted(name for name in kwargs if name in _BRIDGE_OWNED_BATCH_KEYS))
+    owned = tuple(sorted(name for name in kwargs if name in NON_MODEL_CONDITION_KEYS))
     if owned:
         raise ValueError(
             f"explicit forward_state kwargs collide with trainer-owned arguments {owned}; the "
-            f"{type(adapter).__name__} bridge reads trajectory storage and trainer metadata from "
-            "the batch and never forwards them to the model"
+            f"{type(adapter).__name__} bridge owns runtime state and strips every non-model "
+            "storage, metadata, and offline-provenance field before model forward"
         )
     forward_kwargs = {
-        key: value
-        for key, value in batch.items()
-        if key not in _BRIDGE_OWNED_BATCH_KEYS and key not in _STATE_OWNED_FORWARD_KEYS
+        key: value for key, value in batch.items() if key not in NON_MODEL_CONDITION_KEYS
     }
     forward_kwargs.update(kwargs)
     return forward_kwargs

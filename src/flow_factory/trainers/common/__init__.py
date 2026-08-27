@@ -5,6 +5,7 @@ from .forward_kwargs import (
     replay_forward_kwargs,
     training_forward_kwargs,
 )
+from .offline_batch import bind_output_forward_context, move_condition_to_device
 from .replay_batching import move_and_stack_samples
 from .sample_prefetch import iter_prefetched_batches
 from .state_validation import (
@@ -15,8 +16,10 @@ from .state_validation import (
 )
 
 __all__ = [
+    "bind_output_forward_context",
     "iter_prefetched_batches",
     "move_and_stack_samples",
+    "move_condition_to_device",
     "reference_forward_kwargs",
     "replay_forward_kwargs",
     "require_component_sigmas",
