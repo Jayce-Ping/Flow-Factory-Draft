@@ -108,6 +108,21 @@ omits Stages 4–5. Offline trainers use `OfflineExecutionDriver`: call PyTorch
 `optimize_batch()`, and advance `data_epoch` only after clean exhaustion. They never fake a
 sampling stage and never load an entire epoch into memory.
 
+The strict V2 record schema is model- and algorithm-neutral: `input` owns generation conditions,
+while optional `demonstration` or `preference` supervision owns ordered output candidates through
+the public `type` discriminator. Offline preprocessing projects only `input` into the existing
+fingerprinted cache, after validating every input and preprocessing binding against the adapter's
+pipeline contract. Target/chosen/rejected media remain normalized paths, decode per access on the
+CPU, and enter adapter-owned output-state codecs for on-the-fly VAE encoding. Offline EMA follows
+`optimizer_step`; checkpoint/eval and `data_epoch` boundaries remain full loader traversals.
+
+Offline exact-state checkpoints use a framework-owned JSON+safetensors runtime sidecar rather than
+Accelerate custom objects, which are pickle-backed. Runtime-state v1 is intentionally
+single-process: it stages and atomically publishes model/optimizer/RNG/progress/EMA/reference state
+after strict semantic-layout and SHA-256 integrity preflight. Distributed offline training is
+supported with model-only checkpoints; distributed exact-state save/resume fails before writing or
+mutating live state.
+
 ---
 
 ## Registry System
@@ -124,6 +139,8 @@ All four registries map string keys → lazy import paths. Resolution: registry 
 | `grpo-guard` | `GRPOGuardTrainer` | Coupled | `GRPOTrainer` |
 | `dppo` | `DPPOTrainer` | Coupled | `GRPOTrainer` |
 | `dpo` | `DPOTrainer` | Decoupled | `BaseTrainer` |
+| `sft` | `SFTTrainer` | Decoupled (offline) | `BaseTrainer` |
+| `offline-dpo` | `OfflineDPOTrainer` | Decoupled (offline) | `BaseTrainer` |
 | `dgpo` | `DGPOTrainer` | Decoupled | `BaseTrainer` |
 | `nft` | `DiffusionNFTTrainer` | Decoupled | `BaseTrainer` |
 | `awm` | `AWMTrainer` | Decoupled | `BaseTrainer` |
@@ -195,7 +212,8 @@ Timesteps are `[0, 1000]` (scheduler scale); sigmas are `[0, 1]` (flow-matching 
 
 ### Adapter Pattern (Models)
 Each model adapter wraps a diffusers pipeline into the `BaseAdapter` interface:
-- `preprocess_func()` — offline encoding (Stage 1)
+- `preprocess_func()` — cacheable generation-input encoding (Stage 1)
+- `build_output_state_codec()` — optional adapter-owned on-the-fly target encoding for offline algorithms
 - `inference()` — full denoising loop (Stage 3)
 - `forward()` — single-step denoising (Stage 6)
 

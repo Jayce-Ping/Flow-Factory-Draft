@@ -45,13 +45,19 @@ def start(self):
         )
         # Checkpoint and evaluation boundaries run here.
         self.execution_driver.run_cycle(self, self.progress)
-        self.adapter.ema_step(step=self.cycle_index)
+        if self.execution_contract.acquisition is AcquisitionMode.ROLLOUT:
+            self.adapter.ema_step(step=self.cycle_index)
         self._after_training_cycle()
         self.progress = self.progress.advance_cycle(
             self.execution_contract.cycle_unit,
             completed=True,
         )
 ```
+
+Offline EMA is intentionally absent from the cycle boundary above. The shared optimizer-step
+helper updates it immediately after each successful offline optimizer step, so several updates in
+one data epoch do not collapse into one EMA update. Online algorithms retain rollout-iteration
+cadence.
 
 The default `_run_training_step` is the familiar three-stage sequence, so a reward-based
 algorithm only implements `optimize()`:
@@ -96,17 +102,52 @@ K-repeat/group sampler choices are rejected because the offline loader selects P
 preserving the meaning of an epoch as one complete traversal rather than weighted replacement
 sampling.
 
+The offline data path stays streaming and has no synthetic rollout stage:
+
+```
+V2 JSONL input projection ──► cached model conditions
+                                      │
+official DistributedSampler ──► collated batch ──► target CPU decode
+                                      │                    │
+                                      └──────────────► adapter output codec
+                                                           │
+                                                    on-the-fly VAE encode
+                                                           │
+                                               SFT / offline-DPO objective
+```
+
+Only the input projection participates in the fingerprinted cache. Changing target media or
+record metadata does not invalidate prompt/input embeddings, while every access still observes the
+current target file.
+
+### Offline checkpoint boundary
+
+Model-only checkpoints remain the default and work with the same distributed backends as offline
+training. Exact offline `resume_type: state` is deliberately narrower in runtime-state v1: it is
+supported only for a single-process, non-distributed run. The checkpoint is written into a sibling
+staging directory and published only after the prepared model, optimizer, RNG, progress, EMA, and
+full-model reference state are complete. Progress and auxiliary tensors use a strict JSON +
+safetensors sidecar; algorithm/model identity, canonical parameter order, optimizer groups, core
+state files, runtime tensors, and RNG are validated by size and SHA-256 before the live policy can
+be mutated. Checkpoints are immutable.
+
+For DDP, FSDP, or DeepSpeed offline training, keep `log.save_model_only: true` (the default) and
+resume weights with `resume_type: lora` or `full`. Distributed exact-state resume needs a future
+collective runtime format; the framework fails fast instead of claiming a partial restore.
+
 
 ## Stage 1: Data Preprocessing
 
-**Goal**: Encode raw text prompts (and optional images / videos / audio files) into model-ready tensor representations *before* training begins, eliminating redundant computation during the RL loop and enabling components offloading such as **text-encoder**, **image-encoder**, and **audio-encoder** (when applicable).
+**Goal**: Encode generation inputs into reusable model conditions before training. For offline
+supervision, keep output media outside this cache and encode it into clean model state on demand.
 
 ### Input / Output
 
 | | Description |
 |---|---|
-| **Input** | Raw dataset: `train.jsonl` or `train.txt` containing prompts, optional image / video / audio paths |
-| **Output** | Cached HuggingFace Dataset on disk with pre-encoded tensors (`prompt_embeds`, `prompt_ids`, `pooled_prompt_embeds`, `image_latents`, etc.) |
+| **Input** | Raw prompts and optional conditioning image / video / audio paths |
+| **Cached output** | Model-input tensors (`prompt_embeds`, `prompt_ids`, conditioning latents/features, etc.) |
+| **Offline supervision** | `target`, `chosen`, and `rejected` media stay as normalized paths and are never written to the tensor cache |
 
 ### How It Works
 
@@ -126,7 +167,8 @@ def _preprocess_batch(self, batch, image_dir, video_dir, audio_dir):
     # 7. Return batch dict with encoded tensors + metadata
 ```
 
-The preprocess function is model-specific. For example, Flux.2 encodes prompts via its text encoder and images via its VAE:
+The preprocess function is model-specific. For example, Flux.2 encodes prompts via its text
+encoder and conditioning images via its VAE:
 
 ```python
 # src/flow_factory/models/flux/flux2.py — Flux2Adapter.preprocess_func()
@@ -145,13 +187,27 @@ def preprocess_func(self, prompt, images, ...):
 - **Cache layout**: The merged cache directory looks like `{cache_dir}/{fingerprint}/_parts/rank_{i:05d}_of_{N:05d}/cache-{fingerprint}_shard{i}of{N-1}.arrow`, plus the top-level `state.json` and `dataset_info.json`. While preprocessing is in flight, the same content lives under `{cache_dir}/{fingerprint}.tmp/`, with a `_build_meta.json` sentinel that records `num_shards` so a subsequent run with the same `num_shards` can resume from any per-rank Arrow files that were already written before a crash, while a different `num_shards` triggers a clean wipe.
 - **No HF default-cache copy**: Because each `map()` call sets `cache_file_name`, HuggingFace does **not** also write a duplicate `cache-*.arrow` under `~/.cache/huggingface/datasets/...`.
 - **Intelligent caching**: A hash fingerprint of `(dataset, split, max_dataset_size, preprocess_func source, preprocess_kwargs, extra_hash_strs)` (the last includes `model_type` and `model_name_or_path`) determines the cache path. Subsequent runs that match the fingerprint take the fast path without any `Dataset.map` invocation.
-- **Component offloading**: Text encoders and VAEs are loaded for preprocessing, then offloaded before the training loop to free VRAM for the denoising model.
+- **Input-only offline cache**: V2 offline records project only `input` into preprocessing. The
+  complete normalized record remains attached to `OfflineDataset`; target media and metadata are
+  excluded from both the Arrow payload and its fingerprint.
+- **On-the-fly output encoding**: `OfflineDataset` decodes target images on the CPU when a row is
+  fetched. The adapter-owned output-state codec validates the pipeline output contract and invokes
+  the VAE under `torch.no_grad()` for every training batch. No target pixels or target latents are
+  cached.
+- **Component lifecycle**: Input-only encoders may be offloaded after the condition cache is built.
+  Components declared by the output-state codec (the SD3.5 VAE today) remain runtime-available for
+  offline batch optimization; online execution may continue to stage its VAE around preprocessing
+  and inference.
 
 ### Configuration
 
 ```yaml
 data:
-  dataset: "path/to/dataset"
+  datasets:
+    - name: default
+      dataset_dir: "path/to/dataset"
+      train:
+        weight: 1
   enable_preprocess: true          # Enable offline preprocessing
   force_reprocess: false           # Force re-encoding even if cache exists; essential if code is modified without changing config
   preprocessing_batch_size: 16     # Batch size for encoding
@@ -159,10 +215,18 @@ data:
   preprocess_parallelism: "local"  # "local" = per-node parallelism (no shared FS required); "global" = cross-node (shared FS required)
 ```
 
+Offline `train.jsonl` files use the strict V2 schema described in
+[`datasets.md`](datasets.md), including the public `type` discriminator. SFT sources must contain
+homogeneous `demonstration` supervision; offline-DPO sources must contain homogeneous `preference`
+supervision.
+
 
 ## Stage 2: K-Repeat Sampling
 
 **Goal**: Construct batches where each unique prompt appears exactly $K$ times (`group_size`), enabling group-relative advantage computation.
+
+This stage belongs only to online rollout execution. Offline SFT and offline DPO instead receive
+each finite batch from PyTorch's official `DistributedSampler` and never resolve a K-repeat sampler.
 
 ### Input / Output
 
@@ -390,13 +454,15 @@ train:
 
 ## Stage 6: Policy Optimization
 
-**Goal**: Update the denoising model's parameters using the computed advantages and PPO-style clipped policy gradient.
+**Goal**: Update the denoising model from either online rollout feedback or offline batch
+supervision.
 
 ### Input / Output
 
 | | Description |
 |---|---|
-| **Input** | `List[BaseSample]` with advantages, trajectories, and log-probs stored |
+| **Online input** | `List[BaseSample]` with advantages, trajectories, and log-probs stored |
+| **Offline input** | One collated demonstration or preference batch plus on-the-fly encoded clean output state |
 | **Output** | Updated model parameters; logged loss metrics |
 
 ### How It Works (GRPO)
@@ -442,6 +508,23 @@ def optimize(self, samples):
 
 > **`shuffle_samples` and on-policy ratio**: the optimize loop reorders `samples` each inner epoch (`train.shuffle_samples: true`, the default). For adapters whose batched `forward()` is *pack-composition-dependent* (e.g. Bagel NaViT packing), this makes a training micro-batch pack a different sample set than its rollout pack, so the on-policy `ratio != 1`. Set `train.shuffle_samples: false` for such adapters (with matched sampling/training `per_device_batch_size`) so each micro-batch reproduces its rollout pack. See the train-inference consistency topic doc.
 
+### Offline Batch Optimization
+
+SFT and offline DPO implement `optimize_batch(batch)` directly. For each dataloader batch they:
+
+1. Move cached input conditions to the model device.
+2. Decode target candidates on the CPU and call the adapter's output-state codec, which performs
+   on-the-fly VAE encoding without gradients.
+3. Sample the configured number of independent flow-matching timesteps and average their loss
+   terms inside this one microstep.
+4. Accumulate gradients across exactly `train.gradient_accumulation_steps` dataloader batches,
+   then run the shared optimizer-step helper.
+
+SFT minimizes flow-matching error for the demonstration target. Offline DPO encodes chosen and
+rejected candidates under the same condition and applies the shared pairwise DPO objective against
+the frozen reference parameters. The online trainer key `dpo` remains a rollout algorithm;
+`offline-dpo` is a separate finite-dataset trainer.
+
 ### Algorithm-Specific Optimization
 
 | Algorithm | Optimization Strategy |
@@ -452,7 +535,9 @@ def optimize(self, samples):
 | **AWM** | Samples fresh timesteps; weights velocity matching loss by advantage; PPO clipping + EMA-KL regularization |
 | **DGPO** | Samples fresh timesteps via `TimeSampler`; applies group-level preference objective with optional PPO clipping and EMA-reference KL |
 | **CRD** | Samples fresh timesteps; reward distillation against CFG-guided teacher with adaptive KL; old/sampling model snapshots and centered advantages |
-| **DPO** | Preference loss on chosen/rejected pairs; pairs formed at the start of `optimize` after advantages |
+| **DPO** | Online preference loss; pairs formed from rollout advantages at the start of `optimize` |
+| **SFT** | Offline flow matching against one demonstration target per record |
+| **Offline DPO** | Offline pairwise objective over dataset-provided chosen/rejected targets and a frozen reference |
 
 ### Optimizer Configuration
 
@@ -569,6 +654,8 @@ unverified; use DDP or FSDP.
 
 - **Inner epochs**: Samples can be reused for multiple optimization passes (`num_inner_epochs`), amortizing the cost of sampling.
 - **Gradient accumulation**: The `accelerator.accumulate()` context handles gradient accumulation across timesteps and micro-batches, with optimizer steps only at sync boundaries.
+- **Offline cadence**: Offline EMA and per-update hooks run on each successful optimizer step;
+  save/eval boundaries and outer-cycle hooks remain data-epoch based.
 - **KL regularization**: Optional penalty keeping the policy close to a reference model (or EMA model for AWM), preventing reward hacking.
 - **Per-timestep iteration**: GRPO iterates over each stored trajectory timestep, computing loss at each. NFT, AWM, DGPO, and CRD sample fresh timesteps independently of the sampling trajectory.
 

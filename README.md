@@ -4,7 +4,7 @@
 <h1 align="center">Flow-Factory</h1>
 
 <p align="center">
-  <b>Easy Reinforcement Learning for Diffusion and Flow-Matching Models</b>
+  <b>Unified Online RL and Offline Fine-Tuning for Diffusion and Flow-Matching Models</b>
 </p>
 
 # 🔥 News
@@ -109,7 +109,9 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
 
 | Algorithm      | `trainer_type` | Paper |
 |----------------|----------------|-------|
-| DPO            | dpo            | [Diffusion-DPO](https://arxiv.org/abs/2311.12908) |
+| SFT            | sft            | Supervised flow matching on demonstration media |
+| Offline DPO    | offline-dpo    | [Diffusion-DPO](https://arxiv.org/abs/2311.12908) on stored preference pairs |
+| Online DPO     | dpo            | [Diffusion-DPO](https://arxiv.org/abs/2311.12908) with online reward-ranked rollouts |
 | GRPO           | grpo           | [Flow-GRPO](https://arxiv.org/abs/2505.05470) / [Dance-GRPO](https://arxiv.org/abs/2505.07818) |
 | DiffusionNFT   | nft            | [DiffusionNFT](https://arxiv.org/abs/2509.16117) |
 | AWM            | awm            | [Advantage Weighted Matching](https://arxiv.org/abs/2509.25050) |
@@ -194,7 +196,7 @@ We provide a set of guidance documents to help you understand the framework and 
 | Document | Description |
 |---|---|
 | [Workflow](guidance/workflow.md) | End-to-end training pipeline: the overall stages from data preprocessing to policy optimization |
-| [Algorithms](guidance/algorithms.md) | Supported algorithms (GRPO, GRPO-Guard, DPPO, DiffusionNFT, AWM, DPO, DGPO, CRD, DiffusionOPD, DMD2, TDM, TDM-R1) and their configurations |
+| [Algorithms](guidance/algorithms.md) | Supported online and offline algorithms, including SFT, offline DPO, GRPO, online DPO, and distillation methods |
 | [Rewards](guidance/rewards.md) | Reward model system: built-in models, custom rewards, and remote reward servers |
 | [Datasets](guidance/datasets.md) | Dataset schemas, media paths, and ordered-reference inputs |
 | [New Model](guidance/new_model.md) | How to add support for a new Diffusion/Flow-Matching model |

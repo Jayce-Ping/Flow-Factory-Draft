@@ -15,6 +15,10 @@
 
 - [DPPO](#dppo)
 
+- [SFT](#sft)
+
+- [Offline DPO](#offline-dpo)
+
 - [DPO](#dpo)
 
 - [DGPO](#dgpo)
@@ -37,12 +41,15 @@
 
 ## Overview
 
-Flow-Factory provides unified implementations of state-of-the-art RL algorithms for flow-matching models. All algorithms share the same model adapter and reward interfaces, enabling direct comparison under controlled conditions.
+Flow-Factory provides unified online RL, offline supervised, preference, and distillation training
+for flow-matching models. All algorithms share model-state and execution contracts while keeping
+dataset acquisition, model I/O, and the objective independently extensible.
 
 At a high level, the supported algorithms fall into three paradigms:
 
 - **Coupled paradigm (GRPO and variants)**: Training timesteps are coupled with the SDE-based sampling dynamics, requiring tractable log-probability computation for policy gradient optimization.
-- **Decoupled paradigm (DPO, DiffusionNFT, AWM, DGPO, CRD, TDM-R1)**: Training timesteps are decoupled from the actual sampling dynamics, making them inherently solver-agnostic.
+- **Offline flow matching (SFT and offline DPO)**: Finite demonstration/preference datasets provide clean target media; training timesteps are sampled independently of any rollout solver.
+- **Decoupled online paradigm (DPO, DiffusionNFT, AWM, DGPO, CRD, TDM-R1)**: Training timesteps are decoupled from the actual sampling dynamics, making them inherently solver-agnostic.
 - **Distillation paradigm (DiffusionOPD, DMD2, TDM)**: Students match flow-matching targets. DiffusionOPD uses a teacher; DMD2 and TDM keep a fake score on one model bundle and update it before the generator.
 
 DMD2, TDM, and TDM-R1 update fake first. TDM-R1 then updates the surrogate
@@ -190,7 +197,61 @@ train:
 
 Like GRPO, DPPO is **coupled** and must use SDE dynamics (`Flow-SDE`, `Dance-SDE`, `CPS`). `DPPOTrainingArguments` does not inherit `GRPOTrainingArguments` (no `clip_range`) — its field set is intentionally minimal. When `kl_beta > 0`, the KL-vs-reference term is evaluated at `kl_guidance_scale`; this is reflected in `DPPOTrainingArguments.get_preprocess_guidance_scale()` so negative prompts are encoded at preprocessing whenever `kl_guidance_scale > 1.0`. Example configs: `examples/dppo/lora/{flux2_klein_base,sd3_5}/geneval2_{single,multi}.yaml`.
 
+## SFT
+
+SFT (`trainer_type: sft`) performs ordinary flow-matching supervision on finite V2
+`demonstration` records. It does not generate rollouts and does not use rewards or advantages. For
+each dataloader microbatch, the adapter encodes target media on the fly, samples `T` independent
+training coordinates per sample, and averages the `T` velocity-MSE terms before one backward pass.
+`num_train_timesteps` therefore controls Monte Carlo loss terms, not gradient accumulation.
+
+```yaml
+train:
+  trainer_type: sft
+  max_epochs: 2
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 4
+  num_train_timesteps: 1
+  weighting_scheme: logit_normal
+  timestep_range: 0.99
+```
+
+One epoch is one complete traversal of the official distributed dataloader. Optimizer steps are a
+separate counter and occur only at gradient-accumulation sync boundaries. Target media is decoded
+and VAE-encoded again when revisited; only input conditions such as prompt embeddings are cached.
+The selected adapter must provide both a pipeline I/O contract and an output-state codec. SD3.5
+text-to-image is the first shipped concrete implementation.
+
+## Offline DPO
+
+Offline DPO (`trainer_type: offline-dpo`) consumes V2 `preference` records directly. Chosen and
+rejected candidates share the same input condition, training coordinate, and forward-process noise.
+For each of `T` independently sampled coordinates, it evaluates current-policy and frozen-reference
+velocity errors for both arms, applies the nonlinear Diffusion-DPO objective, and then averages the
+`T` scalar objectives. Averaging arm MSEs before the nonlinear objective is not equivalent and is
+intentionally not used.
+
+```yaml
+train:
+  trainer_type: offline-dpo
+  max_epochs: 1
+  beta: 2000.0
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 2
+  num_train_timesteps: 1
+  weighting_scheme: logit_normal
+  ref_param_device: cpu
+```
+
+Offline DPO does not run reward models and does not form pairs from a sampled group—the pair is the
+dataset record. LoRA uses the adapter-disabled base policy as reference; full-parameter training
+uses a frozen parameter snapshot. Resume checkpoints must restore training progress and any
+materialized EMA/reference state rather than rebuilding a reference from the resumed policy.
+
 ## DPO
+
+This section describes the existing **online** DPO implementation (`trainer_type: dpo`). For DPO
+over stored chosen/rejected media, use [offline DPO](#offline-dpo).
 
 DPO (Direct Preference Optimization) [[11]](#ref11) is a **decoupled** algorithm that optimises a pairwise preference loss on flow-matching velocity targets. Instead of per-sample policy-gradient ratios, it forms chosen/rejected pairs within each group (based on per-sample advantages), then minimises a Bradley-Terry preference loss over the DSM errors of the two policies (current vs. frozen reference). To use this algorithm, set:
 

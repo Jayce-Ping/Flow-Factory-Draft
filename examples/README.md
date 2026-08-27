@@ -10,7 +10,7 @@ examples/{algorithm}/{finetune_type}/{model_type}/{variant}.yaml
 
 | Level | Description | Examples |
 |-------|-------------|---------|
-| `algorithm` | Training algorithm | `grpo`, `dppo`, `nft`, `awm`, `dgpo`, `dpo`, `crd`, `opd`, `dmd2`, `tdm`, `tdm_r1` |
+| `algorithm` | Training algorithm | `grpo`, `dppo`, `nft`, `awm`, `dgpo`, `dpo`, `sft`, `offline_dpo`, `crd`, `opd`, `dmd2`, `tdm`, `tdm_r1` |
 | `finetune_type` | Parameter-efficient or full | `lora`, `full` |
 | `model_type` | Model family (underscore-separated) | `flux1`, `sd3_5`, `wan21`, `ltx2` |
 | `variant` | Config variant | `default.yaml`, `nocfg.yaml`, `t2v.yaml` |
@@ -23,6 +23,18 @@ examples/{algorithm}/{finetune_type}/{model_type}/{variant}.yaml
 ```bash
 ff-train examples/grpo/lora/flux1/default.yaml
 ```
+
+## Offline smoke examples
+
+- [`sft` with SD3.5](sft/lora/sd3_5/default.yaml) consumes the strict V2
+  demonstration fixture in [`dataset/offline_sft_example`](../dataset/offline_sft_example).
+- [`offline-dpo` with SD3.5](offline_dpo/lora/sd3_5/default.yaml) consumes the strict V2
+  preference fixture in [`dataset/offline_dpo_example`](../dataset/offline_dpo_example).
+
+Both recipes are deliberately small, single-process, FP32 correctness checks for macOS or CPU
+development. They disable evaluation, rewards, checkpointing, and EMA; they are not
+quality-training recipes. They use Hugging Face's public `hf-internal-testing/tiny-sd3-pipe`
+fixture; replace it with the intended SD3/SD3.5 checkpoint for real training.
 
 ## DMD2 and TDM
 

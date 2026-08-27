@@ -58,13 +58,19 @@ average all configured timestep loss terms within one dataloader-batch microstep
 
 ### 7. Coupled vs Decoupled Paradigm
 - **Coupled** (GRPO, GRPO-Guard, DPPO): Training timesteps are coupled with SDE-based sampling. Requires log-probability computation. Must use SDE dynamics (`Flow-SDE`, `Dance-SDE`, `CPS`).
-- **Decoupled** (online/offline DPO, NFT, AWM, DGPO, CRD): Training timesteps are decoupled from sampling. Can use any dynamics including `ODE`.
+- **Decoupled** (SFT, online/offline DPO, NFT, AWM, DGPO, CRD): Training timesteps are decoupled from sampling or dataset acquisition. Can use any dynamics including `ODE`; SFT has no policy-ratio or reference-model requirement.
 - **Distillation** (`diffusion-opd`): On-policy multi-teacher distillation; dynamics-agnostic (ODE or SDE) and has no reward/advantage stage.
 
 Mixing paradigms (e.g., using `ODE` dynamics with `GRPO`) will produce incorrect gradients silently.
 
 ### 8. Component Offloading Lifecycle
-Text encoders and VAEs are loaded for Stage 1 (preprocessing), then offloaded to free VRAM before the training loop. They are reloaded for inference during sampling. Do not assume these components are always on-device.
+Input encoders are loaded for Stage 1 and may be offloaded after cached conditions are built. Online
+execution reloads the components required for inference. Offline target pixels/latents MUST NOT be
+preprocessed or cached: output-codec components such as the VAE remain runtime-available and encode
+each fetched target batch under `torch.no_grad()`. Do not assume identical component lifecycles
+across acquisition modes. Before offline input preprocessing or cache lookup, every normalized
+input and the preprocessor's grouped/ordered binding MUST be validated against the adapter's
+`PipelineIOContract`; unsupported media or negative prompts must never be silently dropped.
 
 ### 9. Accelerator `prepare()` Scope
 All target components (trainable **and** frozen-but-shardable) are bundled into a single `ModelBundle` (`models/model_bundle.py`) and prepared with the **optimizer** as one root via `accelerator.prepare()` — DeepSpeed (one engine) and FSDP2 (one root) cannot prepare multiple models separately. After prepare, each component is exposed as a `RoutedComponentProxy` that routes forwards through the bundle root; the optimizer/EMA/reference params still target only the `requires_grad` subset (frozen members are sharded for memory but never trained). Online train dataloaders use the framework's rank-aware grouped samplers; offline train dataloaders use PyTorch's official `DistributedSampler`, including for one-process execution. Neither train loader is passed to `accelerator.prepare()` or `prepare_data_loader()`, because both are already distributed and a second shard would duplicate or drop data. Eval dataloaders remain prepared with the model bundle and optimizer in the single root call.
@@ -74,6 +80,14 @@ All target components (trainable **and** frozen-but-shardable) are bundled into 
 
 ### 9b. Checkpoint Save/Load Symmetry Under the Bundle
 Checkpoints are written and read for **trainable members only** — components whose `target_module_map[name]` is non-empty (`adapter.trainable_component_names`). Frozen-but-shardable bundle members (e.g. Wan2.2's `transformer_2`, kept in `target_components` only to be FSDP-sharded for memory; see #9) map to `None` and are skipped by both `save_checkpoint` and `_load_lora`/`_load_full_model`. Loaders MUST iterate `trainable_component_names`, not `target_components`, or resume logs a spurious error for a per-component subdir that was never written. `resume_type='state'` restores via `accelerator.load_state` into the prepared bundle root and is therefore keyed to bundle membership — resuming into a different `target_components` / bundle composition will mismatch.
+
+Offline exact-state runtime v1 MUST NOT register an Accelerate custom checkpoint object because
+Accelerate loads those files through pickle. It uses an immutable staged JSON+safetensors sidecar
+and validates algorithm/model identity, canonical parameter ordering, optimizer groups, core
+artifact SHA-256 digests, RNG, and EMA/reference payloads before policy mutation. This exact-state
+path is single-process only. Distributed offline training MUST use model-only checkpoints until a
+collective atomic runtime format exists; state save/resume must fail fast rather than restore only a
+subset.
 
 ### 10. DeepSpeed ZeRO-3 Is Unsupported
 Supported distributed plans are DDP, FSDP, and DeepSpeed ZeRO-1/2. Reward model sharding under ZeRO-3 is broken even with DeepSpeed's own `zero.GatheredParameters` context manager, and parameter sharding also breaks frozen-component synchronization. `validate_supported_distributed_plan` (`trainers/abc.py`) rejects it at `BaseTrainer.__init__`, before any weights load, and `config/deepspeed/` ships no ZeRO-3 profile. Multi-role training narrows this further: `_validate_multirole_backend` requires ZeRO-1/2 and, under FSDP2, `use_orig_params=True`.
@@ -99,7 +113,9 @@ optimizer/preparation, feedback runtime, and model lifecycle.
 `_after_training_cycle()`. Online
 `DPOTrainer` forms chosen/rejected pairs at the start of `optimize()`. **Offline epoch order**:
 official `DistributedSampler.set_epoch(data_epoch)` → exhaust the finite dataloader through
-`optimize_batch()` → shared EMA → `_after_training_cycle()` → increment `data_epoch`.
+`optimize_batch()` → `_after_training_cycle()` → increment `data_epoch`. Offline shared EMA and
+`_after_gradient_step()` use optimizer-step cadence; online shared EMA uses rollout-iteration
+cadence.
 
 **Trainer hierarchy**: New trainers MUST inherit directly from `BaseTrainer`. The only sanctioned exceptions are strict behavioral variants of GRPO that change only the per-step loss while reusing GRPO's sampling/advantage/eval machinery: `GRPOGuardTrainer → GRPOTrainer` (adds ratio-normalization) and `DPPOTrainer → GRPOTrainer` (replaces the PPO ratio-clip with a KL trust-region mask). Trainer-to-trainer inheritance creates fragile coupling; when in doubt, inherit from `BaseTrainer` and extract shared logic into helper methods. All reward-based trainers delegate advantage computation to `self.advantage_processor.compute_advantages()`. Reward-free online trainers MUST declare `ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT`; the shared feedback gate omits reward and advantage dispatch.
 
@@ -149,10 +165,17 @@ All config dataclasses live in `hparams/`. The top-level `Arguments` aggregates 
 3. Any code that accesses `config.<field_name>`
 
 ### 16. Algorithm-Specific Training Args
-`TrainingArguments` has algorithm-specific subclasses (`GRPOTrainingArguments`, `DPPOTrainingArguments`, `DPOTrainingArguments`, `DGPOTrainingArguments`, `NFTTrainingArguments`, `AWMTrainingArguments`, `CRDTrainingArguments`, `DiffusionOPDTrainingArguments`). The correct subclass is resolved by `get_training_args_class()` (registry in `hparams/training_args/_registry.py`). Adding a new algorithm requires adding a corresponding subclass and updating the resolver.
+`TrainingArguments` has algorithm-specific subclasses, including separate `DPOTrainingArguments`
+for online DPO and `OfflineDPOTrainingArguments` for finite preference data, plus
+`SFTTrainingArguments` for demonstrations. The correct subclass is resolved by
+`get_training_args_class()` (registry in `hparams/training_args/_registry.py`). Adding a new
+algorithm requires a corresponding subclass and resolver entry.
 
 ### 17. YAML Config Structure
-Config keys must exactly match Pydantic field names. Typos fail silently with default values. See `examples/` for canonical config templates; structure defined in `hparams/args.py`.
+Config keys must exactly match Pydantic field names. Typos fail silently with default values. See
+`examples/` for canonical templates; structure is defined in `hparams/args.py`. Offline split JSONL
+uses strict schema version 2 and the public `type` discriminator; algorithm names never appear in
+the record schema.
 
 ---
 
