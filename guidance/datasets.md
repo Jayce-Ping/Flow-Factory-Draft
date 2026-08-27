@@ -116,6 +116,32 @@ The generic loader accepts `"audio"` or `"audios"` and resolves them against `au
 Only use these columns with an adapter that declares an audio input. MiniMax H3 Ref2VA instead
 places audio entries inside the ordered `"references"` array.
 
+## SenseNova-U1 datasets
+
+SenseNova-U1 1.0/1.5 supports prompt-only T2I and ordered multi-reference I2I.
+T2I can use the ordinary text or JSONL formats above; the
+[default GRPO recipe](../examples/grpo/lora/sensenova/default.yaml) uses OCR prompts.
+
+For I2I, each row uses the ordinary `"images"` list. List order is preserved and
+each sample may contain a different number and size of reference images:
+
+```jsonl
+{"prompt":"Combine these images together.","images":["first.png","second.png"]}
+{"prompt":"Combine these images together.","images":["style.png","subject.png","layout.png"]}
+```
+
+Prepare the 2–3-reference example dataset with:
+
+```bash
+python dataset/multi_ref_image/prepare.py
+```
+
+Then launch the
+[multi-reference GRPO recipe](../examples/grpo/lora/sensenova/multi_reference_image.yaml).
+The dataset cache stores ragged reference lists as PIL images. SenseNova builds a
+separate variable-length NEO-Unify prefix for each generated sample; it does not
+NaViT-pack independent samples like Bagel.
+
 ## MiniMax H3 datasets
 
 All three MiniMax H3 workflows require preprocessing and training batch size `B=1`. They do not use

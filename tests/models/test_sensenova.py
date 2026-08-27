@@ -133,6 +133,24 @@ def test_sensenova_example_uses_adapter_generation_parameters():
     assert "img_cfg_scale" not in config.eval_args.extra_kwargs
 
 
+def test_sensenova_multi_reference_example_uses_ordered_i2i_parameters():
+    """The I2I recipe uses canonical dual guidance and the multi-ref dataset."""
+    config_path = (
+        Path(__file__).parents[2]
+        / "examples/grpo/lora/sensenova/multi_reference_image.yaml"
+    )
+    config = Arguments.load_from_yaml(str(config_path))
+    dataset = config.data_args.datasets[0]
+
+    assert dataset.name == "multi_reference_image"
+    assert dataset.dataset_dir == "dataset/multi_ref_image"
+    assert config.training_args.guidance_scale == 1.0
+    assert config.training_args.extra_kwargs["image_guidance_scale"] == 1.0
+    assert config.eval_args.guidance_scale == 3.0
+    assert config.eval_args.extra_kwargs["image_guidance_scale"] == 1.5
+    assert config.eval_args.extra_kwargs["cfg_norm"] == "global"
+
+
 @pytest.mark.parametrize("use_pixel_head", [False, True])
 def test_sensenova_denoiser_supports_u1_heads(use_pixel_head: bool):
     """U1.0 and U1.5 head variants produce a valid native patch velocity."""

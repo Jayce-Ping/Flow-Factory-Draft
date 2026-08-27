@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Flow-Factory adapter for SenseNova-U1 1.0 and 1.5 checkpoints."""
+"""SenseNova-U1 1.0/1.5 adapter for T2I and ordered multi-reference I2I."""
 
 from __future__ import annotations
 
@@ -67,7 +67,7 @@ class SenseNovaI2ISample(I2ISample):
 
 
 class SenseNovaAdapter(BaseAdapter):
-    """Support SenseNova-U1 1.0 and U1.5 text/image-to-image generation.
+    """Support SenseNova-U1 1.0/1.5 T2I and ordered multi-reference I2I.
 
     The two checkpoints use the same NEO-Unify backbone and differ primarily in
     their flow-matching output head.  The vendored model reads ``use_pixel_head``
@@ -76,7 +76,14 @@ class SenseNovaAdapter(BaseAdapter):
     The adapter follows the official NEO-Unify image-prefill contract for I2I:
     each ordered reference image is inserted into the prompt as a visual-token
     block, then the generated image is denoised against text+image, image-only,
-    and optional unconditional KV caches.
+    and optional unconditional KV caches. Ragged reference-image batches remain
+    nested PIL lists and are evaluated one generated sample at a time rather than
+    using Bagel-style packed attention across independent samples.
+
+    NEO-Unify owns text tokenization, vision encoding, and pixel-space flow
+    matching inside one composite model. Consequently the component runtime
+    declares only ``transformer`` (the ``SenseNovaDenoiser`` wrapper), with no
+    standalone Flow-Factory VAE or text encoder.
     """
 
     # Reference images have variable spatial sizes/counts and are re-encoded at
@@ -108,7 +115,11 @@ class SenseNovaAdapter(BaseAdapter):
 
     @property
     def default_target_modules(self) -> List[str]:
-        """Default LoRA targets for NEO-Unify generation branches and heads."""
+        """Return the union of U1.0/U1.5 generation LoRA targets.
+
+        PEFT matches only modules present in the loaded checkpoint: U1.0 uses the
+        MLP ``fm_head`` targets while U1.5 uses the pixel-head convolution targets.
+        """
         return [
             "q_proj_mot_gen",
             "k_proj_mot_gen",
@@ -586,7 +597,7 @@ class SenseNovaAdapter(BaseAdapter):
         cfg_norm: str,
         step_index: Optional[int],
     ) -> torch.Tensor:
-        """Apply the official two-scale text/image CFG combination."""
+        """Apply official dual CFG using text and image guidance scales."""
         if image_condition is None and uncondition is None:
             return condition
         if image_condition is None:
@@ -676,7 +687,17 @@ class SenseNovaAdapter(BaseAdapter):
         condition_images: Optional[MultiImageBatch] = None,
         **kwargs: Any,
     ) -> FlowMatchEulerDiscreteSDESchedulerOutput:
-        """Predict one transition and optionally evaluate its SDE log probability."""
+        """Predict one transition and optionally evaluate its SDE log probability.
+
+        A leading batch is accepted, but independent samples are processed
+        sequentially with separate variable-length prefix caches and B=1 denoiser
+        calls. Prebuilt ``past_key_values`` and companion cache arguments describe
+        one sample and are therefore intended for B=1 inference replay.
+
+        ``guidance_scale`` controls text CFG. ``image_guidance_scale`` controls the
+        image branch for I2I and is ignored for T2I. Both are non-negative; ``1.0``
+        disables the corresponding guidance delta.
+        """
         if return_kwargs is None:
             return_kwargs = [
                 "velocity",
@@ -882,7 +903,12 @@ class SenseNovaAdapter(BaseAdapter):
         """Generate T2I or ordered multi-reference I2I samples.
 
         ``condition_images`` is a nested per-sample batch, and each inner list
-        may contain one or more reference images.
+        may contain one or more reference images. Prompts are generated
+        sequentially with one prefix cache and denoising loop per sample; output
+        order matches prompt order.
+
+        ``guidance_scale`` controls text CFG. ``image_guidance_scale`` is I2I-only
+        image guidance; ``1.0`` disables the corresponding guidance delta.
         """
         if prompt is None:
             raise ValueError("SenseNovaAdapter.inference requires `prompt`.")
