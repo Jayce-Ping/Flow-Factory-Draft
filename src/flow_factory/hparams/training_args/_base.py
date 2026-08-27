@@ -40,6 +40,14 @@ class EvaluationArguments(ArgABC):
         default=None,
         metadata={"help": "Width for evaluation. If None, use the second element of `resolution`."},
     )
+    num_frames: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of output frames for video-capable model evaluation."},
+    )
+    frame_rate: Optional[float] = field(
+        default=None,
+        metadata={"help": "Output video frame rate for model evaluation."},
+    )
     per_device_batch_size: int = field(
         default=1,
         metadata={"help": "Batch size per device for evaluation."},
@@ -130,6 +138,14 @@ class TrainingArguments(ArgABC):
         metadata={
             "help": "Width for sampling and training. If None, use the second element of `resolution`."
         },
+    )
+    num_frames: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of output frames for video-capable model sampling and training."},
+    )
+    frame_rate: Optional[float] = field(
+        default=None,
+        metadata={"help": "Output video frame rate for model sampling and training."},
     )
 
     # --- Sampling and training ---

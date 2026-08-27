@@ -5,8 +5,7 @@ verification claims.
 
 ## Dependency and workflows
 
-Required diffusers commit:
-`4e0466f3e5260f0d78b5e2b68ffbf27d819cc6db`.
+Required dependency: `diffusers>=0.40.0`.
 
 | Registry key | Workflow input | Trainable component |
 |---|---|---|
@@ -14,7 +13,7 @@ Required diffusers commit:
 | `minimax-h3-fl2va` | prompt plus first frame, optionally last frame | `transformer` |
 | `minimax-h3-ref2va` | prompt plus ordered heterogeneous references | `transformer_ref` |
 
-The feature probe must validate pinned public symbols, workflow maps, block call surfaces,
+The feature probe must validate public symbols, workflow maps, block call surfaces,
 row-timestep construction, reference constructors, and modular APIs. A no-weight
 `from_config`/component-spec/workflow build proves API compatibility only.
 

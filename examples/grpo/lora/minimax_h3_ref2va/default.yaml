@@ -1,4 +1,4 @@
-# This configuration is schema- and API-validated against the pinned diffusers commit.
+# This configuration is schema- and API-validated against diffusers>=0.40.0.
 # It has not been run with the 61 GB checkpoint and is not a claim of training quality,
 # memory fit, generated-media parity, numerical parity, or hardware validation.
 # MiniMax H3 requires B=1 and has no CFG; guidance must remain neutral at 1.0.

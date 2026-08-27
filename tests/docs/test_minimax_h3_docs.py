@@ -26,7 +26,7 @@ def _text(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
 
 
-def test_readme_documents_h3_links_pin_and_limits() -> None:
+def test_readme_documents_h3_links_dependency_and_limits() -> None:
     text = _text("README.md")
     assert (
         "The configurations under `examples/` have been verified to yield measurable "
@@ -48,7 +48,7 @@ def test_readme_documents_h3_links_pin_and_limits() -> None:
         assert (ROOT / link).is_file()
 
     for required in (
-        "4e0466f3e5260f0d78b5e2b68ffbf27d819cc6db",
+        "diffusers>=0.40.0",
         "pip install -e .",
         "PyAV >=18.0.0",
         "B=1",
@@ -60,7 +60,6 @@ def test_readme_documents_h3_links_pin_and_limits() -> None:
         "N + 1 states",
         "30B",
         "completed long-run reward trend is not claimed",
-        "pip install 'diffusers @ git+https://github.com/huggingface/diffusers.git@",
         "[Datasets](guidance/datasets.md)",
     ):
         assert required in text

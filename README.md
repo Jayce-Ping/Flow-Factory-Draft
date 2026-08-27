@@ -13,9 +13,9 @@
   [text-to-audio-video](examples/grpo/lora/minimax_h3_t2va/debug.yaml),
   [first/last-frame-to-audio-video](examples/grpo/lora/minimax_h3_fl2va/default.yaml), and
   [ordered-reference-to-audio-video](examples/grpo/lora/minimax_h3_ref2va/default.yaml)
-  workflows with GRPO + LoRA. H3 requires a pinned diffusers commit:
+  workflows with GRPO + LoRA. H3 requires diffusers 0.40.0 or newer:
 ```bash
-pip install 'diffusers @ git+https://github.com/huggingface/diffusers.git@4e0466f3e5260f0d78b5e2b68ffbf27d819cc6db'
+pip install 'diffusers>=0.40.0'
 pip install -e .
 ```
 
@@ -153,9 +153,8 @@ pip install -e .[deepspeed]
 
 > **Note**: The Bagel adapter requires `flash-attn` (>= 2.5.8) and `opencv-python`. Install them with `pip install -e .[bagel]` (the `[bagel]` extra is intentionally not part of `[all]` because flash-attn is heavy to build).
 
-> **Dependency pin:** MiniMax H3 requires the unreleased modular APIs at diffusers
-> commit `4e0466f3e5260f0d78b5e2b68ffbf27d819cc6db`. PyAV >=18.0.0 decodes ordered
-> video/audio references.
+> **Dependency:** MiniMax H3 requires `diffusers>=0.40.0`. PyAV >=18.0.0 decodes
+> ordered video/audio references.
 
 > **Note**: Some models (e.g., LTX-2) require pipeline code not yet released in the official `diffusers` package. For these models, install the bundled diffusers submodule:
 > ```bash

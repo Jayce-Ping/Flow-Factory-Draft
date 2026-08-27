@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar, Mapping, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, Tuple, cast
 
 from ..optimizer_args import AdamWOptimizerArguments
 from ._base import TrainingArguments
@@ -143,39 +143,6 @@ class DMD2TrainingArguments(TrainingArguments):
                 f"0 <= lower < upper <= 1, received {(lower, upper)!r}"
             )
         self.perturbation_timestep_range = (lower, upper)
-
-    @classmethod
-    def from_dict(cls, values: Mapping[str, Any]) -> DMD2TrainingArguments:
-        """Build algorithm arguments while forwarding model-specific fields.
-
-        Args:
-            values: User-provided training field mapping.
-
-        Returns:
-            Parsed DMD2 training arguments.
-        """
-        if not isinstance(values, Mapping):
-            raise TypeError(
-                "expected training arguments as a mapping, "
-                f"received {type(values).__name__}: {values!r}"
-            )
-        retired_fields = set(values) & {
-            "fake_optmizer",
-            "dfake_gen_update_ratio",
-            "fake_updates_per_generator",
-            "dm_loss_type",
-            "dm_step_scale",
-            "pseudo_huber_c_scale",
-            "surrogate_beta",
-            "generator_kl_beta",
-        }
-        if retired_fields:
-            raise ValueError(
-                f"{cls.__name__} retired field(s) {tuple(sorted(retired_fields))!r}; "
-                "remove obsolete controls, configure role optimizers under top-level "
-                "`optimizers`, and use train.ttur_fake_updates for the fake-first TTUR count"
-            )
-        return super().from_dict(dict(values))
 
     def role_update_plan(self) -> "RoleUpdatePlan":
         """Return fake TTUR phases followed by one generator phase."""

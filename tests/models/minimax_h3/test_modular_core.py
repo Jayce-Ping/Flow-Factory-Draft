@@ -967,13 +967,13 @@ def test_decode_preserves_upstream_output_type_validation(monkeypatch):
         )
 
 
-def test_dependency_probe_error_names_pin(monkeypatch):
+def test_dependency_probe_error_names_minimum_release(monkeypatch):
     from flow_factory.models.minimax_h3 import dependency
 
     monkeypatch.setattr(dependency, "_SYMBOLS", None)
     import_error = ImportError("missing")
     monkeypatch.setattr(dependency, "_IMPORT_ERROR", import_error)
-    with pytest.raises(ImportError, match="4e0466f3e5260f0d78b5e2b68ffbf27d819cc6db") as raised:
+    with pytest.raises(ImportError, match=r"diffusers>=0\.40\.0") as raised:
         dependency.require_minimax_h3_support()
     assert raised.value.__cause__ is import_error
 
@@ -1007,7 +1007,7 @@ def test_dependency_probe_rejects_incompatible_workflow_triggers(monkeypatch, wo
 
     with pytest.raises(ImportError, match=rf"MiniMaxH3Blocks.*{workflow}") as raised:
         dependency.require_minimax_h3_support()
-    assert dependency.MINIMAX_H3_DIFFUSERS_COMMIT in str(raised.value)
+    assert dependency.MINIMAX_H3_DIFFUSERS_MIN_VERSION in str(raised.value)
     assert dependency.MINIMAX_H3_INSTALL in str(raised.value)
 
 
@@ -1036,7 +1036,9 @@ def test_dependency_probe_rejects_block_without_pipeline_state_call_contract(mon
         "SetTimestepsStep",
     ],
 )
-def test_dependency_probe_rejects_incompatible_api_with_actionable_pin(monkeypatch, broken_field):
+def test_dependency_probe_rejects_incompatible_api_with_actionable_requirement(
+    monkeypatch, broken_field
+):
     from flow_factory.models.minimax_h3 import dependency
 
     bundle = dataclasses.replace(FakeSymbols(), **{broken_field: object})
@@ -1047,16 +1049,13 @@ def test_dependency_probe_rejects_incompatible_api_with_actionable_pin(monkeypat
         dependency.require_minimax_h3_support()
 
     message = str(raised.value)
-    assert "4e0466f3e5260f0d78b5e2b68ffbf27d819cc6db" in message
-    assert "pip install 'diffusers @ git+https://github.com/huggingface/diffusers.git@" in message
+    assert "diffusers>=0.40.0" in message
+    assert "pip install 'diffusers>=0.40.0'" in message
     assert broken_field in message
 
 
-def test_pyproject_pins_exact_h3_diffusers_revision():
+def test_pyproject_requires_released_h3_diffusers():
     text = Path("pyproject.toml").read_text()
-    requirement = (
-        "diffusers @ git+https://github.com/huggingface/diffusers.git@"
-        "4e0466f3e5260f0d78b5e2b68ffbf27d819cc6db"
-    )
+    requirement = "diffusers>=0.40.0"
     assert text.count(requirement) == 1
-    assert '"diffusers>=0.37.0"' not in text
+    assert "git+https://github.com/huggingface/diffusers.git@" not in text

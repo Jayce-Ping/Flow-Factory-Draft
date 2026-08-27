@@ -159,29 +159,19 @@ def test_per_role_optimizers_parse_from_the_top_level_list() -> None:
     assert surrogate.learning_rate == 6e-5
 
 
-@pytest.mark.parametrize(
-    "train_overrides,match",
-    [
-        ({"fake_optmizer": {"learning_rate": 1e-5}}, "fake_optmizer"),
-        ({"fake_updates_per_generator": 3}, "fake_updates_per_generator"),
-        ({"perturbation_timestep_range": [False, True]}, "perturbation_timestep_range"),
-        ({"dfake_gen_update_ratio": 0}, "dfake_gen_update_ratio"),
-        ({"dfake_gen_update_ratio": 1.5}, "dfake_gen_update_ratio"),
-    ],
-)
-def test_multirole_config_rejects_retired_mistyped_or_invalid_fields(
-    train_overrides: dict,
-    match: str,
-) -> None:
-    with pytest.raises((TypeError, ValueError), match=match):
-        _parse_train("dmd2", train_overrides=train_overrides)
+def test_multirole_config_rejects_invalid_declared_fields() -> None:
+    with pytest.raises((TypeError, ValueError), match="perturbation_timestep_range"):
+        _parse_train(
+            "dmd2",
+            train_overrides={"perturbation_timestep_range": [False, True]},
+        )
 
 
 @pytest.mark.parametrize(
     "args_cls",
     [DMD2TrainingArguments, TDMTrainingArguments, TDMR1TrainingArguments],
 )
-def test_multirole_training_args_forward_model_inference_fields(args_cls) -> None:
+def test_multirole_training_args_declare_shared_model_inference_fields(args_cls) -> None:
     args = args_cls.from_dict(
         {
             "num_frames": 124,
@@ -190,11 +180,9 @@ def test_multirole_training_args_forward_model_inference_fields(args_cls) -> Non
         }
     )
 
-    assert args.extra_kwargs == {
-        "num_frames": 124,
-        "frame_rate": 24.0,
-        "timestep_shift": 3.0,
-    }
+    assert args.num_frames == 124
+    assert args.frame_rate == 24.0
+    assert args.extra_kwargs == {"timestep_shift": 3.0}
     assert dict(args)["num_frames"] == 124
     assert dict(args)["frame_rate"] == 24.0
     assert dict(args)["timestep_shift"] == 3.0
@@ -204,13 +192,14 @@ def test_multirole_training_args_forward_model_inference_fields(args_cls) -> Non
     "field_name",
     ["surrogate_beta", "generator_kl_beta", "dm_step_scale", "dm_loss_type"],
 )
-def test_tdm_r1_rejects_removed_generalized_fields(field_name: str) -> None:
-    with pytest.raises(ValueError, match=field_name):
-        _parse_train(
-            "tdm-r1",
-            train_overrides={"group_size": 2, field_name: 1.0},
-            rewards=[{"name": "score", "reward_model": "clip"}],
-        )
+def test_tdm_r1_forwards_undeclared_fields_through_extra_kwargs(field_name: str) -> None:
+    config = _parse_train(
+        "tdm-r1",
+        train_overrides={"group_size": 2, field_name: 1.0},
+        rewards=[{"name": "score", "reward_model": "clip"}],
+    )
+
+    assert config.training_args.extra_kwargs[field_name] == 1.0
 
 
 def test_role_plans_and_base_trainer_config_seams_are_exact() -> None:
