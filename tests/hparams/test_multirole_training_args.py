@@ -169,12 +169,35 @@ def test_per_role_optimizers_parse_from_the_top_level_list() -> None:
         ({"dfake_gen_update_ratio": 1.5}, "dfake_gen_update_ratio"),
     ],
 )
-def test_multirole_config_rejects_unknown_or_mistyped_fields(
+def test_multirole_config_rejects_retired_mistyped_or_invalid_fields(
     train_overrides: dict,
     match: str,
 ) -> None:
     with pytest.raises((TypeError, ValueError), match=match):
         _parse_train("dmd2", train_overrides=train_overrides)
+
+
+@pytest.mark.parametrize(
+    "args_cls",
+    [DMD2TrainingArguments, TDMTrainingArguments, TDMR1TrainingArguments],
+)
+def test_multirole_training_args_forward_model_inference_fields(args_cls) -> None:
+    args = args_cls.from_dict(
+        {
+            "num_frames": 124,
+            "frame_rate": 24.0,
+            "extra_kwargs": {"timestep_shift": 3.0},
+        }
+    )
+
+    assert args.extra_kwargs == {
+        "num_frames": 124,
+        "frame_rate": 24.0,
+        "timestep_shift": 3.0,
+    }
+    assert dict(args)["num_frames"] == 124
+    assert dict(args)["frame_rate"] == 24.0
+    assert dict(args)["timestep_shift"] == 3.0
 
 
 @pytest.mark.parametrize(

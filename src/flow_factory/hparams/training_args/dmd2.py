@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Mapping, Optional, Tuple, cast
 
 from ..optimizer_args import AdamWOptimizerArguments
@@ -146,7 +146,7 @@ class DMD2TrainingArguments(TrainingArguments):
 
     @classmethod
     def from_dict(cls, values: Mapping[str, Any]) -> DMD2TrainingArguments:
-        """Build strict algorithm arguments from a mapping.
+        """Build algorithm arguments while forwarding model-specific fields.
 
         Args:
             values: User-provided training field mapping.
@@ -159,31 +159,23 @@ class DMD2TrainingArguments(TrainingArguments):
                 "expected training arguments as a mapping, "
                 f"received {type(values).__name__}: {values!r}"
             )
-        expected_fields = {config_field.name for config_field in fields(cls) if config_field.init}
-        unknown_fields = set(values) - expected_fields
-        retired_fields = unknown_fields & {
+        retired_fields = set(values) & {
+            "fake_optmizer",
             "dfake_gen_update_ratio",
             "fake_updates_per_generator",
             "dm_loss_type",
             "dm_step_scale",
             "pseudo_huber_c_scale",
+            "surrogate_beta",
+            "generator_kl_beta",
         }
         if retired_fields:
             raise ValueError(
                 f"{cls.__name__} retired field(s) {tuple(sorted(retired_fields))!r}; "
-                "use train.ttur_fake_updates for the fake-first TTUR count"
+                "remove obsolete controls, configure role optimizers under top-level "
+                "`optimizers`, and use train.ttur_fake_updates for the fake-first TTUR count"
             )
-        if unknown_fields:
-            raise ValueError(
-                f"unknown {cls.__name__} field(s) {tuple(sorted(unknown_fields))!r}; "
-                f"expected {tuple(sorted(expected_fields))!r}"
-            )
-        explicit_extras = values.get("extra_kwargs")
-        if explicit_extras:
-            raise ValueError(
-                f"{cls.__name__} does not accept extra_kwargs; received {explicit_extras!r}"
-            )
-        return cls(**dict(values))
+        return super().from_dict(dict(values))
 
     def role_update_plan(self) -> "RoleUpdatePlan":
         """Return fake TTUR phases followed by one generator phase."""
