@@ -36,6 +36,11 @@ def test_main_readme_lists_sensenova_as_t2i_and_multi_reference_i2i() -> None:
     assert "SenseNova-U1 1.0" in combined_rows
     assert "SenseNova-U1 1.5" in combined_rows
     assert combined_rows.count("<td>sensenova</td>") == 2
+    assert "<td>17.55B total</td>" in combined_rows
+    assert "<td>17.53B total</td>" in combined_rows
+    assert "17,552,340,992 base parameters for U1 1.0" in readme
+    assert "17,532,854,464 for U1 1.5" in readme
+    assert "`8B-MoT` does not mean 8B total parameters" in readme
     assert "BAGEL-7B-MoT" in combined_rows
 
     dataset_docs = readme[readme.index("## Image-to-Image & Image-to-Video") :]
