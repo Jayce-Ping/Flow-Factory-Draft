@@ -255,7 +255,7 @@ def encode_image(
     """
 ```
 
-> **Important**: The `images` input follows the **multi-image batch** convention: `List[List[Image.Image]]`. Each sample can have zero, one, or multiple condition images. See [Data Format Conventions](#data-format-conventions) for details. Adapters that persist a returned image column as PIL (declare it in `python_format_columns`, e.g. Bagel's `condition_images`) may keep it as PIL; the dataset stores those columns via the HF Image feature and reads them back as PIL.
+> **Important**: The `images` input follows the **multi-image batch** convention: `List[List[Image.Image]]`. Each sample can have zero, one, or multiple condition images. See [Data Format Conventions](#data-format-conventions) for details. Adapters that persist a returned image column as PIL (declare it in `python_format_columns`, e.g. Bagel and SenseNova `condition_images`) may keep it as PIL; the dataset stores those columns via the HF Image feature and reads them back as PIL.
 
 #### `encode_video`
 
@@ -612,7 +612,7 @@ for example, has no standalone Flow-Factory VAE or text encoder.
 
 ### Design Pattern
 
-Many non-diffusers models (e.g., Bagel) are a **single composite `nn.Module`** that internally contains sub-modules (LLM, ViT, projectors, etc.). Unlike diffusers pipelines where components are independent top-level objects, these models have a deeply nested structure.
+Many non-diffusers models (e.g., Bagel and SenseNova) are a **single composite `nn.Module`** that internally contains sub-modules (LLM, ViT, projectors, etc.). Unlike diffusers pipelines where components are independent top-level objects, these models have a deeply nested structure.
 
 The key design pattern is to store the **full composite model** on the pipeline while creating **aliases** to its key sub-modules that `BaseAdapter` needs to manage (freeze, LoRA, prepare with accelerator):
 

@@ -22,6 +22,7 @@ from PIL import Image
 
 from flow_factory.hparams.args import Arguments
 from flow_factory.models.registry import get_model_adapter_class
+from flow_factory.models.runtime import PseudoPipelineRuntime
 from flow_factory.models.sensenova import sensenova as sensenova_module
 from flow_factory.models.sensenova.modeling.neo_unify.configuration_neo_chat import NEOChatConfig
 from flow_factory.models.sensenova.modeling.neo_unify.modeling_neo_chat import (
@@ -108,6 +109,21 @@ def _prefix_cache(model: NEOChatModel):
 def test_sensenova_registry_entry():
     """The public key resolves to the new adapter."""
     assert get_model_adapter_class("sensenova") is SenseNovaAdapter
+
+
+def test_sensenova_declares_unified_component_layout():
+    """SenseNova has one model component and no standalone VAE/text encoder."""
+    adapter = SenseNovaAdapter.__new__(SenseNovaAdapter)
+    runtime = PseudoPipelineRuntime(
+        SimpleNamespace(),
+        {"transformer": torch.nn.Identity()},
+    )
+
+    assert adapter.preprocessing_modules == []
+    assert adapter.inference_modules == ["transformer"]
+    assert runtime.declared_component_names == ["transformer"]
+    assert runtime.text_encoder_names == []
+    assert "vae" not in runtime.declared_component_names
 
 
 def test_sensenova_example_uses_adapter_generation_parameters():
