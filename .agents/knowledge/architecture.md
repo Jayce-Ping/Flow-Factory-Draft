@@ -42,9 +42,18 @@
 
 ---
 
-## Six-Stage Training Pipeline
+## Execution Contracts and Training Pipelines
 
 > Authoritative reference: `guidance/workflow.md`
+
+`ExecutionContract` keeps four axes orthogonal: example acquisition (`rollout` or `dataset`),
+outer-cycle unit (`rollout_iteration` or `data_epoch`), training feedback (`reward` or `none`), and
+loader distribution (`grouped_rollout` or `distributed_epoch`). Algorithm `paradigm` remains a
+separate declaration of gradient semantics.
+The fields remain separate dimensions, but unsupported combinations fail fast: dataset acquisition
+currently consumes batch supervision and rejects runtime reward feedback.
+
+### Online reward-based pipeline
 
 ```
 Stage 1: Data Preprocessing (offline, cached)
@@ -77,16 +86,22 @@ Stage 6: Policy Optimization
   │  Policy gradient (GRPO) or weighted matching (NFT/AWM) or DPO preference loss
   │  Gradient update via accelerator
   ▼
-  (Repeat Stages 2–6 for next epoch)
+  (Repeat Stages 2–6 for the next rollout iteration)
 ```
 
-**Trainer methods vs stages** (each epoch, after Stage 1):
+**Trainer methods vs stages** (each online rollout iteration, after Stage 1):
 
 | Method | Stages |
 |--------|--------|
 | `sample()` | 2–3 (K-repeat batches + `adapter.inference` trajectories) |
 | `prepare_feedback()` | 4–5: reward buffer finalize, `AdvantageProcessor` |
 | `optimize()` | 6: `adapter.forward` and optimizer step (DPO: form chosen/rejected pairs at entry, then loss) |
+
+Reward-free online distillation uses the same rollout driver but declares `feedback=none` and
+omits Stages 4–5. Offline trainers use `OfflineExecutionDriver`: call PyTorch
+`DistributedSampler.set_epoch(data_epoch)`, stream every finite dataloader batch through
+`optimize_batch()`, and advance `data_epoch` only after clean exhaustion. They never fake a
+sampling stage and never load an entire epoch into memory.
 
 ---
 
@@ -162,7 +177,7 @@ Configured via the `acceleration:` block (`hparams/acceleration_args.py`): two o
 
 - **New model adapter**: `guidance/new_model.md`, skill `/ff-new-model`, conventions `topics/adapter_conventions.md`
 - **New reward model**: `guidance/rewards.md`, skill `/ff-new-reward`
-- **New algorithm**: `guidance/algorithms.md`, skill `/ff-new-algorithm`. `BaseTrainer` owns the epoch loop (`start`), timestep sampling, feedback/advantages, the optimizer step and the velocity KL; only `optimize()` is abstract. Vary behavior through `sampling_context`, `_run_training_step`, `_after_gradient_step` and `_after_optimizer_step` rather than by restating the loop. An algorithm that trains several model copies declares them in `_declare_model_variants()` (`topics/component_variants.md`).
+- **New algorithm**: `guidance/algorithms.md`, skill `/ff-new-algorithm`. Declare an immutable `execution_contract` independently from `paradigm`. `BaseTrainer.start()` owns common cycle boundaries and delegates to the online or offline driver; online algorithms override `optimize(samples)`, while offline algorithms override `optimize_batch(batch)`. Vary online behavior through `sampling_context` and `_run_training_step`, per-update behavior through `_after_gradient_step`, and cycle behavior through `_after_training_cycle`. An algorithm that trains several model copies declares them in `_declare_model_variants()` (`topics/component_variants.md`).
 - **New accelerator**: subclass `acceleration/abc.py::BaseAccelerator` (declare `safety`/`stage`), register in `acceleration/registry.py`
 
 ---
@@ -286,7 +301,7 @@ Details: `topics/component_variants.md`.
 - **Async**: optional non-blocking computation
 
 ### Advantage Computation
-`AdvantageProcessor` (`advantage/advantage_processor.py`): communication-aware, auto-selects gather vs local path. Strategies: `"sum"` (GRPO) and `"gdpo"`. All reward-based trainers delegate to `self.advantage_processor.compute_advantages()`; the distillation trainer `diffusion-opd` is the exception (its `prepare_feedback()` is a no-op — no reward/advantage stage).
+`AdvantageProcessor` (`advantage/advantage_processor.py`): communication-aware, auto-selects gather vs local path. Strategies: `"sum"` (GRPO) and `"gdpo"`. All reward-based trainers delegate to `self.advantage_processor.compute_advantages()`. Reward-free online distillation trainers declare `ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT`; the shared feedback gate omits the entire reward/advantage stage.
 
 ### Configuration Hierarchy
 ```

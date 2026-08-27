@@ -4,7 +4,7 @@
 
 ---
 
-## Default Lifecycle
+## Default Reward-Based Online Lifecycle
 
 ```
 sample()
@@ -13,7 +13,7 @@ sample()
     self._maybe_offload_samples_to_cpu(sample_batch) # D2H if enabled, else no-op
     samples.extend(sample_batch)
     reward_buffer.add_samples(sample_batch)          # async tasks see deterministic state
-prepare_feedback(samples)
+prepare_feedback(samples)                               # only when contract feedback=reward
   reward_buffer.finalize(...)                        # reward path may H2D per model.device
   compute_advantages(...)
 optimize(samples)
@@ -85,7 +85,7 @@ for each micro-batch:
 
 Compared with the previous "eager precompute over ALL batches, then train all batches" design, this caps the precompute footprint to a single batch (the precomputed velocities were 5+ GB on FLUX1 1024² 32-batch in the eager design; tens of GB on Wan).
 
-Train-inference consistency invariant is preserved: `ema_step()` runs once per outer epoch in `start()`, so all batches within a single `optimize()` call see the same EMA snapshot regardless of interleave timing. RNG consumption order changes (per-batch vs upfront), so noise sequences are not bit-identical to the eager design — regression tests must use statistical metrics rather than numeric diffs.
+Train-inference consistency invariant is preserved: `ema_step()` runs once per online rollout iteration in `start()`, so all batches within a single `optimize()` call see the same EMA snapshot regardless of interleave timing. RNG consumption order changes (per-batch vs upfront), so noise sequences are not bit-identical to the eager design — regression tests must use statistical metrics rather than numeric diffs.
 
 ## `extra_kwargs` Device Asymmetry (Caveat)
 
@@ -104,7 +104,7 @@ If a future custom adapter stores large GPU tensors in `extra_kwargs`, either ha
 
 ## Cross-refs
 
-- `constraints.md` #11 (BaseTrainer hook order: `sample()` → `prepare_feedback()` → `optimize()`)
+- `constraints.md` #11 (online hook order: `sample()` → optional-by-contract `prepare_feedback()` → `optimize()`; offline execution uses `optimize_batch()`)
 - `constraints.md` #14 (BaseSample dataclass hierarchy and `_shared_fields`)
 - `constraints.md` #15 + `.cursor/rules/examples-yaml-sync.mdc` (the three-tier strategy is an intentional deviation)
 - `topics/train_inference_consistency.md` item #4 (EMA swap without restore — preserved by per-batch interleave)

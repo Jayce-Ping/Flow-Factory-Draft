@@ -34,6 +34,7 @@ from ...samples import (
     StackedSampleBatch,
 )
 from ..abc import BaseTrainer
+from ..execution import ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT
 from .dmd2 import DMD2Trainer
 from .distillation_runtime import (
     as_role_microbatches,
@@ -78,6 +79,7 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
     """Optimize every boundary of a deterministic few-step generator trajectory."""
 
     paradigm: ClassVar[Literal["distillation"]] = "distillation"
+    execution_contract = ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT
 
     def _optimizer_args_for_role(self, role_name: str):
         """Resolve this role's optimizer, falling back to TDM's published defaults.
@@ -125,7 +127,7 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
     def _run_training_step(self) -> None:
         """Run GAS distinct trajectory rollouts and one fake/generator phase pair.
 
-        Overriding only this keeps the shared epoch loop, so checkpointing and
+        Overriding only this keeps the shared rollout-iteration loop, so checkpointing and
         eval-time reward monitoring behave exactly as they do for every other
         trainer.
         """

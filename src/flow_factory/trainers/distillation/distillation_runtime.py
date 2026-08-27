@@ -702,7 +702,7 @@ def run_distillation_training_step(trainer: Any) -> None:
     ):
         with trainer.sampling_context():
             samples = trainer.sample()
-        trainer.prepare_feedback(samples)
+        trainer._prepare_training_feedback(samples)
         microbatches.append(samples)
     trainer.optimize(microbatches)
 

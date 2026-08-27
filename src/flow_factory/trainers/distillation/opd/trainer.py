@@ -39,7 +39,7 @@ Design (2-pass, per epoch):
                  forwards the student at the same x_j and matches its projected
                  target to the cached teacher target.
 
-This keeps teacher swaps to M-per-epoch, runs the gradient loop with student
+This keeps teacher swaps to M-per-rollout-iteration, runs the gradient loop with student
 params only (no autocast-cache disable, no DDP bypass), and reuses proven FF
 trajectory-replay primitives shared with GRPO.
 """
@@ -70,6 +70,7 @@ from ....utils.logger_utils import setup_logger
 from ....utils.trajectory_collector import compute_trajectory_indices
 from ...abc import BaseTrainer
 from ...common.forward_kwargs import replay_forward_kwargs
+from ...execution import ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT
 from .common import (
     TARGET_REQUEST_FIELDS,
     compute_structured_distillation_loss,
@@ -87,6 +88,7 @@ class DiffusionOPDTrainer(BaseTrainer):
     # Distillation paradigm: no reward/advantage stage and rollout log-probs do not
     # enter the loss, so lossy rollout acceleration is permitted (constraints.md #7).
     paradigm = "distillation"
+    execution_contract = ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)

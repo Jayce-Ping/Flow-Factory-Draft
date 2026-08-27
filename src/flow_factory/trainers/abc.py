@@ -15,7 +15,7 @@
 # src/flow_factory/trainers/abc.py
 import json
 import os
-from abc import ABC, abstractmethod
+from abc import ABC
 from collections import defaultdict
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
@@ -76,6 +76,16 @@ from ..utils.dist import gather_aligned_floating_tensors, reduce_loss_info
 from ..utils.logger_utils import setup_logger
 from ..utils.noise_schedule import TimeSampler
 from .common.sample_prefetch import iter_prefetched_batches
+from .execution import (
+    ONLINE_EXECUTION_CONTRACT,
+    AcquisitionMode,
+    CycleUnit,
+    ExecutionContract,
+    ExecutionDriver,
+    FeedbackMode,
+    TrainingProgress,
+    build_execution_driver,
+)
 from .multirole import (
     MultiRoleBackendValidationMixin,
     MultiRoleCheckpointingMixin,
@@ -103,6 +113,7 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
     # 'decoupled' / 'distillation' trainers may use them. Concrete trainers
     # MUST override this; leaving it None disables lossy acceleration.
     paradigm: ClassVar[Optional[Literal["coupled", "decoupled", "distillation"]]] = None
+    execution_contract: ClassVar[ExecutionContract] = ONLINE_EXECUTION_CONTRACT
 
     def __init__(
         self,
@@ -126,8 +137,11 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         )  # If `eval_reward_args` is not given, use `reward_args`
 
         self.adapter = adapter
-        self.epoch = 0
-        self.step = 0
+        self.progress = TrainingProgress()
+        self.execution_driver: ExecutionDriver = build_execution_driver(
+            type(self).execution_contract
+        )
+        self._validate_execution_hooks()
 
         self._initialization()
         self._initialize_snapshots()
@@ -154,15 +168,78 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         """Whether to show tqdm progress bars."""
         return self.log_args.verbose and self.accelerator.is_local_main_process
 
+    @property
+    def cycle_index(self) -> int:
+        """Return the completed outer-cycle count for this trainer."""
+        return self._get_progress().cycle_index(type(self).execution_contract.cycle_unit)
+
+    def _get_progress(self) -> TrainingProgress:
+        """Return initialized typed progress for normal and lightweight test trainers."""
+        progress = getattr(self, "progress", None)
+        if progress is None:
+            progress = TrainingProgress()
+            self.progress = progress
+        return progress
+
+    @property
+    def epoch(self) -> int:
+        """Return the legacy alias for the active execution cycle.
+
+        Online trainers map this alias to ``rollout_iteration``. Offline trainers map it to
+        ``data_epoch``, where one epoch means one complete finite dataloader traversal.
+        """
+        return self._get_progress().cycle_index(type(self).execution_contract.cycle_unit)
+
+    @epoch.setter
+    def epoch(self, value: int) -> None:
+        """Set the legacy execution-cycle alias.
+
+        Args:
+            value: Non-negative completed-cycle count.
+        """
+        progress = self._get_progress()
+        if type(self).execution_contract.cycle_unit is CycleUnit.ROLLOUT_ITERATION:
+            self.progress = replace(progress, rollout_iteration=value)
+        else:
+            self.progress = replace(progress, data_epoch=value)
+
+    @property
+    def step(self) -> int:
+        """Return the primary optimizer-step count."""
+        return self._get_progress().optimizer_step
+
+    @step.setter
+    def step(self, value: int) -> None:
+        """Set the primary optimizer-step count.
+
+        Args:
+            value: Non-negative number of completed primary optimizer updates.
+        """
+        progress = self._get_progress()
+        self.progress = replace(progress, optimizer_step=value)
+
+    def _validate_execution_hooks(self) -> None:
+        """Require the optimization hook selected by the execution contract."""
+        acquisition = type(self).execution_contract.acquisition
+        if acquisition is AcquisitionMode.ROLLOUT and type(self).optimize is BaseTrainer.optimize:
+            raise TypeError(f"online trainer {type(self).__name__} must override optimize(samples)")
+        if (
+            acquisition is AcquisitionMode.DATASET
+            and type(self).optimize_batch is BaseTrainer.optimize_batch
+        ):
+            raise TypeError(
+                f"offline trainer {type(self).__name__} must override optimize_batch(batch)"
+            )
+
     def _initialize_snapshots(self) -> None:
         """Initialize optional trainer-owned parameter snapshots before state resume."""
 
     def should_continue_training(self) -> bool:
-        """Outer epoch loop: continue unless a finite ``max_epochs`` has been reached."""
+        """Continue unless the execution cycle reaches finite ``max_epochs``."""
         m = self.training_args.max_epochs
         if m is None or m < 0:
             return True
-        return self.epoch < m
+        return self.cycle_index < m
 
     def accumulate_gradients(self):
         """Context manager for gradient accumulation over the single prepared root.
@@ -897,19 +974,25 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
     def start(self) -> None:
         """Run the training loop until the configured budget is exhausted.
 
-        Every algorithm drives the same epoch: reseed, save on ``save_freq``,
-        evaluate on ``eval_freq``, then sample, score, optimize, and step EMA.
-        Only the middle of that sequence is algorithm-specific, so the loop lives
-        here and the variation is expressed through
-        :meth:`sampling_context`, :meth:`_run_training_step` and
-        :meth:`_after_optimizer_step` rather than by restating the loop.
+        Save and evaluation boundaries are common. The execution driver owns the middle:
+        online algorithms run one rollout iteration, while offline algorithms exhaust one
+        finite distributed dataloader. Progress advances only after the driver and cycle-end
+        hooks return normally.
         """
         while self.should_continue_training():
-            self.adapter.set_trajectory_seed(self.epoch + self.training_args.seed)
+            driver = getattr(self, "execution_driver", None)
+            if driver is None:
+                driver = build_execution_driver(type(self).execution_contract)
+                self.execution_driver = driver
+            driver.prepare_cycle(
+                self,
+                self.progress,
+                seed=self.training_args.seed,
+            )
 
             if (
                 self.log_args.save_freq > 0
-                and self.epoch % self.log_args.save_freq == 0
+                and self.cycle_index % self.log_args.save_freq == 0
                 and self.log_args.save_dir
             ):
                 save_dir = os.path.join(
@@ -917,30 +1000,51 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
                     str(self.log_args.run_name),
                     "checkpoints",
                 )
-                self.save_checkpoint(save_dir, epoch=self.epoch)
+                self.save_checkpoint(save_dir, epoch=self.cycle_index)
 
-            if self.eval_args.eval_freq > 0 and self.epoch % self.eval_args.eval_freq == 0:
+            if self.eval_args.eval_freq > 0 and self.cycle_index % self.eval_args.eval_freq == 0:
                 self.evaluate()
 
-            self._run_training_step()
+            driver.run_cycle(self, self.progress)
 
-            self.adapter.ema_step(step=self.epoch)
-            self._after_optimizer_step()
-            self.epoch += 1
+            self.adapter.ema_step(step=self.cycle_index)
+            self._after_training_cycle()
+            self.progress = self.progress.advance_cycle(
+                type(self).execution_contract.cycle_unit,
+                completed=True,
+            )
+
+    def set_trajectory_seed(self, seed: int) -> None:
+        """Set the adapter seed used by the next online rollout iteration.
+
+        Args:
+            seed: Effective trajectory seed for this rollout iteration.
+        """
+        self.adapter.set_trajectory_seed(seed)
+
+    def run_online_cycle(self) -> None:
+        """Run one complete online rollout, feedback, and optimization cycle."""
+        self._run_training_step()
 
     def _run_training_step(self) -> None:
-        """Run one epoch's rollout, feedback and optimization.
+        """Run one online rollout iteration and its declared downstream stages.
 
         Every trainer supplies ``sample()``; what it stores follows from the
         paradigm, since a coupled algorithm needs the full trajectory and its log
-        probabilities while a decoupled one needs only the terminal state.
+        probabilities while a decoupled one needs only the terminal state. Reward
+        feedback runs only when declared by the execution contract.
         Distillation accumulates several dataloader batches before a single
         optimizer step, so the grouping is a hook rather than a fixed sequence.
         """
         with self.sampling_context():
             samples = self.sample()
-        self.prepare_feedback(samples)
+        self._prepare_training_feedback(samples)
         self.optimize(samples)
+
+    def _prepare_training_feedback(self, samples: List[BaseSample]) -> None:
+        """Dispatch training feedback only when required by the execution contract."""
+        if type(self).execution_contract.feedback is FeedbackMode.REWARD:
+            self.prepare_feedback(samples)
 
     @contextmanager
     def sampling_context(self) -> Iterator[None]:
@@ -951,11 +1055,12 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         """
         yield
 
-    def _after_optimizer_step(self) -> None:
-        """Update algorithm-owned auxiliary weights after the optimizer step.
+    def _after_training_cycle(self) -> None:
+        """Update algorithm-owned auxiliary weights after one execution cycle.
 
-        EMA is handled by the loop; this is for extra snapshots an algorithm keeps
-        alongside it, such as CRD's old model and sampling model.
+        Shared EMA is handled immediately before this hook. This hook is for auxiliary
+        snapshots whose cadence is one complete rollout iteration or data epoch, such as
+        CRD's old model and sampling model.
         """
 
     def prepare_feedback(self, samples: List[BaseSample]) -> None:
@@ -999,10 +1104,32 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
             aggregation_func=aggregation_func,
         )
 
-    @abstractmethod
-    def optimize(self, *args, **kwargs):
-        """Update policy model"""
-        pass
+    def optimize(self, *args: Any, **kwargs: Any) -> None:
+        """Update an online policy from acquired rollout samples.
+
+        Args:
+            *args: Algorithm-specific online optimization inputs.
+            **kwargs: Algorithm-specific online optimization options.
+
+        Raises:
+            NotImplementedError: If an online trainer does not implement this hook.
+        """
+        raise NotImplementedError(
+            f"online trainer {type(self).__name__} must implement optimize(samples)"
+        )
+
+    def optimize_batch(self, batch: Any) -> None:
+        """Update an offline policy from one dataloader batch.
+
+        Args:
+            batch: Collated offline training batch.
+
+        Raises:
+            NotImplementedError: If an offline trainer does not implement this hook.
+        """
+        raise NotImplementedError(
+            f"offline trainer {type(self).__name__} must implement optimize_batch(batch)"
+        )
 
     def _sample_timesteps(
         self,
@@ -1120,9 +1247,9 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
     def _after_gradient_step(self) -> None:
         """Update per-optimizer-step auxiliary weights before metrics are logged.
 
-        Distinct from :meth:`_after_optimizer_step`, which runs once per epoch;
-        this runs on every optimizer step, which is the cadence DGPO's fast
-        reference EMA needs.
+        Distinct from :meth:`_after_training_cycle`, which runs once per rollout
+        iteration or data epoch; this runs on every optimizer step, which is the
+        cadence DGPO's fast reference EMA needs.
         """
 
     def _velocity_kl(

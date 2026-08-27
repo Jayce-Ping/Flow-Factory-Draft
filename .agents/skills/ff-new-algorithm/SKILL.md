@@ -10,7 +10,9 @@ description: "Complete workflow for adding a new RL training algorithm. Covers p
 ## Prerequisites
 
 Determine your algorithm's characteristics:
+- **Execution**: Online rollout or offline finite dataset epoch? (`constraints.md` #6)
 - **Paradigm**: Coupled or Decoupled? (`constraints.md` #7)
+- **Training feedback**: Runtime reward or dataset-provided supervision?
 - **Dynamics**: Which SDE/ODE formulation? (`Flow-SDE`, `Dance-SDE`, `CPS`, `ODE`)
 - **Advantage**: How are advantages computed from rewards? (Most algorithms can delegate to `AdvantageProcessor`)
 - **Loss**: What is the policy optimization objective?
@@ -21,10 +23,11 @@ Determine your algorithm's characteristics:
    - Coupled example: `trainers/rl/grpo.py` (GRPO)
    - Decoupled example: `trainers/rl/nft.py` (DiffusionNFT) or `trainers/rl/awm.py` (AWM)
 2. **Identify what's shared vs unique** (`constraints.md` #11):
-   - Shared: the epoch loop (`BaseTrainer.start`), data loading, reward computation,
+   - Shared: execution-cycle boundaries (`BaseTrainer.start`), data loading, reward computation,
      `AdvantageProcessor`, `prepare_feedback`, `compute_advantages`, adapter interface, checkpoint logic
    - Unique: the loss function and the algorithm-specific hyperparameters. Never restate the loop
-   - Per-epoch hook order: `sample()` → `prepare_feedback()` → `optimize()` (see `guidance/workflow.md`)
+   - Online order: `sample()` → optional `prepare_feedback()` → `optimize()`
+   - Offline order: complete finite dataloader traversal through `optimize_batch()`
 
 ## Phase 2: Configuration
 
@@ -104,16 +107,19 @@ from ..registry import register_trainer
 class MyAlgoTrainer(BaseTrainer):
     """My custom RL algorithm trainer."""
 
-    # Do NOT define start(). BaseTrainer.start() owns the epoch loop: reseed, checkpoint on
-    # save_freq, evaluate on eval_freq, _run_training_step(), ema_step, _after_optimizer_step.
-    # evaluate(), prepare_feedback() and compute_advantages() are likewise CONCRETE base
-    # methods. optimize() is the only abstract one.
+    # Declare execution_contract independently from paradigm. The default is online reward
+    # execution. Offline trainers select OFFLINE_EXECUTION_CONTRACT and implement
+    # optimize_batch(batch); online trainers implement optimize(samples).
+    #
+    # Do NOT define start(). BaseTrainer.start() owns checkpoint/eval boundaries, delegates to
+    # the selected execution driver, steps shared EMA, and advances the typed cycle counter.
+    # evaluate(), prepare_feedback() and compute_advantages() are likewise concrete base methods.
     #
     # Vary behavior through hooks instead of restating the loop:
     #   sampling_context()       - wrap the rollout (e.g. install a snapshot's weights)
     #   _run_training_step()     - replace the sample -> feedback -> optimize middle
     #   _after_gradient_step()   - run right after each optimizer step
-    #   _after_optimizer_step()  - run once per epoch, after the EMA step
+    #   _after_training_cycle()  - run once per rollout iteration/data epoch, after shared EMA
     #   _declare_model_variants() - declare several trainable copies (see component_variants.md)
 
     def sample(self):
@@ -130,7 +136,10 @@ class MyAlgoTrainer(BaseTrainer):
 ```
 
 > **Note**: `AdvantageProcessor` is auto-instantiated in `BaseTrainer._init_reward_model()`.
-> Reward-based trainers delegate via `self.advantage_processor.compute_advantages()` — see `architecture.md` "Advantage Computation". (Pure-distillation trainers like `diffusion-opd` skip rewards/advantages with a no-op `prepare_feedback()`.)
+> Reward-based trainers delegate via `self.advantage_processor.compute_advantages()` — see
+> `architecture.md` "Advantage Computation". Reward-free online distillation trainers declare
+> `ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT`; the shared feedback gate then omits reward and
+> advantage dispatch without requiring a fake no-op stage.
 
 ### Step 4 — Register in Trainer Registry
 
@@ -188,7 +197,7 @@ optimizers:
 - [ ] `MyAlgoTrainingArguments` correctly parsed from YAML
 - [ ] `get_training_args_class('my_algo')` returns correct subclass
 - [ ] `get_trainer_class('my_algo')` loads `MyAlgoTrainer`
-- [ ] Training runs end-to-end for ≥2 epochs without errors
+- [ ] Training runs end-to-end for at least two declared execution cycles without errors
 - [ ] Loss values are numerically reasonable (not NaN, decreasing)
 - [ ] Rewards improve over training
 - [ ] Checkpoint save/load works correctly
@@ -201,7 +210,7 @@ optimizers:
 1. **Not subclassing `TrainingArguments`** — algorithm-specific params won't be parsed from YAML
 2. **Forgetting `_registry.py` + `__init__.py` updates** — falls back to base `TrainingArguments`, losing custom params
 3. **Using ODE with coupled paradigm** — no log-probabilities available, silent incorrect gradients
-4. **Not calling `self.should_continue_training()`** — infinite loop if `max_epochs` is set
+4. **Overriding `start()`** — bypasses the shared driver, progress, checkpoint, eval, and EMA boundaries
 5. **Duplicating `_initialization()` logic** — already called in `BaseTrainer.__init__`; don't re-prepare modules
 6. **Reimplementing advantage gather/scatter** — use `self.advantage_processor.compute_advantages()` instead; it handles both sampler topologies automatically
 7. **Extending `GRPOTrainer` unnecessarily** — unless your algorithm extends GRPO's PPO-clipped loss, extend `BaseTrainer` directly (as NFT and AWM do)

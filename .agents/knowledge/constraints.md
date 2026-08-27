@@ -38,12 +38,22 @@ and seed dispatch, and its immutable names must equal `trajectory_component_orde
 
 ## Training Pipeline (6–10)
 
-### 6. Six-Stage Pipeline Order
-The training loop executes: Data Preprocessing → K-Repeat Sampling → Trajectory Generation → Reward Computation → Advantage Computation → Policy Optimization. This order is invariant. Do not reorder or skip stages.
+### 6. Execution Contract and Stage Order
+Every trainer declares an immutable `ExecutionContract`; acquisition, outer-cycle unit, training
+feedback, and loader distribution are independent of the algorithm's `paradigm`. Online
+reward-based execution preserves the six-stage order: Data Preprocessing → K-Repeat Sampling →
+Trajectory Generation → Reward Computation → Advantage Computation → Policy Optimization.
+Reward-free online distillation omits only the declared feedback stages. Offline execution is a
+finite `DistributedSampler` dataloader traversal with per-batch optimization; it MUST NOT emulate
+this by making `sample()` a no-op or by materializing the entire epoch. One complete offline
+dataloader traversal is one `data_epoch`, and an interrupted traversal does not advance it.
+Runtime reward feedback is not yet implemented for dataset acquisition and MUST fail at contract
+construction instead of being silently ignored; SFT and offline preference training consume their
+supervision directly from each batch.
 
 ### 7. Coupled vs Decoupled Paradigm
 - **Coupled** (GRPO, GRPO-Guard, DPPO): Training timesteps are coupled with SDE-based sampling. Requires log-probability computation. Must use SDE dynamics (`Flow-SDE`, `Dance-SDE`, `CPS`).
-- **Decoupled** (DPO, NFT, AWM, DGPO, CRD): Training timesteps are decoupled from sampling. Can use any dynamics including `ODE`.
+- **Decoupled** (online/offline DPO, NFT, AWM, DGPO, CRD): Training timesteps are decoupled from sampling. Can use any dynamics including `ODE`.
 - **Distillation** (`diffusion-opd`): On-policy multi-teacher distillation; dynamics-agnostic (ODE or SDE) and has no reward/advantage stage.
 
 Mixing paradigms (e.g., using `ODE` dynamics with `GRPO`) will produce incorrect gradients silently.
@@ -52,7 +62,7 @@ Mixing paradigms (e.g., using `ODE` dynamics with `GRPO`) will produce incorrect
 Text encoders and VAEs are loaded for Stage 1 (preprocessing), then offloaded to free VRAM before the training loop. They are reloaded for inference during sampling. Do not assume these components are always on-device.
 
 ### 9. Accelerator `prepare()` Scope
-All target components (trainable **and** frozen-but-shardable) are bundled into a single `ModelBundle` (`models/model_bundle.py`) and prepared with the **optimizer** as one root via `accelerator.prepare()` — DeepSpeed (one engine) and FSDP2 (one root) cannot prepare multiple models separately. After prepare, each component is exposed as a `RoutedComponentProxy` that routes forwards through the bundle root; the optimizer/EMA/reference params still target only the `requires_grad` subset (frozen members are sharded for memory but never trained). The train dataloader uses a custom distributed sampler (`DistributedKRepeatSampler`, `GroupContiguousSampler`, or `GroupDistributedSampler`) and is NOT prepared via accelerator. Breaking this causes duplicate data or incorrect gradient accumulation.
+All target components (trainable **and** frozen-but-shardable) are bundled into a single `ModelBundle` (`models/model_bundle.py`) and prepared with the **optimizer** as one root via `accelerator.prepare()` — DeepSpeed (one engine) and FSDP2 (one root) cannot prepare multiple models separately. After prepare, each component is exposed as a `RoutedComponentProxy` that routes forwards through the bundle root; the optimizer/EMA/reference params still target only the `requires_grad` subset (frozen members are sharded for memory but never trained). Online train dataloaders use the framework's rank-aware grouped samplers; offline train dataloaders use PyTorch's official `DistributedSampler`, including for one-process execution. Neither train loader is passed to `accelerator.prepare()` or `prepare_data_loader()`, because both are already distributed and a second shard would duplicate or drop data. Eval dataloaders remain prepared with the model bundle and optimizer in the single root call.
 
 ### 9a. Sampler Geometric Constraints
 `DistributedKRepeatSampler` and `GroupContiguousSampler` require `M * K ≡ 0 (mod W * B * G)` where M=unique_sample_num, K=group_size, W=world_size, B=per_device_batch_size, G=gradient_step_per_epoch — **unless** `gradient_accumulation_steps` is set manually, in which case the constraint reduces to `M * K ≡ 0 (mod W * B)`. **GroupContiguousSampler** adds: `M ≡ 0 (mod W)`. **GroupDistributedSampler** (DGPO) requires: `K % W == 0` and `(W * B) % K == 0`; auto-aligned by `_align_for_group_distributed`. See `topics/samplers.md` for full details.
@@ -67,12 +77,26 @@ Supported distributed plans are DDP, FSDP, and DeepSpeed ZeRO-1/2. Reward model 
 
 ## Base Class Interfaces (11–14)
 
-### 11. BaseTrainer Abstract Contract
-`BaseTrainer.__init__` expects `(accelerator, config, adapter)`. `optimize()` is the only abstract method subclasses must implement. `start()` (the shared epoch loop), `prepare_feedback()`, `compute_advantages()` and `evaluate()` are **concrete** base methods — override only to customize, and prefer the hooks (`sampling_context`, `_run_training_step`, `_after_gradient_step`, `_after_optimizer_step`) over restating the loop. The `_initialization()` method handles dataloader, optimizer, accelerator preparation, reward model loading, and `AdvantageProcessor` instantiation — do not duplicate this logic.
+### 11. BaseTrainer Execution Contract
+`BaseTrainer.__init__` expects `(accelerator, config, adapter)`. `start()` owns common save/eval
+boundaries and delegates each outer cycle to the driver selected by `execution_contract`.
+`TrainingProgress` tracks `optimizer_step`, `rollout_iteration`, and `data_epoch` independently;
+the legacy `step` alias maps to the primary optimizer step, while `epoch` maps to the contract's
+cycle unit. Online trainers override `optimize(samples)`. Offline trainers override
+`optimize_batch(batch)`. Both hooks are concrete fail-fast methods, and initialization verifies the
+matching hook was overridden; subclasses must not add a fake implementation for the other mode.
+Prefer `sampling_context`, `_run_training_step`, `_after_gradient_step`, and
+`_after_training_cycle` over restating the loop. `_initialization()` continues to own dataloaders,
+optimizer/preparation, feedback runtime, and model lifecycle.
 
-**Per-epoch hook order**: `sample()` (Stages 2–3) → `prepare_feedback()` (Stages 4–5) → `optimize()` (Stage 6). `DPOTrainer` forms chosen/rejected pairs at the **start** of `optimize()` (not in `prepare_feedback()`).
+**Online rollout order**: seed → periodic save/eval boundaries → `sample()` (Stages 2–3) →
+`prepare_feedback()` when declared (Stages 4–5) → `optimize()` (Stage 6) → shared EMA →
+`_after_training_cycle()`. Online
+`DPOTrainer` forms chosen/rejected pairs at the start of `optimize()`. **Offline epoch order**:
+official `DistributedSampler.set_epoch(data_epoch)` → exhaust the finite dataloader through
+`optimize_batch()` → shared EMA → `_after_training_cycle()` → increment `data_epoch`.
 
-**Trainer hierarchy**: New trainers MUST inherit directly from `BaseTrainer`. The only sanctioned exceptions are strict behavioral variants of GRPO that change only the per-step loss while reusing GRPO's sampling/advantage/eval machinery: `GRPOGuardTrainer → GRPOTrainer` (adds ratio-normalization) and `DPPOTrainer → GRPOTrainer` (replaces the PPO ratio-clip with a KL trust-region mask). Trainer-to-trainer inheritance creates fragile coupling; when in doubt, inherit from `BaseTrainer` and extract shared logic into helper methods. All reward-based trainers delegate advantage computation to `self.advantage_processor.compute_advantages()`; the distillation trainer `diffusion-opd` is the exception (its `prepare_feedback()` is a no-op with no reward/advantage stage).
+**Trainer hierarchy**: New trainers MUST inherit directly from `BaseTrainer`. The only sanctioned exceptions are strict behavioral variants of GRPO that change only the per-step loss while reusing GRPO's sampling/advantage/eval machinery: `GRPOGuardTrainer → GRPOTrainer` (adds ratio-normalization) and `DPPOTrainer → GRPOTrainer` (replaces the PPO ratio-clip with a KL trust-region mask). Trainer-to-trainer inheritance creates fragile coupling; when in doubt, inherit from `BaseTrainer` and extract shared logic into helper methods. All reward-based trainers delegate advantage computation to `self.advantage_processor.compute_advantages()`. Reward-free online trainers MUST declare `ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT`; the shared feedback gate omits reward and advantage dispatch.
 
 ### 12. BaseAdapter Abstract Methods
 Subclasses of `BaseAdapter` MUST implement these **4 abstract methods**:

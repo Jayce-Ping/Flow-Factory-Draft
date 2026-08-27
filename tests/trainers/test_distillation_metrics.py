@@ -24,10 +24,10 @@ import pytest
 import torch
 
 from flow_factory.trainers.distillation.distillation_runtime import (
+    generate_one_rollout_batch,
     pop_distillation_metrics,
     record_distillation_metric,
     record_state_statistics,
-    generate_one_rollout_batch,
     run_distillation_training_step,
     run_role_phase,
 )
@@ -177,7 +177,7 @@ def test_an_epoch_logs_what_its_roles_recorded() -> None:
         show_progress_bar=False,
         sampling_context=lambda: _null_context(),
         sample=lambda: ["sample"],
-        prepare_feedback=lambda samples: None,
+        _prepare_training_feedback=lambda samples: None,
         optimize=optimize,
         log_data=lambda data, step: logged.append((data, step)),
     )
@@ -287,7 +287,7 @@ def test_an_epoch_that_records_nothing_logs_nothing() -> None:
         show_progress_bar=False,
         sampling_context=lambda: _null_context(),
         sample=lambda: ["sample"],
-        prepare_feedback=lambda samples: None,
+        _prepare_training_feedback=lambda samples: None,
         optimize=lambda microbatches: None,
         log_data=lambda data, step: logged.append((data, step)),
     )

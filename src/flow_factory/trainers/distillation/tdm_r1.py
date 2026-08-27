@@ -27,6 +27,7 @@ from ...hparams.training_args.tdm_r1 import TDM_R1_DEFAULT_OPTIMIZERS
 from ...models.abc import BaseAdapter
 from ...samples import BaseSample, LatentState
 from ..abc import BaseTrainer
+from ..execution import ONLINE_EXECUTION_CONTRACT
 from .distillation_runtime import (
     as_role_microbatches,
     detach_state,
@@ -49,6 +50,7 @@ class TDMR1Trainer(TDMTrainer):
     """Reinforce deterministic TDM trajectories through a frozen-reference surrogate."""
 
     paradigm: ClassVar[Literal["decoupled"]] = "decoupled"
+    execution_contract = ONLINE_EXECUTION_CONTRACT
 
     def _optimizer_args_for_role(self, role_name: str):
         """Resolve this role's optimizer, falling back to TDM-R1's published defaults.

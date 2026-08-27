@@ -18,6 +18,17 @@ Trainers module for various RL algorithms.
 """
 
 from .abc import BaseTrainer
+from .execution import (
+    OFFLINE_EXECUTION_CONTRACT,
+    ONLINE_EXECUTION_CONTRACT,
+    ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT,
+    AcquisitionMode,
+    CycleUnit,
+    ExecutionContract,
+    FeedbackMode,
+    LoaderKind,
+    TrainingProgress,
+)
 from .loader import load_trainer
 from .registry import get_trainer_class, list_registered_trainers
 
@@ -26,6 +37,15 @@ from .registry import get_trainer_class, list_registered_trainers
 
 __all__ = [
     "BaseTrainer",
+    "AcquisitionMode",
+    "CycleUnit",
+    "ExecutionContract",
+    "FeedbackMode",
+    "LoaderKind",
+    "OFFLINE_EXECUTION_CONTRACT",
+    "ONLINE_EXECUTION_CONTRACT",
+    "ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT",
+    "TrainingProgress",
     "get_trainer_class",
     "list_registered_trainers",
     "load_trainer",

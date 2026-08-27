@@ -137,7 +137,9 @@ class TrainingArguments(ArgABC):
         default=None,
         metadata={
             "help": (
-                "Maximum number of outer training epochs (counter `epoch` runs 0 .. max_epochs-1). "
+                "Maximum number of outer execution cycles: rollout iterations online and "
+                "complete dataloader epochs offline. The legacy `epoch` alias runs from "
+                "0 through max_epochs - 1. "
                 "None or a negative value means no limit (train until interrupted)."
             ),
         },
@@ -246,7 +248,7 @@ class TrainingArguments(ArgABC):
     )
     ema_update_interval: int = field(
         default=10,
-        metadata={"help": "Update EMA every N epochs."},
+        metadata={"help": "Update EMA every N outer execution cycles."},
     )
     ema_device: Literal["cpu", "cuda"] = field(
         default="cuda",

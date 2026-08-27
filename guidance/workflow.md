@@ -3,6 +3,7 @@
 ## Table of Contents
 
 - [Overview](#overview)
+- [Execution Contracts](#execution-contracts)
 - [Stage 1: Data Preprocessing](#stage-1-data-preprocessing)
 - [Stage 2: K-Repeat Sampling](#stage-2-k-repeat-sampling)
 - [Stage 3: Trajectory Generation](#stage-3-trajectory-generation)
@@ -13,11 +14,12 @@
 
 ## Overview
 
-Flow-Factory follows an **online RL** training paradigm for diffusion/flow-matching models. Each epoch executes a six-stage pipeline:
+Flow-Factory supports online rollout and offline dataset execution for diffusion/flow-matching
+models. Each online reward-based rollout iteration executes the six-stage pipeline below:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                          Flow-Factory Training Epoch                            │
+│                    Flow-Factory Online Rollout Iteration                       │
 │                                                                                 │
 │  ┌─────────────┐    ┌──────────┐    ┌──────────────┐    ┌───────────────┐       │
 │  │    Data     │    │ K-Repeat │    │  Trajectory  │    │    Reward     │       │
@@ -32,17 +34,23 @@ Flow-Factory follows an **online RL** training paradigm for diffusion/flow-match
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The high-level training loop lives once in `BaseTrainer.start()`; no algorithm restates it:
+The high-level loop lives once in `BaseTrainer.start()`; an execution driver owns the middle:
 
 ```python
 # src/flow_factory/trainers/abc.py — BaseTrainer.start()
 def start(self):
     while self.should_continue_training():
-        # Reseed, checkpoint on save_freq, evaluate on eval_freq (omitted for brevity)
-        self._run_training_step()      # Stages 2-6, the algorithm-specific middle
-        self.adapter.ema_step(step=self.epoch)
-        self._after_optimizer_step()
-        self.epoch += 1
+        self.execution_driver.prepare_cycle(
+            self, self.progress, seed=self.training_args.seed
+        )
+        # Checkpoint and evaluation boundaries run here.
+        self.execution_driver.run_cycle(self, self.progress)
+        self.adapter.ema_step(step=self.cycle_index)
+        self._after_training_cycle()
+        self.progress = self.progress.advance_cycle(
+            self.execution_contract.cycle_unit,
+            completed=True,
+        )
 ```
 
 The default `_run_training_step` is the familiar three-stage sequence, so a reward-based
@@ -54,7 +62,29 @@ self.prepare_feedback(samples)     # Stages 4 + 5 (rewards + advantages)
 self.optimize(samples)             # Stage 6 (DPO: pair formation + loss here)
 ```
 
-> **Note**: Stage 1 (preprocessing) runs *once* before training begins and is cached to disk. Stages 2–6 repeat every epoch. The three methods above map directly to those stages: `sample` → trajectory rollouts; `prepare_feedback` → finalize rewards from the buffer and compute advantages; `optimize` → policy update (DPO additionally forms chosen/rejected pairs at the start of `optimize` before the loss). `optimize()` is the only abstract one; vary the rest through `sampling_context`, `_run_training_step` and `_after_optimizer_step`.
+> **Note**: Stage 1 preprocessing runs before training and may be cached. Stages 2–6 repeat per
+> online rollout iteration. `sample` generates trajectories, `prepare_feedback` finalizes rewards
+> and advantages when declared, and `optimize` updates the online policy. Vary online execution
+> through `sampling_context` and `_run_training_step`; use `_after_gradient_step` for each primary
+> optimizer update and `_after_training_cycle` for one complete outer cycle.
+
+## Execution Contracts
+
+Trainer execution and gradient paradigm are separate declarations:
+
+| Axis | Online | Offline |
+|---|---|---|
+| Acquisition | generated rollout | finite dataset batch |
+| Cycle unit | `rollout_iteration` | `data_epoch` |
+| Train loader | framework grouped sampler | PyTorch `DistributedSampler` |
+| Batch hook | `_run_training_step()` / `optimize(samples)` | `optimize_batch(batch)` |
+
+An offline epoch means one complete traversal of its finite distributed dataloader. The driver
+calls `DistributedSampler.set_epoch(data_epoch)`, streams batches directly to `optimize_batch`, and
+increments `data_epoch` only after clean exhaustion. It does not execute a fake sampling stage and
+does not accumulate the epoch's target media in memory. `optimizer_step` is tracked separately from
+both cycle counters. Dataset acquisition currently consumes supervision from the batch and rejects
+runtime reward feedback at contract construction.
 
 
 ## Stage 1: Data Preprocessing
@@ -157,7 +187,7 @@ def __iter__(self):
 
 ### Key Points
 
-- **Deterministic seeding**: All ranks share the same `seed + epoch` generator, ensuring identical permutation and K-repeat ordering — no explicit cross-rank communication needed.
+- **Deterministic seeding**: All ranks share the same `seed + rollout_iteration` value (stored in the sampler's legacy `epoch` field), ensuring identical permutation and K-repeat ordering — no explicit cross-rank communication needed.
 - **Automatic alignment**: The sampler adjusts `unique_sample_num` upward to ensure `M * K` is evenly divisible by `batch_size * num_replicas`.
 - **Group identification**: Each sample carries a `unique_id` (hash of prompt + conditions). During advantage computation, samples are grouped by this ID across all ranks.
 
@@ -167,10 +197,10 @@ def __iter__(self):
 train:
   per_device_batch_size: 2       # Batch size per GPU
   group_size: 4                  # K — repetitions per prompt
-  unique_sample_num_per_epoch: 64  # M — unique prompts per epoch
+  unique_sample_num_per_epoch: 64  # Legacy name: M unique prompts per rollout iteration
 ```
 
-> **Effective samples per epoch** = $M \times K$. For example, with `M=64, K=4`, each epoch generates 256 samples across the cluster.
+> **Effective samples per rollout iteration** = $M \times K$. For example, with `M=64, K=4`, one iteration generates 256 samples across the cluster.
 
 
 ## Stage 3: Trajectory Generation
@@ -534,10 +564,10 @@ unverified; use DDP or FSDP.
 
 ## Putting It All Together
 
-A complete epoch with GRPO on a 8×GPU cluster:
+A complete rollout iteration with GRPO on an 8×GPU cluster:
 
 ```
-Epoch N
+Rollout iteration N
 ├── DataLoader (DistributedKRepeatSampler)
 │   └── Select 64 unique prompts × 4 repeats = 256 samples
 │       → 32 samples per GPU (256 / 8)

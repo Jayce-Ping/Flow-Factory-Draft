@@ -262,7 +262,7 @@ class CRDTrainer(BaseTrainer):
 
     # ========================= Main Training Loop =========================
 
-    def _after_optimizer_step(self) -> None:
+    def _after_training_cycle(self) -> None:
         """Advance CRD's two auxiliary snapshots alongside the optimizer EMA."""
         self._update_old_model()
         self._update_sampling_model()
