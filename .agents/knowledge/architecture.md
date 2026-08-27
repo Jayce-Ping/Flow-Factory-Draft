@@ -51,7 +51,12 @@ outer-cycle unit (`rollout_iteration` or `data_epoch`), training feedback (`rewa
 loader distribution (`grouped_rollout` or `distributed_epoch`). Algorithm `paradigm` remains a
 separate declaration of gradient semantics.
 The fields remain separate dimensions, but unsupported combinations fail fast: dataset acquisition
-currently consumes batch supervision and rejects runtime reward feedback.
+currently consumes batch supervision and rejects runtime reward feedback. `FeedbackMode.NONE`
+rejects training reward configuration but allows explicit evaluation rewards. Offline hparams
+leave grouped-rollout sampler geometry unresolved: their finite loader length is established only
+when the official `DistributedSampler` dataloader is built. SFT and offline DPO share offline
+flow-matching timestep hparams; multiple timestep loss terms are averaged within a batch
+microstep, independently of gradient accumulation.
 
 ### Online reward-based pipeline
 

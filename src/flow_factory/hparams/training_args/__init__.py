@@ -22,6 +22,7 @@ against the monolithic ``training_args.py`` continue to work unchanged:
 """
 
 from ._base import EvaluationArguments, TrainingArguments
+from ._offline import OfflineFlowMatchingTrainingArguments, OfflineTrainingArguments
 from ._registry import get_training_args_class, list_registered_training_args
 from .awm import AWMTrainingArguments
 from .crd import CRDTrainingArguments
@@ -31,13 +32,19 @@ from .dpo import DPOTrainingArguments
 from .dppo import DPPOTrainingArguments
 from .grpo import GRPOTrainingArguments
 from .nft import NFTTrainingArguments
+from .offline_dpo import OfflineDPOTrainingArguments
 from .opd import DiffusionOPDTrainingArguments, TeacherConfig
+from .sft import SFTTrainingArguments
 from .tdm import TDMTrainingArguments
 from .tdm_r1 import TDMR1TrainingArguments
 
 __all__ = [
     "EvaluationArguments",
     "TrainingArguments",
+    "OfflineTrainingArguments",
+    "OfflineFlowMatchingTrainingArguments",
+    "SFTTrainingArguments",
+    "OfflineDPOTrainingArguments",
     "GRPOTrainingArguments",
     "DPPOTrainingArguments",
     "NFTTrainingArguments",

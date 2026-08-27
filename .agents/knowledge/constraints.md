@@ -49,7 +49,12 @@ this by making `sample()` a no-op or by materializing the entire epoch. One comp
 dataloader traversal is one `data_epoch`, and an interrupted traversal does not advance it.
 Runtime reward feedback is not yet implemented for dataset acquisition and MUST fail at contract
 construction instead of being silently ignored; SFT and offline preference training consume their
-supervision directly from each batch.
+supervision directly from each batch. Any `FeedbackMode.NONE` algorithm rejects training
+`rewards` while still permitting explicit `eval_rewards`. Offline configuration requires an
+explicit positive integer `gradient_accumulation_steps`, unit dataset-source weights, and leaves
+the online `sampler_type` at `auto`; it never resolves or aligns K-repeat/group geometry and never
+multiplies accumulation by the number of training timesteps. Offline flow-matching algorithms
+average all configured timestep loss terms within one dataloader-batch microstep.
 
 ### 7. Coupled vs Decoupled Paradigm
 - **Coupled** (GRPO, GRPO-Guard, DPPO): Training timesteps are coupled with SDE-based sampling. Requires log-probability computation. Must use SDE dynamics (`Flow-SDE`, `Dance-SDE`, `CPS`).

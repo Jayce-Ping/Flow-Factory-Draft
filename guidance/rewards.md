@@ -432,7 +432,10 @@ eval_rewards:
     batch_size: 8
 ```
 
-If `eval_rewards` is not specified, training rewards are reused for evaluation.
+If `eval_rewards` is not specified, training rewards are reused for evaluation on
+reward-based algorithms. Reward-free online and offline execution contracts reject
+`rewards`, so their evaluation monitoring must be configured explicitly through
+`eval_rewards`.
 
 **Use cases:**
 - Train with fast model, evaluate with slower but more accurate model

@@ -19,7 +19,11 @@ from typing import Any, ClassVar, Literal, Mapping, Optional, Tuple, Union
 
 import yaml
 
-from ...contracts.execution import ONLINE_EXECUTION_CONTRACT, ExecutionContract
+from ...contracts.execution import (
+    ONLINE_EXECUTION_CONTRACT,
+    AcquisitionMode,
+    ExecutionContract,
+)
 from ...utils.dist import get_world_size
 from ...utils.logger_utils import setup_logger
 from ..abc import ArgABC
@@ -324,34 +328,7 @@ class TrainingArguments(ArgABC):
 
         self.height, self.width = self.resolution
 
-        # --- Batch size calculation ---
-        # NOTE: M alignment and derived quantities (num_batches_per_epoch,
-        # gradient_accumulation_steps) are computed in Arguments._align_batch_geometry()
-        # because the correct alignment strategy depends on the resolved sampler type,
-        # which requires cross-component information (data_args, reward_args) only
-        # available at the Arguments level.
-        # Placeholder values are set here so the fields exist; they will be
-        # overwritten by _align_batch_geometry() before any consumer reads them.
-        world_size = get_world_size()
-        logger.info(f"World Size: {world_size}")
-
-        sample_num_per_iteration = world_size * self.per_device_batch_size
-        self.num_batches_per_epoch = (self.unique_sample_num_per_epoch * self.group_size) // max(
-            1, sample_num_per_iteration
-        )
-        if self.gradient_accumulation_steps == "auto":
-            self._manual_gradient_accumulation_steps = False
-            self.gradient_accumulation_steps = self.compute_gradient_accumulation_steps(
-                self.num_batches_per_epoch,
-            )
-        else:
-            self._manual_gradient_accumulation_steps = True
-            self.gradient_accumulation_steps = int(self.gradient_accumulation_steps)
-            if self.gradient_accumulation_steps < 1:
-                raise ValueError(
-                    f"`gradient_accumulation_steps` must be >= 1, "
-                    f"got {self.gradient_accumulation_steps}."
-                )
+        self._initialize_batch_geometry()
 
         # --- Optimizer defaults ---
         # Explicit float() casts guard against scientific-notation values (e.g. 1e-4)
@@ -371,6 +348,54 @@ class TrainingArguments(ArgABC):
             )
         else:
             self.learning_rate = float(self.learning_rate)
+
+    def _initialize_batch_geometry(self) -> None:
+        """Initialize execution-specific batch fields without crossing acquisition modes."""
+        contract = getattr(type(self), "execution_contract", None)
+        if not isinstance(contract, ExecutionContract):
+            raise TypeError(
+                f"training arguments {type(self).__name__}.execution_contract must be "
+                f"ExecutionContract, got {type(contract).__name__}: {contract!r}"
+            )
+        if contract.acquisition is AcquisitionMode.DATASET:
+            accumulation_steps = self.gradient_accumulation_steps
+            if type(accumulation_steps) is not int:
+                raise TypeError(
+                    "offline `gradient_accumulation_steps` must be an explicit int >= 1, "
+                    f"got {type(accumulation_steps).__name__}: {accumulation_steps!r}"
+                )
+            if accumulation_steps < 1:
+                raise ValueError(
+                    "offline `gradient_accumulation_steps` must be >= 1, "
+                    f"got {accumulation_steps}"
+                )
+            self._manual_gradient_accumulation_steps = True
+            self.num_batches_per_epoch = 0
+            return
+
+        # M alignment and derived quantities are finalized later in
+        # Arguments._align_batch_geometry(), after the online sampler is resolved.
+        world_size = get_world_size()
+        logger.info(f"World Size: {world_size}")
+
+        sample_num_per_iteration = world_size * self.per_device_batch_size
+        self.num_batches_per_epoch = (self.unique_sample_num_per_epoch * self.group_size) // max(
+            1, sample_num_per_iteration
+        )
+        if self.gradient_accumulation_steps == "auto":
+            self._manual_gradient_accumulation_steps = False
+            self.gradient_accumulation_steps = self.compute_gradient_accumulation_steps(
+                self.num_batches_per_epoch,
+            )
+            return
+
+        self._manual_gradient_accumulation_steps = True
+        self.gradient_accumulation_steps = int(self.gradient_accumulation_steps)
+        if self.gradient_accumulation_steps < 1:
+            raise ValueError(
+                f"`gradient_accumulation_steps` must be >= 1, "
+                f"got {self.gradient_accumulation_steps}."
+            )
 
     def compute_gradient_accumulation_steps(
         self,

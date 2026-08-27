@@ -86,6 +86,16 @@ does not accumulate the epoch's target media in memory. `optimizer_step` is trac
 both cycle counters. Dataset acquisition currently consumes supervision from the batch and rejects
 runtime reward feedback at contract construction.
 
+Offline training uses an explicit positive integer `train.gradient_accumulation_steps` (default
+`1`). It does not derive accumulation from `gradient_step_per_epoch`, grouped sampling geometry,
+or `num_train_timesteps`. SFT and offline DPO share the offline flow-matching timestep controls;
+their `num_train_timesteps` loss terms are averaged inside each dataloader-batch microstep and do
+not create additional accumulation microsteps. Keep `data.sampler_type: auto`; explicit
+K-repeat/group sampler choices are rejected because the offline loader selects PyTorch
+`DistributedSampler` directly. Every offline training source must use `train.weight: 1`,
+preserving the meaning of an epoch as one complete traversal rather than weighted replacement
+sampling.
+
 
 ## Stage 1: Data Preprocessing
 

@@ -249,6 +249,19 @@ in auto mode, a placeholder for `gradient_accumulation_steps`. Both are overwrit
 `_manual_gradient_accumulation_steps` is set to `True` and the value is preserved unchanged
 throughout the rest of the initialisation sequence.
 
+### Offline bypass
+
+Dataset-acquisition algorithms do not enter this initialization sequence. Their training
+arguments require an explicit positive integer `gradient_accumulation_steps` (default `1`) and
+leave `num_batches_per_epoch=0` until the finite dataloader is constructed. `Arguments` keeps
+`data.sampler_type="auto"` as an unused neutral sentinel, rejects explicit grouped sampler choices,
+and does not read or rewrite `group_size`, `unique_sample_num_per_epoch`, or
+`gradient_step_per_epoch`. It also skips the per-timestep accumulation multiplier. The offline
+flow-matching trainer instead averages its `num_train_timesteps` loss terms inside each dataloader
+batch microstep. The offline loader independently constructs PyTorch's official
+`DistributedSampler` and validates that its finite batch count is divisible by the explicit
+accumulation window.
+
 ---
 
 ## When to Use Which Sampler

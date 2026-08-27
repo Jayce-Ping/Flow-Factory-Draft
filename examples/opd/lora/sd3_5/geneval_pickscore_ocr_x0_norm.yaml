@@ -165,32 +165,7 @@ eval:
   eval_freq: 10  # Run evaluation every N epochs (0 to disable)
   seed: 42  # Eval random seed
 
-# Reward Model Configuration (monitoring only — NOT used by the distillation loss)
-# Routing via `applicable_datasets`: geneval -> geneval, ocr -> ocr,
-# pick_score -> all three sources (applicable_datasets omitted = applies to all).
-rewards:
-  - name: "geneval"  # Reward identifier (appears in log keys)
-    reward_model: "GenEval"  # Reward model class (from registry)
-    batch_size: 32  # Inference batch size for this reward model
-    device: "cuda"  # Device to run reward model on
-    dtype: float32  # Precision for reward model inference
-    applicable_datasets: ["geneval"]  # Only fires on geneval source batches
-
-  - name: "ocr"  # Reward identifier (appears in log keys)
-    reward_model: "OCR"  # Reward model class (from registry)
-    batch_size: 32  # Inference batch size for this reward model
-    device: "cuda"  # Device to run reward model on
-    dtype: bfloat16  # Precision for reward model inference
-    applicable_datasets: ["ocr"]  # Only fires on ocr source batches
-
-  - name: "pick_score"  # Reward identifier (appears in log keys)
-    reward_model: "PickScore"  # Reward model class (from registry)
-    batch_size: 32  # Inference batch size for this reward model
-    device: "cuda"  # Device to run reward model on
-    dtype: bfloat16  # Precision for reward model inference
-    # applicable_datasets omitted -> applies to ALL training sources (geneval, pickscore, ocr)
-
-# Eval Reward Models (same routing as training rewards)
+# Eval Reward Models (monitoring only; not used by the distillation loss)
 eval_rewards:
   - name: "geneval"  # Eval reward identifier
     reward_model: "GenEval"  # Reward model class (from registry)

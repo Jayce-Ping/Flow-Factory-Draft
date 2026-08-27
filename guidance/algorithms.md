@@ -413,9 +413,10 @@ eval_rewards:
     reward_model: pickscore
 ```
 
-Training rewards remain rejected for `dmd2` and `tdm`: an eval-only signal must not
-become a training signal by accident. `tdm-r1` is the exception, since its generator
-objective is reward-driven and it requires training rewards.
+Training rewards are rejected by every reward-free execution contract, including `dmd2`,
+`tdm`, and `diffusion-opd`: an eval-only signal must not become a training signal by
+accident. `tdm-r1` uses the reward-feedback contract instead, since its generator objective
+is reward-driven and requires training rewards.
 
 See [`examples/dmd2/lora/sd3_5/ocr.yaml`](../examples/dmd2/lora/sd3_5/ocr.yaml)
 for a validated four-step SD3.5 setup.
