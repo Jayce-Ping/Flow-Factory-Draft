@@ -78,6 +78,12 @@ def test_offline_algorithm_defaults_are_finite_data_epochs(
     assert "execution_contract" not in training_args.to_dict()
 
 
+def test_offline_algorithms_are_registered_without_replacing_online_dpo() -> None:
+    assert get_training_args_class("sft") is SFTTrainingArguments
+    assert get_training_args_class("offline-dpo") is OfflineDPOTrainingArguments
+    assert get_training_args_class("dpo") is DPOTrainingArguments
+
+
 @pytest.mark.parametrize("arguments_class", [SFTTrainingArguments, OfflineDPOTrainingArguments])
 def test_offline_algorithms_share_flow_matching_timestep_contract(
     arguments_class: type[OfflineFlowMatchingTrainingArguments],
@@ -166,6 +172,19 @@ def test_offline_sources_require_unit_weights() -> None:
 
     assert config.data_args.training_datasets[0].train is not None
     assert config.data_args.training_datasets[0].train.weight == 1
+
+
+def test_offline_configuration_requires_unified_supervised_sources() -> None:
+    with pytest.raises(ValueError, match=r"requires at least one.*data\.datasets"):
+        Arguments(training_args=SFTTrainingArguments())
+
+
+def test_offline_configuration_requires_input_condition_preprocessing() -> None:
+    with pytest.raises(ValueError, match=r"enable_preprocess=True.*input-only"):
+        Arguments(
+            training_args=SFTTrainingArguments(),
+            data_args=DataArguments(enable_preprocess=False, datasets=_data().datasets),
+        )
 
 
 @pytest.mark.parametrize(

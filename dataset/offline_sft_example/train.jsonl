@@ -1,0 +1,2 @@
+{"schema_version":2,"input":{"prompt":"A coral circle centered on a dark background","negative_prompt":null,"media":[]},"supervision":{"type":"demonstration","target":{"media":[{"type":"image","path":"media/coral.ppm"}]}},"metadata":{"example_id":"sft-coral"}}
+{"schema_version":2,"input":{"prompt":"A cyan square centered on a dark background","negative_prompt":null,"media":[]},"supervision":{"type":"demonstration","target":{"media":[{"type":"image","path":"media/cyan.ppm"}]}},"metadata":{"example_id":"sft-cyan"}}

@@ -17,8 +17,8 @@ from typing import Any, List
 
 import pytest
 import torch
-from diffusers.utils.torch_utils import randn_tensor
 
+from diffusers.utils.torch_utils import randn_tensor
 from flow_factory.models.abc import BaseAdapter
 from flow_factory.samples import BaseSample, ComponentTimes, LatentState
 from flow_factory.scheduler import SchedulerGroup, SDESchedulerOutput
@@ -423,6 +423,44 @@ def test_explicit_noise_application_supports_heterogeneous_components() -> None:
             (1 - sigma_broadcast) * clean + sigma_broadcast * noise,
         )
         assert torch.equal(noised.target_velocity.components[name], noise - clean)
+
+
+@pytest.mark.parametrize(
+    ("direction", "expected_target"),
+    [
+        ("noise", torch.tensor([[2.0]])),
+        ("data", torch.tensor([[-2.0]])),
+    ],
+)
+def test_forward_process_target_follows_adapter_velocity_direction(
+    direction: str,
+    expected_target: torch.Tensor,
+) -> None:
+    """The shared noising hook matches both supported prediction conventions."""
+    adapter = _adapter()
+    adapter.flow_velocity_direction = direction
+    clean = LatentState({"latent": torch.tensor([[1.0]])})
+    noise = LatentState({"latent": torch.tensor([[3.0]])})
+    times = _latent_times(torch.tensor([500.0]))
+
+    noised = adapter.apply_forward_process_noise(clean, times, noise)
+
+    assert torch.equal(noised.target_velocity.components["latent"], expected_target)
+
+
+def test_forward_process_noising_rejects_an_unknown_velocity_direction() -> None:
+    """Invalid adapter declarations fail before constructing a training target."""
+    adapter = _adapter()
+    adapter.flow_velocity_direction = "sideways"
+    clean = LatentState({"latent": torch.tensor([[1.0]])})
+    noise = LatentState({"latent": torch.tensor([[3.0]])})
+
+    with pytest.raises(ValueError, match=r"flow_velocity_direction.*'noise'.*'data'.*sideways"):
+        adapter.apply_forward_process_noise(
+            clean,
+            _latent_times(torch.tensor([500.0])),
+            noise,
+        )
 
 
 def test_explicit_noise_application_consumes_no_randomness() -> None:

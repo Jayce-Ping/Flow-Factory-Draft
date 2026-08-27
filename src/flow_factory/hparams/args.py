@@ -247,6 +247,17 @@ class Arguments(ArgABC):
         """Keep finite dataset epochs independent from online grouped-sampler geometry."""
         if self._get_execution_contract().acquisition is not AcquisitionMode.DATASET:
             return
+        if not self.data_args.training_datasets:
+            raise ValueError(
+                "offline dataset execution requires at least one enabled training source "
+                "under data.datasets; the legacy data.dataset_dir prompt-only path cannot "
+                "carry demonstration or preference supervision"
+            )
+        if not self.data_args.enable_preprocess:
+            raise ValueError(
+                "offline dataset execution requires data.enable_preprocess=True so model-input "
+                "conditions can use the input-only preprocessing cache"
+            )
         sampler_type = self.data_args.sampler_type
         if sampler_type != "auto":
             raise ValueError(

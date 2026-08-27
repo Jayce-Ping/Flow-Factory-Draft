@@ -1,0 +1,87 @@
+# Small single-process correctness recipe for SD3.5 offline DPO.
+# It is intended for configuration and short smoke checks, not quality training.
+launcher: "accelerate"
+config_file: null
+num_processes: 1
+main_process_port: 29500
+mixed_precision: "no"
+
+data:
+  datasets:
+    - name: offline_dpo_smoke
+      dataset_dir: "dataset/offline_dpo_example"
+      train:
+        weight: 1
+        max_dataset_size: 2
+      # No eval source: offline smoke checks do not need generation or reward models.
+  enable_preprocess: true
+  preprocessing_batch_size: 1
+  dataloader_num_workers: 0
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  sampler_type: "auto"  # Offline execution selects PyTorch DistributedSampler.
+
+model:
+  model_name_or_path: "hf-internal-testing/tiny-sd3-pipe"
+  model_type: "sd3-5"
+  finetune_type: "lora"
+  target_components: ["transformer"]
+  target_modules: "default"
+  lora_rank: 4
+  lora_alpha: 4
+  trainable_parameters_dtype: "fp32"
+  frozen_parameters_dtype: "fp32"
+  resume_path: null
+  resume_type: null
+
+train:
+  trainer_type: "offline-dpo"
+  max_epochs: 1  # One epoch is one complete finite dataloader traversal.
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 1
+
+  beta: 2000.0
+  ref_param_device: "cpu"
+  resolution: 64
+  guidance_scale: 1.0
+  num_inference_steps: 4
+  num_train_timesteps: 1  # Loss terms averaged inside each batch microstep.
+  weighting_scheme: "uniform"
+  timestep_range: 0.99
+  time_shift: 1.0
+
+  ema_decay: 0.0
+  ema_update_interval: 1
+  ema_device: "cpu"
+  latent_storage_dtype: "fp32"
+  enable_gradient_checkpointing: false
+  seed: 42
+
+scheduler:
+  dynamics_type: "ODE"
+
+eval:
+  resolution: 64
+  per_device_batch_size: 1
+  guidance_scale: 1.0
+  num_inference_steps: 4
+  eval_freq: 0
+  seed: 42
+
+log:
+  run_name: "sd3_5_offline_dpo_smoke"
+  project: "Flow-Factory"
+  logging_backend: "none"
+  save_dir: "saves/"
+  save_freq: 0
+  save_model_only: true
+  verbose: true
+
+optimizers:
+  - name: "default"
+    optimizer: "adamw"
+    learning_rate: 1.0e-5
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    max_grad_norm: 1.0

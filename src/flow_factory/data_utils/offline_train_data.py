@@ -23,6 +23,11 @@ from accelerate import Accelerator
 from datasets import Dataset as HFDataset
 from torch.utils.data import DataLoader
 
+from ..contracts import (
+    InputMediaBinding,
+    PipelineIOContract,
+    validate_pipeline_model_input,
+)
 from ..hparams import Arguments
 from ..utils.base import filter_kwargs
 from .dataset import (
@@ -58,6 +63,7 @@ def build_offline_train_dataloader(
     preprocess_func: PreprocessCallable,
     *,
     supervision_type: OfflineSupervisionType,
+    pipeline_io_contract: PipelineIOContract,
     preprocess_kwargs: Optional[Mapping[str, Any]] = None,
     extra_hash_strs: Optional[Sequence[str]] = None,
     media_decoders: Optional[Mapping[MediaType, MediaDecoder]] = None,
@@ -79,6 +85,8 @@ def build_offline_train_dataloader(
         accelerator: Accelerator used only for rank metadata and cache barriers.
         preprocess_func: Adapter input-preprocessing callable.
         supervision_type: Homogeneous supervision required from every source.
+        pipeline_io_contract: Adapter-owned input/output declaration used to reject
+            unsupported conditions before preprocessing.
         preprocess_kwargs: Optional overrides layered onto config-derived train
             preprocessing arguments.
         extra_hash_strs: Additional input-cache fingerprint components.
@@ -107,6 +115,21 @@ def build_offline_train_dataloader(
         raise TypeError(
             "offline train data requires a callable preprocess_func, "
             f"got {type(preprocess_func).__name__}"
+        )
+    if not isinstance(pipeline_io_contract, PipelineIOContract):
+        raise TypeError(
+            "offline train data requires a PipelineIOContract, "
+            f"got {type(pipeline_io_contract).__name__}"
+        )
+    ordered_references = _supports_ordered_references(preprocess_func)
+    expected_ordered_references = (
+        pipeline_io_contract.input_media.binding is InputMediaBinding.ORDERED_REFERENCES
+    )
+    if ordered_references != expected_ordered_references:
+        raise ValueError(
+            "offline input preprocessing binding disagrees with pipeline contract: "
+            f"contract={pipeline_io_contract.input_media.binding.value!r}, "
+            f"preprocess supports_ordered_references={ordered_references}"
         )
     if preprocess_kwargs is not None and not isinstance(preprocess_kwargs, Mapping):
         raise TypeError(
@@ -158,6 +181,11 @@ def build_offline_train_dataloader(
             else data_args.max_dataset_size
         )
         records = _slice_records(records, max_dataset_size, source_name=source.name)
+        _validate_pipeline_inputs(
+            records,
+            contract=pipeline_io_contract,
+            source_name=source.name,
+        )
         _require_decoder_coverage(
             records,
             available_decoder_types,
@@ -206,6 +234,24 @@ def build_offline_train_dataloader(
         batch_drop_last=batch_drop_last,
         pin_memory=pin_memory,
     )
+
+
+def _validate_pipeline_inputs(
+    records: Sequence[NormalizedDatasetRecord],
+    *,
+    contract: PipelineIOContract,
+    source_name: str,
+) -> None:
+    """Validate every normalized input before any condition cache can be reused."""
+    for row_index, record in enumerate(records):
+        try:
+            validate_pipeline_model_input(record.model_input, contract)
+        except (TypeError, ValueError) as exc:
+            error_type = type(exc)
+            raise error_type(
+                f"offline source {source_name!r} row {row_index} violates its pipeline "
+                f"input contract: {exc}"
+            ) from exc
 
 
 def _build_distributed_condition_cache(

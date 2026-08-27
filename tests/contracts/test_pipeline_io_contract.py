@@ -23,15 +23,18 @@ from flow_factory.contracts import (
     DecodedMediaLike,
     GeometrySource,
     InputMediaBinding,
+    InputMediaLike,
     InputMediaOrder,
     InputMediaRule,
     InputMediaSpec,
     MediaFormat,
     MediaType,
+    ModelInputLike,
     NegativePromptPolicy,
     OutputMediaSequence,
     PipelineIOContract,
     RateRequirement,
+    validate_pipeline_model_input,
 )
 
 IMAGE_FORMAT = MediaFormat(
@@ -143,11 +146,106 @@ class _DecodedFixture:
     sample_rate: int | None
 
 
+@dataclass
+class _InputMediaFixture:
+    type: str
+    fps: float | None = None
+    sample_rate: int | None = None
+
+
+@dataclass
+class _ModelInputFixture:
+    prompt: str
+    negative_prompt: str | None = None
+    media: tuple[_InputMediaFixture, ...] = ()
+
+
 def test_decoded_media_protocol_is_structural_and_serialization_independent() -> None:
     """Dataset-owned decoded objects need no contract inheritance or conversion."""
     media = _DecodedFixture(type="image", payload=object(), fps=None, sample_rate=None)
 
     assert isinstance(media, DecodedMediaLike)
+
+
+def test_model_input_protocols_are_structural_and_validate_prompt_only_contracts() -> None:
+    """Normalized dataset values need no inheritance from the contract package."""
+    model_input = _ModelInputFixture(prompt="a prompt", negative_prompt="low quality")
+
+    assert isinstance(model_input, ModelInputLike)
+    assert isinstance(_InputMediaFixture(type="image"), InputMediaLike)
+    validate_pipeline_model_input(model_input, _text_to_image_contract())
+
+
+def test_model_input_validation_rejects_unsupported_media_and_negative_prompt() -> None:
+    """Model-declared inputs fail before an adapter can silently ignore them."""
+    image_input = _ModelInputFixture(
+        prompt="conditioned",
+        media=(_InputMediaFixture(type="image"),),
+    )
+    with pytest.raises(ValueError, match="does not accept input media type 'image'"):
+        validate_pipeline_model_input(image_input, _text_to_image_contract())
+
+    negative_input = _ModelInputFixture(prompt="prompt", negative_prompt="unsupported")
+    with pytest.raises(ValueError, match="does not support negative_prompt"):
+        validate_pipeline_model_input(
+            negative_input,
+            _text_to_image_contract(NegativePromptPolicy.UNSUPPORTED),
+        )
+    with pytest.raises(ValueError, match="requires negative_prompt"):
+        validate_pipeline_model_input(
+            _ModelInputFixture(prompt="prompt"),
+            _text_to_image_contract(NegativePromptPolicy.REQUIRED),
+        )
+
+
+def test_model_input_validation_enforces_counts_and_required_rates() -> None:
+    """Cardinality and rate metadata remain adapter declarations, not algorithm logic."""
+    video_format = MediaFormat(
+        type=MediaType.VIDEO,
+        fps=RateRequirement.REQUIRED,
+        sample_rate=RateRequirement.NOT_APPLICABLE,
+    )
+    contract = PipelineIOContract(
+        input_media=InputMediaSpec(
+            rules=(InputMediaRule(format=video_format, min_count=1, max_count=1),),
+            binding=InputMediaBinding.GROUPED_BY_TYPE,
+            order=InputMediaOrder.WITHIN_TYPE,
+        ),
+        negative_prompt=NegativePromptPolicy.OPTIONAL,
+        output_media=OutputMediaSequence(items=(IMAGE_FORMAT,)),
+        geometry_source=GeometrySource.INPUT_MEDIA,
+        batch_capability=BatchCapability.UNIFORM,
+    )
+
+    with pytest.raises(ValueError, match="requires at least 1 input 'video'"):
+        validate_pipeline_model_input(_ModelInputFixture(prompt="prompt"), contract)
+    with pytest.raises(ValueError, match=r"media\[0\] requires fps"):
+        validate_pipeline_model_input(
+            _ModelInputFixture(
+                prompt="prompt",
+                media=(_InputMediaFixture(type="video"),),
+            ),
+            contract,
+        )
+    with pytest.raises(ValueError, match="accepts at most 1 input 'video'"):
+        validate_pipeline_model_input(
+            _ModelInputFixture(
+                prompt="prompt",
+                media=(
+                    _InputMediaFixture(type="video", fps=24.0),
+                    _InputMediaFixture(type="video", fps=30.0),
+                ),
+            ),
+            contract,
+        )
+
+    validate_pipeline_model_input(
+        _ModelInputFixture(
+            prompt="prompt",
+            media=(_InputMediaFixture(type="video", fps=24.0),),
+        ),
+        contract,
+    )
 
 
 @pytest.mark.parametrize(

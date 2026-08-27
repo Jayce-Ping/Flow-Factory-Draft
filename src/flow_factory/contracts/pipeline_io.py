@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
@@ -99,6 +100,46 @@ class DecodedMediaLike(Protocol):
     @property
     def sample_rate(self) -> int | None:
         """Return source samples per second when applicable."""
+        ...
+
+
+@runtime_checkable
+class InputMediaLike(Protocol):
+    """Structural media reference accepted by input-contract validation."""
+
+    @property
+    def type(self) -> str:
+        """Return the public media type discriminator."""
+        ...
+
+    @property
+    def fps(self) -> float | None:
+        """Return an optional source frame rate."""
+        ...
+
+    @property
+    def sample_rate(self) -> int | None:
+        """Return an optional source sample rate."""
+        ...
+
+
+@runtime_checkable
+class ModelInputLike(Protocol):
+    """Structural normalized input consumed by a pipeline I/O contract."""
+
+    @property
+    def prompt(self) -> str:
+        """Return the positive text prompt."""
+        ...
+
+    @property
+    def negative_prompt(self) -> str | None:
+        """Return the optional negative text prompt."""
+        ...
+
+    @property
+    def media(self) -> tuple[InputMediaLike, ...]:
+        """Return input media in public record order."""
         ...
 
 
@@ -234,6 +275,118 @@ class PipelineIOContract:
             )
 
 
+def validate_pipeline_model_input(
+    model_input: ModelInputLike,
+    contract: PipelineIOContract,
+) -> None:
+    """Validate one normalized input against model-declared pipeline semantics.
+
+    The function depends only on structural protocols, so the dataset schema and
+    model adapter remain independent. Callers must run it before preprocessing;
+    otherwise an adapter may silently ignore unsupported conditioning media.
+    """
+    _require_instance(contract, PipelineIOContract, "contract")
+    if not isinstance(model_input, ModelInputLike):
+        raise TypeError(
+            "expected model_input to implement ModelInputLike, received "
+            f"{type(model_input).__name__}: {model_input!r}"
+        )
+    if type(model_input.prompt) is not str:
+        raise TypeError(
+            "expected model_input.prompt to be str, received "
+            f"{type(model_input.prompt).__name__}: {model_input.prompt!r}"
+        )
+    negative_prompt = model_input.negative_prompt
+    if negative_prompt is not None and type(negative_prompt) is not str:
+        raise TypeError(
+            "expected model_input.negative_prompt to be str or None, received "
+            f"{type(negative_prompt).__name__}: {negative_prompt!r}"
+        )
+    if contract.negative_prompt is NegativePromptPolicy.UNSUPPORTED and negative_prompt is not None:
+        raise ValueError("pipeline does not support negative_prompt")
+    if contract.negative_prompt is NegativePromptPolicy.REQUIRED and negative_prompt is None:
+        raise ValueError("pipeline requires negative_prompt")
+
+    media = model_input.media
+    if type(media) is not tuple:
+        raise TypeError(
+            "expected model_input.media to be tuple, received " f"{type(media).__name__}: {media!r}"
+        )
+    rules_by_type = {rule.format.type.value: rule for rule in contract.input_media.rules}
+    counts = {media_type: 0 for media_type in rules_by_type}
+    for index, item in enumerate(media):
+        if not isinstance(item, InputMediaLike):
+            raise TypeError(
+                f"expected model_input.media[{index}] to implement InputMediaLike, "
+                f"received {type(item).__name__}: {item!r}"
+            )
+        media_type = item.type
+        if type(media_type) is not str:
+            raise TypeError(
+                f"expected model_input.media[{index}].type to be str, received "
+                f"{type(media_type).__name__}: {media_type!r}"
+            )
+        rule = rules_by_type.get(media_type)
+        if rule is None:
+            raise ValueError(
+                f"pipeline does not accept input media type {media_type!r} at index {index}; "
+                f"accepted types={tuple(rules_by_type)!r}"
+            )
+        counts[media_type] += 1
+        _validate_input_rate(item.fps, rule.format.fps, "fps", index)
+        _validate_input_rate(
+            item.sample_rate,
+            rule.format.sample_rate,
+            "sample_rate",
+            index,
+        )
+
+    for media_type, rule in rules_by_type.items():
+        count = counts[media_type]
+        if count < rule.min_count:
+            raise ValueError(
+                f"pipeline requires at least {rule.min_count} input {media_type!r} item(s), "
+                f"received {count}"
+            )
+        if rule.max_count is not None and count > rule.max_count:
+            raise ValueError(
+                f"pipeline accepts at most {rule.max_count} input {media_type!r} item(s), "
+                f"received {count}"
+            )
+
+
+def _validate_input_rate(
+    value: object,
+    requirement: RateRequirement,
+    rate_name: str,
+    media_index: int,
+) -> None:
+    """Validate one normalized rate against its declared requirement."""
+    if requirement is RateRequirement.NOT_APPLICABLE:
+        if value is not None:
+            raise ValueError(
+                f"pipeline input media[{media_index}] does not accept {rate_name}, "
+                f"received {value!r}"
+            )
+        return
+    if value is None:
+        if requirement is RateRequirement.REQUIRED:
+            raise ValueError(f"pipeline input media[{media_index}] requires {rate_name}")
+        return
+    if rate_name == "fps":
+        if type(value) is not float or not math.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"pipeline input media[{media_index}] requires finite positive fps, "
+                f"received {value!r}"
+            )
+        return
+    if type(value) is not int or value <= 0:
+        raise ValueError(
+            f"pipeline input media[{media_index}] requires positive integer sample_rate, "
+            f"received {value!r}"
+        )
+
+
 def _require_enum(value: object, enum_type: type[Enum], field_name: str) -> None:
     if not isinstance(value, enum_type):
         raise TypeError(
@@ -273,13 +426,16 @@ __all__ = [
     "DecodedMediaLike",
     "GeometrySource",
     "InputMediaBinding",
+    "InputMediaLike",
     "InputMediaOrder",
     "InputMediaRule",
     "InputMediaSpec",
     "MediaFormat",
     "MediaType",
+    "ModelInputLike",
     "NegativePromptPolicy",
     "OutputMediaSequence",
     "PipelineIOContract",
     "RateRequirement",
+    "validate_pipeline_model_input",
 ]

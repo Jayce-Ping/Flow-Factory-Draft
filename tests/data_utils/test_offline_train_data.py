@@ -26,6 +26,20 @@ from PIL import Image
 from torch.utils.data import ConcatDataset, DistributedSampler
 
 import flow_factory.data_utils.offline_train_data as offline_train_data
+from flow_factory.contracts import (
+    BatchCapability,
+    GeometrySource,
+    InputMediaBinding,
+    InputMediaOrder,
+    InputMediaRule,
+    InputMediaSpec,
+    MediaFormat,
+    MediaType,
+    NegativePromptPolicy,
+    OutputMediaSequence,
+    PipelineIOContract,
+    RateRequirement,
+)
 from flow_factory.data_utils.offline_dataset import (
     OFFLINE_CONDITION_ID_COLUMN,
     DemonstrationOutput,
@@ -35,6 +49,34 @@ from flow_factory.data_utils.offline_dataset import (
 from flow_factory.data_utils.offline_train_data import build_offline_train_dataloader
 from flow_factory.hparams.data_args import DataArguments
 from flow_factory.hparams.dataset_args import DatasetArguments, DatasetTrainSpec
+
+_IMAGE_FORMAT = MediaFormat(
+    type=MediaType.IMAGE,
+    fps=RateRequirement.NOT_APPLICABLE,
+    sample_rate=RateRequirement.NOT_APPLICABLE,
+)
+_TEXT_TO_IMAGE_CONTRACT = PipelineIOContract(
+    input_media=InputMediaSpec(
+        rules=(),
+        binding=InputMediaBinding.GROUPED_BY_TYPE,
+        order=InputMediaOrder.INSENSITIVE,
+    ),
+    negative_prompt=NegativePromptPolicy.OPTIONAL,
+    output_media=OutputMediaSequence(items=(_IMAGE_FORMAT,)),
+    geometry_source=GeometrySource.CONFIGURED,
+    batch_capability=BatchCapability.UNIFORM,
+)
+_ORDERED_IMAGE_CONTRACT = PipelineIOContract(
+    input_media=InputMediaSpec(
+        rules=(InputMediaRule(format=_IMAGE_FORMAT, min_count=1, max_count=1),),
+        binding=InputMediaBinding.ORDERED_REFERENCES,
+        order=InputMediaOrder.GLOBAL,
+    ),
+    negative_prompt=NegativePromptPolicy.OPTIONAL,
+    output_media=OutputMediaSequence(items=(_IMAGE_FORMAT,)),
+    geometry_source=GeometrySource.CONFIGURED,
+    batch_capability=BatchCapability.UNIFORM,
+)
 
 
 class _TrainingArguments(dict):
@@ -224,6 +266,7 @@ def test_builder_returns_detached_input_cache_and_decodes_target_on_demand(
         accelerator,
         preprocessor.preprocess,
         supervision_type="demonstration",
+        pipeline_io_contract=_TEXT_TO_IMAGE_CONTRACT,
         shuffle=False,
     )
 
@@ -273,6 +316,7 @@ def test_builder_slices_each_source_and_preserves_resolved_source_identity(tmp_p
         _Accelerator(),
         _CountingPreprocessor().preprocess,
         supervision_type="demonstration",
+        pipeline_io_contract=_TEXT_TO_IMAGE_CONTRACT,
         shuffle=False,
     )
 
@@ -301,6 +345,7 @@ def test_target_and_metadata_only_manifest_change_reuses_condition_cache(tmp_pat
         _Accelerator(),
         preprocessor.preprocess,
         supervision_type="demonstration",
+        pipeline_io_contract=_TEXT_TO_IMAGE_CONTRACT,
         shuffle=False,
     )
     _write_manifest(
@@ -312,6 +357,7 @@ def test_target_and_metadata_only_manifest_change_reuses_condition_cache(tmp_pat
         _Accelerator(),
         preprocessor.preprocess,
         supervision_type="demonstration",
+        pipeline_io_contract=_TEXT_TO_IMAGE_CONTRACT,
         shuffle=False,
     )
 
@@ -338,6 +384,7 @@ def test_builder_supports_homogeneous_offline_preference_sources(tmp_path: Path)
         _Accelerator(),
         _CountingPreprocessor().preprocess,
         supervision_type="preference",
+        pipeline_io_contract=_TEXT_TO_IMAGE_CONTRACT,
         shuffle=False,
     )
 
@@ -367,6 +414,7 @@ def test_builder_uses_bridge_ordered_reference_boundary_with_single_row_batches(
         _Accelerator(),
         preprocessor.preprocess,
         supervision_type="demonstration",
+        pipeline_io_contract=_ORDERED_IMAGE_CONTRACT,
         shuffle=False,
     )
 
@@ -375,6 +423,46 @@ def test_builder_uses_bridge_ordered_reference_boundary_with_single_row_batches(
     assert "type" not in preprocessor.references[0][0]
     (dataset,) = _source_datasets(loader)
     assert dataset[0].model_input.media[0].type == "image"
+
+
+def test_builder_rejects_unsupported_input_media_before_condition_preprocessing(
+    tmp_path: Path,
+) -> None:
+    """Text-to-image adapters cannot silently discard V2 conditioning media."""
+    dataset_dir = tmp_path / "unsupported-input"
+    dataset_dir.mkdir()
+    _write_image(dataset_dir / "reference.png", 25)
+    _write_image(dataset_dir / "target.png", 75)
+    row = _demonstration_row("must use the reference", "target.png")
+    row["input"]["media"] = [{"type": "image", "path": "reference.png"}]
+    _write_manifest(dataset_dir, [row])
+    preprocessor = _CountingPreprocessor()
+
+    with pytest.raises(
+        ValueError,
+        match=r"source 'unsupported-input' row 0.*does not accept input media type 'image'",
+    ):
+        build_offline_train_dataloader(
+            _config(tmp_path, [_source("unsupported-input", dataset_dir, 0)]),
+            _Accelerator(),
+            preprocessor.preprocess,
+            supervision_type="demonstration",
+            pipeline_io_contract=_TEXT_TO_IMAGE_CONTRACT,
+        )
+
+    assert preprocessor.calls == 0
+
+
+def test_builder_rejects_preprocessor_binding_drift_before_dataset_io(tmp_path: Path) -> None:
+    """Projection layout must agree with the adapter-owned binding declaration."""
+    with pytest.raises(ValueError, match=r"binding disagrees.*ordered_references.*False"):
+        build_offline_train_dataloader(
+            _config(tmp_path, [_source("missing", tmp_path / "missing", 0)]),
+            _Accelerator(),
+            _CountingPreprocessor().preprocess,
+            supervision_type="demonstration",
+            pipeline_io_contract=_ORDERED_IMAGE_CONTRACT,
+        )
 
 
 def test_builder_rejects_non_unit_weight_and_unresolved_source_id_before_io(
@@ -389,6 +477,7 @@ def test_builder_rejects_non_unit_weight_and_unresolved_source_id_before_io(
             _Accelerator(),
             preprocessor.preprocess,
             supervision_type="demonstration",
+            pipeline_io_contract=_TEXT_TO_IMAGE_CONTRACT,
         )
     with pytest.raises(ValueError, match="resolved integer source_id"):
         build_offline_train_dataloader(
@@ -396,6 +485,7 @@ def test_builder_rejects_non_unit_weight_and_unresolved_source_id_before_io(
             _Accelerator(),
             preprocessor.preprocess,
             supervision_type="demonstration",
+            pipeline_io_contract=_TEXT_TO_IMAGE_CONTRACT,
         )
     assert preprocessor.calls == 0
 
@@ -428,6 +518,7 @@ def test_builder_rejects_missing_target_decoder_before_condition_preprocessing(
             _Accelerator(),
             preprocessor.preprocess,
             supervision_type="demonstration",
+            pipeline_io_contract=_TEXT_TO_IMAGE_CONTRACT,
         )
     assert preprocessor.calls == 0
 
@@ -474,6 +565,7 @@ def test_builder_delegates_distributed_condition_cache_to_rank_safe_orchestrator
         accelerator,
         _CountingPreprocessor().preprocess,
         supervision_type="demonstration",
+        pipeline_io_contract=_TEXT_TO_IMAGE_CONTRACT,
         shuffle=False,
     )
 
