@@ -25,7 +25,8 @@ container, never an all-`-1` placeholder. Sparse terminal-only state collection 
 
 ## Both storage formats, one trainer-facing API
 
-Twelve of the fourteen adapters still emit legacy trajectories; only LTX2 emits structured ones.
+Thirteen of the eighteen registered adapter variants still emit legacy trajectories. The two LTX2
+workflows and three MiniMax H3 workflows emit structured ones.
 That dual track is deliberately invisible above the bridge: no trainer reads `all_latents`,
 `latent_index_map` or `log_prob_index_map`, and the format branch exists only inside
 `trajectory_bridge`. Keep it that way — a trainer that indexes storage directly re-couples every
@@ -51,6 +52,7 @@ reduction, and losses.
 | DiffusionNFT / AWM / DPO | Terminal state plus ordered forward-process noise |
 | DGPO | Deterministic per-UID component noise in `component_order` |
 | CRD | Global two-pass order; pass two rebuilds state from stored component noise |
+| DMD2 / TDM / TDM-R1 | Terminal state plus ordered forward-process noise; TDM conditional re-noising restores each component's boundary dtype after float32 likelihood math |
 | DiffusionOPD | Requires homogeneous scheduler-group dynamics; no reward/advantage stage |
 
 Single-component adapters retain legacy bit-parity: generalizing a reduction to N components

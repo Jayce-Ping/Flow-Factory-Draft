@@ -14,9 +14,16 @@
 
 from typing import Any, List
 
+import pytest
 import torch
 
 from flow_factory.models.abc import BaseAdapter
+from flow_factory.models.minimax_h3 import (
+    MiniMaxH3T2VAAdapter,
+)
+from flow_factory.models.minimax_h3 import (
+    build_training_component_times as build_h3_training_component_times,
+)
 from flow_factory.samples import BaseSample, ComponentTimes, LatentState
 from flow_factory.scheduler import SDESchedulerOutput
 from flow_factory.trainers.distillation.distribution_matching import (
@@ -166,14 +173,80 @@ def test_tdm_conditional_renoise_matches_official_linear_flow_formula() -> None:
     expected_state = ratio * x_mid + beta * fresh
     expected_target = mixed - clean.components["latent"]
     expected_importance = torch.exp(
-        -0.5 * mixed.square().flatten(1).mean(1)
-        + 0.5 * fresh.square().flatten(1).mean(1)
+        -0.5 * mixed.square().flatten(1).mean(1) + 0.5 * fresh.square().flatten(1).mean(1)
     ).clamp(1 / 20.0, 20.0)
 
     torch.testing.assert_close(noised.state.components["latent"], expected_state)
     torch.testing.assert_close(noised.target_velocity.components["latent"], expected_target)
     torch.testing.assert_close(importance, expected_importance)
     assert importance.requires_grad is False
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_tdm_conditional_renoise_preserves_h3_latent_dtype(dtype: torch.dtype) -> None:
+    """Keep float32 conditional math behind the adapter's latent-storage boundary."""
+    adapter = object.__new__(MiniMaxH3T2VAAdapter)
+    clean = LatentState(
+        {
+            "video": torch.linspace(-1, 1, 2 * 96, dtype=dtype).reshape(1, 2, 96),
+            "audio": torch.linspace(-1, 1, 3 * 32, dtype=dtype).reshape(1, 3, 32),
+        }
+    )
+    model_noise = LatentState(
+        {
+            name: torch.linspace(-0.5, 0.5, component.numel(), dtype=torch.float32).reshape(
+                component.shape
+            )
+            for name, component in clean.components.items()
+        }
+    )
+    mid_times = build_h3_training_component_times(
+        torch.tensor([250.0]),
+        video_shift=1.0,
+        audio_shift=1.0,
+    )
+    target_times = build_h3_training_component_times(
+        torch.tensor([750.0]),
+        video_shift=1.0,
+        audio_shift=1.0,
+    )
+
+    noised, importance = tdm_conditional_renoise(
+        adapter,
+        clean,
+        model_noise,
+        mid_times=mid_times,
+        target_times=target_times,
+    )
+
+    for state in (noised.state, noised.target_velocity, noised.noise):
+        assert all(component.dtype == dtype for component in state.components.values())
+    assert importance.dtype == torch.float32
+
+
+def test_tdm_conditional_renoise_keeps_importance_inputs_in_float32() -> None:
+    adapter = _adapter()
+    reduced_dtypes: list[tuple[torch.dtype, ...]] = []
+
+    def capture_reduction(values: dict[str, torch.Tensor], *, state: LatentState) -> torch.Tensor:
+        reduced_dtypes.append(tuple(component.dtype for component in values.values()))
+        return next(iter(values.values())).flatten(1).mean(dim=1)
+
+    adapter.reduce_latent_values = capture_reduction
+    clean = _state(torch.linspace(-1, 1, 12, dtype=torch.float16).reshape(1, 3, 2, 2))
+    model_noise = _state(torch.linspace(-0.5, 0.5, 12).reshape(1, 3, 2, 2))
+
+    noised, importance = tdm_conditional_renoise(
+        adapter,
+        clean,
+        model_noise,
+        mid_times=_times(torch.tensor([0.25])),
+        target_times=_times(torch.tensor([0.75])),
+    )
+
+    assert noised.noise.components["latent"].dtype == torch.float16
+    assert reduced_dtypes == [(torch.float32,), (torch.float32,)]
+    assert importance.dtype == torch.float32
 
 
 def test_tdm_fake_loss_is_finite_with_unit_importance() -> None:

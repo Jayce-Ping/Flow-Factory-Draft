@@ -12,6 +12,7 @@
 | Transformer (trainable) | `trainable_parameters_dtype` (fp32/bf16) | Gradient precision |
 | Scheduler math | `float32` always | `1/sigma` amplification (see below) |
 | Latent storage (trajectory) | `latent_storage_dtype` (configurable) | Memory vs. precision tradeoff |
+| Forward-process adapter boundary | Exact dtype/device of each clean latent component | Structured adapters reject noise with a different storage representation |
 | Advantage computation | `float64` (numpy) | Normalization stability |
 
 Boundaries are set in `BaseAdapter._mix_precision()` (`models/abc.py`) and `BaseTrainer.__init__` (autocast context). Autocast weight-cache invariant + in-place ref/EMA/named swaps: `topics/autocast_param_swap.md` (#20a).
@@ -69,6 +70,17 @@ The round-trip ensures that the precision of stored latents matches what trainin
 | `ratio` drifts from 1.0 at epoch start | Compare `forward()` output dtype between rollout and training. Verify `cast_latents()` is called in both paths. |
 | Gradients explode near end of schedule | Scheduler using lower-than-float32 precision? Check `_input_dtype` round-trip in scheduler. |
 | Reward NaN but generation looks normal | Advantage normalization overflow — verify `float64` in `advantage_processor.py`. |
+| Forward noising rejects float32 noise for fp16/bf16 latents | Keep stochastic/likelihood math in float32, then cast the adapter-bound noise component with `.to(clean_component)` before calling `apply_forward_process_noise()`. |
+
+## Fix records
+
+### TDM conditional noise crossed the latent boundary in float32
+- **Date**: 2026-08-27
+- **Symptom**: MiniMax H3 rejected TDM fake-stage noise because the clean video/audio latents were float16 while conditionally mixed noise was float32.
+- **Root Cause**: TDM correctly promoted conditional re-noising and likelihood math to float32 but passed that compute representation directly into the adapter's strict storage boundary.
+- **Fix**: TDM now retains float32 mixed/fresh noise for importance weighting and creates a separate adapter-bound noise state cast component-wise to each clean latent's actual dtype and device.
+- **Lesson**: Compute precision and boundary representation are separate contracts. Restore representation at the producer boundary instead of weakening adapter validation or casting from global configuration.
+- **Related Constraint**: N/A
 
 ## Cross-refs
 
