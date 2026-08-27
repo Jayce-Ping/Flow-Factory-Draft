@@ -21,8 +21,8 @@ import pytest
 import torch
 import torch.nn as nn
 from accelerate import DistributedType
-from diffusers.modular_pipelines.modular_pipeline import ModularPipeline
 
+from diffusers.modular_pipelines.modular_pipeline import ModularPipeline
 from flow_factory.models.abc import BaseAdapter
 from flow_factory.models.model_bundle import ModelBundle, RoutedComponentProxy
 from flow_factory.models.runtime import (
@@ -31,6 +31,7 @@ from flow_factory.models.runtime import (
     PseudoPipelineRuntime,
 )
 from flow_factory.trainers.abc import BaseTrainer
+from flow_factory.trainers.execution import OFFLINE_EXECUTION_CONTRACT
 
 
 class TrackingModule(nn.Module):
@@ -857,6 +858,7 @@ class LifecycleAdapterFake:
 
     preprocessing_modules = ["text_encoders", "vae"]
     inference_modules = ["transformer", "vae"]
+    output_state_encoding_modules = ["target_encoder"]
 
     def __init__(self) -> None:
         self.calls: List[Any] = []
@@ -874,7 +876,7 @@ class LifecycleAdapterFake:
     def _resolve_component_names(self, components: Any = None) -> List[str]:
         """Resolve the groups needed by the trainer regression test."""
         self.calls.append(("resolve", components))
-        return ["transformer", "vae"]
+        return list(dict.fromkeys(components))
 
     def uses_fsdp_cpu_efficient_loading(self) -> bool:
         """Return whether frozen components require rank-zero synchronization."""
@@ -892,11 +894,18 @@ class TrainerAcceleratorFake:
         """Record no-op synchronization."""
 
 
+class LifecycleTrainerFake(SimpleNamespace):
+    """Bind BaseTrainer hooks while retaining a minimal lifecycle fixture."""
+
+    execution_contract = BaseTrainer.execution_contract
+    _build_train_dataloader = BaseTrainer._build_train_dataloader
+
+
 def test_trainer_preprocessing_routes_through_adapter_public_lifecycle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter = LifecycleAdapterFake()
-    trainer = SimpleNamespace(
+    trainer = LifecycleTrainerFake(
         adapter=adapter,
         accelerator=TrainerAcceleratorFake(),
         config=SimpleNamespace(data_args=SimpleNamespace(eval_datasets=[])),
@@ -920,7 +929,7 @@ def test_trainer_synchronizes_lazy_frozen_components_after_materialization(
 ) -> None:
     adapter = LifecycleAdapterFake()
     adapter.fsdp_cpu_efficient_loading = True
-    trainer = SimpleNamespace(
+    trainer = LifecycleTrainerFake(
         adapter=adapter,
         accelerator=TrainerAcceleratorFake(),
         config=SimpleNamespace(data_args=SimpleNamespace(eval_datasets=[])),
@@ -945,7 +954,7 @@ def test_trainer_synchronizes_lazy_frozen_components_after_materialization(
 
 def test_trainer_inference_load_routes_through_adapter_public_lifecycle() -> None:
     adapter = LifecycleAdapterFake()
-    trainer = SimpleNamespace(
+    trainer = LifecycleTrainerFake(
         adapter=adapter,
         accelerator=TrainerAcceleratorFake(),
         config=SimpleNamespace(data_args=SimpleNamespace(enable_preprocess=True)),
@@ -962,7 +971,7 @@ def test_trainer_inference_load_routes_through_adapter_public_lifecycle() -> Non
 def test_trainer_synchronizes_lazy_inference_components_after_materialization() -> None:
     adapter = LifecycleAdapterFake()
     adapter.fsdp_cpu_efficient_loading = True
-    trainer = SimpleNamespace(
+    trainer = LifecycleTrainerFake(
         adapter=adapter,
         accelerator=TrainerAcceleratorFake(),
         config=SimpleNamespace(data_args=SimpleNamespace(enable_preprocess=True)),
@@ -977,6 +986,27 @@ def test_trainer_synchronizes_lazy_inference_components_after_materialization() 
         ("resolve", adapter.inference_modules),
         ("load", ["transformer", "vae"], trainer.accelerator.device),
         ("synchronize", ["transformer", "vae"]),
+    ]
+
+
+def test_offline_inference_lifecycle_includes_output_codec_components() -> None:
+    adapter = LifecycleAdapterFake()
+
+    class OfflineLifecycleTrainerFake(LifecycleTrainerFake):
+        execution_contract = OFFLINE_EXECUTION_CONTRACT
+
+    trainer = OfflineLifecycleTrainerFake(
+        adapter=adapter,
+        accelerator=TrainerAcceleratorFake(),
+        config=SimpleNamespace(data_args=SimpleNamespace(enable_preprocess=True)),
+    )
+
+    BaseTrainer._load_inference_components(trainer, trainable_module_names=[])
+
+    expected = [*adapter.inference_modules, *adapter.output_state_encoding_modules]
+    assert adapter.calls == [
+        ("resolve", expected),
+        ("load", expected, trainer.accelerator.device),
     ]
 
 

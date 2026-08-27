@@ -312,17 +312,56 @@ def test_offline_epoch_means_one_complete_dataloader_traversal() -> None:
         "batch:[0, 1]",
         "batch:[2, 3]",
         "batch:[4]",
-        "ema:0",
         "set_epoch:1",
         "batch:[0, 1]",
         "batch:[2, 3]",
         "batch:[4]",
-        "ema:1",
     ]
     assert trainer.epoch == 2
     assert trainer.step == 6
     assert trainer.progress.data_epoch == 2
     assert trainer.progress.rollout_iteration == 0
+
+
+@pytest.mark.parametrize(
+    ("trainer_class", "expected_ema_events"),
+    [
+        (OfflineEpochTrainerFake, ["ema:0"]),
+        (OnlineCycleTrainerFake, []),
+    ],
+)
+def test_shared_ema_uses_optimizer_step_cadence_only_for_offline_acquisition(
+    trainer_class: type[BaseTrainer],
+    expected_ema_events: List[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Offline EMA follows successful updates while online EMA remains cycle-owned."""
+    trainer = object.__new__(trainer_class)
+    events: List[str] = []
+    trainer.progress = trainer._get_progress()
+    trainer.training_args = SimpleNamespace(max_grad_norm=1.0)
+    trainer.model_bundle = SimpleNamespace(parameters=lambda: [])
+    trainer.accelerator = SimpleNamespace(
+        clip_grad_norm_=lambda parameters, max_norm: torch.tensor(0.5)
+    )
+    trainer.optimizer = SimpleNamespace(
+        step=lambda: events.append("optimizer"),
+        zero_grad=lambda: events.append("zero_grad"),
+    )
+    trainer.adapter = SimpleNamespace(
+        ema_step=lambda step: events.append(f"ema:{step}"),
+    )
+    trainer.log_data = lambda data, step: events.append(f"log:{step}")
+    monkeypatch.setattr(
+        "flow_factory.trainers.abc.reduce_loss_info",
+        lambda accelerator, loss_info: {"loss": torch.tensor(1.0)},
+    )
+
+    trainer._apply_optimizer_step({"loss": [torch.tensor(1.0)]})
+
+    assert [event for event in events if event.startswith("ema:")] == expected_ema_events
+    assert events == ["optimizer", *expected_ema_events, "zero_grad", "log:0"]
+    assert trainer.step == 1
 
 
 def test_incomplete_offline_traversal_does_not_advance_data_epoch() -> None:

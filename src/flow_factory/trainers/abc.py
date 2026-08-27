@@ -430,11 +430,7 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         if self.adapter.uses_fsdp_cpu_efficient_loading():
             self._synchronize_frozen_components(self.adapter.preprocessing_modules)
 
-        dataloader, train_dataloaders_by_source = get_train_dataloader(
-            config=self.config,
-            accelerator=self.accelerator,
-            preprocess_func=self.adapter.preprocess_func,
-        )
+        dataloader, train_dataloaders_by_source = self._build_train_dataloader()
         self.train_dataloaders_by_source: Dict[str, DataLoader] = train_dataloaders_by_source
 
         eval_dataloaders = get_eval_dataloaders(
@@ -451,6 +447,21 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         self.accelerator.wait_for_everyone()
 
         return dataloader, eval_dataloaders
+
+    def _build_train_dataloader(
+        self,
+    ) -> Tuple[Optional[Union[DataLoader, "MultiSourceTrainDataLoader"]], Dict[str, DataLoader]]:
+        """Build the acquisition-specific training loader.
+
+        Online trainers inherit the grouped rollout loader unchanged. Offline
+        trainers override this hook and delegate to the shared finite-dataset
+        builder; the surrounding preprocessing-component lifecycle remains common.
+        """
+        return get_train_dataloader(
+            config=self.config,
+            accelerator=self.accelerator,
+            preprocess_func=self.adapter.preprocess_func,
+        )
 
     def _init_optimizer(self) -> torch.optim.Optimizer:
         """Build the single optimizer root, its groups ordered and tagged by role.
@@ -700,6 +711,9 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         prepared_names = set(trainable_module_names)
 
         modules_to_load = list(self.adapter.inference_modules)
+
+        if type(self).execution_contract.acquisition is AcquisitionMode.DATASET:
+            modules_to_load.extend(self.adapter.output_state_encoding_modules)
 
         if not self.config.data_args.enable_preprocess:
             modules_to_load.extend(self.adapter.preprocessing_modules)
@@ -1037,7 +1051,8 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
 
             driver.run_cycle(self, self.progress)
 
-            self.adapter.ema_step(step=self.cycle_index)
+            if type(self).execution_contract.acquisition is AcquisitionMode.ROLLOUT:
+                self.adapter.ema_step(step=self.cycle_index)
             self._after_training_cycle()
             self.progress = self.progress.advance_cycle(
                 type(self).execution_contract.cycle_unit,
@@ -1265,6 +1280,8 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
             self.training_args.max_grad_norm,
         )
         self.optimizer.step()
+        if type(self).execution_contract.acquisition is AcquisitionMode.DATASET:
+            self.adapter.ema_step(step=self.step)
         self.optimizer.zero_grad()
         self._after_gradient_step()
 
