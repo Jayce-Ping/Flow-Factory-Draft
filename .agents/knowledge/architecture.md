@@ -58,6 +58,14 @@ when the official `DistributedSampler` dataloader is built. SFT and offline DPO 
 flow-matching timestep hparams; multiple timestep loss terms are averaged within a batch
 microstep, independently of gradient accumulation.
 
+`BaseTrainer.start()` deliberately places periodic save/eval boundaries asymmetrically. Online
+execution prepares the trajectory seed and runs the boundary at the current completed
+`rollout_iteration` before generating the next rollout, preserving the historical pre-cycle
+cadence. Offline execution first exhausts the finite dataloader, runs `_after_training_cycle()`,
+advances `data_epoch`, and only then runs the boundary at the newly completed epoch index. One
+`data_epoch` means exactly one complete dataloader traversal; an exception during traversal or the
+cycle hook advances neither the counter nor the boundary.
+
 ### Online reward-based pipeline
 
 ```
@@ -105,8 +113,9 @@ Stage 6: Policy Optimization
 Reward-free online distillation uses the same rollout driver but declares `feedback=none` and
 omits Stages 4–5. Offline trainers use `OfflineExecutionDriver`: call PyTorch
 `DistributedSampler.set_epoch(data_epoch)`, stream every finite dataloader batch through
-`optimize_batch()`, and advance `data_epoch` only after clean exhaustion. They never fake a
-sampling stage and never load an entire epoch into memory.
+`optimize_batch()`, then return to the shared loop for the cycle hook, `data_epoch` advancement,
+and the post-epoch save/eval boundary. They never fake a sampling stage and never load an entire
+epoch into memory.
 
 The strict V2 record schema is model- and algorithm-neutral: `input` owns generation conditions,
 while optional `demonstration` or `preference` supervision owns ordered output candidates through
@@ -114,7 +123,8 @@ the public `type` discriminator. Offline preprocessing projects only `input` int
 fingerprinted cache, after validating every input and preprocessing binding against the adapter's
 pipeline contract. Target/chosen/rejected media remain normalized paths, decode per access on the
 CPU, and enter adapter-owned output-state codecs for on-the-fly VAE encoding. Offline EMA follows
-`optimizer_step`; checkpoint/eval and `data_epoch` boundaries remain full loader traversals.
+`optimizer_step`; checkpoint/eval occurs only after the complete traversal, cycle hook, and
+`data_epoch` advancement.
 
 Offline exact-state checkpoints use a framework-owned JSON+safetensors runtime sidecar rather than
 Accelerate custom objects, which are pickle-backed. Runtime-state v1 is intentionally
@@ -214,8 +224,17 @@ Timesteps are `[0, 1000]` (scheduler scale); sigmas are `[0, 1]` (flow-matching 
 Each model adapter wraps a diffusers pipeline into the `BaseAdapter` interface:
 - `preprocess_func()` — cacheable generation-input encoding (Stage 1)
 - `build_output_state_codec()` — optional adapter-owned on-the-fly target encoding for offline algorithms
+- `output_state_codec_unavailable_reason` — actionable class-level blocker for adapters that are
+  intentionally online-only until a correct target codec exists
 - `inference()` — full denoising loop (Stage 3)
 - `forward()` — single-step denoising (Stage 6)
+
+Offline trainer loading validates this class-level output capability before Accelerator
+construction or model loading. Realized codec components and geometry are validated again after
+adapter construction. Input `encode_*` methods and target codecs remain separate lifecycle
+boundaries, but compatible condition/target paths reuse one role-neutral numerical encoder inside
+the adapter family. The boundaries add only role-owned caching, packing, geometry, masks, and
+forward/decode context; they must not duplicate the underlying VAE transform.
 
 **Per-modality encoders** (`encode_prompt`, `encode_image`, `encode_video`, `encode_audio`) are no-op by default on `BaseAdapter` — override only the modalities your model consumes. `preprocess_func` dispatches to all four and skips any that return `None`, so text/image/video-only adapters need no stub overrides for unused modalities.
 

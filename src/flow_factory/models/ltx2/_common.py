@@ -20,7 +20,6 @@ from __future__ import annotations
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import torch
-
 from diffusers.utils.torch_utils import randn_tensor
 
 from ...samples import (
@@ -39,6 +38,14 @@ from ..component_reduction import reduce_component_log_probs
 # Both LTX2 adapters expose one joint video+audio policy, so the authoritative
 # component order is fixed here rather than derived from any mapping iteration.
 LTX2_COMPONENT_ORDER: Tuple[str, ...] = ("video", "audio")
+
+LTX2_OUTPUT_STATE_CODEC_UNAVAILABLE_REASON = (
+    "The default offline loader has no target-audio decoder, and Diffusers does not "
+    "expose a checkpoint-validated LTX2 waveform-to-training-mel frontend before "
+    "audio_vae.encode; the BWE vocoder's internal MelSTFT is not a verified substitute. "
+    "Add the audio decoder, a parity-tested waveform frontend, and a joint video/audio "
+    "target-packing fixture before enabling offline training."
+)
 
 # Latent-shaped scheduler outputs a trainer replays per component. Every other
 # callback result stays a legacy ``extra_kwargs`` entry because it either carries

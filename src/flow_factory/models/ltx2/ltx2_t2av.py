@@ -20,7 +20,6 @@ from typing import Any, ClassVar, Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
 from accelerate import Accelerator
-
 from diffusers.pipelines.ltx2.pipeline_ltx2 import LTX2Pipeline, rescale_noise_cfg
 
 from ...hparams import *
@@ -48,6 +47,7 @@ from ...utils.trajectory_collector import (
 from ..abc import BaseAdapter
 from ._common import (
     LTX2_COMPONENT_ORDER,
+    LTX2_OUTPUT_STATE_CODEC_UNAVAILABLE_REASON,
     attach_ltx2_state_masks,
     build_ltx2_component_step_output,
     build_ltx2_full_component_schedule,
@@ -164,6 +164,7 @@ class LTX2_T2AV_Adapter(BaseAdapter):
 
     supports_diffusers_cache = True
     trajectory_component_order: ClassVar[Tuple[str, ...]] = LTX2_COMPONENT_ORDER
+    output_state_codec_unavailable_reason = LTX2_OUTPUT_STATE_CODEC_UNAVAILABLE_REASON
 
     def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)

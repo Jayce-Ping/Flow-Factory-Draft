@@ -77,6 +77,25 @@ _ORDERED_IMAGE_CONTRACT = PipelineIOContract(
     geometry_source=GeometrySource.CONFIGURED,
     batch_capability=BatchCapability.UNIFORM,
 )
+_TEXT_TO_AUDIO_CONTRACT = PipelineIOContract(
+    input_media=InputMediaSpec(
+        rules=(),
+        binding=InputMediaBinding.GROUPED_BY_TYPE,
+        order=InputMediaOrder.INSENSITIVE,
+    ),
+    negative_prompt=NegativePromptPolicy.OPTIONAL,
+    output_media=OutputMediaSequence(
+        items=(
+            MediaFormat(
+                type=MediaType.AUDIO,
+                fps=RateRequirement.NOT_APPLICABLE,
+                sample_rate=RateRequirement.REQUIRED,
+            ),
+        )
+    ),
+    geometry_source=GeometrySource.OUTPUT_MEDIA,
+    batch_capability=BatchCapability.UNIFORM,
+)
 
 
 class _TrainingArguments(dict):
@@ -493,16 +512,24 @@ def test_builder_rejects_non_unit_weight_and_unresolved_source_id_before_io(
 def test_builder_rejects_missing_target_decoder_before_condition_preprocessing(
     tmp_path: Path,
 ) -> None:
-    dataset_dir = tmp_path / "video"
+    dataset_dir = tmp_path / "audio"
     _write_manifest(
         dataset_dir,
         [
             {
                 "schema_version": 2,
-                "input": {"prompt": "video target", "media": []},
+                "input": {"prompt": "audio target", "media": []},
                 "supervision": {
                     "type": "demonstration",
-                    "target": {"media": [{"type": "video", "path": "target.mp4", "fps": 24.0}]},
+                    "target": {
+                        "media": [
+                            {
+                                "type": "audio",
+                                "path": "target.wav",
+                                "sample_rate": 16000,
+                            }
+                        ]
+                    },
                 },
             }
         ],
@@ -511,15 +538,57 @@ def test_builder_rejects_missing_target_decoder_before_condition_preprocessing(
 
     with pytest.raises(
         NotImplementedError,
-        match=r"source 'video'.*type 'video'.*target\.mp4",
+        match=r"source 'audio'.*type 'audio'.*target\.wav",
     ):
         build_offline_train_dataloader(
-            _config(tmp_path, [_source("video", dataset_dir, 0)]),
+            _config(tmp_path, [_source("audio", dataset_dir, 0)]),
+            _Accelerator(),
+            preprocessor.preprocess,
+            supervision_type="demonstration",
+            pipeline_io_contract=_TEXT_TO_AUDIO_CONTRACT,
+        )
+    assert preprocessor.calls == 0
+
+
+def test_builder_rejects_output_contract_before_condition_preprocessing(
+    tmp_path: Path,
+) -> None:
+    dataset_dir = tmp_path / "wrong-output"
+    _write_manifest(
+        dataset_dir,
+        [
+            {
+                "schema_version": 2,
+                "input": {"prompt": "video target", "media": []},
+                "supervision": {
+                    "type": "demonstration",
+                    "target": {
+                        "media": [
+                            {
+                                "type": "video",
+                                "path": "target.mp4",
+                                "fps": 24.0,
+                            }
+                        ]
+                    },
+                },
+            }
+        ],
+    )
+    preprocessor = _CountingPreprocessor()
+
+    with pytest.raises(
+        ValueError,
+        match=r"source 'wrong-output' row 0 target.*expected.*type 'image'.*'video'",
+    ):
+        build_offline_train_dataloader(
+            _config(tmp_path, [_source("wrong-output", dataset_dir, 0)]),
             _Accelerator(),
             preprocessor.preprocess,
             supervision_type="demonstration",
             pipeline_io_contract=_TEXT_TO_IMAGE_CONTRACT,
         )
+
     assert preprocessor.calls == 0
 
 

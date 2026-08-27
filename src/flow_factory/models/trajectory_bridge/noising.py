@@ -15,7 +15,6 @@
 from typing import Any, Dict, Mapping, Optional
 
 import torch
-
 from diffusers.utils.torch_utils import randn_tensor
 
 from ...samples import (

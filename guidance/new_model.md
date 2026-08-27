@@ -9,6 +9,7 @@
   - [Step 2: Create Adapter Class](#step-2-create-adapter-class)
   - [Step 3: Configure Module Properties](#step-3-configure-module-properties)
   - [Step 4: Implement Encoding Methods](#step-4-implement-encoding-methods)
+  - [Advanced: Offline Output-State Encoding](#advanced-offline-output-state-encoding)
   - [Step 5: Implement `inference()`](#step-5-implement-inference)
   - [Step 6: Implement `forward()`](#step-6-implement-forward)
   - [Step 7: Register the Adapter](#step-7-register-the-adapter)
@@ -201,7 +202,10 @@ preprocess_func(prompt, images, videos, audios, **kwargs):
     return results
 ```
 
-Text-to-image models override only `encode_prompt` and `encode_image`; image-to-video models add `encode_video`; audio-conditioned models add `encode_audio`. There is no need to add stub `pass` overrides for unused modalities — `BaseAdapter` already provides them.
+Text-to-image and text-to-video models usually override only `encode_prompt`. Image-conditioned
+models add `encode_image`, video-conditioned models add `encode_video`, and audio-conditioned
+models add `encode_audio`. There is no need to add stub `pass` overrides for unused modalities —
+`BaseAdapter` already provides them.
 
 #### `encode_prompt`
 
@@ -296,6 +300,67 @@ def encode_audio(
     """
     return None
 ```
+
+
+### Advanced: Offline Output-State Encoding
+
+The four `encode_*` methods above encode **generation inputs** for the condition cache. Do not use
+them to encode SFT or offline-DPO targets: a target has a different lifecycle, may contain a
+different media sequence, and must never enter the input-cache fingerprint.
+Consequently, a text-to-image adapter without `encode_image`, or a text-to-video adapter without
+`encode_video`, is not missing an SFT method: image/video is that pipeline's output, and belongs in
+its output-state codec. Add a per-modality input encoder only when the pipeline actually consumes
+that modality as conditioning.
+
+This separation does not imply two numerical implementations. When condition media and target
+media use the same checkpoint transform, extract one role-neutral helper for the VAE posterior and
+normalization, then call it from both the input encoder and the output codec. Keep only the
+role-specific orchestration separate: input caching and condition packing on one side; target
+geometry, clean-state packing, masks, and forward/decode context on the other.
+
+Offline-capable adapters instead declare two orthogonal pieces:
+
+1. `pipeline_io_contract`: static input/output media, rate, geometry, ordering, negative-prompt,
+   and batch rules.
+2. `build_output_state_codec()`: an adapter-owned on-the-fly target encoder. Its codec declares
+   `required_components` and returns a detached `EncodedOutputState` containing clean latent state,
+   model forward context, decode context, and exact geometry signatures.
+
+The codec owns the target role's selection and orchestration of model-specific choices:
+pixel/waveform normalization, the checkpoint-validated posterior policy (normally deterministic
+mode/argmax), dtype/device conversion, latent normalization, temporal/spatial geometry, patch
+packing, masks, and condition-dependent forward fields. Its VAE tensor transform may still be the
+same role-neutral helper called by a condition encoder. The trainer only consumes the generic
+encoded state. Target pixels and latents are never cached.
+
+```python
+class MyModelAdapter(BaseAdapter):
+    pipeline_io_contract = MY_PIPELINE_IO_CONTRACT
+
+    def build_output_state_codec(self) -> OutputStateCodec:
+        return MyModelOutputStateCodec(self)
+
+    def _validate_encoded_output_geometry(self, media_batch, condition, encoded):
+        # Compare codec-reported geometry/context with the authoritative pipeline layout.
+        ...
+```
+
+If a codec cannot yet be implemented correctly, declare the exact blocker instead of providing a
+partial codec or a runtime-only stub:
+
+```python
+class MyOnlineOnlyAdapter(BaseAdapter):
+    output_state_codec_unavailable_reason = (
+        "The input cache omits the source mask required to build target forward context. "
+        "Extend the input-condition contract and add an official parity fixture."
+    )
+```
+
+The reason must be a non-empty actionable string and must be removed once a real codec is built.
+Offline trainer loading surfaces it before Accelerator construction and model download; online
+algorithms continue to use the adapter normally. Add unit tests for component declarations,
+posterior determinism, dtype/device behavior, geometry and packing, batch validation, and parity
+with the official pipeline or training fixture.
 
 
 ### Step 5: Implement `inference()`

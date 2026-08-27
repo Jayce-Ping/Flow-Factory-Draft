@@ -35,7 +35,6 @@ from ...samples import (
 )
 from ..abc import BaseTrainer
 from ..execution import ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT
-from .dmd2 import DMD2Trainer
 from .distillation_runtime import (
     as_role_microbatches,
     detach_state,
@@ -58,6 +57,7 @@ from .distribution_matching import (
     tdm_fake_loss,
     tdm_generator_loss,
 )
+from .dmd2 import DMD2Trainer
 from .tdm_trajectory import TDMBoundaryUnit, TDMTrajectoryRuntimeMixin
 
 

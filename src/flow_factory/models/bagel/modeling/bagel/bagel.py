@@ -568,9 +568,7 @@ class Bagel(PreTrainedModel):
         p = self.latent_patch_size
         packed_latent = list()
         for latent, (h, w) in zip(padded_latent, patchified_vae_latent_shapes):
-            latent = latent[:, : h * p, : w * p].reshape(self.latent_channel, h, p, w, p)
-            latent = torch.einsum("chpwq->hwpqc", latent).reshape(-1, p * p * self.latent_channel)
-            packed_latent.append(latent)
+            packed_latent.append(patchify(latent[:, : h * p, : w * p], p))
         packed_latent = torch.cat(packed_latent, dim=0)
         packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
         packed_timestep_embeds = self.time_embedder(packed_timesteps)

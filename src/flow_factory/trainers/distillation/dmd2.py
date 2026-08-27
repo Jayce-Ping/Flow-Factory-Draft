@@ -36,8 +36,8 @@ from accelerate import Accelerator
 from ...hparams import Arguments, DMD2TrainingArguments
 from ...hparams.training_args.dmd2 import DMD2_DEFAULT_OPTIMIZERS
 from ...models.abc import BaseAdapter
-from ...samples import BaseSample, ComponentTimes, LatentState, StackedSampleBatch
 from ...rewards import BaseRewardModel
+from ...samples import BaseSample, ComponentTimes, LatentState, StackedSampleBatch
 from ..abc import BaseTrainer
 from ..execution import ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT
 from .distillation_runtime import (
@@ -266,9 +266,7 @@ class DMD2Trainer(BaseTrainer):
         if getattr(self, "_boundary_draw_seed", None) != scheduler_seed:
             self._boundary_draw_seed = scheduler_seed
             self._boundary_draw_count = 0
-        step_index = self.adapter.scheduler_group.sample_ode_step_index(
-            self._boundary_draw_count
-        )
+        step_index = self.adapter.scheduler_group.sample_ode_step_index(self._boundary_draw_count)
         self._boundary_draw_count += 1
         num_steps = int(self.training_args.num_inference_steps)
         if step_index >= num_steps:

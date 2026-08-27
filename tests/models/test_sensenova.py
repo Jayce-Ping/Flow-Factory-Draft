@@ -94,7 +94,12 @@ def _tiny_config(use_pixel_head: bool) -> NEOChatConfig:
     )
 
 
-def _prefix_cache(model: NEOChatModel):
+def _prefix_cache(
+    model: NEOChatModel,
+    *,
+    token_height: int = 1,
+    token_width: int = 1,
+):
     """Build a short text prefix cache without requiring a tokenizer package."""
     indexes = torch.stack(
         [torch.arange(3), torch.zeros(3, dtype=torch.long), torch.zeros(3, dtype=torch.long)]
@@ -102,8 +107,17 @@ def _prefix_cache(model: NEOChatModel):
     attention_mask = {"full_attention": create_block_causal_mask(indexes[0])}
     with torch.inference_mode():
         cache, _ = model._t2i_prefix_forward(torch.tensor([[2, 3, 4]]), indexes, attention_mask)
-    prepare_flash_kv_cache(cache, current_len=1, batch_size=1)
-    return cache, model._build_t2i_image_indexes(1, 1, 3, device="cpu")
+    prepare_flash_kv_cache(
+        cache,
+        current_len=token_height * token_width,
+        batch_size=1,
+    )
+    return cache, model._build_t2i_image_indexes(
+        token_height,
+        token_width,
+        3,
+        device="cpu",
+    )
 
 
 def test_sensenova_registry_entry():
@@ -152,8 +166,7 @@ def test_sensenova_example_uses_adapter_generation_parameters():
 def test_sensenova_multi_reference_example_uses_ordered_i2i_parameters():
     """The I2I recipe uses canonical dual guidance and the multi-ref dataset."""
     config_path = (
-        Path(__file__).parents[2]
-        / "examples/grpo/lora/sensenova/multi_reference_image.yaml"
+        Path(__file__).parents[2] / "examples/grpo/lora/sensenova/multi_reference_image.yaml"
     )
     config = Arguments.load_from_yaml(str(config_path))
     dataset = config.data_args.datasets[0]
@@ -171,19 +184,19 @@ def test_sensenova_multi_reference_example_uses_ordered_i2i_parameters():
 def test_sensenova_denoiser_supports_u1_heads(use_pixel_head: bool):
     """U1.0 and U1.5 head variants produce a valid native patch velocity."""
     model = NEOChatModel(_tiny_config(use_pixel_head)).eval()
-    cache, indexes_image = _prefix_cache(model)
+    cache, indexes_image = _prefix_cache(model, token_height=1, token_width=2)
     try:
         with torch.inference_mode():
             velocity = SenseNovaDenoiser(model)(
-                latents=torch.randn(1, 3, 32, 32),
+                latents=torch.randn(1, 3, 32, 64),
                 timestep=torch.tensor(0.2),
                 past_key_values=cache,
                 indexes_image=indexes_image,
                 attention_mask={"full_attention": None},
-                image_size=(32, 32),
+                image_size=(32, 64),
                 noise_scale=1.0,
             )
-        assert velocity.shape == (1, 1, 3072)
+        assert velocity.shape == (1, 2, 3072)
         assert torch.isfinite(velocity).all()
     finally:
         clear_flash_kv_cache(cache)
@@ -246,7 +259,7 @@ def test_sensenova_multi_reference_prefill(monkeypatch):
     references = [Image.new("RGB", (32, 32), color=(index * 40, 0, 0)) for index in range(2)]
     context = adapter._build_context(
         "Combine the references into one image.",
-        (32, 32),
+        (32, 64),
         guidance_scale=3.0,
         image_guidance_scale=2.0,
         condition_images=references,
@@ -256,33 +269,33 @@ def test_sensenova_multi_reference_prefill(monkeypatch):
         assert context["img_past_key_values"] is not None
         assert context["uncond_past_key_values"] is not None
         velocity = adapter.transformer(
-            latents=torch.randn(1, 3, 32, 32),
+            latents=torch.randn(1, 3, 32, 64),
             timestep=torch.tensor(0.2),
             past_key_values=context["past_key_values"],
             indexes_image=context["indexes_image"],
             attention_mask=context["attention_mask"],
-            image_size=(32, 32),
+            image_size=(32, 64),
             noise_scale=1.0,
         )
         image_velocity = adapter.transformer(
-            latents=torch.randn(1, 3, 32, 32),
+            latents=torch.randn(1, 3, 32, 64),
             timestep=torch.tensor(0.2),
             past_key_values=context["img_past_key_values"],
             indexes_image=context["img_indexes_image"],
             attention_mask=context["img_attention_mask"],
-            image_size=(32, 32),
+            image_size=(32, 64),
             noise_scale=1.0,
         )
-        assert velocity.shape == image_velocity.shape == (1, 1, 3072)
+        assert velocity.shape == image_velocity.shape == (1, 2, 3072)
         assert torch.isfinite(velocity).all()
         assert torch.isfinite(image_velocity).all()
         uncond_velocity = adapter.transformer(
-            latents=torch.randn(1, 3, 32, 32),
+            latents=torch.randn(1, 3, 32, 64),
             timestep=torch.tensor(0.2),
             past_key_values=context["uncond_past_key_values"],
             indexes_image=context["uncond_indexes_image"],
             attention_mask=context["uncond_attention_mask"],
-            image_size=(32, 32),
+            image_size=(32, 64),
             noise_scale=1.0,
         )
         assert uncond_velocity.shape == velocity.shape
@@ -295,10 +308,10 @@ def test_sensenova_multi_reference_prefill(monkeypatch):
         output = adapter.forward(
             t=torch.tensor(1000.0),
             t_next=torch.tensor(500.0),
-            latents=torch.randn(1, 3, 32, 32),
+            latents=torch.randn(1, 3, 32, 64),
             prompt="Combine the references into one image.",
             height=32,
-            width=32,
+            width=64,
             guidance_scale=3.0,
             image_guidance_scale=2.0,
             past_key_values=context["past_key_values"],
@@ -312,7 +325,7 @@ def test_sensenova_multi_reference_prefill(monkeypatch):
             uncond_attention_mask=context["uncond_attention_mask"],
             compute_log_prob=False,
         )
-        assert output.next_latents.shape == (1, 3, 32, 32)
+        assert output.next_latents.shape == (1, 3, 32, 64)
     finally:
         adapter._clear_context(context)
 

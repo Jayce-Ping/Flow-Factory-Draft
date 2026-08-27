@@ -136,9 +136,10 @@ def without_media_decoding(
                     for component, tensor in value.components.items()
                     if isinstance(tensor, torch.Tensor) and tensor.ndim >= 1
                 }
-                if len(component_sizes) != len(value.components) or len(
-                    set(component_sizes.values())
-                ) != 1:
+                if (
+                    len(component_sizes) != len(value.components)
+                    or len(set(component_sizes.values())) != 1
+                ):
                     raise ValueError(
                         f"{algorithm_name} media-free decoder adapter={adapter_name!r}, "
                         f"signature={decoder_signature} received invalid LatentState batch "
@@ -639,8 +640,9 @@ def run_role_phase(
     # checkpointing recomputes the forward during backward; if the inner loss
     # context has already restored another variant, FSDP1 observes a different
     # graph (and, worse, can recompute with the wrong role's weights).
-    with trainer.role_optimization.phase(role_name), trainer.adapter.use_component_variant(
-        role_name
+    with (
+        trainer.role_optimization.phase(role_name),
+        trainer.adapter.use_component_variant(role_name),
     ):
         # A single microbatch would render a 1/1 bar once per TTUR repeat, which is
         # noise; the role's own progress is already carried by the caller's bar.

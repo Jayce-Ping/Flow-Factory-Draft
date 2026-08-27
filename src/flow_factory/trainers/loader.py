@@ -100,6 +100,7 @@ def load_trainer(config: Arguments) -> BaseTrainer:
     # all-reduce with backward; adapters that leave trainable params ungraded in
     # some iterations (e.g. Qwen-Image) opt in via ddp_find_unused_parameters.
     adapter_cls = get_model_adapter_class(config.model_args.model_type)
+    trainer_cls.validate_adapter_class_execution_contract(adapter_cls)
     find_unused = _requires_ddp_unused_parameter_detection(config, adapter_cls)
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=find_unused)
 

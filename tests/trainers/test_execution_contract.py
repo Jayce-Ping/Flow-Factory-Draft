@@ -33,6 +33,7 @@ from flow_factory.contracts import (
     PipelineIOContract,
     RateRequirement,
 )
+from flow_factory.models.abc import BaseAdapter
 from flow_factory.trainers.abc import BaseTrainer
 from flow_factory.trainers.execution import (
     OFFLINE_EXECUTION_CONTRACT,
@@ -172,13 +173,77 @@ def test_offline_trainer_requires_adapter_pipeline_and_output_codec_before_initi
     BaseTrainer._validate_adapter_execution_contract(trainer)
 
 
+def test_offline_trainer_surfaces_declared_adapter_blocker_before_generic_contract_errors() -> None:
+    trainer_class = get_trainer_class("sft")
+    trainer = object.__new__(trainer_class)
+    trainer.adapter = SimpleNamespace(
+        pipeline_io_contract=None,
+        output_state_codec=None,
+        output_state_codec_unavailable_reason=(
+            "Condition pixels are missing; extend the condition projection."
+        ),
+    )
+
+    with pytest.raises(
+        NotImplementedError,
+        match=r"Condition pixels are missing.*extend the condition projection",
+    ):
+        BaseTrainer._validate_adapter_execution_contract(trainer)
+
+
+def test_offline_trainer_class_preflight_requires_contract_and_codec_builder() -> None:
+    trainer_class = get_trainer_class("sft")
+
+    class MissingContractAdapter(BaseAdapter):
+        pass
+
+    class MissingCodecBuilderAdapter(BaseAdapter):
+        pipeline_io_contract = _IMAGE_OUTPUT_CONTRACT
+
+    class DeclaredCodecBuilderAdapter(BaseAdapter):
+        pipeline_io_contract = _IMAGE_OUTPUT_CONTRACT
+
+        def build_output_state_codec(self) -> Any:
+            return None
+
+        def _validate_encoded_output_geometry(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+    class MissingGeometryValidationAdapter(BaseAdapter):
+        pipeline_io_contract = _IMAGE_OUTPUT_CONTRACT
+
+        def build_output_state_codec(self) -> Any:
+            return None
+
+    with pytest.raises(TypeError, match=r"MissingContractAdapter.*PipelineIOContract"):
+        trainer_class.validate_adapter_class_execution_contract(MissingContractAdapter)
+    with pytest.raises(TypeError, match=r"MissingCodecBuilderAdapter.*build_output_state_codec"):
+        trainer_class.validate_adapter_class_execution_contract(MissingCodecBuilderAdapter)
+    with pytest.raises(
+        TypeError,
+        match=r"MissingGeometryValidationAdapter.*_validate_encoded_output_geometry",
+    ):
+        trainer_class.validate_adapter_class_execution_contract(MissingGeometryValidationAdapter)
+
+    trainer_class.validate_adapter_class_execution_contract(DeclaredCodecBuilderAdapter)
+
+
 def test_online_trainer_does_not_require_offline_output_codec() -> None:
     """Rollout acquisition remains compatible with existing online-only adapters."""
     trainer_class = get_trainer_class("dpo")
     trainer = object.__new__(trainer_class)
-    trainer.adapter = SimpleNamespace(pipeline_io_contract=None, output_state_codec=None)
+    trainer.adapter = SimpleNamespace(
+        pipeline_io_contract=None,
+        output_state_codec=None,
+        output_state_codec_unavailable_reason="Offline targets are not implemented.",
+    )
 
     BaseTrainer._validate_adapter_execution_contract(trainer)
+
+    class KnownOfflineBlockerAdapter(BaseAdapter):
+        output_state_codec_unavailable_reason = "Offline targets are not implemented."
+
+    trainer_class.validate_adapter_class_execution_contract(KnownOfflineBlockerAdapter)
 
 
 def test_feedback_mode_is_independent_from_rollout_acquisition() -> None:

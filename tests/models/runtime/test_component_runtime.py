@@ -21,8 +21,8 @@ import pytest
 import torch
 import torch.nn as nn
 from accelerate import DistributedType
-
 from diffusers.modular_pipelines.modular_pipeline import ModularPipeline
+
 from flow_factory.models.abc import BaseAdapter
 from flow_factory.models.model_bundle import ModelBundle, RoutedComponentProxy
 from flow_factory.models.runtime import (

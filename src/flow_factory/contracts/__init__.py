@@ -45,10 +45,12 @@ from .pipeline_io import (
     MediaType,
     ModelInputLike,
     NegativePromptPolicy,
+    OutputMediaLike,
     OutputMediaSequence,
     PipelineIOContract,
     RateRequirement,
     validate_pipeline_model_input,
+    validate_pipeline_output_candidate,
 )
 
 __all__ = [
@@ -77,9 +79,11 @@ __all__ = [
     "ONLINE_EXECUTION_CONTRACT",
     "ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT",
     "OutputMediaSequence",
+    "OutputMediaLike",
     "PipelineIOContract",
     "RateRequirement",
     "ROLLOUT_STORAGE_KEYS",
     "TRAINER_METADATA_KEYS",
     "validate_pipeline_model_input",
+    "validate_pipeline_output_candidate",
 ]

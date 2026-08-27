@@ -148,7 +148,9 @@ class EncodedOutputState:
     Args:
         clean_state: Batched clean target latents in adapter component order.
         forward_context: Output-derived fields that may enter model forward.
-        decode_context: Geometry and rate fields retained for the existing decode path.
+        decode_context: Geometry, rate, and model metadata routed by
+            ``BaseAdapter.decode_output_state`` into the existing decoder. The wrapper filters
+            validation-only fields that ``decode_latents`` does not accept.
         geometry_signatures: One exact output-geometry signature per batch sample.
 
     Note:

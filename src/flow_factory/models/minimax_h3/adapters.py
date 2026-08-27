@@ -45,6 +45,13 @@ from .workflow import (
 
 _H3_PREPROCESS_CACHE_FIELDS = frozenset({"height", "width", "num_frames"})
 _H3_PREPROCESS_CACHE_VERSION = "minimax-h3-v1"
+_H3_OUTPUT_STATE_CODEC_UNAVAILABLE_REASON = (
+    "The default offline loader has no target-audio decoder, and the MiniMax H3 "
+    "inference workflows do not define an authoritative joint video/audio "
+    "training-target encode recipe, including posterior selection, normalization, "
+    "and packing. Add the audio decoder and an official or parity-tested target "
+    "fixture before enabling offline training."
+)
 
 
 class _MiniMaxH3WorkflowAdapter:
@@ -58,6 +65,7 @@ class _MiniMaxH3WorkflowAdapter:
     flow_velocity_direction: ClassVar[Literal["data"]] = "data"
     preprocess_cache_fields: ClassVar[frozenset[str]] = _H3_PREPROCESS_CACHE_FIELDS
     preprocess_cache_version: ClassVar[str] = _H3_PREPROCESS_CACHE_VERSION
+    output_state_codec_unavailable_reason: ClassVar[str] = _H3_OUTPUT_STATE_CODEC_UNAVAILABLE_REASON
 
     def load_pipeline(self) -> Any:
         """Load only this adapter's modular workflow."""

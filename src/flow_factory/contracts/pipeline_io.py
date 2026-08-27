@@ -124,6 +124,26 @@ class InputMediaLike(Protocol):
 
 
 @runtime_checkable
+class OutputMediaLike(Protocol):
+    """Structural output-media metadata accepted before payload decoding."""
+
+    @property
+    def type(self) -> str:
+        """Return the public media type discriminator."""
+        ...
+
+    @property
+    def fps(self) -> float | None:
+        """Return an optional source frame rate."""
+        ...
+
+    @property
+    def sample_rate(self) -> int | None:
+        """Return an optional source sample rate."""
+        ...
+
+
+@runtime_checkable
 class ModelInputLike(Protocol):
     """Structural normalized input consumed by a pipeline I/O contract."""
 
@@ -284,6 +304,17 @@ def validate_pipeline_model_input(
     The function depends only on structural protocols, so the dataset schema and
     model adapter remain independent. Callers must run it before preprocessing;
     otherwise an adapter may silently ignore unsupported conditioning media.
+
+    Args:
+        model_input: Structurally normalized prompt and input-media metadata.
+        contract: Adapter-owned pipeline input/output declaration.
+
+    Returns:
+        None after successful validation.
+
+    Raises:
+        TypeError: If the input or any field violates boundary types.
+        ValueError: If prompt or input media violates the pipeline contract.
     """
     _require_instance(contract, PipelineIOContract, "contract")
     if not isinstance(model_input, ModelInputLike):
@@ -355,6 +386,65 @@ def validate_pipeline_model_input(
             )
 
 
+def validate_pipeline_output_candidate(
+    media: tuple[OutputMediaLike, ...],
+    contract: PipelineIOContract,
+) -> None:
+    """Validate undecoded output metadata against exact pipeline semantics.
+
+    This dependency-neutral boundary lets a dataset reject incompatible target,
+    chosen, or rejected media before condition preprocessing or payload decoding.
+    Model-specific geometry remains owned by later boundaries.
+
+    Args:
+        media: Exact ordered media tuple for one output candidate.
+        contract: Adapter-owned pipeline input/output declaration.
+
+    Returns:
+        None after successful validation.
+
+    Raises:
+        TypeError: If the candidate or its metadata violates boundary types.
+        ValueError: If media order, modality, or rate violates the contract.
+    """
+    _require_instance(contract, PipelineIOContract, "contract")
+    if type(media) is not tuple:
+        raise TypeError(
+            "expected output candidate media to be tuple, received "
+            f"{type(media).__name__}: {media!r}"
+        )
+    expected_items = contract.output_media.items
+    if len(media) != len(expected_items):
+        raise ValueError(
+            "expected output candidate exact media sequence length "
+            f"{len(expected_items)}, received {len(media)}"
+        )
+    for index, (item, expected) in enumerate(zip(media, expected_items)):
+        if not isinstance(item, OutputMediaLike):
+            raise TypeError(
+                f"expected output candidate media[{index}] to implement OutputMediaLike, "
+                f"received {type(item).__name__}: {item!r}"
+            )
+        media_type = item.type
+        if type(media_type) is not str:
+            raise TypeError(
+                f"expected output candidate media[{index}].type to be str, received "
+                f"{type(media_type).__name__}: {media_type!r}"
+            )
+        if media_type != expected.type.value:
+            raise ValueError(
+                f"expected output candidate media[{index}].type {expected.type.value!r}, "
+                f"received {media_type!r}"
+            )
+        _validate_output_rate(item.fps, expected.fps, "fps", index)
+        _validate_output_rate(
+            item.sample_rate,
+            expected.sample_rate,
+            "sample_rate",
+            index,
+        )
+
+
 def _validate_input_rate(
     value: object,
     requirement: RateRequirement,
@@ -385,6 +475,30 @@ def _validate_input_rate(
             f"pipeline input media[{media_index}] requires positive integer sample_rate, "
             f"received {value!r}"
         )
+
+
+def _validate_output_rate(
+    value: object,
+    requirement: RateRequirement,
+    rate_name: str,
+    media_index: int,
+) -> None:
+    """Validate one undecoded output rate against its declared requirement."""
+    identifier = f"output candidate media[{media_index}].{rate_name}"
+    if requirement is RateRequirement.NOT_APPLICABLE:
+        if value is not None:
+            raise ValueError(f"expected {identifier}=None, received {value!r}")
+        return
+    if value is None:
+        if requirement is RateRequirement.REQUIRED:
+            raise ValueError(f"expected required {identifier}, received None")
+        return
+    if rate_name == "fps":
+        if type(value) is not float or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"expected finite positive {identifier}, received {value!r}")
+        return
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"expected positive integer {identifier}, received {value!r}")
 
 
 def _require_enum(value: object, enum_type: type[Enum], field_name: str) -> None:
@@ -435,7 +549,9 @@ __all__ = [
     "ModelInputLike",
     "NegativePromptPolicy",
     "OutputMediaSequence",
+    "OutputMediaLike",
     "PipelineIOContract",
     "RateRequirement",
     "validate_pipeline_model_input",
+    "validate_pipeline_output_candidate",
 ]

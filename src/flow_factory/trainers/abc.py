@@ -42,11 +42,10 @@ import torch.distributed as dist
 import torch.nn as nn
 from accelerate import Accelerator
 from accelerate.utils import DistributedType, ProjectConfiguration, set_seed
+from diffusers.utils.outputs import BaseOutput
 from PIL import Image
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-
-from diffusers.utils.outputs import BaseOutput
 
 from ..acceleration import BaseAccelerator, build_accelerator, validate_accelerator
 from ..advantage import AdvantageProcessor
@@ -285,6 +284,18 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         """Require trainer runtime and algorithm arguments to declare one execution mode."""
         type(self).validate_training_arguments_contract(self.training_args)
 
+    @classmethod
+    def validate_adapter_class_execution_contract(cls, adapter_cls: type) -> None:
+        """Reject statically unsupported offline adapters before model loading."""
+        if cls.execution_contract.acquisition is not AcquisitionMode.DATASET:
+            return
+        if not isinstance(adapter_cls, type) or not issubclass(adapter_cls, BaseAdapter):
+            raise TypeError(
+                f"offline trainer {cls.__name__} requires a BaseAdapter subclass, "
+                f"received {adapter_cls!r}"
+            )
+        adapter_cls.validate_offline_output_capability()
+
     def _validate_adapter_execution_contract(self) -> None:
         """Require offline execution to have a complete adapter-owned output seam.
 
@@ -294,6 +305,21 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         """
         if type(self).execution_contract.acquisition is not AcquisitionMode.DATASET:
             return
+        unavailable_reason = getattr(
+            self.adapter,
+            "output_state_codec_unavailable_reason",
+            None,
+        )
+        if unavailable_reason is not None:
+            if not isinstance(unavailable_reason, str) or not unavailable_reason.strip():
+                raise TypeError(
+                    f"adapter {type(self.adapter).__name__} declared an invalid "
+                    "output_state_codec_unavailable_reason; expected a non-empty string"
+                )
+            raise NotImplementedError(
+                f"offline output-state encoding is unavailable for adapter "
+                f"{type(self.adapter).__name__}: {unavailable_reason.strip()}"
+            )
         pipeline_contract = getattr(self.adapter, "pipeline_io_contract", None)
         if not isinstance(pipeline_contract, PipelineIOContract):
             raise TypeError(
@@ -1365,13 +1391,15 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
 
         Save and evaluation boundaries are common. The execution driver owns the middle:
         online algorithms run one rollout iteration, while offline algorithms exhaust one
-        finite distributed dataloader. Progress advances only after the driver and cycle-end
-        hooks return normally.
+        finite distributed dataloader. Online boundaries retain their historical pre-rollout
+        cadence; offline boundaries run only after a complete data epoch. Progress advances only
+        after the driver and cycle-end hooks return normally.
         """
+        contract = type(self).execution_contract
         while self.should_continue_training():
             driver = getattr(self, "execution_driver", None)
             if driver is None:
-                driver = build_execution_driver(type(self).execution_contract)
+                driver = build_execution_driver(contract)
                 self.execution_driver = driver
             driver.prepare_cycle(
                 self,
@@ -1379,30 +1407,37 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
                 seed=self.training_args.seed,
             )
 
-            if (
-                self.log_args.save_freq > 0
-                and self.cycle_index % self.log_args.save_freq == 0
-                and self.log_args.save_dir
-            ):
-                save_dir = os.path.join(
-                    self.log_args.save_dir,
-                    str(self.log_args.run_name),
-                    "checkpoints",
-                )
-                self.save_checkpoint(save_dir, epoch=self.cycle_index)
-
-            if self.eval_args.eval_freq > 0 and self.cycle_index % self.eval_args.eval_freq == 0:
-                self.evaluate()
+            if contract.acquisition is AcquisitionMode.ROLLOUT:
+                self._run_periodic_cycle_boundaries()
 
             driver.run_cycle(self, self.progress)
 
-            if type(self).execution_contract.acquisition is AcquisitionMode.ROLLOUT:
+            if contract.acquisition is AcquisitionMode.ROLLOUT:
                 self.adapter.ema_step(step=self.cycle_index)
             self._after_training_cycle()
             self.progress = self.progress.advance_cycle(
-                type(self).execution_contract.cycle_unit,
+                contract.cycle_unit,
                 completed=True,
             )
+            if contract.acquisition is AcquisitionMode.DATASET:
+                self._run_periodic_cycle_boundaries()
+
+    def _run_periodic_cycle_boundaries(self) -> None:
+        """Run save and evaluation actions at the current completed-cycle index."""
+        if (
+            self.log_args.save_freq > 0
+            and self.cycle_index % self.log_args.save_freq == 0
+            and self.log_args.save_dir
+        ):
+            save_dir = os.path.join(
+                self.log_args.save_dir,
+                str(self.log_args.run_name),
+                "checkpoints",
+            )
+            self.save_checkpoint(save_dir, epoch=self.cycle_index)
+
+        if self.eval_args.eval_freq > 0 and self.cycle_index % self.eval_args.eval_freq == 0:
+            self.evaluate()
 
     def set_trajectory_seed(self, seed: int) -> None:
         """Set the adapter seed used by the next online rollout iteration.

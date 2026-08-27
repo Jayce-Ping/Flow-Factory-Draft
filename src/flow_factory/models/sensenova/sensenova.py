@@ -18,15 +18,15 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
+from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image
 
-from diffusers.utils.torch_utils import randn_tensor
-
-from ...samples import I2ISample, T2ISample
+from ...contracts import InputMediaOrder, MediaType, NegativePromptPolicy
+from ...samples import ComponentTimes, I2ISample, LatentState, NoisedState, T2ISample
 from ...scheduler import (
     FlowMatchEulerDiscreteSDEScheduler,
     FlowMatchEulerDiscreteSDESchedulerOutput,
@@ -38,6 +38,14 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ..output_state import (
+    DecodedMediaBatch,
+    EncodedOutputState,
+    GeometrySignature,
+    MediaGeometrySignature,
+    OutputStateCodec,
+)
+from ..pipeline_contracts import image_output_contract
 from ..runtime import ComponentRuntime, PseudoPipelineRuntime
 from .modeling.neo_unify.modeling_neo_chat import (
     SYSTEM_MESSAGE_FOR_GEN,
@@ -66,6 +74,62 @@ class SenseNovaI2ISample(I2ISample):
     condition_images_as_pil: ClassVar[bool] = True
 
 
+@dataclass(frozen=True, slots=True)
+class _SenseNovaOutputStateCodec:
+    """Encode target RGB images directly into SenseNova's pixel flow state."""
+
+    adapter: "SenseNovaAdapter"
+    required_components: ClassVar[Tuple[str, ...]] = ()
+
+    def encode_output_state(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Mapping[str, Any],
+        generator: Optional[torch.Generator] = None,
+    ) -> EncodedOutputState:
+        """Resize RGB targets exactly and normalize them from [0, 1] to [-1, 1]."""
+        del condition, generator
+        height, width = self.adapter._offline_output_geometry()
+        tensors = []
+        for sample_index, candidate in enumerate(media_batch):
+            if len(candidate) != 1 or not isinstance(candidate[0].payload, Image.Image):
+                raise TypeError(
+                    "SenseNova output codec expected exactly one PIL.Image target for "
+                    f"sample {sample_index}"
+                )
+            image = (
+                candidate[0]
+                .payload.convert("RGB")
+                .resize(
+                    (width, height),
+                    resample=Image.Resampling.BICUBIC,
+                )
+            )
+            pixels = torch.from_numpy(np.array(image, dtype=np.float32, copy=True))
+            tensors.append(pixels.permute(2, 0, 1).div_(127.5).sub_(1.0))
+        dtype = getattr(self.adapter.transformer, "dtype", None)
+        if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point:
+            raise TypeError(
+                "SenseNova output codec expected transformer floating dtype, " f"received {dtype!r}"
+            )
+        latents = torch.stack(tensors, dim=0).to(device=self.adapter.device, dtype=dtype)
+        signature = GeometrySignature(
+            media=(
+                MediaGeometrySignature(
+                    type=MediaType.IMAGE,
+                    height=height,
+                    width=width,
+                ),
+            )
+        )
+        return EncodedOutputState(
+            clean_state=LatentState({"latent": latents}),
+            forward_context={},
+            decode_context={"height": height, "width": width},
+            geometry_signatures=tuple(signature for _ in tensors),
+        )
+
+
 class SenseNovaAdapter(BaseAdapter):
     """Support SenseNova-U1 1.0/1.5 T2I and ordered multi-reference I2I.
 
@@ -91,6 +155,12 @@ class SenseNovaAdapter(BaseAdapter):
     python_format_columns: ClassVar[frozenset[str]] = frozenset({"condition_images"})
     ddp_find_unused_parameters = True
     flow_velocity_direction: ClassVar[Literal["noise", "data"]] = "noise"
+    pipeline_io_contract = image_output_contract(
+        negative_prompt=NegativePromptPolicy.UNSUPPORTED,
+        input_image_min_count=0,
+        input_image_max_count=None,
+        input_order=InputMediaOrder.WITHIN_TYPE,
+    )
 
     def load_pipeline(self) -> SenseNovaPseudoPipeline:
         """Load the custom Transformers checkpoint and tokenizer."""
@@ -112,6 +182,10 @@ class SenseNovaAdapter(BaseAdapter):
         if scheduler_args:
             scheduler_kwargs.update(scheduler_args.to_dict())
         return FlowMatchEulerDiscreteSDEScheduler(**scheduler_kwargs)
+
+    def build_output_state_codec(self) -> OutputStateCodec:
+        """Build the VAE-free on-the-fly target pixel codec."""
+        return _SenseNovaOutputStateCodec(self)
 
     @property
     def default_target_modules(self) -> List[str]:
@@ -168,6 +242,7 @@ class SenseNovaAdapter(BaseAdapter):
 
     def encode_video(self, videos: Any, **kwargs: Any) -> None:
         """SenseNova-U1 has no video input in this adapter."""
+        return None
 
     def decode_latents(
         self,
@@ -253,6 +328,81 @@ class SenseNovaAdapter(BaseAdapter):
                 f"received height={height}, width={width}."
             )
         return height, width
+
+    def _offline_output_geometry(self) -> Tuple[int, int]:
+        """Resolve configured offline output geometry through model grid validation."""
+        return self._image_shape(
+            getattr(self.training_args, "height", None),
+            getattr(self.training_args, "width", None),
+            None,
+        )
+
+    def _validate_encoded_output_geometry(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Mapping[str, Any],
+        encoded: EncodedOutputState,
+    ) -> None:
+        """Verify the pixel state and signatures use configured model geometry."""
+        del condition
+        height, width = self._offline_output_geometry()
+        expected_signature = GeometrySignature(
+            media=(
+                MediaGeometrySignature(
+                    type=MediaType.IMAGE,
+                    height=height,
+                    width=width,
+                ),
+            )
+        )
+        if encoded.geometry_signatures != tuple(expected_signature for _ in media_batch):
+            raise ValueError(
+                "SenseNova target geometry signatures must match configured output "
+                f"geometry {(height, width)}"
+            )
+        if dict(encoded.decode_context) != {"height": height, "width": width}:
+            raise ValueError(
+                "SenseNova decode_context must exactly match configured geometry, "
+                f"received {dict(encoded.decode_context)!r}"
+            )
+        latents = encoded.clean_state.components["latent"]
+        if tuple(latents.shape[1:]) != (3, height, width):
+            raise ValueError(
+                "SenseNova clean pixel state expected shape "
+                f"(B, 3, {height}, {width}), received {tuple(latents.shape)}"
+            )
+
+    def add_forward_process_noise(
+        self,
+        clean_state: LatentState,
+        times: ComponentTimes,
+        *,
+        generator: Optional[torch.Generator] = None,
+    ) -> NoisedState:
+        """Draw the resolution-scaled Gaussian used by official SenseNova rollout."""
+        if clean_state.component_names != ("latent",):
+            raise ValueError(
+                "SenseNova forward process expected one 'latent' component, "
+                f"received {clean_state.component_names}"
+            )
+        clean = clean_state.components["latent"]
+        if clean.ndim != 4 or clean.shape[1] != 3:
+            raise ValueError(
+                "SenseNova forward process expected BCHW RGB clean state, "
+                f"received {tuple(clean.shape)}"
+            )
+        noise = randn_tensor(
+            clean.shape,
+            generator=generator,
+            device=clean.device,
+            dtype=clean.dtype,
+        )
+        noise = noise * self._noise_scale((clean.shape[-2], clean.shape[-1]))
+        return self.apply_forward_process_noise(
+            clean_state,
+            times,
+            LatentState({"latent": noise}),
+        )
 
     def _noise_scale(self, image_size: Tuple[int, int]) -> float:
         """Match the official resolution-dependent initialization scale."""
@@ -383,8 +533,8 @@ class SenseNovaAdapter(BaseAdapter):
             cache, _ = model._it2i_prefix_forward(input_embeds, indexes, attention_mask)
 
         merge_size = int(1 / model.downsample_ratio)
-        token_h = image_size[1] // (model.patch_size * merge_size)
-        token_w = image_size[0] // (model.patch_size * merge_size)
+        token_h = image_size[0] // (model.patch_size * merge_size)
+        token_w = image_size[1] // (model.patch_size * merge_size)
         indexes_image = model._build_t2i_image_indexes(
             token_h,
             token_w,
@@ -452,8 +602,8 @@ class SenseNovaAdapter(BaseAdapter):
             with torch.no_grad():
                 cache, _ = model._it2i_prefix_forward(input_embeds, indexes, attention_mask)
             merge_size = int(1 / model.downsample_ratio)
-            token_h = image_size[1] // (model.patch_size * merge_size)
-            token_w = image_size[0] // (model.patch_size * merge_size)
+            token_h = image_size[0] // (model.patch_size * merge_size)
+            token_w = image_size[1] // (model.patch_size * merge_size)
             unconditional_branch = {
                 "past_key_values": cache,
                 "indexes_image": model._build_t2i_image_indexes(
@@ -494,8 +644,8 @@ class SenseNovaAdapter(BaseAdapter):
         model = self._base_model()
         device = self.device
         merge_size = int(1 / model.downsample_ratio)
-        token_h = image_size[1] // (model.patch_size * merge_size)
-        token_w = image_size[0] // (model.patch_size * merge_size)
+        token_h = image_size[0] // (model.patch_size * merge_size)
+        token_w = image_size[1] // (model.patch_size * merge_size)
         append_text = "<think>\n\n</think>\n\n<img>"
         query = model._build_t2i_query(
             prompt,
@@ -650,8 +800,8 @@ class SenseNovaAdapter(BaseAdapter):
         return model.unpatchify(
             velocity,
             model.patch_size * int(1 / model.downsample_ratio),
-            image_size[1],
             image_size[0],
+            image_size[1],
         )
 
     # ============================== Forward ==============================

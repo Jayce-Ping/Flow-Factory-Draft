@@ -19,7 +19,7 @@ import logging
 import os
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -27,6 +27,7 @@ from accelerate import Accelerator
 from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
 from PIL import Image
 
+from ...contracts import NegativePromptPolicy
 from ...hparams import *
 from ...samples import T2ISample
 from ...scheduler import (
@@ -45,6 +46,12 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ..configured_image_output import (
+    ConfiguredImageOutputAdapterMixin,
+    EncodedImageTensor,
+)
+from ..pipeline_contracts import image_output_contract
+from ._output import encode_flux1_vae_image
 
 logger = setup_logger(__name__)
 
@@ -60,8 +67,12 @@ class Flux1Sample(T2ISample):
     img_ids: Optional[torch.Tensor] = None
 
 
-class Flux1Adapter(BaseAdapter):
+class Flux1Adapter(ConfiguredImageOutputAdapterMixin, BaseAdapter):
     """Concrete implementation for Flow Matching models (FLUX.1)."""
+
+    pipeline_io_contract = image_output_contract(
+        negative_prompt=NegativePromptPolicy.UNSUPPORTED,
+    )
 
     def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
@@ -130,18 +141,46 @@ class Flux1Adapter(BaseAdapter):
         }
 
     def encode_image(self, images: Union[Image.Image, List[Optional[Image.Image]]]) -> None:
-        """
-        Encode input images into latent representations using the VAE encoder.
-         Args:
-            images:
-                - Single Image.Image
-                - List[Image.Image]: list of images
-        """
-        pass
+        """Return no condition encoding because FLUX.1 is text-to-image."""
+        return None
 
     def encode_video(self, videos: Union[torch.Tensor, List[torch.Tensor]]) -> None:
         """Not needed for FLUX text-to-image models."""
-        pass
+        return None
+
+    def _output_geometry_multiple(self) -> int:
+        """Require the VAE grid and 2x2 latent packing used by Diffusers."""
+        return self.pipeline.vae_scale_factor * 2
+
+    def _encode_output_images(
+        self,
+        pixel_values: torch.Tensor,
+        condition: Mapping[str, Any],
+        generator: Optional[torch.Generator],
+    ) -> EncodedImageTensor:
+        """Match Diffusers FLUX Kontext VAE normalization and FLUX packing."""
+        del condition, generator
+        latents = encode_flux1_vae_image(self, pixel_values)
+        batch_size, channels, latent_height, latent_width = latents.shape
+        packed = self.pipeline._pack_latents(
+            latents,
+            batch_size,
+            channels,
+            latent_height,
+            latent_width,
+        )
+        img_ids = self.pipeline._prepare_latent_image_ids(
+            batch_size,
+            latent_height // 2,
+            latent_width // 2,
+            self.device,
+            packed.dtype,
+        )
+        return EncodedImageTensor(
+            latents=packed,
+            forward_context={"img_ids": img_ids},
+            decode_context={},
+        )
 
     def decode_latents(
         self,

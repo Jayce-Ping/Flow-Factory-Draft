@@ -27,6 +27,7 @@ from ..contracts import (
     InputMediaBinding,
     PipelineIOContract,
     validate_pipeline_model_input,
+    validate_pipeline_output_candidate,
 )
 from ..hparams import Arguments
 from ..utils.base import filter_kwargs
@@ -41,6 +42,7 @@ from .offline_condition_cache import (
     project_offline_condition_dataset,
 )
 from .offline_dataset import (
+    DEFAULT_MEDIA_DECODERS,
     OFFLINE_CONDITION_ID_COLUMN,
     MediaDecoder,
     OfflineDataset,
@@ -186,6 +188,11 @@ def build_offline_train_dataloader(
             contract=pipeline_io_contract,
             source_name=source.name,
         )
+        _validate_pipeline_outputs(
+            records,
+            contract=pipeline_io_contract,
+            source_name=source.name,
+        )
         _require_decoder_coverage(
             records,
             available_decoder_types,
@@ -252,6 +259,35 @@ def _validate_pipeline_inputs(
                 f"offline source {source_name!r} row {row_index} violates its pipeline "
                 f"input contract: {exc}"
             ) from exc
+
+
+def _validate_pipeline_outputs(
+    records: Sequence[NormalizedDatasetRecord],
+    *,
+    contract: PipelineIOContract,
+    source_name: str,
+) -> None:
+    """Validate every supervision candidate before condition preprocessing."""
+    for row_index, record in enumerate(records):
+        supervision = record.supervision
+        if isinstance(supervision, DemonstrationSupervision):
+            candidates = (("target", supervision.target.media),)
+        elif isinstance(supervision, PreferenceSupervision):
+            candidates = (
+                ("chosen", supervision.chosen.media),
+                ("rejected", supervision.rejected.media),
+            )
+        else:
+            raise RuntimeError("normalized offline record unexpectedly lacks supervision")
+        for candidate_name, media in candidates:
+            try:
+                validate_pipeline_output_candidate(media, contract)
+            except (TypeError, ValueError) as exc:
+                error_type = type(exc)
+                raise error_type(
+                    f"offline source {source_name!r} row {row_index} {candidate_name} "
+                    f"violates its pipeline output contract: {exc}"
+                ) from exc
 
 
 def _build_distributed_condition_cache(
@@ -392,7 +428,7 @@ def _slice_records(
 def _available_decoder_types(
     media_decoders: Optional[Mapping[MediaType, MediaDecoder]],
 ) -> frozenset[MediaType]:
-    available = {"image"}
+    available = set(DEFAULT_MEDIA_DECODERS)
     if media_decoders is not None:
         for media_type in media_decoders:
             if media_type not in ("image", "video", "audio"):

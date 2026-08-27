@@ -29,12 +29,19 @@ import json
 import os
 import pickle
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Callable, Dict, List, Literal, Mapping, Sequence, Union
 
+import numpy as np
 import torch
 from PIL import Image
 from pydantic import ValidationError
 from torch.utils.data import Dataset
+
+try:
+    import av
+except ImportError:
+    av = None
 
 from .schema import (
     DatasetRecordV2,
@@ -241,7 +248,7 @@ class OfflineDataset(Dataset):
                 context=f"offline dataset index {index}",
             )
 
-        decoders: Dict[MediaType, MediaDecoder] = {"image": decode_image}
+        decoders: Dict[MediaType, MediaDecoder] = dict(DEFAULT_MEDIA_DECODERS)
         if media_decoders is not None:
             for media_type, decoder in media_decoders.items():
                 if media_type not in ("image", "video", "audio"):
@@ -430,12 +437,79 @@ class OfflineCollator:
 
 
 def decode_image(asset: MediaAsset) -> Image.Image:
-    """Decode one target image as detached RGB pixels on the CPU."""
+    """Decode one target image as detached RGB pixels on the CPU.
+
+    Args:
+        asset: Normalized image reference with a resolved local path.
+
+    Returns:
+        Detached RGB PIL image.
+
+    Raises:
+        ValueError: If PIL cannot decode the target image.
+    """
     try:
         with Image.open(asset.path) as image:
             return image.convert("RGB")
     except (OSError, ValueError) as exc:
         raise ValueError(f"failed to decode target image {asset.path!r}: {exc}") from exc
+
+
+def decode_video(asset: MediaAsset) -> np.ndarray:
+    """Decode one target video into native-rate RGB frames on the CPU.
+
+    The returned ``uint8`` array has shape ``(frames, height, width, 3)`` and is
+    accepted directly by Diffusers ``VideoProcessor.preprocess_video``. Temporal
+    sampling, spatial resizing, and model-specific geometry remain adapter-owned.
+    Keeping this function at module scope makes the default decoder safe to pickle
+    under spawn-based DataLoader workers.
+
+    Args:
+        asset: Normalized video reference with a resolved local path.
+
+    Returns:
+        Contiguous ``uint8`` RGB array shaped ``(frames, height, width, 3)``.
+
+    Raises:
+        ImportError: If PyAV is unavailable.
+        ValueError: If the container, stream, or decoded geometry is invalid.
+    """
+    if av is None:
+        raise ImportError(
+            "offline target video decoding requires PyAV>=18.0.0; "
+            "install with `pip install 'av>=18.0.0'`"
+        )
+    try:
+        with av.open(asset.path) as container:
+            if not container.streams.video:
+                raise ValueError("container has no video stream")
+            stream = container.streams.video[0]
+            frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(stream)]
+    except (OSError, ValueError, av.error.FFmpegError) as exc:
+        raise ValueError(f"failed to decode target video {asset.path!r}: {exc}") from exc
+
+    if not frames:
+        raise ValueError(f"failed to decode target video {asset.path!r}: decoded no frames")
+    try:
+        video = np.stack(frames, axis=0)
+    except ValueError as exc:
+        raise ValueError(
+            f"failed to decode target video {asset.path!r}: decoded frames have inconsistent geometry"
+        ) from exc
+    if video.ndim != 4 or video.shape[-1] != 3:
+        raise ValueError(
+            f"failed to decode target video {asset.path!r}: expected RGB frames shaped "
+            f"(F,H,W,3), received {video.shape}"
+        )
+    return np.ascontiguousarray(video, dtype=np.uint8)
+
+
+DEFAULT_MEDIA_DECODERS: Mapping[MediaType, MediaDecoder] = MappingProxyType(
+    {
+        "image": decode_image,
+        "video": decode_video,
+    }
+)
 
 
 def compute_offline_condition_id(
@@ -675,6 +749,7 @@ def _require_record_supervision(
 
 
 __all__ = [
+    "DEFAULT_MEDIA_DECODERS",
     "DecodedMedia",
     "DemonstrationOutput",
     "DemonstrationOutputBatch",
@@ -690,5 +765,6 @@ __all__ = [
     "compute_offline_condition_id",
     "compute_offline_record_id",
     "decode_image",
+    "decode_video",
     "load_offline_manifest",
 ]

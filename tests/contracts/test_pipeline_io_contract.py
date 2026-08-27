@@ -31,10 +31,12 @@ from flow_factory.contracts import (
     MediaType,
     ModelInputLike,
     NegativePromptPolicy,
+    OutputMediaLike,
     OutputMediaSequence,
     PipelineIOContract,
     RateRequirement,
     validate_pipeline_model_input,
+    validate_pipeline_output_candidate,
 )
 
 IMAGE_FORMAT = MediaFormat(
@@ -174,6 +176,22 @@ def test_model_input_protocols_are_structural_and_validate_prompt_only_contracts
     assert isinstance(model_input, ModelInputLike)
     assert isinstance(_InputMediaFixture(type="image"), InputMediaLike)
     validate_pipeline_model_input(model_input, _text_to_image_contract())
+
+
+def test_output_media_protocol_validates_undecoded_dataset_metadata() -> None:
+    """Target compatibility is provable without importing a dataset or decoding payloads."""
+    target = (_InputMediaFixture(type="image"),)
+
+    assert isinstance(target[0], OutputMediaLike)
+    validate_pipeline_output_candidate(target, _text_to_image_contract())
+
+    with pytest.raises(ValueError, match=r"expected.*type 'image'.*'video'"):
+        validate_pipeline_output_candidate(
+            (_InputMediaFixture(type="video", fps=24.0),),
+            _text_to_image_contract(),
+        )
+    with pytest.raises(ValueError, match=r"exact media sequence length 1, received 2"):
+        validate_pipeline_output_candidate(target * 2, _text_to_image_contract())
 
 
 def test_model_input_validation_rejects_unsupported_media_and_negative_prompt() -> None:

@@ -96,6 +96,30 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
 
 > To support new models, see [Guidance/New Model](guidance/new_model.md).
 
+### Offline SFT / DPO capability
+
+SFT and offline DPO share the same adapter-owned, on-the-fly output-state codec contract. Condition
+`encode_*` methods remain a separate cacheable-input lifecycle; when condition and target media use
+the same checkpoint VAE mapping, both paths reuse one role-neutral numerical primitive. The table
+below describes implementation capability, not long-run training evidence.
+
+| Model type | Offline target | Status |
+|------------|----------------|--------|
+| `sd3-5`, `flux1`, `flux1-kontext` | Image | Available |
+| `flux2`, `flux2-klein` | Image | Available |
+| `qwen-image`, `z-image` | Image | Available |
+| `qwen-image-edit-plus` | Image | Available with `per_device_batch_size: 1`; output geometry follows the input condition |
+| `bagel` | Image | Available; each batch must have uniform post-transform target geometry |
+| `sensenova` | Image | Available |
+| `wan2_t2v` | Video | Available; decoded targets must already contain exactly configured `num_frames` (no implicit resampling) |
+| `wan2_i2v` | Video | Blocked: the cached input condition cannot reconstruct Wan's VAE condition state and first-frame mask |
+| `ltx2_t2av`, `ltx2_i2av` | Video + audio | Blocked: target-audio decoding and a parity-tested waveform-to-mel training frontend are missing |
+| `minimax-h3-t2va`, `minimax-h3-fl2va`, `minimax-h3-ref2va` | Video + audio | Blocked: target-audio decoding and an authoritative joint target encode/packing recipe are missing |
+
+Known blockers fail before Accelerator construction or model download. They affect only offline
+algorithms; the same adapters remain available to online training. See
+[`Algorithm Guidance`](guidance/algorithms.md#offline-model-capability) for details.
+
 > **MiniMax H3 status:** the T2VA debug and
 > [native-quality FSDP2](examples/grpo/lora/minimax_h3_t2va/quality_720p_fsdp2.yaml)
 > paths are real-weight

@@ -344,7 +344,9 @@ class TDMR1Trainer(TDMTrainer):
             active_masks=terms.boundary_state.active_masks,
         )
 
-    def _surrogate_reward_direction(self, batch: Any, terms: Any) -> tuple[LatentState, LatentState]:
+    def _surrogate_reward_direction(
+        self, batch: Any, terms: Any
+    ) -> tuple[LatentState, LatentState]:
         """Return the surrogate's guided direction against its frozen reference.
 
         The surrogate is queried with guidance so its learned preference is amplified the

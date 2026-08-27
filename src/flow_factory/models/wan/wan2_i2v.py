@@ -29,6 +29,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from peft import PeftModel
 from PIL import Image
 
+from ...contracts import GeometrySource, NegativePromptPolicy
 from ...hparams import *
 from ...samples import I2VSample
 from ...scheduler import UniPCMultistepSDEScheduler, UniPCMultistepSDESchedulerOutput
@@ -51,6 +52,7 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ..pipeline_contracts import video_output_contract
 
 logger = setup_logger(__name__)
 
@@ -86,6 +88,19 @@ class Wan2_I2V_Adapter(BaseAdapter):
     # gradient in a given step. Ignored under DeepSpeed/FSDP.
     ddp_find_unused_parameters = True
     supports_diffusers_cache = True
+    output_state_codec_unavailable_reason = (
+        "The offline condition cache retains Wan 2.1 CLIP image embeddings but not "
+        "the source pixels required to rebuild its VAE condition tensor, and Wan 2.2 "
+        "retains no image condition state. Extend the input-condition contract with "
+        "source pixels or a canonical VAE condition plus first-frame mask; do not infer "
+        "the input condition from the target video's first frame."
+    )
+    pipeline_io_contract = video_output_contract(
+        negative_prompt=NegativePromptPolicy.OPTIONAL,
+        input_image_min_count=1,
+        input_image_max_count=1,
+        geometry_source=GeometrySource.CONFIGURED,
+    )
 
     def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)

@@ -47,6 +47,11 @@ Reward-free online distillation omits only the declared feedback stages. Offline
 finite `DistributedSampler` dataloader traversal with per-batch optimization; it MUST NOT emulate
 this by making `sample()` a no-op or by materializing the entire epoch. One complete offline
 dataloader traversal is one `data_epoch`, and an interrupted traversal does not advance it.
+Periodic boundaries are acquisition-specific: online execution preserves its historical
+pre-rollout save/eval boundary, while offline execution runs save/eval only after the dataloader
+has been exhausted, `_after_training_cycle()` has returned, and `data_epoch` has advanced. A
+failed or interrupted offline traversal therefore reaches neither epoch advancement nor its
+periodic boundary.
 Runtime reward feedback is not yet implemented for dataset acquisition and MUST fail at contract
 construction instead of being silently ignored; SFT and offline preference training consume their
 supervision directly from each batch. Any `FeedbackMode.NONE` algorithm rejects training
@@ -71,6 +76,16 @@ each fetched target batch under `torch.no_grad()`. Do not assume identical compo
 across acquisition modes. Before offline input preprocessing or cache lookup, every normalized
 input and the preprocessor's grouped/ordered binding MUST be validated against the adapter's
 `PipelineIOContract`; unsupported media or negative prompts must never be silently dropped.
+Condition `encode_*` methods and output-state codecs MUST remain separate lifecycle boundaries:
+the former owns reusable input caching and condition orchestration, while the latter owns
+on-the-fly target geometry, packing, masks, and forward/decode context. When both roles use the
+same checkpoint VAE transform, they MUST call one role-neutral numerical encoding primitive rather
+than maintain duplicate transforms.
+An offline-capable adapter MUST declare a static `PipelineIOContract` and a real
+`build_output_state_codec()` implementation. A known blocker MUST instead be declared through a
+non-empty actionable `output_state_codec_unavailable_reason`; it MUST NOT be hidden behind a fake
+codec builder or by omitting one output modality. Offline trainer loading validates this boundary
+before Accelerator construction or model loading, while online execution remains unaffected.
 
 ### 9. Accelerator `prepare()` Scope
 All target components (trainable **and** frozen-but-shardable) are bundled into a single `ModelBundle` (`models/model_bundle.py`) and prepared with the **optimizer** as one root via `accelerator.prepare()` — DeepSpeed (one engine) and FSDP2 (one root) cannot prepare multiple models separately. After prepare, each component is exposed as a `RoutedComponentProxy` that routes forwards through the bundle root; the optimizer/EMA/reference params still target only the `requires_grad` subset (frozen members are sharded for memory but never trained). Online train dataloaders use the framework's rank-aware grouped samplers; offline train dataloaders use PyTorch's official `DistributedSampler`, including for one-process execution. Neither train loader is passed to `accelerator.prepare()` or `prepare_data_loader()`, because both are already distributed and a second shard would duplicate or drop data. Eval dataloaders remain prepared with the model bundle and optimizer in the single root call.
@@ -110,12 +125,15 @@ optimizer/preparation, feedback runtime, and model lifecycle.
 
 **Online rollout order**: seed → periodic save/eval boundaries → `sample()` (Stages 2–3) →
 `prepare_feedback()` when declared (Stages 4–5) → `optimize()` (Stage 6) → shared EMA →
-`_after_training_cycle()`. Online
+`_after_training_cycle()` → increment `rollout_iteration`. The online boundary therefore uses the
+pre-cycle completed-rollout index, preserving the historical index-zero boundary. Online
 `DPOTrainer` forms chosen/rejected pairs at the start of `optimize()`. **Offline epoch order**:
 official `DistributedSampler.set_epoch(data_epoch)` → exhaust the finite dataloader through
-`optimize_batch()` → `_after_training_cycle()` → increment `data_epoch`. Offline shared EMA and
-`_after_gradient_step()` use optimizer-step cadence; online shared EMA uses rollout-iteration
-cadence.
+`optimize_batch()` → `_after_training_cycle()` → increment `data_epoch` → periodic save/eval
+boundaries. Here one `data_epoch` is exactly one complete dataloader traversal, so the offline
+boundary uses the newly completed-epoch index and never represents a partial traversal. Offline
+shared EMA and `_after_gradient_step()` use optimizer-step cadence; online shared EMA uses
+rollout-iteration cadence.
 
 **Trainer hierarchy**: New trainers MUST inherit directly from `BaseTrainer`. The only sanctioned exceptions are strict behavioral variants of GRPO that change only the per-step loss while reusing GRPO's sampling/advantage/eval machinery: `GRPOGuardTrainer → GRPOTrainer` (adds ratio-normalization) and `DPPOTrainer → GRPOTrainer` (replaces the PPO ratio-clip with a KL trust-region mask). Trainer-to-trainer inheritance creates fragile coupling; when in doubt, inherit from `BaseTrainer` and extract shared logic into helper methods. All reward-based trainers delegate advantage computation to `self.advantage_processor.compute_advantages()`. Reward-free online trainers MUST declare `ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT`; the shared feedback gate omits reward and advantage dispatch.
 

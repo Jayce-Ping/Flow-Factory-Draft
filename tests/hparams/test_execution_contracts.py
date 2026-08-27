@@ -25,7 +25,7 @@ from flow_factory.contracts.execution import (
     ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT,
     ExecutionContract,
 )
-from flow_factory.hparams import Arguments, get_training_args_class
+from flow_factory.hparams import Arguments, SFTTrainingArguments, get_training_args_class
 from flow_factory.hparams.training_args import (
     DiffusionOPDTrainingArguments,
     DMD2TrainingArguments,
@@ -34,6 +34,7 @@ from flow_factory.hparams.training_args import (
     TrainingArguments,
     list_registered_training_args,
 )
+from flow_factory.models.abc import BaseAdapter
 from flow_factory.trainers.abc import BaseTrainer
 from flow_factory.trainers.loader import load_trainer
 from flow_factory.trainers.registry import get_trainer_class, list_registered_trainers
@@ -140,4 +141,32 @@ def test_loader_rejects_contract_drift_before_loading_model() -> None:
     ):
         load_trainer(config)
 
+    load_model.assert_not_called()
+
+
+def test_loader_surfaces_offline_adapter_blocker_before_accelerator_or_model_loading() -> None:
+    """A known model-specific target blocker must not download or allocate anything."""
+
+    class KnownUnavailableAdapter(BaseAdapter):
+        output_state_codec_unavailable_reason = (
+            "Target packing has no parity fixture; add and validate one first."
+        )
+
+    config = SimpleNamespace(
+        training_args=SFTTrainingArguments(),
+        model_args=SimpleNamespace(model_type="known_unavailable"),
+    )
+
+    with (
+        patch(
+            "flow_factory.trainers.loader.get_model_adapter_class",
+            return_value=KnownUnavailableAdapter,
+        ),
+        patch("flow_factory.trainers.loader.Accelerator") as accelerator,
+        patch("flow_factory.trainers.loader.load_model") as load_model,
+        pytest.raises(NotImplementedError, match=r"KnownUnavailableAdapter.*parity fixture"),
+    ):
+        load_trainer(config)
+
+    accelerator.assert_not_called()
     load_model.assert_not_called()

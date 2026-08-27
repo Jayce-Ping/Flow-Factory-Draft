@@ -19,13 +19,14 @@ import logging
 import os
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import torch
 from accelerate import Accelerator
 from diffusers.pipelines.z_image.pipeline_z_image import ZImagePipeline
 from PIL import Image
 
+from ...contracts import NegativePromptPolicy
 from ...hparams import *
 from ...samples import T2ISample
 from ...scheduler import (
@@ -44,6 +45,12 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ..configured_image_output import (
+    ConfiguredImageOutputAdapterMixin,
+    EncodedImageTensor,
+    encode_shift_scale_vae_image,
+)
+from ..pipeline_contracts import image_output_contract
 
 logger = setup_logger(__name__)
 
@@ -55,7 +62,11 @@ class ZImageSample(T2ISample):
     # Obj var - no extra
 
 
-class ZImageAdapter(BaseAdapter):
+class ZImageAdapter(ConfiguredImageOutputAdapterMixin, BaseAdapter):
+    pipeline_io_contract = image_output_contract(
+        negative_prompt=NegativePromptPolicy.OPTIONAL,
+    )
+
     def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
         self.pipeline: ZImagePipeline
@@ -178,16 +189,39 @@ class ZImageAdapter(BaseAdapter):
     def encode_image(
         self,
         images: Union[Image.Image, torch.Tensor, List[torch.Tensor]],
-    ):
+    ) -> None:
         """Not needed for Z-Image models."""
-        pass
+        return None
 
     def encode_video(
         self,
         videos: Union[torch.Tensor, List[torch.Tensor]],
-    ):
+    ) -> None:
         """Not needed for Z-Image models."""
-        pass
+        return None
+
+    def _output_geometry_multiple(self) -> int:
+        """Require the exact spatial grid enforced by the official pipeline."""
+        return self.pipeline.vae_scale_factor * 2
+
+    def _encode_output_images(
+        self,
+        pixel_values: torch.Tensor,
+        condition: Mapping[str, Any],
+        generator: Optional[torch.Generator],
+    ) -> EncodedImageTensor:
+        """Match official Z-Image img2img posterior and normalization."""
+        del condition, generator
+        latents = encode_shift_scale_vae_image(
+            self,
+            pixel_values,
+            source="Z-Image target VAE encode",
+        )
+        return EncodedImageTensor(
+            latents=latents,
+            forward_context={},
+            decode_context={},
+        )
 
     def decode_latents(
         self,

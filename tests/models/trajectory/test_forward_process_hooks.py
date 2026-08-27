@@ -17,8 +17,8 @@ from typing import Any, List
 
 import pytest
 import torch
-
 from diffusers.utils.torch_utils import randn_tensor
+
 from flow_factory.models.abc import BaseAdapter
 from flow_factory.samples import BaseSample, ComponentTimes, LatentState
 from flow_factory.scheduler import SchedulerGroup, SDESchedulerOutput

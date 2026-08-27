@@ -17,9 +17,12 @@ from __future__ import annotations
 import functools
 import json
 import multiprocessing
+import pickle
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
+import av
+import numpy as np
 import pytest
 import torch
 from PIL import Image
@@ -35,6 +38,7 @@ from flow_factory.data_utils.offline_dataset import (
     PreferenceOutputBatch,
     compute_offline_condition_id,
     compute_offline_record_id,
+    decode_video,
     load_offline_manifest,
 )
 from flow_factory.data_utils.schema import MediaAsset, NormalizedDatasetRecord, normalize_v2_record
@@ -46,6 +50,23 @@ SOURCE_ID = 7
 def _save_image(path: Path, color: tuple[int, int, int]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.new("RGB", (3, 2), color=color).save(path)
+
+
+def _save_video(path: Path, values: Sequence[int], *, fps: int = 24) -> None:
+    """Write a tiny deterministic RGB video for decoder and spawn-worker tests."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with av.open(path, mode="w") as container:
+        stream = container.add_stream("mpeg4", rate=fps)
+        stream.width = 6
+        stream.height = 4
+        stream.pix_fmt = "yuv420p"
+        for value in values:
+            pixels = np.full((stream.height, stream.width, 3), value, dtype=np.uint8)
+            frame = av.VideoFrame.from_ndarray(pixels, format="rgb24")
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
 
 
 def _demonstration_record(
@@ -158,6 +179,11 @@ def _spawn_dataset_worker(
             batch.source_ids.tolist(),
         )
     )
+
+
+def _spawn_video_dataset_worker(dataset: OfflineDataset, result_queue: Any) -> None:
+    payload = dataset[0].output.target_media[0].payload
+    result_queue.put((payload.shape, payload.dtype.str, payload.flags.c_contiguous))
 
 
 def test_manifest_reader_preserves_order_resolves_paths_and_requires_one_type(
@@ -673,16 +699,12 @@ def test_collator_uses_declared_supervision_instead_of_first_item_union(tmp_path
         OfflineCollator("demonstration")([demonstration_dataset[0], preference_dataset[0]])
 
 
-@pytest.mark.parametrize("media_type", ["video", "audio"])
-def test_unsupported_output_media_fail_explicitly(
-    tmp_path: Path,
-    media_type: str,
-) -> None:
-    media: Dict[str, Any] = {"type": media_type, "path": f"target.{media_type}"}
-    if media_type == "video":
-        media["fps"] = 24.0
-    else:
-        media["sample_rate"] = 16000
+def test_unsupported_audio_output_fails_explicitly(tmp_path: Path) -> None:
+    media: Dict[str, Any] = {
+        "type": "audio",
+        "path": "target.audio",
+        "sample_rate": 16000,
+    }
     record = normalize_v2_record(
         {
             "schema_version": 2,
@@ -694,7 +716,7 @@ def test_unsupported_output_media_fail_explicitly(
         },
         dataset_dir=tmp_path,
     )
-    with pytest.raises(NotImplementedError, match=rf"type '{media_type}'.*no decoder"):
+    with pytest.raises(NotImplementedError, match=r"type 'audio'.*no decoder"):
         OfflineDataset(
             [record],
             _condition_cache([record], [{"prompt_embeds": torch.ones(2)}]),
@@ -702,6 +724,72 @@ def test_unsupported_output_media_fail_explicitly(
             source_id=SOURCE_ID,
             supervision_type="demonstration",
         )
+
+
+def test_default_video_decoder_returns_diffusers_compatible_cpu_frames(tmp_path: Path) -> None:
+    target_path = tmp_path / "target.mp4"
+    _save_video(target_path, [16, 64, 192])
+    record = normalize_v2_record(
+        {
+            "schema_version": 2,
+            "input": {"prompt": "video", "media": []},
+            "supervision": {
+                "type": "demonstration",
+                "target": {"media": [{"type": "video", "path": "target.mp4", "fps": 24.0}]},
+            },
+        },
+        dataset_dir=tmp_path,
+    )
+    dataset = OfflineDataset(
+        [record],
+        _condition_cache([record], [{"prompt_embeds": torch.ones(2)}]),
+        source_name=SOURCE_NAME,
+        source_id=SOURCE_ID,
+        supervision_type="demonstration",
+    )
+
+    item = dataset[0]
+    assert isinstance(item.output, DemonstrationOutput)
+    decoded = item.output.target_media[0]
+    assert isinstance(decoded.payload, np.ndarray)
+    assert decoded.payload.shape == (3, 4, 6, 3)
+    assert decoded.payload.dtype == np.uint8
+    assert decoded.payload.flags.c_contiguous
+    assert decoded.fps == 24.0
+    assert pickle.loads(pickle.dumps(decode_video)) is decode_video
+    pickle.dumps(dataset)
+
+
+def test_default_video_decoder_survives_spawn_worker_pickling(tmp_path: Path) -> None:
+    target_path = tmp_path / "spawn.mp4"
+    _save_video(target_path, [12, 24])
+    record = normalize_v2_record(
+        {
+            "schema_version": 2,
+            "input": {"prompt": "spawn video", "media": []},
+            "supervision": {
+                "type": "demonstration",
+                "target": {"media": [{"type": "video", "path": "spawn.mp4", "fps": 24.0}]},
+            },
+        },
+        dataset_dir=tmp_path,
+    )
+    dataset = OfflineDataset(
+        [record],
+        tuple(_condition_cache([record], [{"cached_text": "encoded"}])),
+        source_name=SOURCE_NAME,
+        source_id=SOURCE_ID,
+        supervision_type="demonstration",
+    )
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    process = context.Process(target=_spawn_video_dataset_worker, args=(dataset, result_queue))
+
+    process.start()
+    process.join(timeout=20)
+
+    assert process.exitcode == 0
+    assert result_queue.get(timeout=5) == ((2, 4, 6, 3), "|u1", True)
 
 
 def test_module_level_media_decoder_can_be_injected_explicitly(tmp_path: Path) -> None:

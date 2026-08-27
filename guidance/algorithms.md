@@ -16,6 +16,7 @@
 - [DPPO](#dppo)
 
 - [SFT](#sft)
+   - [Offline Model Capability](#offline-model-capability)
 
 - [Offline DPO](#offline-dpo)
 
@@ -219,8 +220,41 @@ train:
 One epoch is one complete traversal of the official distributed dataloader. Optimizer steps are a
 separate counter and occur only at gradient-accumulation sync boundaries. Target media is decoded
 and VAE-encoded again when revisited; only input conditions such as prompt embeddings are cached.
-The selected adapter must provide both a pipeline I/O contract and an output-state codec. SD3.5
-text-to-image is the first shipped concrete implementation.
+The selected adapter must provide both a pipeline I/O contract and an output-state codec.
+Unlike the historical online cadence, which runs save/eval at the current completed-rollout index
+before the next rollout, an offline periodic boundary runs only after the dataloader traversal
+completes, the cycle hook returns, and `data_epoch` advances. A failed traversal or cycle hook
+produces no completed epoch and no periodic boundary.
+
+### Offline Model Capability
+
+SFT and offline DPO consume the same decoded-media boundary, so model capability is identical for
+both algorithms. `encode_image`, `encode_video`, and `encode_audio` preprocess model *inputs* into
+the reusable condition cache; they are not target encoders. An adapter's `OutputStateCodec`
+separately encodes `target`, `chosen`, or `rejected` media on demand and owns VAE normalization,
+posterior policy, geometry, packing, and forward context. These APIs remain separate because their
+cache and component lifecycles differ. When a condition and target use the same checkpoint VAE
+mapping, both paths reuse one role-neutral numerical primitive rather than duplicate the transform.
+
+| Model type | Status | Boundary detail |
+|------------|--------|-----------------|
+| `sd3-5`, `flux1`, `flux1-kontext`, `flux2`, `flux2-klein` | Available | Image target codec |
+| `qwen-image`, `z-image` | Available | Image target codec |
+| `qwen-image-edit-plus` | Available | Input-derived target geometry; the current contract requires `per_device_batch_size: 1` |
+| `bagel` | Available | Custom VAE codec with deterministic posterior mean and official patch packing; each batch requires one uniform post-transform target grid |
+| `sensenova` | Available | Model-specific image target codec |
+| `wan2_t2v` | Available | Video target codec; decoded media must already match configured `num_frames`, with no implicit temporal resampling |
+| `wan2_i2v` | Blocked | The input-only cache lacks source pixels or canonical VAE condition state needed to rebuild the official condition tensor and first-frame mask. Using the target's first frame as input would leak supervision. |
+| `ltx2_t2av`, `ltx2_i2av` | Blocked | The default loader has no target-audio decoder, and Diffusers has no checkpoint-validated waveform-to-training-mel frontend. The BWE vocoder's internal MelSTFT is not a parity substitute. |
+| `minimax-h3-t2va`, `minimax-h3-fl2va`, `minimax-h3-ref2va` | Blocked | The default loader has no target-audio decoder, and the inference workflows do not specify authoritative joint video/audio posterior selection, normalization, and packing. |
+
+An intentionally unavailable adapter declares `output_state_codec_unavailable_reason`. Offline
+trainer loading reports that actionable reason before constructing Accelerator or loading model
+weights. Online execution ignores the declaration. Capability is enabled only after the adapter
+removes the blocker, declares its static `PipelineIOContract`, and supplies model-specific
+numerical tests. When an upstream pipeline owns the target transform, those tests must include
+parity against the pinned upstream implementation. The framework never silently drops one output
+modality or substitutes target media for a missing input condition.
 
 ## Offline DPO
 

@@ -60,16 +60,15 @@ from accelerate.utils import (
 from accelerate.utils.modeling import (
     get_state_dict_offloaded_model,
 )
+from diffusers.models.modeling_utils import ModelMixin
+from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+from diffusers.schedulers.scheduling_utils import SchedulerMixin
+from diffusers.utils.outputs import BaseOutput
 from huggingface_hub import split_torch_state_dict_into_shards
 from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
 from peft import LoraConfig, PeftModel, get_peft_model
 from PIL import Image
 from safetensors.torch import load_file, save_file
-
-from diffusers.models.modeling_utils import ModelMixin
-from diffusers.pipelines.pipeline_utils import DiffusionPipeline
-from diffusers.schedulers.scheduling_utils import SchedulerMixin
-from diffusers.utils.outputs import BaseOutput
 
 from ..contracts import AcquisitionMode, PipelineIOContract
 from ..ema import EMAModuleWrapper
@@ -216,6 +215,10 @@ class BaseAdapter(ABC):
     preprocess_cache_version: ClassVar[str] = ""
     trajectory_component_order: ClassVar[Tuple[str, ...]] = ("latent",)
     pipeline_io_contract: ClassVar[Optional[PipelineIOContract]] = None
+    # A non-empty explanation means that this adapter is intentionally online-only
+    # for now. Offline trainer loading surfaces it before model weights are loaded,
+    # while online algorithms may continue to construct and use the adapter.
+    output_state_codec_unavailable_reason: ClassVar[Optional[str]] = None
     flow_velocity_direction: ClassVar[Literal["noise", "data"]] = "noise"
 
     # Resolution-invariant latent axis roles for the model-agnostic latent state
@@ -239,6 +242,7 @@ class BaseAdapter(ABC):
     # rejected at class creation instead of at training time.
     _BOUNDARY_OWNING_METHODS: ClassVar[Tuple[str, ...]] = (
         "encode_output_state",
+        "decode_output_state",
         "forward_state",
         "reduce_component_latent_values",
         "reduce_latent_values",
@@ -253,6 +257,8 @@ class BaseAdapter(ABC):
                         "Provide build_output_state_codec() and "
                         "_validate_encoded_output_geometry() instead."
                     )
+                elif name == "decode_output_state":
+                    override_hint = "Implement decode_latents() with model-specific kwargs instead."
                 else:
                     override_hint = f"Override the protected hook _{name} instead."
                 raise TypeError(
@@ -437,7 +443,11 @@ class BaseAdapter(ABC):
     # ============================ Output-State Encoding ============================
     @property
     def output_state_codec(self) -> Optional[OutputStateCodec]:
-        """Return the immutable codec selected during adapter construction."""
+        """Return the immutable codec selected during adapter construction.
+
+        Returns:
+            Adapter-owned output codec, or ``None`` for online-only adapters.
+        """
         return self._output_state_codec
 
     @property
@@ -447,6 +457,9 @@ class BaseAdapter(ABC):
         The caller owns component device staging. Keeping this declaration separate
         from :meth:`encode_output_state` prevents a per-batch encode from implicitly
         moving or offloading modules behind the trainer's back.
+
+        Returns:
+            Ordered runtime component names required for target encoding.
         """
         return self._output_state_encoding_modules
 
@@ -455,11 +468,66 @@ class BaseAdapter(ABC):
 
         The component runtime, canonical scheduler, and scheduler group are available
         before this hook runs. Online-only adapters retain the default ``None``.
+
+        Returns:
+            Adapter-owned output codec, or ``None`` when offline output is unsupported.
         """
         return None
 
+    @classmethod
+    def _validated_output_state_codec_unavailable_reason(cls) -> Optional[str]:
+        """Return a normalized offline-codec blocker declared by the adapter."""
+        reason = cls.output_state_codec_unavailable_reason
+        if reason is None:
+            return None
+        if not isinstance(reason, str) or not reason.strip():
+            raise TypeError(
+                f"adapter {cls.__name__}.output_state_codec_unavailable_reason must be "
+                f"a non-empty string or None, received {type(reason).__name__}: {reason!r}"
+            )
+        return reason.strip()
+
+    @classmethod
+    def validate_offline_output_capability(cls) -> None:
+        """Fail before model loading unless this adapter can encode offline targets.
+
+        A concrete codec still validates its realized components during adapter
+        construction. This class-level check covers declarations that can be proven
+        without downloading weights or allocating accelerator memory.
+
+        Returns:
+            None after successful static capability validation.
+
+        Raises:
+            NotImplementedError: If the adapter declares an actionable offline blocker.
+            TypeError: If the contract, codec builder, or geometry hook is missing.
+        """
+        reason = cls._validated_output_state_codec_unavailable_reason()
+        if reason is not None:
+            raise NotImplementedError(
+                f"offline output-state encoding is unavailable for adapter "
+                f"{cls.__name__}: {reason}"
+            )
+        contract = cls.pipeline_io_contract
+        if not isinstance(contract, PipelineIOContract):
+            raise TypeError(
+                f"offline training requires adapter {cls.__name__} to declare a "
+                f"PipelineIOContract, received {type(contract).__name__}: {contract!r}"
+            )
+        if cls.build_output_state_codec is BaseAdapter.build_output_state_codec:
+            raise TypeError(
+                f"offline training requires adapter {cls.__name__} to provide an "
+                "output-state codec through build_output_state_codec()"
+            )
+        if cls._validate_encoded_output_geometry is BaseAdapter._validate_encoded_output_geometry:
+            raise TypeError(
+                f"offline training requires adapter {cls.__name__} to override "
+                "_validate_encoded_output_geometry()"
+            )
+
     def _validate_output_state_codec_lifecycle(self) -> Tuple[str, ...]:
         """Validate the adapter's pipeline contract and codec declaration."""
+        unavailable_reason = type(self)._validated_output_state_codec_unavailable_reason()
         contract = self.pipeline_io_contract
         if contract is not None and not isinstance(contract, PipelineIOContract):
             raise TypeError(
@@ -470,6 +538,11 @@ class BaseAdapter(ABC):
         codec = self.output_state_codec
         if codec is None:
             return ()
+        if unavailable_reason is not None:
+            raise ValueError(
+                f"adapter {type(self).__name__} built an output-state codec while declaring "
+                "output_state_codec_unavailable_reason; remove the stale blocker declaration"
+            )
         if contract is None:
             raise ValueError(
                 f"adapter {type(self).__name__} built an output-state codec without declaring "
@@ -497,9 +570,16 @@ class BaseAdapter(ABC):
             Detached clean output state using the adapter's latent-storage policy.
 
         Raises:
+            NotImplementedError: If the adapter declares a known codec blocker.
             RuntimeError: If the adapter does not expose the complete offline codec seam.
             TypeError: If condition or generator has the wrong boundary type.
         """
+        unavailable_reason = type(self)._validated_output_state_codec_unavailable_reason()
+        if unavailable_reason is not None:
+            raise NotImplementedError(
+                f"offline output-state encoding is unavailable for adapter "
+                f"{type(self).__name__}: {unavailable_reason}"
+            )
         contract = self.pipeline_io_contract
         if contract is None:
             raise RuntimeError(
@@ -560,6 +640,59 @@ class BaseAdapter(ABC):
 
         self._validate_encoded_output_geometry(validated_media, condition, encoded)
         return encoded
+
+    def decode_output_state(
+        self,
+        encoded: EncodedOutputState,
+        *,
+        output_type: Literal["pil", "pt", "np"] = "pil",
+    ) -> Any:
+        """Decode one encoded offline state through the adapter's existing decoder.
+
+        ``decode_context`` may contain geometry retained only for validation as well as
+        kwargs required by a particular decoder. This wrapper forwards only names accepted
+        by ``decode_latents`` and supplies the requested output type when that decoder exposes
+        the standard ``output_type`` argument.
+
+        Args:
+            encoded: Validated single-component output state produced by this adapter.
+            output_type: Existing decoder output representation.
+
+        Returns:
+            Model-specific decoded image or video batch.
+
+        Raises:
+            TypeError: If ``encoded`` or ``output_type`` has the wrong boundary type.
+            ValueError: If the state cannot be represented by the legacy single-latent decoder.
+        """
+        if not isinstance(encoded, EncodedOutputState):
+            raise TypeError(
+                "expected encoded output state to be EncodedOutputState, "
+                f"received {type(encoded).__name__}: {encoded!r}"
+            )
+        if type(output_type) is not str:
+            raise TypeError(
+                "expected output_type to be str, "
+                f"received {type(output_type).__name__}: {output_type!r}"
+            )
+        if output_type not in ("pil", "pt", "np"):
+            raise ValueError(
+                "expected output_type in ('pil', 'pt', 'np'), " f"received {output_type!r}"
+            )
+        if encoded.clean_state.component_names != ("latent",):
+            raise ValueError(
+                "decode_output_state requires exactly one 'latent' component for the "
+                f"existing decode_latents boundary, received {encoded.clean_state.component_names}"
+            )
+        decode_kwargs = filter_kwargs(
+            self.decode_latents,
+            **dict(encoded.decode_context),
+            output_type=output_type,
+        )
+        return self.decode_latents(
+            encoded.clean_state.components["latent"],
+            **decode_kwargs,
+        )
 
     def _validate_encoded_output_geometry(
         self,

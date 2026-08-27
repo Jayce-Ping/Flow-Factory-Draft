@@ -43,7 +43,9 @@ def start(self):
         self.execution_driver.prepare_cycle(
             self, self.progress, seed=self.training_args.seed
         )
-        # Checkpoint and evaluation boundaries run here.
+        if self.execution_contract.acquisition is AcquisitionMode.ROLLOUT:
+            # Preserve the online pre-rollout boundary.
+            self._run_periodic_cycle_boundaries()
         self.execution_driver.run_cycle(self, self.progress)
         if self.execution_contract.acquisition is AcquisitionMode.ROLLOUT:
             self.adapter.ema_step(step=self.cycle_index)
@@ -52,12 +54,17 @@ def start(self):
             self.execution_contract.cycle_unit,
             completed=True,
         )
+        if self.execution_contract.acquisition is AcquisitionMode.DATASET:
+            # Offline boundaries observe a newly completed data epoch.
+            self._run_periodic_cycle_boundaries()
 ```
 
 Offline EMA is intentionally absent from the cycle boundary above. The shared optimizer-step
 helper updates it immediately after each successful offline optimizer step, so several updates in
 one data epoch do not collapse into one EMA update. Online algorithms retain rollout-iteration
-cadence.
+cadence. Save/eval cadence is also intentionally mode-specific: online uses the current
+completed-rollout index before the next rollout, while offline uses the newly completed
+`data_epoch` only after traversal, the cycle hook, and counter advancement.
 
 The default `_run_training_step` is the familiar three-stage sequence, so a reward-based
 algorithm only implements `optimize()`:
@@ -87,10 +94,12 @@ Trainer execution and gradient paradigm are separate declarations:
 
 An offline epoch means one complete traversal of its finite distributed dataloader. The driver
 calls `DistributedSampler.set_epoch(data_epoch)`, streams batches directly to `optimize_batch`, and
-increments `data_epoch` only after clean exhaustion. It does not execute a fake sampling stage and
-does not accumulate the epoch's target media in memory. `optimizer_step` is tracked separately from
-both cycle counters. Dataset acquisition currently consumes supervision from the batch and rejects
-runtime reward feedback at contract construction.
+returns only after clean exhaustion. The shared loop then runs `_after_training_cycle()`, advances
+`data_epoch`, and evaluates the post-epoch save/eval boundary in that order. If traversal or the
+cycle hook fails, neither the epoch counter nor the boundary advances. It does not execute a fake
+sampling stage and does not accumulate the epoch's target media in memory. `optimizer_step` is
+tracked separately from both cycle counters. Dataset acquisition currently consumes supervision
+from the batch and rejects runtime reward feedback at contract construction.
 
 Offline training uses an explicit positive integer `train.gradient_accumulation_steps` (default
 `1`). It does not derive accumulation from `gradient_step_per_epoch`, grouped sampling geometry,
@@ -179,7 +188,11 @@ def preprocess_func(self, prompt, images, ...):
     return batch
 ```
 
-> **Audio is symmetric**: `audio_dir` is the third optional input handled by `_preprocess_batch`, parallel to `image_dir` / `video_dir`. Audio-aware adapters (e.g. the LTX-2 audio-video adapter) override `encode_audio` to consume the loaded `audios` batch; text/image/video-only adapters inherit the no-op `BaseAdapter.encode_audio` and ignore the column entirely.
+> **Audio input is symmetric**: `audio_dir` is the third optional input handled by
+> `_preprocess_batch`, parallel to `image_dir` / `video_dir`. An audio-*conditioned* adapter
+> overrides `encode_audio` to consume the loaded `audios` batch. LTX2 and MiniMax H3 currently
+> generate audio rather than consume it, so their target audio belongs in an output-state codec,
+> not `encode_audio`; adapters with no audio input inherit the no-op method.
 
 ### Key Points
 
@@ -194,10 +207,17 @@ def preprocess_func(self, prompt, images, ...):
   fetched. The adapter-owned output-state codec validates the pipeline output contract and invokes
   the VAE under `torch.no_grad()` for every training batch. No target pixels or target latents are
   cached.
+- **Shared numerical primitive, separate lifecycle**: Condition `encode_*` methods remain the
+  cacheable input API, while output-state codecs remain the on-the-fly target API. If condition and
+  target media use the same checkpoint VAE transform, both paths call one role-neutral numerical
+  helper; only their caching, geometry, packing, masks, and forward/decode orchestration differ.
 - **Component lifecycle**: Input-only encoders may be offloaded after the condition cache is built.
-  Components declared by the output-state codec (the SD3.5 VAE today) remain runtime-available for
-  offline batch optimization; online execution may continue to stage its VAE around preprocessing
-  and inference.
+  Components declared by each output-state codec remain runtime-available for offline batch
+  optimization; online execution may continue to stage its VAE around preprocessing and inference.
+- **Capability preflight**: Before Accelerator construction or model loading, an offline trainer
+  requires a static pipeline I/O contract and codec builder. A model with a known blocker exposes
+  `output_state_codec_unavailable_reason`, whose actionable explanation is reported immediately.
+  Online algorithms do not require this output seam and remain unaffected.
 
 ### Configuration
 
@@ -655,7 +675,8 @@ unverified; use DDP or FSDP.
 - **Inner epochs**: Samples can be reused for multiple optimization passes (`num_inner_epochs`), amortizing the cost of sampling.
 - **Gradient accumulation**: The `accelerator.accumulate()` context handles gradient accumulation across timesteps and micro-batches, with optimizer steps only at sync boundaries.
 - **Offline cadence**: Offline EMA and per-update hooks run on each successful optimizer step;
-  save/eval boundaries and outer-cycle hooks remain data-epoch based.
+  after a complete traversal, the outer-cycle hook runs, `data_epoch` advances, and only then does
+  the data-epoch-based save/eval boundary run.
 - **KL regularization**: Optional penalty keeping the policy close to a reference model (or EMA model for AWM), preventing reward hacking.
 - **Per-timestep iteration**: GRPO iterates over each stored trajectory timestep, computing loss at each. NFT, AWM, DGPO, and CRD sample fresh timesteps independently of the sampling trajectory.
 

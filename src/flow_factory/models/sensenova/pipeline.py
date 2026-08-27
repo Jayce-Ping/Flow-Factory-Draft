@@ -82,10 +82,17 @@ class SenseNovaDenoiser(nn.Module):
         model = self.model
         merge_size = int(1 / model.downsample_ratio)
         patch_size = model.patch_size
-        token_h = image_size[1] // (patch_size * merge_size)
-        token_w = image_size[0] // (patch_size * merge_size)
-        grid_h = image_size[1] // patch_size
-        grid_w = image_size[0] // patch_size
+        height, width = image_size
+        if tuple(latents.shape[-2:]) != (height, width):
+            raise ValueError(
+                "SenseNovaDenoiser image_size uses canonical (height, width) and must "
+                f"match latent geometry; received image_size={image_size}, "
+                f"latents={tuple(latents.shape)}"
+            )
+        token_h = height // (patch_size * merge_size)
+        token_w = width // (patch_size * merge_size)
+        grid_h = height // patch_size
+        grid_w = width // patch_size
         image_token_num = token_h * token_w
 
         z = model.patchify(latents, patch_size * merge_size)

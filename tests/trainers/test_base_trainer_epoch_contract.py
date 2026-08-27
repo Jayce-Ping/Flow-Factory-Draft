@@ -291,6 +291,29 @@ class InvalidSamplerOfflineTrainerFake(OfflineEpochTrainerFake):
         self.events.append("eval")
 
 
+class BoundaryOfflineEpochTrainerFake(OfflineEpochTrainerFake):
+    """Record offline boundaries after a complete finite traversal."""
+
+    def __init__(self, fail_on_batch: Optional[int] = None) -> None:
+        super().__init__(total_epochs=1, fail_on_batch=fail_on_batch)
+        self.log_args = SimpleNamespace(save_freq=1, save_dir="unused", run_name="run")
+        self.eval_args = SimpleNamespace(eval_freq=1)
+
+    def save_checkpoint(self, save_directory: str, epoch: Optional[int] = None) -> None:
+        """Record the completed epoch attached to the checkpoint.
+
+        Args:
+            save_directory: Resolved checkpoint root, unused by the fake.
+            epoch: Completed data-epoch count attached to the checkpoint.
+        """
+        del save_directory
+        self.events.append(f"save:{epoch}")
+
+    def evaluate(self) -> None:
+        """Record the post-epoch evaluation boundary."""
+        self.events.append("eval")
+
+
 class MissingOfflineHookTrainer(BaseTrainer):
     """Offline trainer intentionally missing its required batch hook."""
 
@@ -321,6 +344,23 @@ def test_offline_epoch_means_one_complete_dataloader_traversal() -> None:
     assert trainer.step == 6
     assert trainer.progress.data_epoch == 2
     assert trainer.progress.rollout_iteration == 0
+
+
+def test_offline_boundaries_run_after_completed_epoch_progress() -> None:
+    """Checkpoint and evaluation observe trained weights and data_epoch=1."""
+    trainer = BoundaryOfflineEpochTrainerFake()
+
+    trainer.start()
+
+    assert trainer.events == [
+        "set_epoch:0",
+        "batch:[0, 1]",
+        "batch:[2, 3]",
+        "batch:[4]",
+        "save:1",
+        "eval",
+    ]
+    assert trainer.progress.data_epoch == 1
 
 
 @pytest.mark.parametrize(
@@ -374,6 +414,17 @@ def test_incomplete_offline_traversal_does_not_advance_data_epoch() -> None:
     assert trainer.events == ["set_epoch:0", "batch:[0, 1]", "batch:[2, 3]"]
     assert trainer.epoch == 0
     assert trainer.step == 1
+
+
+def test_incomplete_offline_traversal_does_not_run_cycle_boundaries() -> None:
+    """A failed batch cannot publish a checkpoint labeled as a complete epoch."""
+    trainer = BoundaryOfflineEpochTrainerFake(fail_on_batch=2)
+
+    with pytest.raises(RuntimeError, match="offline batch failed"):
+        trainer.start()
+
+    assert trainer.events == ["set_epoch:0", "batch:[0, 1]", "batch:[2, 3]"]
+    assert trainer.progress.data_epoch == 0
 
 
 def test_invalid_offline_sampler_fails_before_shared_cycle_boundaries() -> None:

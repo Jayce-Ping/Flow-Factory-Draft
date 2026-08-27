@@ -39,8 +39,8 @@ from flow_factory.models.output_state import (
 from flow_factory.models.stable_diffusion.sd3_5 import SD3_5Adapter
 from flow_factory.samples import LatentState
 
-HEIGHT = 6
-WIDTH = 10
+HEIGHT = 16
+WIDTH = 32
 
 
 @dataclass(frozen=True)
@@ -152,7 +152,12 @@ def _adapter(
         latent_storage_dtype=None,
     )
     adapter.accelerator = SimpleNamespace(device=torch.device("cpu"))
-    adapter.pipeline = SimpleNamespace(image_processor=processor, vae=vae)
+    adapter.pipeline = SimpleNamespace(
+        image_processor=processor,
+        vae=vae,
+        vae_scale_factor=8,
+        patch_size=2,
+    )
     adapter.component_runtime = SimpleNamespace(get_component=lambda name: vae)
     adapter._output_state_encoding_modules = ("vae",)
     adapter._output_state_codec = adapter.build_output_state_codec() if build_codec else None
@@ -178,7 +183,7 @@ def _encoded_geometry(
     decode_context: Optional[dict[str, int]] = None,
 ) -> EncodedOutputState:
     return EncodedOutputState(
-        clean_state=LatentState({"latent": torch.zeros(1, 1, 3, 5)}),
+        clean_state=LatentState({"latent": torch.zeros(1, 1, HEIGHT // 2, WIDTH // 2)}),
         forward_context={},
         decode_context=(
             {"height": HEIGHT, "width": WIDTH} if decode_context is None else decode_context
@@ -278,7 +283,12 @@ def test_sd3_5_codec_accepts_supported_diffusers_latent_distribution_surfaces(
 
     encoded = adapter.encode_output_state(_media_batch(1), {})
 
-    assert encoded.clean_state.components["latent"].shape == (1, 1, 3, 5)
+    assert encoded.clean_state.components["latent"].shape == (
+        1,
+        1,
+        HEIGHT // 2,
+        WIDTH // 2,
+    )
     assert vae.posteriors[0].sample_calls == 0
 
 
@@ -287,7 +297,7 @@ def test_sd3_5_codec_rejects_processor_geometry_before_vae_encode() -> None:
     vae = _FakeVAE()
     adapter = _adapter(processor=processor, vae=vae)
 
-    with pytest.raises(ValueError, match=r"did not produce configured geometry"):
+    with pytest.raises(ValueError, match=r"changed configured target geometry"):
         adapter.encode_output_state(_media_batch(1), {})
 
     assert vae.encode_inputs == []
@@ -328,6 +338,17 @@ def test_sd3_5_codec_rejects_malformed_configured_geometry(
         adapter.build_output_state_codec()
 
 
+@pytest.mark.parametrize(("height", "width"), [(HEIGHT + 2, WIDTH), (HEIGHT, WIDTH + 2)])
+def test_sd3_5_codec_rejects_geometry_outside_transformer_grid(
+    height: int,
+    width: int,
+) -> None:
+    adapter = _adapter(height=height, width=width, build_codec=False)
+
+    with pytest.raises(ValueError, match=r"divisible by 16"):
+        adapter.build_output_state_codec()
+
+
 @pytest.mark.parametrize(
     ("encoded", "message"),
     [
@@ -337,11 +358,11 @@ def test_sd3_5_codec_rejects_malformed_configured_geometry(
         ),
         (
             _encoded_geometry(decode_context={"height": HEIGHT, "width": WIDTH + 1}),
-            r"decode_context must exactly match configured output geometry",
+            r"decode_context 'width' must equal configured value",
         ),
         (
             _encoded_geometry(decode_context={"height": HEIGHT, "width": WIDTH, "extra": 1}),
-            r"decode_context must exactly match configured output geometry",
+            r"decode_context must exactly contain height and width",
         ),
     ],
 )

@@ -19,7 +19,7 @@ import logging
 import os
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -28,8 +28,9 @@ from diffusers.pipelines.wan.pipeline_wan import WanPipeline, prompt_clean
 from peft import PeftModel
 from PIL import Image
 
+from ...contracts import GeometrySource, MediaType, NegativePromptPolicy
 from ...hparams import *
-from ...samples import T2VSample
+from ...samples import LatentState, T2VSample
 from ...scheduler import UniPCMultistepSDEScheduler, UniPCMultistepSDESchedulerOutput
 from ...utils.base import filter_kwargs
 from ...utils.logger_utils import setup_logger
@@ -41,6 +42,14 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ..output_state import (
+    DecodedMediaBatch,
+    EncodedOutputState,
+    GeometrySignature,
+    MediaGeometrySignature,
+    OutputStateCodec,
+)
+from ..pipeline_contracts import video_output_contract
 
 logger = setup_logger(__name__)
 
@@ -51,12 +60,237 @@ class WanT2VSample(T2VSample):
     _shared_fields: ClassVar[frozenset[str]] = frozenset({})
 
 
+@dataclass(frozen=True, slots=True)
+class _WanT2VOutputStateCodec:
+    """Encode decoded videos into deterministic normalized Wan clean latents."""
+
+    adapter: "Wan2_T2V_Adapter"
+    required_components: ClassVar[Tuple[str, ...]] = ("vae",)
+
+    def encode_output_state(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Mapping[str, Any],
+        generator: Optional[torch.Generator] = None,
+    ) -> EncodedOutputState:
+        """Preprocess and VAE-encode one exact configured-geometry target batch."""
+        del condition, generator  # Wan target encoding uses deterministic posterior mode.
+        height, width, num_frames = self.adapter._configured_output_geometry()
+        videos, frame_rates = self._extract_videos(media_batch, num_frames)
+        pixel_values = self.adapter.pipeline.video_processor.preprocess_video(
+            videos,
+            height=height,
+            width=width,
+        )
+        self._validate_pixel_values(
+            pixel_values,
+            batch_size=len(videos),
+            height=height,
+            width=width,
+            num_frames=num_frames,
+        )
+
+        vae = self.adapter.vae
+        vae_dtype = getattr(vae, "dtype", None)
+        if not isinstance(vae_dtype, torch.dtype) or not vae_dtype.is_floating_point:
+            raise TypeError(
+                "Wan2 T2V output codec expected VAE to expose a floating dtype, "
+                f"received {vae_dtype!r}"
+            )
+        pixel_values = pixel_values.to(device=self.adapter.device, dtype=vae_dtype)
+        encoder_output = vae.encode(pixel_values)
+        latents = self._posterior_mode(encoder_output)
+
+        z_dim, latents_mean, latents_std = self._normalization_statistics(
+            vae,
+            device=latents.device,
+            dtype=latents.dtype,
+        )
+        temporal_scale, spatial_scale = self.adapter._vae_scale_factors()
+        expected_latent_shape = (
+            len(videos),
+            z_dim,
+            (num_frames - 1) // temporal_scale + 1,
+            height // spatial_scale,
+            width // spatial_scale,
+        )
+        if tuple(latents.shape) != expected_latent_shape:
+            raise ValueError(
+                "Wan2 T2V VAE encode returned incompatible target geometry: "
+                f"expected {expected_latent_shape}, received {tuple(latents.shape)}"
+            )
+        latents = (latents - latents_mean) / latents_std
+
+        signatures = tuple(
+            GeometrySignature(
+                media=(
+                    MediaGeometrySignature(
+                        type=MediaType.VIDEO,
+                        height=height,
+                        width=width,
+                        frames=num_frames,
+                        fps=fps,
+                    ),
+                )
+            )
+            for fps in frame_rates
+        )
+        return EncodedOutputState(
+            clean_state=LatentState({"latent": latents}),
+            forward_context={},
+            decode_context={"height": height, "width": width, "num_frames": num_frames},
+            geometry_signatures=signatures,
+        )
+
+    @staticmethod
+    def _extract_videos(
+        media_batch: DecodedMediaBatch,
+        num_frames: int,
+    ) -> Tuple[List[Any], List[Optional[float]]]:
+        """Extract one decoded pixel video per sample and require exact frame count."""
+        videos: List[Any] = []
+        frame_rates: List[Optional[float]] = []
+        for sample_index, candidate in enumerate(media_batch):
+            if len(candidate) != 1:
+                raise ValueError(
+                    "Wan2 T2V output codec expected one video per sample, "
+                    f"received {len(candidate)} for sample {sample_index}"
+                )
+            media = candidate[0]
+            payload = media.payload
+            if isinstance(payload, np.ndarray):
+                if payload.ndim != 4 or payload.shape[-1] != 3:
+                    raise ValueError(
+                        "Wan2 T2V output codec expected NumPy video shaped (F,H,W,3), "
+                        f"received {payload.shape} for sample {sample_index}"
+                    )
+                frame_count = payload.shape[0]
+            elif isinstance(payload, torch.Tensor):
+                if payload.ndim != 4 or payload.shape[1] != 3:
+                    raise ValueError(
+                        "Wan2 T2V output codec expected tensor video shaped (F,3,H,W), "
+                        f"received {tuple(payload.shape)} for sample {sample_index}"
+                    )
+                frame_count = payload.shape[0]
+            elif isinstance(payload, (list, tuple)):
+                if not payload:
+                    raise ValueError(
+                        f"Wan2 T2V output codec received an empty video for sample {sample_index}"
+                    )
+                frame_count = len(payload)
+                payload = list(payload)
+            else:
+                raise TypeError(
+                    "Wan2 T2V output codec expected decoded video as NumPy, tensor, or "
+                    f"frame list, received {type(payload).__name__} for sample {sample_index}"
+                )
+            if frame_count != num_frames:
+                raise ValueError(
+                    "Wan2 T2V target video must already match configured temporal geometry: "
+                    f"expected {num_frames} frames, received {frame_count} for sample "
+                    f"{sample_index}"
+                )
+            videos.append(payload)
+            frame_rates.append(media.fps)
+        return videos, frame_rates
+
+    @staticmethod
+    def _validate_pixel_values(
+        pixel_values: object,
+        *,
+        batch_size: int,
+        height: int,
+        width: int,
+        num_frames: int,
+    ) -> None:
+        """Require Diffusers video preprocessing to preserve exact B/F/H/W."""
+        if not isinstance(pixel_values, torch.Tensor):
+            raise TypeError(
+                "Wan VideoProcessor.preprocess_video expected torch.Tensor output, "
+                f"received {type(pixel_values).__name__}"
+            )
+        expected_shape = (batch_size, 3, num_frames, height, width)
+        if tuple(pixel_values.shape) != expected_shape:
+            raise ValueError(
+                "Wan VideoProcessor.preprocess_video changed configured target geometry: "
+                f"expected {expected_shape}, received {tuple(pixel_values.shape)}"
+            )
+
+    @staticmethod
+    def _posterior_mode(encoder_output: Any) -> torch.Tensor:
+        """Resolve current Diffusers Wan VAE output surfaces without sampling."""
+        posterior = getattr(encoder_output, "latent_dist", None)
+        if posterior is None and isinstance(encoder_output, (tuple, list)):
+            if len(encoder_output) != 1:
+                raise TypeError(
+                    "Wan2 T2V VAE encode expected a single latent distribution tuple, "
+                    f"received length {len(encoder_output)}"
+                )
+            posterior = getattr(encoder_output[0], "latent_dist", encoder_output[0])
+        if posterior is None and getattr(encoder_output, "mode", None) is not None:
+            posterior = encoder_output
+        mode = getattr(posterior, "mode", None)
+        latents = mode() if callable(mode) else mode
+        if not isinstance(latents, torch.Tensor):
+            raise TypeError(
+                "Wan2 T2V VAE latent distribution must expose tensor mode, "
+                f"received {type(latents).__name__}"
+            )
+        if latents.ndim != 5:
+            raise ValueError(
+                "Wan2 T2V VAE posterior mode expected rank-5 BCFHW tensor, "
+                f"received shape {tuple(latents.shape)}"
+            )
+        return latents
+
+    @staticmethod
+    def _normalization_statistics(
+        vae: Any,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[int, torch.Tensor, torch.Tensor]:
+        """Return validated per-channel Wan latent mean and standard deviation."""
+        config = getattr(vae, "config", None)
+        z_dim = getattr(config, "z_dim", None)
+        if type(z_dim) is not int or z_dim <= 0:
+            raise TypeError(
+                "Wan2 T2V VAE config expected positive int z_dim, " f"received {z_dim!r}"
+            )
+        try:
+            mean = torch.as_tensor(getattr(config, "latents_mean", None), dtype=torch.float32)
+            std = torch.as_tensor(getattr(config, "latents_std", None), dtype=torch.float32)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "Wan2 T2V VAE config expected numeric latents_mean and latents_std"
+            ) from exc
+        if mean.ndim != 1 or std.ndim != 1 or mean.numel() != z_dim or std.numel() != z_dim:
+            raise ValueError(
+                "Wan2 T2V VAE config expected one latent mean/std value per channel: "
+                f"z_dim={z_dim}, mean_shape={tuple(mean.shape)}, std_shape={tuple(std.shape)}"
+            )
+        if not torch.isfinite(mean).all() or not torch.isfinite(std).all():
+            raise ValueError("Wan2 T2V VAE latent normalization statistics must be finite")
+        if not torch.all(std > 0):
+            raise ValueError("Wan2 T2V VAE latents_std values must all be positive")
+        view_shape = (1, z_dim, 1, 1, 1)
+        return (
+            z_dim,
+            mean.view(view_shape).to(device=device, dtype=dtype),
+            std.view(view_shape).to(device=device, dtype=dtype),
+        )
+
+
 class Wan2_T2V_Adapter(BaseAdapter):
     # Wan2.2 trains both transformer and transformer_2 but uses only one per
     # timestep (boundary_ratio), so under DDP the other's trainable params get no
     # gradient in a given step. Ignored under DeepSpeed/FSDP.
     ddp_find_unused_parameters = True
     supports_diffusers_cache = True
+    pipeline_io_contract = video_output_contract(
+        negative_prompt=NegativePromptPolicy.OPTIONAL,
+        geometry_source=GeometrySource.CONFIGURED,
+    )
 
     def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
@@ -67,6 +301,117 @@ class Wan2_T2V_Adapter(BaseAdapter):
         return WanPipeline.from_pretrained(
             self.model_args.model_name_or_path,
         )
+
+    def build_output_state_codec(self) -> OutputStateCodec:
+        """Build the deterministic on-the-fly Wan target-video encoder."""
+        self._configured_output_geometry()
+        return _WanT2VOutputStateCodec(self)
+
+    def _vae_scale_factors(self) -> Tuple[int, int]:
+        """Return strictly validated temporal and spatial VAE compression factors."""
+        temporal = getattr(self.pipeline, "vae_scale_factor_temporal", None)
+        spatial = getattr(self.pipeline, "vae_scale_factor_spatial", None)
+        for name, value in (("temporal", temporal), ("spatial", spatial)):
+            if type(value) is not int or value <= 0:
+                raise TypeError(
+                    f"Wan2 T2V expected positive int VAE {name} scale factor, "
+                    f"received {value!r}"
+                )
+        return temporal, spatial
+
+    def _transformer_patch_size(self) -> Tuple[int, int, int]:
+        """Return the active Wan transformer's three-axis patch size."""
+        transformer = getattr(self.pipeline, "transformer", None)
+        if transformer is None:
+            transformer = getattr(self.pipeline, "transformer_2", None)
+        patch_size = getattr(getattr(transformer, "config", None), "patch_size", None)
+        if (
+            not isinstance(patch_size, (tuple, list))
+            or len(patch_size) != 3
+            or any(type(value) is not int or value <= 0 for value in patch_size)
+        ):
+            raise TypeError(
+                "Wan2 T2V expected transformer patch_size as three positive ints, "
+                f"received {patch_size!r}"
+            )
+        return tuple(patch_size)
+
+    def _configured_output_geometry(self) -> Tuple[int, int, int]:
+        """Return configured H/W/F after fail-fast Wan geometry validation."""
+        geometry = []
+        for name in ("height", "width", "num_frames"):
+            value = getattr(self.training_args, name, None)
+            if type(value) is not int:
+                raise TypeError(
+                    f"Wan2 T2V output geometry expected training_args.{name} to be int, "
+                    f"received {type(value).__name__}: {value!r}"
+                )
+            if value <= 0:
+                raise ValueError(
+                    f"Wan2 T2V output geometry expected training_args.{name} > 0, "
+                    f"received {value}"
+                )
+            geometry.append(value)
+        height, width, num_frames = geometry
+        temporal_scale, spatial_scale = self._vae_scale_factors()
+        if (num_frames - 1) % temporal_scale:
+            raise ValueError(
+                "Wan2 T2V output geometry requires (num_frames - 1) divisible by "
+                f"{temporal_scale}, received num_frames={num_frames}"
+            )
+        patch_size = self._transformer_patch_size()
+        height_multiple = spatial_scale * patch_size[1]
+        width_multiple = spatial_scale * patch_size[2]
+        if height % height_multiple or width % width_multiple:
+            raise ValueError(
+                "Wan2 T2V output geometry requires height/width divisible by "
+                f"({height_multiple}, {width_multiple}), received ({height}, {width})"
+            )
+        return height, width, num_frames
+
+    def _validate_encoded_output_geometry(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Mapping[str, Any],
+        encoded: EncodedOutputState,
+    ) -> None:
+        """Verify codec signatures and decode fields against configured H/W/F."""
+        del condition
+        height, width, num_frames = self._configured_output_geometry()
+        if len(encoded.geometry_signatures) != len(media_batch):
+            raise ValueError(
+                "Wan2 T2V output geometry expected one signature per target sample, "
+                f"received {len(encoded.geometry_signatures)} for batch size {len(media_batch)}"
+            )
+        for sample_index, (candidate, signature) in enumerate(
+            zip(media_batch, encoded.geometry_signatures)
+        ):
+            expected = GeometrySignature(
+                media=(
+                    MediaGeometrySignature(
+                        type=MediaType.VIDEO,
+                        height=height,
+                        width=width,
+                        frames=num_frames,
+                        fps=candidate[0].fps,
+                    ),
+                )
+            )
+            if signature != expected:
+                raise ValueError(
+                    "Wan2 T2V encoded output geometry disagrees with configured H/W/F "
+                    f"for sample {sample_index}: expected {expected!r}, received {signature!r}"
+                )
+        expected_decode_context = {
+            "height": height,
+            "width": width,
+            "num_frames": num_frames,
+        }
+        if dict(encoded.decode_context) != expected_decode_context:
+            raise ValueError(
+                "Wan2 T2V decode_context must exactly match configured output geometry "
+                f"{expected_decode_context}, received {dict(encoded.decode_context)!r}"
+            )
 
     def apply_lora(
         self,
@@ -230,13 +575,18 @@ class Wan2_T2V_Adapter(BaseAdapter):
 
         return results
 
-    def encode_image(self, images: Union[Image.Image, torch.Tensor, List[torch.Tensor]]):
-        """Not needed for Wan text-to-video models."""
-        pass
+    def encode_image(
+        self,
+        images: Union[Image.Image, torch.Tensor, List[torch.Tensor]],
+    ) -> None:
+        """Return no condition because Wan T2V accepts no input images."""
+        del images
+        return None
 
-    def encode_video(self, videos: Union[torch.Tensor, List[torch.Tensor]]):
-        """Not needed for Wan text-to-video models."""
-        pass
+    def encode_video(self, videos: Union[torch.Tensor, List[torch.Tensor]]) -> None:
+        """Return no condition because Wan T2V accepts no input videos."""
+        del videos
+        return None
 
     def decode_latents(
         self, latents: torch.Tensor, output_type: Literal["pt", "pil", "np"] = "pil"
@@ -509,100 +859,161 @@ class Wan2_T2V_Adapter(BaseAdapter):
         Core forward pass for T2V generation.
 
         Args:
-            t: Current timestep tensor.
+            t: Shared scalar or one current timestep per batch sample.
             latents: Current latent representations (B, C, T, H, W).
             prompt_embeds: Text prompt embeddings.
             negative_prompt_embeds: Optional negative prompt embeddings (for CFG).
-            guidance_scale: CFG scale factor.
-            transformer: Transformer module to use (defaults to self.transformer).
-            pipeline_model: Pipeline model for cache_context (defaults to self.pipeline.transformer).
+            guidance_scale: CFG scale for the primary/high-noise transformer.
+            guidance_scale_2: Optional CFG scale for the low-noise transformer.
+            t_next: Shared scalar or one next timestep per batch sample.
             next_latents: Optional target latents for log-prob computation.
+            noise_level: Current noise level for SDE sampling.
             attention_kwargs: Optional kwargs for attention layers.
             compute_log_prob: Whether to compute log probabilities.
             return_kwargs: List of outputs to return.
-            noise_level: Current noise level for SDE sampling.
+            boundary_timestep: Optional explicit Wan2.2 transformer boundary.
 
         Returns:
             UniPCMultistepSDESchedulerOutput containing requested outputs.
         """
-        # 1. Prepare variables
-        t = t[0] if t.ndim == 1 else t  # A scalar
-        if t_next is not None:
-            t_next = t_next[0] if t_next.ndim == 1 else t_next
-
+        # 1. Prepare variables. Online rollout supplies one shared scalar while
+        # offline objectives supply one independently sampled timestep per sample.
         batch_size = latents.shape[0]
         device = latents.device
-        dtype = (
-            self.pipeline.transformer.dtype
-            if self.pipeline.transformer is not None
-            else self.pipeline.transformer_2.dtype
+        model_timesteps, scheduler_timestep = self._normalize_forward_timesteps(
+            t,
+            batch_size=batch_size,
+            device=device,
+            identifier="t",
         )
+        scheduler_timestep_next = None
+        if t_next is not None:
+            _, scheduler_timestep_next = self._normalize_forward_timesteps(
+                t_next,
+                batch_size=batch_size,
+                device=device,
+                identifier="t_next",
+            )
 
         # Determine boundary timestep
         if boundary_timestep is None and self.pipeline.config.boundary_ratio is not None:
             boundary_timestep = (
                 self.pipeline.config.boundary_ratio * self.scheduler.config.num_train_timesteps
             )
-        # Determine which transformer to use
-        if boundary_timestep is None or t >= boundary_timestep:
-            pipeline_transformer = self.pipeline.transformer
-            transformer = self.transformer
-            current_guidance_scale = guidance_scale
+        if boundary_timestep is None:
+            high_noise_indices = torch.arange(batch_size, device=device)
+            low_noise_indices = torch.empty(0, dtype=torch.long, device=device)
         else:
-            pipeline_transformer = self.pipeline.transformer_2
-            transformer = self.transformer_2
-            current_guidance_scale = (
-                guidance_scale_2 if guidance_scale_2 is not None else guidance_scale
-            )
+            high_noise_indices = torch.nonzero(
+                model_timesteps >= boundary_timestep,
+                as_tuple=False,
+            ).flatten()
+            low_noise_indices = torch.nonzero(
+                model_timesteps < boundary_timestep,
+                as_tuple=False,
+            ).flatten()
+        low_noise_guidance_scale = (
+            guidance_scale_2 if guidance_scale_2 is not None else guidance_scale
+        )
 
         # Auto-detect CFG
-        if current_guidance_scale > 1.0 and negative_prompt_embeds is None:
+        if max(guidance_scale, low_noise_guidance_scale) > 1.0 and negative_prompt_embeds is None:
             logger.warning(
                 "Passed `guidance_scale` > 1.0, but no `negative_prompt_embeds` provided. "
                 "Classifier-free guidance will be disabled."
             )
-        do_classifier_free_guidance = (
-            negative_prompt_embeds is not None and current_guidance_scale > 1.0
+
+        # 2-4. Wan2.2 may route different offline samples through different
+        # transformers. Execute homogeneous partitions and restore dataset order.
+        velocity_parts: List[torch.Tensor] = []
+        index_parts: List[torch.Tensor] = []
+        partitions = (
+            (
+                high_noise_indices,
+                self.pipeline.transformer,
+                self.transformer if high_noise_indices.numel() else None,
+                guidance_scale,
+                "transformer",
+            ),
+            (
+                low_noise_indices,
+                self.pipeline.transformer_2,
+                self.transformer_2 if low_noise_indices.numel() else None,
+                low_noise_guidance_scale,
+                "transformer_2",
+            ),
         )
-
-        # 2. Prepare timestep
-        mask = torch.ones(latents.shape, dtype=torch.float32, device=device)
-        latent_model_input = latents.to(dtype)
-
-        if self.pipeline.config.expand_timesteps:
-            temp_ts = (mask[0][0][:, ::2, ::2] * t).flatten()
-            timestep = temp_ts.unsqueeze(0).expand(batch_size, -1)
-        else:
-            timestep = t.expand(batch_size)
-
-        # 3. Transformer forward pass
-        with pipeline_transformer.cache_context("cond"):
-            velocity = transformer(
-                hidden_states=latent_model_input,
-                timestep=timestep,
-                encoder_hidden_states=prompt_embeds,
-                attention_kwargs=attention_kwargs,
-                return_dict=False,
-            )[0]
-
-        # 4. Apply CFG
-        if do_classifier_free_guidance:
-            with pipeline_transformer.cache_context("uncond"):
-                velocity_uncond = transformer(
+        for (
+            indices,
+            pipeline_transformer,
+            transformer,
+            current_guidance_scale,
+            component_name,
+        ) in partitions:
+            if indices.numel() == 0:
+                continue
+            if pipeline_transformer is None or transformer is None:
+                raise RuntimeError(f"Wan2 forward routed samples to unavailable {component_name}")
+            latent_model_input = latents.index_select(0, indices).to(pipeline_transformer.dtype)
+            partition_timesteps = model_timesteps.index_select(0, indices)
+            if self.pipeline.config.expand_timesteps:
+                spatial_mask = torch.ones_like(
+                    latent_model_input[:, 0, :, ::2, ::2],
+                    dtype=torch.float32,
+                )
+                transformer_timestep = (
+                    spatial_mask * partition_timesteps[:, None, None, None]
+                ).flatten(1)
+            else:
+                transformer_timestep = partition_timesteps
+            partition_prompt_embeds = prompt_embeds.index_select(0, indices)
+            with pipeline_transformer.cache_context("cond"):
+                partition_velocity = transformer(
                     hidden_states=latent_model_input,
-                    timestep=timestep,
-                    encoder_hidden_states=negative_prompt_embeds,
+                    timestep=transformer_timestep,
+                    encoder_hidden_states=partition_prompt_embeds,
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
                 )[0]
-            velocity = velocity_uncond + current_guidance_scale * (velocity - velocity_uncond)
+
+            do_classifier_free_guidance = (
+                negative_prompt_embeds is not None and current_guidance_scale > 1.0
+            )
+            if do_classifier_free_guidance:
+                partition_negative_prompt_embeds = negative_prompt_embeds.index_select(
+                    0,
+                    indices,
+                )
+                with pipeline_transformer.cache_context("uncond"):
+                    velocity_uncond = transformer(
+                        hidden_states=latent_model_input,
+                        timestep=transformer_timestep,
+                        encoder_hidden_states=partition_negative_prompt_embeds,
+                        attention_kwargs=attention_kwargs,
+                        return_dict=False,
+                    )[0]
+                partition_velocity = velocity_uncond + current_guidance_scale * (
+                    partition_velocity - velocity_uncond
+                )
+            index_parts.append(indices)
+            velocity_parts.append(partition_velocity)
+
+        velocity_dtypes = {part.dtype for part in velocity_parts}
+        if len(velocity_dtypes) != 1:
+            raise TypeError(
+                "Wan2 transformer partitions returned different velocity dtypes: "
+                f"{tuple(sorted(str(dtype) for dtype in velocity_dtypes))}"
+            )
+        partition_order = torch.cat(index_parts)
+        restore_order = torch.argsort(partition_order)
+        velocity = torch.cat(velocity_parts, dim=0).index_select(0, restore_order)
 
         # 5. Scheduler step
         output = self.scheduler.step(
             velocity=velocity,
-            timestep=t,
+            timestep=scheduler_timestep,
             latents=latents,
-            timestep_next=t_next,
+            timestep_next=scheduler_timestep_next,
             next_latents=next_latents,
             compute_log_prob=compute_log_prob,
             return_dict=True,
@@ -611,3 +1022,52 @@ class Wan2_T2V_Adapter(BaseAdapter):
         )
 
         return output
+
+    @staticmethod
+    def _normalize_forward_timesteps(
+        value: torch.Tensor,
+        *,
+        batch_size: int,
+        device: torch.device,
+        identifier: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return per-sample model times and scheduler-compatible original rank.
+
+        Args:
+            value: Shared scalar, singleton vector, or per-sample timestep vector.
+            batch_size: Latent batch size.
+            device: Latent device required by transformer and scheduler operations.
+            identifier: Argument name used in validation errors.
+
+        Returns:
+            A per-sample vector plus a scalar for shared input or the original
+            vector for independently sampled input.
+
+        Raises:
+            TypeError: If the timestep is not a tensor.
+            ValueError: If its rank, length, or device is incompatible.
+        """
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(
+                f"Wan2 forward expected {identifier} to be torch.Tensor, "
+                f"received {type(value).__name__}"
+            )
+        if value.device != device:
+            raise ValueError(
+                f"Wan2 forward expected {identifier} on {device}, received {value.device}"
+            )
+        if value.ndim == 0:
+            return value.expand(batch_size), value
+        if value.ndim != 1:
+            raise ValueError(
+                f"Wan2 forward expected {identifier} rank 0 or 1, "
+                f"received shape {tuple(value.shape)}"
+            )
+        if value.numel() == 1:
+            return value.expand(batch_size), value[0]
+        if value.numel() != batch_size:
+            raise ValueError(
+                f"Wan2 forward expected {identifier} length 1 or batch size {batch_size}, "
+                f"received {value.numel()}"
+            )
+        return value, value

@@ -55,7 +55,7 @@ import random
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -65,8 +65,15 @@ from accelerate import Accelerator
 from PIL import Image
 from tqdm import tqdm
 
+from ...contracts import (
+    BatchCapability,
+    GeometrySource,
+    InputMediaOrder,
+    MediaType,
+    NegativePromptPolicy,
+)
 from ...hparams import Arguments
-from ...samples import I2ISample, T2ISample
+from ...samples import I2ISample, LatentState, T2ISample
 from ...scheduler import (
     FlowMatchEulerDiscreteSDEScheduler,
     SDESchedulerOutput,
@@ -88,6 +95,14 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ..output_state import (
+    DecodedMediaBatch,
+    EncodedOutputState,
+    GeometrySignature,
+    MediaGeometrySignature,
+    OutputStateCodec,
+)
+from ..pipeline_contracts import image_output_contract
 from ..runtime import ComponentRuntime, PseudoPipelineRuntime
 
 # Bagel's LLM attention (qwen2_navit) hard-requires flash-attn's varlen kernel,
@@ -109,7 +124,7 @@ if not is_flash_attn_available(_FLASH_ATTN_MIN_VERSION):
         f"https://github.com/Dao-AILab/flash-attention/releases."
     )
 
-from .data.data_utils import add_special_tokens, pil_img2rgb
+from .data.data_utils import add_special_tokens, patchify, pil_img2rgb
 from .data.transforms import ImageTransform
 from .modeling.bagel import Bagel
 from .modeling.bagel.qwen2_navit import NaiveCache
@@ -163,6 +178,185 @@ class BagelI2ISample(I2ISample):
     image_shape: Optional[Tuple[int, int]] = None
 
 
+@dataclass(frozen=True, slots=True)
+class _BagelOutputStateCodec:
+    """Encode target images through Bagel's custom VAE and token layout."""
+
+    adapter: "BagelAdapter"
+    required_components: ClassVar[Tuple[str, ...]] = ("vae",)
+
+    def encode_output_state(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Mapping[str, Any],
+        generator: Optional[torch.Generator] = None,
+    ) -> EncodedOutputState:
+        """Apply Bagel's official image transform, VAE normalization, and patchify path."""
+        del condition, generator  # Bagel uses the posterior mean and consumes no RNG.
+
+        transformed_images = []
+        image_shapes = []
+        for sample_index, candidate in enumerate(media_batch):
+            if len(candidate) != 1:
+                raise ValueError(
+                    "Bagel output codec expected one image per sample, "
+                    f"received {len(candidate)} for sample {sample_index}"
+                )
+            image = candidate[0].payload
+            if not isinstance(image, Image.Image):
+                raise TypeError(
+                    "Bagel output codec expected decoded PIL.Image targets, "
+                    f"received {type(image).__name__} for sample {sample_index}"
+                )
+
+            # Reuse the exact transform supplied to the official Bagel training and
+            # image-prefill path: alpha-over-white RGB conversion, aspect-preserving
+            # stride resize, ToTensor, and [-1, 1] normalization.
+            transformed = self.adapter.vae_transform(pil_img2rgb(image))
+            if not isinstance(transformed, torch.Tensor):
+                raise TypeError(
+                    "Bagel vae_transform expected torch.Tensor output, "
+                    f"received {type(transformed).__name__} for sample {sample_index}"
+                )
+            if transformed.ndim != 3 or transformed.shape[0] != 3:
+                raise ValueError(
+                    "Bagel vae_transform expected CHW RGB output, "
+                    f"received shape {tuple(transformed.shape)} for sample {sample_index}"
+                )
+            if not transformed.is_floating_point():
+                raise TypeError(
+                    "Bagel vae_transform expected floating output, "
+                    f"received dtype {transformed.dtype} for sample {sample_index}"
+                )
+            height, width = transformed.shape[-2:]
+            if height <= 0 or width <= 0:
+                raise ValueError(
+                    "Bagel vae_transform produced non-positive target geometry "
+                    f"{(height, width)} for sample {sample_index}"
+                )
+            transformed_images.append(transformed)
+            image_shapes.append((height, width))
+
+        image_shape = image_shapes[0]
+        if any(shape != image_shape for shape in image_shapes[1:]):
+            raise ValueError(
+                "Bagel offline target batches require identical post-transform image "
+                f"geometry, received {tuple(image_shapes)}. Use batch size 1 or batch "
+                "targets by the geometry produced by Bagel's official vae_transform."
+            )
+
+        vae = self.adapter.vae
+        reg = getattr(vae, "reg", None)
+        if getattr(reg, "sample", None) is not False:
+            raise RuntimeError(
+                "Bagel offline target encoding requires vae.reg.sample=False so repeated "
+                "SFT/offline-DPO epochs use the deterministic posterior mean"
+            )
+        vae_dtype = self._module_dtype(vae)
+        pixel_values = torch.stack(transformed_images).to(
+            device=self.adapter.device,
+            dtype=vae_dtype,
+        )
+        latents = vae.encode(pixel_values)
+        if not isinstance(latents, torch.Tensor):
+            raise TypeError(
+                "Bagel custom VAE encode expected torch.Tensor output, "
+                f"received {type(latents).__name__}"
+            )
+        if latents.ndim != 4 or latents.shape[0] != len(media_batch):
+            raise ValueError(
+                "Bagel custom VAE encode expected BCHW output with unchanged batch size, "
+                f"received shape {tuple(latents.shape)}"
+            )
+
+        bagel = self.adapter.pipeline.bagel
+        patch_size = self._positive_int(bagel.latent_patch_size, "latent_patch_size")
+        latent_channels = self._positive_int(bagel.latent_channel, "latent_channel")
+        latent_downsample = self._positive_int(
+            bagel.latent_downsample,
+            "latent_downsample",
+        )
+        height, width = image_shape
+        if height % latent_downsample or width % latent_downsample:
+            raise ValueError(
+                "Bagel target geometry must be divisible by latent_downsample "
+                f"{latent_downsample}, received {(height, width)}"
+            )
+        if latents.shape[1] != latent_channels:
+            raise ValueError(
+                "Bagel custom VAE channel count disagrees with bagel.latent_channel: "
+                f"expected {latent_channels}, received shape {tuple(latents.shape)}"
+            )
+
+        latent_height = height // latent_downsample
+        latent_width = width // latent_downsample
+        required_height = latent_height * patch_size
+        required_width = latent_width * patch_size
+        if latents.shape[-2] < required_height or latents.shape[-1] < required_width:
+            raise ValueError(
+                "Bagel custom VAE output is too small for the official crop/patchify path: "
+                f"required at least {(required_height, required_width)}, received "
+                f"{tuple(latents.shape[-2:])}"
+            )
+
+        # Reuse Bagel's official patchify primitive after the same padded-latent
+        # crop used by forward_cache_update_vae and the model's training forward.
+        packed_latents = torch.stack(
+            [
+                patchify(latent[:, :required_height, :required_width], patch_size)
+                for latent in latents
+            ]
+        )
+
+        signature = GeometrySignature(
+            media=(
+                MediaGeometrySignature(
+                    type=MediaType.IMAGE,
+                    height=height,
+                    width=width,
+                ),
+            )
+        )
+        context = {"image_shape": image_shape}
+        return EncodedOutputState(
+            clean_state=LatentState({"latent": packed_latents}),
+            forward_context=context,
+            decode_context=context,
+            geometry_signatures=tuple(signature for _ in media_batch),
+        )
+
+    @staticmethod
+    def _module_dtype(module: nn.Module) -> torch.dtype:
+        """Resolve the floating dtype of Bagel's custom VAE or its wrapper."""
+        dtype = getattr(module, "dtype", None)
+        if not isinstance(dtype, torch.dtype):
+            try:
+                dtype = next(module.parameters()).dtype
+            except (AttributeError, StopIteration) as exc:
+                raise TypeError(
+                    "Bagel output codec could not resolve the custom VAE parameter dtype"
+                ) from exc
+        if not dtype.is_floating_point:
+            raise TypeError(
+                "Bagel output codec expected a floating custom VAE dtype, " f"received {dtype}"
+            )
+        return dtype
+
+    @staticmethod
+    def _positive_int(value: Any, name: str) -> int:
+        """Validate one Bagel latent-layout integer without coercion."""
+        if type(value) is not int:
+            raise TypeError(
+                f"Bagel output codec expected integer {name}, "
+                f"received {type(value).__name__}: {value!r}"
+            )
+        if value <= 0:
+            raise ValueError(
+                f"Bagel output codec expected positive integer {name}, received {value!r}"
+            )
+        return value
+
+
 # ============================================================================
 # BagelAdapter
 # ============================================================================
@@ -185,6 +379,14 @@ class BagelAdapter(BaseAdapter):
     # so ragged multi-reference batches serialize; they read back as PIL and are
     # re-normalized by ``_normalize_condition_images``.
     python_format_columns: ClassVar[frozenset[str]] = frozenset({"condition_images"})
+    pipeline_io_contract = image_output_contract(
+        negative_prompt=NegativePromptPolicy.UNSUPPORTED,
+        input_image_min_count=0,
+        input_image_max_count=None,
+        input_order=InputMediaOrder.WITHIN_TYPE,
+        geometry_source=GeometrySource.OUTPUT_MEDIA,
+        batch_capability=BatchCapability.UNIFORM,
+    )
 
     # Bagel is a mixture-of-transformer-experts model: the generation path uses
     # *_moe_gen experts while the understanding/ViT path is unused during RL
@@ -238,8 +440,8 @@ class BagelAdapter(BaseAdapter):
         # on every training forward() but only once during rollout. Stochastic sampling
         # (mean + std*randn) would then differ between the two and break the on-policy
         # ratio (== 1). Use the posterior mean so condition encoding is deterministic.
-        # vae.encode is only used for condition images here (generation uses init noise;
-        # vae.decode is unaffected), so this is safe.
+        # Generation still uses init noise, while condition images and offline targets
+        # both require a stable clean encoding; vae.decode is unaffected.
         pipeline.vae.reg.sample = False
         return pipeline
 
@@ -258,6 +460,107 @@ class BagelAdapter(BaseAdapter):
             },
             aliases={"transformer": pipeline.transformer},
         )
+
+    def build_output_state_codec(self) -> OutputStateCodec:
+        """Build Bagel's deterministic on-the-fly target-image encoder."""
+        return _BagelOutputStateCodec(self)
+
+    def _validate_encoded_output_geometry(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Mapping[str, Any],
+        encoded: EncodedOutputState,
+    ) -> None:
+        """Verify output-derived geometry against Bagel's official resize and token grid."""
+        del condition
+        expected_shapes = []
+        resize_transform = getattr(self.vae_transform, "resize_transform", None)
+        if not callable(resize_transform):
+            raise TypeError(
+                "Bagel output geometry validation requires vae_transform.resize_transform"
+            )
+        for sample_index, candidate in enumerate(media_batch):
+            image = candidate[0].payload
+            if not isinstance(image, Image.Image):
+                raise TypeError(
+                    "Bagel output geometry expected decoded PIL.Image targets, "
+                    f"received {type(image).__name__} for sample {sample_index}"
+                )
+            resized = resize_transform(pil_img2rgb(image))
+            if isinstance(resized, Image.Image):
+                width, height = resized.size
+            elif isinstance(resized, torch.Tensor) and resized.ndim >= 2:
+                height, width = resized.shape[-2:]
+            else:
+                raise TypeError(
+                    "Bagel resize_transform expected PIL.Image or Tensor output, "
+                    f"received {type(resized).__name__} for sample {sample_index}"
+                )
+            expected_shapes.append((height, width))
+
+        image_shape = expected_shapes[0]
+        if any(shape != image_shape for shape in expected_shapes[1:]):
+            raise ValueError(
+                "Bagel output geometry validation expected a uniform transformed batch, "
+                f"received {tuple(expected_shapes)}"
+            )
+        expected_signature = GeometrySignature(
+            media=(
+                MediaGeometrySignature(
+                    type=MediaType.IMAGE,
+                    height=image_shape[0],
+                    width=image_shape[1],
+                ),
+            )
+        )
+        if encoded.geometry_signatures != tuple(expected_signature for _ in media_batch):
+            raise ValueError(
+                "Bagel encoded output signatures must match output-media-derived geometry "
+                f"{image_shape}, received {encoded.geometry_signatures!r}"
+            )
+
+        expected_context = {"image_shape": image_shape}
+        if dict(encoded.forward_context) != expected_context:
+            raise ValueError(
+                "Bagel forward_context must contain only the output-derived image_shape "
+                f"{image_shape}, received {dict(encoded.forward_context)!r}"
+            )
+        if dict(encoded.decode_context) != expected_context:
+            raise ValueError(
+                "Bagel decode_context must contain only the output-derived image_shape "
+                f"{image_shape}, received {dict(encoded.decode_context)!r}"
+            )
+
+        bagel = self.pipeline.bagel
+        patch_size = _BagelOutputStateCodec._positive_int(
+            bagel.latent_patch_size,
+            "latent_patch_size",
+        )
+        latent_channels = _BagelOutputStateCodec._positive_int(
+            bagel.latent_channel,
+            "latent_channel",
+        )
+        latent_downsample = _BagelOutputStateCodec._positive_int(
+            bagel.latent_downsample,
+            "latent_downsample",
+        )
+        height, width = image_shape
+        if height % latent_downsample or width % latent_downsample:
+            raise ValueError(
+                "Bagel output-media geometry must be divisible by latent_downsample "
+                f"{latent_downsample}, received {image_shape}"
+            )
+        expected_latent_shape = (
+            len(media_batch),
+            (height // latent_downsample) * (width // latent_downsample),
+            patch_size * patch_size * latent_channels,
+        )
+        latents = encoded.clean_state.components["latent"]
+        if tuple(latents.shape) != expected_latent_shape:
+            raise ValueError(
+                "Bagel clean target state disagrees with the output-media token grid: "
+                f"expected {expected_latent_shape}, received {tuple(latents.shape)}"
+            )
 
     def load_scheduler(self) -> FlowMatchEulerDiscreteSDEScheduler:
         """

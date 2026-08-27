@@ -159,6 +159,7 @@ class _LifecycleAdapter(BaseAdapter):
         self._codec_to_build = codec
         self.codec_build_context: Optional[Tuple[bool, bool, bool]] = None
         self.geometry_validation: Optional[Tuple[Any, ...]] = None
+        self.decode_call: Optional[Tuple[Any, ...]] = None
         super().__init__(
             _config(latent_storage_dtype),
             SimpleNamespace(device=torch.device("cpu")),
@@ -203,7 +204,13 @@ class _LifecycleAdapter(BaseAdapter):
     def _mix_precision(self) -> None:
         pass
 
-    def decode_latents(self, latents: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+    def decode_latents(
+        self,
+        latents: torch.Tensor,
+        height: int,
+        output_type: str = "pil",
+    ) -> torch.Tensor:
+        self.decode_call = (latents, height, output_type)
         return latents
 
     def inference(self, **kwargs: Any) -> Any:
@@ -240,6 +247,38 @@ def test_contract_without_codec_preserves_online_adapter_construction() -> None:
         adapter.encode_output_state(_image_batch(1), {})
 
 
+def test_known_codec_blocker_is_actionable_at_direct_encode_boundary() -> None:
+    class KnownUnavailableAdapter(_OnlineOnlyAdapter):
+        output_state_codec_unavailable_reason = (
+            "Source conditioning pixels are not retained; extend the condition contract."
+        )
+
+    adapter = KnownUnavailableAdapter(None)
+
+    with pytest.raises(
+        NotImplementedError,
+        match=r"KnownUnavailableAdapter.*Source conditioning pixels.*extend",
+    ):
+        adapter.encode_output_state(_image_batch(1), {})
+
+
+@pytest.mark.parametrize("reason", ["", "   ", 3])
+def test_codec_blocker_reason_must_be_a_non_empty_string(reason: Any) -> None:
+    class InvalidReasonAdapter(_LifecycleAdapter):
+        output_state_codec_unavailable_reason = reason
+
+    with pytest.raises(TypeError, match=r"non-empty string or None"):
+        InvalidReasonAdapter(None)
+
+
+def test_codec_and_unavailable_reason_cannot_be_declared_together() -> None:
+    class StaleBlockerAdapter(_LifecycleAdapter):
+        output_state_codec_unavailable_reason = "Codec is not implemented."
+
+    with pytest.raises(ValueError, match=r"built an output-state codec.*stale blocker"):
+        StaleBlockerAdapter(_Codec())
+
+
 def test_online_only_adapter_fails_clearly_when_encoding_is_requested() -> None:
     adapter = _OnlineOnlyAdapter(None)
 
@@ -270,6 +309,12 @@ def test_public_output_state_wrapper_cannot_be_overridden() -> None:
 
         class InvalidAdapter(_LifecycleAdapter):
             def encode_output_state(self, *args: Any, **kwargs: Any) -> Any:
+                return None
+
+    with pytest.raises(TypeError, match=r"must not override BaseAdapter.decode_output_state"):
+
+        class InvalidDecodeAdapter(_LifecycleAdapter):
+            def decode_output_state(self, *args: Any, **kwargs: Any) -> Any:
                 return None
 
 
@@ -345,6 +390,43 @@ def test_encode_output_state_does_not_hide_attached_codec_tensor_during_cast() -
 
     with pytest.raises(ValueError, match=r"detached.*clean_state component 'latent'"):
         adapter.encode_output_state(_image_batch(1), {})
+
+
+def test_decode_output_state_routes_context_through_existing_decoder_signature() -> None:
+    adapter = _LifecycleAdapter(_Codec())
+    encoded = _encoded_image_batch(1)
+
+    decoded = adapter.decode_output_state(encoded, output_type="pt")
+
+    latent = encoded.clean_state.components["latent"]
+    assert decoded is latent
+    assert adapter.decode_call == (latent, 8, "pt")
+
+
+@pytest.mark.parametrize(
+    ("encoded", "output_type", "message"),
+    [
+        (object(), "pil", r"expected encoded output state"),
+        (_encoded_image_batch(1), 3, r"expected output_type to be str"),
+        (_encoded_image_batch(1), "latent", r"expected output_type in"),
+        (
+            _encoded_image_batch(1, component_name="video"),
+            "pil",
+            r"exactly one 'latent' component",
+        ),
+    ],
+)
+def test_decode_output_state_validates_shared_boundary_arguments(
+    encoded: Any,
+    output_type: Any,
+    message: str,
+) -> None:
+    adapter = _LifecycleAdapter(_Codec())
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        adapter.decode_output_state(encoded, output_type=output_type)
+
+    assert adapter.decode_call is None
 
 
 def test_default_geometry_hook_rejects_self_reported_codec_geometry() -> None:
