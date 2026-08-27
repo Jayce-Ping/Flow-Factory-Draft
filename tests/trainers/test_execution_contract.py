@@ -13,12 +13,27 @@
 # limitations under the License.
 
 from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
 from typing import Any, List, Optional, Tuple
 
 import pytest
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
 
+from flow_factory.contracts import (
+    BatchCapability,
+    GeometrySource,
+    InputMediaBinding,
+    InputMediaOrder,
+    InputMediaSpec,
+    MediaFormat,
+    MediaType,
+    NegativePromptPolicy,
+    OutputMediaSequence,
+    PipelineIOContract,
+    RateRequirement,
+)
+from flow_factory.trainers.abc import BaseTrainer
 from flow_factory.trainers.execution import (
     OFFLINE_EXECUTION_CONTRACT,
     ONLINE_EXECUTION_CONTRACT,
@@ -34,6 +49,26 @@ from flow_factory.trainers.execution import (
     build_execution_driver,
 )
 from flow_factory.trainers.registry import get_trainer_class
+
+_IMAGE_OUTPUT_CONTRACT = PipelineIOContract(
+    input_media=InputMediaSpec(
+        rules=(),
+        binding=InputMediaBinding.GROUPED_BY_TYPE,
+        order=InputMediaOrder.INSENSITIVE,
+    ),
+    negative_prompt=NegativePromptPolicy.OPTIONAL,
+    output_media=OutputMediaSequence(
+        items=(
+            MediaFormat(
+                type=MediaType.IMAGE,
+                fps=RateRequirement.NOT_APPLICABLE,
+                sample_rate=RateRequirement.NOT_APPLICABLE,
+            ),
+        )
+    ),
+    geometry_source=GeometrySource.CONFIGURED,
+    batch_capability=BatchCapability.UNIFORM,
+)
 
 
 class _OnlineHostFake:
@@ -112,6 +147,38 @@ def test_predefined_offline_contract_uses_distributed_epoch_execution() -> None:
         feedback=FeedbackMode.NONE,
         loader_kind=LoaderKind.DISTRIBUTED_EPOCH,
     )
+
+
+def test_offline_trainer_requires_adapter_pipeline_and_output_codec_before_initialization() -> None:
+    """Dataset acquisition fails before preprocessing when model output support is absent."""
+    trainer_class = get_trainer_class("sft")
+    trainer = object.__new__(trainer_class)
+    trainer.adapter = SimpleNamespace(pipeline_io_contract=None, output_state_codec=None)
+
+    with pytest.raises(TypeError, match="requires adapter.*PipelineIOContract"):
+        BaseTrainer._validate_adapter_execution_contract(trainer)
+
+    trainer.adapter = SimpleNamespace(
+        pipeline_io_contract=_IMAGE_OUTPUT_CONTRACT,
+        output_state_codec=None,
+    )
+    with pytest.raises(TypeError, match="requires adapter.*output-state codec"):
+        BaseTrainer._validate_adapter_execution_contract(trainer)
+
+    trainer.adapter = SimpleNamespace(
+        pipeline_io_contract=_IMAGE_OUTPUT_CONTRACT,
+        output_state_codec=object(),
+    )
+    BaseTrainer._validate_adapter_execution_contract(trainer)
+
+
+def test_online_trainer_does_not_require_offline_output_codec() -> None:
+    """Rollout acquisition remains compatible with existing online-only adapters."""
+    trainer_class = get_trainer_class("dpo")
+    trainer = object.__new__(trainer_class)
+    trainer.adapter = SimpleNamespace(pipeline_io_contract=None, output_state_codec=None)
+
+    BaseTrainer._validate_adapter_execution_contract(trainer)
 
 
 def test_feedback_mode_is_independent_from_rollout_acquisition() -> None:

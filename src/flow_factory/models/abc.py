@@ -71,7 +71,7 @@ from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.schedulers.scheduling_utils import SchedulerMixin
 from diffusers.utils.outputs import BaseOutput
 
-from ..contracts import PipelineIOContract
+from ..contracts import AcquisitionMode, PipelineIOContract
 from ..ema import EMAModuleWrapper
 from ..hparams import *
 from ..samples import (
@@ -346,13 +346,39 @@ class BaseAdapter(ABC):
     # ================================== Post Init =================================
     def post_init(self):
         """Hook for additional initialization after main trainer's `accelerator.prepare`."""
+        is_state_resume = bool(
+            self.model_args.resume_path and self.model_args.resume_type == "state"
+        )
+        trainer_runtime_state = getattr(self, "_trainer_runtime_state", None)
+        is_offline_execution = (
+            self.training_args.execution_contract.acquisition is AcquisitionMode.DATASET
+        )
+        if is_state_resume and is_offline_execution and trainer_runtime_state is None:
+            raise RuntimeError(
+                "offline state resume requires the BaseTrainer runtime checkpoint contract "
+                "before adapter.post_init"
+            )
+        if is_state_resume and trainer_runtime_state is None:
+            # Preserve the established online checkpoint lifecycle. Online
+            # algorithm-owned evolving snapshots need a separate all-or-nothing
+            # migration before they can join the offline runtime-state contract.
+            self.load_checkpoint(self.model_args.resume_path, resume_type="state")
+            self._init_ema()
+            self._init_ref_parameters()
+            return
+
+        # Offline state resume preflights EMA/reference payloads against realized
+        # wrappers before Accelerate mutates policy or optimizer state. Every
+        # checkpointed child is overwritten by the validated payload later in this
+        # method, so constructing it from the pre-resume policy is only a shape,
+        # dtype, device, and schedule contract.
+        self._init_ema()
+        self._init_ref_parameters()
         # Full training-state resume must happen here: accelerator.prepare() has now
         # registered the trainable modules and optimizer, so accelerator.load_state()
         # can actually restore model + optimizer + RNG (and any other prepared objects).
-        if self.model_args.resume_path and self.model_args.resume_type == "state":
+        if is_state_resume:
             self.load_checkpoint(self.model_args.resume_path, resume_type="state")
-        self._init_ema()
-        self._init_ref_parameters()
 
     # ============================== Latent Casting =================================
     @property
@@ -1101,6 +1127,53 @@ class BaseAdapter(ABC):
         return component_map
 
     # ============================== EMA Management ==============================
+    def runtime_state_child_names(self) -> Tuple[str, ...]:
+        """Declare checkpointed EMA/reference children before training-state load.
+
+        The trainer binds its safe JSON+safetensors runtime sidecar before
+        :meth:`post_init` invokes ``accelerator.load_state``. These names therefore
+        derive only from immutable configuration, not from wrappers that are
+        constructed afterwards.
+        """
+        child_names = []
+        if self.training_args.ema_decay > 0:
+            child_names.append("ema")
+        if self.training_args.requires_ref_model and self.model_args.finetune_type == "full":
+            child_names.append("reference")
+        return tuple(child_names)
+
+    def runtime_state_children(self) -> Dict[str, EMAModuleWrapper]:
+        """Return realized checkpoint children after :meth:`post_init`.
+
+        Returns:
+            Mapping in the same deterministic order as
+            :meth:`runtime_state_child_names`.
+
+        Raises:
+            RuntimeError: If configured declarations and realized wrappers differ.
+            TypeError: If a realized child does not implement the expected wrapper type.
+        """
+        children: Dict[str, EMAModuleWrapper] = {}
+        for name, attribute_name in (("ema", "ema_wrapper"), ("reference", "_ref_ema")):
+            child = getattr(self, attribute_name, None)
+            if child is None:
+                continue
+            if not isinstance(child, EMAModuleWrapper):
+                raise TypeError(
+                    f"expected adapter runtime child {name!r} to be EMAModuleWrapper, "
+                    f"received {type(child).__name__}: {child!r}"
+                )
+            children[name] = child
+
+        expected_names = self.runtime_state_child_names()
+        received_names = tuple(children)
+        if received_names != expected_names:
+            raise RuntimeError(
+                "adapter runtime checkpoint children mismatch after post_init: expected "
+                f"{expected_names!r}, received {received_names!r}"
+            )
+        return children
+
     def _ema_tracked_parameters(self) -> List[torch.nn.Parameter]:
         """Return live prepared parameters owned by the base trainable variant.
 
@@ -2616,6 +2689,24 @@ class BaseAdapter(ABC):
             if self.accelerator.is_main_process:
                 logger.info(f"Saving training state (resume-ready) to {save_directory}...")
 
+            runtime_checkpoint_save = getattr(
+                self,
+                "_trainer_runtime_checkpoint_save",
+                None,
+            )
+            if runtime_checkpoint_save is not None:
+                runtime_checkpoint_save(
+                    save_directory,
+                    safe_serialization=safe_serialization,
+                    **kwargs,
+                )
+                if self.accelerator.is_main_process:
+                    logger.info("Training state saved.")
+                return
+
+            runtime_preflight = getattr(self, "_trainer_runtime_save_preflight", None)
+            if runtime_preflight is not None:
+                runtime_preflight(save_directory)
             # Variant metadata must be written before accelerate mutates optimizer
             # state, or a resume cannot tell which optimizer group owns which variant.
             multirole_checkpoint_state = getattr(self, "_multirole_checkpoint_state", None)
@@ -2974,7 +3065,35 @@ class BaseAdapter(ABC):
         multirole_checkpoint_state = getattr(self, "_multirole_checkpoint_state", None)
         if multirole_checkpoint_state is not None:
             multirole_checkpoint_state.validate_load(path)
+        trainer_runtime_state = getattr(self, "_trainer_runtime_state", None)
+        if (
+            self.training_args.execution_contract.acquisition is AcquisitionMode.DATASET
+            and trainer_runtime_state is None
+        ):
+            raise RuntimeError(
+                "offline state resume requires the BaseTrainer runtime checkpoint contract "
+                "before accelerator.load_state"
+            )
+        if trainer_runtime_state is not None:
+            custom_objects = getattr(self.accelerator, "_custom_objects", None)
+            if not isinstance(custom_objects, list):
+                raise TypeError(
+                    "expected Accelerator._custom_objects to be a list before offline "
+                    f"state resume, received {type(custom_objects).__name__}: "
+                    f"{custom_objects!r}"
+                )
+            if custom_objects:
+                raise RuntimeError(
+                    "offline safe state resume requires no pickle-backed Accelerate custom "
+                    f"objects, received {tuple(type(obj).__name__ for obj in custom_objects)!r}"
+                )
+            trainer_runtime_state.validate_load(
+                path,
+                children=self.runtime_state_children(),
+            )
         self.accelerator.load_state(path)
+        if trainer_runtime_state is not None:
+            trainer_runtime_state.commit_validated_load()
 
         if self.accelerator.is_main_process:
             logger.info("Training state loaded successfully.")

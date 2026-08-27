@@ -13,8 +13,11 @@
 # limitations under the License.
 
 # src/flow_factory/trainers/abc.py
+import hashlib
 import json
+import math
 import os
+import uuid
 from abc import ABC
 from collections import defaultdict
 from contextlib import ExitStack, contextmanager
@@ -47,6 +50,7 @@ from diffusers.utils.outputs import BaseOutput
 
 from ..acceleration import BaseAccelerator, build_accelerator, validate_accelerator
 from ..advantage import AdvantageProcessor
+from ..contracts import PipelineIOContract
 from ..data_utils.dataset import METADATA_COLUMN
 from ..data_utils.loader import (
     get_eval_dataloaders,
@@ -76,6 +80,7 @@ from ..utils.base import (
 from ..utils.dist import gather_aligned_floating_tensors, reduce_loss_info
 from ..utils.logger_utils import setup_logger
 from ..utils.noise_schedule import TimeSampler
+from .common.runtime_state import TrainerRuntimeState
 from .common.sample_prefetch import iter_prefetched_batches
 from .execution import (
     ONLINE_EXECUTION_CONTRACT,
@@ -140,7 +145,14 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         )  # If `eval_reward_args` is not given, use `reward_args`
 
         self.adapter = adapter
-        self.progress = TrainingProgress()
+        self._validate_adapter_execution_contract()
+        is_offline_execution = type(self).execution_contract.acquisition is AcquisitionMode.DATASET
+        if is_offline_execution:
+            self._runtime_state = TrainerRuntimeState(
+                child_names=self.adapter.runtime_state_child_names()
+            )
+        else:
+            self.progress = TrainingProgress()
         self.execution_driver: ExecutionDriver = build_execution_driver(
             type(self).execution_contract
         )
@@ -148,8 +160,15 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
 
         self._initialization()
         self._initialize_snapshots()
+        if is_offline_execution:
+            self._runtime_state.configure_identity(self._runtime_checkpoint_identity())
+            self._register_runtime_checkpointing()
         self._register_multirole_checkpointing()
+        if is_offline_execution:
+            self._finalize_runtime_checkpointing()
         self.adapter.post_init()
+        if is_offline_execution:
+            self._attach_runtime_state_children()
         # Apply persistent stage='both' accelerators last: after prepare, state-resume,
         # EMA, and reference-parameter setup, so e.g. torch.compile wraps the final
         # weights and keeps state_dict keys / parameter identity stable.
@@ -172,17 +191,45 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         return self.log_args.verbose and self.accelerator.is_local_main_process
 
     @property
+    def progress(self) -> TrainingProgress:
+        """Return the single authoritative immutable training progress value.
+
+        Offline trainers delegate to ``TrainerRuntimeState`` so checkpoint save/load
+        and the execution loop cannot diverge. Online trainers and ``__new__``-based
+        lightweight fixtures retain one local value until their checkpoint lifecycle is
+        migrated as one complete unit.
+        """
+        runtime_state = self.__dict__.get("_runtime_state")
+        if runtime_state is not None:
+            return runtime_state.progress
+        progress = self.__dict__.get("_lightweight_progress")
+        if progress is None:
+            progress = TrainingProgress()
+            self.__dict__["_lightweight_progress"] = progress
+        return progress
+
+    @progress.setter
+    def progress(self, progress: TrainingProgress) -> None:
+        """Replace authoritative progress after strict type validation."""
+        if type(progress) is not TrainingProgress:
+            raise TypeError(
+                "expected progress to be TrainingProgress, "
+                f"received {type(progress).__name__}: {progress!r}"
+            )
+        runtime_state = self.__dict__.get("_runtime_state")
+        if runtime_state is not None:
+            runtime_state.progress = progress
+        else:
+            self.__dict__["_lightweight_progress"] = progress
+
+    @property
     def cycle_index(self) -> int:
         """Return the completed outer-cycle count for this trainer."""
         return self._get_progress().cycle_index(type(self).execution_contract.cycle_unit)
 
     def _get_progress(self) -> TrainingProgress:
         """Return initialized typed progress for normal and lightweight test trainers."""
-        progress = getattr(self, "progress", None)
-        if progress is None:
-            progress = TrainingProgress()
-            self.progress = progress
-        return progress
+        return self.progress
 
     @property
     def epoch(self) -> int:
@@ -238,6 +285,28 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         """Require trainer runtime and algorithm arguments to declare one execution mode."""
         type(self).validate_training_arguments_contract(self.training_args)
 
+    def _validate_adapter_execution_contract(self) -> None:
+        """Require offline execution to have a complete adapter-owned output seam.
+
+        This runs before dataloader preprocessing, distributed preparation, and
+        optimizer construction so an online-only adapter cannot begin an offline
+        run and fail only when its first target batch is encoded.
+        """
+        if type(self).execution_contract.acquisition is not AcquisitionMode.DATASET:
+            return
+        pipeline_contract = getattr(self.adapter, "pipeline_io_contract", None)
+        if not isinstance(pipeline_contract, PipelineIOContract):
+            raise TypeError(
+                f"offline trainer {type(self).__name__} requires adapter "
+                f"{type(self.adapter).__name__} to declare a PipelineIOContract, "
+                f"received {type(pipeline_contract).__name__}: {pipeline_contract!r}"
+            )
+        if getattr(self.adapter, "output_state_codec", None) is None:
+            raise TypeError(
+                f"offline trainer {type(self).__name__} requires adapter "
+                f"{type(self.adapter).__name__} to provide an output-state codec"
+            )
+
     @classmethod
     def validate_training_arguments_contract(cls, training_args: Any) -> None:
         """Validate one argument class before model or trainer initialization."""
@@ -263,6 +332,282 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
 
     def _initialize_snapshots(self) -> None:
         """Initialize optional trainer-owned parameter snapshots before state resume."""
+
+    def _runtime_checkpoint_identity(self) -> Dict[str, Any]:
+        """Describe the realized offline state layout with stable semantic hashes."""
+        parameter_schema, parameter_ids = self._runtime_parameter_schema()
+        optimizer_schema = self._runtime_optimizer_schema(parameter_ids)
+        model_name = str(getattr(self.model_args, "model_name_or_path", "unspecified"))
+        model_type = str(getattr(self.model_args, "model_type", type(self.adapter).__name__))
+        return {
+            "trainer": self._qualified_type_name(self),
+            "adapter": self._qualified_type_name(self.adapter),
+            "algorithm": str(self.training_args.trainer_type),
+            "model": f"{model_type}:{model_name}",
+            "finetune_type": str(self.model_args.finetune_type),
+            "optimizer_roles": tuple(self._required_trainable_roles()),
+            "parameter_schema_digest": self._runtime_schema_digest(parameter_schema),
+            "optimizer_schema_digest": self._runtime_schema_digest(optimizer_schema),
+            "world_size": self.accelerator.num_processes,
+        }
+
+    def _runtime_parameter_schema(self) -> Tuple[List[Dict[str, Any]], Dict[int, str]]:
+        """Return ordered canonical parameter descriptors and identity lookup."""
+        registry = getattr(self.adapter, "component_variant_registry", None)
+        schema: List[Dict[str, Any]] = []
+        parameter_ids: Dict[int, str] = {}
+        if isinstance(registry, ComponentVariantRegistry):
+            for variant_name in registry.variant_names:
+                for record in registry.parameter_records(variant_name):
+                    parameter_id = f"{variant_name}/{record.component_name}/{record.parameter_name}"
+                    if parameter_id in parameter_ids.values():
+                        raise ValueError(
+                            "runtime checkpoint parameter identifiers must be unique, "
+                            f"received duplicate {parameter_id!r}"
+                        )
+                    parameter = record.parameter
+                    parameter_ids[id(parameter)] = parameter_id
+                    schema.append(
+                        {
+                            "id": parameter_id,
+                            "shape": list(parameter.shape),
+                            "dtype": str(parameter.dtype),
+                        }
+                    )
+            return schema, parameter_ids
+
+        # Narrow adapters and integration fixtures may not expose the variant
+        # registry. They still receive a deterministic optimizer-positional schema,
+        # while production model adapters use canonical component parameter names.
+        for group_index, group in enumerate(self.optimizer.param_groups):
+            for parameter_index, parameter in enumerate(group["params"]):
+                parameter_id = f"optimizer_group_{group_index}/parameter_{parameter_index}"
+                if id(parameter) in parameter_ids:
+                    raise ValueError(
+                        "runtime checkpoint optimizer contains the same parameter more than "
+                        f"once: {parameter_id!r}"
+                    )
+                parameter_ids[id(parameter)] = parameter_id
+                schema.append(
+                    {
+                        "id": parameter_id,
+                        "shape": list(parameter.shape),
+                        "dtype": str(parameter.dtype),
+                    }
+                )
+        return schema, parameter_ids
+
+    def _runtime_optimizer_schema(self, parameter_ids: Dict[int, str]) -> Dict[str, Any]:
+        """Bind optimizer type, group configuration, and ordered parameter owners."""
+        optimizer = getattr(self.optimizer, "optimizer", self.optimizer)
+        groups = []
+        for group_index, group in enumerate(self.optimizer.param_groups):
+            group_parameter_ids = []
+            for parameter in group["params"]:
+                parameter_id = parameter_ids.get(id(parameter))
+                if parameter_id is None:
+                    raise ValueError(
+                        "runtime checkpoint optimizer group contains an unowned parameter at "
+                        f"group {group_index}"
+                    )
+                group_parameter_ids.append(parameter_id)
+            options = {
+                str(key): self._runtime_json_value(value, f"optimizer.group[{group_index}].{key}")
+                for key, value in group.items()
+                if key != "params"
+            }
+            groups.append({"parameters": group_parameter_ids, "options": options})
+        return {
+            "type": self._qualified_type_name(optimizer),
+            "groups": groups,
+        }
+
+    @classmethod
+    def _runtime_json_value(cls, value: Any, path: str) -> Any:
+        """Normalize optimizer options into a deterministic JSON-only tree."""
+        if value is None or type(value) in (bool, int, str):
+            return value
+        if type(value) is float:
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"runtime checkpoint identity value at {path} must be finite, "
+                    f"received {value!r}"
+                )
+            return value
+        if isinstance(value, torch.dtype):
+            return str(value)
+        if isinstance(value, (list, tuple)):
+            return [
+                cls._runtime_json_value(item, f"{path}[{index}]")
+                for index, item in enumerate(value)
+            ]
+        if isinstance(value, dict):
+            normalized = {}
+            for key, item in value.items():
+                if type(key) is not str:
+                    raise TypeError(
+                        f"runtime checkpoint identity key at {path} must be str, "
+                        f"received {type(key).__name__}: {key!r}"
+                    )
+                normalized[key] = cls._runtime_json_value(item, f"{path}.{key}")
+            return normalized
+        raise TypeError(
+            f"unsupported runtime checkpoint identity value at {path}: "
+            f"{type(value).__name__}: {value!r}"
+        )
+
+    @staticmethod
+    def _runtime_schema_digest(value: Any) -> str:
+        """Return a stable SHA-256 digest for one normalized schema."""
+        payload = json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _qualified_type_name(value: Any) -> str:
+        """Return a stable module-qualified runtime type name."""
+        value_type = type(value)
+        return f"{value_type.__module__}.{value_type.__qualname__}"
+
+    def _register_runtime_checkpointing(self) -> None:
+        """Reserve the safe offline state path without registering pickle objects."""
+        if getattr(self, "_runtime_checkpoint_registered", False):
+            raise RuntimeError(
+                f"cannot register trainer runtime checkpointing twice for {type(self).__name__}"
+            )
+
+        custom_objects = getattr(self.accelerator, "_custom_objects", None)
+        if not isinstance(custom_objects, list):
+            raise TypeError(
+                "expected Accelerator._custom_objects to be a list, received "
+                f"{type(custom_objects).__name__}: "
+                f"{custom_objects!r}"
+            )
+        if custom_objects:
+            raise RuntimeError(
+                "offline safe state checkpoints do not permit pre-registered Accelerate "
+                f"custom objects because Accelerate serializes them with pickle; received "
+                f"{tuple(type(obj).__name__ for obj in custom_objects)!r}"
+            )
+        self._runtime_checkpoint_registered = True
+
+    def _finalize_runtime_checkpointing(self) -> None:
+        """Require no pickle custom state after every trainer registration hook."""
+        self._validate_runtime_checkpoint_layout()
+        self.adapter._trainer_runtime_state = self._runtime_state
+        self.adapter._trainer_runtime_save_preflight = self._preflight_runtime_state_save
+        self.adapter._trainer_runtime_checkpoint_save = self._save_runtime_training_state_checkpoint
+        if self.model_args.resume_path and self.model_args.resume_type == "state":
+            self._validate_runtime_child_checkpoint_backend("resume training state")
+
+    def _preflight_runtime_state_save(self, output_dir: str) -> None:
+        """Reject an incompatible offline state save before creating a staging dir."""
+        del output_dir
+        self._validate_runtime_child_checkpoint_backend("save training state")
+        self._validate_runtime_checkpoint_layout()
+        self._runtime_state.state_dict()
+        if self.accelerator.project_configuration.save_on_each_node:
+            raise RuntimeError(
+                "offline safe state checkpoints currently require one shared filesystem; "
+                "Accelerator save_on_each_node is not supported. Use a model-only "
+                "checkpoint or shared checkpoint storage."
+            )
+
+    def _save_runtime_training_state_checkpoint(
+        self,
+        save_directory: str,
+        *,
+        safe_serialization: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        """Write a complete offline state into staging, then publish one directory."""
+        self._preflight_runtime_state_save(save_directory)
+        destination = os.path.abspath(os.fspath(save_directory))
+        parent = os.path.dirname(destination)
+        basename = os.path.basename(destination)
+
+        if os.path.exists(destination):
+            raise FileExistsError(
+                "offline state checkpoints are immutable and cannot overwrite "
+                f"existing path {destination!r}"
+            )
+        os.makedirs(parent, exist_ok=True)
+        generation = uuid.uuid4().hex
+        staging_directory = os.path.join(
+            parent,
+            f".{basename}.incomplete-{generation}",
+        )
+        os.makedirs(staging_directory, exist_ok=False)
+
+        self.accelerator.save_state(
+            staging_directory,
+            safe_serialization=safe_serialization,
+            **kwargs,
+        )
+        self._runtime_state.prepare_save(staging_directory)
+        os.replace(staging_directory, destination)
+
+    def _validate_runtime_child_checkpoint_backend(self, operation: str) -> None:
+        """Keep exact offline state resume on the fully atomic local backend."""
+        distributed_type = self.accelerator.distributed_type
+        if self.accelerator.num_processes == 1 and distributed_type is DistributedType.NO:
+            return
+        raise RuntimeError(
+            f"cannot {operation} for offline exact state under backend "
+            f"{distributed_type.value} with world_size={self.accelerator.num_processes}. "
+            "Safe runtime-state v1 is single-process only; distributed offline training "
+            "remains supported with model-only checkpoints."
+        )
+
+    def _validate_runtime_checkpoint_layout(self) -> None:
+        """Reject every pickle-backed Accelerate custom checkpoint object."""
+        custom_objects = getattr(self.accelerator, "_custom_objects", None)
+        if not isinstance(custom_objects, list):
+            raise TypeError(
+                "expected Accelerator._custom_objects to remain a list, "
+                f"received {type(custom_objects).__name__}: {custom_objects!r}"
+            )
+        if custom_objects:
+            raise RuntimeError(
+                "offline safe state checkpoints require Accelerator._custom_objects to remain "
+                "empty because Accelerate loads custom objects with pickle; received "
+                f"{tuple(type(obj).__name__ for obj in custom_objects)!r}"
+            )
+
+    def _attach_runtime_state_children(self) -> None:
+        """Attach realized EMA/reference wrappers and require complete restoration."""
+        child_names = self._runtime_state.child_names
+        is_state_resume = bool(
+            self.model_args.resume_path and self.model_args.resume_type == "state"
+        )
+        if is_state_resume:
+            if not self._runtime_state.load_received:
+                raise RuntimeError("state resume completed without restoring trainer runtime state")
+            if self._runtime_state.pending_child_names != child_names:
+                raise RuntimeError(
+                    "state resume must provide every declared EMA/reference payload before "
+                    f"attachment: expected {child_names!r}, received pending "
+                    f"{self._runtime_state.pending_child_names!r}"
+                )
+
+        children = self.adapter.runtime_state_children()
+        if tuple(children) != child_names:
+            raise RuntimeError(
+                "trainer and adapter runtime checkpoint children mismatch: expected "
+                f"{child_names!r}, received {tuple(children)!r}"
+            )
+        for name, child in children.items():
+            self._runtime_state.attach_child(name, child)
+        if self._runtime_state.pending_child_names:
+            raise RuntimeError(
+                "trainer initialization left unrestored runtime checkpoint children: "
+                f"{self._runtime_state.pending_child_names!r}"
+            )
 
     def should_continue_training(self) -> bool:
         """Continue unless the execution cycle reaches finite ``max_epochs``."""
@@ -1737,6 +2082,22 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         """
         if epoch is not None:
             save_directory = os.path.join(save_directory, f"checkpoint-{epoch}")
+
+        if (
+            not self.log_args.save_model_only
+            and self.model_args.resume_type == "state"
+            and self.model_args.resume_path
+            and os.path.isdir(self.model_args.resume_path)
+            and os.path.isdir(save_directory)
+            and os.path.samefile(self.model_args.resume_path, save_directory)
+        ):
+            logger.info(
+                "Skipping immutable state checkpoint %s: it is the checkpoint this "
+                "unadvanced execution cycle resumed from.",
+                save_directory,
+            )
+            self.accelerator.wait_for_everyone()
+            return
 
         self.adapter.save_checkpoint(
             save_directory=save_directory,
