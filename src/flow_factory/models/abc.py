@@ -70,6 +70,7 @@ from peft import LoraConfig, PeftModel, get_peft_model
 from PIL import Image
 from safetensors.torch import load_file, save_file
 
+from ..contracts import PipelineIOContract
 from ..ema import EMAModuleWrapper
 from ..hparams import *
 from ..hparams.gradient_checkpointing import GradientCheckpointingSpec
@@ -110,6 +111,14 @@ from .checkpointing import (
 )
 from .latent_geometry import LatentAxes, infer_latent_axes
 from .model_bundle import RoutedComponentProxy
+from .output_state import (
+    DecodedMediaBatch,
+    EncodedOutputState,
+    OutputStateCodec,
+    validate_codec_required_components,
+    validate_encoded_output_state,
+    validate_output_candidate_batch,
+)
 from .precision import (
     build_component_load_dtype_kwargs,
     cast_module_role_dtypes,
@@ -222,6 +231,11 @@ class BaseAdapter(ABC):
     preprocess_cache_fields: ClassVar[frozenset[str]] = frozenset()
     preprocess_cache_version: ClassVar[str] = ""
     trajectory_component_order: ClassVar[Tuple[str, ...]] = ("latent",)
+    pipeline_io_contract: ClassVar[Optional[PipelineIOContract]] = None
+    # A non-empty explanation means that this adapter is intentionally online-only
+    # for now. Offline trainer loading surfaces it before model weights are loaded,
+    # while online algorithms may continue to construct and use the adapter.
+    output_state_codec_unavailable_reason: ClassVar[Optional[str]] = None
     flow_velocity_direction: ClassVar[Literal["noise", "data"]] = "noise"
 
     # Resolution-invariant latent axis roles for the model-agnostic latent state
@@ -244,6 +258,8 @@ class BaseAdapter(ABC):
     # name. Overriding one would silently bypass that contract, so subclasses are
     # rejected at class creation instead of at training time.
     _BOUNDARY_OWNING_METHODS: ClassVar[Tuple[str, ...]] = (
+        "encode_output_state",
+        "decode_output_state",
         "forward_state",
         "reduce_component_latent_values",
         "reduce_latent_values",
@@ -253,11 +269,19 @@ class BaseAdapter(ABC):
         super().__init_subclass__(**kwargs)
         for name in BaseAdapter._BOUNDARY_OWNING_METHODS:
             if name in cls.__dict__:
+                if name == "encode_output_state":
+                    override_hint = (
+                        "Provide build_output_state_codec() and "
+                        "_validate_encoded_output_geometry() instead."
+                    )
+                elif name == "decode_output_state":
+                    override_hint = "Override the protected hook _decode_output_state instead."
+                else:
+                    override_hint = f"Override the protected hook _{name} instead."
                 raise TypeError(
                     f"adapter {cls.__name__} must not override BaseAdapter.{name}: it owns a "
                     f"shared contract that an override would bypass ({name} validates its "
-                    f"arguments and its result on behalf of every caller). Override the "
-                    f"protected hook _{name} instead."
+                    f"arguments and its result on behalf of every caller). {override_hint}"
                 )
 
     def __init__(self, config: Arguments, accelerator: Accelerator):
@@ -304,6 +328,13 @@ class BaseAdapter(ABC):
         self.model_args.target_components = self.component_runtime.resolve_component_names(
             self.model_args.target_components
         )
+
+        # Build target-media encoding only after load-dtype policy, component runtime,
+        # scheduler group, and target-name canonicalization are established. The codec
+        # declaration is immutable lifecycle metadata; it must not materialize, load,
+        # move, or mutate component dtypes.
+        self._output_state_codec = self._build_output_state_codec_declaration()
+        self._output_state_encoding_modules = self._validate_output_state_codec_lifecycle()
 
         # Cache target module mapping
         self.target_module_map = self._init_target_module_map()
@@ -414,6 +445,308 @@ class BaseAdapter(ABC):
         if all(components[name] is latents for name, latents in state.components.items()):
             return state
         return LatentState(components, active_masks=state.active_masks)
+
+    # ============================ Output-State Encoding ============================
+    def _build_output_state_codec_declaration(self) -> Optional[OutputStateCodec]:
+        """Build codec metadata without changing component materialization or overrides."""
+        materialized_before = tuple(self.component_runtime.materialized_component_names)
+        overrides_before = tuple(self.component_runtime.override_components)
+        codec = self.build_output_state_codec()
+        materialized_after = tuple(self.component_runtime.materialized_component_names)
+        overrides_after = tuple(self.component_runtime.override_components)
+        if materialized_after != materialized_before or overrides_after != overrides_before:
+            raise RuntimeError(
+                f"adapter {type(self).__name__}.build_output_state_codec() must be "
+                "declaration-only and cannot materialize or replace components: "
+                f"materialized_before={materialized_before}, "
+                f"materialized_after={materialized_after}, "
+                f"overrides_before={overrides_before}, overrides_after={overrides_after}"
+            )
+        return codec
+
+    @property
+    def output_state_codec(self) -> Optional[OutputStateCodec]:
+        """Return the immutable codec selected during adapter construction.
+
+        Returns:
+            Adapter-owned output codec, or ``None`` for online-only adapters.
+        """
+        return self._output_state_codec
+
+    @property
+    def output_state_encoding_modules(self) -> Tuple[str, ...]:
+        """Return validated component names required for target-media encoding.
+
+        The caller owns component device staging. Keeping this declaration separate
+        from :meth:`encode_output_state` prevents a per-batch encode from implicitly
+        moving or offloading modules behind the trainer's back.
+
+        Returns:
+            Ordered runtime component names required for target encoding.
+        """
+        return self._output_state_encoding_modules
+
+    def build_output_state_codec(self) -> Optional[OutputStateCodec]:
+        """Build the adapter-owned target-media codec, if offline training is supported.
+
+        The component runtime, canonical scheduler, and scheduler group are available
+        before this hook runs. This hook declares lifecycle metadata only: it must not
+        materialize, load, move, replace, or mutate the dtype of any model component.
+        Online-only adapters retain the default ``None``.
+
+        Returns:
+            Adapter-owned output codec, or ``None`` when offline output is unsupported.
+        """
+        return None
+
+    @classmethod
+    def _validated_output_state_codec_unavailable_reason(cls) -> Optional[str]:
+        """Return a normalized offline-codec blocker declared by the adapter."""
+        reason = cls.output_state_codec_unavailable_reason
+        if reason is None:
+            return None
+        if not isinstance(reason, str) or not reason.strip():
+            raise TypeError(
+                f"adapter {cls.__name__}.output_state_codec_unavailable_reason must be "
+                f"a non-empty string or None, received {type(reason).__name__}: {reason!r}"
+            )
+        return reason.strip()
+
+    @classmethod
+    def validate_offline_output_capability(cls) -> None:
+        """Fail before model loading unless this adapter can encode offline targets.
+
+        A concrete codec still validates its realized components during adapter
+        construction. This class-level check covers declarations that can be proven
+        without downloading weights or allocating accelerator memory.
+
+        Returns:
+            None after successful static capability validation.
+
+        Raises:
+            NotImplementedError: If the adapter declares an actionable offline blocker.
+            TypeError: If the contract, codec builder, or geometry hook is missing.
+        """
+        reason = cls._validated_output_state_codec_unavailable_reason()
+        if reason is not None:
+            raise NotImplementedError(
+                f"offline output-state encoding is unavailable for adapter "
+                f"{cls.__name__}: {reason}"
+            )
+        contract = cls.pipeline_io_contract
+        if not isinstance(contract, PipelineIOContract):
+            raise TypeError(
+                f"offline training requires adapter {cls.__name__} to declare a "
+                f"PipelineIOContract, received {type(contract).__name__}: {contract!r}"
+            )
+        if cls.build_output_state_codec is BaseAdapter.build_output_state_codec:
+            raise TypeError(
+                f"offline training requires adapter {cls.__name__} to provide an "
+                "output-state codec through build_output_state_codec()"
+            )
+        if cls._validate_encoded_output_geometry is BaseAdapter._validate_encoded_output_geometry:
+            raise TypeError(
+                f"offline training requires adapter {cls.__name__} to override "
+                "_validate_encoded_output_geometry()"
+            )
+
+    def _validate_output_state_codec_lifecycle(self) -> Tuple[str, ...]:
+        """Validate the adapter's pipeline contract and codec declaration."""
+        unavailable_reason = type(self)._validated_output_state_codec_unavailable_reason()
+        contract = self.pipeline_io_contract
+        if contract is not None and not isinstance(contract, PipelineIOContract):
+            raise TypeError(
+                f"adapter {type(self).__name__} expected pipeline_io_contract to be "
+                f"PipelineIOContract or None, received {type(contract).__name__}: {contract!r}"
+            )
+
+        codec = self.output_state_codec
+        if codec is None:
+            return ()
+        if unavailable_reason is not None:
+            raise ValueError(
+                f"adapter {type(self).__name__} built an output-state codec while declaring "
+                "output_state_codec_unavailable_reason; remove the stale blocker declaration"
+            )
+        if contract is None:
+            raise ValueError(
+                f"adapter {type(self).__name__} built an output-state codec without declaring "
+                "pipeline_io_contract"
+            )
+        return validate_codec_required_components(
+            codec,
+            tuple(self.component_runtime.declared_component_names),
+        )
+
+    def encode_output_state(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Mapping[str, Any],
+        generator: Optional[torch.Generator] = None,
+    ) -> EncodedOutputState:
+        """Encode decoded targets through the adapter-owned validated boundary.
+
+        Args:
+            media_batch: Exact output-media sequence for every batch sample.
+            condition: Model-input condition for the same batch.
+            generator: Optional deterministic generator used by stochastic encoders.
+
+        Returns:
+            Detached clean output state using the adapter's latent-storage policy.
+
+        Raises:
+            NotImplementedError: If the adapter declares a known codec blocker.
+            RuntimeError: If the adapter does not expose the complete offline codec seam.
+            TypeError: If condition or generator has the wrong boundary type.
+        """
+        unavailable_reason = type(self)._validated_output_state_codec_unavailable_reason()
+        if unavailable_reason is not None:
+            raise NotImplementedError(
+                f"offline output-state encoding is unavailable for adapter "
+                f"{type(self).__name__}: {unavailable_reason}"
+            )
+        contract = self.pipeline_io_contract
+        if contract is None:
+            raise RuntimeError(
+                f"adapter {type(self).__name__} cannot encode output state because it does not "
+                "declare pipeline_io_contract"
+            )
+        codec = self.output_state_codec
+        if codec is None:
+            raise RuntimeError(
+                f"adapter {type(self).__name__} declares pipeline_io_contract but does not "
+                "provide an output-state codec through build_output_state_codec()"
+            )
+        if not isinstance(condition, Mapping):
+            raise TypeError(
+                "expected output-state condition to be Mapping[str, Any], "
+                f"received {type(condition).__name__}: {condition!r}"
+            )
+        if generator is not None and not isinstance(generator, torch.Generator):
+            raise TypeError(
+                "expected output-state generator to be torch.Generator or None, "
+                f"received {type(generator).__name__}: {generator!r}"
+            )
+
+        validated_media = validate_output_candidate_batch(media_batch, contract)
+        with torch.no_grad():
+            encoded = codec.encode_output_state(
+                validated_media,
+                condition,
+                generator,
+            )
+
+        encoded = validate_encoded_output_state(
+            encoded,
+            contract=contract,
+            expected_component_order=self.trajectory_component_order,
+            expected_batch_size=len(validated_media),
+            device=self.device,
+        )
+
+        # Offline targets are trajectory states too. Apply the same storage boundary
+        # as online rollout after first proving that the codec returned detached state;
+        # casting before validation could accidentally hide an attached source tensor.
+        clean_state = self.cast_latent_state(encoded.clean_state)
+        if clean_state is not encoded.clean_state:
+            encoded = EncodedOutputState(
+                clean_state=clean_state,
+                forward_context=encoded.forward_context,
+                decode_context=encoded.decode_context,
+                geometry_signatures=encoded.geometry_signatures,
+            )
+            encoded = validate_encoded_output_state(
+                encoded,
+                contract=contract,
+                expected_component_order=self.trajectory_component_order,
+                expected_batch_size=len(validated_media),
+                device=self.device,
+            )
+
+        self._validate_encoded_output_geometry(validated_media, condition, encoded)
+        return encoded
+
+    def decode_output_state(
+        self,
+        encoded: EncodedOutputState,
+        *,
+        output_type: Literal["pil", "pt", "np"] = "pil",
+    ) -> Any:
+        """Decode one encoded offline state through the adapter's existing decoder.
+
+        ``decode_context`` may contain geometry retained only for validation as well as
+        kwargs required by a particular decoder. This wrapper forwards only names accepted
+        by ``decode_latents`` and supplies the requested output type when that decoder exposes
+        the standard ``output_type`` argument.
+
+        Args:
+            encoded: Validated single-component output state produced by this adapter.
+            output_type: Existing decoder output representation.
+
+        Returns:
+            Model-specific decoded image or video batch.
+
+        Raises:
+            TypeError: If ``encoded`` or ``output_type`` has the wrong boundary type.
+            ValueError: If the state cannot be represented by the legacy single-latent decoder.
+        """
+        if not isinstance(encoded, EncodedOutputState):
+            raise TypeError(
+                "expected encoded output state to be EncodedOutputState, "
+                f"received {type(encoded).__name__}: {encoded!r}"
+            )
+        if type(output_type) is not str:
+            raise TypeError(
+                "expected output_type to be str, "
+                f"received {type(output_type).__name__}: {output_type!r}"
+            )
+        if output_type not in ("pil", "pt", "np"):
+            raise ValueError(
+                "expected output_type in ('pil', 'pt', 'np'), " f"received {output_type!r}"
+            )
+        return self._decode_output_state(encoded, output_type=output_type)
+
+    def _decode_output_state(
+        self,
+        encoded: EncodedOutputState,
+        *,
+        output_type: Literal["pil", "pt", "np"],
+    ) -> Any:
+        """Route the default single-component state through ``decode_latents``."""
+        if encoded.clean_state.component_names != ("latent",):
+            raise ValueError(
+                "default _decode_output_state requires exactly one 'latent' component; "
+                "multi-component adapters must override the protected hook, received "
+                f"{encoded.clean_state.component_names}"
+            )
+        decode_kwargs = filter_kwargs(
+            self.decode_latents,
+            **dict(encoded.decode_context),
+            output_type=output_type,
+        )
+        return self.decode_latents(
+            encoded.clean_state.components["latent"],
+            **decode_kwargs,
+        )
+
+    def _validate_encoded_output_geometry(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Mapping[str, Any],
+        encoded: EncodedOutputState,
+    ) -> None:
+        """Validate codec geometry against adapter-owned input/configuration facts.
+
+        Generic validation can prove that signatures are internally coherent, but it
+        cannot prove that self-reported dimensions agree with configured geometry or
+        input-media-derived constraints. Every adapter that supplies a codec must own
+        that model-specific comparison explicitly.
+        """
+        raise NotImplementedError(
+            f"adapter {type(self).__name__} provides an output-state codec but must override "
+            "_validate_encoded_output_geometry() to validate geometry signatures against "
+            f"geometry_source={self.pipeline_io_contract.geometry_source.value!r}"
+        )
 
     # ============================== Loading Components ==============================
     @abstractmethod
