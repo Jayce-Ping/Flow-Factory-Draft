@@ -229,9 +229,16 @@ class BagelAdapter(BaseAdapter):
 
     def load_pipeline(self) -> BagelPseudoPipeline:
         """Load the Bagel model and VAE into a pseudo-pipeline."""
+        component_dtypes = self._resolve_component_load_dtype_mapping(
+            component_names=["bagel", "transformer", "vae"],
+            transformer_names=["transformer"],
+            text_encoder_names=[],
+        )
         pipeline = BagelPseudoPipeline.from_pretrained(
             self._model_path,
             low_cpu_mem_usage=False,
+            component_dtypes=component_dtypes,
+            pad_token_id=self._tokenizer.pad_token_id,
             **self.model_args.extra_kwargs,
         )
         # Train-inference consistency (I2I): the condition-image VAE encode is rebuilt
@@ -257,6 +264,7 @@ class BagelAdapter(BaseAdapter):
                 "vae": pipeline.vae,
             },
             aliases={"transformer": pipeline.transformer},
+            alias_routes={"transformer": ("bagel", ("language_model",))},
         )
 
     def load_scheduler(self) -> FlowMatchEulerDiscreteSDEScheduler:

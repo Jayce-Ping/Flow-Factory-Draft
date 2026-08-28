@@ -103,6 +103,12 @@ from ..utils.video import MultiVideoBatch
 from . import trajectory_bridge as bridge
 from .latent_geometry import LatentAxes, infer_latent_axes
 from .model_bundle import RoutedComponentProxy
+from .precision import (
+    build_component_load_dtype_kwargs,
+    cast_module_role_dtypes,
+    component_dtype_mapping,
+    parameter_dtype_inventory,
+)
 from .runtime import ClassicPipelineRuntime, ComponentRuntime
 from .variants import DEFAULT_BASE_VARIANT, ComponentVariantRegistry, ComponentVariantSpec
 
@@ -169,6 +175,7 @@ class BaseAdapter(ABC):
     """
 
     _DTYPE_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+    component_load_dtype_defaults: ClassVar[Any] = None
 
     lora_keys: List[str] = [
         "lora_A",
@@ -201,6 +208,7 @@ class BaseAdapter(ABC):
     # Opt in only when every transformer forward branch runs inside a diffusers
     # ``cache_context``. The rollout cache accelerator rejects the default.
     supports_diffusers_cache: ClassVar[bool] = False
+    supports_fsdp2_cpu_efficient_loading: ClassVar[bool] = False
     supports_ordered_references: ClassVar[bool] = False
     preprocess_cache_fields: ClassVar[frozenset[str]] = frozenset()
     preprocess_cache_version: ClassVar[str] = ""
@@ -252,6 +260,12 @@ class BaseAdapter(ABC):
         self.eval_args = config.eval_args
         self._mode: str = "train"  # ['train', 'eval', 'rollout']
         self._named_parameters: Dict[str, NamedParametersInfo] = {}
+        self._component_load_dtype_manifest = self.component_load_dtype_defaults
+        self._component_load_dtype_overrides = getattr(
+            self.model_args,
+            "component_load_dtypes",
+            None,
+        )
 
         # Build the component runtime while preserving the public pipeline alias.
         self.component_runtime = self.build_component_runtime()
@@ -397,6 +411,96 @@ class BaseAdapter(ABC):
             Classic runtime wrapping the subclass's existing ``load_pipeline`` result.
         """
         return ClassicPipelineRuntime(self.load_pipeline())
+
+    def _load_diffusers_pipeline(
+        self,
+        pipeline_class: type,
+        pretrained_model_name_or_path: str,
+        **kwargs: Any,
+    ) -> DiffusionPipeline:
+        """Load an eager Diffusers pipeline with the resolved component dtype policy."""
+        manifest_policy = self._component_load_dtype_manifest
+        user_policy = self._component_load_dtype_overrides
+
+        if isinstance(user_policy, torch.dtype) or (
+            user_policy is None and isinstance(manifest_policy, torch.dtype)
+        ):
+            kwargs.update(
+                {
+                    key: value
+                    for key, value in build_component_load_dtype_kwargs(
+                        user_policy=user_policy,
+                        manifest_policy=manifest_policy,
+                        component_names=(),
+                        transformer_names=(),
+                        text_encoder_names=(),
+                    ).items()
+                    if key not in kwargs
+                }
+            )
+        elif isinstance(user_policy, Mapping) or isinstance(manifest_policy, Mapping):
+            load_config = getattr(pipeline_class, "load_config", None)
+            if not callable(load_config):
+                raise TypeError(
+                    f"adapter {type(self).__name__} expected {pipeline_class.__name__}.load_config "
+                    "to resolve component_load_dtypes mapping"
+                )
+            config_keys = {
+                "cache_dir",
+                "force_download",
+                "proxies",
+                "token",
+                "local_files_only",
+                "revision",
+            }
+            config_kwargs = {key: value for key, value in kwargs.items() if key in config_keys}
+            pipeline_config = load_config(pretrained_model_name_or_path, **config_kwargs)
+            component_names = [
+                name
+                for name, value in pipeline_config.items()
+                if isinstance(value, (list, tuple)) and len(value) >= 2
+            ]
+            load_dtype_kwargs = build_component_load_dtype_kwargs(
+                user_policy=user_policy,
+                manifest_policy=manifest_policy,
+                component_names=component_names,
+                transformer_names=[
+                    name for name in component_names if "transformer" in name
+                ],
+                text_encoder_names=[
+                    name for name in component_names if "text_encoder" in name
+                ],
+                preserve_unselected=True,
+            )
+            kwargs.update(
+                {
+                    key: value
+                    for key, value in load_dtype_kwargs.items()
+                    if key not in kwargs
+                }
+            )
+
+        return pipeline_class.from_pretrained(pretrained_model_name_or_path, **kwargs)
+
+    def _resolve_component_load_dtype_mapping(
+        self,
+        *,
+        component_names: Sequence[str],
+        transformer_names: Sequence[str],
+        text_encoder_names: Sequence[str],
+    ) -> Dict[str, torch.dtype]:
+        """Resolve adapter defaults and user overrides for explicit loader components."""
+        return component_dtype_mapping(
+            user_policy=getattr(self, "_component_load_dtype_overrides", None),
+            manifest_policy=getattr(
+                self,
+                "_component_load_dtype_manifest",
+                getattr(self, "component_load_dtype_defaults", None),
+            ),
+            component_names=component_names,
+            transformer_names=transformer_names,
+            text_encoder_names=text_encoder_names,
+        )
 
     def load_scheduler(self) -> SDESchedulerMixin:
         """Load and return the scheduler."""
@@ -1363,28 +1467,59 @@ class BaseAdapter(ABC):
     # ============================== Precision Management ==============================
     def _cast_module_mixed_precision(
         self,
+        name: str,
         component: torch.nn.Module,
         train_dtype: torch.dtype,
         frozen_dtype: Optional[torch.dtype],
+        *,
+        force_uniform_dtype: Optional[torch.dtype] = None,
     ) -> int:
         """
         Set floating-point parameters/buffers without a trainable round-trip through frozen_dtype.
 
         Trainable parameters use ``train_dtype``. Frozen parameters and floating-point buffers use
         ``frozen_dtype`` when it is set, or are left at their loaded dtype when ``frozen_dtype`` is
-        ``None`` (preserve). Integer/bool buffers are left unchanged (same as ``Module.to``).
+        ``None`` (no post-load mutation). Integer/bool buffers are left unchanged.
         """
-        n_trainable = 0
-        for _, param in component.named_parameters():
-            if param.requires_grad:
-                param.data = param.data.to(dtype=train_dtype)
-                n_trainable += 1
-            elif frozen_dtype is not None:
-                param.data = param.data.to(dtype=frozen_dtype)
-        for _, buf in component.named_buffers():
-            if buf.is_floating_point() and frozen_dtype is not None:
-                buf.data = buf.data.to(dtype=frozen_dtype)
-        return n_trainable
+        result = cast_module_role_dtypes(
+            component,
+            component_name=name,
+            trainable_dtype=train_dtype,
+            frozen_dtype=frozen_dtype,
+            force_uniform_dtype=force_uniform_dtype,
+            is_adapter_parameter=lambda parameter_name: any(
+                key in parameter_name for key in self.lora_keys
+            ),
+        )
+        if result.protected:
+            logger.info(
+                "Preserved %d model-protected FP32 parameter/buffer entries in component %r",
+                result.protected,
+                name,
+            )
+        return result.trainable
+
+    def _log_component_precision_inventory(
+        self,
+        name: str,
+        component: torch.nn.Module,
+        *,
+        stage: str,
+    ) -> None:
+        """Log effective trainable/frozen parameter storage after dtype policy."""
+        if not self.accelerator.is_main_process:
+            return
+        inventory = parameter_dtype_inventory(component)
+        rendered = {
+            role: {str(dtype): count for dtype, count in sorted(values.items(), key=str)}
+            for role, values in inventory.items()
+        }
+        logger.info(
+            "Precision inventory stage=%s component=%s %s",
+            stage,
+            name,
+            rendered,
+        )
 
     def _apply_component_precision_policy(
         self,
@@ -1396,11 +1531,29 @@ class BaseAdapter(ABC):
         frozen_dtype = self._frozen_dtype_for_component(name)
         if name in self.model_args.target_components:
             if self._is_fsdp2() and self.accelerator.mixed_precision != "no":
-                component.to(dtype=torch.float32)
+                self._cast_module_mixed_precision(
+                    name,
+                    component,
+                    train_dtype,
+                    frozen_dtype,
+                    force_uniform_dtype=torch.float32,
+                )
             else:
-                self._cast_module_mixed_precision(component, train_dtype, frozen_dtype)
+                self._cast_module_mixed_precision(
+                    name,
+                    component,
+                    train_dtype,
+                    frozen_dtype,
+                )
         elif frozen_dtype is not None:
-            component.to(dtype=frozen_dtype)
+            self._cast_module_mixed_precision(
+                name,
+                component,
+                train_dtype,
+                frozen_dtype,
+                force_uniform_dtype=frozen_dtype,
+            )
+        self._log_component_precision_inventory(name, component, stage="materialize")
 
     def _resolved_frozen_component_dtype_policy(
         self,
@@ -1408,8 +1561,8 @@ class BaseAdapter(ABC):
         """Resolve scalar or selector-based frozen dtype configuration.
 
         Concrete component selectors override the two supported component groups,
-        and groups override ``default``. A null value means preserve the loaded
-        checkpoint dtype for that component.
+        and groups override ``default``. A null value means no post-load dtype
+        mutation for that component.
         """
         cached = getattr(self, "_frozen_component_dtype_policy_cache", None)
         if cached is not None:
@@ -1461,8 +1614,8 @@ class BaseAdapter(ABC):
 
         Frozen-dtype policy: a scalar ``frozen_parameters_dtype`` applies to every
         component. A mapping resolves concrete component, component-group, then
-        ``default`` values in descending priority. A null resolved value preserves
-        the component's checkpoint dtype.
+        ``default`` values in descending priority. A null resolved value performs
+        no post-load dtype mutation.
 
         FSDP2 caveat: FSDP2 shards each unit with ONE original dtype, and accelerate upcasts the
         trainable params to an fp32 master when ``mixed_precision != 'no'``. So a trained component
@@ -1483,11 +1636,23 @@ class BaseAdapter(ABC):
         if self._is_fsdp2() and self.accelerator.mixed_precision != "no":
             for name in merged_names:
                 if name in target_set:
-                    self.get_component(name).to(dtype=torch.float32)
+                    self._cast_module_mixed_precision(
+                        name,
+                        self.get_component(name),
+                        train_dtype,
+                        self._frozen_dtype_for_component(name),
+                        force_uniform_dtype=torch.float32,
+                    )
                 else:
                     frozen_dtype = self._frozen_dtype_for_component(name)
                     if frozen_dtype is not None:
-                        self.get_component(name).to(dtype=frozen_dtype)
+                        self._cast_module_mixed_precision(
+                            name,
+                            self.get_component(name),
+                            train_dtype,
+                            frozen_dtype,
+                            force_uniform_dtype=frozen_dtype,
+                        )
                 # else: preserve the untrained component's loaded dtype
             frozen_policy = {
                 name: self._frozen_dtype_for_component(name)
@@ -1495,9 +1660,19 @@ class BaseAdapter(ABC):
                 if name not in target_set
             }
             logger.info(
-                "FSDP2: trained components -> fp32 (uniform orig dtype); "
-                f"frozen component policy -> {frozen_policy}"
+                "FSDP2 precision: configured trainable storage=%s, "
+                "effective original/master=torch.float32, compute=%s; "
+                "frozen component policy -> %s",
+                train_dtype,
+                self.accelerator.mixed_precision,
+                frozen_policy,
             )
+            for name in merged_names:
+                self._log_component_precision_inventory(
+                    name,
+                    self.get_component(name),
+                    stage="initialize",
+                )
             return
 
         # Split: trainable -> train_dtype; frozen -> frozen_dtype, or preserved when None.
@@ -1509,16 +1684,31 @@ class BaseAdapter(ABC):
             frozen_policy[name] = frozen_dtype
             if name in target_set:
                 trainable_count += self._cast_module_mixed_precision(
-                    component, train_dtype, frozen_dtype
+                    name,
+                    component,
+                    train_dtype,
+                    frozen_dtype,
                 )
             elif frozen_dtype is not None:
-                component.to(dtype=frozen_dtype)
+                self._cast_module_mixed_precision(
+                    name,
+                    component,
+                    train_dtype,
+                    frozen_dtype,
+                    force_uniform_dtype=frozen_dtype,
+                )
             # else: preserve the fully-frozen component's loaded dtype
 
         if trainable_count > 0:
             logger.info(
                 f"Set {trainable_count} trainable parameters to {train_dtype}; "
                 f"frozen component policy -> {frozen_policy}"
+            )
+        for name in merged_names:
+            self._log_component_precision_inventory(
+                name,
+                self.get_component(name),
+                stage="initialize",
             )
 
     # ============================== LoRA Management ==============================
@@ -1635,18 +1825,6 @@ class BaseAdapter(ABC):
     def _is_fsdp2(self) -> bool:
         """Check if FSDP2 is enabled."""
         return getattr(self.accelerator, "is_fsdp2", False)
-
-    def uses_fsdp_cpu_efficient_loading(self) -> bool:
-        """Return whether FSDP defers weight materialization to rank zero.
-
-        Public because the trainer must know it: under this mode only rank zero
-        holds real weights before ``prepare``, so frozen-component broadcasts and
-        preprocessing loads are ordered around it.
-        """
-        if not self._is_fsdp():
-            return False
-        fsdp_plugin = self.accelerator.state.fsdp_plugin
-        return fsdp_plugin is not None and getattr(fsdp_plugin, "cpu_ram_efficient_loading", False)
 
     # ------------------------------ Shard Strategies ---------------------------------
     def _is_zero3(self) -> bool:
@@ -2898,43 +3076,16 @@ class BaseAdapter(ABC):
                     logger.info(f"Merged LoRA adapter into base model for {comp_name}")
 
     # ============================== Freezing Components ==============================
-    def _freeze_text_encoders(self):
-        """Freeze every text encoder declared by the component runtime."""
-        for encoder in self.text_encoders:
-            if encoder is None:
-                continue
-            encoder.requires_grad_(False)
-            encoder.eval()
-
-    def _freeze_vae(self):
-        """Freeze declared video and audio VAEs when materialized."""
-        if self.has_component("vae"):
-            vae = self.get_component("vae")
-            if vae is not None:
-                vae.requires_grad_(False)
-                vae.eval()
-
-        if self.has_component("audio_vae"):
-            audio_vae = self.get_component("audio_vae")
-            if audio_vae is not None:
-                audio_vae.requires_grad_(False)
-                audio_vae.eval()
-
-    def _freeze_transformers(self):
-        """Freeze transformer components (e.g., UNet, ControlNets)."""
-        for name in self.transformer_names:
-            comp = self.get_component(name)
-            if comp is None:
-                continue
-            comp.requires_grad_(False)
-            comp.eval()
-
     def _freeze_components(self):
-        """Freeze strategy using cached target_module_map."""
-        # Freeze everything first
-        self._freeze_text_encoders()
-        self._freeze_vae()
-        self._freeze_transformers()
+        """Freeze each materialized physical root, then reopen logical targets."""
+        seen_roots = set()
+        for root_name in self.component_runtime.materialized_component_names:
+            component = self.component_runtime.get_canonical_component(root_name)
+            if not isinstance(component, nn.Module) or id(component) in seen_roots:
+                continue
+            seen_roots.add(id(component))
+            component.requires_grad_(False)
+            component.eval()
 
         # Selectively unfreeze target components
         for comp_name in self.model_args.target_components:
@@ -3084,6 +3235,9 @@ class BaseAdapter(ABC):
             if name in materialized_after and name not in materialized_before:
                 component = self.component_runtime.get_canonical_component(name)
                 if isinstance(component, torch.nn.Module):
+                    if name not in self.model_args.target_components:
+                        component.requires_grad_(False)
+                        component.eval()
                     self._apply_component_precision_policy(name, component)
         self.component_runtime.load_stage_components(components, device=device or self.device)
 

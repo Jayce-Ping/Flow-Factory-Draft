@@ -60,6 +60,11 @@ class ComponentRuntime(ABC):
         """Return all declared component/spec and alias names."""
         return sorted(self.declared_components)
 
+    def physical_route(self, name: str) -> tuple[str, tuple[str, ...]]:
+        """Return the physical ownership root and root-relative logical path."""
+        self._validate_declared_names([name])
+        return name, ()
+
     @property
     def materialized_component_names(self) -> List[str]:
         """Return materialized canonical module names, excluding aliases."""

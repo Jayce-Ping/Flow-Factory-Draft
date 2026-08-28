@@ -8,7 +8,8 @@
 
 | Component | Runtime dtype | Why |
 |-----------|--------------|-----|
-| Frozen params/buffers (frozen transformer base, VAE, text encoders) | `frozen_parameters_dtype` — default `None` **preserves each component's `from_pretrained` dtype** (no downcast) | Released checkpoints ship components in different dtypes (e.g. Z-Image: transformer fp32, text encoder bf16); set an explicit dtype to force one / save memory |
+| Pretrained component load | `component_load_dtypes` over adapter defaults | Lets the native loader enforce model rules such as Diffusers FP32 islands |
+| Frozen params/buffers (frozen transformer base, VAE, text encoders) | `frozen_parameters_dtype`; default `None` performs no post-load mutation | Released components may use different dtypes; use an explicit override only when the model permits it |
 | Transformer (trainable) | `trainable_parameters_dtype` (fp32/bf16) | Gradient precision |
 | Scheduler math | `float32` always | `1/sigma` amplification (see below) |
 | Latent storage (trajectory) | `latent_storage_dtype` (configurable) | Memory vs. precision tradeoff |
@@ -17,10 +18,13 @@
 
 Boundaries are set in `BaseAdapter._mix_precision()` (`models/abc.py`) and `BaseTrainer.__init__` (autocast context). Autocast weight-cache invariant + in-place ref/EMA/named swaps: `topics/autocast_param_swap.md` (#20a).
 
-`frozen_parameters_dtype` accepts either one dtype or a selector mapping. Resolution order is
+`component_load_dtypes` and `frozen_parameters_dtype` accept either one dtype or a selector mapping. Resolution order is
 concrete component, component group (`transformers` / `text_encoders`), then `default`. A null
-result preserves the checkpoint dtype. Under FSDP2 mixed precision, trained components keep
-uniform fp32 original parameters while the resolved policy still applies to fully frozen
+load result delegates to the native loader, while a null frozen result performs no post-load
+mutation. `transformer` names one concrete component; `transformers` selects every transformer
+declared by the pipeline. To disable an adapter's load manifest, set
+`component_load_dtypes: {default: null}`. Under FSDP2 mixed precision, trained components keep
+uniform fp32 original parameters while the resolved frozen policy still applies to fully frozen
 components.
 
 ## `cast_latents()` Contract

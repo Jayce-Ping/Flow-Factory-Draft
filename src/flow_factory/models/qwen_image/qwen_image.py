@@ -90,7 +90,8 @@ class QwenImageAdapter(BaseAdapter):
         self._warned_no_cfg = False
 
     def load_pipeline(self) -> QwenImagePipeline:
-        return QwenImagePipeline.from_pretrained(
+        return self._load_diffusers_pipeline(
+            QwenImagePipeline,
             self.model_args.model_name_or_path, low_cpu_mem_usage=False
         )
 

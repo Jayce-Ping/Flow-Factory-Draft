@@ -95,7 +95,7 @@ def load_h3_workflow_pipeline(
 def build_h3_component_runtime(adapter: Any) -> ModularPipelineRuntime:
     """Wrap one pruned pipeline and materialize only its training transformer."""
     validate_h3_target_components(adapter)
-    runtime = ModularPipelineRuntime(adapter.load_pipeline())
+    runtime = ModularPipelineRuntime.from_adapter(adapter, adapter.load_pipeline())
     runtime.materialize_components([adapter.transformer_component_name])
     return runtime
 
@@ -145,17 +145,6 @@ def validate_h3_target_components(adapter: Any) -> None:
             f"MiniMax H3 workflow={adapter.workflow!r} expected target_components "
             f"{expected_targets!r}, received {received_targets!r}"
         )
-
-
-def freeze_h3_setup_components(adapter: Any) -> None:
-    """Freeze or unfreeze only the explicitly materialized training transformer."""
-    target_name = adapter.transformer_component_name
-    trainable_modules = adapter.target_module_map[target_name]
-    if adapter.model_args.finetune_type == "lora":
-        trainable_modules = None
-    adapter._freeze_component(target_name, trainable_modules=trainable_modules)
-    if trainable_modules:
-        adapter.get_component(target_name).train()
 
 
 def map_h3_training_component_times(

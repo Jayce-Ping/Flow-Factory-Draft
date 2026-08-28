@@ -23,8 +23,9 @@ Supports both single reward and multi-reward loading with automatic deduplicatio
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Callable, ContextManager, Dict, List, Literal, Optional, Tuple
 
 from accelerate import Accelerator
 
@@ -119,6 +120,7 @@ class MultiRewardLoader:
         training_dataset_names: Optional[List[str]] = None,
         eval_reward_args: Optional[MultiRewardArguments] = None,
         eval_dataset_names: Optional[List[str]] = None,
+        load_context: Optional[Callable[[], ContextManager[None]]] = None,
     ):
         """
         Initialize the MultiRewardLoader.
@@ -137,12 +139,15 @@ class MultiRewardLoader:
             eval_dataset_names: Names of eval datasets for per-eval-dataset
                 reward routing. When provided, builds per-dataset mappings
                 using the ``datasets`` field in each eval reward config.
+            load_context: Backend-owned context entered around each unique
+                reward model construction.
         """
         self.reward_args = reward_args
         self.eval_reward_args = eval_reward_args
         self.accelerator = accelerator
         self._training_dataset_names = training_dataset_names or []
         self._eval_dataset_names = eval_dataset_names or []
+        self._load_context = load_context or nullcontext
 
         # Internal state
         self._cache: Dict[tuple, RewardModelHandle] = {}
@@ -205,7 +210,8 @@ class MultiRewardLoader:
                 # logger.info(f"Reusing '{handle.config.name}' for '{config.name}' ({source})")
             else:
                 # Load new model
-                model = load_reward_model(config, self.accelerator)
+                with self._load_context():
+                    model = load_reward_model(config, self.accelerator)
                 handle = RewardModelHandle(
                     model=model, config=config, names=[f"{config.name}({source})"]
                 )

@@ -69,7 +69,8 @@ class Flux1Adapter(BaseAdapter):
         self.scheduler: FlowMatchEulerDiscreteSDEScheduler
 
     def load_pipeline(self) -> FluxPipeline:
-        return FluxPipeline.from_pretrained(
+        return self._load_diffusers_pipeline(
+            FluxPipeline,
             self.model_args.model_name_or_path, low_cpu_mem_usage=False
         )
 

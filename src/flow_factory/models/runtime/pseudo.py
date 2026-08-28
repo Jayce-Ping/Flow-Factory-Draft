@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import torch.nn as nn
 
@@ -34,6 +34,7 @@ class PseudoPipelineRuntime(ComponentRuntime):
         pipeline: Any,
         components: Mapping[str, Any],
         aliases: Optional[Mapping[str, Any]] = None,
+        alias_routes: Optional[Mapping[str, tuple[str, Sequence[str]]]] = None,
     ) -> None:
         """Initialize an explicit pseudo-pipeline runtime.
 
@@ -41,6 +42,7 @@ class PseudoPipelineRuntime(ComponentRuntime):
             pipeline: Compatibility pipeline/container.
             components: Canonical modules managed by stage lifecycle.
             aliases: Addressable module aliases excluded from stage lifecycle.
+            alias_routes: Alias ownership as ``alias -> (physical root, path)``.
 
         Raises:
             TypeError: If a component or alias is not a ``torch.nn.Module``.
@@ -66,6 +68,21 @@ class PseudoPipelineRuntime(ComponentRuntime):
             )
         self._canonical_components: Dict[str, Any] = dict(components)
         self._alias_components: Dict[str, Any] = dict(aliases)
+        alias_routes = alias_routes or {}
+        self._alias_routes: Dict[str, tuple[str, tuple[str, ...]]] = {}
+        for alias_name, route in alias_routes.items():
+            if alias_name not in self._alias_components:
+                raise ValueError(
+                    f"Pseudo-pipeline alias route {alias_name!r} has no matching alias; "
+                    f"expected one of {sorted(self._alias_components)}"
+                )
+            root, path = route
+            if root not in self._canonical_components:
+                raise ValueError(
+                    f"Pseudo-pipeline alias {alias_name!r} references unknown root={root!r}; "
+                    f"expected one of {sorted(self._canonical_components)}"
+                )
+            self._alias_routes[alias_name] = (root, tuple(path))
 
     @property
     def canonical_components(self) -> Mapping[str, Any]:
@@ -76,6 +93,11 @@ class PseudoPipelineRuntime(ComponentRuntime):
     def alias_components(self) -> Mapping[str, Any]:
         """Return explicit addressable aliases excluded from device lifecycle."""
         return self._alias_components
+
+    def physical_route(self, name: str) -> tuple[str, tuple[str, ...]]:
+        if name in self._alias_routes:
+            return self._alias_routes[name]
+        return super().physical_route(name)
 
     def _get_materialized_component(self, name: str) -> Any:
         if name in self._alias_components:

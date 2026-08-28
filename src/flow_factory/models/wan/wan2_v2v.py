@@ -79,6 +79,11 @@ class Wan2_V2V_Adapter(BaseAdapter):
     # timestep (boundary_ratio), so under DDP the other's trainable params get no
     # gradient in a given step. Ignored under DeepSpeed/FSDP.
     ddp_find_unused_parameters = True
+    component_load_dtype_defaults = {
+        "transformers": torch.bfloat16,
+        "text_encoders": torch.bfloat16,
+        "vae": torch.float32,
+    }
 
     def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
@@ -87,7 +92,8 @@ class Wan2_V2V_Adapter(BaseAdapter):
         self.scheduler: UniPCMultistepSDEScheduler
 
     def load_pipeline(self) -> WanVideoToVideoPipeline:
-        return WanVideoToVideoPipeline.from_pretrained(
+        return self._load_diffusers_pipeline(
+            WanVideoToVideoPipeline,
             self.model_args.model_name_or_path,
         )
 

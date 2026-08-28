@@ -18,6 +18,52 @@ import torch
 from flow_factory.hparams import ModelArguments
 
 
+def test_component_load_dtype_policy_normalizes_selectors() -> None:
+    arguments = ModelArguments(
+        component_load_dtypes={
+            "transformers": "bf16",
+            "vae": "fp32",
+            "audio_vae": None,
+        }
+    )
+
+    assert arguments.component_load_dtypes == {
+        "transformers": torch.bfloat16,
+        "vae": torch.float32,
+        "audio_vae": None,
+    }
+    assert arguments.to_dict()["component_load_dtypes"] == {
+        "transformers": "bfloat16",
+        "vae": "float32",
+        "audio_vae": None,
+    }
+
+
+def test_component_load_dtype_scalar_is_supported() -> None:
+    arguments = ModelArguments(component_load_dtypes="fp16")
+
+    assert arguments.component_load_dtypes is torch.float16
+    assert arguments.to_dict()["component_load_dtypes"] == "float16"
+
+
+def test_component_load_dtype_explicit_default_null_is_preserved() -> None:
+    arguments = ModelArguments(component_load_dtypes={"default": None})
+
+    assert arguments.component_load_dtypes == {"default": None}
+    assert arguments.to_dict()["component_load_dtypes"] == {"default": None}
+
+
+@pytest.mark.parametrize("invalid", (1, ["bf16"]))
+def test_component_load_dtype_rejects_non_dtype_non_mapping_values(invalid) -> None:
+    with pytest.raises(TypeError, match=r"component_load_dtypes.*dtype, mapping, or None"):
+        ModelArguments(component_load_dtypes=invalid)
+
+
+def test_component_load_dtype_rejects_unknown_dtype_name() -> None:
+    with pytest.raises(ValueError, match=r"component_load_dtypes.*known dtype.*int8"):
+        ModelArguments(component_load_dtypes="int8")
+
+
 def test_scalar_frozen_dtype_remains_a_backward_compatible_global_policy() -> None:
     arguments = ModelArguments(frozen_parameters_dtype="bf16")
 

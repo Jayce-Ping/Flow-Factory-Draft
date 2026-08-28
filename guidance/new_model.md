@@ -836,6 +836,16 @@ Choose the runtime explicitly in `build_component_runtime()`:
   pipeline.
 
 Component membership uses canonical lookup through declared specs, not `hasattr`.
+When a logical target is a submodule alias of a larger physical root, declare
+`alias_routes` explicitly, for example
+`{"transformer": ("bagel", ("language_model",))}`. The load planner then freezes,
+moves, and validates the physical root exactly once while training through the
+logical route.
+
+Adapters should leave `supports_fsdp2_cpu_efficient_loading = False` unless their
+component source can selectively materialize TARGET state without applying the
+rank-zero/meta policy to text encoders, VAEs, or reward models. Modular adapters
+that satisfy this contract may opt in.
 Keep declared specs distinct from materialized modules; use
 `materialize_components(None)` only when the workflow genuinely needs every
 declaration. A prepared/replacement override must be installed through the runtime so

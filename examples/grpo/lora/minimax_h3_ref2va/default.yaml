@@ -30,6 +30,7 @@ model:
   target_modules: "default"
   model_name_or_path: "MiniMaxAI/MiniMax-H3"
   model_type: "minimax-h3-ref2va"
+  component_load_dtypes: "bf16"  # Official recipe; Diffusers preserves FP32 islands.
   resume_path: null
   resume_type: null
 

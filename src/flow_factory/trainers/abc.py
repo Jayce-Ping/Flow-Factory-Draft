@@ -35,7 +35,6 @@ from typing import (
 
 import numpy as np
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from accelerate import Accelerator
 from accelerate.utils import DistributedType, ProjectConfiguration, set_seed
@@ -53,6 +52,7 @@ from ..data_utils.loader import (
 )
 from ..hparams import *
 from ..hparams.optimizer_args import OptimizerArguments
+from ..loading import ComponentRole, ModelLoadCoordinator
 from ..logger import LogFormatter, load_logger
 from ..models.abc import BaseAdapter
 from ..models.model_bundle import ModelBundle, RoutedComponentProxy
@@ -63,7 +63,6 @@ from ..rewards import (
     MultiRewardLoader,
     RewardBuffer,
     RewardProcessor,
-    load_reward_model,
 )
 from ..samples import BaseSample, LatentState, NoisedState, StackedSampleBatch
 from ..utils.base import (
@@ -126,6 +125,7 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         )  # If `eval_reward_args` is not given, use `reward_args`
 
         self.adapter = adapter
+        self.load_coordinator = ModelLoadCoordinator(adapter, accelerator)
         self.epoch = 0
         self.step = 0
 
@@ -236,13 +236,13 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
             else []
         )
 
-        # Initialize all reward model instances
         self.reward_loader = MultiRewardLoader(
             reward_args=self.config.reward_args,
             accelerator=self.accelerator,
             training_dataset_names=training_dataset_names,
             eval_reward_args=self.config.eval_reward_args,
             eval_dataset_names=eval_dataset_names,
+            load_context=lambda: self.load_coordinator.load_scope(ComponentRole.REWARD),
         ).load()
         # Get training & eval reward models
         self.reward_models = self.reward_loader.get_training_reward_models()
@@ -317,11 +317,10 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         Returns:
             Tuple of (train_dataloader, eval_dataloaders_by_name).
         """
-        self.adapter.on_load_components(
-            components=self.adapter.preprocessing_modules, device=self.accelerator.device
+        self.load_coordinator.load_components(
+            self.adapter.preprocessing_modules,
+            device=self.accelerator.device,
         )
-        if self.adapter.uses_fsdp_cpu_efficient_loading():
-            self._synchronize_frozen_components(self.adapter.preprocessing_modules)
 
         dataloader, train_dataloaders_by_source = get_train_dataloader(
             config=self.config,
@@ -602,12 +601,10 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         resolved = [m for m in resolved if m not in prepared_names]
 
         if resolved:
-            self.adapter.on_load_components(
-                components=resolved,
+            self.load_coordinator.load_components(
+                resolved,
                 device=self.accelerator.device,
             )
-            if self.adapter.uses_fsdp_cpu_efficient_loading():
-                self._synchronize_frozen_components(resolved)
 
     def _validate_paradigm_dynamics(self) -> None:
         """Reject a scheduler whose dynamics the declared paradigm cannot use.
@@ -667,12 +664,7 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
             self.accelerator, self.training_args.per_device_batch_size
         )
 
-        # Fix for FSDP, synchronize frozen components like text encoder & VAE.
-        # Otherwise they may be uninitialized on Rank > 0.
-        if self.adapter.uses_fsdp_cpu_efficient_loading():
-            logger.info("FSDP CPU Efficient Loading detected. Synchronizing frozen components...")
-            # self.adapter.on_load(self.accelerator.device)
-            self._synchronize_frozen_components()
+        self.load_coordinator.bootstrap_targets()
 
         # Init dataloader, then materialize every live component variant before
         # optimizer and distributed bundle construction.
@@ -702,7 +694,11 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         # One prepare call -> one DDP/FSDP/DeepSpeed root for the whole bundle.
         # (Parameter dtypes -- incl. the FSDP2 uniform-fp32 requirement for sharded trained
         # components -- are already handled in the adapter's `_mix_precision`.)
-        prepared = self.accelerator.prepare(model_bundle, self.optimizer, *eval_dataloader_list)
+        prepared = self.load_coordinator.prepare(
+            model_bundle,
+            self.optimizer,
+            *eval_dataloader_list,
+        )
         self.model_bundle = prepared[0]
         self.optimizer = prepared[1]
         inner_bundle = self.accelerator.unwrap_model(self.model_bundle)
@@ -821,30 +817,6 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
             for accelerator in self.rollout_accelerators:
                 stack.enter_context(accelerator.rollout_context(self.adapter))
             yield
-
-    def _synchronize_frozen_components(
-        self,
-        components: Optional[Union[str, List[str]]] = None,
-    ):
-        if self.accelerator.num_processes <= 1:
-            return
-
-        # Synchronize all non-prepared components
-        all_names = self.adapter._resolve_component_names(components)
-        for name in all_names:
-            if self.adapter._should_manage_device(name):
-                comp = self.adapter.get_component(name)
-                if isinstance(comp, nn.Module):
-                    for param in comp.parameters():
-                        param.data = param.data.to(self.accelerator.device)
-                        dist.broadcast(param.data, src=0)
-                    for buffer in comp.buffers():
-                        buffer.data = buffer.data.to(self.accelerator.device)
-                        dist.broadcast(buffer.data, src=0)
-
-        # Barrier to ensure everyone is done
-        self.accelerator.wait_for_everyone()
-        logger.info(f"[Rank {self.accelerator.process_index}] Frozen components synchronized.")
 
     @staticmethod
     def _patch_deepspeed_autocast(accelerator):

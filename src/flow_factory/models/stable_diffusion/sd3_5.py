@@ -69,7 +69,8 @@ class SD3_5Adapter(BaseAdapter):
         self.scheduler: FlowMatchEulerDiscreteSDEScheduler
 
     def load_pipeline(self) -> StableDiffusion3Pipeline:
-        return StableDiffusion3Pipeline.from_pretrained(
+        return self._load_diffusers_pipeline(
+            StableDiffusion3Pipeline,
             self.model_args.model_name_or_path,
             low_cpu_mem_usage=False,
         )

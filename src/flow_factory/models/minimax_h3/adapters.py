@@ -36,7 +36,6 @@ from .workflow import (
     build_h3_scheduler_group,
     decode_h3_adapter_latents,
     forward_h3_adapter,
-    freeze_h3_setup_components,
     infer_h3_workflow,
     init_h3_target_module_map,
     load_h3_workflow_pipeline,
@@ -59,6 +58,10 @@ class _MiniMaxH3WorkflowAdapter:
     flow_velocity_direction: ClassVar[Literal["data"]] = "data"
     preprocess_cache_fields: ClassVar[frozenset[str]] = _H3_PREPROCESS_CACHE_FIELDS
     preprocess_cache_version: ClassVar[str] = _H3_PREPROCESS_CACHE_VERSION
+    supports_fsdp2_cpu_efficient_loading: ClassVar[bool] = True
+    # Official Diffusers recipe: load at BF16 and let each ModelMixin preserve
+    # its declared FP32 islands (including both H3 autoencoders).
+    component_load_dtype_defaults: ClassVar[torch.dtype] = torch.bfloat16
 
     def load_pipeline(self) -> Any:
         """Load this modular workflow from a local directory or Hugging Face repo."""
@@ -81,9 +84,6 @@ class _MiniMaxH3WorkflowAdapter:
 
     def _init_target_module_map(self) -> Dict[str, Union[List[str], None]]:
         return init_h3_target_module_map(self)
-
-    def _freeze_components(self) -> None:
-        freeze_h3_setup_components(self)
 
     def preprocess_func(self, **kwargs: Any) -> Dict[str, Any]:
         return preprocess_h3_workflow(self, **kwargs)

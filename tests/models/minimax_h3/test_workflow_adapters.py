@@ -116,6 +116,7 @@ class WorkflowPipelineFake:
         for name in self.config_specs:
             setattr(self, name, SimpleNamespace())
         self.load_calls: List[List[str]] = []
+        self.load_kwargs: List[Dict[str, Any]] = []
 
     @property
     def component_names(self) -> List[str]:
@@ -144,8 +145,9 @@ class WorkflowPipelineFake:
         cls.calls.append((model_name_or_path, workflow))
         return cls(workflow)
 
-    def load_components(self, names: List[str]) -> None:
+    def load_components(self, names: List[str], **kwargs: Any) -> None:
         self.load_calls.append(list(names))
+        self.load_kwargs.append(dict(kwargs))
         for name in names:
             if name == "scheduler":
                 setattr(self, name, UpstreamSchedulerFake())
@@ -294,6 +296,10 @@ def test_workflow_adapter_loads_pruned_runtime_and_exact_setup_components(
         "video_processor",
     }
     assert adapter.pipeline.load_calls == [[transformer_name], ["scheduler"]]
+    assert adapter.pipeline.load_kwargs == [
+        {"dtype": torch.bfloat16},
+        {"dtype": torch.bfloat16},
+    ]
     assert len(adapter.scheduler.timesteps) == 4
     assert len(adapter.audio_scheduler.timesteps) == 4
     assert not hasattr(adapter.pipeline, "unrelated")
@@ -308,7 +314,17 @@ def test_workflow_adapter_loads_pruned_runtime_and_exact_setup_components(
         name for name in preprocessing_names if name not in adapter.pipeline.config_component_names
     ]
     assert adapter.pipeline.load_calls[-1] == expected_lazy_names
+    assert adapter.pipeline.load_kwargs[-1] == {"dtype": torch.bfloat16}
     assert not hasattr(adapter.pipeline, "unrelated")
+
+
+def test_workflow_adapter_can_disable_default_load_dtype_manifest() -> None:
+    config = _config(["transformer"])
+    config.model_args.component_load_dtypes = {"default": None}
+
+    adapter = MiniMaxH3T2VAAdapter(config, AcceleratorFake())
+
+    assert adapter.pipeline.load_kwargs == [{}, {}]
 
 
 _SHARED_H3_ADAPTER_METHODS = (

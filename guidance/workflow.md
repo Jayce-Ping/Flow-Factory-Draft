@@ -451,7 +451,35 @@ DeepSpeed clips inside its own engine and ignores the value handed to
 threshold is published to the plugin through `ACCELERATE_GRADIENT_CLIPPING` before
 the Accelerator is built.
 
-### Frozen Component Precision
+### Component Loading and Frozen Precision
+
+`model.component_load_dtypes` controls the dtype passed to the native component
+loader. It overlays model-specific adapter defaults and accepts the same selector
+forms as the frozen policy:
+
+```yaml
+model:
+  component_load_dtypes:
+    transformers: bf16  # Every declared transformer component.
+    vae: fp32           # One concrete component.
+```
+
+`transformer` is a concrete component name; `transformers` is a group selector.
+Set `component_load_dtypes: {default: null}` to disable an adapter's load-dtype
+defaults and delegate every component to its native loader. Diffusers load-time
+FP32 protections are applied before the post-load policy.
+
+At runtime, `ModelLoadCoordinator` compiles logical component names into
+exactly-once physical-root requests. This matters for aliases such as Bagel's
+`transformer -> bagel.language_model`: the `bagel` root is target-owned and must
+not be moved or synchronized as an auxiliary component. Backend strategies then
+apply these role contracts:
+
+- TARGET roots enter the prepared DDP/DeepSpeed/FSDP bundle.
+- AUXILIARY and REWARD roots remain full per-rank replicas.
+- HOST roots such as tokenizers, processors, and schedulers are never sharded.
+- FSDP2 CPU-efficient loading is enabled only for adapters that explicitly
+  declare compatible selective component loading.
 
 `model.frozen_parameters_dtype` accepts either one dtype for every frozen
 component or a selector mapping:
@@ -459,14 +487,14 @@ component or a selector mapping:
 ```yaml
 model:
   frozen_parameters_dtype:
-    default: null       # Preserve checkpoint dtype when no selector matches.
+    default: null       # Do not mutate dtype after loading.
     transformers: bf16  # Component group override.
     vae: fp32           # Concrete component override.
 ```
 
 Concrete component names take priority over the `transformers` and
 `text_encoders` groups, which take priority over `default`. A null value at any
-level preserves that component's loaded checkpoint dtype. The scalar form
+level leaves that component untouched after loading. The scalar form
 (`frozen_parameters_dtype: bf16`) remains shorthand for applying one dtype to
 every frozen component.
 

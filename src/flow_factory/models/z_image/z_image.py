@@ -56,13 +56,17 @@ class ZImageSample(T2ISample):
 
 
 class ZImageAdapter(BaseAdapter):
+    # Z-Image trains and serves its diffusion transformer in FP32.
+    component_load_dtype_defaults = {"transformer": torch.float32}
+
     def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
         self.pipeline: ZImagePipeline
         self.scheduler: FlowMatchEulerDiscreteSDEScheduler
 
     def load_pipeline(self) -> ZImagePipeline:
-        return ZImagePipeline.from_pretrained(
+        return self._load_diffusers_pipeline(
+            ZImagePipeline,
             self.model_args.model_name_or_path, low_cpu_mem_usage=False
         )
 

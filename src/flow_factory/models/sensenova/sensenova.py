@@ -94,10 +94,18 @@ class SenseNovaAdapter(BaseAdapter):
 
     def load_pipeline(self) -> SenseNovaPseudoPipeline:
         """Load the custom Transformers checkpoint and tokenizer."""
+        load_kwargs = dict(self.model_args.extra_kwargs)
+        component_dtypes = self._resolve_component_load_dtype_mapping(
+            component_names=["transformer"],
+            transformer_names=["transformer"],
+            text_encoder_names=[],
+        )
+        if "transformer" in component_dtypes:
+            load_kwargs.setdefault("dtype", component_dtypes["transformer"])
         return SenseNovaPseudoPipeline.from_pretrained(
             self.model_args.model_name_or_path,
             low_cpu_mem_usage=False,
-            **self.model_args.extra_kwargs,
+            **load_kwargs,
         )
 
     def build_component_runtime(self) -> ComponentRuntime:

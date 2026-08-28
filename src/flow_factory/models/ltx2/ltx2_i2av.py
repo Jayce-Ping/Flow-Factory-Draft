@@ -188,7 +188,8 @@ class LTX2_I2AV_Adapter(BaseAdapter):
         self._has_warned_multi_image = False
 
     def load_pipeline(self) -> LTX2ImageToVideoPipeline:
-        return LTX2ImageToVideoPipeline.from_pretrained(
+        return self._load_diffusers_pipeline(
+            LTX2ImageToVideoPipeline,
             self.model_args.model_name_or_path,
             low_cpu_mem_usage=False,
         )
