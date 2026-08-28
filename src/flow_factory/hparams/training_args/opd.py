@@ -23,8 +23,12 @@ entries) via :class:`TeacherConfig.applicable_datasets`.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, List, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, List, Literal, Optional, Tuple, Union
 
+from ...contracts.execution import (
+    ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT,
+    ExecutionContract,
+)
 from ..abc import ArgABC
 from ._base import TrainingArguments, _standardize_timestep_range
 
@@ -107,6 +111,8 @@ class DiffusionOPDTrainingArguments(TrainingArguments):
     and ``x0`` are ODE-only velocity-derived targets. Under SDE, the ``xt``
     loss remains divided by the scheduler's transition variance.
     """
+
+    execution_contract: ClassVar[ExecutionContract] = ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT
 
     teachers: List[TeacherConfig] = field(
         default_factory=list,

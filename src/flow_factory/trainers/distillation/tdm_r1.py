@@ -22,6 +22,7 @@ from typing import Any, ClassVar, List, Literal, Optional, Sequence
 import torch
 from accelerate import Accelerator
 
+from ...contracts.execution import ONLINE_EXECUTION_CONTRACT, ExecutionContract
 from ...hparams import Arguments, TDMR1TrainingArguments
 from ...hparams.training_args.tdm_r1 import TDM_R1_DEFAULT_OPTIMIZERS
 from ...models.abc import BaseAdapter
@@ -50,6 +51,7 @@ class TDMR1Trainer(TDMTrainer):
     """Reinforce deterministic TDM trajectories through a frozen-reference surrogate."""
 
     paradigm: ClassVar[Literal["decoupled"]] = "decoupled"
+    execution_contract: ClassVar[ExecutionContract] = ONLINE_EXECUTION_CONTRACT
 
     def _optimizer_args_for_role(self, role_name: str):
         """Resolve this role's optimizer, falling back to TDM-R1's published defaults.

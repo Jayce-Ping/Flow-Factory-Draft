@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, Literal, Tuple
 
+from ...contracts.execution import ONLINE_EXECUTION_CONTRACT, ExecutionContract
 from ..optimizer_args import AdamWOptimizerArguments
 from .dmd2 import _finite_float
 from .tdm import TDMTrainingArguments
@@ -30,6 +31,8 @@ if TYPE_CHECKING:
 @dataclass
 class TDMR1TrainingArguments(TDMTrainingArguments):
     """Configure TDM-R1 with a learned surrogate and frozen reference."""
+
+    execution_contract: ClassVar[ExecutionContract] = ONLINE_EXECUTION_CONTRACT
 
     advantage_aggregation: Literal["sum", "gdpo"] = "gdpo"
     tdm_weight: float = 0.3

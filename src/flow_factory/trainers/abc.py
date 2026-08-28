@@ -15,7 +15,7 @@
 # src/flow_factory/trainers/abc.py
 import json
 import os
-from abc import ABC, abstractmethod
+from abc import ABC
 from collections import defaultdict
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
@@ -45,6 +45,12 @@ from tqdm import tqdm
 
 from ..acceleration import BaseAccelerator, build_accelerator, validate_accelerator
 from ..advantage import AdvantageProcessor
+from ..contracts.execution import (
+    ONLINE_EXECUTION_CONTRACT,
+    AcquisitionMode,
+    ExecutionContract,
+    FeedbackMode,
+)
 from ..data_utils.dataset import METADATA_COLUMN
 from ..data_utils.loader import (
     get_eval_dataloaders,
@@ -75,6 +81,11 @@ from ..utils.dist import gather_aligned_floating_tensors, reduce_loss_info
 from ..utils.logger_utils import setup_logger
 from ..utils.noise_schedule import TimeSampler
 from .common.sample_prefetch import iter_prefetched_batches
+from .execution import (
+    AcquisitionDriver,
+    TrainingProgress,
+    build_acquisition_driver,
+)
 from .multirole import (
     MultiRoleBackendValidationMixin,
     MultiRoleCheckpointingMixin,
@@ -102,6 +113,7 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
     # 'decoupled' / 'distillation' trainers may use them. Concrete trainers
     # MUST override this; leaving it None disables lossy acceleration.
     paradigm: ClassVar[Optional[Literal["coupled", "decoupled", "distillation"]]] = None
+    execution_contract: ClassVar[ExecutionContract] = ONLINE_EXECUTION_CONTRACT
 
     def __init__(
         self,
@@ -118,6 +130,7 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
 
         self.training_args = config.training_args
         self.eval_args = config.eval_args
+        self._validate_execution_contract()
 
         self.reward_args = config.reward_args
         self.eval_reward_args = (
@@ -125,9 +138,13 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         )  # If `eval_reward_args` is not given, use `reward_args`
 
         self.adapter = adapter
+        self._validate_adapter_execution_contract()
         self.load_coordinator = ModelLoadCoordinator(adapter, accelerator)
-        self.epoch = 0
-        self.step = 0
+        self.progress = TrainingProgress()
+        self.acquisition_driver: AcquisitionDriver = build_acquisition_driver(
+            type(self).execution_contract
+        )
+        self._validate_execution_hooks()
 
         self._initialization()
         self._initialize_snapshots()
@@ -154,15 +171,144 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         """Whether to show tqdm progress bars."""
         return self.log_args.verbose and self.accelerator.is_local_main_process
 
+    @property
+    def cycle_index(self) -> int:
+        """Return the completed acquisition-cycle count for this trainer."""
+        return self._get_progress().cycle_index(type(self).execution_contract.acquisition)
+
+    def _get_progress(self) -> TrainingProgress:
+        """Return typed progress for initialized and lightweight test trainers."""
+        progress = self.__dict__.get("progress")
+        if progress is None:
+            progress = TrainingProgress()
+            self.__dict__["progress"] = progress
+        if not isinstance(progress, TrainingProgress):
+            raise TypeError(
+                "expected trainer progress to be TrainingProgress, received "
+                f"{type(progress).__name__}: {progress!r}"
+            )
+        return progress
+
+    @property
+    def epoch(self) -> int:
+        """Return the compatibility alias for the active acquisition cycle.
+
+        Generated acquisition maps this alias to rollout iterations. Dataset
+        acquisition maps it to complete dataloader traversals.
+        """
+        return self.cycle_index
+
+    @epoch.setter
+    def epoch(self, value: int) -> None:
+        """Set the compatibility acquisition-cycle alias.
+
+        Args:
+            value: Non-negative completed-cycle count.
+        """
+        progress = self._get_progress()
+        if type(self).execution_contract.acquisition is AcquisitionMode.GENERATION:
+            self.progress = replace(progress, rollout_iteration=value)
+        else:
+            self.progress = replace(progress, data_epoch=value)
+
+    @property
+    def step(self) -> int:
+        """Return the completed primary optimizer-step count."""
+        return self._get_progress().optimizer_step
+
+    @step.setter
+    def step(self, value: int) -> None:
+        """Set the completed primary optimizer-step count.
+
+        Args:
+            value: Non-negative number of completed optimizer updates.
+        """
+        self.progress = replace(self._get_progress(), optimizer_step=value)
+
+    def _validate_execution_hooks(self) -> None:
+        """Require the optimization hook selected by acquisition mode."""
+        acquisition = type(self).execution_contract.acquisition
+        if (
+            acquisition is AcquisitionMode.GENERATION
+            and type(self).optimize is BaseTrainer.optimize
+        ):
+            raise TypeError(
+                f"generation trainer {type(self).__name__} must override optimize(samples)"
+            )
+        if (
+            acquisition is AcquisitionMode.DATASET
+            and type(self).optimize_batch is BaseTrainer.optimize_batch
+        ):
+            raise TypeError(
+                f"dataset trainer {type(self).__name__} must override optimize_batch(batch)"
+            )
+
+    def _validate_execution_contract(self) -> None:
+        """Require trainer runtime and arguments to declare equal semantics."""
+        type(self).validate_training_arguments_contract(self.training_args)
+
+    @classmethod
+    def validate_training_arguments_contract(cls, training_args: Any) -> None:
+        """Validate algorithm arguments before heavyweight initialization.
+
+        Args:
+            training_args: Resolved algorithm-specific training arguments.
+        """
+        trainer_contract = cls.execution_contract
+        arguments_contract = getattr(type(training_args), "execution_contract", None)
+        if not isinstance(trainer_contract, ExecutionContract):
+            raise TypeError(
+                f"trainer {cls.__name__}.execution_contract must be ExecutionContract, "
+                f"got {type(trainer_contract).__name__}: {trainer_contract!r}"
+            )
+        if not isinstance(arguments_contract, ExecutionContract):
+            raise TypeError(
+                f"training arguments {type(training_args).__name__}.execution_contract "
+                f"must be ExecutionContract, got {type(arguments_contract).__name__}: "
+                f"{arguments_contract!r}"
+            )
+        if trainer_contract != arguments_contract:
+            raise ValueError(
+                f"execution contract mismatch for trainer {cls.__name__} and "
+                f"training arguments {type(training_args).__name__}: "
+                f"trainer={trainer_contract!r}, arguments={arguments_contract!r}"
+            )
+
+    @classmethod
+    def validate_adapter_class_execution_contract(cls, adapter_cls: type) -> None:
+        """Reject statically unsupported dataset acquisition before model loading.
+
+        Args:
+            adapter_cls: Resolved model adapter class.
+        """
+        if cls.execution_contract.acquisition is not AcquisitionMode.DATASET:
+            return
+        if not isinstance(adapter_cls, type) or not issubclass(adapter_cls, BaseAdapter):
+            raise TypeError(
+                f"dataset trainer {cls.__name__} requires a BaseAdapter subclass, "
+                f"received {adapter_cls!r}"
+            )
+        validator = getattr(adapter_cls, "validate_offline_output_capability", None)
+        if not callable(validator):
+            raise TypeError(
+                f"adapter {adapter_cls.__name__} must define "
+                "validate_offline_output_capability() for dataset acquisition"
+            )
+        validator()
+
+    def _validate_adapter_execution_contract(self) -> None:
+        """Validate the realized adapter on the selected acquisition path."""
+        type(self).validate_adapter_class_execution_contract(type(self.adapter))
+
     def _initialize_snapshots(self) -> None:
         """Initialize optional trainer-owned parameter snapshots before state resume."""
 
     def should_continue_training(self) -> bool:
-        """Outer epoch loop: continue unless a finite ``max_epochs`` has been reached."""
+        """Continue until the active acquisition cycle reaches ``max_epochs``."""
         m = self.training_args.max_epochs
         if m is None or m < 0:
             return True
-        return self.epoch < m
+        return self.cycle_index < m
 
     def accumulate_gradients(self):
         """Context manager for gradient accumulation over the single prepared root.
@@ -322,11 +468,14 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
             device=self.accelerator.device,
         )
 
-        dataloader, train_dataloaders_by_source = get_train_dataloader(
-            config=self.config,
-            accelerator=self.accelerator,
-            preprocess_func=self.adapter.preprocess_func,
-        )
+        build_train_dataloader = getattr(self, "_build_train_dataloader", None)
+        if build_train_dataloader is None:
+            # A few lifecycle tests intentionally call this shared method on a
+            # lightweight structural host. Preserve that supported boundary while
+            # real trainer subclasses continue to override the acquisition seam.
+            dataloader, train_dataloaders_by_source = BaseTrainer._build_train_dataloader(self)
+        else:
+            dataloader, train_dataloaders_by_source = build_train_dataloader()
         self.train_dataloaders_by_source: Dict[str, DataLoader] = train_dataloaders_by_source
 
         eval_dataloaders = get_eval_dataloaders(
@@ -343,6 +492,25 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         self.accelerator.wait_for_everyone()
 
         return dataloader, eval_dataloaders
+
+    def _build_train_dataloader(
+        self,
+    ) -> Tuple[Optional[Union[DataLoader, "MultiSourceTrainDataLoader"]], Dict[str, DataLoader]]:
+        """Build the acquisition-specific training dataloader.
+
+        Returns:
+            Training loader and its per-source loader mapping.
+
+        Note:
+            The default preserves grouped online rollout loading. Dataset-based
+            trainers override this hook with the finite offline loader builder; the
+            surrounding preprocessing lifecycle remains shared.
+        """
+        return get_train_dataloader(
+            config=self.config,
+            accelerator=self.accelerator,
+            preprocess_func=self.adapter.preprocess_func,
+        )
 
     def _init_optimizer(self) -> torch.optim.Optimizer:
         """Build the single optimizer root, its groups ordered and tagged by role.
@@ -592,6 +760,14 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         prepared_names = set(trainable_module_names)
 
         modules_to_load = list(self.adapter.inference_modules)
+
+        execution_contract = getattr(
+            type(self),
+            "execution_contract",
+            ONLINE_EXECUTION_CONTRACT,
+        )
+        if execution_contract.acquisition is AcquisitionMode.DATASET:
+            modules_to_load.extend(self.adapter.output_state_encoding_modules)
 
         if not self.config.data_args.enable_preprocess:
             modules_to_load.extend(self.adapter.preprocessing_modules)
@@ -880,36 +1056,77 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
     def start(self) -> None:
         """Run the training loop until the configured budget is exhausted.
 
-        Every algorithm drives the same epoch: reseed, save on ``save_freq``,
-        evaluate on ``eval_freq``, then sample, score, optimize, and step EMA.
-        Only the middle of that sequence is algorithm-specific, so the loop lives
-        here and the variation is expressed through
-        :meth:`sampling_context`, :meth:`_run_training_step` and
-        :meth:`_after_optimizer_step` rather than by restating the loop.
+        Generation acquisition retains the existing pre-rollout checkpoint,
+        evaluation, and cycle-level EMA cadence. Dataset acquisition exhausts one
+        finite official distributed loader before incrementing ``data_epoch`` and
+        publishing post-epoch boundaries. Optimizer progress remains independent.
         """
+        contract = type(self).execution_contract
         while self.should_continue_training():
-            self.adapter.set_trajectory_seed(self.epoch + self.training_args.seed)
+            driver = getattr(self, "acquisition_driver", None)
+            if driver is None:
+                driver = build_acquisition_driver(contract)
+                self.acquisition_driver = driver
+            driver.prepare_cycle(
+                self,
+                self._get_progress(),
+                seed=self.training_args.seed,
+            )
 
-            if (
-                self.log_args.save_freq > 0
-                and self.epoch % self.log_args.save_freq == 0
-                and self.log_args.save_dir
-            ):
-                save_dir = os.path.join(
-                    self.log_args.save_dir,
-                    str(self.log_args.run_name),
-                    "checkpoints",
-                )
-                self.save_checkpoint(save_dir, epoch=self.epoch)
+            if contract.acquisition is AcquisitionMode.GENERATION:
+                self._run_periodic_cycle_boundaries()
 
-            if self.eval_args.eval_freq > 0 and self.epoch % self.eval_args.eval_freq == 0:
-                self.evaluate()
+            driver.run_cycle(self, self._get_progress())
 
-            self._run_training_step()
-
-            self.adapter.ema_step(step=self.epoch)
+            if contract.acquisition is AcquisitionMode.GENERATION:
+                self.adapter.ema_step(step=self.cycle_index)
             self._after_optimizer_step()
-            self.epoch += 1
+            self.progress = self._get_progress().advance_acquisition(
+                contract.acquisition,
+                completed=True,
+            )
+
+            if contract.acquisition is AcquisitionMode.DATASET:
+                self._run_periodic_cycle_boundaries()
+
+    def _run_periodic_cycle_boundaries(self) -> None:
+        """Run save and evaluation actions at the completed-cycle index."""
+        if (
+            self.log_args.save_freq > 0
+            and self.cycle_index % self.log_args.save_freq == 0
+            and self.log_args.save_dir
+        ):
+            save_dir = os.path.join(
+                self.log_args.save_dir,
+                str(self.log_args.run_name),
+                "checkpoints",
+            )
+            self.save_checkpoint(save_dir, epoch=self.cycle_index)
+
+        if self.eval_args.eval_freq > 0 and self.cycle_index % self.eval_args.eval_freq == 0:
+            self.evaluate()
+
+    def set_trajectory_seed(self, seed: int) -> None:
+        """Set the adapter seed for one generated acquisition.
+
+        Args:
+            seed: Effective seed for the next generation cycle.
+        """
+        self.adapter.set_trajectory_seed(seed)
+
+    def run_generation_acquisition(self) -> None:
+        """Run one complete generated acquisition and policy update."""
+        self._run_training_step()
+
+    def train_on_dataset_batch(self, batch: Any) -> None:
+        """Run declared feedback and optimization for one dataset batch.
+
+        Args:
+            batch: Collated batch acquired from the finite offline dataloader.
+        """
+        if type(self).execution_contract.feedback is FeedbackMode.RUNTIME_REWARD:
+            self.prepare_feedback(batch)
+        self.optimize_batch(batch)
 
     def _run_training_step(self) -> None:
         """Run one epoch's rollout, feedback and optimization.
@@ -922,7 +1139,8 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         """
         with self.sampling_context():
             samples = self.sample()
-        self.prepare_feedback(samples)
+        if type(self).execution_contract.feedback is FeedbackMode.RUNTIME_REWARD:
+            self.prepare_feedback(samples)
         self.optimize(samples)
 
     @contextmanager
@@ -982,10 +1200,26 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
             aggregation_func=aggregation_func,
         )
 
-    @abstractmethod
-    def optimize(self, *args, **kwargs):
-        """Update policy model"""
-        pass
+    def optimize(self, *args: Any, **kwargs: Any) -> None:
+        """Update a policy from generated examples.
+
+        Args:
+            *args: Algorithm-specific generated-acquisition inputs.
+            **kwargs: Algorithm-specific optimization options.
+        """
+        raise NotImplementedError(
+            f"generation trainer {type(self).__name__} must implement optimize(samples)"
+        )
+
+    def optimize_batch(self, batch: Any) -> None:
+        """Update a policy from one acquired dataset batch.
+
+        Args:
+            batch: Collated offline training batch.
+        """
+        raise NotImplementedError(
+            f"dataset trainer {type(self).__name__} must implement optimize_batch(batch)"
+        )
 
     def _sample_timesteps(
         self,
@@ -1091,6 +1325,8 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
             self.training_args.max_grad_norm,
         )
         self.optimizer.step()
+        if type(self).execution_contract.acquisition is AcquisitionMode.DATASET:
+            self.adapter.ema_step(step=self.step)
         self.optimizer.zero_grad()
         self._after_gradient_step()
 

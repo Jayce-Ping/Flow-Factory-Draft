@@ -23,6 +23,10 @@ from typing import Any, ClassVar, Dict, Iterator, List, Literal, Sequence, Tuple
 import torch
 from accelerate import Accelerator
 
+from ...contracts.execution import (
+    ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT,
+    ExecutionContract,
+)
 from ...hparams import Arguments, TDMTrainingArguments
 from ...hparams.training_args.dmd2 import DMD2_DEFAULT_OPTIMIZERS
 from ...models.abc import BaseAdapter
@@ -80,6 +84,7 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
     """Optimize every boundary of a deterministic few-step generator trajectory."""
 
     paradigm: ClassVar[Literal["distillation"]] = "distillation"
+    execution_contract: ClassVar[ExecutionContract] = ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT
 
     def _optimizer_args_for_role(self, role_name: str):
         """Resolve this role's optimizer, falling back to TDM's published defaults.

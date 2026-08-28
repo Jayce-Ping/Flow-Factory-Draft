@@ -50,13 +50,17 @@ import math
 import os
 from collections import defaultdict
 from functools import partial
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union, cast
+from typing import Any, ClassVar, Dict, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
 import tqdm as tqdm_
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
+from ....contracts.execution import (
+    ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT,
+    ExecutionContract,
+)
 from ....hparams import DiffusionOPDTrainingArguments
 from ....hparams.training_args.opd import resolve_distill_step_band
 from ....samples import (
@@ -87,6 +91,7 @@ class DiffusionOPDTrainer(BaseTrainer):
     # Distillation paradigm: no reward/advantage stage and rollout log-probs do not
     # enter the loss, so lossy rollout acceleration is permitted (constraints.md #7).
     paradigm = "distillation"
+    execution_contract: ClassVar[ExecutionContract] = ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)

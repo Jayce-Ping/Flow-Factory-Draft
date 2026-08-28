@@ -30,6 +30,7 @@ from typing import Any, Dict, Literal, Optional
 
 import yaml
 
+from ..contracts.execution import AcquisitionMode, ExecutionContract, FeedbackMode
 from ..utils.dist import get_world_size
 from ..utils.logger_utils import setup_logger
 from .abc import ArgABC
@@ -212,12 +213,6 @@ class Arguments(ArgABC):
                     "trainer_type='tdm-r1' requires complete reward groups with "
                     f"group_size >= 2, received group_size={training_args.group_size}."
                 )
-        elif isinstance(training_args, DMD2TrainingArguments) and self.reward_args:
-            raise ValueError(
-                f"trainer_type={training_args.trainer_type!r} does not accept training "
-                f"rewards, but received {len(self.reward_args)} reward configuration(s)."
-            )
-
         if (
             isinstance(training_args, TDMTrainingArguments)
             and self.scheduler_args.dynamics_type != "ODE"
@@ -226,6 +221,57 @@ class Arguments(ArgABC):
                 f"trainer_type={training_args.trainer_type!r} requires "
                 "scheduler.dynamics_type='ODE', received "
                 f"dynamics_type={self.scheduler_args.dynamics_type!r}."
+            )
+
+    def _get_execution_contract(self) -> ExecutionContract:
+        """Return the immutable algorithm contract used by configuration gating."""
+        contract = getattr(type(self.training_args), "execution_contract", None)
+        if not isinstance(contract, ExecutionContract):
+            raise TypeError(
+                f"training arguments {type(self.training_args).__name__}.execution_contract "
+                f"must be ExecutionContract, got {type(contract).__name__}: {contract!r}"
+            )
+        return contract
+
+    def _validate_training_feedback_contract(self) -> None:
+        """Reject runtime training rewards when the algorithm declares no feedback."""
+        if self._get_execution_contract().feedback is FeedbackMode.NONE and self.reward_args:
+            raise ValueError(
+                f"trainer_type={self.training_args.trainer_type!r} does not accept training "
+                f"rewards, but received {len(self.reward_args)} reward configuration(s). "
+                "Use eval_rewards for evaluation-only monitoring."
+            )
+
+    def _validate_dataset_acquisition_contract(self) -> None:
+        """Keep complete data epochs independent from grouped generation geometry."""
+        if self._get_execution_contract().acquisition is not AcquisitionMode.DATASET:
+            return
+        if not self.data_args.training_datasets:
+            raise ValueError(
+                "dataset acquisition requires at least one enabled training source under "
+                "data.datasets; the legacy prompt-only data.dataset_dir path cannot carry "
+                "demonstration or preference supervision"
+            )
+        if not self.data_args.enable_preprocess:
+            raise ValueError(
+                "dataset acquisition requires data.enable_preprocess=True so model-input "
+                "conditions use the input-only preprocessing cache"
+            )
+        if self.data_args.sampler_type != "auto":
+            raise ValueError(
+                "dataset acquisition uses torch.utils.data.DistributedSampler directly; "
+                f"data.sampler_type must remain 'auto', received "
+                f"{self.data_args.sampler_type!r}"
+            )
+        bad_weights = [
+            (dataset.name, dataset.train.weight)
+            for dataset in self.data_args.training_datasets
+            if dataset.train is not None and dataset.train.weight != 1
+        ]
+        if bad_weights:
+            raise ValueError(
+                "dataset acquisition requires train.weight=1 so one epoch remains one "
+                f"complete dataloader traversal; received {bad_weights!r}"
             )
 
     def _validate_dmd2_batch_geometry(self) -> None:
@@ -294,7 +340,9 @@ class Arguments(ArgABC):
             self.log_args.run_name = f"{self.model_args.model_type}_{self.model_args.finetune_type}_{self.training_args.trainer_type}_{time_stamp}"
 
         self._synthesize_default_optimizer_args()
+        self._validate_training_feedback_contract()
         self._validate_dataset_routing()
+        self._validate_dataset_acquisition_contract()
         # Resolve `RewardArguments.applicable_datasets is None` -> concrete
         # list of applicable dataset names. Must run AFTER validation (so the
         # unknown-name check is against the user's raw input, not the
@@ -325,6 +373,8 @@ class Arguments(ArgABC):
         self._validate_teacher_sources()
         self._resolve_scheduler_sde_defaults()
         self._validate_multirole_training_contract()
+        if self._get_execution_contract().acquisition is AcquisitionMode.DATASET:
+            return
         self._resolve_sampler_type()
         self._align_batch_geometry()
         self._adjust_gradient_accumulation()
@@ -483,7 +533,8 @@ class Arguments(ArgABC):
                     f"or drop the dataset entry from `data.datasets`."
                 )
 
-        _check_side(self.reward_args, train_names, side="Training")
+        if self._get_execution_contract().feedback is FeedbackMode.RUNTIME_REWARD:
+            _check_side(self.reward_args, train_names, side="Training")
         _check_side(self.eval_reward_args, eval_names, side="Eval")
 
     def _validate_teacher_sources(self) -> None:

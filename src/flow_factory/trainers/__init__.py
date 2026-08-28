@@ -18,6 +18,13 @@ Trainers module for various RL algorithms.
 """
 
 from .abc import BaseTrainer
+from .execution import (
+    AcquisitionDriver,
+    DatasetAcquisitionDriver,
+    GenerationAcquisitionDriver,
+    TrainingProgress,
+    build_acquisition_driver,
+)
 from .loader import load_trainer
 from .registry import get_trainer_class, list_registered_trainers
 
@@ -26,6 +33,11 @@ from .registry import get_trainer_class, list_registered_trainers
 
 __all__ = [
     "BaseTrainer",
+    "AcquisitionDriver",
+    "DatasetAcquisitionDriver",
+    "GenerationAcquisitionDriver",
+    "TrainingProgress",
+    "build_acquisition_driver",
     "get_trainer_class",
     "list_registered_trainers",
     "load_trainer",
