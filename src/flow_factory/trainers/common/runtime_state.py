@@ -12,18 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Safe checkpoint storage for offline trainer progress and child state."""
+"""Safe checkpoint storage for trainer progress and late-bound child state."""
 
 import hashlib
 import json
 import math
 import os
+import random
 import re
 import uuid
 from collections.abc import Iterable, Mapping
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
+import numpy as np
 import torch
+from accelerate.utils import SCALER_NAME
 from accelerate.utils import load as accelerate_load
 from safetensors.torch import load_file, save_file
 
@@ -57,6 +60,12 @@ _IDENTITY_KEYS = frozenset(
         "optimizer_roles",
         "parameter_schema_digest",
         "optimizer_schema_digest",
+        "execution_contract_digest",
+        "data_contract_digest",
+        "distributed_type",
+        "backend_schema_digest",
+        "mixed_precision",
+        "gradient_scaler",
         "world_size",
     }
 )
@@ -87,7 +96,7 @@ class CheckpointableChild(Protocol):
 
 
 class TrainerRuntimeState:
-    """Own offline progress and late-bound EMA/reference checkpoint state.
+    """Own unified progress and late-bound EMA/reference checkpoint state.
 
     Runtime payloads intentionally do not use Accelerate's generic custom checkpoint
     objects because those objects are serialized with pickle. The framework writes a
@@ -220,6 +229,11 @@ class TrainerRuntimeState:
         input_dir: str | os.PathLike[str],
         *,
         children: Mapping[str, CheckpointableChild] | None = None,
+        invariant_validator: (
+            Callable[[TrainingProgress, Mapping[str, Mapping[str, Any]]], None] | None
+        ) = None,
+        expected_process_index: int | None = None,
+        expected_device_type: str | None = None,
     ) -> None:
         """Decode and stage compatible state before policy/optimizer mutation."""
         if self._load_received:
@@ -242,13 +256,13 @@ class TrainerRuntimeState:
         )
         if legacy_files:
             raise RuntimeError(
-                "offline state checkpoint contains legacy or foreign pickle custom state "
+                "state checkpoint contains legacy or foreign pickle custom state "
                 f"files {legacy_files!r}; this runtime accepts only JSON + safetensors. "
                 "Resume model weights instead or regenerate a trusted state checkpoint."
             )
 
         metadata_path = os.path.join(input_path, TRAINER_RUNTIME_METADATA_FILENAME)
-        if not os.path.isfile(metadata_path):
+        if os.path.islink(metadata_path) or not os.path.isfile(metadata_path):
             raise RuntimeError(
                 "state checkpoint is incompatible with trainer runtime-state v1: expected "
                 f"metadata file {metadata_path!r}, received missing file. Checkpoints created "
@@ -269,6 +283,10 @@ class TrainerRuntimeState:
             input_path,
             metadata["state_files"],
             require_complete=self._identity["trainer"] != "unspecified",
+            expected_process_index=expected_process_index,
+            expected_device_type=expected_device_type,
+            world_size=self._identity["world_size"],
+            require_scaler=self._identity["gradient_scaler"] not in ("none", "unspecified"),
         )
 
         tensor_filename = _validate_checkpoint_file(
@@ -281,6 +299,11 @@ class TrainerRuntimeState:
                 "trainer runtime metadata tensor_file path must be a generated runtime "
                 f"safetensors basename, received {tensor_filename!r}"
             )
+        _validate_manifest_file_set(
+            input_path,
+            state_files=metadata["state_files"],
+            tensor_filename=tensor_filename,
+        )
         tensor_path = os.path.join(input_path, tensor_filename)
         tensors = load_file(tensor_path, device="cpu")
         consumed_tensors: set[str] = set()
@@ -315,6 +338,13 @@ class TrainerRuntimeState:
                 child = children[name]
                 _require_checkpointable_child(child, name, require_validator=True)
                 child.validate_state_dict(child_payloads[name])
+        if invariant_validator is not None:
+            if not callable(invariant_validator):
+                raise TypeError(
+                    "trainer runtime invariant_validator must be callable, received "
+                    f"{type(invariant_validator).__name__}: {invariant_validator!r}"
+                )
+            invariant_validator(progress, child_payloads)
         self._validated_load = (progress, child_payloads)
 
     def commit_validated_load(self) -> None:
@@ -598,6 +628,12 @@ def _normalize_identity(identity: Mapping[str, Any]) -> dict[str, Any]:
             "optimizer_roles": (),
             "parameter_schema_digest": "unspecified",
             "optimizer_schema_digest": "unspecified",
+            "execution_contract_digest": "unspecified",
+            "data_contract_digest": "unspecified",
+            "distributed_type": "unspecified",
+            "backend_schema_digest": "unspecified",
+            "mixed_precision": "unspecified",
+            "gradient_scaler": "unspecified",
             "world_size": 1,
         }
     _require_exact_keys(identity, _IDENTITY_KEYS, "trainer runtime identity")
@@ -610,6 +646,12 @@ def _normalize_identity(identity: Mapping[str, Any]) -> dict[str, Any]:
         "finetune_type",
         "parameter_schema_digest",
         "optimizer_schema_digest",
+        "execution_contract_digest",
+        "data_contract_digest",
+        "distributed_type",
+        "backend_schema_digest",
+        "mixed_precision",
+        "gradient_scaler",
     ):
         value = identity[field_name]
         if type(value) is not str or not value:
@@ -655,15 +697,14 @@ def _collect_accelerate_state_files(output_path: str) -> list[dict[str, Any]]:
             directory_path = os.path.join(directory, directory_name)
             if os.path.islink(directory_path):
                 raise RuntimeError(
-                    "offline state checkpoint staging cannot contain symlinked "
+                    "state checkpoint staging cannot contain symlinked "
                     f"directories: {directory_path!r}"
                 )
         for filename in filenames:
             file_path = os.path.join(directory, filename)
             if os.path.islink(file_path) or not os.path.isfile(file_path):
                 raise RuntimeError(
-                    "offline state checkpoint staging requires regular files, "
-                    f"received {file_path!r}"
+                    "state checkpoint staging requires regular files, " f"received {file_path!r}"
                 )
             relative_path = os.path.relpath(file_path, output_path).replace(os.sep, "/")
             entries.append(_describe_file(file_path, relative_path))
@@ -677,6 +718,78 @@ def _describe_file(file_path: str, relative_path: str) -> dict[str, Any]:
         "size": os.path.getsize(file_path),
         "sha256": _file_sha256(file_path),
     }
+
+
+def _validate_manifest_file_set(
+    input_path: str,
+    *,
+    state_files: Any,
+    tensor_filename: str,
+) -> None:
+    """Reject unmanifested files that a backend loader could otherwise consume."""
+    if not isinstance(state_files, list):
+        raise TypeError("trainer runtime metadata state_files must be a list")
+    expected_paths = {
+        TRAINER_RUNTIME_METADATA_FILENAME,
+        tensor_filename,
+    }
+    for index, entry in enumerate(state_files):
+        entry = _require_mapping(entry, f"trainer runtime state_files[{index}]")
+        relative_path = entry.get("path")
+        if type(relative_path) is not str:
+            raise TypeError(
+                f"trainer runtime state_files[{index}] path must be str, "
+                f"received {type(relative_path).__name__}: {relative_path!r}"
+            )
+        expected_paths.add(relative_path)
+
+    actual_paths = set()
+    for directory, directory_names, filenames in os.walk(input_path):
+        for directory_name in directory_names:
+            directory_path = os.path.join(directory, directory_name)
+            if os.path.islink(directory_path):
+                raise RuntimeError(
+                    "state checkpoint cannot contain symlinked directories during resume: "
+                    f"{directory_path!r}"
+                )
+        for filename in filenames:
+            file_path = os.path.join(directory, filename)
+            if os.path.islink(file_path) or not os.path.isfile(file_path):
+                raise RuntimeError(
+                    "state checkpoint resume requires regular files, " f"received {file_path!r}"
+                )
+            actual_paths.add(os.path.relpath(file_path, input_path).replace(os.sep, "/"))
+    unmanifested_state_paths = tuple(
+        sorted(
+            path
+            for path in actual_paths.difference(expected_paths)
+            if _is_backend_state_candidate(path)
+        )
+    )
+    if unmanifested_state_paths:
+        raise RuntimeError(
+            "state checkpoint contains unmanifested backend artifacts that could be "
+            f"consumed during resume: unmanifested={unmanifested_state_paths!r}"
+        )
+
+
+def _is_backend_state_candidate(path: str) -> bool:
+    """Identify unmanifested names that Accelerate or a backend may consume."""
+    top_level = path.split("/", 1)[0]
+    prefixes = (
+        "model",
+        "pytorch_model",
+        "optimizer",
+        "scheduler",
+        "sampler",
+        "scaler",
+        "random_states",
+        "custom_checkpoint",
+        "dl_state_dict",
+        TRAINER_RUNTIME_TENSOR_PREFIX,
+        "flow_factory_",
+    )
+    return top_level.startswith(prefixes)
 
 
 def _file_sha256(file_path: str) -> str:
@@ -740,6 +853,10 @@ def _validate_accelerate_state_files(
     entries: Any,
     *,
     require_complete: bool,
+    expected_process_index: int | None,
+    expected_device_type: str | None,
+    world_size: int,
+    require_scaler: bool,
 ) -> None:
     """Reject missing/truncated core state and parse RNG before model mutation."""
     if not isinstance(entries, list):
@@ -765,30 +882,218 @@ def _validate_accelerate_state_files(
         raise ValueError("trainer runtime metadata state_files must be sorted by path")
     if not require_complete:
         return
+    if type(expected_process_index) is not int:
+        raise TypeError(
+            "exact state preflight requires accelerator.process_index as an int, "
+            f"received {type(expected_process_index).__name__}: "
+            f"{expected_process_index!r}"
+        )
+    if expected_process_index < 0 or expected_process_index >= world_size:
+        raise ValueError(
+            "exact state preflight process index is outside the checkpoint world: "
+            f"process_index={expected_process_index}, world_size={world_size}"
+        )
+    if type(expected_device_type) is not str or not expected_device_type:
+        raise TypeError(
+            "exact state preflight requires accelerator.device.type as a non-empty "
+            f"str, received {type(expected_device_type).__name__}: "
+            f"{expected_device_type!r}"
+        )
 
     paths = frozenset(received_paths)
-    if not ({"model.safetensors", "pytorch_model.bin"} & paths):
-        raise RuntimeError("offline exact state checkpoint is missing its prepared model artifact")
-    for required_path in ("optimizer.bin", "random_states_0.pkl"):
-        if required_path not in paths:
-            raise RuntimeError(
-                "offline exact state checkpoint is missing required artifact " f"{required_path!r}"
-            )
+    if not any(_is_prepared_model_artifact(path) for path in paths):
+        raise RuntimeError("exact state checkpoint is missing its prepared model artifact")
+    if not any(_is_optimizer_artifact(path) for path in paths):
+        raise RuntimeError("exact state checkpoint is missing its optimizer artifact")
+    if require_scaler and SCALER_NAME not in paths:
+        raise RuntimeError(
+            "exact state checkpoint is missing the gradient scaler artifact required "
+            "by its runtime identity"
+        )
+    rng_paths = tuple(
+        sorted(
+            path for path in paths if re.fullmatch(r"random_states_[0-9]+\.pkl", path) is not None
+        )
+    )
+    if not rng_paths:
+        raise RuntimeError("exact state checkpoint is missing its per-rank RNG artifact")
+    expected_rng_path = f"random_states_{expected_process_index}.pkl"
+    if expected_rng_path not in rng_paths:
+        raise RuntimeError(
+            "exact state checkpoint is missing the current rank RNG artifact: "
+            f"expected {expected_rng_path!r}, available={rng_paths!r}"
+        )
+    _validate_rng_state(
+        input_path,
+        expected_rng_path,
+        expected_device_type=expected_device_type,
+    )
 
-    rng_path = os.path.join(input_path, "random_states_0.pkl")
+
+def _validate_rng_state(
+    input_path: str,
+    relative_path: str,
+    *,
+    expected_device_type: str,
+) -> None:
+    """Validate the exact RNG payload Accelerate will consume for this rank."""
+    rng_path = os.path.join(input_path, relative_path)
     rng_state = accelerate_load(rng_path, map_location="cpu", weights_only=True)
-    rng_state = _require_mapping(rng_state, "offline RNG state")
-    required_rng_keys = frozenset({"random_state", "numpy_random_seed", "torch_manual_seed"})
+    rng_state = _require_mapping(
+        rng_state,
+        f"exact-resume RNG state {relative_path!r}",
+    )
+    required_rng_keys = {
+        "random_state",
+        "numpy_random_seed",
+        "torch_manual_seed",
+    }
+    device_rng_keys = {
+        "cuda": "torch_cuda_manual_seed",
+        "xpu": "torch_xpu_manual_seed",
+        "mlu": "torch_mlu_manual_seed",
+        "sdaa": "torch_sdaa_manual_seed",
+        "musa": "torch_musa_manual_seed",
+        "hpu": "torch_hpu_manual_seed",
+        "neuron": "torch_neuron_manual_seed",
+        "xla": "xm_seed",
+    }
+    if expected_device_type == "mps":
+        raise RuntimeError(
+            "Accelerate does not serialize the MPS RNG state required for exact "
+            "training resume; use a model-weight resume on MPS"
+        )
+    if expected_device_type != "cpu":
+        device_key = device_rng_keys.get(expected_device_type)
+        if device_key is None:
+            raise RuntimeError(
+                "exact training resume does not recognize the accelerator RNG "
+                f"device type {expected_device_type!r}"
+            )
+        required_rng_keys.add(device_key)
     missing_rng_keys = required_rng_keys.difference(rng_state)
     if missing_rng_keys:
         raise ValueError(
-            "offline RNG state is missing required keys: " f"{tuple(sorted(missing_rng_keys))!r}"
+            f"exact-resume RNG state {relative_path!r} is missing required keys: "
+            f"{tuple(sorted(missing_rng_keys))!r}"
         )
-    if type(rng_state["torch_manual_seed"]) is not torch.Tensor:
+    if "step" in rng_state and (type(rng_state["step"]) is not int or rng_state["step"] < 0):
+        raise ValueError(
+            f"exact-resume RNG state {relative_path!r} step must be a non-negative "
+            f"int, received {rng_state['step']!r}"
+        )
+
+    try:
+        random.Random().setstate(rng_state["random_state"])
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"exact-resume RNG state {relative_path!r} has invalid random_state"
+        ) from error
+    try:
+        np.random.RandomState().set_state(rng_state["numpy_random_seed"])
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"exact-resume RNG state {relative_path!r} has invalid numpy_random_seed"
+        ) from error
+    torch_state = rng_state["torch_manual_seed"]
+    if type(torch_state) is not torch.Tensor:
         raise TypeError(
-            "offline RNG torch_manual_seed must be a plain torch.Tensor, received "
-            f"{type(rng_state['torch_manual_seed']).__name__}"
+            f"exact-resume RNG {relative_path!r} torch_manual_seed must be a "
+            f"plain torch.Tensor, received {type(torch_state).__name__}"
         )
+    try:
+        torch.Generator(device="cpu").set_state(torch_state)
+    except RuntimeError as error:
+        raise ValueError(
+            f"exact-resume RNG state {relative_path!r} has invalid torch_manual_seed"
+        ) from error
+
+    if expected_device_type in device_rng_keys and expected_device_type != "xla":
+        device_states = rng_state[device_rng_keys[expected_device_type]]
+        if not isinstance(device_states, (list, tuple)) or not device_states:
+            raise TypeError(
+                f"exact-resume RNG {relative_path!r} device state must be a non-empty "
+                f"sequence, received {type(device_states).__name__}: {device_states!r}"
+            )
+        device_module = getattr(torch, expected_device_type, None)
+        device_count = getattr(device_module, "device_count", None)
+        if not callable(device_count):
+            raise RuntimeError(
+                "exact training resume cannot validate the visible RNG topology for "
+                f"device type {expected_device_type!r}; use a model-weight resume"
+            )
+        visible_device_count = device_count()
+        if type(visible_device_count) is not int or visible_device_count < 1:
+            raise RuntimeError(
+                "exact training resume expected at least one visible device for RNG "
+                f"type {expected_device_type!r}, received {visible_device_count!r}"
+            )
+        if len(device_states) != visible_device_count:
+            raise ValueError(
+                f"exact-resume RNG {relative_path!r} device-state topology mismatch: "
+                f"expected {visible_device_count} visible {expected_device_type} device "
+                f"states, received {len(device_states)}"
+            )
+        for index, device_state in enumerate(device_states):
+            if type(device_state) is not torch.Tensor:
+                raise TypeError(
+                    f"exact-resume RNG {relative_path!r} device state {index} must be "
+                    f"a plain torch.Tensor, received {type(device_state).__name__}"
+                )
+            if (
+                device_state.device.type != "cpu"
+                or device_state.dtype is not torch.uint8
+                or device_state.ndim != 1
+                or device_state.numel() == 0
+            ):
+                raise ValueError(
+                    f"exact-resume RNG {relative_path!r} device state {index} must "
+                    "be a non-empty one-dimensional CPU uint8 tensor, received "
+                    f"device={device_state.device}, dtype={device_state.dtype}, "
+                    f"shape={tuple(device_state.shape)!r}"
+                )
+            try:
+                generator = torch.Generator(device=torch.device(expected_device_type, index))
+                generator.set_state(device_state)
+            except (RuntimeError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"exact-resume RNG {relative_path!r} device state {index} cannot "
+                    f"be installed on {expected_device_type}:{index}"
+                ) from error
+    elif expected_device_type == "xla":
+        xm_seed = rng_state[device_rng_keys[expected_device_type]]
+        if type(xm_seed) is not int and type(xm_seed) is not torch.Tensor:
+            raise TypeError(
+                f"exact-resume RNG {relative_path!r} xm_seed must be an int or plain "
+                f"torch.Tensor, received {type(xm_seed).__name__}"
+            )
+
+
+def _is_prepared_model_artifact(path: str) -> bool:
+    """Recognize Accelerate model artifacts across plain, FSDP, and DeepSpeed."""
+    basename = path.rsplit("/", 1)[-1]
+    return (
+        basename in {"model.safetensors", "pytorch_model.bin"}
+        or (basename.startswith("pytorch_model_fsdp") and basename.endswith(".bin"))
+        or path.startswith("pytorch_model_fsdp_")
+        or (
+            path.startswith("pytorch_model/")
+            and "model_states" in basename.lower()
+            and "optim_states" not in basename.lower()
+        )
+    )
+
+
+def _is_optimizer_artifact(path: str) -> bool:
+    """Recognize standalone or backend-integrated Accelerate optimizer state."""
+    basename = path.rsplit("/", 1)[-1]
+    return (
+        basename == "optimizer.bin"
+        or (basename.startswith("optimizer_") and basename.endswith(".bin"))
+        or path.startswith("optimizer_")
+        # DeepSpeed stores optimizer shards inside its model checkpoint directory.
+        or (path.startswith("pytorch_model/") and "optim" in basename.lower())
+    )
 
 
 def _validate_metadata_header(

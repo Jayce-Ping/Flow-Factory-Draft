@@ -208,6 +208,7 @@ def test_failed_dataset_batch_does_not_publish_a_partial_epoch() -> None:
 
     assert trainer.events == ["set_epoch:0", "batch:[0, 1]", "batch:[2, 3]"]
     assert trainer.progress == TrainingProgress(optimizer_step=1)
+    assert trainer._acquisition_cycle_incomplete is True
 
 
 def test_dataset_driver_requires_official_distributed_sampler_on_one_process() -> None:

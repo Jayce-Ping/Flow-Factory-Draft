@@ -31,6 +31,13 @@ from flow_factory.models.variants import (
     ComponentVariantRegistry,
 )
 from flow_factory.trainers.abc import BaseTrainer
+from flow_factory.trainers.common.runtime_state import TrainerRuntimeState
+from flow_factory.trainers.distillation.tdm_r1 import (
+    SLOW_SURROGATE_SNAPSHOT,
+    TDMR1Trainer,
+)
+from flow_factory.trainers.execution import TrainingProgress
+from flow_factory.trainers.multirole import MULTIROLE_RUNTIME_CHILD_NAME
 from flow_factory.trainers.role_optimization import (
     OptimizationRole,
     RoleOptimizationCoordinator,
@@ -403,6 +410,63 @@ def test_registered_custom_state_defensively_revalidates_metadata() -> None:
         trainer._load_multirole_state_dict(state)
 
 
+def test_multirole_child_rejects_runtime_progress_mismatch_before_load() -> None:
+    """The primary-role counter cannot overwrite the runtime progress truth."""
+    trainer = _trainer_runtime("full")
+    trainer._register_multirole_checkpointing()
+    state = trainer._multirole_state_dict()
+
+    with pytest.raises(ValueError, match="optimizer_step=3.*trainer_step=0"):
+        trainer._multirole_checkpoint_state.validate_runtime_progress(
+            TrainingProgress(optimizer_step=3),
+            state,
+        )
+
+
+def test_safe_runtime_round_trip_replaces_accelerate_pickle_custom_state(
+    tmp_path: Path,
+) -> None:
+    """Real Accelerator state restores multi-role counters through safetensors."""
+    checkpoint = tmp_path / "checkpoint"
+    source = _trainer_runtime("full")
+    source.runtime_state = TrainerRuntimeState(child_names=(MULTIROLE_RUNTIME_CHILD_NAME,))
+    source._runtime_children_attached = False
+    source._register_multirole_checkpointing()
+    source.runtime_state.attach_child(
+        MULTIROLE_RUNTIME_CHILD_NAME,
+        source._multirole_checkpoint_state,
+    )
+    source._runtime_children_attached = True
+    _step_fake_role(source)
+    source.optimization_roles[BASE_VARIANT].step = 7
+    source.step = 7
+
+    source._save_exact_training_state(str(checkpoint))
+
+    assert not tuple(checkpoint.glob("custom_checkpoint_*.pkl"))
+    assert (checkpoint / "flow_factory_trainer_runtime.json").is_file()
+
+    target = _trainer_runtime("full")
+    target.runtime_state = TrainerRuntimeState(child_names=(MULTIROLE_RUNTIME_CHILD_NAME,))
+    target._runtime_children_attached = False
+    target._register_multirole_checkpointing()
+    children = {
+        MULTIROLE_RUNTIME_CHILD_NAME: target._multirole_checkpoint_state,
+    }
+    target.runtime_state.validate_load(
+        checkpoint,
+        children=children,
+        invariant_validator=target._validate_runtime_checkpoint_invariants,
+    )
+    target.adapter.load_checkpoint(str(checkpoint), resume_type="state")
+    target.runtime_state.commit_validated_load()
+    target._attach_runtime_children(children)
+
+    assert target.step == 7
+    assert target.optimization_roles[BASE_VARIANT].step == 7
+    assert target.optimization_roles["fake"].step == 1
+
+
 def test_canonical_save_writes_metadata_before_accelerate_mutates_state(tmp_path: Path) -> None:
     trainer = _trainer_runtime("full")
     trainer._register_multirole_checkpointing()
@@ -606,6 +670,42 @@ def test_snapshot_state_round_trip_is_exact_and_not_export_metadata() -> None:
             atol=0,
         )
     assert "old_surrogate" not in str(registry.metadata())
+
+
+def test_tdm_r1_predeclares_the_slow_snapshot_for_exact_resume_preflight() -> None:
+    """A fresh resume target exposes the same snapshot schema as its source."""
+    source_base = _trainer_runtime(
+        "full",
+        variant_names=("generator", "fake", "surrogate"),
+    )
+    source = object.__new__(TDMR1Trainer)
+    source.__dict__.update(source_base.__dict__)
+    source._initialize_snapshots()
+    source_registry = source.adapter.component_variant_registry
+    for parameter in source_registry.parameters("surrogate"):
+        parameter.data.add_(2)
+    source_registry.update_snapshot(SLOW_SURROGATE_SNAPSHOT, decay=0.25)
+    state = source._multirole_snapshot_state_dict()
+
+    target_base = _trainer_runtime(
+        "full",
+        variant_names=("generator", "fake", "surrogate"),
+    )
+    target = object.__new__(TDMR1Trainer)
+    target.__dict__.update(target_base.__dict__)
+    target._initialize_snapshots()
+
+    target._validate_multirole_snapshot_state(state)
+    target.adapter.component_variant_registry.load_snapshot_state_dict(state)
+    actual = target.adapter.component_variant_registry.snapshot_state_dict()
+    assert actual["update_counts"] == {SLOW_SURROGATE_SNAPSHOT: 1}
+    for name, expected in state["snapshots"][SLOW_SURROGATE_SNAPSHOT]["parameters"].items():
+        torch.testing.assert_close(
+            actual["snapshots"][SLOW_SURROGATE_SNAPSHOT]["parameters"][name],
+            expected,
+            rtol=0,
+            atol=0,
+        )
 
 
 def test_accelerate_round_trip_restores_the_old_surrogate_snapshot(tmp_path: Path) -> None:

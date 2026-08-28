@@ -68,7 +68,7 @@ def _trainer(**training_overrides: Any) -> DMD2Trainer:
     trainer.role_optimization = _FakeCoordinator()
     trainer.dataloader = None
     trainer._rollout_data_iter = None
-    trainer._rollout_dataloader_epoch = 0
+    trainer._rollout_batches_consumed = None
     trainer.step = 0
     trainer.epoch = 0
     return trainer

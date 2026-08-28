@@ -103,7 +103,7 @@ class DMD2Trainer(BaseTrainer):
         self.training_args: DMD2TrainingArguments
         self._validate_generation_schedule()
         self._rollout_data_iter: Optional[Iterator[Any]] = None
-        self._rollout_dataloader_epoch = 0
+        self._rollout_batches_consumed: Optional[int] = None
         non_ode = {
             name: scheduler.dynamics_type
             for name, scheduler in self.adapter.scheduler_group.items()

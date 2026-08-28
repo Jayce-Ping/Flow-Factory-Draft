@@ -114,7 +114,7 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
         super().__init__(accelerator=accelerator, config=config, adapter=adapter)
         self.training_args: TDMTrainingArguments
         self._rollout_data_iter: Iterator[Any] | None = None
-        self._rollout_dataloader_epoch = 0
+        self._rollout_batches_consumed: int | None = None
         self._validate_trajectory_configuration()
 
     def _init_reward_model(self) -> Tuple[Dict[str, object], Dict[str, object]]:

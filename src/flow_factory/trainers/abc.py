@@ -37,7 +37,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from accelerate import Accelerator
-from accelerate.utils import DistributedType, ProjectConfiguration, set_seed
+from accelerate.utils import DistributedType, ProjectConfiguration, gather_object, set_seed
 from diffusers.utils.outputs import BaseOutput
 from PIL import Image
 from torch.utils.data import DataLoader
@@ -77,9 +77,20 @@ from ..utils.base import (
     filter_kwargs,
     json_default,
 )
+from ..utils.checkpoint import (
+    HF_PATH_PREFIX,
+    download_hf_checkpoint,
+    parse_hf_checkpoint_path,
+)
 from ..utils.dist import gather_aligned_floating_tensors, reduce_loss_info
 from ..utils.logger_utils import setup_logger
 from ..utils.noise_schedule import TimeSampler
+from .common.runtime_identity import (
+    build_default_data_identity_payload,
+    build_default_execution_identity_payload,
+    build_trainer_runtime_identity,
+)
+from .common.runtime_state import TrainerRuntimeState
 from .common.sample_prefetch import iter_prefetched_batches
 from .execution import (
     AcquisitionDriver,
@@ -87,6 +98,7 @@ from .execution import (
     build_acquisition_driver,
 )
 from .multirole import (
+    MULTIROLE_RUNTIME_CHILD_NAME,
     MultiRoleBackendValidationMixin,
     MultiRoleCheckpointingMixin,
     configure_deepspeed_micro_batch_size,
@@ -114,6 +126,10 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
     # MUST override this; leaving it None disables lossy acceleration.
     paradigm: ClassVar[Optional[Literal["coupled", "decoupled", "distillation"]]] = None
     execution_contract: ClassVar[ExecutionContract] = ONLINE_EXECUTION_CONTRACT
+    runtime_child_names: ClassVar[Tuple[str, ...]] = ()
+
+    _ADAPTER_EMA_RUNTIME_CHILD = "adapter_ema"
+    _ADAPTER_REFERENCE_RUNTIME_CHILD = "adapter_reference"
 
     def __init__(
         self,
@@ -140,16 +156,24 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         self.adapter = adapter
         self._validate_adapter_execution_contract()
         self.load_coordinator = ModelLoadCoordinator(adapter, accelerator)
-        self.progress = TrainingProgress()
+        self.runtime_state = TrainerRuntimeState(child_names=self._declared_runtime_child_names())
+        self._runtime_children_attached = False
+        self._exact_resume_source_checkpoint: Optional[str] = None
+        self._exact_resume_boundary_pending = False
+        self._acquisition_cycle_active = False
+        self._acquisition_cycle_incomplete = False
         self.acquisition_driver: AcquisitionDriver = build_acquisition_driver(
             type(self).execution_contract
         )
         self._validate_execution_hooks()
 
         self._initialization()
+        self._realize_runtime_child_declarations()
+        self._initialize_adapter_runtime()
         self._initialize_snapshots()
         self._register_multirole_checkpointing()
-        self.adapter.post_init()
+        self.runtime_state.configure_identity(build_trainer_runtime_identity(self))
+        self._finalize_adapter_runtime()
         # Apply persistent stage='both' accelerators last: after prepare, state-resume,
         # EMA, and reference-parameter setup, so e.g. torch.compile wraps the final
         # weights and keeps state_dict keys / parameter identity stable.
@@ -176,12 +200,45 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         """Return the completed acquisition-cycle count for this trainer."""
         return self._get_progress().cycle_index(type(self).execution_contract.acquisition)
 
-    def _get_progress(self) -> TrainingProgress:
-        """Return typed progress for initialized and lightweight test trainers."""
-        progress = self.__dict__.get("progress")
+    @property
+    def progress(self) -> TrainingProgress:
+        """Return the single runtime-owned progress value.
+
+        Lightweight structural tests that construct a trainer without running
+        ``BaseTrainer.__init__`` retain a private fallback, but initialized trainers
+        never duplicate counters outside :class:`TrainerRuntimeState`.
+        """
+        runtime_state = self.__dict__.get("runtime_state")
+        if runtime_state is not None:
+            if not isinstance(runtime_state, TrainerRuntimeState):
+                raise TypeError(
+                    "expected runtime_state to be TrainerRuntimeState, received "
+                    f"{type(runtime_state).__name__}: {runtime_state!r}"
+                )
+            return runtime_state.progress
+        progress = self.__dict__.get("_lightweight_progress")
         if progress is None:
             progress = TrainingProgress()
-            self.__dict__["progress"] = progress
+            self.__dict__["_lightweight_progress"] = progress
+        return progress
+
+    @progress.setter
+    def progress(self, progress: TrainingProgress) -> None:
+        """Replace runtime progress without maintaining a second counter copy."""
+        if not isinstance(progress, TrainingProgress):
+            raise TypeError(
+                "expected trainer progress to be TrainingProgress, received "
+                f"{type(progress).__name__}: {progress!r}"
+            )
+        runtime_state = self.__dict__.get("runtime_state")
+        if runtime_state is None:
+            self.__dict__["_lightweight_progress"] = progress
+        else:
+            runtime_state.progress = progress
+
+    def _get_progress(self) -> TrainingProgress:
+        """Return typed progress for initialized and lightweight test trainers."""
+        progress = self.progress
         if not isinstance(progress, TrainingProgress):
             raise TypeError(
                 "expected trainer progress to be TrainingProgress, received "
@@ -243,6 +300,14 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
                 f"dataset trainer {type(self).__name__} must override optimize_batch(batch)"
             )
 
+    def runtime_execution_identity_payload(self) -> Dict[str, Any]:
+        """Return exact-resume objective semantics, extensible by trainers."""
+        return build_default_execution_identity_payload(self)
+
+    def runtime_data_identity_payload(self) -> Dict[str, Any]:
+        """Return exact-resume loader semantics, extensible by trainers."""
+        return build_default_data_identity_payload(self)
+
     def _validate_execution_contract(self) -> None:
         """Require trainer runtime and arguments to declare equal semantics."""
         type(self).validate_training_arguments_contract(self.training_args)
@@ -302,6 +367,295 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
 
     def _initialize_snapshots(self) -> None:
         """Initialize optional trainer-owned parameter snapshots before state resume."""
+
+    def _declared_runtime_child_names(self) -> Tuple[str, ...]:
+        """Declare every child whose state must participate in exact resume.
+
+        The declaration is configuration-derived and therefore available before
+        heavyweight initialization. Concrete trainers may add class-level names and
+        register matching objects during :meth:`_initialize_snapshots`.
+        """
+        algorithm_names = self._algorithm_runtime_child_names()
+        reserved_names = {
+            self._ADAPTER_EMA_RUNTIME_CHILD,
+            self._ADAPTER_REFERENCE_RUNTIME_CHILD,
+            MULTIROLE_RUNTIME_CHILD_NAME,
+        }
+        collisions = tuple(name for name in algorithm_names if name in reserved_names)
+        if collisions:
+            raise ValueError(
+                "algorithm runtime child names collide with framework-reserved names: "
+                f"collisions={collisions!r}, reserved={tuple(sorted(reserved_names))!r}"
+            )
+
+        names = []
+        if self.training_args.ema_decay > 0:
+            names.append(self._ADAPTER_EMA_RUNTIME_CHILD)
+        if self.training_args.requires_ref_model and self.model_args.finetune_type == "full":
+            names.append(self._ADAPTER_REFERENCE_RUNTIME_CHILD)
+        if len(self._required_trainable_roles()) > 1:
+            names.append(MULTIROLE_RUNTIME_CHILD_NAME)
+        names.extend(algorithm_names)
+        return tuple(names)
+
+    def _algorithm_runtime_child_names(self) -> Tuple[str, ...]:
+        """Return configuration-active trainer-owned checkpoint children.
+
+        Most algorithms declare a fixed class-level tuple. Algorithms whose
+        snapshots are conditional or data-driven may override this hook, while
+        retaining a declaration that is computable before heavyweight setup.
+        """
+        return type(self).runtime_child_names
+
+    def _realize_runtime_child_declarations(self) -> None:
+        """Refresh declarations after algorithms materialize their concrete roles."""
+        child_names = self._declared_runtime_child_names()
+        if child_names == self.runtime_state.child_names:
+            return
+        self.runtime_state = TrainerRuntimeState(
+            progress=self.runtime_state.progress,
+            child_names=child_names,
+        )
+
+    def register_runtime_child(self, name: str, child: Any) -> None:
+        """Register one trainer-owned child declared by ``runtime_child_names``.
+
+        This hook lets an algorithm build a reference/EMA snapshot after distributed
+        preparation while still attaching it only after an exact-resume payload has
+        been fully preflighted and committed.
+
+        Args:
+            name: Configuration-declared runtime child name.
+            child: Object implementing state, validation, and load methods.
+        """
+        declared_names = self._algorithm_runtime_child_names()
+        if name not in declared_names:
+            raise KeyError(
+                f"trainer runtime child {name!r} was not declared for this "
+                f"configuration; expected one of {declared_names!r}"
+            )
+        children = self.__dict__.setdefault("_trainer_runtime_children", {})
+        if name in children:
+            raise RuntimeError(f"trainer runtime child {name!r} is already registered")
+        children[name] = child
+
+    def _register_named_parameter_runtime_child(self, name: str) -> None:
+        """Register one realized adapter named-parameter snapshot for exact resume."""
+        named_parameters = getattr(self.adapter, "_named_parameters", None)
+        if not isinstance(named_parameters, dict):
+            raise TypeError(
+                "adapter named-parameter snapshots must be stored as a dict, received "
+                f"{type(named_parameters).__name__}"
+            )
+        if name not in named_parameters:
+            raise KeyError(
+                f"adapter named-parameter snapshot {name!r} was not initialized; "
+                f"available snapshots={tuple(named_parameters)!r}"
+            )
+        child = getattr(named_parameters[name], "ema_wrapper", None)
+        if child is None:
+            raise TypeError(
+                f"adapter named-parameter snapshot {name!r} has no checkpointable " "ema_wrapper"
+            )
+        self.register_runtime_child(name, child)
+
+    @contextmanager
+    def _suspend_adapter_state_resume(self) -> Iterator[None]:
+        """Let adapter post-init realize children without loading state itself."""
+        resume_path = self.model_args.resume_path
+        resume_type = self.model_args.resume_type
+        self.model_args.resume_path = None
+        self.model_args.resume_type = None
+        try:
+            yield
+        finally:
+            self.model_args.resume_path = resume_path
+            self.model_args.resume_type = resume_type
+
+    def _runtime_checkpoint_children(self) -> Dict[str, Any]:
+        """Return realized children in the immutable declaration order."""
+        children: Dict[str, Any] = {}
+        declared_names = self.runtime_state.child_names
+        if self._ADAPTER_EMA_RUNTIME_CHILD in declared_names:
+            children[self._ADAPTER_EMA_RUNTIME_CHILD] = self.adapter.ema_wrapper
+        if self._ADAPTER_REFERENCE_RUNTIME_CHILD in declared_names:
+            children[self._ADAPTER_REFERENCE_RUNTIME_CHILD] = self.adapter._ref_ema
+        if MULTIROLE_RUNTIME_CHILD_NAME in declared_names:
+            children[MULTIROLE_RUNTIME_CHILD_NAME] = self._multirole_checkpoint_state
+        children.update(self.__dict__.get("_trainer_runtime_children", {}))
+
+        missing = tuple(name for name in declared_names if children.get(name) is None)
+        unexpected = tuple(name for name in children if name not in declared_names)
+        if missing or unexpected:
+            raise RuntimeError(
+                "trainer runtime children do not match their declaration: "
+                f"missing={missing!r}, unexpected={unexpected!r}"
+            )
+        return {name: children[name] for name in declared_names}
+
+    def _attach_runtime_children(self, children: Dict[str, Any]) -> None:
+        """Attach every prevalidated child exactly once after state restoration."""
+        if self._runtime_children_attached:
+            raise RuntimeError("trainer runtime children are already attached")
+        for name in self.runtime_state.child_names:
+            self.runtime_state.attach_child(name, children[name])
+        self._runtime_children_attached = True
+
+    def _validate_runtime_checkpoint_invariants(
+        self,
+        progress: TrainingProgress,
+        child_states: Dict[str, Any],
+    ) -> None:
+        """Validate cross-child counter invariants before prepared-state mutation."""
+        if MULTIROLE_RUNTIME_CHILD_NAME in child_states:
+            self._multirole_checkpoint_state.validate_runtime_progress(
+                progress,
+                child_states[MULTIROLE_RUNTIME_CHILD_NAME],
+            )
+
+    def _validate_distributed_runtime_children(self) -> None:
+        """Reject auxiliary state that lacks a distributed-aware gather contract."""
+        distributed_type = getattr(getattr(self, "accelerator", None), "distributed_type", None)
+        if distributed_type is not DistributedType.FSDP:
+            return
+        unsafe_children = [
+            name
+            for name in (
+                self._ADAPTER_EMA_RUNTIME_CHILD,
+                self._ADAPTER_REFERENCE_RUNTIME_CHILD,
+            )
+            if name in self.runtime_state.child_names
+        ]
+        unsafe_children.extend(
+            name
+            for name in self._algorithm_runtime_child_names()
+            if name in self.runtime_state.child_names
+        )
+        registry = getattr(self.adapter, "component_variant_registry", None)
+        snapshots = getattr(registry, "_snapshots", {})
+        if snapshots:
+            unsafe_children.append("multirole_variant_snapshots")
+        if unsafe_children:
+            raise RuntimeError(
+                "exact state checkpointing under FSDP requires a "
+                "distributed-aware gather/restore implementation for auxiliary tensors; "
+                f"unsupported runtime children={tuple(unsafe_children)!r}. Model-only "
+                "checkpoints remain supported."
+            )
+
+    def _validate_runtime_child_coverage(self) -> None:
+        """Reject adapter snapshots that an exact checkpoint would silently omit."""
+        named_parameters = getattr(self.adapter, "_named_parameters", {})
+        if not named_parameters:
+            return
+        if not isinstance(named_parameters, dict):
+            raise TypeError(
+                "adapter named-parameter snapshots must be stored as a dict, received "
+                f"{type(named_parameters).__name__}"
+            )
+        tracked_children = self._runtime_checkpoint_children()
+        tracked_identities = {id(child) for child in tracked_children.values()}
+        untracked_names = tuple(
+            name
+            for name, info in named_parameters.items()
+            if id(getattr(info, "ema_wrapper", None)) not in tracked_identities
+        )
+        if untracked_names:
+            raise RuntimeError(
+                "exact state checkpointing would omit adapter named-parameter snapshots "
+                f"{untracked_names!r}; declare runtime_child_names and register each wrapper "
+                "during _initialize_snapshots(), or save model weights only"
+            )
+
+    def _initialize_adapter_runtime(self) -> None:
+        """Run adapter post-init while deferring only exact prepared-state loading."""
+        state_resume = bool(self.model_args.resume_path and self.model_args.resume_type == "state")
+        if state_resume:
+            # Reject declaration-known FSDP auxiliary state before allocating late
+            # EMA/reference snapshots. Variant snapshots are checked again after
+            # their algorithm hook materializes them.
+            self._validate_distributed_runtime_children()
+            # BaseAdapter.post_init historically performs load-before-EMA. Temporarily
+            # suppress only that load so the same hook still realizes all late children;
+            # the trainer then owns the preflight/load/commit boundary below.
+            with self._suspend_adapter_state_resume():
+                self.adapter.post_init()
+        else:
+            self.adapter.post_init()
+
+    @staticmethod
+    def _resolve_exact_state_checkpoint_path(path: str) -> str:
+        """Resolve exact-state input without an internal distributed barrier.
+
+        Rank-local resolution failures are synchronized by the caller before any
+        prepared state mutates. The adapter's general resolver intentionally ends in
+        a barrier after an HF download, which is useful for ordinary weight loading
+        but would hide an asymmetric failure from that preflight error gather.
+        """
+        path = os.path.expanduser(path)
+        force_hf = path.startswith(HF_PATH_PREFIX)
+        if not force_hf and os.path.exists(path):
+            return path
+        repo_id, subfolder, revision = parse_hf_checkpoint_path(path)
+        return download_hf_checkpoint(repo_id, subfolder, revision)
+
+    def _finalize_adapter_runtime(self) -> None:
+        """Execute exact-resume preflight/load/commit after all children exist."""
+        state_resume = bool(self.model_args.resume_path and self.model_args.resume_type == "state")
+        if state_resume:
+            children: Dict[str, Any] = {}
+            resume_path = ""
+            preflight_error = None
+            try:
+                children = self._runtime_checkpoint_children()
+                self._validate_distributed_runtime_children()
+                resume_path = self._resolve_exact_state_checkpoint_path(self.model_args.resume_path)
+                self.runtime_state.validate_load(
+                    resume_path,
+                    children=children,
+                    invariant_validator=self._validate_runtime_checkpoint_invariants,
+                    expected_process_index=self.accelerator.process_index,
+                    expected_device_type=self.accelerator.device.type,
+                )
+            except Exception as error:
+                preflight_error = error
+            self._synchronize_checkpoint_phase_error("resume preflight", preflight_error)
+
+            core_load_error = None
+            try:
+                # The public adapter wrapper adds an unconditional trailing barrier.
+                # Invoke the already-resolved prepared-state primitive directly so a
+                # rank-local exception can reach the error gather below instead of
+                # leaving successful peers blocked at that barrier.
+                self.adapter._load_training_state(resume_path)
+            except Exception as error:
+                core_load_error = error
+            self._synchronize_checkpoint_phase_error(
+                "Accelerator artifact load",
+                core_load_error,
+            )
+            runtime_commit_error = None
+            try:
+                self.runtime_state.commit_validated_load()
+                self._attach_runtime_children(children)
+            except Exception as error:
+                runtime_commit_error = error
+            self._synchronize_checkpoint_phase_error(
+                "runtime child commit",
+                runtime_commit_error,
+            )
+            self._exact_resume_source_checkpoint = self._canonical_checkpoint_path(resume_path)
+            self._exact_resume_boundary_pending = (
+                type(self).execution_contract.acquisition is AcquisitionMode.GENERATION
+            )
+        else:
+            children = self._runtime_checkpoint_children()
+            self._attach_runtime_children(children)
+
+    @staticmethod
+    def _canonical_checkpoint_path(path: str) -> str:
+        """Return a symlink-resolved absolute checkpoint identity."""
+        return os.path.realpath(os.path.abspath(os.path.expanduser(os.fspath(path))))
 
     def should_continue_training(self) -> bool:
         """Continue until the active acquisition cycle reaches ``max_epochs``."""
@@ -1076,35 +1430,85 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
             if contract.acquisition is AcquisitionMode.GENERATION:
                 self._run_periodic_cycle_boundaries()
 
-            driver.run_cycle(self, self._get_progress())
-
-            if contract.acquisition is AcquisitionMode.GENERATION:
-                self.adapter.ema_step(step=self.cycle_index)
-            self._after_optimizer_step()
-            self.progress = self._get_progress().advance_acquisition(
-                contract.acquisition,
-                completed=True,
-            )
+            self._acquisition_cycle_active = True
+            self._acquisition_cycle_incomplete = True
+            try:
+                driver.run_cycle(self, self._get_progress())
+                if contract.acquisition is AcquisitionMode.GENERATION:
+                    self.adapter.ema_step(step=self.cycle_index)
+                self._after_acquisition_cycle()
+                self.progress = self._get_progress().advance_acquisition(
+                    contract.acquisition,
+                    completed=True,
+                )
+                self._acquisition_cycle_incomplete = False
+            finally:
+                self._acquisition_cycle_active = False
 
             if contract.acquisition is AcquisitionMode.DATASET:
                 self._run_periodic_cycle_boundaries()
 
     def _run_periodic_cycle_boundaries(self) -> None:
-        """Run save and evaluation actions at the completed-cycle index."""
-        if (
+        """Run acquisition-specific save/evaluation ordering at a cycle boundary.
+
+        Online training preserves its pre-rollout save-then-evaluate cadence. Offline
+        evaluation runs first so an exact checkpoint captures the post-evaluation RNG
+        that will precede the next data epoch; model-only saves follow the same visible
+        boundary ordering without claiming exact RNG restoration.
+        """
+        should_save = (
             self.log_args.save_freq > 0
             and self.cycle_index % self.log_args.save_freq == 0
             and self.log_args.save_dir
-        ):
+        )
+        save_dir = None
+        save_target = None
+        if should_save:
             save_dir = os.path.join(
                 self.log_args.save_dir,
                 str(self.log_args.run_name),
                 "checkpoints",
             )
+            save_target = os.path.join(save_dir, f"checkpoint-{self.cycle_index}")
+
+        should_evaluate = (
+            self.eval_args.eval_freq > 0 and self.cycle_index % self.eval_args.eval_freq == 0
+        )
+
+        def save() -> None:
+            if save_dir is None:
+                return
+            if self._should_skip_duplicate_resume_source_checkpoint(save_target):
+                return
             self.save_checkpoint(save_dir, epoch=self.cycle_index)
 
-        if self.eval_args.eval_freq > 0 and self.cycle_index % self.eval_args.eval_freq == 0:
-            self.evaluate()
+        acquisition = type(self).execution_contract.acquisition
+        if acquisition is AcquisitionMode.DATASET:
+            if should_evaluate:
+                self.evaluate()
+            save()
+        else:
+            save()
+            if should_evaluate:
+                self.evaluate()
+            if getattr(self, "_exact_resume_boundary_pending", False):
+                self._exact_resume_boundary_pending = False
+
+    def _should_skip_duplicate_resume_source_checkpoint(
+        self,
+        save_target: Optional[str],
+    ) -> bool:
+        """Skip only the first online boundary that resolves to its resume source."""
+        if (
+            type(self).execution_contract.acquisition is not AcquisitionMode.GENERATION
+            or not getattr(self, "_exact_resume_boundary_pending", False)
+            or save_target is None
+        ):
+            return False
+        resume_source = getattr(self, "_exact_resume_source_checkpoint", None)
+        if resume_source is None:
+            return False
+        return self._canonical_checkpoint_path(save_target) == resume_source
 
     def set_trajectory_seed(self, seed: int) -> None:
         """Set the adapter seed for one generated acquisition.
@@ -1152,11 +1556,12 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         """
         yield
 
-    def _after_optimizer_step(self) -> None:
-        """Update algorithm-owned auxiliary weights after the optimizer step.
+    def _after_acquisition_cycle(self) -> None:
+        """Update algorithm-owned state after one complete acquisition cycle.
 
-        EMA is handled by the loop; this is for extra snapshots an algorithm keeps
-        alongside it, such as CRD's old model and sampling model.
+        Generated acquisition calls this once per rollout iteration; dataset
+        acquisition calls it once per complete dataloader epoch. Per-update state
+        belongs in :meth:`_after_gradient_step` instead.
         """
 
     def prepare_feedback(self, samples: List[BaseSample]) -> None:
@@ -1339,9 +1744,9 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
     def _after_gradient_step(self) -> None:
         """Update per-optimizer-step auxiliary weights before metrics are logged.
 
-        Distinct from :meth:`_after_optimizer_step`, which runs once per epoch;
-        this runs on every optimizer step, which is the cadence DGPO's fast
-        reference EMA needs.
+        Distinct from :meth:`_after_acquisition_cycle`, which runs after a complete
+        rollout iteration or dataloader epoch; this runs on every optimizer step,
+        which is the cadence DGPO's fast reference EMA needs.
         """
 
     def _velocity_kl(
@@ -1770,7 +2175,203 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
 
         self.accelerator.wait_for_everyone()
 
-    def save_checkpoint(self, save_directory: str, epoch: Optional[int] = None):
+    @staticmethod
+    def _state_checkpoint_staging_directory(save_directory: str) -> str:
+        """Return the deterministic sibling used for atomic state publication."""
+        normalized = os.path.normpath(save_directory)
+        parent, basename = os.path.split(normalized)
+        if not basename or basename in (".", ".."):
+            raise ValueError(
+                "state checkpoint destination must name a concrete directory, "
+                f"received {save_directory!r}"
+            )
+        return os.path.join(parent, f".{basename}.flow-factory-staging")
+
+    @staticmethod
+    def _state_checkpoint_publish_claim(save_directory: str) -> str:
+        """Return the sibling lock coordinating local-main publishers."""
+        normalized = os.path.normpath(save_directory)
+        parent, basename = os.path.split(normalized)
+        if not basename or basename in (".", ".."):
+            raise ValueError(
+                "state checkpoint destination must name a concrete directory, "
+                f"received {save_directory!r}"
+            )
+        return os.path.join(parent, f".{basename}.flow-factory-publish-claim")
+
+    def _synchronize_checkpoint_phase_error(
+        self,
+        phase: str,
+        error: Exception | None,
+    ) -> None:
+        """Make every rank leave a failed checkpoint phase without a barrier hang."""
+        process_index = getattr(self.accelerator, "process_index", 0)
+        payload = (
+            None
+            if error is None
+            else {
+                "rank": process_index,
+                "type": type(error).__name__,
+                "message": str(error),
+            }
+        )
+        if getattr(self.accelerator, "num_processes", 1) <= 1:
+            if error is not None:
+                raise error
+            return
+        gathered = gather_object([payload])
+        failures = tuple(item for item in gathered if item is not None)
+        if not failures:
+            return
+        message = f"exact state checkpoint {phase} failed across ranks: {failures!r}"
+        if error is not None:
+            raise RuntimeError(message) from error
+        raise RuntimeError(message)
+
+    def _claim_state_checkpoint_publication(self, claim_path: str) -> bool:
+        """Elect one publisher per visible filesystem using an atomic claim file."""
+        os.makedirs(os.path.dirname(claim_path) or ".", exist_ok=True)
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        try:
+            descriptor = os.open(claim_path, flags, 0o600)
+        except FileExistsError:
+            return False
+        try:
+            owner = f"rank={getattr(self.accelerator, 'process_index', 0)}\n".encode("utf-8")
+            os.write(descriptor, owner)
+        finally:
+            os.close(descriptor)
+        return True
+
+    def _save_exact_training_state(self, save_directory: str) -> None:
+        """Write Accelerator artifacts, commit a manifest, then publish atomically."""
+        staging_directory = ""
+        publish_claim = ""
+        preflight_error = None
+        try:
+            if getattr(getattr(self.accelerator, "device", None), "type", None) == "mps":
+                raise RuntimeError(
+                    "exact state checkpoints are unsupported on MPS because Accelerate "
+                    "does not serialize the MPS RNG state required for exact resume; "
+                    "set log.save_model_only=true to save resumable model weights"
+                )
+            if getattr(self, "_acquisition_cycle_active", False) or getattr(
+                self,
+                "_acquisition_cycle_incomplete",
+                False,
+            ):
+                raise RuntimeError(
+                    "exact state checkpoints require a complete acquisition boundary; "
+                    "the current rollout iteration or data epoch is active or ended partially"
+                )
+            self._validate_distributed_runtime_children()
+            self._validate_runtime_child_coverage()
+            staging_directory = self._state_checkpoint_staging_directory(save_directory)
+            publish_claim = self._state_checkpoint_publish_claim(save_directory)
+            if os.path.lexists(save_directory):
+                raise FileExistsError(
+                    "exact state checkpoints are immutable and cannot overwrite an existing "
+                    f"destination: {save_directory!r}"
+                )
+            if os.path.lexists(staging_directory):
+                raise FileExistsError(
+                    "exact state checkpoint staging already exists, likely from an interrupted "
+                    f"save; inspect or remove it explicitly before retrying: {staging_directory!r}"
+                )
+            if os.path.lexists(publish_claim):
+                raise FileExistsError(
+                    "exact state checkpoint publication claim already exists, likely from an "
+                    f"interrupted save; inspect or remove it explicitly: {publish_claim!r}"
+                )
+        except Exception as error:
+            preflight_error = error
+        self._synchronize_checkpoint_phase_error("preflight", preflight_error)
+        self.accelerator.wait_for_everyone()
+
+        save_on_each_node = self.accelerator.project_configuration.save_on_each_node
+        should_publish = False
+        global_claim_error = None
+        if self.accelerator.is_main_process:
+            try:
+                should_publish = self._claim_state_checkpoint_publication(publish_claim)
+                if not should_publish:
+                    raise FileExistsError(
+                        "exact state checkpoint publication was claimed by a concurrent "
+                        f"writer after preflight: {publish_claim!r}"
+                    )
+            except Exception as error:
+                global_claim_error = error
+        self._synchronize_checkpoint_phase_error("global publisher election", global_claim_error)
+
+        local_claim_error = None
+        if (
+            save_on_each_node
+            and self.accelerator.is_local_main_process
+            and not self.accelerator.is_main_process
+        ):
+            try:
+                should_publish = self._claim_state_checkpoint_publication(publish_claim)
+            except Exception as error:
+                local_claim_error = error
+        self._synchronize_checkpoint_phase_error("node publisher election", local_claim_error)
+
+        # On a shared path, the global-main claim is visible to every node and the
+        # other local mains lose election. Disable their generic Accelerate writes
+        # while preserving per-node writes when each node sees its own filesystem.
+        override_node_save = save_on_each_node and self.accelerator.is_local_main_process
+        if override_node_save:
+            self.accelerator.project_configuration.save_on_each_node = should_publish
+        core_save_error = None
+        try:
+            self.adapter.save_checkpoint(
+                save_directory=staging_directory,
+                model_only=False,
+                include_training_roles=True,
+            )
+        except Exception as error:
+            core_save_error = error
+        finally:
+            if override_node_save:
+                self.accelerator.project_configuration.save_on_each_node = save_on_each_node
+        self._synchronize_checkpoint_phase_error("Accelerator artifact save", core_save_error)
+        # FSDP/DeepSpeed may finish rank-local shard writes after the main process
+        # returns from its own save call. Hash only after every rank has arrived.
+        self.accelerator.wait_for_everyone()
+
+        manifest_error = None
+        if should_publish:
+            try:
+                self.runtime_state.prepare_save(staging_directory)
+            except Exception as error:
+                manifest_error = error
+        self._synchronize_checkpoint_phase_error("runtime manifest", manifest_error)
+        self.accelerator.wait_for_everyone()
+
+        publication_error = None
+        if should_publish:
+            try:
+                os.replace(staging_directory, save_directory)
+            except Exception as error:
+                publication_error = error
+        self._synchronize_checkpoint_phase_error("atomic publication", publication_error)
+
+        # Keep every filesystem's claim until every publisher has installed its
+        # final directory. If one node fails, successful nodes retain an explicit
+        # claim beside their final checkpoint instead of looking independently
+        # retryable while another node still has only staging artifacts.
+        claim_cleanup_error = None
+        if should_publish:
+            try:
+                os.unlink(publish_claim)
+            except Exception as error:
+                claim_cleanup_error = error
+        self._synchronize_checkpoint_phase_error(
+            "publication claim cleanup",
+            claim_cleanup_error,
+        )
+        self.accelerator.wait_for_everyone()
+
+    def save_checkpoint(self, save_directory: str, epoch: Optional[int] = None) -> None:
         """Save trainer state to a specific path.
 
         A periodic checkpoint exists to be resumed from, so it carries the
@@ -1781,11 +2382,14 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         if epoch is not None:
             save_directory = os.path.join(save_directory, f"checkpoint-{epoch}")
 
-        self.adapter.save_checkpoint(
-            save_directory=save_directory,
-            model_only=self.log_args.save_model_only,
-            include_training_roles=True,
-        )
+        if self.log_args.save_model_only:
+            self.adapter.save_checkpoint(
+                save_directory=save_directory,
+                model_only=True,
+                include_training_roles=True,
+            )
+        else:
+            self._save_exact_training_state(save_directory)
 
         self.accelerator.wait_for_everyone()
 
@@ -1793,8 +2397,14 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         self,
         path: str,
         resume_type: Optional[Literal["lora", "full", "state"]] = None,
-    ):
+    ) -> None:
         """Load trainer state from a specific path."""
+        if resume_type == "state":
+            raise RuntimeError(
+                "exact training-state resume must be configured through model.resume_path "
+                "and model.resume_type='state' before trainer construction, so runtime "
+                "identity and child state can be validated before any prepared state mutates"
+            )
         self.adapter.load_checkpoint(
             path=path,
             strict=True,

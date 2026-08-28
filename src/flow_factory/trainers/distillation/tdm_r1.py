@@ -81,6 +81,11 @@ class TDMR1Trainer(TDMTrainer):
         super().__init__(accelerator=accelerator, config=config, adapter=adapter)
         self.training_args: TDMR1TrainingArguments
 
+    def _initialize_snapshots(self) -> None:
+        """Declare the slow surrogate before exact-state compatibility preflight."""
+        super()._initialize_snapshots()
+        self.adapter.declare_variant_snapshot("surrogate", SLOW_SURROGATE_SNAPSHOT)
+
     def _init_reward_model(self):
         """Use train-time rewards instead of TDM's reward-free runtime."""
         return BaseTrainer._init_reward_model(self)
@@ -150,7 +155,7 @@ class TDMR1Trainer(TDMTrainer):
         record_distillation_metric(self, "train/surrogate_slow_decay", decay)
 
     def _ensure_slow_surrogate(self) -> None:
-        """Create the trust-region snapshot after trainable roles exist."""
+        """Retain lazy compatibility for lightweight, non-constructor test hosts."""
         if not self.adapter.has_variant_snapshot(SLOW_SURROGATE_SNAPSHOT):
             self.adapter.declare_variant_snapshot("surrogate", SLOW_SURROGATE_SNAPSHOT)
 
