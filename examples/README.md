@@ -89,9 +89,10 @@ The T2VA `debug.yaml` recipe is real-weight validated with the 61 GB checkpoint
 1 GPU and 16 GPUs across two nodes completed CPS rollout, video/audio decode,
 CLAP reward, GRPO replay/backward/optimizer step, and LoRA checkpoint save/resume.
 Its 64x96 canvas is intentionally a correctness geometry. The quality-oriented T2VA
-default remains an unverified quality starting point. FL2VA and Ref2VA are
-**Schema/API validated only** rather than claims of training stability or reward
-improvement.
+default is now the shared-`vid_prompt`, LoRA-rank-64 baseline aligned with the LTX2
+T2AV recipe and uses both CLAP and ImageBind rewards. It is configuration/API
+validated; no completed long-run reward trend is claimed. FL2VA and Ref2VA are also
+**Schema/API validated only**, rather than claims of training stability or reward improvement.
 
 The T2VA `quality_720p_fsdp2.yaml` recipe is the active native-quality path:
 768x1344, 124 frames, 24 denoising steps, LoRA rank 64 / alpha 128, and two
@@ -99,9 +100,9 @@ updates from 48 prompt groups per epoch. Its real-weight FSDP2 initialization,
 checkpoint, native-resolution decode, and CLAP evaluation are validated; a
 completed long-run reward trend is not yet claimed.
 
-FL2VA and Ref2VA use Meta ImageBind for audio-video alignment. Install ImageBind
-and PyTorchVideo from their upstream repositories before running those examples;
-ImageBind is licensed CC-BY-NC-SA 4.0 (NonCommercial).
+The aligned T2VA default, FL2VA, and Ref2VA use Meta ImageBind for audio-video
+alignment. Install ImageBind and PyTorchVideo from their upstream repositories before
+running those examples; ImageBind is licensed CC-BY-NC-SA 4.0 (NonCommercial).
 
 ```bash
 pip install git+https://github.com/facebookresearch/ImageBind.git

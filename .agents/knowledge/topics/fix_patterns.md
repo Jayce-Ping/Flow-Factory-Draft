@@ -190,6 +190,14 @@ Based on the fix type, write the fix entry to the appropriate document:
 - **Lesson**: When delegating sharding to an official sampler, define epoch semantics over its realized finite loader. Distinguish sampler-level repeated indices from optimizer-level synthetic padding.
 - **Related Constraint**: #9
 
+### Recipe migrations must move tests and documentation with the config
+- **Date**: 2026-08-28
+- **Symptom**: Rebasing onto the precision-aware loading branch changed the MiniMax H3 T2VA default to the shared `vid_prompt` source, added ImageBind routing, and removed its old unvalidated warning, while the executable example test and user guides still required the prior dataset and wording.
+- **Root Cause**: The recipe-only commit updated YAML semantics without treating example assertions, dataset links, dependency notes, and validation-status language as one public workflow contract.
+- **Fix**: The T2VA default test now locks the shared TXT manifests and CLAP/ImageBind routing while retaining the dedicated JSONL fixture check for the validated debug recipe. The example and dataset guides now describe the shared source, ImageBind dependency, and the exact evidence boundary without claiming a completed long run.
+- **Lesson**: An example configuration is executable documentation. Any recipe migration must update its production parse test, linked data provenance, optional dependency instructions, and validation claims in the same integration change.
+- **Related Constraint**: #15
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

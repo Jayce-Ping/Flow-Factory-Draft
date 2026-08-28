@@ -321,8 +321,10 @@ T2VA `debug.yaml` is real-weight validated on 1 and 16 GPUs, including LoRA
 checkpoint save/resume. Its 64x96 canvas validates
 correctness and memory fit, not visual quality or reward improvement.
 `quality_720p_fsdp2.yaml` has real-weight initialization, checkpoint, native-resolution
-decode, and evaluation coverage; no long-run reward trend is claimed. The default,
-FL2VA, and Ref2VA configs remain schema/API-validated starting points.
+decode, and evaluation coverage; no long-run reward trend is claimed. The aligned default uses
+the shared `dataset/vid_prompt` source, LoRA rank 64, and CLAP plus ImageBind rewards; it remains a
+configuration/API-validated baseline without a published long-run trend. FL2VA and Ref2VA remain
+schema/API-validated starting points.
 
 ### T2VA: `minimax-h3-t2va`
 
@@ -332,9 +334,11 @@ T2VA is prompt-only:
 {"prompt":"A small paper windmill turns beside a quiet stream with synchronized birdsong."}
 ```
 
-Do not include negative prompts, images, or references. Use the
-[T2VA dataset fixture](../dataset/minimax_h3_t2va/train.jsonl) with the
-[T2VA GRPO configuration](../examples/grpo/lora/minimax_h3_t2va/default.yaml).
+Do not include negative prompts, images, or references. The
+[T2VA default GRPO configuration](../examples/grpo/lora/minimax_h3_t2va/default.yaml) uses the
+shared [`vid_prompt` TXT dataset](../dataset/vid_prompt/train.txt). The dedicated
+[T2VA JSONL fixture](../dataset/minimax_h3_t2va/train.jsonl) remains the compact input for the
+real-weight validated `debug.yaml` recipe.
 
 ### FL2VA: `minimax-h3-fl2va`
 

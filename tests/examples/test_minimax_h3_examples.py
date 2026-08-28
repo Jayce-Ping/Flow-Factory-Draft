@@ -89,6 +89,15 @@ def test_examples_parse_through_production_config_and_registry(
     assert "N + 1 states and exactly N trainable transitions" in yaml_text
     assert "B=1" in yaml_text
     assert "no CFG" in yaml_text
+    if directory == "minimax_h3_t2va":
+        assert "not been run with the 61 GB checkpoint" not in yaml_text
+        assert [reward.reward_model for reward in config.reward_args] == [
+            "clap",
+            "imagebind",
+        ]
+        assert all(reward.applicable_datasets == ["vid_prompt"] for reward in config.reward_args)
+    else:
+        assert "not been run with the 61 GB checkpoint" in yaml_text
     assert "stg_scale" not in yaml_text
     assert "modality_scale" not in yaml_text
     assert "negative_prompt" not in yaml_text
@@ -120,10 +129,20 @@ def test_t2va_validated_variants_parse(
 
 
 def test_t2va_manifests_contain_prompt_only() -> None:
+    """Keep the dedicated JSONL fixture used by the validated debug recipe strict."""
     for split in ("train", "test"):
         rows = _read_jsonl(ROOT / "dataset/minimax_h3_t2va" / f"{split}.jsonl")
         assert rows
         assert all(set(row) == {"prompt"} and row["prompt"] for row in rows)
+
+
+def test_t2va_default_shared_text_manifests_contain_prompts() -> None:
+    """The aligned default recipe uses the shared prompt-only TXT dataset."""
+    for split in ("train", "test"):
+        prompts = (ROOT / "dataset/vid_prompt" / f"{split}.txt").read_text(encoding="utf-8")
+        lines = prompts.splitlines()
+        assert lines
+        assert all(prompt.strip() for prompt in lines)
 
 
 def test_fl2va_manifests_preserve_one_or_two_ordered_images() -> None:
