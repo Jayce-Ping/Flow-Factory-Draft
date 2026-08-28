@@ -20,7 +20,7 @@ import math
 import os
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -32,8 +32,15 @@ from torch.nn.utils.rnn import pad_sequence
 
 import diffusers
 
+from ...contracts import (
+    BatchCapability,
+    GeometrySource,
+    InputMediaOrder,
+    MediaType,
+    NegativePromptPolicy,
+)
 from ...hparams import *
-from ...samples import I2ISample
+from ...samples import I2ISample, LatentState
 from ...scheduler import (
     FlowMatchEulerDiscreteSDEScheduler,
     FlowMatchEulerDiscreteSDESchedulerOutput,
@@ -60,6 +67,20 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ..configured_image_output import ConfiguredImageOutputCodec
+from ..output_state import (
+    DecodedMediaBatch,
+    EncodedOutputState,
+    GeometrySignature,
+    MediaGeometrySignature,
+    OutputStateCodec,
+)
+from ..pipeline_contracts import image_output_contract
+from ._output import (
+    encode_qwen_output_images,
+    encode_qwen_vae_image,
+    parse_qwen_condition_sizes,
+)
 from ._utils import _pad_seq_dim
 
 logger = setup_logger(__name__)
@@ -81,21 +102,6 @@ class QwenImageEditPlusSample(I2ISample):
     image_latents: Optional[torch.Tensor] = None
 
 
-def retrieve_latents(
-    encoder_output: torch.Tensor,
-    generator: Optional[torch.Generator] = None,
-    sample_mode: str = "sample",
-):
-    if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
-        return encoder_output.latent_dist.sample(generator)
-    elif hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
-        return encoder_output.latent_dist.mode()
-    elif hasattr(encoder_output, "latents"):
-        return encoder_output.latents
-    else:
-        raise AttributeError("Could not access latents of provided encoder_output")
-
-
 def calculate_dimensions(target_area, ratio):
     # Calculate width and height based on target area and aspect ratio (height / width)
     height = math.sqrt(target_area * ratio)
@@ -107,6 +113,69 @@ def calculate_dimensions(target_area, ratio):
     return width, height
 
 
+@dataclass(frozen=True, slots=True)
+class _QwenImageEditOutputStateCodec:
+    """Encode targets at the input-derived geometry used by Qwen Edit Plus."""
+
+    adapter: "QwenImageEditPlusAdapter"
+    required_components: ClassVar[Tuple[str, ...]] = ("vae",)
+
+    def encode_output_state(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Mapping[str, Any],
+        generator: Optional[torch.Generator] = None,
+    ) -> EncodedOutputState:
+        """Resolve output aspect ratio from the last reference, then VAE encode."""
+        if len(media_batch) != 1:
+            raise ValueError(
+                "Qwen-Image-Edit-Plus output codec supports exactly one sample per batch, "
+                f"received {len(media_batch)}"
+            )
+        images = ConfiguredImageOutputCodec._extract_images(media_batch)
+        height, width = self.adapter._condition_derived_output_geometry(condition)
+        pixel_values = self.adapter.pipeline.image_processor.preprocess(
+            images,
+            height=height,
+            width=width,
+        )
+        ConfiguredImageOutputCodec._validate_pixel_values(
+            pixel_values,
+            1,
+            height,
+            width,
+        )
+        vae_dtype = getattr(self.adapter.vae, "dtype", None)
+        if not isinstance(vae_dtype, torch.dtype) or not vae_dtype.is_floating_point:
+            raise TypeError(
+                "Qwen-Image-Edit-Plus output codec expected VAE floating dtype, "
+                f"received {vae_dtype!r}"
+            )
+        pixel_values = pixel_values.to(device=self.adapter.device, dtype=vae_dtype)
+        encoded_image = encode_qwen_output_images(
+            self.adapter,
+            pixel_values,
+            condition,
+            generator,
+            condition_sizes_key="vae_image_sizes",
+        )
+        signature = GeometrySignature(
+            media=(
+                MediaGeometrySignature(
+                    type=MediaType.IMAGE,
+                    height=height,
+                    width=width,
+                ),
+            )
+        )
+        return EncodedOutputState(
+            clean_state=LatentState({"latent": encoded_image.latents}),
+            forward_context=encoded_image.forward_context,
+            decode_context={"height": height, "width": width},
+            geometry_signatures=(signature,),
+        )
+
+
 class QwenImageEditPlusAdapter(BaseAdapter):
     """Adapter for Qwen-Image-Edit Plus text-to-image models."""
 
@@ -114,6 +183,14 @@ class QwenImageEditPlusAdapter(BaseAdapter):
     # embedder receives no gradient and DDP must scan for unused parameters.
     ddp_find_unused_parameters = True
     supports_diffusers_cache = True
+    pipeline_io_contract = image_output_contract(
+        negative_prompt=NegativePromptPolicy.OPTIONAL,
+        input_image_min_count=1,
+        input_image_max_count=None,
+        input_order=InputMediaOrder.WITHIN_TYPE,
+        geometry_source=GeometrySource.INPUT_MEDIA,
+        batch_capability=BatchCapability.SINGLE_SAMPLE,
+    )
 
     def __init__(self, config: Arguments, accelerator: Accelerator):
         if not is_version_at_least("diffusers", "0.37.0"):
@@ -137,9 +214,111 @@ class QwenImageEditPlusAdapter(BaseAdapter):
 
     def load_pipeline(self) -> QwenImageEditPlusPipeline:
         return self._load_diffusers_pipeline(
-            QwenImageEditPlusPipeline,
-            self.model_args.model_name_or_path, low_cpu_mem_usage=False
+            QwenImageEditPlusPipeline, self.model_args.model_name_or_path, low_cpu_mem_usage=False
         )
+
+    def build_output_state_codec(self) -> OutputStateCodec:
+        """Declare the condition-geometry-aware Qwen target image codec."""
+        return _QwenImageEditOutputStateCodec(self)
+
+    def _condition_derived_output_geometry(
+        self,
+        condition: Mapping[str, Any],
+    ) -> Tuple[int, int]:
+        """Match inference auto-resize using the last reference aspect ratio."""
+        sizes = parse_qwen_condition_sizes(
+            condition.get("condition_image_sizes"),
+            batch_size=1,
+            source="Qwen-Image-Edit-Plus condition_image_sizes",
+        )[0]
+        if not sizes:
+            raise ValueError(
+                "Qwen-Image-Edit-Plus offline output geometry requires at least one "
+                "condition image size"
+            )
+        image_width, image_height = sizes[-1]
+        configured_height = getattr(self.training_args, "height", None)
+        configured_width = getattr(self.training_args, "width", None)
+        if type(configured_height) is not int or type(configured_width) is not int:
+            raise TypeError(
+                "Qwen-Image-Edit-Plus offline output geometry requires configured integer "
+                f"height/width, received {(configured_height, configured_width)!r}"
+            )
+        width, height = calculate_dimensions(
+            configured_height * configured_width,
+            image_height / image_width,
+        )
+        multiple = self.pipeline.vae_scale_factor * 2
+        width = width // multiple * multiple
+        height = height // multiple * multiple
+        if width <= 0 or height <= 0:
+            raise ValueError(
+                "Qwen-Image-Edit-Plus derived non-positive output geometry " f"{(height, width)}"
+            )
+        return height, width
+
+    def _validate_encoded_output_geometry(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Mapping[str, Any],
+        encoded: EncodedOutputState,
+    ) -> None:
+        """Verify signatures, decode fields, and target-first ordered image shapes."""
+        height, width = self._condition_derived_output_geometry(condition)
+        expected_signature = GeometrySignature(
+            media=(
+                MediaGeometrySignature(
+                    type=MediaType.IMAGE,
+                    height=height,
+                    width=width,
+                ),
+            )
+        )
+        if len(media_batch) != 1 or encoded.geometry_signatures != (expected_signature,):
+            raise ValueError(
+                "Qwen-Image-Edit-Plus encoded geometry must match its single input-derived "
+                f"target geometry {(height, width)}"
+            )
+        if dict(encoded.decode_context) != {"height": height, "width": width}:
+            raise ValueError(
+                "Qwen-Image-Edit-Plus decode_context must exactly match input-derived "
+                f"geometry {(height, width)}, received {dict(encoded.decode_context)!r}"
+            )
+        expected_img_shapes = self._offline_img_shapes(height, width, condition)
+        img_shapes = encoded.forward_context.get("img_shapes")
+        if img_shapes != expected_img_shapes:
+            raise ValueError(
+                "Qwen-Image-Edit-Plus img_shapes must contain target geometry first and "
+                "preserve ordered reference geometry: "
+                f"expected {expected_img_shapes!r}, received {img_shapes!r}"
+            )
+
+    def _offline_img_shapes(
+        self,
+        height: int,
+        width: int,
+        condition: Mapping[str, Any],
+    ) -> List[List[Tuple[int, int, int]]]:
+        """Build the exact target-first shape sequence consumed by the transformer."""
+        sizes = parse_qwen_condition_sizes(
+            condition.get("vae_image_sizes"),
+            batch_size=1,
+            source="Qwen-Image-Edit-Plus vae_image_sizes",
+        )[0]
+        if not sizes:
+            raise ValueError(
+                "Qwen-Image-Edit-Plus offline img_shapes requires at least one VAE image size"
+            )
+        scale = self.pipeline.vae_scale_factor * 2
+        shapes = [(1, height // scale, width // scale)]
+        for size_index, (image_width, image_height) in enumerate(sizes):
+            if image_width % scale or image_height % scale:
+                raise ValueError(
+                    "Qwen-Image-Edit-Plus VAE image geometry must be divisible by "
+                    f"{scale}, received {(image_height, image_width)} at index {size_index}"
+                )
+            shapes.append((1, image_height // scale, image_width // scale))
+        return [shapes]
 
     @property
     def default_target_modules(self) -> List[str]:
@@ -453,13 +632,19 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         device: torch.device,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
     ) -> torch.Tensor:
+        """Encode condition images with posterior argmax, then pack in input order."""
+        del generator
         images = self._standardize_image_input(images, "pt")
 
         all_image_latents = []
         for image in images:
             image = image.to(device=device, dtype=dtype)
             if image.shape[1] != self.pipeline.latent_channels:
-                image_latents = self.pipeline._encode_vae_image(image=image, generator=generator)
+                image_latents = encode_qwen_vae_image(
+                    self,
+                    image,
+                    sample_mode="argmax",
+                )
             else:
                 image_latents = image
             if batch_size > image_latents.shape[0] and batch_size % image_latents.shape[0] == 0:
@@ -531,9 +716,9 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         return latents, image_latents
 
     # ---------------------------------------- Video Encoding ---------------------------------- #
-    def encode_video(self, videos: Union[torch.Tensor, List[torch.Tensor]]):
+    def encode_video(self, videos: Union[torch.Tensor, List[torch.Tensor]]) -> None:
         """Not needed for Qwen-Image-Edit models."""
-        pass
+        return None
 
     # ---------------------------------------- Image Decoding ---------------------------------- #
     def decode_latents(

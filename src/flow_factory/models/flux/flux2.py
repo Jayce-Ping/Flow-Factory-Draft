@@ -19,7 +19,7 @@ import logging
 import os
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -36,6 +36,7 @@ from diffusers.pipelines.flux2.system_messages import (
 )
 from PIL import Image
 
+from ...contracts import InputMediaOrder, NegativePromptPolicy
 from ...hparams import *
 from ...samples import I2ISample
 from ...scheduler import (
@@ -63,6 +64,12 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ..configured_image_output import (
+    ConfiguredImageOutputAdapterMixin,
+    EncodedImageTensor,
+)
+from ..pipeline_contracts import image_output_contract
+from ._output import encode_flux2_output_images, prepare_flux2_condition_latents
 
 logger = setup_logger(__name__)
 
@@ -83,7 +90,14 @@ class Flux2Sample(I2ISample):
 CONDITION_IMAGE_SIZE = (1024, 1024)
 
 
-class Flux2Adapter(BaseAdapter):
+class Flux2Adapter(ConfiguredImageOutputAdapterMixin, BaseAdapter):
+    pipeline_io_contract = image_output_contract(
+        negative_prompt=NegativePromptPolicy.UNSUPPORTED,
+        input_image_min_count=0,
+        input_image_max_count=None,
+        input_order=InputMediaOrder.WITHIN_TYPE,
+    )
+
     def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
         self.pipeline: Flux2Pipeline
@@ -95,8 +109,7 @@ class Flux2Adapter(BaseAdapter):
 
     def load_pipeline(self) -> Flux2Pipeline:
         return self._load_diffusers_pipeline(
-            Flux2Pipeline,
-            self.model_args.model_name_or_path, low_cpu_mem_usage=False
+            Flux2Pipeline, self.model_args.model_name_or_path, low_cpu_mem_usage=False
         )
 
     @property
@@ -259,12 +272,12 @@ class Flux2Adapter(BaseAdapter):
         image_latents_list = []
         image_latent_ids_list = []
         for cond_img_tensors in condition_image_tensors:
-            image_latents, image_latent_ids = self.pipeline.prepare_image_latents(
-                images=cond_img_tensors,
+            image_latents, image_latent_ids = prepare_flux2_condition_latents(
+                self,
+                cond_img_tensors,
                 batch_size=1,
                 device=device,
                 dtype=dtype,
-                generator=generator,
             )
             image_latents_list.append(image_latents.squeeze(0))
             image_latent_ids_list.append(image_latent_ids.squeeze(0))
@@ -377,7 +390,21 @@ class Flux2Adapter(BaseAdapter):
     # ------------------------- Video Encoding ------------------------
     def encode_video(self, videos: Any) -> None:
         """Flux.2 does not support video encoding."""
-        pass
+        return None
+
+    def _output_geometry_multiple(self) -> int:
+        """Require the VAE grid and 2x2 latent patching used by Diffusers."""
+        return self.pipeline.vae_scale_factor * 2
+
+    def _encode_output_images(
+        self,
+        pixel_values: torch.Tensor,
+        condition: Mapping[str, Any],
+        generator: Optional[torch.Generator],
+    ) -> EncodedImageTensor:
+        """Sample and pack target images with the FLUX.2 latent recipe."""
+        del condition
+        return encode_flux2_output_images(self, pixel_values, generator)
 
     # ------------------------- Latent Decoding ------------------------
     def decode_latents(

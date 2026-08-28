@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from numbers import Integral
 from typing import Any, Optional
 
 import torch
@@ -112,7 +113,7 @@ def encode_qwen_output_images(
     img_shapes = [[target_shape] for _ in range(batch_size)]
     if condition_sizes_key is not None:
         condition_sizes = condition.get(condition_sizes_key)
-        parsed_sizes = _parse_condition_sizes(
+        parsed_sizes = parse_qwen_condition_sizes(
             condition_sizes,
             batch_size=batch_size,
             source=f"{type(adapter).__name__} condition[{condition_sizes_key!r}]",
@@ -152,38 +153,74 @@ def _channel_statistics(
     return statistics.view(1, channels, 1, 1, 1)
 
 
-def _parse_condition_sizes(
+def parse_qwen_condition_sizes(
     value: Any,
     *,
     batch_size: int,
     source: str,
 ) -> list[list[tuple[int, int]]]:
-    """Validate collated per-sample ``(width, height)`` condition geometry."""
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
-        raise TypeError(f"{source} must be a per-sample sequence, received {type(value).__name__}")
-    if len(value) != batch_size:
+    """Normalize dense or ragged collated ``(width, height)`` geometry."""
+    samples = _geometry_sequence(value, source=source, expected_rank=3)
+    if len(samples) != batch_size:
         raise ValueError(
-            f"{source} expected batch size {batch_size}, received sequence length {len(value)}"
+            f"{source} expected batch size {batch_size}, received sequence length {len(samples)}"
         )
     result: list[list[tuple[int, int]]] = []
-    for sample_index, sizes in enumerate(value):
-        if not isinstance(sizes, Sequence) or isinstance(sizes, (str, bytes)):
-            raise TypeError(f"{source}[{sample_index}] must be a sequence of (width, height) pairs")
+    for sample_index, sizes in enumerate(samples):
+        sample_source = f"{source}[{sample_index}]"
+        sizes = _geometry_sequence(sizes, source=sample_source, expected_rank=2)
         parsed: list[tuple[int, int]] = []
         for size_index, size in enumerate(sizes):
-            if not isinstance(size, Sequence) or isinstance(size, (str, bytes)) or len(size) != 2:
+            size_source = f"{sample_source}[{size_index}]"
+            size = _geometry_sequence(size, source=size_source, expected_rank=1)
+            if len(size) != 2:
                 raise TypeError(
-                    f"{source}[{sample_index}][{size_index}] must be a (width, height) pair"
+                    f"{size_source} must be a (width, height) pair, received length {len(size)}"
                 )
             width, height = size
-            if type(width) is not int or type(height) is not int or width <= 0 or height <= 0:
+            if (
+                isinstance(width, bool)
+                or not isinstance(width, Integral)
+                or isinstance(height, bool)
+                or not isinstance(height, Integral)
+                or width <= 0
+                or height <= 0
+            ):
                 raise ValueError(
-                    f"{source}[{sample_index}][{size_index}] expected positive integer "
-                    f"geometry, received {tuple(size)!r}"
+                    f"{size_source} expected positive integer geometry, "
+                    f"received {tuple(size)!r}"
                 )
-            parsed.append((width, height))
+            parsed.append((int(width), int(height)))
         result.append(parsed)
     return result
 
 
-__all__ = ["encode_qwen_output_images", "encode_qwen_vae_image"]
+def _geometry_sequence(value: Any, *, source: str, expected_rank: int) -> list[Any]:
+    """Convert one tensor/sequence geometry level without losing item order."""
+    if isinstance(value, torch.Tensor):
+        if value.ndim != expected_rank:
+            raise ValueError(
+                f"{source} expected rank {expected_rank}, received tensor shape "
+                f"{tuple(value.shape)}"
+            )
+        if value.dtype not in (
+            torch.uint8,
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+        ):
+            raise TypeError(
+                f"{source} expected integer geometry tensor, received dtype {value.dtype}"
+            )
+        return value.detach().cpu().tolist()
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise TypeError(f"{source} must be a sequence, received {type(value).__name__}")
+    return list(value)
+
+
+__all__ = [
+    "encode_qwen_output_images",
+    "encode_qwen_vae_image",
+    "parse_qwen_condition_sizes",
+]
