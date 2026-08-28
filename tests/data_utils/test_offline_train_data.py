@@ -142,6 +142,7 @@ class _Accelerator:
 class _CountingPreprocessor:
     def __init__(self) -> None:
         self.calls = 0
+        self.batch_sizes: List[int] = []
         self.is_train: bool | None = None
         self.guidance_scale: float | None = None
 
@@ -153,6 +154,7 @@ class _CountingPreprocessor:
         guidance_scale: float,
     ) -> Dict[str, torch.Tensor]:
         self.calls += 1
+        self.batch_sizes.append(len(prompt))
         self.is_train = is_train
         self.guidance_scale = guidance_scale
         return {"prompt_embeds": torch.ones(len(prompt), 2)}
@@ -583,6 +585,37 @@ def test_builder_rejects_single_sample_pipeline_batching_before_dataset_io(
     assert preprocessor.calls == 0
 
 
+def test_single_sample_contract_forces_condition_preprocessing_batch_size_one(
+    tmp_path: Path,
+) -> None:
+    """Single-sample adapters must also preprocess their condition cache at B=1."""
+    dataset_dir = tmp_path / "single-sample-cache"
+    dataset_dir.mkdir()
+    rows = []
+    for index in range(2):
+        target = f"target-{index}.png"
+        _write_image(dataset_dir / target, index)
+        rows.append(_demonstration_row(f"prompt-{index}", target))
+    _write_manifest(dataset_dir, rows)
+    contract = replace(
+        _TEXT_TO_IMAGE_CONTRACT,
+        batch_capability=BatchCapability.SINGLE_SAMPLE,
+    )
+    preprocessor = _CountingPreprocessor()
+
+    build_offline_train_dataloader(
+        _config(tmp_path, [_source("single-sample-cache", dataset_dir, 0)]),
+        _Accelerator(),
+        preprocessor.preprocess,
+        supervision_type="demonstration",
+        pipeline_io_contract=contract,
+        shuffle=False,
+    )
+
+    assert preprocessor.calls == 2
+    assert preprocessor.batch_sizes == [1, 1]
+
+
 def test_builder_rejects_non_unit_weight_and_unresolved_source_id_before_io(
     tmp_path: Path,
 ) -> None:
@@ -610,7 +643,17 @@ def test_builder_rejects_non_unit_weight_and_unresolved_source_id_before_io(
 
 def test_builder_rejects_missing_target_decoder_before_condition_preprocessing(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        offline_train_data,
+        "DEFAULT_MEDIA_DECODERS",
+        {
+            media_type: decoder
+            for media_type, decoder in offline_dataset_module.DEFAULT_MEDIA_DECODERS.items()
+            if media_type != "audio"
+        },
+    )
     dataset_dir = tmp_path / "audio"
     _write_manifest(
         dataset_dir,

@@ -18,6 +18,11 @@ from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple,
 
 import torch
 
+from ...contracts import (
+    BatchCapability,
+    GeometrySource,
+    NegativePromptPolicy,
+)
 from ...samples import (
     ComponentTimes,
     LatentState,
@@ -28,8 +33,11 @@ from ...samples import (
 from ...scheduler import MiniMaxH3SDEScheduler, SchedulerGroup
 from ..abc import BaseAdapter
 from ..checkpointing import CheckpointUnit
+from ..output_state import DecodedMediaBatch, EncodedOutputState, OutputStateCodec
+from ..pipeline_contracts import audio_video_output_contract
 from ..runtime import ModularPipelineRuntime
 from ._common import apply_forward_process_noise, draw_forward_process_noise
+from ._output import MiniMaxH3AVOutputCodec, validate_h3_encoded_output_geometry
 from .workflow import (
     build_h3_component_runtime,
     build_h3_replay_forward_kwargs,
@@ -183,7 +191,11 @@ class _MiniMaxH3WorkflowAdapter:
             compute_log_prob=compute_log_prob,
             return_fields=return_fields,
             noise_level=noise_level,
-            **build_h3_replay_forward_kwargs(forward_kwargs),
+            **build_h3_replay_forward_kwargs(
+                forward_kwargs,
+                state=state,
+                workflow=self.workflow,
+            ),
         )
 
     def forward(self, **kwargs: Any) -> MultiModalStepOutput:
@@ -193,9 +205,10 @@ class _MiniMaxH3WorkflowAdapter:
 class MiniMaxH3T2VAAdapter(_MiniMaxH3WorkflowAdapter, BaseAdapter):
     """Load the workflow-pruned MiniMax H3 text-to-video-audio partition."""
 
-    output_state_codec_unavailable_reason = (
-        "MiniMax H3 offline targets require lossless audiovisual decoding/alignment, and the "
-        "official target-video posterior policy is not defined by the inference encoders"
+    pipeline_io_contract = audio_video_output_contract(
+        negative_prompt=NegativePromptPolicy.UNSUPPORTED,
+        geometry_source=GeometrySource.CONFIGURED,
+        batch_capability=BatchCapability.SINGLE_SAMPLE,
     )
 
     workflow: ClassVar[str] = "t2va"
@@ -208,13 +221,50 @@ class MiniMaxH3T2VAAdapter(_MiniMaxH3WorkflowAdapter, BaseAdapter):
         "audio_vae",
     ]
 
+    def build_output_state_codec(self) -> OutputStateCodec:
+        """Declare the configured audiovisual target codec without loading components.
+
+        Returns:
+            Immutable MiniMax H3 audiovisual output codec declaration.
+        """
+        return MiniMaxH3AVOutputCodec(self)
+
+    def _validate_encoded_output_geometry(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Mapping[str, Any],
+        encoded: EncodedOutputState,
+    ) -> None:
+        """Require encoded rows and rate metadata to match cached T2VA geometry."""
+        validate_h3_encoded_output_geometry(self, media_batch, condition, encoded)
+
+    def _decode_output_state(
+        self,
+        encoded: EncodedOutputState,
+        *,
+        output_type: Literal["pil", "pt", "np"],
+    ) -> Any:
+        """Decode the two-component target state through H3's existing decoder."""
+        geometry = encoded.decode_context.get("geometry")
+        if not isinstance(geometry, Mapping):
+            raise TypeError(
+                "MiniMax H3 decode_context requires a geometry mapping, "
+                f"received {type(geometry).__name__}: {geometry!r}"
+            )
+        return self.decode_latents(
+            encoded.clean_state,
+            geometry=geometry,
+            output_type=output_type,
+        )
+
 
 class MiniMaxH3FL2VAAdapter(_MiniMaxH3WorkflowAdapter, BaseAdapter):
     """Load the workflow-pruned MiniMax H3 first/last-frame partition."""
 
     output_state_codec_unavailable_reason = (
-        "MiniMax H3 offline targets require lossless audiovisual decoding/alignment, and the "
-        "official target-video posterior policy is not defined by the inference encoders"
+        "MiniMax H3 conditioned offline forward requires a shared, reproducible "
+        "conditioned-prefix binder; paired offline-DPO arms must reuse identical "
+        "condition posterior noise"
     )
 
     workflow: ClassVar[str] = "fl2va"
@@ -238,8 +288,9 @@ class MiniMaxH3Ref2VAAdapter(_MiniMaxH3WorkflowAdapter, BaseAdapter):
     """Load the workflow-pruned MiniMax H3 omni-reference partition."""
 
     output_state_codec_unavailable_reason = (
-        "MiniMax H3 offline targets require lossless audiovisual decoding/alignment, and the "
-        "official target-video posterior policy is not defined by the inference encoders"
+        "MiniMax H3 conditioned offline forward requires a shared, reproducible "
+        "conditioned-prefix binder; paired offline-DPO arms must reuse identical "
+        "condition posterior noise"
     )
 
     workflow: ClassVar[str] = "ref2va"

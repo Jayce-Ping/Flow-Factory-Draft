@@ -223,6 +223,7 @@ def build_offline_train_dataloader(
             preprocess_func=preprocess_func,
             preprocess_kwargs=normalized_preprocess_kwargs,
             preprocessing_batch_size=data_args.preprocessing_batch_size,
+            batch_capability=pipeline_io_contract.batch_capability,
             force_reprocess=data_args.force_reprocess,
             extra_hash_strs=[*normalized_extra_hash_strs, f"offline_train_source:{source.name}"],
             preprocess_parallelism=data_args.preprocess_parallelism,
@@ -314,6 +315,7 @@ def _build_distributed_condition_cache(
     preprocess_func: PreprocessCallable,
     preprocess_kwargs: Mapping[str, Any],
     preprocessing_batch_size: int,
+    batch_capability: BatchCapability,
     force_reprocess: bool,
     extra_hash_strs: Sequence[str],
     preprocess_parallelism: Literal["global", "local"],
@@ -322,7 +324,11 @@ def _build_distributed_condition_cache(
 ) -> HFDataset:
     """Build one input-only cache through the existing rank-safe orchestrator."""
     ordered_references = _supports_ordered_references(preprocess_func)
-    effective_batch_size = 1 if ordered_references else preprocessing_batch_size
+    effective_batch_size = (
+        1
+        if ordered_references or batch_capability is BatchCapability.SINGLE_SAMPLE
+        else preprocessing_batch_size
+    )
     raw_dataset = project_offline_condition_dataset(
         records,
         source_name=source_name,

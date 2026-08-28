@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Tuple
 
 from ..contracts import (
     BatchCapability,
@@ -158,11 +158,67 @@ def video_output_contract(
     )
 
 
+def audio_video_output_contract(
+    *,
+    negative_prompt: NegativePromptPolicy,
+    input_rules: Tuple[InputMediaRule, ...] = (),
+    input_binding: InputMediaBinding = InputMediaBinding.GROUPED_BY_TYPE,
+    input_order: InputMediaOrder = InputMediaOrder.INSENSITIVE,
+    output_fps: RateRequirement = RateRequirement.REQUIRED,
+    output_sample_rate: RateRequirement = RateRequirement.REQUIRED,
+    geometry_source: GeometrySource = GeometrySource.OUTPUT_MEDIA,
+    batch_capability: BatchCapability = BatchCapability.SINGLE_SAMPLE,
+) -> PipelineIOContract:
+    """Build an exact ordered video-and-audio output declaration.
+
+    Supplying explicit input rules keeps this constructor neutral to how a model
+    binds conditions: prompt-only, grouped image conditions, and globally ordered
+    heterogeneous references all use the same output contract. Cross-type total
+    cardinality constraints remain adapter-owned because ``InputMediaSpec``
+    represents per-type bounds only.
+
+    Args:
+        negative_prompt: Whether negative prompts are unsupported, optional, or required.
+        input_rules: Canonically ordered per-type input-media rules.
+        input_binding: How input media are projected into model-facing arguments.
+        input_order: Which input-media ordering carries semantic meaning.
+        output_fps: Whether target-video frame-rate metadata is accepted or required.
+        output_sample_rate: Whether target-audio sample-rate metadata is accepted or required.
+        geometry_source: Boundary that determines aligned output geometry.
+        batch_capability: Whether the adapter accepts uniform, ragged, or single-sample batches.
+
+    Returns:
+        Immutable pipeline I/O contract with exact output order ``(video, audio)``.
+    """
+    video_format = MediaFormat(
+        type=MediaType.VIDEO,
+        fps=output_fps,
+        sample_rate=RateRequirement.NOT_APPLICABLE,
+    )
+    audio_format = MediaFormat(
+        type=MediaType.AUDIO,
+        fps=RateRequirement.NOT_APPLICABLE,
+        sample_rate=output_sample_rate,
+    )
+    return PipelineIOContract(
+        input_media=InputMediaSpec(
+            rules=input_rules,
+            binding=input_binding,
+            order=input_order,
+        ),
+        negative_prompt=negative_prompt,
+        output_media=OutputMediaSequence(items=(video_format, audio_format)),
+        geometry_source=geometry_source,
+        batch_capability=batch_capability,
+    )
+
+
 __all__ = [
     "AUDIO_FORMAT_REQUIRED_RATE",
     "IMAGE_FORMAT",
     "VIDEO_FORMAT_OPTIONAL_FPS",
     "VIDEO_FORMAT_REQUIRED_FPS",
+    "audio_video_output_contract",
     "image_output_contract",
     "video_output_contract",
 ]

@@ -99,8 +99,10 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
 
 > **Offline output support:** SFT and offline DPO currently support `sd3-5`, `flux1`,
 > `flux1-kontext`, `flux2`, `flux2-klein`, `qwen-image`, `qwen-image-edit-plus`, `z-image`,
-> `bagel`, `sensenova`, and `wan2_t2v`. Wan I2V, LTX2, and MiniMax H3 fail fast on their
-> currently unresolved output/condition or audio-video semantics. See the
+> `bagel`, `sensenova`, `wan2_t2v`, and `minimax-h3-t2va`. Wan I2V, LTX2, and the
+> conditioned MiniMax H3 FL2VA/Ref2VA workflows fail fast on their currently unresolved
+> output/condition semantics. MiniMax H3 T2VA targets use an exact ordered video/audio pair,
+> encoded on demand into its structured latent state. See the
 > [offline model matrix](guidance/datasets.md#offline-model-support).
 
 > **MiniMax H3 status:** the T2VA debug and

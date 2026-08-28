@@ -108,9 +108,11 @@ must carry the supervision type required by its trainer. Prompt-only rows, mixed
 preference rows, unknown keys, and non-V2 records fail during manifest loading.
 
 All V2 media paths are resolved against that source's `dataset_dir`; an absolute path is retained.
-Images and videos have built-in CPU decoders. Video targets require PyAV 18 or newer. There is no
-default audio target decoder yet, which is one reason the current audio-video adapters are blocked
-for offline objectives.
+Images, videos, and audio have built-in CPU decoders. Video targets require PyAV 18 or newer.
+Decoded audio is a detached CPU `float32` waveform shaped `(channels, samples)`. A manifest
+`sample_rate` is a logical source-clock override and does not pre-resample the decoded samples;
+source-clock truncation, channel conversion, the single model-rate conversion, posterior selection,
+and latent packing remain adapter-owned.
 
 Tiny schema-complete fixtures and configs are available for
 [SFT](../examples/sft/lora/sd3_5/default.yaml) and
@@ -201,9 +203,20 @@ output semantics.
 |---|---|---|
 | Supported | `sd3-5`, `flux1`, `flux1-kontext`, `flux2`, `flux2-klein`, `qwen-image`, `qwen-image-edit-plus`, `z-image`, `bagel`, `sensenova` | Image-output codecs with adapter-specific geometry and packing. SenseNova uses the existing grouped `images` input with within-type order, not heterogeneous references. |
 | Supported | `wan2_t2v` | Video targets require `fps`; the codec resamples to configured frames/rate and samples the Wan VAE posterior on the fly. |
+| Supported | `minimax-h3-t2va` | Every candidate is an exact ordered `(video, audio)` pair with required `fps` and `sample_rate`. The codec aligns both streams to configured H3 geometry, samples the video posterior, takes the official audio-posterior mode, and packs structured video/audio rows on the fly. Condition preprocessing and training remain B=1. |
 | Blocked | `wan2_i2v` | Output geometry depends on the first-frame VAE latent/mask, while the current condition cache does not preserve the source pixels needed by that binder. |
-| Blocked | `ltx2_t2av`, `ltx2_i2av` | Lossless audio decode/rate metadata and exact audio-video duration alignment are not unified; I2AV also needs the pinned first-frame active mask. |
-| Blocked | `minimax-h3-t2va`, `minimax-h3-fl2va`, `minimax-h3-ref2va` | The audio-video boundary and official target-video posterior policy are not yet defined for offline targets. |
+| Blocked | `ltx2_t2av`, `ltx2_i2av` | Their adapter codec still needs exact LTX-specific audio/video duration alignment, latent packing, and decode context; I2AV also needs the pinned first-frame active mask. |
+| Blocked | `minimax-h3-fl2va`, `minimax-h3-ref2va` | Their cached input media still need a shared, reproducible offline condition-prefix binder; offline DPO must reuse the same conditioned prefix noise for both preference arms. |
+
+MiniMax H3 T2VA supervision lists video first and audio second. The target video must cover the
+configured 24-fps duration; it is deterministically sampled onto that frame grid and resized to the
+configured canvas. Audio is converted to stereo at the H3 audio-VAE rate, then trimmed or
+right-padded to the exact aligned latent duration. For example:
+
+```jsonl
+{"schema_version":2,"input":{"prompt":"Ocean waves beneath an aurora.","media":[]},"supervision":{"type":"demonstration","target":{"media":[{"type":"video","path":"targets/aurora.mp4","fps":24.0},{"type":"audio","path":"targets/aurora.wav","sample_rate":32000}]}},"metadata":{}}
+{"schema_version":2,"input":{"prompt":"Ocean waves beneath an aurora.","media":[]},"supervision":{"type":"preference","chosen":{"media":[{"type":"video","path":"pairs/chosen.mp4","fps":24.0},{"type":"audio","path":"pairs/chosen.wav","sample_rate":32000}]},"rejected":{"media":[{"type":"video","path":"pairs/rejected.mp4","fps":24.0},{"type":"audio","path":"pairs/rejected.wav","sample_rate":32000}]}},"metadata":{}}
+```
 
 ## Common task formats
 

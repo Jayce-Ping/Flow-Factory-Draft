@@ -48,6 +48,8 @@ the complete mapping when its forward has different semantics or additional guid
 - SenseNova neutralizes text and image guidance together and disables CFG normalization.
 - Bagel replaces the base mapping with its actual `cfg_text_scale` / `cfg_img_scale` arguments;
   it must not inherit an irrelevant `guidance_scale` key through its permissive `**kwargs`.
+- MiniMax H3 T2VA inherits neutral `guidance_scale=1.0`; its strict forward validates that
+  interface value even though the guidance-distilled checkpoint has no CFG branch.
 
 Wan I2V and LTX2 remain behind explicit offline output-codec blockers. Wan I2V must mirror the two
 neutral Wan transformer scales before it is enabled. LTX2 must set video/audio CFG scales and

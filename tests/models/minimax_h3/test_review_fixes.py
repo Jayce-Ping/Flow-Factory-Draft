@@ -656,6 +656,8 @@ def _training_batch() -> StackedSampleBatch:
 def _patch_h3_forward(monkeypatch) -> None:
     def forward(*args, **kwargs):
         state = args[1]
+        if kwargs.get("velocity_only"):
+            return state
         return MultiModalStepOutput(
             next_state=state,
             next_state_mean=state,

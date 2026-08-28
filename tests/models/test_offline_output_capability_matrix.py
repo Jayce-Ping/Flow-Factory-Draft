@@ -30,9 +30,8 @@ from flow_factory.models.wan.wan2_i2v import Wan2_I2V_Adapter
         (Wan2_I2V_Adapter, "first-frame VAE condition"),
         (LTX2_T2AV_Adapter, "paired video/audio decoding"),
         (LTX2_I2AV_Adapter, "active mask"),
-        (MiniMaxH3T2VAAdapter, "target-video posterior policy"),
-        (MiniMaxH3FL2VAAdapter, "target-video posterior policy"),
-        (MiniMaxH3Ref2VAAdapter, "target-video posterior policy"),
+        (MiniMaxH3FL2VAAdapter, "conditioned-prefix binder"),
+        (MiniMaxH3Ref2VAAdapter, "conditioned-prefix binder"),
     ],
 )
 def test_unimplemented_offline_media_semantics_fail_before_model_loading(
@@ -42,3 +41,8 @@ def test_unimplemented_offline_media_semantics_fail_before_model_loading(
     """Expose actionable blockers instead of silently guessing target encoding."""
     with pytest.raises(NotImplementedError, match=reason_fragment):
         adapter_type.validate_offline_output_capability()
+
+
+def test_minimax_h3_t2va_declares_complete_offline_output_semantics() -> None:
+    """T2VA has no conditioned prefix and can encode paired AV targets on demand."""
+    MiniMaxH3T2VAAdapter.validate_offline_output_capability()

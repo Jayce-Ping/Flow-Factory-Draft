@@ -25,6 +25,7 @@ from ...samples import (
     MiniMaxH3FL2VASample,
     MiniMaxH3Ref2VASample,
     MiniMaxH3T2VASample,
+    MultiModalStepOutput,
     StructuredTrajectory,
 )
 from ...scheduler import MiniMaxH3SDEScheduler, SchedulerGroup
@@ -475,7 +476,10 @@ def forward_h3_adapter_state(
             f"received prompt B={prompt_embeds.shape[0]}"
         )
     layout = _normalize_layout({"layout": forward_kwargs["layout"]})
-    return forward_h3_state(
+    velocity_only = (
+        not compute_log_prob and next_state is None and tuple(return_fields) == ("velocity",)
+    )
+    result = forward_h3_state(
         adapter.get_component(adapter.transformer_component_name),
         state,
         condition_prefixes,
@@ -488,29 +492,79 @@ def forward_h3_adapter_state(
         generator=forward_kwargs.get("generator"),
         noise_level=noise_level,
         compute_log_prob=compute_log_prob,
+        velocity_only=velocity_only,
         attention_kwargs=forward_kwargs.get("attention_kwargs"),
         return_kwargs=return_fields,
         workflow=adapter.workflow,
     )
+    if velocity_only:
+        if not isinstance(result, LatentState):
+            raise TypeError(
+                "MiniMax H3 velocity-only forward expected LatentState, "
+                f"received {type(result).__name__}"
+            )
+        return MultiModalStepOutput(velocity=result)
+    return result
 
 
-def build_h3_replay_forward_kwargs(forward_kwargs: Mapping[str, Any]) -> Dict[str, Any]:
+def build_h3_replay_forward_kwargs(
+    forward_kwargs: Mapping[str, Any],
+    *,
+    state: Optional[LatentState] = None,
+    workflow: Optional[str] = None,
+) -> Dict[str, Any]:
     """Select the conditioning arguments H3 ``forward`` accepts from a replay batch.
 
     Replay wrappers receive every collated batch field, while ``forward`` is a strict
-    public boundary. Selecting here keeps that boundary strict for rollout callers.
+    public boundary. Offline T2VA cache rows retain their authoritative layout as flat
+    input fields and have no condition latents. This binder nests that layout and builds
+    empty prefixes from the current state, so storage casts cannot leave prefix dtype or
+    device stale. Online replay already supplies both nested fields and keeps that path.
 
     Args:
         forward_kwargs: Conditioning arguments resolved from the stored batch.
+        state: Current target state, required to bind missing T2VA prefixes.
+        workflow: H3 workflow identifier, required when prefixes are missing.
 
     Returns:
         Conditioning arguments accepted by ``forward``.
     """
-    return {
+    selected = {
         name: value
         for name, value in forward_kwargs.items()
         if name in _H3_FORWARD_CONDITIONING_FIELDS
     }
+    if "layout" not in selected:
+        layout = _normalize_layout(forward_kwargs)
+        required_layout_fields = (
+            *_LAYOUT_MATRIX_FIELDS,
+            *_LAYOUT_INDEX_FIELDS,
+            *_LAYOUT_COUNT_FIELDS,
+        )
+        missing = tuple(field for field in required_layout_fields if field not in layout)
+        if missing:
+            raise ValueError(
+                f"MiniMax H3 workflow={workflow!r} replay flat layout missing fields={missing}"
+            )
+        selected["layout"] = layout
+
+    if "condition_prefixes" not in selected:
+        if workflow != "t2va":
+            raise ValueError(
+                f"MiniMax H3 workflow={workflow!r} replay requires a shared, reproducible "
+                "conditioned-prefix binder"
+            )
+        if not isinstance(state, LatentState):
+            raise TypeError(
+                "MiniMax H3 T2VA replay requires LatentState to bind empty prefixes, "
+                f"received {type(state).__name__}"
+            )
+        validate_target_state(state)
+        selected["condition_prefixes"] = {
+            component: values.new_empty((values.shape[0], 0, values.shape[-1]))
+            for component, values in state.components.items()
+        }
+    return selected
 
 
 def forward_h3_adapter(adapter: Any, **kwargs: Any) -> Any:
@@ -901,8 +955,10 @@ def _normalize_b1_integer(value: Any, field: str) -> int:
 def _decoded_video_sample(video: Any) -> Any:
     if isinstance(video, torch.Tensor) and video.shape[0] == 1:
         return video[0]
-    if isinstance(video, list) and len(video) == 1 and (
-        video[0] is None or isinstance(video[0], list)
+    if (
+        isinstance(video, list)
+        and len(video) == 1
+        and (video[0] is None or isinstance(video[0], list))
     ):
         return video[0]
     return video

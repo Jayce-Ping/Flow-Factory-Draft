@@ -38,6 +38,8 @@ from PIL import Image
 from pydantic import ValidationError
 from torch.utils.data import Dataset
 
+from ..utils.audio import load_audio
+
 try:
     import av
 except ImportError:
@@ -511,10 +513,57 @@ def decode_video(asset: MediaAsset) -> np.ndarray:
     return np.ascontiguousarray(video, dtype=np.uint8)
 
 
+def decode_audio(asset: MediaAsset) -> torch.Tensor:
+    """Decode one target audio asset as a detached CPU waveform.
+
+    The returned contiguous ``float32`` tensor has shape ``(channels, samples)``.
+    The manifest ``sample_rate`` is a logical source-clock override, so decoding
+    intentionally preserves the file's samples instead of resampling them. The
+    :class:`DecodedMedia` boundary carries that override to the model codec, which
+    owns source-clock truncation, channel conversion, and the single model-rate
+    resample. This mirrors the source-clock semantics of video ``fps`` overrides.
+    Keeping this function at module scope makes the default decoder safe to pickle
+    under spawn-based DataLoader workers.
+
+    Args:
+        asset: Normalized audio reference with a resolved local path and optional rate override.
+
+    Returns:
+        Detached contiguous CPU waveform shaped ``(channels, samples)``.
+
+    Raises:
+        TypeError: If the audio backend returns a non-tensor or non-floating payload.
+        ValueError: If the decoded waveform is empty, non-finite, or not two-dimensional.
+    """
+    waveform = load_audio(asset.path, sample_rate=None)
+    if not isinstance(waveform, torch.Tensor):
+        raise TypeError(
+            f"failed to decode target audio {asset.path!r}: expected torch.Tensor, "
+            f"received {type(waveform).__name__}"
+        )
+    if not waveform.is_floating_point():
+        raise TypeError(
+            f"failed to decode target audio {asset.path!r}: expected floating waveform, "
+            f"received {waveform.dtype}"
+        )
+    waveform = waveform.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    if waveform.ndim != 2 or waveform.shape[0] < 1 or waveform.shape[1] < 1:
+        raise ValueError(
+            f"failed to decode target audio {asset.path!r}: expected non-empty waveform "
+            f"shaped (channels,samples), received {tuple(waveform.shape)}"
+        )
+    if not torch.isfinite(waveform).all():
+        raise ValueError(
+            f"failed to decode target audio {asset.path!r}: waveform contains non-finite values"
+        )
+    return waveform
+
+
 DEFAULT_MEDIA_DECODERS: Mapping[MediaType, MediaDecoder] = MappingProxyType(
     {
         "image": decode_image,
         "video": decode_video,
+        "audio": decode_audio,
     }
 )
 
@@ -840,6 +889,7 @@ __all__ = [
     "PreferenceOutputBatch",
     "compute_offline_condition_id",
     "compute_offline_record_id",
+    "decode_audio",
     "decode_image",
     "decode_video",
     "load_offline_manifest",

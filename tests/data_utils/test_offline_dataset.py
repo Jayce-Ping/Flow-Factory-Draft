@@ -38,6 +38,7 @@ from flow_factory.data_utils.offline_dataset import (
     PreferenceOutputBatch,
     compute_offline_condition_id,
     compute_offline_record_id,
+    decode_audio,
     decode_video,
     load_offline_manifest,
 )
@@ -867,16 +868,28 @@ def test_collator_uses_declared_supervision_instead_of_first_item_union(tmp_path
         OfflineCollator("demonstration")([demonstration_dataset[0], preference_dataset[0]])
 
 
-def test_unsupported_audio_output_fails_explicitly(tmp_path: Path) -> None:
+def test_default_audio_decoder_preserves_samples_and_source_clock_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_path = tmp_path / "target.wav"
+    target_path.write_bytes(b"identity-only audio payload")
+    calls: List[tuple[str, int | None]] = []
+
+    def fake_load_audio(path: str, sample_rate: int | None = None) -> torch.Tensor:
+        calls.append((str(path), sample_rate))
+        return torch.arange(12, dtype=torch.float64).reshape(2, 6).requires_grad_()
+
+    monkeypatch.setattr(offline_dataset_module, "load_audio", fake_load_audio)
     media: Dict[str, Any] = {
         "type": "audio",
-        "path": "target.audio",
+        "path": "target.wav",
         "sample_rate": 16000,
     }
     record = normalize_v2_record(
         {
             "schema_version": 2,
-            "input": {"prompt": "unsupported", "media": []},
+            "input": {"prompt": "audio target", "media": []},
             "supervision": {
                 "type": "demonstration",
                 "target": {"media": [media]},
@@ -884,14 +897,27 @@ def test_unsupported_audio_output_fails_explicitly(tmp_path: Path) -> None:
         },
         dataset_dir=tmp_path,
     )
-    with pytest.raises(NotImplementedError, match=r"type 'audio'.*no decoder"):
-        OfflineDataset(
-            [record],
-            _condition_cache([record], [{"prompt_embeds": torch.ones(2)}]),
-            source_name=SOURCE_NAME,
-            source_id=SOURCE_ID,
-            supervision_type="demonstration",
-        )
+    dataset = OfflineDataset(
+        [record],
+        _condition_cache([record], [{"prompt_embeds": torch.ones(2)}]),
+        source_name=SOURCE_NAME,
+        source_id=SOURCE_ID,
+        supervision_type="demonstration",
+    )
+
+    item = dataset[0]
+
+    assert isinstance(item.output, DemonstrationOutput)
+    decoded = item.output.target_media[0]
+    assert calls == [(str(target_path), None)]
+    assert decoded.payload.shape == (2, 6)
+    assert decoded.payload.dtype is torch.float32
+    assert decoded.payload.device.type == "cpu"
+    assert decoded.payload.is_contiguous()
+    assert decoded.payload.requires_grad is False
+    assert decoded.sample_rate == 16000
+    assert pickle.loads(pickle.dumps(decode_audio)) is decode_audio
+    pickle.dumps(dataset)
 
 
 def test_default_video_decoder_returns_diffusers_compatible_cpu_frames(tmp_path: Path) -> None:
