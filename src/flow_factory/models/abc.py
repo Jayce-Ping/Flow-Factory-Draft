@@ -16,11 +16,11 @@ import glob
 import hashlib
 import json
 import logging
-import shutil
 
 # src/flow_factory/models/abc.py
 import os
 import re
+import shutil
 from abc import ABC, abstractmethod
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, fields
@@ -823,20 +823,12 @@ class BaseAdapter(ABC):
                 user_policy=user_policy,
                 manifest_policy=manifest_policy,
                 component_names=component_names,
-                transformer_names=[
-                    name for name in component_names if "transformer" in name
-                ],
-                text_encoder_names=[
-                    name for name in component_names if "text_encoder" in name
-                ],
+                transformer_names=[name for name in component_names if "transformer" in name],
+                text_encoder_names=[name for name in component_names if "text_encoder" in name],
                 preserve_unselected=True,
             )
             kwargs.update(
-                {
-                    key: value
-                    for key, value in load_dtype_kwargs.items()
-                    if key not in kwargs
-                }
+                {key: value for key, value in load_dtype_kwargs.items() if key not in kwargs}
             )
 
         return pipeline_class.from_pretrained(pretrained_model_name_or_path, **kwargs)

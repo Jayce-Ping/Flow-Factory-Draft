@@ -765,11 +765,7 @@ class GeneralDataset(Dataset):
         # Complex values (nested lists/dicts) in the source JSONL must already be
         # stored as JSON strings for Arrow compatibility.
         batch_dict[METADATA_COLUMN] = [
-            {
-                k: v[idx]
-                for k, v in batch.items()
-                if k not in metadata_excluded_columns
-            }
+            {k: v[idx] for k, v in batch.items() if k not in metadata_excluded_columns}
             for idx in range(len(batch["prompt"]))
         ]
 
@@ -1357,8 +1353,7 @@ def _load_ordered_reference(
             loaded["sample_rate"] = effective_sample_rate
         else:
             raise ValueError(
-                "expected ordered reference kind in ('image', 'video', 'audio'), "
-                f"got {kind!r}"
+                "expected ordered reference kind in ('image', 'video', 'audio'), " f"got {kind!r}"
             )
     except (FileNotFoundError, ImportError, OSError, RuntimeError, ValueError) as error:
         raise ValueError(
@@ -1407,19 +1402,14 @@ def _decode_ordered_video(
         if not container.streams.video:
             raise ValueError(f"expected a video stream in {video_path!r}, got none")
         video_stream = container.streams.video[0]
-        frames = [
-            frame.to_ndarray(format="rgb24")
-            for frame in container.decode(video_stream)
-        ]
+        frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(video_stream)]
         reported_frame_rate = video_stream.average_rate or video_stream.guessed_rate
         frame_rate = None if reported_frame_rate is None else float(reported_frame_rate)
         audio = None
         sample_rate = None
         if container.streams.audio:
             container.seek(0)
-            audio, sample_rate = _decode_av_audio_stream(
-                container, container.streams.audio[0]
-            )
+            audio, sample_rate = _decode_av_audio_stream(container, container.streams.audio[0])
     if not frames:
         raise ValueError(f"expected video frames in {video_path!r}, decoded none")
     return np.stack(frames), frame_rate, audio, sample_rate
@@ -1447,12 +1437,10 @@ def _decode_av_audio_stream(container: Any, stream: Any) -> tuple[torch.Tensor, 
     chunks = []
     for frame in container.decode(stream):
         chunks.extend(
-            torch.from_numpy(resampled.to_ndarray())
-            for resampled in resampler.resample(frame)
+            torch.from_numpy(resampled.to_ndarray()) for resampled in resampler.resample(frame)
         )
     chunks.extend(
-        torch.from_numpy(resampled.to_ndarray())
-        for resampled in resampler.resample(None)
+        torch.from_numpy(resampled.to_ndarray()) for resampled in resampler.resample(None)
     )
     if not chunks:
         raise ValueError("expected decoded audio samples, got none")
