@@ -12,7 +12,7 @@ data:
       dataset_dir: "dataset/vid_prompt"
       train: {weight: 1, max_dataset_size: 1024}
       eval: {}
-  preprocessing_batch_size: 4
+  preprocessing_batch_size: 1
   dataloader_num_workers: 8
   force_reprocess: true
   cache_dir: "~/.cache/flow_factory/datasets"
