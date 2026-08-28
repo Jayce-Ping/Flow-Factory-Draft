@@ -47,11 +47,11 @@ train:
   clip_range: 1.0e-4
   adv_clip_range: 5.0
   kl_type: "v-based"
-  kl_beta: 0
+  kl_beta: 0.01
   ref_param_device: "cuda"
 
   resolution: 512
-  num_inference_steps: 10
+  num_inference_steps: 14
   # Text and image CFG for ordered multi-reference generation.
   guidance_scale: 1.0
   image_guidance_scale: 1.0
@@ -87,7 +87,7 @@ eval:
   per_device_batch_size: 2
   guidance_scale: 3.0
   image_guidance_scale: 1.5
-  num_inference_steps: 50
+  num_inference_steps: 14
   eval_freq: 20
   seed: 42
   cfg_norm: global

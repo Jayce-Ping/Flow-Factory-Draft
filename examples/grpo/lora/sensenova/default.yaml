@@ -48,12 +48,12 @@ train:
   adv_clip_range: 5.0  # Advantage clipping range
   # KL div
   kl_type: 'v-based' # Options: 'x-based', 'v-based'
-  kl_beta: 0 # KL divergence coefficient. Set ~1e-2 for 'x-based' and ~1e-3 for 'v-based'.
+  kl_beta: 0.01 # KL divergence coefficient.
   ref_param_device: 'cuda' # Options: cpu, cuda
 
   # Sampling settings
   resolution: 512  # Can be int or [height, width]
-  num_inference_steps: 10  # Number of timesteps
+  num_inference_steps: 14  # Number of timesteps
   # SenseNova-U1 generation params (passed to inference/forward via **training_args)
   guidance_scale: 1.0  # Text guidance; any non-negative float; 1.0 disables text CFG
   image_guidance_scale: 1.0  # Image guidance for I2I; any non-negative float
@@ -96,7 +96,7 @@ eval:
   resolution: 512  # Evaluation resolution
   per_device_batch_size: 2  # Eval batch size
   guidance_scale: 4.0  # Text guidance; 1.0 disables text CFG
-  num_inference_steps: 50  # Number of eval timesteps
+  num_inference_steps: 14  # Number of eval timesteps
   eval_freq: 20  # Eval frequency in epochs (0 to disable)
   seed: 42  # Eval seed (defaults to training seed)
   image_guidance_scale: 1.0  # Image guidance for I2I; any non-negative float
