@@ -29,6 +29,7 @@ from flow_factory.trainers.common.flow_matching import (
     build_noised_output_state,
     flow_matching_per_sample_loss,
     sample_offline_timesteps,
+    validate_preference_component_times,
     validate_preference_output_states,
 )
 
@@ -199,6 +200,27 @@ def test_preference_arms_share_coordinates_and_noise_but_keep_their_own_batches(
     assert torch.equal(chosen_times.timestep["latent"], rejected_times.timestep["latent"])
     assert torch.equal(chosen_times.sigma["latent"], rejected_times.sigma["latent"])
     assert rejected.noise is chosen.noise
+
+
+def test_preference_component_times_reject_context_dependent_schedule_drift() -> None:
+    chosen = ComponentTimes(
+        timestep={"latent": torch.tensor([500.0, 250.0])},
+        next_timestep={"latent": torch.zeros(2)},
+        sigma={"latent": torch.tensor([0.5, 0.25])},
+        next_sigma={"latent": torch.zeros(2)},
+    )
+    rejected = ComponentTimes(
+        timestep={"latent": chosen.timestep["latent"].clone()},
+        next_timestep={"latent": chosen.next_timestep["latent"].clone()},
+        sigma={"latent": torch.tensor([0.5, 0.2])},
+        next_sigma={"latent": chosen.next_sigma["latent"].clone()},
+    )
+
+    with pytest.raises(ValueError, match="component times values mismatch"):
+        validate_preference_component_times(chosen, rejected)
+
+    rejected.sigma = {"latent": chosen.sigma["latent"].clone()}
+    validate_preference_component_times(chosen, rejected)
 
 
 def test_flow_matching_loss_computes_fp32_errors_before_adapter_reduction() -> None:

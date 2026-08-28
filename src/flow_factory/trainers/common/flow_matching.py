@@ -235,6 +235,69 @@ def validate_preference_output_states(
     )
 
 
+def validate_preference_component_times(
+    chosen: ComponentTimes,
+    rejected: ComponentTimes,
+) -> None:
+    """Require pairwise arms to resolve one identical forward-process schedule.
+
+    Offline DPO supplies the same primary scheduler coordinates to both output
+    arms. An adapter may still derive component-specific coordinates from output
+    context, so equality has to be proven after that model-owned mapping rather
+    than inferred from the shared primary tensor.
+
+    Args:
+        chosen: Component schedule resolved for the chosen output.
+        rejected: Component schedule resolved for the rejected output.
+
+    Raises:
+        TypeError: If either value is not ``ComponentTimes`` or optional fields differ.
+        ValueError: If field metadata, component order, or tensor values differ.
+    """
+    for name, value in (("chosen", chosen), ("rejected", rejected)):
+        if not isinstance(value, ComponentTimes):
+            raise TypeError(
+                f"expected {name} component times to be ComponentTimes, "
+                f"received {type(value).__name__}: {value!r}"
+            )
+
+    for field_name in ("timestep", "next_timestep", "sigma", "next_sigma"):
+        chosen_values = getattr(chosen, field_name)
+        rejected_values = getattr(rejected, field_name)
+        if (chosen_values is None) != (rejected_values is None):
+            raise TypeError(
+                "preference arm component times optional-field mismatch for " f"{field_name!r}"
+            )
+        if chosen_values is None:
+            continue
+        if tuple(chosen_values) != tuple(rejected_values):
+            raise ValueError(
+                "preference arm component times order mismatch for "
+                f"{field_name!r}: chosen={tuple(chosen_values)}, "
+                f"rejected={tuple(rejected_values)}"
+            )
+        for component_name in chosen_values:
+            chosen_tensor = chosen_values[component_name]
+            rejected_tensor = rejected_values[component_name]
+            if (
+                chosen_tensor.shape != rejected_tensor.shape
+                or chosen_tensor.dtype != rejected_tensor.dtype
+                or chosen_tensor.device != rejected_tensor.device
+            ):
+                raise ValueError(
+                    "preference arm component times tensor metadata mismatch for "
+                    f"{field_name}[{component_name!r}]: "
+                    f"chosen=({tuple(chosen_tensor.shape)}, {chosen_tensor.dtype}, "
+                    f"{chosen_tensor.device}), rejected=({tuple(rejected_tensor.shape)}, "
+                    f"{rejected_tensor.dtype}, {rejected_tensor.device})"
+                )
+            if not torch.equal(chosen_tensor, rejected_tensor):
+                raise ValueError(
+                    "preference arm component times values mismatch for "
+                    f"{field_name}[{component_name!r}]"
+                )
+
+
 def _validate_matching_masks(chosen: LatentState, rejected: LatentState) -> None:
     if (chosen.active_masks is None) != (rejected.active_masks is None):
         raise ValueError("preference arms must either both define active masks or both omit them")
@@ -316,5 +379,6 @@ __all__ = [
     "build_noised_output_state",
     "flow_matching_per_sample_loss",
     "sample_offline_timesteps",
+    "validate_preference_component_times",
     "validate_preference_output_states",
 ]
