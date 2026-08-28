@@ -10,7 +10,7 @@ examples/{algorithm}/{finetune_type}/{model_type}/{variant}.yaml
 
 | Level | Description | Examples |
 |-------|-------------|---------|
-| `algorithm` | Training algorithm | `grpo`, `dppo`, `nft`, `awm`, `dgpo`, `dpo`, `crd`, `opd`, `dmd2`, `tdm`, `tdm_r1` |
+| `algorithm` | Training algorithm | `sft`, `offline_dpo`, `grpo`, `dppo`, `nft`, `awm`, `dgpo`, `dpo`, `crd`, `opd`, `dmd2`, `tdm`, `tdm_r1` |
 | `finetune_type` | Parameter-efficient or full | `lora`, `full` |
 | `model_type` | Model family (underscore-separated) | `flux1`, `sd3_5`, `wan21`, `ltx2` |
 | `variant` | Config variant | `default.yaml`, `nocfg.yaml`, `t2v.yaml` |
@@ -23,6 +23,20 @@ examples/{algorithm}/{finetune_type}/{model_type}/{variant}.yaml
 ```bash
 ff-train examples/grpo/lora/flux1/default.yaml
 ```
+
+## Offline examples
+
+- [`sft` with SD3.5](sft/lora/sd3_5/default.yaml) consumes V2
+  `demonstration` records from [`examples/data/sft_sd3_5`](data/sft_sd3_5/train.jsonl).
+- [`offline-dpo` with SD3.5](offline_dpo/lora/sd3_5/default.yaml) consumes V2
+  `preference` records from
+  [`examples/data/offline_dpo_sd3_5`](data/offline_dpo_sd3_5/train.jsonl).
+
+The two tiny manifests reuse repository images so their paths resolve without a separate dataset
+download. They are configuration and smoke-test fixtures, not quality-training datasets. Offline
+training requires an explicit integer `gradient_accumulation_steps`; the number of rank-local
+dataloader batches must be divisible by it. See the [dataset guide](../guidance/datasets.md#offline-v2-records)
+for the production schema and media requirements.
 
 ## DMD2 and TDM
 

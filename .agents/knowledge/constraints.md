@@ -38,24 +38,38 @@ and seed dispatch, and its immutable names must equal `trajectory_component_orde
 
 ## Training Pipeline (6–10)
 
-### 6. Six-Stage Pipeline Order
-The training loop executes: Data Preprocessing → K-Repeat Sampling → Trajectory Generation → Reward Computation → Advantage Computation → Policy Optimization. This order is invariant. Do not reorder or skip stages.
+### 6. Execution Contract and Stage Order
+Every trainer and its training arguments declare the same immutable acquisition/feedback
+`ExecutionContract`. Generation + runtime reward preserves Data Preprocessing → K-Repeat →
+Trajectory Generation → Reward → Advantage → Policy Optimization. Dataset + no feedback exhausts
+the finite loader through `optimize_batch()` and must not call rollout/reward stages. Do not infer
+either axis from batch fields or make it user-configurable independently of `trainer_type`.
 
 ### 7. Coupled vs Decoupled Paradigm
 - **Coupled** (GRPO, GRPO-Guard, DPPO): Training timesteps are coupled with SDE-based sampling. Requires log-probability computation. Must use SDE dynamics (`Flow-SDE`, `Dance-SDE`, `CPS`).
-- **Decoupled** (DPO, NFT, AWM, DGPO, CRD): Training timesteps are decoupled from sampling. Can use any dynamics including `ODE`.
+- **Decoupled** (SFT, offline DPO, online DPO, NFT, AWM, DGPO, CRD): Training timesteps are decoupled from sampling. Can use any dynamics including `ODE`.
 - **Distillation** (`diffusion-opd`): On-policy multi-teacher distillation; dynamics-agnostic (ODE or SDE) and has no reward/advantage stage.
 
 Mixing paradigms (e.g., using `ODE` dynamics with `GRPO`) will produce incorrect gradients silently.
 
 ### 8. Component Offloading Lifecycle
-Text encoders and VAEs are loaded for Stage 1 (preprocessing), then offloaded to free VRAM before the training loop. They are reloaded for inference during sampling. Do not assume these components are always on-device.
+Text and condition encoders are loaded for preprocessing, then may be offloaded before the
+training loop. Online inference reloads its declared components. Dataset acquisition separately
+loads adapter-declared output codec components for on-the-fly target/chosen/rejected encoding;
+these output latent states must never enter the input-condition cache.
 
 ### 9. Accelerator `prepare()` Scope
-All target components (trainable **and** frozen-but-shardable) are bundled into a single `ModelBundle` (`models/model_bundle.py`) and prepared with the **optimizer** as one root via `accelerator.prepare()` — DeepSpeed (one engine) and FSDP2 (one root) cannot prepare multiple models separately. After prepare, each component is exposed as a `RoutedComponentProxy` that routes forwards through the bundle root; the optimizer/EMA/reference params still target only the `requires_grad` subset (frozen members are sharded for memory but never trained). The train dataloader uses a custom distributed sampler (`DistributedKRepeatSampler`, `GroupContiguousSampler`, or `GroupDistributedSampler`) and is NOT prepared via accelerator. Breaking this causes duplicate data or incorrect gradient accumulation.
+All target components (trainable **and** frozen-but-shardable) are bundled into a single `ModelBundle` (`models/model_bundle.py`) and prepared with the **optimizer** as one root via `accelerator.prepare()` — DeepSpeed (one engine) and FSDP2 (one root) cannot prepare multiple models separately. After prepare, each component is exposed as a `RoutedComponentProxy` that routes forwards through the bundle root; the optimizer/EMA/reference params still target only the `requires_grad` subset (frozen members are sharded for memory but never trained). Generation dataloaders use the framework's grouped samplers; dataset acquisition uses PyTorch's official `DistributedSampler`, calls `set_epoch(data_epoch)`, and requires one complete traversal per offline epoch. Neither train dataloader path is prepared via Accelerator. Breaking this causes duplicate data or incorrect gradient accumulation.
 
 ### 9a. Sampler Geometric Constraints
 `DistributedKRepeatSampler` and `GroupContiguousSampler` require `M * K ≡ 0 (mod W * B * G)` where M=unique_sample_num, K=group_size, W=world_size, B=per_device_batch_size, G=gradient_step_per_epoch — **unless** `gradient_accumulation_steps` is set manually, in which case the constraint reduces to `M * K ≡ 0 (mod W * B)`. **GroupContiguousSampler** adds: `M ≡ 0 (mod W)`. **GroupDistributedSampler** (DGPO) requires: `K % W == 0` and `(W * B) % K == 0`; auto-aligned by `_align_for_group_distributed`. See `topics/samplers.md` for full details.
+
+Dataset acquisition does not use grouped geometry: every source weight is `1`,
+`gradient_accumulation_steps` is an explicit positive integer, and each rank's finite batch count
+must be divisible by it. Do not add batches merely to close or implicitly flush a partial
+accumulation window. PyTorch's official `DistributedSampler` remains authoritative for cross-rank
+tail handling: with `drop_last=False` it may repeat tail indices to equalize rank lengths, and one
+offline epoch means one complete traversal of that resulting finite loader.
 
 ### 9b. Checkpoint Save/Load Symmetry Under the Bundle
 Checkpoints are written and read for **trainable members only** — components whose `target_module_map[name]` is non-empty (`adapter.trainable_component_names`). Frozen-but-shardable bundle members (e.g. Wan2.2's `transformer_2`, kept in `target_components` only to be FSDP-sharded for memory; see #9) map to `None` and are skipped by both `save_checkpoint` and `_load_lora`/`_load_full_model`. Loaders MUST iterate `trainable_component_names`, not `target_components`, or resume logs a spurious error for a per-component subdir that was never written. `resume_type='state'` restores via `accelerator.load_state` into the prepared bundle root and is therefore keyed to bundle membership — resuming into a different `target_components` / bundle composition will mismatch.
@@ -67,10 +81,18 @@ Supported distributed plans are DDP, FSDP, and DeepSpeed ZeRO-1/2. Reward model 
 
 ## Base Class Interfaces (11–14)
 
-### 11. BaseTrainer Abstract Contract
-`BaseTrainer.__init__` expects `(accelerator, config, adapter)`. `optimize()` is the only abstract method subclasses must implement. `start()` (the shared epoch loop), `prepare_feedback()`, `compute_advantages()` and `evaluate()` are **concrete** base methods — override only to customize, and prefer the hooks (`sampling_context`, `_run_training_step`, `_after_gradient_step`, `_after_optimizer_step`) over restating the loop. The `_initialization()` method handles dataloader, optimizer, accelerator preparation, reward model loading, and `AdvantageProcessor` instantiation — do not duplicate this logic.
+### 11. BaseTrainer Execution Contract
+`BaseTrainer.__init__` expects `(accelerator, config, adapter)`. Generation trainers override
+`optimize(samples)`; dataset trainers override `optimize_batch(batch)`, and construction validates
+the hook selected by the execution contract. `start()`, acquisition drivers,
+`prepare_feedback()`, `compute_advantages()` and `evaluate()` are concrete base behavior — prefer
+the hooks over restating the loop. `_initialization()` owns dataloaders, optimizer, distributed
+preparation, rewards, and advantage processing.
 
-**Per-epoch hook order**: `sample()` (Stages 2–3) → `prepare_feedback()` (Stages 4–5) → `optimize()` (Stage 6). `DPOTrainer` forms chosen/rejected pairs at the **start** of `optimize()` (not in `prepare_feedback()`).
+**Acquisition hook order**: generation calls `sample()` → optional `prepare_feedback()` →
+`optimize()`; dataset acquisition iterates the official finite loader and calls optional feedback →
+`optimize_batch()`. Online `DPOTrainer` forms pairs at `optimize()` entry. Offline DPO consumes
+dataset pairs directly.
 
 **Trainer hierarchy**: New trainers MUST inherit directly from `BaseTrainer`. The only sanctioned exceptions are strict behavioral variants of GRPO that change only the per-step loss while reusing GRPO's sampling/advantage/eval machinery: `GRPOGuardTrainer → GRPOTrainer` (adds ratio-normalization) and `DPPOTrainer → GRPOTrainer` (replaces the PPO ratio-clip with a KL trust-region mask). Trainer-to-trainer inheritance creates fragile coupling; when in doubt, inherit from `BaseTrainer` and extract shared logic into helper methods. All reward-based trainers delegate advantage computation to `self.advantage_processor.compute_advantages()`; the distillation trainer `diffusion-opd` is the exception (its `prepare_feedback()` is a no-op with no reward/advantage stage).
 
@@ -91,6 +113,12 @@ Subclasses of `BaseAdapter` MUST implement these **4 abstract methods**:
 Note: `preprocess_func()` is a **concrete method** on `BaseAdapter` that dispatches to all four encoders (`prompt`, `images`, `videos`, `audios`) and skips integration when the called encoder returns `None`. It does NOT need to be overridden unless the model requires cross-modal preprocessing (e.g. prompt rewriting from images).
 
 Breaking the signature of any of the four abstract methods (or changing the encoder return contract from "dict-or-`None`") breaks the entire training pipeline.
+
+Offline-capable adapters additionally declare a `PipelineIOContract`, a declaration-only
+`OutputStateCodec`, logical encoding components, and exact geometry validation. Condition and
+output paths may share role-neutral transforms, but the official posterior `sample`/`argmax`
+policy stays explicit at their semantic boundaries. Unsupported adapters declare an actionable
+`output_state_codec_unavailable_reason` and fail before heavyweight loading.
 
 **Adapter hierarchy**: All model adapters MUST inherit directly from `BaseAdapter` — never from another adapter. Shared logic between adapters for the same model family should use private helper functions, code duplication, or mixins — not adapter-to-adapter inheritance. Adapter subclassing creates fragile coupling where changes to a parent adapter silently break child adapters, and makes the 4-abstract-method contract harder to verify (the 4 per-modality encoders have no-op defaults, so a fresh subclass of `BaseAdapter` is always valid; chained inheritance hides which encoder a model actually overrides).
 
@@ -120,7 +148,12 @@ All config dataclasses live in `hparams/`. The top-level `Arguments` aggregates 
 3. Any code that accesses `config.<field_name>`
 
 ### 16. Algorithm-Specific Training Args
-`TrainingArguments` has algorithm-specific subclasses (`GRPOTrainingArguments`, `DPPOTrainingArguments`, `DPOTrainingArguments`, `DGPOTrainingArguments`, `NFTTrainingArguments`, `AWMTrainingArguments`, `CRDTrainingArguments`, `DiffusionOPDTrainingArguments`). The correct subclass is resolved by `get_training_args_class()` (registry in `hparams/training_args/_registry.py`). Adding a new algorithm requires adding a corresponding subclass and updating the resolver.
+`TrainingArguments` has algorithm-specific subclasses (`SFTTrainingArguments`,
+`OfflineDPOTrainingArguments`, `GRPOTrainingArguments`, `DPPOTrainingArguments`,
+`DPOTrainingArguments`, `DGPOTrainingArguments`, `NFTTrainingArguments`, `AWMTrainingArguments`,
+`CRDTrainingArguments`, `DiffusionOPDTrainingArguments`, and the multi-role distillation classes).
+The correct subclass is resolved by `get_training_args_class()`; adding an algorithm requires a
+corresponding subclass and registry entry.
 
 ### 17. YAML Config Structure
 Config keys must exactly match Pydantic field names. Typos fail silently with default values. See `examples/` for canonical config templates; structure defined in `hparams/args.py`.
@@ -131,6 +164,13 @@ Config keys must exactly match Pydantic field names. Typos fail silently with de
 
 ### 18. All-Rank Synchronization Points
 `accelerator.wait_for_everyone()` must be called at critical synchronization points (after preprocessing, before/after evaluation, checkpoint saving). Missing barriers cause deadlocks or race conditions.
+
+### 18a. Exact Resume Must Cover Replayed Evaluation
+Exact-state identity MUST lock evaluation cadence, sampling configuration, ordered realized eval
+loaders, per-dataset overrides, and eval rewards. Online checkpoints are saved before evaluation
+and replay that evaluation after resume, so treating eval as an operational control permits global
+device RNG drift. Exact-state save MUST fail before adapter or filesystem mutation on a device
+whose RNG Accelerate cannot serialize; MPS users must use model-only checkpoints.
 
 ### 19. FSDP CPU Efficient Loading
 Distributed loading is owned by `ModelLoadCoordinator` and its `BackendLoadRuntime`. TARGET roots may use rank-zero/meta FSDP2 loading only when the adapter declares that capability. AUXILIARY and REWARD resources are materialized as full per-rank replicas; FSDP auxiliary roots receive a cached sampled-fingerprint check, while reward loading is isolated from target-only loading state. Trainer code must not manipulate FSDP loading environment variables or broadcast component weights directly.

@@ -1,7 +1,8 @@
 # Design Philosophy
 
-Flow-Factory is a simple, extensible RL fine-tuning framework for diffusion/flow-matching models.
-Models, algorithms, and rewards are decoupled via registries and base-class contracts.
+Flow-Factory is a simple, extensible online and offline fine-tuning framework for
+diffusion/flow-matching models. Models, algorithms, data acquisition, and rewards are decoupled via
+registries and typed contracts.
 Both rollout and training run under Hugging Face Accelerate (DDP / DeepSpeed ZeRO-1-2 / FSDP
 backends). The single most important invariant is **train-inference consistency**.
 

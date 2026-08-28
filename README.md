@@ -4,7 +4,7 @@
 <h1 align="center">Flow-Factory</h1>
 
 <p align="center">
-  <b>Easy Reinforcement Learning for Diffusion and Flow-Matching Models</b>
+  <b>Unified Online RL and Offline Fine-Tuning for Diffusion and Flow-Matching Models</b>
 </p>
 
 # 🔥 News
@@ -45,6 +45,7 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
   - [Quick Start Example](#quick-start-example)
 - [Guidance](#-guidance)
 - [Dataset](#-dataset)
+  - [Offline SFT and Preference Data](#offline-sft-and-preference-data)
   - [Text-to-Image & Text-to-Video](#text-to-image--text-to-video)
   - [Image-to-Image & Image-to-Video](#image-to-image--image-to-video)
 - [Reward Model](#-reward-model)
@@ -96,6 +97,12 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
 
 > To support new models, see [Guidance/New Model](guidance/new_model.md).
 
+> **Offline output support:** SFT and offline DPO currently support `sd3-5`, `flux1`,
+> `flux1-kontext`, `flux2`, `flux2-klein`, `qwen-image`, `qwen-image-edit-plus`, `z-image`,
+> `bagel`, `sensenova`, and `wan2_t2v`. Wan I2V, LTX2, and MiniMax H3 fail fast on their
+> currently unresolved output/condition or audio-video semantics. See the
+> [offline model matrix](guidance/datasets.md#offline-model-support).
+
 > **MiniMax H3 status:** the T2VA debug and
 > [native-quality FSDP2](examples/grpo/lora/minimax_h3_t2va/quality_720p_fsdp2.yaml)
 > paths are real-weight
@@ -107,9 +114,11 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
 
 # 💻 Supported Algorithms
 
-| Algorithm      | `trainer_type` | Paper |
+| Algorithm      | `trainer_type` | Reference / objective |
 |----------------|----------------|-------|
-| DPO            | dpo            | [Diffusion-DPO](https://arxiv.org/abs/2311.12908) |
+| SFT            | sft            | Supervised flow matching over V2 demonstrations |
+| Offline DPO    | offline-dpo    | [Diffusion-DPO](https://arxiv.org/abs/2311.12908) over V2 preference pairs |
+| Online DPO     | dpo            | [Diffusion-DPO](https://arxiv.org/abs/2311.12908) with generated, reward-ranked pairs |
 | GRPO           | grpo           | [Flow-GRPO](https://arxiv.org/abs/2505.05470) / [Dance-GRPO](https://arxiv.org/abs/2505.07818) |
 | DiffusionNFT   | nft            | [DiffusionNFT](https://arxiv.org/abs/2509.16117) |
 | AWM            | awm            | [Advantage Weighted Matching](https://arxiv.org/abs/2509.25050) |
@@ -186,6 +195,13 @@ Start training with the following simple command:
 ff-train examples/grpo/lora/flux1/default.yaml
 ```
 
+Offline smoke recipes use strict V2 manifests and require no training reward model:
+
+```bash
+ff-train examples/sft/lora/sd3_5/default.yaml
+ff-train examples/offline_dpo/lora/sd3_5/default.yaml
+```
+
 # 📖 Guidance
 
 We provide a set of guidance documents to help you understand the framework and extend it. For a comprehensive understanding of the framework's design and motivation, refer to our [technique report](https://arxiv.org/abs/2602.12529).
@@ -193,7 +209,7 @@ We provide a set of guidance documents to help you understand the framework and 
 | Document | Description |
 |---|---|
 | [Workflow](guidance/workflow.md) | End-to-end training pipeline: the overall stages from data preprocessing to policy optimization |
-| [Algorithms](guidance/algorithms.md) | Supported algorithms (GRPO, GRPO-Guard, DPPO, DiffusionNFT, AWM, DPO, DGPO, CRD, DiffusionOPD, DMD2, TDM, TDM-R1) and their configurations |
+| [Algorithms](guidance/algorithms.md) | Supported online RL, SFT, offline DPO, and distillation algorithms and their configurations |
 | [Rewards](guidance/rewards.md) | Reward model system: built-in models, custom rewards, and remote reward servers |
 | [Datasets](guidance/datasets.md) | Dataset schemas, media paths, and ordered-reference inputs |
 | [New Model](guidance/new_model.md) | How to add support for a new Diffusion/Flow-Matching model |
@@ -213,6 +229,21 @@ The unified structure of dataset is:
 |----|---| video1.mp4
 |----|---| ...
 ```
+
+## Offline SFT and Preference Data
+
+SFT and offline DPO use strict JSONL with `schema_version: 2`. Public media objects always use the
+`type` discriminator; `kind` is not accepted in V2:
+
+```jsonl
+{"schema_version":2,"input":{"prompt":"A clean poster.","media":[]},"supervision":{"type":"demonstration","target":{"media":[{"type":"image","path":"targets/poster.png"}]}},"metadata":{}}
+{"schema_version":2,"input":{"prompt":"A clean poster.","media":[]},"supervision":{"type":"preference","chosen":{"media":[{"type":"image","path":"pairs/chosen.png"}]},"rejected":{"media":[{"type":"image","path":"pairs/rejected.png"}]}},"metadata":{}}
+```
+
+Prompt and input-condition encodings are cached. Target, chosen, and rejected media are decoded and
+encoded on the fly; their VAE latents are never stored in the preprocessing cache. One offline
+epoch is one complete dataloader traversal sharded by PyTorch's official `DistributedSampler`. See the
+[dataset guide](guidance/datasets.md#offline-v2-records) for the full schema and cadence rules.
 
 ## Text-to-Image & Text-to-Video
 

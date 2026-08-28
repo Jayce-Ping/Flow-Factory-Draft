@@ -1,18 +1,21 @@
 ---
 name: ff-new-algorithm
-description: "Complete workflow for adding a new RL training algorithm. Covers paradigm selection, TrainingArguments subclass, trainer implementation, registry, example config, and verification. Trigger: 'add algorithm', 'new trainer', 'new training method', 'implement algorithm'."
+description: "Complete workflow for adding an online or offline training algorithm. Covers execution-contract and paradigm selection, TrainingArguments subclass, trainer implementation, registry, example config, and verification. Trigger: 'add algorithm', 'new trainer', 'new training method', 'implement algorithm'."
 ---
 
-# New RL Algorithm Integration
+# New Training Algorithm Integration
 
 > **Authoritative reference**: `guidance/algorithms.md`
 
 ## Prerequisites
 
 Determine your algorithm's characteristics:
+- **Acquisition**: Generated rollouts or a finite dataset? (`generation` / `dataset`)
+- **Feedback**: Runtime reward/advantage or none? (`runtime_reward` / `none`)
 - **Paradigm**: Coupled or Decoupled? (`constraints.md` #7)
 - **Dynamics**: Which SDE/ODE formulation? (`Flow-SDE`, `Dance-SDE`, `CPS`, `ODE`)
-- **Advantage**: How are advantages computed from rewards? (Most algorithms can delegate to `AdvantageProcessor`)
+- **Supervision**: Prompt-only generation, demonstrations, preference pairs, or a new typed record?
+- **Advantage**: If feedback is enabled, how are advantages computed? (Most reward-based algorithms can delegate to `AdvantageProcessor`)
 - **Loss**: What is the policy optimization objective?
 
 ## Phase 1: Design
@@ -20,11 +23,25 @@ Determine your algorithm's characteristics:
 1. **Study existing implementations**:
    - Coupled example: `trainers/rl/grpo.py` (GRPO)
    - Decoupled example: `trainers/rl/nft.py` (DiffusionNFT) or `trainers/rl/awm.py` (AWM)
+   - Finite demonstration example: `trainers/offline/sft.py` (SFT)
+   - Finite preference example: `trainers/offline/offline_dpo.py` (offline DPO)
 2. **Identify what's shared vs unique** (`constraints.md` #11):
-   - Shared: the epoch loop (`BaseTrainer.start`), data loading, reward computation,
-     `AdvantageProcessor`, `prepare_feedback`, `compute_advantages`, adapter interface, checkpoint logic
+   - Shared: the cycle loop (`BaseTrainer.start`), acquisition dispatch, progress counters,
+     adapter interface, checkpoint/eval boundaries, role optimization, and exact-resume identity
+   - Conditional: runtime rewards, `AdvantageProcessor`, `prepare_feedback`, and
+     `compute_advantages` exist only when the feedback contract requests them
    - Unique: the loss function and the algorithm-specific hyperparameters. Never restate the loop
-   - Per-epoch hook order: `sample()` → `prepare_feedback()` → `optimize()` (see `guidance/workflow.md`)
+   - Generation hook order: `sample()` → optional `prepare_feedback()` → `optimize()`
+   - Dataset hook order: official finite loader traversal → `optimize_batch(batch)`
+3. **Declare one immutable execution contract**:
+   - Online RL: `ONLINE_EXECUTION_CONTRACT` (`generation + runtime_reward`)
+   - Generation without rewards: `ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT`
+   - Finite offline training: `OFFLINE_EXECUTION_CONTRACT` (`dataset + none`)
+
+Keep execution semantics orthogonal to `PipelineIOContract`. The algorithm owns how examples are
+acquired and optimized; the adapter owns accepted input/output media, geometry, and output-state
+encoding. A new offline record shape belongs in the typed data layer, never in model-specific loss
+branches.
 
 ## Phase 2: Configuration
 
@@ -95,25 +112,30 @@ from .training_args import MyAlgoTrainingArguments
 
 ### Step 3 — Create Trainer Class
 
+For a generated online algorithm:
+
 ```python
-# src/flow_factory/trainers/rl/my_algo.py
+# src/flow_factory/trainers/rl/my_online_algo.py
+from ...contracts import ONLINE_EXECUTION_CONTRACT
 from ..abc import BaseTrainer
 from ..registry import register_trainer
 
-@register_trainer('my_algo')
-class MyAlgoTrainer(BaseTrainer):
-    """My custom RL algorithm trainer."""
+@register_trainer("my-online-algo")
+class MyOnlineAlgoTrainer(BaseTrainer):
+    """My generated-acquisition algorithm."""
 
-    # Do NOT define start(). BaseTrainer.start() owns the epoch loop: reseed, checkpoint on
-    # save_freq, evaluate on eval_freq, _run_training_step(), ema_step, _after_optimizer_step.
-    # evaluate(), prepare_feedback() and compute_advantages() are likewise CONCRETE base
-    # methods. optimize() is the only abstract one.
+    execution_contract = ONLINE_EXECUTION_CONTRACT
+
+    # Do NOT define start(). BaseTrainer.start() owns the acquisition loop: reseed,
+    # periodic boundaries, acquisition dispatch, EMA, and _after_acquisition_cycle().
+    # evaluate(), prepare_feedback(), and compute_advantages() are concrete base methods.
+    # A generation trainer implements sample() and optimize(samples).
     #
     # Vary behavior through hooks instead of restating the loop:
     #   sampling_context()       - wrap the rollout (e.g. install a snapshot's weights)
     #   _run_training_step()     - replace the sample -> feedback -> optimize middle
     #   _after_gradient_step()   - run right after each optimizer step
-    #   _after_optimizer_step()  - run once per epoch, after the EMA step
+    #   _after_acquisition_cycle() - run once per rollout iteration or data epoch
     #   _declare_model_variants() - declare several trainable copies (see component_variants.md)
 
     def sample(self):
@@ -129,8 +151,38 @@ class MyAlgoTrainer(BaseTrainer):
         pass
 ```
 
-> **Note**: `AdvantageProcessor` is auto-instantiated in `BaseTrainer._init_reward_model()`.
-> Reward-based trainers delegate via `self.advantage_processor.compute_advantages()` — see `architecture.md` "Advantage Computation". (Pure-distillation trainers like `diffusion-opd` skip rewards/advantages with a no-op `prepare_feedback()`.)
+For a finite offline algorithm:
+
+```python
+# src/flow_factory/trainers/offline/my_offline_algo.py
+from ...contracts import OFFLINE_EXECUTION_CONTRACT
+from ..abc import BaseTrainer
+from ..registry import register_trainer
+
+@register_trainer("my-offline-algo")
+class MyOfflineAlgoTrainer(BaseTrainer):
+    """My finite-dataset algorithm."""
+
+    paradigm = "decoupled"
+    execution_contract = OFFLINE_EXECUTION_CONTRACT
+
+    def _build_train_dataloader(self):
+        """Build a finite official-DistributedSampler loader for one typed schema."""
+        # Reuse build_offline_train_dataloader when the supervision type matches;
+        # otherwise extend the typed schema/collator first.
+        ...
+
+    def optimize_batch(self, batch):
+        """Apply one gradient-accumulation microstep from a dataset batch."""
+        # Decode output media in the dataset and encode it on demand through
+        # adapter.encode_output_state(); never add target VAE latents to the cache.
+        ...
+```
+
+> **Note**: `AdvantageProcessor` is relevant only to `runtime_reward` feedback.
+> Reward-based trainers delegate via `self.advantage_processor.compute_advantages()` — see
+> `architecture.md` "Advantage Computation". `none` feedback bypasses rewards structurally; do not
+> emulate that by overriding reward methods with incidental no-ops.
 
 ### Step 4 — Register in Trainer Registry
 
@@ -188,9 +240,12 @@ optimizers:
 - [ ] `MyAlgoTrainingArguments` correctly parsed from YAML
 - [ ] `get_training_args_class('my_algo')` returns correct subclass
 - [ ] `get_trainer_class('my_algo')` loads `MyAlgoTrainer`
-- [ ] Training runs end-to-end for ≥2 epochs without errors
+- [ ] `execution_contract` matches the argument class and implemented optimization hook
+- [ ] Training runs end-to-end for ≥2 acquisition cycles without errors
+- [ ] Dataset acquisition defines one epoch as one complete finite dataloader traversal
 - [ ] Loss values are numerically reasonable (not NaN, decreasing)
-- [ ] Rewards improve over training
+- [ ] Rewards improve over training when feedback is `runtime_reward`
+- [ ] Offline supervision media is encoded on the fly and excluded from preprocessing caches
 - [ ] Checkpoint save/load works correctly
 - [ ] Works with at least two different model adapters
 - [ ] Coupled algorithms only use SDE dynamics
@@ -206,3 +261,6 @@ optimizers:
 6. **Reimplementing advantage gather/scatter** — use `self.advantage_processor.compute_advantages()` instead; it handles both sampler topologies automatically
 7. **Extending `GRPOTrainer` unnecessarily** — unless your algorithm extends GRPO's PPO-clipped loss, extend `BaseTrainer` directly (as NFT and AWM do)
 8. **Optimizer-time CFG without `get_preprocess_guidance_scale()`** — if your algorithm calls `adapter.forward(guidance_scale=X)` where X > 1.0 but `training_args.guidance_scale` ≤ 1.0, negative prompts won't be encoded at preprocessing time and CFG silently falls back to no-CFG. Override `get_preprocess_guidance_scale()` in your TrainingArguments subclass to return `max(guidance_scale, your_optimize_cfg)`. See DGPO's `kl_cfg` for a real example.
+9. **Inferring online/offline behavior from batch keys** — declare `ExecutionContract`; keep acquisition and feedback independent from the model I/O schema.
+10. **Using `optimize()` for finite data** — dataset acquisition calls `optimize_batch(batch)` and advances `data_epoch` only after clean loader exhaustion.
+11. **Caching target/chosen/rejected latents** — cache prompt/input conditions only; output media is decoded and encoded on demand through the adapter output codec.

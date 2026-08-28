@@ -53,7 +53,162 @@ resolved against their corresponding media directory. MiniMax H3 Ref2VA is diffe
 relative `references[*].path` and `references[*].audio_path` values are resolved against
 `dataset_dir`; absolute paths are accepted unchanged.
 
+## Offline V2 records
+
+SFT and offline DPO require strict JSONL records with `"schema_version": 2`. In this release, V2 is
+a supervised offline format: every record must carry either demonstration or preference
+supervision. It is not an alternative input format for the existing online generation loader.
+V2 separates the model input from its supervision, so dataset rows remain model- and
+algorithm-neutral:
+
+```text
+record
+├── input                    # prompt plus optional condition media
+├── supervision             # demonstration or preference
+└── metadata                # optional JSON provenance; never a model input
+```
+
+Every V2 media object uses `type` as its only public discriminator. The accepted values are
+`image`, `video`, and `audio`:
+
+```json
+{"type":"image","path":"images/source.png"}
+{"type":"video","path":"videos/clip.mp4","fps":24.0}
+{"type":"audio","path":"audios/clip.wav","sample_rate":48000}
+```
+
+Do not write `kind` in a V2 record. Some ordered-reference adapters still consume a validated
+legacy `kind` mapping internally; the V2 condition projection creates that private bridge only at
+the adapter preprocessing boundary. It is not part of the public V2 schema.
+
+### Demonstration supervision
+
+One SFT row has a shared input and one target candidate:
+
+```jsonl
+{"schema_version":2,"input":{"prompt":"Restyle the source as a watercolor.","media":[{"type":"image","path":"conditions/source.png"}]},"supervision":{"type":"demonstration","target":{"media":[{"type":"image","path":"targets/watercolor.png"}]}},"metadata":{"license":"example"}}
+```
+
+Use it with `train.trainer_type: sft`. `target.media` is an ordered sequence because a pipeline
+may eventually emit several modalities. Adapter-level codec availability and explicit blockers
+are checked before model weights are loaded. The offline loader then validates each record's exact
+output sequence, rates, input cardinality, and batch capability before condition preprocessing or
+training; adapter-specific encoded geometry is validated at the output-codec boundary.
+
+### Preference supervision
+
+One offline-DPO row shares the input across a chosen and rejected candidate:
+
+```jsonl
+{"schema_version":2,"input":{"prompt":"A clean typographic poster.","media":[]},"supervision":{"type":"preference","chosen":{"media":[{"type":"image","path":"pairs/chosen.png"}]},"rejected":{"media":[{"type":"image","path":"pairs/rejected.png"}]}},"metadata":{"annotator":"example"}}
+```
+
+Use it with `train.trainer_type: offline-dpo`. A training source must be homogeneous: every row
+must carry the supervision type required by its trainer. Prompt-only rows, mixed demonstration and
+preference rows, unknown keys, and non-V2 records fail during manifest loading.
+
+All V2 media paths are resolved against that source's `dataset_dir`; an absolute path is retained.
+Images and videos have built-in CPU decoders. Video targets require PyAV 18 or newer. There is no
+default audio target decoder yet, which is one reason the current audio-video adapters are blocked
+for offline objectives.
+
+Tiny schema-complete fixtures and configs are available for
+[SFT](../examples/sft/lora/sd3_5/default.yaml) and
+[offline DPO](../examples/offline_dpo/lora/sd3_5/default.yaml).
+
+Evaluation still uses generation acquisition, including when the trainer is SFT or offline DPO.
+Consequently, a split enabled through `data.datasets[*].eval` must use one of the legacy
+prompt/condition formats documented under [Common task formats](#common-task-formats), not a
+supervised V2 record. A single dataset directory may therefore contain a V2 `train.jsonl` and a
+legacy prompt-only `test.jsonl` without conflating their roles.
+
+### Condition cache and target lifecycle
+
+Offline preprocessing intentionally caches only the input side:
+
+```text
+V2 input
+  -> project prompt and condition media
+  -> adapter.preprocess_func under no-grad
+  -> Arrow cache of prompt/condition tensors
+
+V2 target, chosen, or rejected
+  -> decode from the source file in Dataset.__getitem__
+  -> collate decoded CPU media
+  -> adapter.encode_output_state under no-grad on every training microbatch
+  -> clean latent state for the objective
+```
+
+Target, chosen, and rejected payloads, their VAE latents, and supervision metadata are never
+written to the Arrow condition cache. There is no target-VAE preprocessing cache. This avoids a
+second large media-derived dataset on disk and keeps output geometry and posterior semantics owned
+by the adapter. The frozen VAE (or other output codec component) remains available at training
+time and performs the comparatively small on-the-fly encode; evaluation already needs the decoder.
+
+During offline dataset construction, every unique normalized input and supervision media path is
+streamed once through SHA-256, with digests memoized only for that source build. These digests are
+identity metadata: media payloads, decoded pixels, and output latents are neither copied nor cached.
+Replacing an input condition file in place therefore changes its condition identity and invalidates
+the Arrow cache automatically. Replacing target, chosen, or rejected media in place changes the
+full record identity used by exact-resume checks; supervision is still decoded afresh and requires
+no target-cache invalidation step.
+
+### Offline dataloader and epoch semantics
+
+Offline sources are concatenated once and sharded with PyTorch's official
+`torch.utils.data.DistributedSampler`, including a one-process run. The trainer calls
+`sampler.set_epoch(data_epoch)` and advances `data_epoch` only after the finite dataloader is
+exhausted successfully. Therefore one offline epoch has the standard meaning: one complete
+dataloader traversal. An exception or interruption during a partial traversal does not publish a
+completed epoch.
+
+Keep these configuration rules:
+
+```yaml
+data:
+  datasets:
+    - name: demonstrations
+      dataset_dir: "dataset/demonstrations"
+      train: {weight: 1}
+  enable_preprocess: true
+  sampler_type: auto
+train:
+  max_epochs: 4
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 4
+```
+
+- Each offline source must use `train.weight: 1`; replacement weighting would make full traversal
+  stop meaning one data epoch.
+- `gradient_accumulation_steps` must be an explicit positive integer. The number of rank-local
+  batches must divide evenly by it; the framework never adds batches merely to close a partial
+  accumulation window or silently flushes one.
+- PyTorch's official `DistributedSampler` owns cross-rank tail handling. With its default
+  `drop_last=False`, it may repeat tail indices when the global dataset size is not divisible by
+  world size so every rank traverses the same number of samples. This is standard sampler behavior;
+  an offline epoch is the resulting complete dataloader traversal, not a global uniqueness claim.
+- The offline loader is already rank-sharded and is not passed to `Accelerator.prepare()`.
+- `num_train_timesteps` controls independently sampled Monte Carlo loss terms averaged inside a
+  microbatch. It does not multiply gradient accumulation or change epoch length.
+
+### Offline model support
+
+The V2 schema is broader than the codecs currently implemented by adapters. Static capability
+validation fails before heavyweight model loading when a selected pipeline cannot preserve its
+output semantics.
+
+| Offline status | Model types | Notes |
+|---|---|---|
+| Supported | `sd3-5`, `flux1`, `flux1-kontext`, `flux2`, `flux2-klein`, `qwen-image`, `qwen-image-edit-plus`, `z-image`, `bagel`, `sensenova` | Image-output codecs with adapter-specific geometry and packing. SenseNova uses the existing grouped `images` input with within-type order, not heterogeneous references. |
+| Supported | `wan2_t2v` | Video targets require `fps`; the codec resamples to configured frames/rate and samples the Wan VAE posterior on the fly. |
+| Blocked | `wan2_i2v` | Output geometry depends on the first-frame VAE latent/mask, while the current condition cache does not preserve the source pixels needed by that binder. |
+| Blocked | `ltx2_t2av`, `ltx2_i2av` | Lossless audio decode/rate metadata and exact audio-video duration alignment are not unified; I2AV also needs the pinned first-frame active mask. |
+| Blocked | `minimax-h3-t2va`, `minimax-h3-fl2va`, `minimax-h3-ref2va` | The audio-video boundary and official target-video posterior policy are not yet defined for offline targets. |
+
 ## Common task formats
+
+The following compact formats remain supported for generation acquisition. They are separate from
+strict V2 offline records and do not carry output supervision.
 
 ### Text-conditioned generation
 
@@ -201,7 +356,8 @@ directory. See the [FL2VA dataset fixture](../dataset/minimax_h3_fl2va/train.jso
 
 ### Ref2VA: `minimax-h3-ref2va`
 
-Ref2VA uses a non-empty ordered `"references"` array containing image, video, and audio entries:
+The existing online Ref2VA loader uses a legacy non-empty ordered `"references"` array containing
+image, video, and audio entries:
 
 ```jsonl
 {"prompt":"Create a coherent scene using the references in order.","references":[{"kind":"image","path":"references/style.png"},{"kind":"video","path":"references/motion.mp4","fps":12.0},{"kind":"audio","path":"references/ambience.wav","sample_rate":16000}]}
@@ -223,6 +379,10 @@ Supported entries:
 soundtrack or a separate dataset-relative `audio_path`; a video `sample_rate` override requires
 `audio_path`. Unknown keys and unsupported `kind` values fail before preprocessing.
 
+This legacy online manifest is distinct from the strict V2 format above. A V2 record always uses
+`input.media[*].type`; offline condition projection performs any required legacy `kind` conversion
+internally.
+
 See the [Ref2VA dataset fixture](../dataset/minimax_h3_ref2va/train.jsonl), its
 [local fixture notes](../dataset/minimax_h3_ref2va/README.md), and the
 [Ref2VA GRPO configuration](../examples/grpo/lora/minimax_h3_ref2va/default.yaml).
@@ -240,9 +400,10 @@ TXT/JSONL row
   -> collate cached fields for rollout
 ```
 
-Prompt encoders, VAEs, and processors are preprocessing components. The trainer can offload them
-after cache creation because optimization consumes their cached outputs rather than decoding and
-encoding every source row again.
+Prompt encoders, condition VAEs, and processors are preprocessing components. Online RL can
+offload them after cache creation because optimization consumes cached conditions. Offline SFT and
+offline DPO reload any output-codec components declared by the adapter and encode target,
+chosen, and rejected media on the fly; those output states are never cached.
 
 Ref2VA adds an ordered-reference path:
 

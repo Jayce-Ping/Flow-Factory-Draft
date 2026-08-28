@@ -12,6 +12,7 @@
   - [Step 5: Implement `inference()`](#step-5-implement-inference)
   - [Step 6: Implement `forward()`](#step-6-implement-forward)
   - [Step 7: Register the Adapter](#step-7-register-the-adapter)
+- [Advanced: Offline Output-State Encoding](#advanced-offline-output-state-encoding)
 - [Advanced: Custom `preprocess_func`](#advanced-custom-preprocess_func)
 - [Advanced: Pseudo-Pipeline for Non-Diffusers Models](#advanced-pseudo-pipeline-for-non-diffusers-models)
 - [Data Format Conventions](#data-format-conventions)
@@ -19,7 +20,7 @@
 
 ## Overview
 
-Flow-Factory uses a **model adapter** pattern that wraps [diffusers](https://github.com/huggingface/diffusers) pipelines into a unified interface for RL training. Each adapter maps a diffusers pipeline to a consistent API that the training loop can call without knowing model-specific details.
+Flow-Factory uses a **model adapter** pattern that wraps [diffusers](https://github.com/huggingface/diffusers) pipelines into a unified interface for online and offline fine-tuning. Each adapter maps a diffusers pipeline to a consistent API that the training loop can call without knowing model-specific details.
 
 The relationship is straightforward:
 
@@ -114,7 +115,7 @@ class MyModelSample(T2ISample):
 | `I2AVSample` | Image-to-audio-video | `ImageConditionSample` subclass |
 | `V2VSample` | Video-to-video | `VideoConditionSample` subclass |
 
-> See [`src/flow_factory/samples/samples.py`](src/flow_factory/samples/samples.py) for all available classes.
+> See [`src/flow_factory/samples/samples.py`](../src/flow_factory/samples/samples.py) for all available classes.
 
 > **Key**: The `_shared_fields` class variable declares fields that are identical across a batch (e.g., `height`, `width`, `latent_index_map`). During `BaseSample.stack()`, shared fields take the first element instead of stacking.
 
@@ -192,7 +193,7 @@ class MyModelAdapter(BaseAdapter):
 | `preprocessing_modules` | `['text_encoders', 'vae']` |
 | `inference_modules` | `['transformer', 'vae']` |
 
-Override only when your model deviates — for example, [WAN-T2V](src/flow_factory/models/wan/wan2_t2v.py) models need `['text_encoders', 'vae', 'image_encoder']` for preprocessing and conditionally include `transformer_2` for inference.
+Override only when your model deviates — for example, [WAN-T2V](../src/flow_factory/models/wan/wan2_t2v.py) models need `['text_encoders', 'vae', 'image_encoder']` for preprocessing and conditionally include `transformer_2` for inference.
 
 > **Tip**: Use `print(dict(self.pipeline.named_children()))` to discover available component names.
 
@@ -547,6 +548,68 @@ model:
   model_name_or_path: "org/my-model-checkpoint"
 ```
 
+## Advanced: Offline Output-State Encoding
+
+Online-only adapters can keep the default `build_output_state_codec() -> None`. To support SFT or
+offline DPO, an adapter must additionally declare both sides of its pipeline and provide an
+on-the-fly output codec:
+
+1. Set a class-level `pipeline_io_contract`. It owns input media counts/order/binding, negative
+   prompt policy, the exact ordered output media sequence, rate requirements, geometry source, and
+   batch capability.
+2. Override `build_output_state_codec()` with a declaration-only codec. Its
+   `required_components` names logical runtime components such as `("vae",)`; construction must
+   not load, materialize, move, replace, or cast them.
+3. Return an `EncodedOutputState` containing a detached `LatentState`, output-derived forward and
+   decode contexts, and one exact geometry signature per sample.
+4. Override `_validate_encoded_output_geometry()` so configured, condition-derived, and
+   output-derived dimensions cannot drift silently.
+5. Declare a complete immutable `offline_training_forward_overrides` mapping whenever the base
+   `{"guidance_scale": 1.0}` contract does not describe the adapter. Offline trainers apply this
+   mapping after sampling configuration and cached batch conditions, so it owns loss-time model
+   conditioning. Conventional CFG branches must all be set to their neutral point (for example,
+   both Wan transformer scales or Bagel text/image CFG scales); guidance-distilled models instead
+   declare the explicit guidance-embedding value used by their official training recipe. Replace
+   the complete mapping so permissive `**kwargs` forwards do not receive unrelated base keys.
+
+The dataset remains responsible only for strict V2 parsing and CPU media decoding. The adapter
+owns numerical output semantics. The SFT/offline-DPO trainer calls `encode_output_state()` on every
+microbatch under `torch.no_grad`; target, chosen, and rejected latents are not preprocessing-cache
+columns. The declared output components are loaded through `ModelLoadCoordinator`, never from
+inside the codec.
+
+Condition encoding and target encoding should share role-neutral numerical transforms instead of
+duplicating VAE math. Extract helpers for pixel preprocessing, posterior extraction, latent
+normalization, patchification, IDs, and packing, then make the posterior policy an explicit
+argument:
+
+```python
+def encode_vae_image(adapter, pixels, *, sample_mode, generator=None):
+    posterior = adapter.vae.encode(pixels).latent_dist
+    latent = (
+        posterior.sample(generator=generator)
+        if sample_mode == "sample"
+        else posterior.mode()
+    )
+    return normalize_and_pack(adapter, latent)
+```
+
+The helper is role-neutral; the caller is not. Follow the official Diffusers pipeline for each
+role. Condition paths commonly use posterior `argmax`/`mode` for stable conditioning, while
+training targets use posterior `sample` and forward the caller's generator. Never merge the two
+entry points in a way that silently changes this policy. Tests should compare the shared transform
+against the pinned Diffusers helper and assert both sample/argmax behavior and generator routing.
+
+An output codec is not merely an `encode_image()` alias. It may need output-specific geometry,
+multi-component state order, active masks, rate alignment, or forward context that condition
+encoding does not own. If those semantics are not lossless, set a concrete
+`output_state_codec_unavailable_reason` so offline selection fails before downloading weights.
+
+SenseNova is an example of an important boundary: its existing condition schema uses grouped
+`images` with within-type order. Do not advertise heterogeneous ordered references merely because
+several images are accepted. The public V2 discriminator remains `type`; conversion to a legacy
+adapter-internal `kind` entry, when genuinely required, belongs only in the condition projection.
+
 ## Advanced: Custom `preprocess_func`
 
 The default `preprocess_func` calls `encode_prompt`, `encode_image`, `encode_video` and `encode_audio` independently. Override it when your model requires **cross-modal preprocessing** — for example, FLUX.2 uses its text encoder to "upsample" (rewrite) prompts based on input images before encoding ([here](https://github.com/X-GenGroup/Flow-Factory/blob/main/src/flow_factory/models/flux/flux2.py#L371)):
@@ -837,9 +900,14 @@ Before submitting a new model adapter, verify:
 - [ ] **`encode_audio()`** — Override only if your model consumes audio; handles `MultiAudioBatch` input format (text/image/video-only models inherit the no-op default)
 - [ ] **`inference()`** — Accepts both raw and pre-encoded inputs; returns `List[Sample]`
 - [ ] **`forward()`** — Single denoising step; ends with `self.scheduler.step()`; returns `SDESchedulerOutput`
+- [ ] **Pipeline I/O contract** — Declares exact input/output media, rate, geometry, and batch semantics before enabling offline training
+- [ ] **Output-state codec (when supported)** — Declaration-only logical component requirements; on-the-fly detached target encoding; exact geometry validation
+- [ ] **Offline forward overrides (when supported)** — Complete immutable adapter mapping; sampling controls never define offline loss semantics; every CFG branch is neutralized or every distilled guidance condition is explicitly pinned
+- [ ] **Role-neutral encoder math** — Condition/output paths reuse transforms but explicitly preserve official posterior `sample` versus `argmax` policy and generator routing
+- [ ] **Explicit offline blocker (when unsupported)** — `output_state_codec_unavailable_reason` names the missing lossless semantic boundary
 - [ ] **Sample dataclass** — All fields without batch dimension; `_shared_fields` correctly set; custom field types are consistent (no `Tensor` vs `List[Tensor]` mixing across samples)
 - [ ] **Registry entry** — Added to `_MODEL_ADAPTER_REGISTRY`
-- [ ] **Tested** — Runs at least one epoch of GRPO training without errors
+- [ ] **Tested** — Runs at least one rollout cycle for online support and one complete dataloader epoch for any declared offline support
 
 ## Component Runtime and Structured Replay
 

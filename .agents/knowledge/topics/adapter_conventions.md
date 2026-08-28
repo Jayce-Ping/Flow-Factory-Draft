@@ -26,6 +26,35 @@ All adapters that support CFG must follow a consistent two-stage pattern. Guidan
 
 `flux/flux2_klein.py` — `encode_prompt()` and `_forward()`.
 
+### Offline flow-matching guidance
+
+Finite-data SFT and offline DPO must not reuse `train.guidance_scale`: that field controls
+generation, and on a conventional CFG adapter it would turn the conditional velocity into a
+conditional/unconditional composite whenever negative embeddings are cached. These trainers
+expand the immutable `adapter.offline_training_forward_overrides` mapping into every SFT policy
+and offline-DPO policy/reference forward. The mapping is layered after both configured training
+arguments and dataset conditions, so adapter-owned model semantics always win.
+
+The base mapping sets `guidance_scale=1.0`, the conventional CFG-off point. An adapter replaces
+the complete mapping when its forward has different semantics or additional guidance branches:
+
+- Z-Image uses `guidance_scale=0.0` because its CFG threshold is `> 0.0`, with normalization and
+  truncation fixed to their neutral settings.
+- Guidance-distilled FLUX.1, FLUX.1-Kontext, and FLUX.2 use the official Diffusers training
+  condition `guidance_scale=3.5`; this is a learned model embedding, not classifier-free guidance.
+- The currently supported Flux2-Klein forward always passes `guidance=None` into its transformer,
+  so its `guidance_scale` remains conventional two-pass CFG and inherits the neutral `1.0`.
+- Wan T2V neutralizes both transformer stages with `guidance_scale=guidance_scale_2=1.0`.
+- SenseNova neutralizes text and image guidance together and disables CFG normalization.
+- Bagel replaces the base mapping with its actual `cfg_text_scale` / `cfg_img_scale` arguments;
+  it must not inherit an irrelevant `guidance_scale` key through its permissive `**kwargs`.
+
+Wan I2V and LTX2 remain behind explicit offline output-codec blockers. Wan I2V must mirror the two
+neutral Wan transformer scales before it is enabled. LTX2 must set video/audio CFG scales and
+modality scales to `1.0`, CFG rescale and STG scales to `0.0`, and neutralize its STG block
+selection with `spatio_temporal_guidance_blocks=None`. The mapping is adapter-owned model
+conditioning, never a sampling or algorithm knob.
+
 ### Models with model-specific CFG extensions
 
 | Model | Extension | Notes |
@@ -176,6 +205,26 @@ LTX2 packs `[video|audio]` into one `(B, Seq, C)` sequence, so it resolves as PA
 12. **LTX2 rollouts publish structured trajectories only** — `LTX2_T2AV_Adapter` / `LTX2_I2AV_Adapter` `inference()` fill `BaseSample.trajectory` with one `StructuredTrajectory` per sample (per-component states, full per-component schedules, joint + per-component log probabilities, and the latent-shaped callbacks in `LTX2_STRUCTURED_CALLBACK_FIELDS`) and leave every legacy field (`timesteps`, `all_latents`, `latent_index_map`, `log_probs`, `log_prob_index_map`) `None`. Non-latent callbacks (e.g. `std_dev_t`, `noise_level`) stay in `extra_kwargs` with their `callback_index_map`, which is present only when such a callback was actually collected. Trainers must read the trajectory through the adapter bridge (`get_terminal_state`, `get_replay_step`, `get_replay_callback`), never by indexing the legacy fields. I2AV additionally carries a video `active_mask` derived from `~conditioning_mask`, so the conditioning frame is excluded from every reduction, log-prob weighting and forward-process noising.
 
 13. **SenseNova ragged I2I is per-sample, not NaViT-packed** — SenseNova-U1 1.0/1.5 accepts ordered, variable-size and variable-count reference images. Each sample's references become one variable-length NEO-Unify prefix and remain PIL across preprocessing, rollout and replay. A framework batch may contain several such samples, but `SenseNovaAdapter.inference()` / `forward()` iterate them and call `SenseNovaDenoiser` with B=1; unlike Bagel, independent samples are not concatenated into a packed attention sequence. The native model's `batch_size>1` path only expands one shared prompt/reference KV cache to generate multiple noises for the same condition and is not a ragged multi-sample batch API.
+
+14. **Offline forward overrides are model conditioning, not sampling CFG** — SFT and offline DPO expand the adapter's complete immutable `offline_training_forward_overrides` mapping into every policy and reference forward, after batch conditions and configured sampling arguments. Conventional CFG adapters use their CFG-off point; guidance-distilled adapters use the value expected by their learned guidance embedder; multi-branch adapters neutralize every active branch under its real forward argument names. Replace the base mapping rather than adding unrelated keys, and never infer it from cached negative embeddings or expose it as an algorithm knob.
+
+## Fix Records
+
+### Sampling CFG leaked into finite-data velocity matching
+
+- **Date**: 2026-08-28
+- **Symptom**: SFT and offline DPO could optimize a CFG-composite velocity when
+  `train.guidance_scale > 1.0`, while their target remained the conditional flow-matching
+  velocity.
+- **Root Cause**: The shared forward helper copied the generation-oriented training arguments
+  into offline forwards without an adapter-owned model-conditioning override.
+- **Fix**: Added the immutable `BaseAdapter.offline_training_forward_overrides` mapping, declared
+  complete model-specific neutral or guidance-distilled mappings (including Wan T2V, SenseNova,
+  and Bagel multi-branch CFG), and expanded it into every offline policy/reference forward after
+  configured and batch arguments.
+- **Lesson**: Generation controls and finite-data model conditioning may share a low-level
+  argument name but must have separate semantic owners.
+- **Related Constraint**: #7
 
 ## Cross-refs
 
