@@ -34,12 +34,8 @@ model:
   lora_alpha: 128
   target_components: "transformer"
   target_modules: "default"
-  frozen_parameters_dtype:
-    default: null
-    transformers: "bf16"
-    text_encoders: "bf16"
-    vae: "fp32"  # H3 autoencoders require FP32 weights.
-    audio_vae: "fp32"
+  # Preserve the released mixed-dtype checkpoint, including Diffusers FP32 islands.
+  frozen_parameters_dtype: null
   trainable_parameters_dtype: "bf16"
   resume_path: null
   resume_type: null

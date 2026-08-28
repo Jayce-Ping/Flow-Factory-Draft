@@ -30,12 +30,8 @@ model:
   model_type: minimax-h3-t2va
   resume_path: null
   resume_type: null
-  frozen_parameters_dtype:
-    default: null
-    transformers: bf16
-    text_encoders: bf16
-    vae: fp32
-    audio_vae: fp32
+  # Preserve the released mixed-dtype checkpoint, including Diffusers FP32 islands.
+  frozen_parameters_dtype: null
   trainable_parameters_dtype: bf16
 
 log:
