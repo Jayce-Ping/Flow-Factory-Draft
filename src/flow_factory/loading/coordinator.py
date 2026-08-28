@@ -103,11 +103,31 @@ class ModelLoadCoordinator:
             for name in requested
             if self.plan.request_for_component(name).role is not ComponentRole.TARGET
         ]
-        if not replicated:
+        remainder_roots = {
+            self.plan.descriptors[name].root
+            for name in requested
+            if self.plan.request_for_component(name).role is ComponentRole.TARGET
+            and self.plan.descriptors[name].role is ComponentRole.AUXILIARY
+        }
+        if not replicated and not remainder_roots:
             return
         with self.load_scope(ComponentRole.AUXILIARY):
-            self.adapter.on_load_components(components=replicated, device=device)
-        self.components_loaded(replicated)
+            if replicated:
+                self.adapter.on_load_components(components=replicated, device=device)
+            for root in remainder_roots:
+                request = self.plan.request_for_root(root)
+                excluded_paths = [
+                    descriptor.path
+                    for descriptor in request.descriptors.values()
+                    if descriptor.role is ComponentRole.TARGET
+                ]
+                self.adapter.component_runtime.load_root_remainder(
+                    root,
+                    excluded_paths=excluded_paths,
+                    device=device,
+                )
+        if replicated:
+            self.components_loaded(replicated)
 
     def prepare(self, *objects: Any) -> Any:
         return self.backend.prepare(*objects)

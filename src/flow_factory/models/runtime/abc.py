@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Mapping, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import torch
 
@@ -64,6 +64,19 @@ class ComponentRuntime(ABC):
         """Return the physical ownership root and root-relative logical path."""
         self._validate_declared_names([name])
         return name, ()
+
+    def load_root_remainder(
+        self,
+        root: str,
+        *,
+        excluded_paths: Sequence[tuple[str, ...]],
+        device: Union[torch.device, str],
+    ) -> None:
+        """Move a physical root except prepared logical routes."""
+        raise RuntimeError(
+            f"{type(self).__name__} cannot partially move physical root={root!r}; "
+            f"excluded_paths={list(excluded_paths)!r}"
+        )
 
     @property
     def materialized_component_names(self) -> List[str]:

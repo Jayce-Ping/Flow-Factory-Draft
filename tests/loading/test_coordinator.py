@@ -94,7 +94,7 @@ def test_base_freezing_uses_materialized_physical_roots_then_logical_target() ->
     assert not any(parameter.requires_grad for parameter in vae.parameters())
 
 
-def test_coordinator_never_moves_a_target_owned_physical_root_as_auxiliary() -> None:
+def test_coordinator_moves_only_auxiliary_remainder_of_target_owned_root() -> None:
     plan = LoadPlanner().build(
         [
             ComponentDescriptor(
@@ -121,6 +121,11 @@ def test_coordinator_never_moves_a_target_owned_physical_root_as_auxiliary() -> 
     coordinator.adapter = SimpleNamespace(
         _resolve_component_names=lambda components: list(components),
         on_load_components=lambda components, device: calls.append(("load", components, device)),
+        component_runtime=SimpleNamespace(
+            load_root_remainder=lambda root, excluded_paths, device: calls.append(
+                ("remainder", root, excluded_paths, device)
+            )
+        ),
     )
     coordinator.load_scope = lambda role: nullcontext()
     coordinator.components_loaded = lambda components: calls.append(("finalize", components))
@@ -132,5 +137,41 @@ def test_coordinator_never_moves_a_target_owned_physical_root_as_auxiliary() -> 
 
     assert calls == [
         ("load", ["vae"], torch.device("cpu")),
+        (
+            "remainder",
+            "bagel",
+            [("language_model",)],
+            torch.device("cpu"),
+        ),
         ("finalize", ["vae"]),
     ]
+
+
+def test_pseudo_runtime_does_not_move_excluded_target_submodule() -> None:
+    class TrackingModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.moves = []
+
+        def to(self, device):
+            self.moves.append(device)
+            return self
+
+    root = torch.nn.Module()
+    root.language_model = TrackingModule()
+    root.latent_pos_embed = TrackingModule()
+    runtime = PseudoPipelineRuntime(
+        SimpleNamespace(),
+        {"bagel": root},
+        aliases={"transformer": root.language_model},
+        alias_routes={"transformer": ("bagel", ("language_model",))},
+    )
+
+    runtime.load_root_remainder(
+        "bagel",
+        excluded_paths=[("language_model",)],
+        device="cuda",
+    )
+
+    assert root.language_model.moves == []
+    assert root.latent_pos_embed.moves == ["cuda"]

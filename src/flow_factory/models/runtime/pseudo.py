@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
+import torch
 import torch.nn as nn
 
 from .abc import ComponentRuntime
@@ -98,6 +99,39 @@ class PseudoPipelineRuntime(ComponentRuntime):
         if name in self._alias_routes:
             return self._alias_routes[name]
         return super().physical_route(name)
+
+    def load_root_remainder(
+        self,
+        root: str,
+        *,
+        excluded_paths: Sequence[tuple[str, ...]],
+        device: Union[torch.device, str],
+    ) -> None:
+        component = self._canonical_components[root]
+        self._move_remainder(component, tuple(excluded_paths), device)
+
+    @classmethod
+    def _move_remainder(
+        cls,
+        module: nn.Module,
+        excluded_paths: tuple[tuple[str, ...], ...],
+        device: Union[torch.device, str],
+    ) -> None:
+        for parameter in module.parameters(recurse=False):
+            parameter.data = parameter.data.to(device)
+        for buffer in module.buffers(recurse=False):
+            buffer.data = buffer.data.to(device)
+
+        excluded_by_child: Dict[str, List[tuple[str, ...]]] = {}
+        for path in excluded_paths:
+            if path:
+                excluded_by_child.setdefault(path[0], []).append(path[1:])
+        for child_name, child in module.named_children():
+            child_exclusions = excluded_by_child.get(child_name)
+            if child_exclusions is None:
+                child.to(device)
+            elif () not in child_exclusions:
+                cls._move_remainder(child, tuple(child_exclusions), device)
 
     def _get_materialized_component(self, name: str) -> Any:
         if name in self._alias_components:
