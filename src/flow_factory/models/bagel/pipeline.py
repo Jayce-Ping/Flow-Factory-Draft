@@ -235,10 +235,12 @@ class BagelPseudoPipeline:
                 model.load_state_dict(state_dict, strict=False)
 
         component_dtypes = component_dtypes or {}
-        if "bagel" in component_dtypes:
-            model.to(dtype=component_dtypes["bagel"])
-        if "transformer" in component_dtypes:
-            model.language_model.to(dtype=component_dtypes["transformer"])
+        bagel_dtype = component_dtypes.get("bagel")
+        transformer_dtype = component_dtypes.get("transformer")
+        if bagel_dtype is not None:
+            model.to(dtype=bagel_dtype)
+        if transformer_dtype is not None and transformer_dtype != bagel_dtype:
+            model.language_model.to(dtype=transformer_dtype)
         if "vae" in component_dtypes:
             vae_model.to(dtype=component_dtypes["vae"])
 

@@ -17,22 +17,18 @@
 from .domain import (
     ComponentDescriptor,
     ComponentRole,
-    ComponentStage,
     LoadPlan,
     LoadPlanner,
     LoadRequest,
-    MaterializationMode,
 )
 from .coordinator import ModelLoadCoordinator, build_adapter_load_plan
 
 __all__ = [
     "ComponentDescriptor",
     "ComponentRole",
-    "ComponentStage",
     "LoadPlan",
     "LoadPlanner",
     "LoadRequest",
-    "MaterializationMode",
     "ModelLoadCoordinator",
     "build_adapter_load_plan",
 ]

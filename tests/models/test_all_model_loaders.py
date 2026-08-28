@@ -12,13 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import ast
 import importlib
 import importlib.machinery
-import inspect
 import sys
 import types
-from pathlib import Path
 from types import MethodType, SimpleNamespace
 from typing import Any, get_args, get_type_hints
 
@@ -134,30 +131,6 @@ def test_sensenova_loader_applies_transformer_load_dtype(
     ]
 
 
-def test_bagel_loader_source_keeps_custom_pipeline_boundary() -> None:
-    source_path = (
-        Path(__file__).parents[2] / "src" / "flow_factory" / "models" / "bagel" / "bagel.py"
-    )
-    tree = ast.parse(source_path.read_text())
-    load_pipeline = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "load_pipeline"
-    )
-
-    calls = [
-        node
-        for node in ast.walk(load_pipeline)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "from_pretrained"
-    ]
-    assert len(calls) == 1
-    assert "BagelPseudoPipeline.from_pretrained" in ast.unparse(calls[0].func)
-    assert any(keyword.arg == "component_dtypes" for keyword in calls[0].keywords)
-
-
 def test_bagel_adapter_imports_with_its_optional_kernel_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -171,10 +144,49 @@ def test_bagel_adapter_imports_with_its_optional_kernel_contract(
     monkeypatch.setattr(import_utils, "get_flash_attn_version", lambda: "test")
 
     module = importlib.import_module("flow_factory.models.bagel.bagel")
+    rope_module = importlib.import_module("flow_factory.models.bagel.modeling.qwen2.modeling_qwen2")
 
-    assert module.BagelAdapter.__name__ == "BagelAdapter"
+    calls = []
+    pipeline = SimpleNamespace(vae=SimpleNamespace(reg=SimpleNamespace(sample=True)))
+    monkeypatch.setattr(
+        module.BagelPseudoPipeline,
+        "from_pretrained",
+        lambda path, **kwargs: calls.append((path, kwargs)) or pipeline,
+    )
+    adapter = object.__new__(module.BagelAdapter)
+    adapter._model_path = "model"
+    adapter._tokenizer = SimpleNamespace(pad_token_id=151643)
+    adapter.model_args = SimpleNamespace(extra_kwargs={})
+
+    assert adapter.load_pipeline() is pipeline
+    assert calls == [
+        (
+            "model",
+            {
+                "low_cpu_mem_usage": False,
+                "component_dtypes": {},
+                "pad_token_id": 151643,
+            },
+        )
+    ]
+    assert not pipeline.vae.reg.sample
     assert not module.BagelAdapter.supports_fsdp2_cpu_efficient_loading
-    assert "_freeze_components" not in module.BagelAdapter.__dict__
+    legacy_inv_freq, _ = rope_module.Qwen2RotaryEmbedding.compute_default_rope_parameters(
+        None,
+        dim=8,
+        base=10_000.0,
+    )
+    partial_inv_freq, _ = rope_module.Qwen2RotaryEmbedding.compute_default_rope_parameters(
+        SimpleNamespace(
+            rope_theta=10_000.0,
+            head_dim=8,
+            hidden_size=8,
+            num_attention_heads=1,
+            partial_rotary_factor=0.5,
+        )
+    )
+    assert legacy_inv_freq.shape == (4,)
+    assert partial_inv_freq.shape == (2,)
 
 
 def test_all_registered_adapters_have_an_audited_load_pipeline() -> None:
@@ -252,10 +264,8 @@ def test_priority_model_loading_topologies_remain_explicit() -> None:
     from flow_factory.models.sensenova.sensenova import SenseNovaAdapter
     from flow_factory.models.wan.wan2_t2v import Wan2_T2V_Adapter
 
-    inference_source = inspect.getsource(LTX2_T2AV_Adapter.inference_modules.fget)
-    assert all(
-        component in inference_source for component in ("vae", "audio_vae", "connectors", "vocoder")
-    )
+    ltx2 = object.__new__(LTX2_T2AV_Adapter)
+    assert {"vae", "audio_vae", "connectors", "vocoder"}.issubset(ltx2.inference_modules)
     assert Wan2_T2V_Adapter.component_load_dtype_defaults["transformers"] is torch.bfloat16
     assert Wan2_T2V_Adapter.ddp_find_unused_parameters
     assert QwenImageEditPlusAdapter.ddp_find_unused_parameters

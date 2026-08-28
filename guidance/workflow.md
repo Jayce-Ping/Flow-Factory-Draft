@@ -475,8 +475,11 @@ exactly-once physical-root requests. This matters for aliases such as Bagel's
 not be moved or synchronized as an auxiliary component. Backend strategies then
 apply these role contracts:
 
-- TARGET roots enter the prepared DDP/DeepSpeed/FSDP bundle.
-- AUXILIARY and REWARD roots remain full per-rank replicas.
+- TARGET-owned logical routes enter the prepared DDP/DeepSpeed/FSDP bundle;
+  their containing physical roots are excluded from auxiliary device movement.
+- AUXILIARY and REWARD resources remain full per-rank replicas. FSDP auxiliary
+  roots receive a cached sampled-fingerprint check; reward loaders receive an
+  isolated replicated-load scope.
 - HOST roots such as tokenizers, processors, and schedulers are never sharded.
 - FSDP2 CPU-efficient loading is enabled only for adapters that explicitly
   declare compatible selective component loading.

@@ -133,7 +133,7 @@ Config keys must exactly match Pydantic field names. Typos fail silently with de
 `accelerator.wait_for_everyone()` must be called at critical synchronization points (after preprocessing, before/after evaluation, checkpoint saving). Missing barriers cause deadlocks or race conditions.
 
 ### 19. FSDP CPU Efficient Loading
-Distributed loading is owned by `ModelLoadCoordinator` and its `BackendLoadRuntime`. TARGET roots may use rank-zero/meta FSDP2 loading only when the adapter declares that capability. AUXILIARY and REWARD roots are materialized as full per-rank replicas inside the replicated load scope, then verified before use. Trainer code must not manipulate FSDP loading environment variables or broadcast component weights directly.
+Distributed loading is owned by `ModelLoadCoordinator` and its `BackendLoadRuntime`. TARGET roots may use rank-zero/meta FSDP2 loading only when the adapter declares that capability. AUXILIARY and REWARD resources are materialized as full per-rank replicas; FSDP auxiliary roots receive a cached sampled-fingerprint check, while reward loading is isolated from target-only loading state. Trainer code must not manipulate FSDP loading environment variables or broadcast component weights directly.
 
 ### 20. Mixed Precision Consistency
 The adapter resolves `component_load_dtypes` at native load/materialization time, then applies frozen/trainable storage policy in `_mix_precision()`. Components materialized later must receive both policies through the component runtime and `on_load_components()`; laziness must not bypass either policy. Autocast context is configured in `BaseTrainer.__init__`. Do not manually cast tensors unless you understand the precision boundary. Details: `topics/dtype_precision.md`.

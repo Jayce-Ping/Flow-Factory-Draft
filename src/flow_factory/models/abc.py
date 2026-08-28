@@ -108,6 +108,8 @@ from .precision import (
     cast_module_role_dtypes,
     component_dtype_mapping,
     parameter_dtype_inventory,
+    resolve_component_dtype,
+    validate_dtype_policy_selectors,
 )
 from .runtime import ClassicPipelineRuntime, ComponentRuntime
 from .variants import DEFAULT_BASE_VARIANT, ComponentVariantRegistry, ComponentVariantSpec
@@ -291,6 +293,9 @@ class BaseAdapter(ABC):
         # Compatibility alias: the runtime override mapping is the sole authoritative cache.
         self._components: Dict[str, torch.nn.Module] = cast(
             Dict[str, torch.nn.Module], self.component_runtime.override_components
+        )
+        self.model_args.target_components = self.component_runtime.resolve_component_names(
+            self.model_args.target_components
         )
 
         # Cache target module mapping
@@ -1555,55 +1560,22 @@ class BaseAdapter(ABC):
             )
         self._log_component_precision_inventory(name, component, stage="materialize")
 
-    def _resolved_frozen_component_dtype_policy(
-        self,
-    ) -> tuple[Optional[torch.dtype], dict[str, Optional[torch.dtype]]]:
-        """Resolve scalar or selector-based frozen dtype configuration.
-
-        Concrete component selectors override the two supported component groups,
-        and groups override ``default``. A null value means no post-load dtype
-        mutation for that component.
-        """
-        cached = getattr(self, "_frozen_component_dtype_policy_cache", None)
-        if cached is not None:
-            return cached
-
-        configured = getattr(self.model_args, "frozen_parameters_dtype", None)
-        if not isinstance(configured, dict):
-            policy = (configured, {})
-            self._frozen_component_dtype_policy_cache = policy
-            return policy
-
-        default_dtype = configured.get("default")
-        overrides: dict[str, Optional[torch.dtype]] = {}
-        group_selectors = ("transformers", "text_encoders")
-
-        for selector in group_selectors:
-            if selector not in configured:
-                continue
-            for component_name in self._resolve_component_names(selector):
-                overrides[component_name] = configured[selector]
-
-        for selector, component_dtype in configured.items():
-            if selector == "default" or selector in group_selectors:
-                continue
-            component_names = self._resolve_component_names(selector)
-            if len(component_names) != 1 or component_names[0] != selector:
-                raise ValueError(
-                    "expected concrete model.frozen_parameters_dtype selector to "
-                    f"resolve only itself, received selector={selector!r}, "
-                    f"resolved={component_names!r}"
-                )
-            overrides[selector] = component_dtype
-
-        policy = (default_dtype, overrides)
-        self._frozen_component_dtype_policy_cache = policy
-        return policy
-
     def _frozen_dtype_for_component(self, name: str) -> Optional[torch.dtype]:
-        """Return one component's frozen dtype or ``None`` to preserve it."""
-        default_dtype, overrides = self._resolved_frozen_component_dtype_policy()
-        return overrides[name] if name in overrides else default_dtype
+        """Return one component's frozen dtype or ``None`` for no mutation."""
+        policy = getattr(self.model_args, "frozen_parameters_dtype", None)
+        if not getattr(self, "_frozen_dtype_policy_validated", False):
+            validate_dtype_policy_selectors(
+                policy,
+                declared_names=self.component_runtime.declared_component_names,
+            )
+            self._frozen_dtype_policy_validated = True
+        return resolve_component_dtype(
+            name,
+            user_policy=policy,
+            manifest_policy=None,
+            transformer_names=self.transformer_names,
+            text_encoder_names=self.text_encoder_names,
+        )
 
     def _mix_precision(self):
         """Set trainable params to ``trainable_parameters_dtype``; by default leave frozen params

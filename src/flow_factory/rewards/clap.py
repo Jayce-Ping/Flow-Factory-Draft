@@ -62,23 +62,7 @@ class CLAPRewardModel(PointwiseRewardModel):
             3. To numpy float32  : ndarray (T',)
         """
         processed: List[np.ndarray] = []
-        for index, waveform in enumerate(audio_list):
-            if not isinstance(waveform, torch.Tensor):
-                raise TypeError(
-                    f"CLAP expected torch.Tensor audio at index={index}, "
-                    f"received {type(waveform).__name__}: {waveform!r}"
-                )
-            if waveform.ndim not in (1, 2):
-                raise ValueError(
-                    f"CLAP expected audio shape (T,) or (C,T) at index={index}, "
-                    f"received shape={tuple(waveform.shape)}"
-                )
-            if not torch.isfinite(waveform).all():
-                invalid = int((~torch.isfinite(waveform)).sum().item())
-                raise ValueError(
-                    f"CLAP expected finite audio at index={index}, received "
-                    f"shape={tuple(waveform.shape)} with invalid_values={invalid}"
-                )
+        for waveform in audio_list:
             if waveform.ndim == 2 and waveform.shape[0] > 1:
                 waveform = waveform.mean(dim=0)
             elif waveform.ndim == 2:

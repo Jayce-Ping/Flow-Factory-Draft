@@ -12,7 +12,6 @@ from flow_factory.loading.backend import (
 from flow_factory.loading.domain import (
     ComponentDescriptor,
     ComponentRole,
-    ComponentStage,
     LoadPlanner,
 )
 
@@ -42,20 +41,17 @@ def _plan():
                 name="bagel",
                 root="bagel",
                 role=ComponentRole.AUXILIARY,
-                stages={ComponentStage.ROLLOUT},
             ),
             ComponentDescriptor(
                 name="transformer",
                 root="bagel",
                 path=("language_model",),
                 role=ComponentRole.TARGET,
-                stages={ComponentStage.OPTIMIZE},
             ),
             ComponentDescriptor(
                 name="vae",
                 root="vae",
                 role=ComponentRole.AUXILIARY,
-                stages={ComponentStage.ROLLOUT},
             ),
         ]
     )
@@ -136,6 +132,10 @@ def test_target_bootstrap_broadcasts_buffers_not_parameters(
         "flow_factory.loading.backend.dist.broadcast",
         lambda tensor, src: broadcasts.append(tensor.clone()),
     )
+    monkeypatch.setattr(
+        "flow_factory.loading.backend.dist.all_reduce",
+        lambda tensor, op: None,
+    )
     adapter = SimpleNamespace(
         get_component=lambda name: {"bagel": target, "vae": vae}[name],
     )
@@ -149,3 +149,44 @@ def test_target_bootstrap_broadcasts_buffers_not_parameters(
 
     assert len(broadcasts) == 1
     assert torch.equal(broadcasts[0], target.rope)
+
+
+def test_target_bootstrap_raises_before_buffer_broadcast_on_meta_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = torch.nn.Module()
+    target.register_buffer("rope", torch.empty(2, device="meta"))
+    monkeypatch.setattr(
+        "flow_factory.loading.backend.dist.all_reduce",
+        lambda tensor, op: None,
+    )
+    monkeypatch.setattr(
+        "flow_factory.loading.backend.dist.broadcast",
+        lambda tensor, src: pytest.fail("invalid ranks must not enter buffer broadcast"),
+    )
+    runtime = FSDPBackendLoadRuntime(
+        _AcceleratorFake(efficient=True),
+        _plan(),
+        SimpleNamespace(get_component=lambda name: target),
+    )
+
+    with pytest.raises(RuntimeError, match=r"target root='bagel'.*meta buffer"):
+        runtime.bootstrap_targets()
+
+
+def test_replicated_root_fingerprint_is_cached_after_first_stage() -> None:
+    adapter = SimpleNamespace(
+        _resolve_component_names=lambda components: list(components),
+    )
+    runtime = FSDPBackendLoadRuntime(
+        _AcceleratorFake(efficient=False),
+        _plan(),
+        adapter,
+    )
+    calls = []
+    runtime._check_replica_fingerprints = lambda roots: calls.append(list(roots))
+
+    runtime.components_loaded(["vae"])
+    runtime.components_loaded(["vae"])
+
+    assert calls == [["vae"]]

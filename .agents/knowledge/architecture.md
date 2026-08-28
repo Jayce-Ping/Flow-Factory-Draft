@@ -209,6 +209,10 @@ non-`None` modular specs but exclude absent classic optional components. The def
 `transformer -> bagel.language_model`, as well as direct canonical components such as SenseNova's
 `transformer -> SenseNovaDenoiser`. `adapter.pipeline` remains the backend compatibility alias,
 while `ModelBundle` and `RoutedComponentProxy` remain the sole distributed preparation runtime.
+`loading/` compiles logical component names into physical ownership roots before trainer-stage
+loads. `ModelLoadCoordinator` excludes target-owned roots from auxiliary movement, and
+`BackendLoadRuntime` owns FSDP target-buffer setup, replicated-load scopes, and cached sampled
+fingerprints. Trainer methods only request component loading and distributed preparation.
 `SchedulerGroup` separately provides immutable component names and ordered scheduler mode/seed
 dispatch; its primary scheduler remains available through `adapter.scheduler`.
 

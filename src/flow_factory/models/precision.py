@@ -78,7 +78,7 @@ def validate_dtype_policy_selectors(
     *,
     declared_names: Sequence[str],
 ) -> None:
-    """Reject selectors that cannot resolve against a runtime's declarations."""
+    """Reject unknown concrete selectors; role-group selectors may be empty."""
     if not isinstance(policy, Mapping):
         return
     allowed = {*declared_names, "default", "transformers", "text_encoders"}

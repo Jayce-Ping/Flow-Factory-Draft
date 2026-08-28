@@ -1,3 +1,17 @@
+# Copyright 2026 Jayce-Ping
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Role-aware distributed component loading and preparation."""
 
 from __future__ import annotations
@@ -44,6 +58,7 @@ class BackendLoadRuntime:
         self.accelerator = accelerator
         self.plan = plan
         self.adapter = adapter
+        self._verified_roots: set[str] = set()
 
     @contextmanager
     def load_scope(self, role: ComponentRole) -> Iterator[None]:
@@ -113,14 +128,16 @@ class FSDPBackendLoadRuntime(BackendLoadRuntime):
             if request.role is not ComponentRole.TARGET:
                 continue
             component = self.adapter.get_component(request.root)
-            if not isinstance(component, nn.Module):
-                continue
-            for buffer_name, buffer in component.named_buffers():
-                if buffer.is_meta:
-                    raise RuntimeError(
-                        f"expected materialized target root={request.root!r} "
-                        f"buffer={buffer_name!r}, received meta tensor"
-                    )
+            self._raise_if_any_rank(
+                not isinstance(component, nn.Module),
+                f"target root={request.root!r} is not a module before FSDP prepare",
+            )
+            buffers = tuple(component.named_buffers())
+            self._raise_if_any_rank(
+                any(buffer.is_meta for _, buffer in buffers),
+                f"target root={request.root!r} has a meta buffer before FSDP prepare",
+            )
+            for _, buffer in buffers:
                 original_device = buffer.device
                 value = buffer.detach().to(self.accelerator.device)
                 dist.broadcast(value, src=0)
@@ -135,28 +152,38 @@ class FSDPBackendLoadRuntime(BackendLoadRuntime):
     ) -> None:
         if self.accelerator.num_processes <= 1:
             return
-        roots = self._logical_names(components, role=ComponentRole.AUXILIARY)
-        self._verify_replicas(roots)
+        roots = [
+            root
+            for root in self._logical_names(components, role=ComponentRole.AUXILIARY)
+            if root not in self._verified_roots
+        ]
+        if not roots:
+            return
+        self._check_replica_fingerprints(roots)
+        self._verified_roots.update(roots)
 
-    def _verify_replicas(self, roots: Sequence[str]) -> None:
-        verified = []
+    def _check_replica_fingerprints(self, roots: Sequence[str]) -> None:
+        checked = []
         for root in roots:
-            if not self.adapter._should_manage_device(root):
-                continue
+            managed = self.adapter._should_manage_device(root)
             component = self.adapter.get_component(root)
-            if isinstance(component, nn.Module):
-                self._verify_fingerprint(root, component)
-                verified.append(root)
+            self._raise_if_any_rank(
+                not managed or not isinstance(component, nn.Module),
+                f"auxiliary root={root!r} is not a runtime-managed module",
+            )
+            self._check_fingerprint(root, component)
+            checked.append(root)
         self.accelerator.wait_for_everyone()
-        logger.info("FSDP replicated components verified: %s", verified)
+        logger.info("FSDP replica sampled fingerprints matched: %s", checked)
 
-    def _verify_fingerprint(self, root: str, component: nn.Module) -> None:
+    def _check_fingerprint(self, root: str, component: nn.Module) -> None:
+        tensors = (*component.parameters(), *component.buffers())
+        self._raise_if_any_rank(
+            any(tensor.is_meta for tensor in tensors),
+            f"replicated root={root!r} has a meta tensor after loading",
+        )
         terms = []
-        for tensor_index, tensor in enumerate((*component.parameters(), *component.buffers())):
-            if tensor.is_meta:
-                raise RuntimeError(
-                    f"expected materialized replicated root={root!r}, received meta tensor"
-                )
+        for tensor_index, tensor in enumerate(tensors):
             if not tensor.is_floating_point() or tensor.numel() == 0:
                 continue
             flat = tensor.detach().reshape(-1)
@@ -190,9 +217,19 @@ class FSDPBackendLoadRuntime(BackendLoadRuntime):
         ]
         if mismatched:
             raise RuntimeError(
-                f"replicated root={root!r} differs from rank 0 after loading; "
+                f"replicated root={root!r} sampled fingerprint differs from rank 0; "
                 f"mismatched_ranks={mismatched}"
             )
+
+    def _raise_if_any_rank(self, local_failure: bool, message: str) -> None:
+        failed = torch.tensor(
+            int(local_failure),
+            device=self.accelerator.device,
+            dtype=torch.int32,
+        )
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+        if failed.item():
+            raise RuntimeError(message)
 
 
 def build_backend_load_runtime(
