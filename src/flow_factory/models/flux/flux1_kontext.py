@@ -19,7 +19,7 @@ import logging
 import os
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -28,6 +28,7 @@ from diffusers.pipelines.flux.pipeline_flux_kontext import FluxKontextPipeline
 from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image
 
+from ...contracts import NegativePromptPolicy
 from ...hparams import *
 from ...samples import I2ISample
 from ...scheduler import (
@@ -55,6 +56,12 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ..configured_image_output import (
+    ConfiguredImageOutputAdapterMixin,
+    EncodedImageTensor,
+)
+from ..pipeline_contracts import image_output_contract
+from ._output import encode_flux1_vae_image, prepare_flux1_output_latents
 
 logger = setup_logger(__name__)
 
@@ -123,8 +130,14 @@ def adjust_image_dimension(
     return height, width
 
 
-class Flux1KontextAdapter(BaseAdapter):
+class Flux1KontextAdapter(ConfiguredImageOutputAdapterMixin, BaseAdapter):
     """Concrete implementation for Flow Matching models (FLUX.1)."""
+
+    pipeline_io_contract = image_output_contract(
+        negative_prompt=NegativePromptPolicy.UNSUPPORTED,
+        input_image_min_count=1,
+        input_image_max_count=1,
+    )
 
     def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
@@ -135,8 +148,7 @@ class Flux1KontextAdapter(BaseAdapter):
 
     def load_pipeline(self) -> FluxKontextPipeline:
         return self._load_diffusers_pipeline(
-            FluxKontextPipeline,
-            self.model_args.model_name_or_path, low_cpu_mem_usage=False
+            FluxKontextPipeline, self.model_args.model_name_or_path, low_cpu_mem_usage=False
         )
 
     @property
@@ -282,7 +294,11 @@ class Flux1KontextAdapter(BaseAdapter):
         image_tensors = self.pipeline.image_processor.preprocess(images, image_height, image_width)
         # 2. Prepare `image_latents` and `image_ids`
         image_tensors = image_tensors.to(device=device, dtype=dtype)
-        image_latents = self.pipeline._encode_vae_image(image=image_tensors, generator=generator)
+        image_latents = encode_flux1_vae_image(
+            self,
+            image_tensors,
+            sample_mode="argmax",
+        )
         image_latent_height, image_latent_width = image_latents.shape[2:]
         image_latents = self.pipeline._pack_latents(
             image_latents, batch_size, num_channels_latents, image_latent_height, image_latent_width
@@ -309,6 +325,73 @@ class Flux1KontextAdapter(BaseAdapter):
     def encode_video(self, videos: Any) -> None:
         """Flux.2 does not support video encoding."""
         pass
+
+    def _output_geometry_multiple(self) -> int:
+        """Require the VAE grid and 2x2 latent packing used by Diffusers."""
+        return self.pipeline.vae_scale_factor * 2
+
+    def _encode_output_images(
+        self,
+        pixel_values: torch.Tensor,
+        condition: Mapping[str, Any],
+        generator: Optional[torch.Generator],
+    ) -> EncodedImageTensor:
+        """Sample target latents and prepend their IDs to cached condition IDs."""
+        packed, target_ids = prepare_flux1_output_latents(self, pixel_values, generator)
+        condition_ids = self._shared_condition_image_ids(
+            condition,
+            batch_size=packed.shape[0],
+            dtype=packed.dtype,
+        )
+        return EncodedImageTensor(
+            latents=packed,
+            forward_context={"latent_ids": torch.cat([target_ids, condition_ids], dim=0)},
+            decode_context={},
+        )
+
+    def _shared_condition_image_ids(
+        self,
+        condition: Mapping[str, Any],
+        *,
+        batch_size: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Resolve cached uniform condition IDs to the shared Diffusers layout."""
+        image_ids = condition.get("image_ids")
+        if isinstance(image_ids, list):
+            if len(image_ids) != batch_size or not all(
+                isinstance(item, torch.Tensor) for item in image_ids
+            ):
+                raise TypeError(
+                    "FLUX.1 Kontext output codec expected one tensor image_ids item per "
+                    f"sample, received {type(image_ids).__name__} of length {len(image_ids)}"
+                )
+            image_ids = torch.stack(image_ids, dim=0)
+        if not isinstance(image_ids, torch.Tensor):
+            raise TypeError(
+                "FLUX.1 Kontext output codec requires cached condition['image_ids'] as "
+                f"torch.Tensor, received {type(image_ids).__name__}"
+            )
+        if image_ids.ndim == 2:
+            shared = image_ids
+        elif image_ids.ndim == 3 and image_ids.shape[0] == batch_size:
+            shared = image_ids[0]
+            if not torch.equal(image_ids, shared.unsqueeze(0).expand_as(image_ids)):
+                raise ValueError(
+                    "FLUX.1 Kontext batched condition image_ids must be identical because "
+                    "the adapter forward consumes one shared position-id sequence"
+                )
+        else:
+            raise ValueError(
+                "FLUX.1 Kontext condition image_ids expected shape (S, 3) or (B, S, 3), "
+                f"received {tuple(image_ids.shape)}"
+            )
+        if shared.shape[-1] != 3:
+            raise ValueError(
+                "FLUX.1 Kontext condition image_ids expected final dimension 3, "
+                f"received {tuple(shared.shape)}"
+            )
+        return shared.to(device=self.device, dtype=dtype)
 
     def decode_latents(
         self, latents: torch.Tensor, height, width, output_type="pil"

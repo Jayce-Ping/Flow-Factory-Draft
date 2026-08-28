@@ -56,6 +56,55 @@ def encode_flux1_vae_image(
     )
 
 
+def prepare_flux1_output_latents(
+    adapter: Any,
+    pixel_values: torch.Tensor,
+    generator: Optional[torch.Generator],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Sample and pack FLUX.1 target latents with their target-first IDs.
+
+    Args:
+        adapter: FLUX.1 adapter exposing the canonical VAE and pipeline helpers.
+        pixel_values: Preprocessed BCHW target images.
+        generator: Generator forwarded unchanged to target posterior sampling.
+
+    Returns:
+        Packed clean target latents and their unbatched position identifiers.
+    """
+    latents = encode_flux1_vae_image(
+        adapter,
+        pixel_values,
+        sample_mode="sample",
+        generator=generator,
+    )
+    if latents.ndim != 4:
+        raise ValueError(
+            f"{type(adapter).__name__} FLUX.1 target VAE expected BCHW latents, "
+            f"received shape {tuple(latents.shape)}"
+        )
+    batch_size, channels, latent_height, latent_width = latents.shape
+    if latent_height % 2 or latent_width % 2:
+        raise ValueError(
+            f"{type(adapter).__name__} FLUX.1 target packing expected even latent height/width, "
+            f"received {(latent_height, latent_width)}"
+        )
+    packed = adapter.pipeline._pack_latents(
+        latents,
+        batch_size,
+        channels,
+        latent_height,
+        latent_width,
+    )
+    target_ids = adapter.pipeline._prepare_latent_image_ids(
+        batch_size,
+        latent_height // 2,
+        latent_width // 2,
+        adapter.device,
+        packed.dtype,
+    )
+    return packed, target_ids
+
+
 def encode_flux2_output_images(
     adapter: Any,
     pixel_values: torch.Tensor,
@@ -214,5 +263,6 @@ __all__ = [
     "encode_flux1_vae_image",
     "encode_flux2_output_images",
     "encode_flux2_vae_image",
+    "prepare_flux1_output_latents",
     "prepare_flux2_condition_latents",
 ]
