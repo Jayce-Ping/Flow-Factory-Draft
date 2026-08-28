@@ -198,6 +198,14 @@ Based on the fix type, write the fix entry to the appropriate document:
 - **Lesson**: An example configuration is executable documentation. Any recipe migration must update its production parse test, linked data provenance, optional dependency instructions, and validation claims in the same integration change.
 - **Related Constraint**: #15
 
+### Optional-kernel adapter tests must lazy-load behind the dependency seam
+- **Date**: 2026-08-28
+- **Symptom**: Collecting the Bagel TDM contract test on macOS failed before any test ran because `flash-attn>=2.5.8` was unavailable.
+- **Root Cause**: The test imported the Bagel adapter at module scope instead of installing the existing fake optional-kernel modules before the adapter import.
+- **Fix**: `tests/models/test_bagel_tdm_contracts.py` now lazily imports Bagel after stubbing `flash_attn`, OpenCV, and the availability probes; new Python files also receive the required Apache 2.0 headers.
+- **Lesson**: Contract tests for CUDA-only optional adapters must exercise the adapter through its dependency boundary so CPU and macOS collection remains valid; importing such adapters at module scope turns an optional dependency into a repository-wide test dependency.
+- **Related Constraint**: N/A
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)
