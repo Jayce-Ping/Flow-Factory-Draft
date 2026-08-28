@@ -17,6 +17,7 @@ import torch
 
 from flow_factory.utils.noise_schedule import (
     TIMESTEP_MAX,
+    TimeSampler,
     flow_match_sigma,
     validate_flow_match_coordinates,
 )
@@ -93,6 +94,70 @@ def test_flow_match_sigma_rejects_invalid_scheduler_coordinates(
 def test_flow_match_sigma_rejects_non_tensor_input() -> None:
     with pytest.raises(TypeError, match=r"torch.Tensor t_scheduler"):
         flow_match_sigma(500.0)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "sampler_name",
+    ["independent_logit_normal_shifted", "independent_uniform"],
+)
+def test_independent_time_samplers_materialize_distinct_batch_draws(
+    sampler_name: str,
+) -> None:
+    generator = torch.Generator(device="cpu").manual_seed(123)
+    sampler = getattr(TimeSampler, sampler_name)
+
+    timesteps = sampler(
+        batch_size=4,
+        num_timesteps=3,
+        timestep_range=(0.2, 0.8),
+        generator=generator,
+    )
+
+    assert timesteps.shape == (3, 4)
+    assert timesteps.stride() != (1, 0)
+    assert torch.all(timesteps >= 200.0)
+    assert torch.all(timesteps <= 800.0)
+    assert all(torch.unique(row).numel() > 1 for row in timesteps)
+
+
+@pytest.mark.parametrize(
+    "sampler_name",
+    ["independent_logit_normal_shifted", "independent_uniform"],
+)
+def test_independent_time_samplers_are_generator_reproducible(sampler_name: str) -> None:
+    sampler = getattr(TimeSampler, sampler_name)
+    first_generator = torch.Generator(device="cpu").manual_seed(91)
+    second_generator = torch.Generator(device="cpu").manual_seed(91)
+
+    first = sampler(2, 4, 0.99, generator=first_generator)
+    second = sampler(2, 4, 0.99, generator=second_generator)
+
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("sampler_name", ["logit_normal_shifted", "uniform"])
+def test_legacy_time_samplers_keep_shared_batch_coordinates(sampler_name: str) -> None:
+    sampler = getattr(TimeSampler, sampler_name)
+    generator = torch.Generator(device="cpu").manual_seed(321)
+
+    timesteps = sampler(4, 3, (0.2, 0.8), generator=generator)
+
+    assert timesteps.shape == (3, 4)
+    for row in timesteps:
+        torch.testing.assert_close(row, row[0].expand_as(row), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("field_name", ["batch_size", "num_timesteps"])
+@pytest.mark.parametrize("invalid", [0, -1, True, 1.0])
+def test_independent_time_samplers_validate_materialized_shape(
+    field_name: str,
+    invalid: object,
+) -> None:
+    kwargs = {"batch_size": 2, "num_timesteps": 3, field_name: invalid}
+    expected_error = TypeError if type(invalid) is not int else ValueError
+
+    with pytest.raises(expected_error):
+        TimeSampler.independent_uniform(timestep_range=0.99, **kwargs)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
