@@ -912,6 +912,8 @@ def _normalize_b1_integer(value: Any, field: str) -> int:
 def _decoded_video_sample(video: Any) -> Any:
     if isinstance(video, torch.Tensor) and video.shape[0] == 1:
         return video[0]
-    if isinstance(video, list) and len(video) == 1 and isinstance(video[0], list):
+    if isinstance(video, list) and len(video) == 1 and (
+        video[0] is None or isinstance(video[0], list)
+    ):
         return video[0]
     return video
