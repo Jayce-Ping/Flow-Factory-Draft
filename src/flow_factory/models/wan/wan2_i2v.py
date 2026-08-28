@@ -81,6 +81,11 @@ def retrieve_latents(
 
 
 class Wan2_I2V_Adapter(BaseAdapter):
+    output_state_codec_unavailable_reason = (
+        "Wan I2V target encoding must bind an output-geometry-dependent first-frame VAE "
+        "condition (and Wan 2.2 first-frame mask); the current condition cache retains only "
+        "CLIP image embeddings, so this target/condition binder is not yet implemented"
+    )
     # Wan2.2 trains both transformer and transformer_2 but uses only one per
     # timestep (boundary_ratio), so under DDP the other's trainable params get no
     # gradient in a given step. Ignored under DeepSpeed/FSDP.

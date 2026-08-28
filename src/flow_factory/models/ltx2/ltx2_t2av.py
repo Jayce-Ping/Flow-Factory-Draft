@@ -162,6 +162,12 @@ class LTX2_T2AV_Adapter(BaseAdapter):
     log_probs is the joint policy log_prob that drives policy gradient training.
     """
 
+    output_state_codec_unavailable_reason = (
+        "LTX2 offline targets require paired video/audio decoding with detected sample rates, "
+        "official mel preprocessing, and exact duration alignment; the offline data plane "
+        "does not yet provide that lossless audiovisual boundary"
+    )
+
     supports_diffusers_cache = True
     trajectory_component_order: ClassVar[Tuple[str, ...]] = LTX2_COMPONENT_ORDER
 

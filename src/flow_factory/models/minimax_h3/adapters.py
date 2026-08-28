@@ -154,11 +154,7 @@ class _MiniMaxH3WorkflowAdapter:
 
     def empty_decoded_media(self, batch_size: int) -> Any:
         """Preserve H3's video/audio/sample-rate decode structure without decoding."""
-        if (
-            not isinstance(batch_size, int)
-            or isinstance(batch_size, bool)
-            or batch_size < 1
-        ):
+        if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size < 1:
             raise ValueError(
                 f"MiniMax H3 expected positive int batch_size, received {batch_size!r}"
             )
@@ -197,6 +193,11 @@ class _MiniMaxH3WorkflowAdapter:
 class MiniMaxH3T2VAAdapter(_MiniMaxH3WorkflowAdapter, BaseAdapter):
     """Load the workflow-pruned MiniMax H3 text-to-video-audio partition."""
 
+    output_state_codec_unavailable_reason = (
+        "MiniMax H3 offline targets require lossless audiovisual decoding/alignment, and the "
+        "official target-video posterior policy is not defined by the inference encoders"
+    )
+
     workflow: ClassVar[str] = "t2va"
     transformer_component_name: ClassVar[str] = "transformer"
     preprocessing_modules: ClassVar[List[str]] = ["text_encoder", "tokenizer", "processor"]
@@ -210,6 +211,11 @@ class MiniMaxH3T2VAAdapter(_MiniMaxH3WorkflowAdapter, BaseAdapter):
 
 class MiniMaxH3FL2VAAdapter(_MiniMaxH3WorkflowAdapter, BaseAdapter):
     """Load the workflow-pruned MiniMax H3 first/last-frame partition."""
+
+    output_state_codec_unavailable_reason = (
+        "MiniMax H3 offline targets require lossless audiovisual decoding/alignment, and the "
+        "official target-video posterior policy is not defined by the inference encoders"
+    )
 
     workflow: ClassVar[str] = "fl2va"
     transformer_component_name: ClassVar[str] = "transformer"
@@ -230,6 +236,11 @@ class MiniMaxH3FL2VAAdapter(_MiniMaxH3WorkflowAdapter, BaseAdapter):
 
 class MiniMaxH3Ref2VAAdapter(_MiniMaxH3WorkflowAdapter, BaseAdapter):
     """Load the workflow-pruned MiniMax H3 omni-reference partition."""
+
+    output_state_codec_unavailable_reason = (
+        "MiniMax H3 offline targets require lossless audiovisual decoding/alignment, and the "
+        "official target-video posterior policy is not defined by the inference encoders"
+    )
 
     workflow: ClassVar[str] = "ref2va"
     transformer_component_name: ClassVar[str] = "transformer_ref"

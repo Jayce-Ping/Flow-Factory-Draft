@@ -177,6 +177,12 @@ class LTX2_I2AV_Adapter(BaseAdapter):
     Shared logic with LTX2_T2AV_Adapter is handled via code duplication.
     """
 
+    output_state_codec_unavailable_reason = (
+        "LTX2 I2AV offline targets require paired video/audio decoding, exact duration "
+        "alignment, and an active mask for the pinned first-frame condition; those lossless "
+        "audiovisual output semantics are not yet implemented"
+    )
+
     supports_diffusers_cache = True
     trajectory_component_order: ClassVar[Tuple[str, ...]] = LTX2_COMPONENT_ORDER
 
