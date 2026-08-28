@@ -4042,7 +4042,7 @@ class BaseAdapter(ABC):
         self,
         primary_timesteps: torch.Tensor,
         *,
-        batch: Optional[StackedSampleBatch] = None,
+        batch: Optional[Mapping[str, Any]] = None,
     ) -> ComponentTimes:
         """Map one primary scheduler coordinate onto every component's times.
 
@@ -4053,7 +4053,7 @@ class BaseAdapter(ABC):
 
         Args:
             primary_timesteps: Primary scheduler coordinates of shape ``(B,)``.
-            batch: Optional collated batch supplying per-component geometry.
+            batch: Optional online or offline mapping supplying per-component geometry.
 
         Returns:
             Component times whose sigma follows the flow-matching schedule.
