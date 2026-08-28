@@ -1,5 +1,6 @@
 """Shared, algorithm-independent trainer primitives."""
 
+from .dpo_objective import dpo_objective
 from .forward_kwargs import (
     reference_forward_kwargs,
     replay_forward_kwargs,
@@ -15,6 +16,7 @@ from .state_validation import (
 )
 
 __all__ = [
+    "dpo_objective",
     "iter_prefetched_batches",
     "move_and_stack_samples",
     "reference_forward_kwargs",
