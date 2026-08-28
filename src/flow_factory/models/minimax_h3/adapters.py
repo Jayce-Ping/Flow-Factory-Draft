@@ -61,11 +61,10 @@ class _MiniMaxH3WorkflowAdapter:
     preprocess_cache_version: ClassVar[str] = _H3_PREPROCESS_CACHE_VERSION
 
     def load_pipeline(self) -> Any:
-        """Load only this adapter's modular workflow."""
+        """Load this modular workflow from a local directory or Hugging Face repo."""
         return load_h3_workflow_pipeline(
             self.model_args.model_name_or_path,
             workflow=self.workflow,
-            transformer_component_name=self.transformer_component_name,
         )
 
     def build_component_runtime(self) -> ModularPipelineRuntime:

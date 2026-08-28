@@ -55,8 +55,9 @@ _REFERENCE_FIELDS: Tuple[str, ...] = ("ImageReference", "VideoReference", "Audio
 
 @dataclass(frozen=True)
 class MiniMaxH3Symbols:
-    """Hold all pinned upstream classes used by the shared H3 core."""
+    """Hold all upstream classes used by the shared H3 core."""
 
+    ModularPipeline: Type[Any]
     MiniMaxH3ModularPipeline: Type[Any]
     MiniMaxH3Blocks: Type[Any]
     PipelineState: Type[Any]
@@ -84,6 +85,7 @@ class MiniMaxH3Symbols:
 
 
 try:
+    from diffusers import ModularPipeline
     from diffusers.modular_pipelines.minimax_h3.before_denoise import (
         MiniMaxH3FL2VAPrepareLatentsStep,
         MiniMaxH3NoKeyframeAnchorsStep,
@@ -120,6 +122,7 @@ try:
     from diffusers.modular_pipelines.modular_pipeline import PipelineState
 
     _SYMBOLS = MiniMaxH3Symbols(
+        ModularPipeline=ModularPipeline,
         MiniMaxH3ModularPipeline=MiniMaxH3ModularPipeline,
         MiniMaxH3Blocks=MiniMaxH3Blocks,
         PipelineState=PipelineState,
@@ -152,7 +155,7 @@ except ImportError as import_error:
 
 
 def require_minimax_h3_support() -> MiniMaxH3Symbols:
-    """Return pinned H3 symbols or raise one actionable feature-probe error.
+    """Return H3 symbols or raise one actionable feature-probe error.
 
     Returns:
         Immutable bundle of required upstream symbols.

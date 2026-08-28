@@ -88,15 +88,7 @@ class WorkflowPipelineFake:
     calls: ClassVar[List[tuple[str, str]]] = []
     component_overrides: ClassVar[Dict[str, Any]] = {}
 
-    def __init__(
-        self,
-        *,
-        blocks: Any,
-        pretrained_model_name_or_path: str,
-        workflow: str,
-    ) -> None:
-        assert blocks is not None
-        self.calls.append((pretrained_model_name_or_path, workflow))
+    def __init__(self, workflow: str) -> None:
         transformer_name = "transformer_ref" if workflow == "ref2va" else "transformer"
         self.workflow = workflow
         self.pretrained_specs = {
@@ -140,6 +132,11 @@ class WorkflowPipelineFake:
     def get_component_spec(self, name: str) -> Any:
         return deepcopy({**self.pretrained_specs, **self.config_specs}[name])
 
+    @classmethod
+    def from_pretrained(cls, model_name_or_path: str, *, workflow: str) -> "WorkflowPipelineFake":
+        cls.calls.append((model_name_or_path, workflow))
+        return cls(workflow)
+
     def load_components(self, names: List[str]) -> None:
         self.load_calls.append(list(names))
         for name in names:
@@ -165,64 +162,6 @@ class AcceleratorFake:
 
     def wait_for_everyone(self) -> None:
         """Provide the checkpoint synchronization surface."""
-
-
-def test_local_workflow_rebinds_pretrained_component_specs(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    required = (
-        "scheduler",
-        "text_encoder",
-        "tokenizer",
-        "processor",
-        "vae",
-        "audio_vae",
-        "transformer",
-    )
-
-    class LocalPipeline:
-        def __init__(
-            self,
-            *,
-            blocks: Any,
-            pretrained_model_name_or_path: str,
-            workflow: str,
-        ) -> None:
-            assert blocks is not None
-            assert pretrained_model_name_or_path == str(tmp_path)
-            assert workflow == "t2va"
-            self.pretrained_component_names = list(required)
-            self.config_component_names = []
-            self.specs = {
-                name: SimpleNamespace(
-                    pretrained_model_name_or_path="MiniMaxAI/MiniMax-H3",
-                    revision="main",
-                )
-                for name in required
-            }
-            self._component_specs = self.specs
-
-        def get_component_spec(self, name: str):
-            return self.specs[name]
-
-    monkeypatch.setattr(
-        "flow_factory.models.minimax_h3.workflow.require_minimax_h3_support",
-        lambda: SimpleNamespace(
-            MiniMaxH3ModularPipeline=LocalPipeline,
-            MiniMaxH3Blocks=lambda: object(),
-        ),
-    )
-
-    pipeline = load_h3_workflow_pipeline(
-        str(tmp_path),
-        workflow="t2va",
-        transformer_component_name="transformer",
-    )
-
-    assert all(
-        spec.pretrained_model_name_or_path == str(tmp_path) and spec.revision is None
-        for spec in pipeline.specs.values()
-    )
 
 
 def _config(target_components: List[str]) -> SimpleNamespace:
@@ -262,10 +201,20 @@ def _fake_dependency(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "flow_factory.models.minimax_h3.workflow.require_minimax_h3_support",
         lambda: SimpleNamespace(
-            MiniMaxH3ModularPipeline=WorkflowPipelineFake,
-            MiniMaxH3Blocks=lambda: object(),
+            ModularPipeline=WorkflowPipelineFake,
         ),
     )
+
+
+@pytest.mark.parametrize(
+    "model_name_or_path",
+    ["MiniMaxAI/MiniMax-H3", "/root/models/MiniMax-H3"],
+)
+def test_workflow_loader_delegates_hub_and_local_sources(model_name_or_path: str) -> None:
+    pipeline = load_h3_workflow_pipeline(model_name_or_path, workflow="t2va")
+
+    assert isinstance(pipeline, WorkflowPipelineFake)
+    assert WorkflowPipelineFake.calls == [(model_name_or_path, "t2va")]
 
 
 @pytest.mark.parametrize(
@@ -572,32 +521,6 @@ def test_ref2va_unknown_lifecycle_component_fails_with_runtime_context() -> None
         match=r"unknown components.*missing.*received=.*transformer_ref",
     ):
         adapter.enable_gradient_checkpointing()
-
-
-@pytest.mark.parametrize(
-    ("adapter_class", "workflow", "required_name", "opposite_name"),
-    [
-        (MiniMaxH3T2VAAdapter, "t2va", "transformer", "transformer_ref"),
-        (MiniMaxH3FL2VAAdapter, "fl2va", "transformer", "transformer_ref"),
-        (MiniMaxH3Ref2VAAdapter, "ref2va", "transformer_ref", "transformer"),
-    ],
-)
-def test_workflow_adapter_rejects_missing_or_opposite_transformer_partition(
-    adapter_class: type[BaseAdapter],
-    workflow: str,
-    required_name: str,
-    opposite_name: str,
-) -> None:
-    WorkflowPipelineFake.component_overrides = {
-        required_name: None,
-        opposite_name: "opposite transformer spec",
-    }
-
-    with pytest.raises(
-        ValueError,
-        match=rf"workflow='{workflow}'.*required.*{required_name}.*opposite.*{opposite_name}",
-    ):
-        adapter_class(_config([required_name]), AcceleratorFake())
 
 
 @pytest.mark.parametrize(

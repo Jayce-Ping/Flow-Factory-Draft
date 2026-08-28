@@ -14,7 +14,6 @@
 
 """Own MiniMax H3 workflow loading, setup, and execution contracts."""
 
-import os
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import torch
@@ -42,14 +41,6 @@ from .denoise import forward_h3_state
 from .dependency import require_minimax_h3_support
 from .layout import build_h3_schedule_plan
 
-_COMMON_REQUIRED_COMPONENTS = (
-    "scheduler",
-    "text_encoder",
-    "tokenizer",
-    "processor",
-    "vae",
-    "audio_vae",
-)
 _COMPONENT_ORDER = ("video", "audio")
 _LAYOUT_MATRIX_FIELDS = ("position_ids",)
 _LAYOUT_INDEX_FIELDS = (
@@ -82,49 +73,13 @@ def load_h3_workflow_pipeline(
     model_name_or_path: str,
     *,
     workflow: str,
-    transformer_component_name: str,
 ) -> Any:
-    """Load and validate one workflow-pruned MiniMax H3 pipeline."""
+    """Load a workflow-pruned H3 pipeline from a local directory or Hub repo."""
     symbols = require_minimax_h3_support()
-    pipeline = symbols.MiniMaxH3ModularPipeline(
-        blocks=symbols.MiniMaxH3Blocks(),
-        pretrained_model_name_or_path=model_name_or_path,
+    return symbols.ModularPipeline.from_pretrained(
+        model_name_or_path,
         workflow=workflow,
     )
-    if os.path.isdir(model_name_or_path):
-        component_specs = getattr(pipeline, "_component_specs", None)
-        if not isinstance(component_specs, dict):
-            raise TypeError(
-                f"MiniMax H3 local workflow={workflow!r} expected authoritative "
-                f"pipeline._component_specs dict, received {type(component_specs).__name__}"
-            )
-        for component_name in pipeline.pretrained_component_names:
-            component_spec = component_specs.get(component_name)
-            if component_spec is None or not hasattr(
-                component_spec, "pretrained_model_name_or_path"
-            ):
-                raise TypeError(
-                    f"MiniMax H3 local workflow={workflow!r} expected pretrained "
-                    f"ComponentSpec for {component_name!r}, received {component_spec!r}"
-                )
-            component_spec.pretrained_model_name_or_path = model_name_or_path
-            component_spec.revision = None
-    declared_specs = ModularPipelineRuntime(pipeline).canonical_components
-
-    opposite_component_name = (
-        "transformer_ref" if transformer_component_name == "transformer" else "transformer"
-    )
-    required_names = (*_COMMON_REQUIRED_COMPONENTS, transformer_component_name)
-    missing_names = [name for name in required_names if declared_specs.get(name) is None]
-    opposite_names = [opposite_component_name] if opposite_component_name in declared_specs else []
-    if missing_names or opposite_names:
-        raise ValueError(
-            f"MiniMax H3 workflow={workflow!r} expected required components "
-            f"{required_names!r} and opposite transformer partition {opposite_component_name!r} "
-            f"to be absent, received missing={missing_names!r}, "
-            f"opposite_present={opposite_names!r}, declared={tuple(declared_specs)!r}"
-        )
-    return pipeline
 
 
 def build_h3_component_runtime(adapter: Any) -> ModularPipelineRuntime:
