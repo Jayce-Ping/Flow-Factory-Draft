@@ -14,6 +14,7 @@
 
 """Own MiniMax H3 workflow loading, setup, and execution contracts."""
 
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import torch
@@ -76,10 +77,19 @@ def load_h3_workflow_pipeline(
 ) -> Any:
     """Load a workflow-pruned H3 pipeline from a local directory or Hub repo."""
     symbols = require_minimax_h3_support()
-    return symbols.ModularPipeline.from_pretrained(
+    pipeline = symbols.ModularPipeline.from_pretrained(
         model_name_or_path,
         workflow=workflow,
     )
+    if Path(model_name_or_path).is_dir():
+        # Hub snapshots retain their original repo ID inside each ComponentSpec.
+        # Point only those sources at the local snapshot so load_components()
+        # reads its subfolders from disk instead of downloading them again.
+        for name in pipeline.pretrained_component_names:
+            spec = pipeline._component_specs[name]
+            spec.pretrained_model_name_or_path = model_name_or_path
+            spec.revision = None
+    return pipeline
 
 
 def build_h3_component_runtime(adapter: Any) -> ModularPipelineRuntime:

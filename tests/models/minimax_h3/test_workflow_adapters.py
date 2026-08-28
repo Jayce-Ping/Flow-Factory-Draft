@@ -101,6 +101,13 @@ class WorkflowPipelineFake:
             "unrelated": "must stay lazy",
             **self.component_overrides,
         }
+        self._component_specs = {
+            name: SimpleNamespace(
+                pretrained_model_name_or_path="MiniMaxAI/MiniMax-H3",
+                revision="main",
+            )
+            for name in self.pretrained_specs
+        }
         self.config_specs = {
             "processor": "processor spec",
             "image_processor": "image processor spec",
@@ -206,15 +213,28 @@ def _fake_dependency(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-@pytest.mark.parametrize(
-    "model_name_or_path",
-    ["MiniMaxAI/MiniMax-H3", "/root/models/MiniMax-H3"],
-)
-def test_workflow_loader_delegates_hub_and_local_sources(model_name_or_path: str) -> None:
+def test_workflow_loader_preserves_hub_source() -> None:
+    model_name_or_path = "MiniMaxAI/MiniMax-H3"
     pipeline = load_h3_workflow_pipeline(model_name_or_path, workflow="t2va")
 
     assert isinstance(pipeline, WorkflowPipelineFake)
     assert WorkflowPipelineFake.calls == [(model_name_or_path, "t2va")]
+    assert all(
+        spec.pretrained_model_name_or_path == model_name_or_path
+        and spec.revision == "main"
+        for spec in pipeline._component_specs.values()
+    )
+
+
+def test_workflow_loader_rebinds_component_sources_for_local_snapshot(tmp_path) -> None:
+    pipeline = load_h3_workflow_pipeline(str(tmp_path), workflow="t2va")
+
+    assert isinstance(pipeline, WorkflowPipelineFake)
+    assert WorkflowPipelineFake.calls == [(str(tmp_path), "t2va")]
+    assert all(
+        spec.pretrained_model_name_or_path == str(tmp_path) and spec.revision is None
+        for spec in pipeline._component_specs.values()
+    )
 
 
 @pytest.mark.parametrize(
