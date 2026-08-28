@@ -31,7 +31,9 @@ from .dpo import DPOTrainingArguments
 from .dppo import DPPOTrainingArguments
 from .grpo import GRPOTrainingArguments
 from .nft import NFTTrainingArguments
+from .offline_dpo import OfflineDPOTrainingArguments
 from .opd import DiffusionOPDTrainingArguments, TeacherConfig
+from .sft import SFTTrainingArguments
 from .tdm import TDMTrainingArguments
 from .tdm_r1 import TDMR1TrainingArguments
 from ..gradient_checkpointing import (
@@ -55,6 +57,8 @@ __all__ = [
     "TDMR1TrainingArguments",
     "CRDTrainingArguments",
     "DiffusionOPDTrainingArguments",
+    "SFTTrainingArguments",
+    "OfflineDPOTrainingArguments",
     "TeacherConfig",
     "get_training_args_class",
     "list_registered_training_args",
