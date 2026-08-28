@@ -24,6 +24,7 @@ from datasets import Dataset as HFDataset
 from torch.utils.data import DataLoader
 
 from ..contracts import (
+    BatchCapability,
     InputMediaBinding,
     PipelineIOContract,
     validate_pipeline_model_input,
@@ -147,6 +148,14 @@ def build_offline_train_dataloader(
 
     data_args = config.data_args
     training_args = config.training_args
+    if (
+        pipeline_io_contract.batch_capability is BatchCapability.SINGLE_SAMPLE
+        and training_args.per_device_batch_size != 1
+    ):
+        raise ValueError(
+            "offline pipeline contract requires per_device_batch_size=1 for "
+            f"single-sample execution, received {training_args.per_device_batch_size!r}"
+        )
     if not data_args.enable_preprocess:
         raise ValueError(
             "offline train data requires data.enable_preprocess=True so cached rows contain "

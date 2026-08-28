@@ -15,6 +15,7 @@
 import gc
 import json
 import weakref
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List
@@ -482,6 +483,35 @@ def test_builder_rejects_preprocessor_binding_drift_before_dataset_io(tmp_path: 
             supervision_type="demonstration",
             pipeline_io_contract=_ORDERED_IMAGE_CONTRACT,
         )
+
+
+def test_builder_rejects_single_sample_pipeline_batching_before_dataset_io(
+    tmp_path: Path,
+) -> None:
+    """Adapter batching capability is enforced before cache or manifest work."""
+    contract = replace(
+        _TEXT_TO_IMAGE_CONTRACT,
+        batch_capability=BatchCapability.SINGLE_SAMPLE,
+    )
+    preprocessor = _CountingPreprocessor()
+
+    with pytest.raises(
+        ValueError,
+        match=r"requires per_device_batch_size=1.*received 2",
+    ):
+        build_offline_train_dataloader(
+            _config(
+                tmp_path,
+                [_source("missing", tmp_path / "missing", 0)],
+                per_device_batch_size=2,
+            ),
+            _Accelerator(),
+            preprocessor.preprocess,
+            supervision_type="demonstration",
+            pipeline_io_contract=contract,
+        )
+
+    assert preprocessor.calls == 0
 
 
 def test_builder_rejects_non_unit_weight_and_unresolved_source_id_before_io(
