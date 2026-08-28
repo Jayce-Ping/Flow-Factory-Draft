@@ -22,9 +22,10 @@ import numpy as np
 import pytest
 import torch
 from datasets import Dataset as HFDataset
+from datasets import Image as HFImage
 from PIL import Image
 
-from flow_factory.data_utils.dataset import GeneralDataset
+from flow_factory.data_utils.dataset import GeneralDataset, _cross_chunk_schema_probe_batches
 from flow_factory.data_utils.offline_condition_cache import (
     build_offline_condition_cache,
     compute_offline_condition_source_hash,
@@ -85,6 +86,73 @@ class OrderedPreprocessor:
 class CollisionPreprocessor:
     def preprocess(self, prompt: List[str]) -> Dict[str, List[str]]:
         return {OFFLINE_CONDITION_ID_COLUMN: ["adapter-owned"] * len(prompt)}
+
+
+class OptionalImagePreprocessor:
+    python_format_columns = frozenset({"condition_images"})
+
+    def preprocess(
+        self,
+        prompt: List[str],
+        images: List[List[Image.Image]],
+    ) -> Dict[str, Any]:
+        condition_images = []
+        image_latents = []
+        image_latent_ids = []
+        for sample_images in images:
+            condition_images.append(sample_images)
+            if sample_images:
+                image_latents.append(torch.ones(2, 3))
+                image_latent_ids.append(torch.zeros(2, 4))
+            else:
+                image_latents.append(None)
+                image_latent_ids.append(None)
+        return {
+            "condition_images": condition_images,
+            "image_latents": image_latents,
+            "image_latent_ids": image_latent_ids,
+        }
+
+
+class ChunkBoundedDatasetSpy:
+    def __init__(
+        self,
+        rows: List[Dict[str, Any]],
+        *,
+        columns: List[str] | None = None,
+        accesses: List[tuple[tuple[str, ...], int, int]] | None = None,
+        max_chunk_size: int = 2,
+    ) -> None:
+        self.rows = rows
+        self.column_names = list(rows[0]) if columns is None else columns
+        self.accesses = [] if accesses is None else accesses
+        self.max_chunk_size = max_chunk_size
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def select_columns(self, column_names: List[str]) -> "ChunkBoundedDatasetSpy":
+        return ChunkBoundedDatasetSpy(
+            self.rows,
+            columns=column_names,
+            accesses=self.accesses,
+            max_chunk_size=self.max_chunk_size,
+        )
+
+    def __getitem__(self, key: slice) -> Dict[str, List[Any]]:
+        if not isinstance(key, slice):
+            raise AssertionError(f"schema discovery requested an unbounded column: {key!r}")
+        start = 0 if key.start is None else key.start
+        stop = len(self.rows) if key.stop is None else key.stop
+        if key.step not in (None, 1):
+            raise AssertionError(f"schema discovery requested a strided slice: {key!r}")
+        if stop - start > self.max_chunk_size:
+            raise AssertionError(f"schema discovery requested an oversized slice: {key!r}")
+        self.accesses.append((tuple(self.column_names), start, stop))
+        return {
+            column_name: [self.rows[index][column_name] for index in range(start, stop)]
+            for column_name in self.column_names
+        }
 
 
 def _demonstration_record(
@@ -175,6 +243,41 @@ def test_target_and_metadata_changes_reuse_the_input_only_cache(tmp_path: Path) 
     assert "second-target-does-not-exist.png" not in repr(second_cache[0])
 
 
+def test_input_media_replacement_invalidates_the_condition_cache(tmp_path: Path) -> None:
+    input_path = tmp_path / "reference.png"
+    Image.new("RGB", (2, 2), color=(1, 2, 3)).save(input_path)
+    record = _demonstration_record(
+        tmp_path,
+        input_media=[{"type": "image", "path": "reference.png"}],
+        target_path="target-does-not-enter-condition-cache.png",
+    )
+    preprocessor = CountingPreprocessor()
+
+    first_cache = build_offline_condition_cache(
+        [record],
+        source_name="content-addressed-input",
+        dataset_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
+        preprocess_func=preprocessor.preprocess,
+        preprocessing_batch_size=1,
+    )
+    first_condition_id = first_cache[0][OFFLINE_CONDITION_ID_COLUMN]
+    Image.new("RGB", (2, 2), color=(4, 5, 6)).save(input_path)
+    second_cache = build_offline_condition_cache(
+        [record],
+        source_name="content-addressed-input",
+        dataset_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
+        preprocess_func=preprocessor.preprocess,
+        preprocessing_batch_size=1,
+    )
+
+    assert preprocessor.calls == 2
+    assert second_cache[0][OFFLINE_CONDITION_ID_COLUMN] != first_condition_id
+    assert second_cache._fingerprint != first_cache._fingerprint
+    assert second_cache.cache_files != first_cache.cache_files
+
+
 def test_condition_cache_does_not_retain_the_bound_preprocessor(tmp_path: Path) -> None:
     preprocessor = CountingPreprocessor()
     preprocessor_ref = weakref.ref(preprocessor)
@@ -196,6 +299,7 @@ def test_condition_cache_does_not_retain_the_bound_preprocessor(tmp_path: Path) 
 
 
 def test_projection_contains_only_input_and_identity_columns(tmp_path: Path) -> None:
+    Image.new("RGB", (2, 2), color=(1, 2, 3)).save(tmp_path / "reference.png")
     record = _demonstration_record(
         tmp_path,
         input_media=[{"type": "image", "path": "reference.png"}],
@@ -220,6 +324,22 @@ def test_projection_contains_only_input_and_identity_columns(tmp_path: Path) -> 
     assert "private-target.png" not in repr(projected[0])
 
 
+def test_projection_normalizes_missing_optional_negative_prompts_in_mixed_batch(
+    tmp_path: Path,
+) -> None:
+    """Tokenizers receive strings when only some V2 rows specify a negative prompt."""
+    projected = project_offline_condition_dataset(
+        [
+            _demonstration_record(tmp_path, negative_prompt=None),
+            _demonstration_record(tmp_path, negative_prompt="bad quality"),
+        ],
+        source_name="mixed-negative-prompts",
+        ordered_references=False,
+    )
+
+    assert projected["negative_prompt"] == ["", "bad quality"]
+
+
 def test_preference_arms_never_enter_the_condition_projection(tmp_path: Path) -> None:
     projected = project_offline_condition_dataset(
         [_preference_record(tmp_path)],
@@ -239,12 +359,40 @@ def test_condition_source_hash_is_order_sensitive() -> None:
     )
 
 
+def test_schema_probe_scans_only_bounded_pending_column_chunks() -> None:
+    dataset = ChunkBoundedDatasetSpy(
+        [
+            {"a": None, "b": [], "always": "set"},
+            {"a": None, "b": [], "always": "set"},
+            {"a": None, "b": [], "always": "set"},
+            {"a": "typed", "b": [], "always": "set"},
+            {"a": None, "b": ["typed"], "always": "set"},
+            {"a": None, "b": [], "always": "set"},
+        ],
+        max_chunk_size=2,
+    )
+
+    probe_batches = _cross_chunk_schema_probe_batches(
+        dataset,
+        preprocessing_batch_size=2,
+    )
+
+    assert probe_batches == [[0, 1], [2, 3], [4, 5]]
+    assert dataset.accesses == [
+        (("a", "b", "always"), 0, 2),
+        (("a", "b"), 2, 4),
+        (("b",), 4, 6),
+    ]
+
+
 def test_grouped_projection_preserves_per_modality_order_and_rate_overrides(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     for name, color in (("first.png", (255, 0, 0)), ("second.png", (0, 255, 0))):
         Image.new("RGB", (2, 2), color=color).save(tmp_path / name)
+    for name in ("first.mp4", "second.mp4", "voice.wav"):
+        (tmp_path / name).write_bytes(f"identity bytes for {name}".encode("utf-8"))
     video_calls: List[tuple[str, float | None]] = []
     audio_calls: List[tuple[str, int | None]] = []
 
@@ -294,11 +442,94 @@ def test_grouped_projection_preserves_per_modality_order_and_rate_overrides(
     assert len(preprocessor.audios[0]) == 1
 
 
+def test_condition_cache_preserves_optional_image_schema_across_map_chunks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Arrow keeps one optional-image schema using datasets 3.3 map keywords."""
+    original_map = HFDataset.map
+    captured_features = []
+
+    def datasets_3_3_compatible_map(
+        self: HFDataset,
+        function: Any,
+        *,
+        batched: bool,
+        with_indices: bool,
+        batch_size: int,
+        fn_kwargs: Dict[str, Any],
+        remove_columns: List[str],
+        new_fingerprint: str,
+        cache_file_name: str,
+        features: Any,
+        desc: str,
+        load_from_cache_file: bool,
+    ) -> HFDataset:
+        captured_features.append(features)
+        return original_map(
+            self,
+            function,
+            batched=batched,
+            with_indices=with_indices,
+            batch_size=batch_size,
+            fn_kwargs=fn_kwargs,
+            remove_columns=remove_columns,
+            new_fingerprint=new_fingerprint,
+            cache_file_name=cache_file_name,
+            features=features,
+            desc=desc,
+            load_from_cache_file=load_from_cache_file,
+        )
+
+    monkeypatch.setattr(HFDataset, "map", datasets_3_3_compatible_map)
+    Image.new("RGB", (2, 2), color=(1, 2, 3)).save(tmp_path / "reference.png")
+    records = [
+        _demonstration_record(tmp_path),
+        _demonstration_record(tmp_path),
+        _demonstration_record(
+            tmp_path,
+            input_media=[{"type": "image", "path": "reference.png"}],
+        ),
+        _demonstration_record(
+            tmp_path,
+            input_media=[{"type": "image", "path": "reference.png"}],
+        ),
+    ]
+
+    cache = build_offline_condition_cache(
+        records,
+        source_name="optional-images",
+        dataset_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
+        preprocess_func=OptionalImagePreprocessor().preprocess,
+        force_reprocess=True,
+        preprocessing_batch_size=2,
+    )
+
+    assert len(captured_features) == 1
+    assert captured_features[0] is not None
+    assert isinstance(cache.features["condition_images"].feature, HFImage)
+    assert cache.features["image_latents"].feature.feature.dtype == "float32"
+    assert cache.features["image_latent_ids"].feature.feature.dtype == "float32"
+    assert cache[0]["condition_images"] == []
+    assert cache[0]["image_latents"] is None
+    assert cache[0]["image_latent_ids"] is None
+    assert cache[1]["condition_images"] == []
+    assert cache[1]["image_latents"] is None
+    assert cache[1]["image_latent_ids"] is None
+    for row in (2, 3):
+        assert len(cache[row]["condition_images"]) == 1
+        assert cache[row]["image_latents"].shape == (2, 3)
+        assert cache[row]["image_latent_ids"].shape == (2, 4)
+
+
 def test_ordered_heterogeneous_references_cross_arrow_as_canonical_json(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     Image.new("RGB", (2, 2), color=(1, 2, 3)).save(tmp_path / "image.png")
+    (tmp_path / "video.mp4").write_bytes(b"identity-only video payload")
+    (tmp_path / "audio.wav").write_bytes(b"identity-only audio payload")
     monkeypatch.setattr(
         "flow_factory.data_utils.dataset._decode_ordered_video",
         lambda path: (np.zeros((1, 2, 2, 3), dtype=np.uint8), 30.0, None, None),

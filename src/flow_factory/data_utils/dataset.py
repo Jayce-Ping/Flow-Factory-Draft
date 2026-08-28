@@ -19,14 +19,16 @@ import json
 import logging
 import math
 import os
+import random
 import shutil
 from dataclasses import asdict
-from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Union
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Protocol, Sequence, Union
 
 import imageio.v3 as iio
 import numpy as np
 import torch
 from datasets import Dataset as HFDataset
+from datasets import Features as HFFeatures
 from datasets import Image as HFImage
 from datasets import Sequence as HFSequence
 from datasets import load_dataset, load_from_disk
@@ -373,6 +375,16 @@ class GeneralDataset(Dataset):
         if target_arrow_path is not None:
             os.makedirs(os.path.dirname(os.path.abspath(target_arrow_path)), exist_ok=True)
 
+        preprocess_features = self._infer_cross_chunk_features(
+            raw_dataset=raw_dataset,
+            preprocessing_batch_size=preprocessing_batch_size,
+            image_dir=self.image_dir,
+            video_dir=self.video_dir,
+            audio_dir=self.audio_dir,
+            force_reprocess=force_reprocess,
+            target_arrow_path=target_arrow_path,
+        )
+
         processed_dataset = raw_dataset.map(
             self._preprocess_batch,
             batched=True,
@@ -386,6 +398,7 @@ class GeneralDataset(Dataset):
             remove_columns=raw_dataset.column_names,
             new_fingerprint=shard_fingerprint,
             cache_file_name=target_arrow_path,
+            features=preprocess_features,
             desc=desc,
             load_from_cache_file=not force_reprocess,
         )
@@ -393,6 +406,106 @@ class GeneralDataset(Dataset):
         _apply_torch_format(processed_dataset)
 
         return processed_dataset
+
+    def _infer_cross_chunk_features(
+        self,
+        *,
+        raw_dataset: HFDataset,
+        preprocessing_batch_size: int,
+        image_dir: Optional[str],
+        video_dir: Optional[str],
+        audio_dir: Optional[str],
+        force_reprocess: bool,
+        target_arrow_path: Optional[str],
+    ) -> Optional[HFFeatures]:
+        """Infer one explicit schema when later map chunks introduce typed values.
+
+        HuggingFace infers a batched map's writer schema from its first output
+        chunk. Optional columns therefore need a representative schema probe when
+        that chunk is empty but a later chunk is populated. This narrow probe may
+        call a preprocessor before the real ordered map, so preprocessors must keep
+        their existing cache-oriented determinism contract. Global Python, NumPy,
+        torch, MPS, and explicit ``torch.Generator`` states are restored; arbitrary
+        adapter-owned mutable state is intentionally outside that guarantee.
+
+        Args:
+            raw_dataset: Input dataset after any distributed sharding.
+            preprocessing_batch_size: Map chunk size.
+            image_dir: Image root forwarded to preprocessing.
+            video_dir: Video root forwarded to preprocessing.
+            audio_dir: Audio root forwarded to preprocessing.
+            force_reprocess: Whether an existing explicit Arrow target is rebuilt.
+            target_arrow_path: Optional explicit Arrow cache target.
+
+        Returns:
+            Explicit output features for a cross-chunk nullable transition, or
+            ``None`` when first-chunk inference is already sufficient.
+        """
+        if (
+            not force_reprocess
+            and target_arrow_path is not None
+            and os.path.isfile(target_arrow_path)
+        ):
+            return None
+
+        probe_batches = _cross_chunk_schema_probe_batches(
+            raw_dataset,
+            preprocessing_batch_size=preprocessing_batch_size,
+        )
+        if probe_batches is None:
+            return None
+
+        explicit_generators = list(_iter_torch_generators(self._preprocess_kwargs))
+        generator_states = [generator.get_state() for generator in explicit_generators]
+        python_state = random.getstate()
+        numpy_state = np.random.get_state()
+        mps_state = None
+        if torch.backends.mps.is_available() and hasattr(torch.mps, "get_rng_state"):
+            mps_state = torch.mps.get_rng_state()
+
+        try:
+            with torch.random.fork_rng():
+                probe_results = [
+                    (
+                        indices,
+                        self._preprocess_batch(
+                            raw_dataset[indices],
+                            indices,
+                            image_dir,
+                            video_dir,
+                            audio_dir,
+                        ),
+                    )
+                    for indices in probe_batches
+                ]
+        finally:
+            random.setstate(python_state)
+            np.random.set_state(numpy_state)
+            if mps_state is not None:
+                torch.mps.set_rng_state(mps_state)
+            for generator, state in zip(explicit_generators, generator_states):
+                generator.set_state(state)
+
+        expected_columns = tuple(probe_results[0][1])
+        combined_result = {column_name: [] for column_name in expected_columns}
+        for indices, probe_result in probe_results:
+            if set(probe_result) != set(expected_columns):
+                raise ValueError(
+                    "preprocess output columns must remain stable across map chunks: "
+                    f"expected {expected_columns!r}, got {tuple(probe_result)!r} "
+                    f"for source rows {indices!r}"
+                )
+            for column_name in expected_columns:
+                values = probe_result[column_name]
+                if not isinstance(values, (list, tuple, np.ndarray)):
+                    raise TypeError(
+                        "batched preprocess output columns must be sequences, "
+                        f"got {type(values).__name__} for {column_name!r} "
+                        f"at source rows {indices!r}"
+                    )
+                combined_result[column_name].extend(values)
+
+        return HFDataset.from_dict(combined_result).features
 
     def _shard_dataset(self, dataset: HFDataset, shard_index: int, num_shards: int) -> HFDataset:
         """
@@ -1008,6 +1121,87 @@ def _normalize_passthrough_columns(columns: Optional[Sequence[str]]) -> tuple[st
             f"{METADATA_COLUMN!r} is owned by GeneralDataset and cannot be a " "passthrough column"
         )
     return normalized
+
+
+def _cross_chunk_schema_probe_batches(
+    dataset: HFDataset,
+    *,
+    preprocessing_batch_size: int,
+) -> Optional[List[List[int]]]:
+    """Return real map chunks needed to cover later typed source values."""
+    if preprocessing_batch_size <= 0 or len(dataset) <= preprocessing_batch_size:
+        return None
+
+    first_chunk_stop = min(preprocessing_batch_size, len(dataset))
+    first_chunk = dataset[:first_chunk_stop]
+    pending_columns = {
+        column_name
+        for column_name in dataset.column_names
+        if not any(_has_typed_payload(value) for value in first_chunk[column_name])
+    }
+    if not pending_columns:
+        return None
+
+    probe_chunk_starts = {0}
+    for start in range(first_chunk_stop, len(dataset), preprocessing_batch_size):
+        stop = min(start + preprocessing_batch_size, len(dataset))
+        pending_chunk = dataset.select_columns(sorted(pending_columns))[start:stop]
+        typed_columns = {
+            column_name
+            for column_name in pending_columns
+            if any(_has_typed_payload(value) for value in pending_chunk[column_name])
+        }
+        if typed_columns:
+            probe_chunk_starts.add(start)
+            pending_columns.difference_update(typed_columns)
+            if not pending_columns:
+                break
+
+    if len(probe_chunk_starts) == 1:
+        return None
+    return [
+        list(range(start, min(start + preprocessing_batch_size, len(dataset))))
+        for start in sorted(probe_chunk_starts)
+    ]
+
+
+def _has_typed_payload(value: Any) -> bool:
+    """Return whether a value can contribute a non-null Arrow child type."""
+    if value is None:
+        return False
+    if isinstance(value, (str, bytes)):
+        return bool(value)
+    if isinstance(value, torch.Tensor):
+        return value.numel() > 0
+    if isinstance(value, np.ndarray):
+        return value.size > 0
+    if isinstance(value, Mapping):
+        return any(_has_typed_payload(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_has_typed_payload(item) for item in value)
+    return True
+
+
+def _iter_torch_generators(
+    value: Any,
+    _seen: Optional[set[int]] = None,
+) -> Iterator[torch.Generator]:
+    """Yield distinct explicit torch generators nested in preprocessing kwargs."""
+    if _seen is None:
+        _seen = set()
+    value_id = id(value)
+    if value_id in _seen:
+        return
+    _seen.add(value_id)
+
+    if isinstance(value, torch.Generator):
+        yield value
+    elif isinstance(value, Mapping):
+        for item in value.values():
+            yield from _iter_torch_generators(item, _seen)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_torch_generators(item, _seen)
 
 
 def _supports_ordered_references(preprocess_func: Optional[Callable]) -> bool:

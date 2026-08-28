@@ -16,9 +16,11 @@
 
 from __future__ import annotations
 
+import json
 import os
-from typing import Any, Literal, Mapping, Optional, Sequence
+from typing import Any, Literal, Mapping, MutableMapping, Optional, Sequence
 
+import torch
 from accelerate import Accelerator
 from datasets import Dataset as HFDataset
 from torch.utils.data import DataLoader
@@ -211,6 +213,7 @@ def build_offline_train_dataloader(
 
     offline_datasets = []
     for source, dataset_dir, records in source_records:
+        media_digest_cache: MutableMapping[str, str] = {}
         condition_cache = _build_distributed_condition_cache(
             records,
             source_name=source.name,
@@ -224,6 +227,7 @@ def build_offline_train_dataloader(
             extra_hash_strs=[*normalized_extra_hash_strs, f"offline_train_source:{source.name}"],
             preprocess_parallelism=data_args.preprocess_parallelism,
             accelerator=accelerator,
+            _media_digest_cache=media_digest_cache,
         )
         offline_datasets.append(
             OfflineDataset(
@@ -233,6 +237,7 @@ def build_offline_train_dataloader(
                 source_id=source.source_id,
                 supervision_type=supervision_type,
                 media_decoders=media_decoders,
+                _media_digest_cache=media_digest_cache,
             )
         )
 
@@ -313,6 +318,7 @@ def _build_distributed_condition_cache(
     extra_hash_strs: Sequence[str],
     preprocess_parallelism: Literal["global", "local"],
     accelerator: Accelerator,
+    _media_digest_cache: MutableMapping[str, str] | None = None,
 ) -> HFDataset:
     """Build one input-only cache through the existing rank-safe orchestrator."""
     ordered_references = _supports_ordered_references(preprocess_func)
@@ -321,6 +327,7 @@ def _build_distributed_condition_cache(
         records,
         source_name=source_name,
         ordered_references=ordered_references,
+        _media_digest_cache=_media_digest_cache,
     )
     condition_ids = tuple(raw_dataset[OFFLINE_CONDITION_ID_COLUMN])
     source_hash = compute_offline_condition_source_hash(condition_ids)
@@ -372,7 +379,25 @@ def _build_extra_hash_strs(
     config: Arguments,
     extra_hash_strs: Optional[Sequence[str]],
 ) -> list[str]:
-    values = [config.model_args.model_type, config.model_args.model_name_or_path]
+    model_args = config.model_args
+    precision_policy = json.dumps(
+        {
+            "component_load_dtypes": _canonical_dtype_policy(
+                getattr(model_args, "component_load_dtypes", None)
+            ),
+            "frozen_parameters_dtype": _canonical_dtype_policy(
+                getattr(model_args, "frozen_parameters_dtype", None)
+            ),
+        },
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    values = [
+        model_args.model_type,
+        model_args.model_name_or_path,
+        f"preprocess_precision:{precision_policy}",
+    ]
     if extra_hash_strs is not None:
         values.extend(extra_hash_strs)
     for index, value in enumerate(values):
@@ -382,6 +407,30 @@ def _build_extra_hash_strs(
                 f"got {type(value).__name__}: {value!r}"
             )
     return values
+
+
+def _canonical_dtype_policy(value: Any) -> Any:
+    """Return stable JSON data for one normalized model dtype policy."""
+    if value is None:
+        return None
+    if isinstance(value, torch.dtype):
+        return str(value).split(".")[-1]
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        canonical = {}
+        for selector in sorted(value):
+            if not isinstance(selector, str) or not selector:
+                raise TypeError(
+                    "offline preprocessing dtype policy selectors must be non-empty strings, "
+                    f"got {selector!r}"
+                )
+            canonical[selector] = _canonical_dtype_policy(value[selector])
+        return canonical
+    raise TypeError(
+        "offline preprocessing dtype policy must be a dtype, string, mapping, or None, "
+        f"got {type(value).__name__}: {value!r}"
+    )
 
 
 def _validate_training_sources(sources: Sequence[Any]) -> None:

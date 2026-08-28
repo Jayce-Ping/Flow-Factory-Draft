@@ -26,7 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import Any, Dict, List, Mapping, MutableMapping, Sequence
 
 from datasets import Dataset as HFDataset
 
@@ -51,6 +51,7 @@ def project_offline_condition_dataset(
     *,
     source_name: str,
     ordered_references: bool,
+    _media_digest_cache: MutableMapping[str, str] | None = None,
 ) -> HFDataset:
     """Build an input-only raw dataset for ``GeneralDataset`` preprocessing.
 
@@ -74,11 +75,15 @@ def project_offline_condition_dataset(
                 f"got {type(record).__name__} at index {index}"
             )
 
+    media_digest_cache: MutableMapping[str, str] = (
+        {} if _media_digest_cache is None else _media_digest_cache
+    )
     condition_ids = [
         compute_offline_condition_id(
             record,
             index=index,
             source_name=source_name,
+            _media_digest_cache=media_digest_cache,
         )
         for index, record in enumerate(stable_records)
     ]
@@ -89,7 +94,12 @@ def project_offline_condition_dataset(
 
     negative_prompts = [record.model_input.negative_prompt for record in stable_records]
     if any(value is not None for value in negative_prompts):
-        columns["negative_prompt"] = negative_prompts
+        # Adapter tokenizers consume a homogeneous text batch. In a mixed V2
+        # batch, an omitted optional negative prompt is semantically the empty
+        # prompt, not a tokenizer-level ``None`` value.
+        columns["negative_prompt"] = [
+            value if value is not None else "" for value in negative_prompts
+        ]
 
     if ordered_references:
         columns["references"] = [

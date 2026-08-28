@@ -271,7 +271,7 @@ def test_manifest_reader_reports_failing_line_context(
     assert "train.jsonl:2" in message
 
 
-def test_manifest_reader_rejects_prompt_only_and_mixed_supervision(tmp_path: Path) -> None:
+def test_manifest_reader_rejects_missing_and_mixed_supervision(tmp_path: Path) -> None:
     prompt_only = tmp_path / "prompt-only.jsonl"
     prompt_only.write_text(
         json.dumps(
@@ -283,8 +283,12 @@ def test_manifest_reader_rejects_prompt_only_and_mixed_supervision(tmp_path: Pat
         + "\n",
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match=r"prompt-only\.jsonl:1 is prompt-only"):
+    with pytest.raises(ValueError) as exc_info:
         load_offline_manifest(prompt_only, supervision_type="demonstration")
+    message = str(exc_info.value)
+    assert "invalid offline V2 record" in message
+    assert "prompt-only.jsonl:1" in message
+    assert "supervision" in message
 
     mixed = tmp_path / "mixed.jsonl"
     preference = {
@@ -380,6 +384,7 @@ def test_dataset_requires_normalized_homogeneous_records_and_matching_cache_ids(
 
 
 def test_record_id_distinguishes_duplicate_rows_by_stable_index(tmp_path: Path) -> None:
+    _save_image(tmp_path / "target.png", (1, 2, 3))
     record = _demonstration_record(tmp_path, ["target.png"])
 
     first = compute_offline_record_id(record, index=0, source_name=SOURCE_NAME)
@@ -423,6 +428,8 @@ def test_dataset_decodes_target_on_every_access_and_strips_reserved_condition_id
 def test_condition_id_is_input_only_while_record_id_tracks_full_provenance(
     tmp_path: Path,
 ) -> None:
+    _save_image(tmp_path / "first.png", (1, 2, 3))
+    _save_image(tmp_path / "second.png", (4, 5, 6))
     first = normalize_v2_record(
         {
             "schema_version": 2,
@@ -454,6 +461,163 @@ def test_condition_id_is_input_only_while_record_id_tracks_full_provenance(
     assert compute_offline_record_id(
         first, index=0, source_name=SOURCE_NAME
     ) != compute_offline_record_id(second, index=0, source_name=SOURCE_NAME)
+
+
+def test_same_path_media_replacement_changes_the_owning_identity(tmp_path: Path) -> None:
+    input_path = tmp_path / "condition.png"
+    target_path = tmp_path / "target.png"
+    _save_image(input_path, (1, 2, 3))
+    _save_image(target_path, (4, 5, 6))
+    record = normalize_v2_record(
+        {
+            "schema_version": 2,
+            "input": {
+                "prompt": "content-addressed",
+                "media": [{"type": "image", "path": "condition.png"}],
+            },
+            "supervision": {
+                "type": "demonstration",
+                "target": {"media": [{"type": "image", "path": "target.png"}]},
+            },
+        },
+        dataset_dir=tmp_path,
+    )
+
+    first_condition_id = compute_offline_condition_id(
+        record,
+        index=0,
+        source_name=SOURCE_NAME,
+    )
+    first_record_id = compute_offline_record_id(
+        record,
+        index=0,
+        source_name=SOURCE_NAME,
+    )
+    _save_image(input_path, (7, 8, 9))
+    second_condition_id = compute_offline_condition_id(
+        record,
+        index=0,
+        source_name=SOURCE_NAME,
+    )
+    second_record_id = compute_offline_record_id(
+        record,
+        index=0,
+        source_name=SOURCE_NAME,
+    )
+    _save_image(target_path, (10, 11, 12))
+    target_changed_condition_id = compute_offline_condition_id(
+        record,
+        index=0,
+        source_name=SOURCE_NAME,
+    )
+    target_changed_record_id = compute_offline_record_id(
+        record,
+        index=0,
+        source_name=SOURCE_NAME,
+    )
+
+    assert second_condition_id != first_condition_id
+    assert second_record_id != first_record_id
+    assert target_changed_condition_id == second_condition_id
+    assert target_changed_record_id != second_record_id
+
+
+@pytest.mark.parametrize("changed_arm", ("chosen", "rejected"))
+def test_preference_record_id_tracks_each_output_arm_content(
+    tmp_path: Path,
+    changed_arm: str,
+) -> None:
+    chosen_path = tmp_path / "chosen.png"
+    rejected_path = tmp_path / "rejected.png"
+    _save_image(chosen_path, (1, 2, 3))
+    _save_image(rejected_path, (4, 5, 6))
+    record = _preference_record(tmp_path, ["chosen.png"], ["rejected.png"])
+
+    first = compute_offline_record_id(record, index=0, source_name=SOURCE_NAME)
+    changed_path = chosen_path if changed_arm == "chosen" else rejected_path
+    _save_image(changed_path, (7, 8, 9))
+
+    assert compute_offline_record_id(record, index=0, source_name=SOURCE_NAME) != first
+
+
+def test_dataset_hashes_each_unique_media_path_once_per_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shared_path = tmp_path / "shared.png"
+    _save_image(shared_path, (1, 2, 3))
+    record = normalize_v2_record(
+        {
+            "schema_version": 2,
+            "input": {
+                "prompt": "shared bytes",
+                "media": [
+                    {"type": "image", "path": "shared.png"},
+                    {"type": "image", "path": "shared.png"},
+                ],
+            },
+            "supervision": {
+                "type": "demonstration",
+                "target": {
+                    "media": [
+                        {"type": "image", "path": "shared.png"},
+                        {"type": "image", "path": "shared.png"},
+                    ]
+                },
+            },
+        },
+        dataset_dir=tmp_path,
+    )
+    records = [record, record]
+    condition_cache = _condition_cache(
+        records,
+        [{"prompt_embeds": torch.ones(2)}, {"prompt_embeds": torch.zeros(2)}],
+    )
+    original_hasher = offline_dataset_module._stream_media_content_sha256
+    hashed_paths: List[str] = []
+
+    def counted_hasher(path: str) -> str:
+        hashed_paths.append(path)
+        return original_hasher(path)
+
+    monkeypatch.setattr(
+        offline_dataset_module,
+        "_stream_media_content_sha256",
+        counted_hasher,
+    )
+
+    OfflineDataset(
+        records,
+        condition_cache,
+        source_name=SOURCE_NAME,
+        source_id=SOURCE_ID,
+        supervision_type="demonstration",
+    )
+
+    assert hashed_paths == [str(shared_path)]
+
+
+def test_identity_helpers_report_unreadable_media_path(tmp_path: Path) -> None:
+    missing_input = normalize_v2_record(
+        {
+            "schema_version": 2,
+            "input": {
+                "prompt": "missing input",
+                "media": [{"type": "image", "path": "missing-input.png"}],
+            },
+            "supervision": {
+                "type": "demonstration",
+                "target": {"media": [{"type": "image", "path": "unused-target.png"}]},
+            },
+        },
+        dataset_dir=tmp_path,
+    )
+    missing_target = _demonstration_record(tmp_path, ["missing-target.png"])
+
+    with pytest.raises(OSError, match=r"hash offline media content.*missing-input\.png"):
+        compute_offline_condition_id(missing_input, index=0, source_name=SOURCE_NAME)
+    with pytest.raises(OSError, match=r"hash offline media content.*missing-target\.png"):
+        compute_offline_record_id(missing_target, index=0, source_name=SOURCE_NAME)
 
 
 def test_dataset_snapshots_plain_condition_cache_order(tmp_path: Path) -> None:
@@ -566,11 +730,13 @@ def test_demonstration_collator_stacks_conditions_and_preserves_ragged_media(
         {
             "prompt_embeds": torch.tensor([1.0, 2.0]),
             "ragged": torch.ones(1),
+            "optional_image_latents": None,
             "label": "first",
         },
         {
             "prompt_embeds": torch.tensor([3.0, 4.0]),
             "ragged": torch.ones(2),
+            "optional_image_latents": torch.ones(2, 3),
             "label": "second",
         },
     ]
@@ -594,6 +760,8 @@ def test_demonstration_collator_stacks_conditions_and_preserves_ragged_media(
         torch.Size([2]),
     ]
     assert batch.condition["label"] == ["first", "second"]
+    assert batch.condition["optional_image_latents"][0] is None
+    assert batch.condition["optional_image_latents"][1].shape == (2, 3)
     assert isinstance(batch.output, DemonstrationOutputBatch)
     assert [len(sample_media) for sample_media in batch.output.target_media] == [1, 2]
     assert [media.path for media in batch.output.target_media[1]] == [
@@ -793,6 +961,7 @@ def test_default_video_decoder_survives_spawn_worker_pickling(tmp_path: Path) ->
 
 
 def test_module_level_media_decoder_can_be_injected_explicitly(tmp_path: Path) -> None:
+    (tmp_path / "target.mp4").write_bytes(b"identity-only test payload")
     record = normalize_v2_record(
         {
             "schema_version": 2,

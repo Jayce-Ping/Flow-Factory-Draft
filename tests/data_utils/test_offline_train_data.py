@@ -26,6 +26,7 @@ from datasets import Dataset as HFDataset
 from PIL import Image
 from torch.utils.data import ConcatDataset, DistributedSampler
 
+import flow_factory.data_utils.offline_dataset as offline_dataset_module
 import flow_factory.data_utils.offline_train_data as offline_train_data
 from flow_factory.contracts import (
     BatchCapability,
@@ -224,12 +225,43 @@ def _config(
         model_args=SimpleNamespace(
             model_type="test-model",
             model_name_or_path="test/model",
+            component_load_dtypes=None,
+            frozen_parameters_dtype=None,
         ),
     )
 
 
 def _write_image(path: Path, value: int) -> None:
     Image.new("RGB", (2, 2), color=(value, value, value)).save(path)
+
+
+def test_offline_cache_fingerprint_tracks_precision_aware_model_policies(
+    tmp_path: Path,
+) -> None:
+    """Condition embeddings cannot cross component load or frozen dtype policies."""
+    baseline = _config(tmp_path, [])
+    load_override = _config(tmp_path, [])
+    load_override.model_args.component_load_dtypes = {
+        "text_encoder": torch.float16,
+        "default": None,
+    }
+    reordered_override = _config(tmp_path, [])
+    reordered_override.model_args.component_load_dtypes = {
+        "default": None,
+        "text_encoder": torch.float16,
+    }
+    frozen_override = _config(tmp_path, [])
+    frozen_override.model_args.frozen_parameters_dtype = {
+        "text_encoders": torch.bfloat16,
+        "default": None,
+    }
+
+    baseline_hash = offline_train_data._build_extra_hash_strs(baseline, None)
+    load_hash = offline_train_data._build_extra_hash_strs(load_override, None)
+
+    assert load_hash != baseline_hash
+    assert load_hash == offline_train_data._build_extra_hash_strs(reordered_override, None)
+    assert offline_train_data._build_extra_hash_strs(frozen_override, None) != baseline_hash
 
 
 def _demonstration_row(prompt: str, target_path: str, *, metadata: int = 0) -> Dict[str, Any]:
@@ -310,6 +342,43 @@ def test_builder_returns_detached_input_cache_and_decodes_target_on_demand(
     del preprocessor
     gc.collect()
     assert preprocessor_ref() is None
+
+
+def test_builder_hashes_a_shared_input_and_target_path_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Condition projection and full record identity share one build-local memo."""
+    dataset_dir = tmp_path / "shared-identity-media"
+    dataset_dir.mkdir()
+    shared_path = dataset_dir / "shared.png"
+    _write_image(shared_path, 10)
+    row = _demonstration_row("shared media", "shared.png")
+    row["input"]["media"] = [{"type": "image", "path": "shared.png"}]
+    _write_manifest(dataset_dir, [row])
+    original_hasher = offline_dataset_module._stream_media_content_sha256
+    hashed_paths: List[str] = []
+
+    def counted_hasher(path: str) -> str:
+        hashed_paths.append(path)
+        return original_hasher(path)
+
+    monkeypatch.setattr(
+        offline_dataset_module,
+        "_stream_media_content_sha256",
+        counted_hasher,
+    )
+
+    build_offline_train_dataloader(
+        _config(tmp_path, [_source("shared-media", dataset_dir, 0)]),
+        _Accelerator(),
+        _OrderedPreprocessor().preprocess,
+        supervision_type="demonstration",
+        pipeline_io_contract=_ORDERED_IMAGE_CONTRACT,
+        shuffle=False,
+    )
+
+    assert hashed_paths == [str(shared_path)]
 
 
 def test_builder_slices_each_source_and_preserves_resolved_source_identity(tmp_path: Path) -> None:

@@ -454,7 +454,7 @@ def test_builder_rejects_rank_local_empty_loader(tmp_path: Path) -> None:
         )
 
 
-def test_gradient_accumulation_tail_fails_without_padding_or_implicit_flush(
+def test_gradient_accumulation_tail_fails_without_extra_batches_or_implicit_flush(
     tmp_path: Path,
 ) -> None:
     dataset = _offline_dataset(
@@ -474,7 +474,7 @@ def test_gradient_accumulation_tail_fails_without_padding_or_implicit_flush(
         )
     message = str(exc_info.value)
     assert "yields 3 batches" in message
-    assert "do not pad" in message
+    assert "does not add batches" in message
     assert "implicitly flush" in message
 
     aligned = _build(

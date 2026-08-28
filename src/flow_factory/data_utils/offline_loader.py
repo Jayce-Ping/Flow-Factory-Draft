@@ -42,11 +42,13 @@ def build_offline_dataloader(
 ) -> DataLoader:
     """Build one finite, already-distributed offline epoch loader.
 
-    Every source participates exactly once through a :class:`ConcatDataset`.
-    Weighted replacement would make "one complete dataloader traversal" stop
-    meaning one data epoch, so all source weights must be explicitly equal to
-    one. The returned loader is not passed through any Accelerator preparation;
-    its official :class:`DistributedSampler` already owns rank sharding.
+    Every source is concatenated once through a :class:`ConcatDataset`. Weighted
+    replacement would make "one complete dataloader traversal" stop meaning one
+    data epoch, so all source weights must be explicitly equal to one. The returned
+    loader is not passed through any Accelerator preparation; its official
+    :class:`DistributedSampler` already owns rank sharding. With
+    ``sampler_drop_last=False``, PyTorch may repeat tail indices so every rank has
+    the same length; that standard sampler behavior remains part of the traversal.
 
     The execution driver, not this builder, calls ``sampler.set_epoch`` before
     each traversal.
@@ -131,8 +133,8 @@ def build_offline_dataloader(
         raise ValueError(
             f"offline dataloader yields {num_batches} batches on rank {rank}, which is not "
             f"divisible by gradient_accumulation_steps={gradient_accumulation_steps}. "
-            "Offline epochs do not pad the loader or implicitly flush a partial gradient-"
-            "accumulation window; adjust dataset size, batch_size, num_replicas, "
+            "Offline training does not add batches solely to close or implicitly flush a "
+            "partial gradient-accumulation window; adjust dataset size, batch_size, num_replicas, "
             "sampler_drop_last, batch_drop_last, or gradient_accumulation_steps explicitly."
         )
     return loader

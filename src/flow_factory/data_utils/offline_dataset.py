@@ -30,7 +30,7 @@ import os
 import pickle
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Callable, Dict, List, Literal, Mapping, Sequence, Union
+from typing import Any, Callable, Dict, List, Literal, Mapping, MutableMapping, Sequence, Union
 
 import numpy as np
 import torch
@@ -59,6 +59,7 @@ OfflineSupervisionType = Literal["demonstration", "preference"]
 MediaDecoder = Callable[[MediaAsset], Any]
 ConditionCache = Union[Dataset, Sequence[Mapping[str, Any]]]
 OFFLINE_CONDITION_ID_COLUMN = "__offline_condition_id__"
+_MEDIA_CONTENT_HASH_CHUNK_SIZE = 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +217,7 @@ class OfflineDataset(Dataset):
         source_id: int,
         supervision_type: OfflineSupervisionType,
         media_decoders: Mapping[MediaType, MediaDecoder] | None = None,
+        _media_digest_cache: MutableMapping[str, str] | None = None,
     ) -> None:
         _validate_supervision_type(supervision_type)
         if not isinstance(source_name, str) or not source_name.strip():
@@ -263,16 +265,21 @@ class OfflineDataset(Dataset):
 
         condition_ids: List[str] = []
         record_ids: List[str] = []
+        media_digest_cache: MutableMapping[str, str] = (
+            {} if _media_digest_cache is None else _media_digest_cache
+        )
         for index, record in enumerate(normalized_records):
             condition_id = compute_offline_condition_id(
                 record,
                 index=index,
                 source_name=source_name,
+                _media_digest_cache=media_digest_cache,
             )
             record_id = compute_offline_record_id(
                 record,
                 index=index,
                 source_name=source_name,
+                _media_digest_cache=media_digest_cache,
             )
             _extract_condition(
                 stable_condition_cache[index],
@@ -517,9 +524,18 @@ def compute_offline_condition_id(
     *,
     index: int,
     source_name: str,
+    _media_digest_cache: MutableMapping[str, str] | None = None,
 ) -> str:
-    """Build an input-only identity for one prompt/condition cache row."""
+    """Build an input-only identity for one prompt/condition cache row.
+
+    Media bytes are streamed into the identity. Callers building several rows may
+    supply one private path-to-digest memo so a repeated asset is read only once;
+    the ordinary standalone call remains self-contained.
+    """
     _validate_identity_inputs(record, index=index, source_name=source_name)
+    media_digest_cache: MutableMapping[str, str] = (
+        {} if _media_digest_cache is None else _media_digest_cache
+    )
     identity_payload = {
         "source_name": source_name,
         "index": index,
@@ -527,7 +543,10 @@ def compute_offline_condition_id(
         "input": {
             "prompt": record.model_input.prompt,
             "negative_prompt": record.model_input.negative_prompt,
-            "media": [_media_identity(media) for media in record.model_input.media],
+            "media": [
+                _media_identity(media, media_digest_cache=media_digest_cache)
+                for media in record.model_input.media
+            ],
         },
     }
     return _hash_identity(identity_payload)
@@ -538,24 +557,38 @@ def compute_offline_record_id(
     *,
     index: int,
     source_name: str,
+    _media_digest_cache: MutableMapping[str, str] | None = None,
 ) -> str:
-    """Build a full provenance identity including supervision and metadata."""
+    """Build a full provenance identity including supervision bytes and metadata."""
+    media_digest_cache: MutableMapping[str, str] = (
+        {} if _media_digest_cache is None else _media_digest_cache
+    )
     condition_id = compute_offline_condition_id(
         record,
         index=index,
         source_name=source_name,
+        _media_digest_cache=media_digest_cache,
     )
     supervision = record.supervision
     if isinstance(supervision, DemonstrationSupervision):
         supervision_payload: Any = {
             "type": "demonstration",
-            "target": _candidate_identity(supervision.target),
+            "target": _candidate_identity(
+                supervision.target,
+                media_digest_cache=media_digest_cache,
+            ),
         }
     elif isinstance(supervision, PreferenceSupervision):
         supervision_payload = {
             "type": "preference",
-            "chosen": _candidate_identity(supervision.chosen),
-            "rejected": _candidate_identity(supervision.rejected),
+            "chosen": _candidate_identity(
+                supervision.chosen,
+                media_digest_cache=media_digest_cache,
+            ),
+            "rejected": _candidate_identity(
+                supervision.rejected,
+                media_digest_cache=media_digest_cache,
+            ),
         }
     else:
         supervision_payload = None
@@ -595,17 +628,60 @@ def _hash_identity(identity_payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical_identity.encode("utf-8")).hexdigest()
 
 
-def _candidate_identity(candidate: NormalizedOutputCandidate) -> Dict[str, Any]:
-    return {"media": [_media_identity(media) for media in candidate.media]}
+def _candidate_identity(
+    candidate: NormalizedOutputCandidate,
+    *,
+    media_digest_cache: MutableMapping[str, str],
+) -> Dict[str, Any]:
+    return {
+        "media": [
+            _media_identity(media, media_digest_cache=media_digest_cache)
+            for media in candidate.media
+        ]
+    }
 
 
-def _media_identity(media: MediaAsset) -> Dict[str, Any]:
+def _media_identity(
+    media: MediaAsset,
+    *,
+    media_digest_cache: MutableMapping[str, str],
+) -> Dict[str, Any]:
     return {
         "type": media.type,
         "path": media.path,
         "fps": media.fps,
         "sample_rate": media.sample_rate,
+        "content_sha256": _media_content_sha256(
+            media.path,
+            media_digest_cache=media_digest_cache,
+        ),
     }
+
+
+def _media_content_sha256(
+    path: str,
+    *,
+    media_digest_cache: MutableMapping[str, str],
+) -> str:
+    """Return one memoized content digest for a normalized local media path."""
+    cached = media_digest_cache.get(path)
+    if cached is not None:
+        return cached
+    content_digest = _stream_media_content_sha256(path)
+    media_digest_cache[path] = content_digest
+    return content_digest
+
+
+def _stream_media_content_sha256(path: str) -> str:
+    """Hash one media file incrementally without decoding or retaining its bytes."""
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as media_file:
+            while chunk := media_file.read(_MEDIA_CONTENT_HASH_CHUNK_SIZE):
+                digest.update(chunk)
+    except OSError as error:
+        raise OSError(f"failed to hash offline media content at {path!r}: {error}") from error
+    return digest.hexdigest()
 
 
 def _extract_condition(

@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Strict public schema for version-two dataset records.
+"""Strict public schema for version-two supervised offline dataset records.
 
 This module owns only the JSON boundary and its model-agnostic normalized
-representation. It deliberately does not parse legacy records, decode media,
-or attach loader-owned identities such as source ids and row ids.
+representation. It deliberately does not parse legacy online-generation records,
+decode media, or attach loader-owned identities such as source ids and row ids.
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ MediaRef = Annotated[
 
 
 class InputSpec(_StrictFrozenModel):
-    """Generation conditions shared by online and offline algorithms."""
+    """Model input shared by the supervised offline algorithm families."""
 
     prompt: str
     negative_prompt: str | None = None
@@ -123,11 +123,11 @@ SupervisionSpec = Annotated[
 
 
 class DatasetRecordV2(_StrictFrozenModel):
-    """Strict V2 JSONL record for online, demonstration, or preference data."""
+    """Strict V2 JSONL record for demonstration or preference data."""
 
     schema_version: Literal[2]
     input: InputSpec
-    supervision: SupervisionSpec | None = None
+    supervision: SupervisionSpec
     metadata: Dict[str, JsonValue] = Field(default_factory=dict)
 
 
@@ -172,12 +172,12 @@ class PreferenceSupervision:
     rejected: NormalizedOutputCandidate
 
 
-NormalizedSupervision = Union[DemonstrationSupervision, PreferenceSupervision, None]
+NormalizedSupervision = Union[DemonstrationSupervision, PreferenceSupervision]
 
 
 @dataclass(frozen=True, slots=True)
 class NormalizedDatasetRecord:
-    """Immutable schema facts, excluding identities owned by a dataset loader."""
+    """Immutable supervised schema facts, excluding loader-owned identities."""
 
     model_input: NormalizedModelInput
     supervision: NormalizedSupervision
@@ -213,9 +213,7 @@ def normalize_v2_record(
     )
 
     supervision: NormalizedSupervision
-    if parsed.supervision is None:
-        supervision = None
-    elif isinstance(parsed.supervision, DemonstrationSpec):
+    if isinstance(parsed.supervision, DemonstrationSpec):
         supervision = DemonstrationSupervision(
             target=_normalize_candidate(parsed.supervision.target, dataset_dir)
         )

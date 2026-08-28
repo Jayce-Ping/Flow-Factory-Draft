@@ -21,30 +21,35 @@ from pydantic import ValidationError
 
 from flow_factory.data_utils.schema import (
     DatasetRecordV2,
+    DemonstrationSpec,
     DemonstrationSupervision,
     PreferenceSupervision,
     normalize_v2_record,
 )
 
 
-def _prompt_only_record(**overrides: Any) -> Dict[str, Any]:
+def _demonstration_record(**overrides: Any) -> Dict[str, Any]:
     record: Dict[str, Any] = {
         "schema_version": 2,
         "input": {"prompt": "A hill at sunset.", "media": []},
+        "supervision": {
+            "type": "demonstration",
+            "target": {"media": [{"type": "image", "path": "target.png"}]},
+        },
     }
     record.update(overrides)
     return record
 
 
-def test_prompt_only_boundary_is_strict_and_normalized_record_is_frozen(tmp_path: Path) -> None:
-    raw = _prompt_only_record(metadata={"z": [2, 1], "a": {"text": "月亮"}})
+def test_supervised_boundary_is_strict_and_normalized_record_is_frozen(tmp_path: Path) -> None:
+    raw = _demonstration_record(metadata={"z": [2, 1], "a": {"text": "月亮"}})
     parsed = DatasetRecordV2.model_validate(raw)
     normalized = normalize_v2_record(parsed, dataset_dir=tmp_path / "dataset")
 
-    assert parsed.supervision is None
+    assert isinstance(parsed.supervision, DemonstrationSpec)
     assert normalized.model_input.prompt == "A hill at sunset."
     assert normalized.model_input.media == ()
-    assert normalized.supervision is None
+    assert isinstance(normalized.supervision, DemonstrationSupervision)
     assert normalized.metadata_json == '{"a":{"text":"月亮"},"z":[2,1]}'
 
     with pytest.raises(ValidationError):
@@ -53,12 +58,20 @@ def test_prompt_only_boundary_is_strict_and_normalized_record_is_frozen(tmp_path
         normalized.metadata_json = "{}"
 
 
+def test_supervision_is_required_at_the_public_v2_boundary() -> None:
+    raw = _demonstration_record()
+    raw.pop("supervision")
+
+    with pytest.raises(ValidationError):
+        DatasetRecordV2.model_validate(raw)
+
+
 def test_demonstration_normalization_preserves_media_order_and_resolves_paths(
     tmp_path: Path,
 ) -> None:
     dataset_dir = tmp_path / "dataset"
     absolute_target = tmp_path / "absolute" / "target.png"
-    raw = _prompt_only_record(
+    raw = _demonstration_record(
         input={
             "prompt": "Use the references in order.",
             "negative_prompt": "blurry",
@@ -97,7 +110,7 @@ def test_demonstration_normalization_preserves_media_order_and_resolves_paths(
 
 
 def test_preference_normalization_keeps_both_arms_under_one_input(tmp_path: Path) -> None:
-    raw = _prompt_only_record(
+    raw = _demonstration_record(
         supervision={
             "type": "preference",
             "chosen": {
@@ -136,7 +149,7 @@ def test_normalization_expands_dataset_root_and_normalizes_absolute_paths(
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     absolute_with_parent = str(tmp_path / "absolute" / ".." / "target.png")
-    raw = _prompt_only_record(
+    raw = _demonstration_record(
         input={
             "prompt": "normalize paths",
             "media": [
@@ -162,7 +175,7 @@ def test_normalization_expands_dataset_root_and_normalizes_absolute_paths(
     ],
 )
 def test_v2_media_rejects_legacy_kind_and_unknown_keys(media: Dict[str, Any]) -> None:
-    raw = _prompt_only_record(input={"prompt": "strict", "media": [media]})
+    raw = _demonstration_record(input={"prompt": "strict", "media": [media]})
 
     with pytest.raises(ValidationError):
         DatasetRecordV2.model_validate(raw)
@@ -186,12 +199,12 @@ def test_v2_media_rejects_legacy_kind_and_unknown_keys(media: Dict[str, Any]) ->
 )
 def test_v2_rejects_unknown_keys_at_every_public_level(override: Dict[str, Any]) -> None:
     with pytest.raises(ValidationError):
-        DatasetRecordV2.model_validate(_prompt_only_record(**override))
+        DatasetRecordV2.model_validate(_demonstration_record(**override))
 
 
 @pytest.mark.parametrize("path", ["", "   "])
 def test_media_path_must_be_non_empty(path: str) -> None:
-    raw = _prompt_only_record(
+    raw = _demonstration_record(
         input={"prompt": "invalid path", "media": [{"type": "image", "path": path}]}
     )
 
@@ -221,14 +234,14 @@ def test_media_path_must_be_non_empty(path: str) -> None:
     ],
 )
 def test_media_rates_are_strict_positive_and_type_specific(media: Dict[str, Any]) -> None:
-    raw = _prompt_only_record(input={"prompt": "invalid rate", "media": [media]})
+    raw = _demonstration_record(input={"prompt": "invalid rate", "media": [media]})
 
     with pytest.raises(ValidationError):
         DatasetRecordV2.model_validate(raw)
 
 
 def test_video_fps_and_audio_sample_rate_are_optional_source_overrides() -> None:
-    raw = _prompt_only_record(
+    raw = _demonstration_record(
         input={
             "prompt": "source rates",
             "media": [
@@ -247,12 +260,12 @@ def test_video_fps_and_audio_sample_rate_are_optional_source_overrides() -> None
 @pytest.mark.parametrize("schema_version", [1, "2", True])
 def test_schema_version_is_strictly_integer_two(schema_version: Any) -> None:
     with pytest.raises(ValidationError):
-        DatasetRecordV2.model_validate(_prompt_only_record(schema_version=schema_version))
+        DatasetRecordV2.model_validate(_demonstration_record(schema_version=schema_version))
 
 
 @pytest.mark.parametrize("supervision_type", ["sft", "offline-dpo", "unknown"])
 def test_supervision_uses_semantic_discriminator(supervision_type: str) -> None:
-    raw = _prompt_only_record(
+    raw = _demonstration_record(
         supervision={
             "type": supervision_type,
             "target": {"media": [{"type": "image", "path": "target.png"}]},
@@ -288,11 +301,11 @@ def test_supervision_branches_cannot_be_mixed_or_incomplete(
     supervision: Dict[str, Any],
 ) -> None:
     with pytest.raises(ValidationError):
-        DatasetRecordV2.model_validate(_prompt_only_record(supervision=supervision))
+        DatasetRecordV2.model_validate(_demonstration_record(supervision=supervision))
 
 
 def test_output_candidate_requires_at_least_one_media_item() -> None:
-    raw = _prompt_only_record(supervision={"type": "demonstration", "target": {"media": []}})
+    raw = _demonstration_record(supervision={"type": "demonstration", "target": {"media": []}})
 
     with pytest.raises(ValidationError):
         DatasetRecordV2.model_validate(raw)
@@ -301,4 +314,4 @@ def test_output_candidate_requires_at_least_one_media_item() -> None:
 @pytest.mark.parametrize("bad_value", [object(), float("nan"), float("inf")])
 def test_metadata_accepts_only_finite_json_values(bad_value: Any) -> None:
     with pytest.raises(ValidationError):
-        DatasetRecordV2.model_validate(_prompt_only_record(metadata={"bad": bad_value}))
+        DatasetRecordV2.model_validate(_demonstration_record(metadata={"bad": bad_value}))
