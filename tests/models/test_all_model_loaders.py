@@ -138,7 +138,10 @@ def test_bagel_adapter_imports_with_its_optional_kernel_contract(
     flash_attn = types.ModuleType("flash_attn")
     flash_attn.__spec__ = importlib.machinery.ModuleSpec("flash_attn", loader=None)
     flash_attn.flash_attn_varlen_func = lambda *args, **kwargs: None
+    cv2 = types.ModuleType("cv2")
+    cv2.__spec__ = importlib.machinery.ModuleSpec("cv2", loader=None)
     monkeypatch.setitem(sys.modules, "flash_attn", flash_attn)
+    monkeypatch.setitem(sys.modules, "cv2", cv2)
     monkeypatch.setattr(import_utils, "is_flash_attn_available", lambda *args: True)
     monkeypatch.setattr(import_utils, "get_flash_attn_version", lambda: "test")
 

@@ -20,8 +20,10 @@ Integrates ByteDance's Bagel multimodal model into Flow-Factory.
 Supports Text-to-Image and Image(s)-to-Image generation tasks.
 """
 
-from .bagel import BagelAdapter, BagelI2ISample, BagelSample
-from .pipeline import BagelPseudoPipeline
+from __future__ import annotations
+
+from importlib import import_module
+from typing import Any
 
 __all__ = [
     "BagelAdapter",
@@ -29,3 +31,12 @@ __all__ = [
     "BagelI2ISample",
     "BagelPseudoPipeline",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Load optional-kernel Bagel classes only when callers request them."""
+    if name in {"BagelAdapter", "BagelSample", "BagelI2ISample"}:
+        return getattr(import_module(".bagel", __name__), name)
+    if name == "BagelPseudoPipeline":
+        return getattr(import_module(".pipeline", __name__), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

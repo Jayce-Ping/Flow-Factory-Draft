@@ -53,6 +53,7 @@ from __future__ import annotations
 import os
 import random
 from collections import defaultdict
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
@@ -65,6 +66,12 @@ from accelerate import Accelerator
 from PIL import Image
 from tqdm import tqdm
 
+from ...contracts import (
+    BatchCapability,
+    GeometrySource,
+    InputMediaOrder,
+    NegativePromptPolicy,
+)
 from ...hparams import Arguments
 from ...samples import I2ISample, T2ISample
 from ...scheduler import (
@@ -88,7 +95,13 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ..output_state import DecodedMediaBatch, EncodedOutputState, OutputStateCodec
+from ..pipeline_contracts import image_output_contract
 from ..runtime import ComponentRuntime, PseudoPipelineRuntime
+from ._output import (
+    BagelOutputStateCodec,
+    validate_bagel_encoded_output_geometry,
+)
 
 # Bagel's LLM attention (qwen2_navit) hard-requires flash-attn's varlen kernel,
 # imported transitively by the `.modeling` imports below. Fail fast here with
@@ -185,6 +198,14 @@ class BagelAdapter(BaseAdapter):
     # so ragged multi-reference batches serialize; they read back as PIL and are
     # re-normalized by ``_normalize_condition_images``.
     python_format_columns: ClassVar[frozenset[str]] = frozenset({"condition_images"})
+    pipeline_io_contract = image_output_contract(
+        negative_prompt=NegativePromptPolicy.UNSUPPORTED,
+        input_image_min_count=0,
+        input_image_max_count=None,
+        input_order=InputMediaOrder.WITHIN_TYPE,
+        geometry_source=GeometrySource.OUTPUT_MEDIA,
+        batch_capability=BatchCapability.UNIFORM,
+    )
 
     # Bagel is a mixture-of-transformer-experts model: the generation path uses
     # *_moe_gen experts while the understanding/ViT path is unused during RL
@@ -266,6 +287,30 @@ class BagelAdapter(BaseAdapter):
             aliases={"transformer": pipeline.transformer},
             alias_routes={"transformer": ("bagel", ("language_model",))},
         )
+
+    def build_output_state_codec(self) -> OutputStateCodec:
+        """Declare Bagel's on-the-fly stochastic target-image codec.
+
+        Returns:
+            Codec requiring the logical Bagel and VAE components at encode time.
+        """
+        return BagelOutputStateCodec(self)
+
+    def _validate_encoded_output_geometry(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Mapping[str, Any],
+        encoded: EncodedOutputState,
+    ) -> None:
+        """Verify target geometry against Bagel's output-media transform.
+
+        Args:
+            media_batch: Decoded target images validated by the shared boundary.
+            condition: Input condition paired with the targets.
+            encoded: Codec result after generic validation.
+        """
+        del condition
+        validate_bagel_encoded_output_geometry(self, media_batch, encoded)
 
     def load_scheduler(self) -> FlowMatchEulerDiscreteSDEScheduler:
         """

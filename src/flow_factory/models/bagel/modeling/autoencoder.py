@@ -10,6 +10,7 @@
 # This modified file is released under the same license.
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 from einops import rearrange
@@ -280,13 +281,37 @@ class DiagonalGaussian(nn.Module):
         self.sample = sample
         self.chunk_dim = chunk_dim
 
-    def forward(self, z: Tensor) -> Tensor:
+    def select(
+        self,
+        z: Tensor,
+        *,
+        sample: bool,
+        generator: Optional[torch.Generator] = None,
+    ) -> Tensor:
+        """Select a posterior sample or mean without changing global policy.
+
+        Args:
+            z: Encoder moments concatenating mean and log variance.
+            sample: Whether to draw from the posterior instead of using its mean.
+            generator: Optional generator used only for posterior sampling.
+
+        Returns:
+            Selected latent tensor.
+        """
         mean, logvar = torch.chunk(z, 2, dim=self.chunk_dim)
-        if self.sample:
+        if sample:
             std = torch.exp(0.5 * logvar)
-            return mean + std * torch.randn_like(mean)
-        else:
-            return mean
+            noise = torch.randn(
+                mean.shape,
+                generator=generator,
+                device=mean.device,
+                dtype=mean.dtype,
+            )
+            return mean + std * noise
+        return mean
+
+    def forward(self, z: Tensor) -> Tensor:
+        return self.select(z, sample=self.sample)
 
 
 class AutoEncoder(nn.Module):
@@ -316,8 +341,18 @@ class AutoEncoder(nn.Module):
 
     def encode(self, x: Tensor) -> Tensor:
         z = self.reg(self.encoder(x))
-        z = self.scale_factor * (z - self.shift_factor)
-        return z
+        return self.normalize_latents(z)
+
+    def normalize_latents(self, z: Tensor) -> Tensor:
+        """Apply the latent shift and scale shared by every encoder role.
+
+        Args:
+            z: Unnormalized latent tensor selected from the posterior.
+
+        Returns:
+            Latents in Bagel's denoising space.
+        """
+        return self.scale_factor * (z - self.shift_factor)
 
     def decode(self, z: Tensor) -> Tensor:
         z = z / self.scale_factor + self.shift_factor
