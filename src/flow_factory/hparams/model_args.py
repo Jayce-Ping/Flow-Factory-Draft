@@ -174,7 +174,6 @@ class ModelArguments(ArgABC):
         "z-image",
         "wan2_t2v",
         "wan2_i2v",
-        "wan2_v2v",
         "bagel",
         "sensenova",
         "ltx2_t2av",

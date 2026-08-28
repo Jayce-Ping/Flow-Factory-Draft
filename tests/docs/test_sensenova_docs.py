@@ -74,7 +74,7 @@ def test_internal_docs_distinguish_sensenova_from_bagel_packing() -> None:
     assert "rather than Bagel-style NaViT packing" in architecture
     assert "SenseNova ragged I2I is per-sample, not NaViT-packed" in conventions
     assert "SenseNovaI2ISample" in conventions
-    assert "all 15 adapters" in conventions
+    assert "all 14 adapters" in conventions
     assert "SD3.5, Z-Image, SenseNova" in conventions
 
 

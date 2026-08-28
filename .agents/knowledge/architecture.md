@@ -125,7 +125,6 @@ All four registries map string keys → lazy import paths. Resolution: registry 
 | `z-image` | `ZImageAdapter` | Text-to-Image |
 | `wan2_t2v` | `Wan2_T2V_Adapter` | Text-to-Video |
 | `wan2_i2v` | `Wan2_I2V_Adapter` | Image-to-Video |
-| `wan2_v2v` | `Wan2_V2V_Adapter` | Video-to-Video |
 | `ltx2_t2av` | `LTX2_T2AV_Adapter` | Text-to-Audio-Video |
 | `ltx2_i2av` | `LTX2_I2AV_Adapter` | Image-to-Audio-Video |
 | `bagel` | `BagelAdapter` | Text-to-Image & Image(s)-to-Image (T2I & I2I both batched via NaViT packing; subset-round packing handles variable I2I reference-image count, no per-sample fallback — see `topics/adapter_conventions.md`) |
