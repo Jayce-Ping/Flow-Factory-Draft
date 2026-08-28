@@ -48,6 +48,18 @@ def test_only_gpu_validated_multirole_examples_are_published() -> None:
     ]
     assert config["scheduler"] == {"dynamics_type": "ODE"}
 
+    bagel_tdm_path = repository_root / "examples" / "tdm" / "lora" / "bagel" / "default.yaml"
+    bagel_tdm_config = yaml.safe_load(bagel_tdm_path.read_text())
+    assert bagel_tdm_config["train"]["trainer_type"] == "tdm"
+    assert bagel_tdm_config["train"]["shuffle_samples"] is False
+    assert bagel_tdm_config["train"]["per_device_batch_size"] == 2
+    assert bagel_tdm_config["train"]["real_guidance_scale"] == 4.0
+    assert bagel_tdm_config["scheduler"]["dynamics_type"] == "ODE"
+    assert [optimizer["name"] for optimizer in bagel_tdm_config["optimizers"]] == [
+        "generator",
+        "fake",
+    ]
+
     tdm_r1_path = repository_root / "examples" / "tdm_r1" / "lora" / "sd3_5" / "ocr.yaml"
     tdm_r1_config = yaml.safe_load(tdm_r1_path.read_text())
     assert tdm_r1_config["data"]["datasets"][0]["dataset_dir"] == "dataset/ocr"

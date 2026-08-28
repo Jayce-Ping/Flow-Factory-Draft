@@ -53,10 +53,6 @@ if TYPE_CHECKING:
 
 _REPLAY_FORWARD_KEYS: tuple[str, ...] = ("guidance_scale", "stg_scale", "true_cfg_scale")
 
-UNSUPPORTED_MEDIA_FREE_PREFIX_REASONS: Mapping[str, str] = {
-    "flow_factory.models.bagel.": "inference has an unsupported media decode contract",
-}
-
 
 def validate_media_free_rollout(adapter: BaseAdapter, *, algorithm_name: str) -> None:
     """Require inference to expose the adapter media reconstruction seam.
@@ -67,13 +63,6 @@ def validate_media_free_rollout(adapter: BaseAdapter, *, algorithm_name: str) ->
     """
     adapter_type = type(adapter)
     decoder = getattr(adapter, "decode_latents", None)
-    for module_prefix, reason in UNSUPPORTED_MEDIA_FREE_PREFIX_REASONS.items():
-        if adapter_type.__module__.startswith(module_prefix):
-            raise ValueError(
-                f"{algorithm_name} media-free rollout cannot use "
-                f"adapter={adapter_type.__name__!r}: {reason}, so media reconstruction "
-                "cannot be disabled"
-            )
     if getattr(adapter_type, "decode_latents", None) is BaseAdapter.decode_latents or not callable(
         decoder
     ):
@@ -335,7 +324,11 @@ def reject_training_rewards(trainer: Any, *, algorithm_name: str) -> tuple:
     return training_models, eval_models
 
 
-def reference_forward_kwargs(training_args: Any, batch: Mapping[str, Any]) -> Dict[str, object]:
+def reference_forward_kwargs(
+    adapter: BaseAdapter,
+    training_args: Any,
+    batch: Mapping[str, Any],
+) -> Dict[str, object]:
     """Return forward arguments for the real score, the only role that may be guided.
 
     The real score defines the target distribution, so classifier-free guidance on it
@@ -345,6 +338,7 @@ def reference_forward_kwargs(training_args: Any, batch: Mapping[str, Any]) -> Di
     role on one scale, which is what these algorithms did before.
 
     Args:
+        adapter: Model adapter that maps canonical guidance to its forward API.
         training_args: Trainer configuration carrying the guidance knobs.
         batch: Collated sample batch whose keys take precedence.
 
@@ -354,7 +348,9 @@ def reference_forward_kwargs(training_args: Any, batch: Mapping[str, Any]) -> Di
     kwargs = replay_forward_kwargs(training_args, batch)
     real_guidance_scale = getattr(training_args, "real_guidance_scale", None)
     if real_guidance_scale is not None and "guidance_scale" not in batch:
-        kwargs["guidance_scale"] = real_guidance_scale
+        reference_kwargs = adapter.reference_guidance_kwargs(real_guidance_scale)
+        kwargs.pop("guidance_scale", None)
+        kwargs.update({key: value for key, value in reference_kwargs.items() if key not in batch})
     return kwargs
 
 

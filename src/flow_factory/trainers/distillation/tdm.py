@@ -374,7 +374,7 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
 
     def _reference_forward_kwargs(self, batch: StackedSampleBatch) -> Dict[str, object]:
         """Return forward arguments for the real score, which alone may be guided."""
-        return reference_forward_kwargs(self.training_args, batch)
+        return reference_forward_kwargs(self.adapter, self.training_args, batch)
 
     def _validate_media_free_rollout(self) -> None:
         """Require inference to expose a suppressible media reconstruction seam."""

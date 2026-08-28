@@ -30,7 +30,7 @@ EXAMPLES = {
     "minimax_h3_t2va": {
         "model_type": "minimax-h3-t2va",
         "target": "transformer",
-        "dataset": Path("dataset/minimax_h3_t2va"),
+        "dataset": Path("dataset/vid_prompt"),
     },
     "minimax_h3_fl2va": {
         "model_type": "minimax-h3-fl2va",
@@ -89,7 +89,6 @@ def test_examples_parse_through_production_config_and_registry(
     assert "N + 1 states and exactly N trainable transitions" in yaml_text
     assert "B=1" in yaml_text
     assert "no CFG" in yaml_text
-    assert "not been run with the 61 GB checkpoint" in yaml_text
     assert "stg_scale" not in yaml_text
     assert "modality_scale" not in yaml_text
     assert "negative_prompt" not in yaml_text

@@ -487,8 +487,12 @@ class TDMTrajectoryRuntimeMixin:
             field="primary interval_end timestep",
             boundary_index=unit.boundary_index,
         )
-        open_start = torch.nextafter(unit.interval_start, unit.interval_end)
-        open_end = torch.nextafter(unit.interval_end, unit.interval_start)
+        interval_start, interval_end = self._normalize_coordinates(
+            unit.interval_start,
+            unit.interval_end,
+        )
+        open_start = torch.nextafter(interval_start, interval_end)
+        open_end = torch.nextafter(interval_end, interval_start)
         if not bool((open_start <= open_end).all().item()):
             raise ValueError(
                 f"TDM boundary_index={unit.boundary_index} interval has no representable "
@@ -496,16 +500,16 @@ class TDMTrajectoryRuntimeMixin:
                 f"end={unit.interval_end.tolist()}"
             )
         random_fraction = torch.rand(
-            unit.interval_start.shape,
-            device=unit.interval_start.device,
-            dtype=unit.interval_start.dtype,
+            interval_start.shape,
+            device=interval_start.device,
+            dtype=interval_start.dtype,
         )
         precision = torch.finfo(random_fraction.dtype)
         random_fraction = random_fraction.clamp(
             min=precision.eps,
             max=1.0 - precision.eps,
         )
-        sampled = unit.interval_start + (unit.interval_end - unit.interval_start) * random_fraction
+        sampled = interval_start + (interval_end - interval_start) * random_fraction
         return torch.minimum(torch.maximum(sampled, open_start), open_end)
 
     def _sample_score_query_times(
@@ -652,23 +656,23 @@ class TDMTrajectoryRuntimeMixin:
         boundary_index: int,
         component: str | None = None,
     ) -> None:
-        """Require one finite real floating scheduler coordinate tensor."""
+        """Require one finite real scheduler coordinate tensor."""
         component_context = "" if component is None else f", component={component!r}"
         if not isinstance(coordinate, torch.Tensor):
             raise TypeError(
                 f"TDM {field}{component_context}, boundary_index={boundary_index} expected "
-                f"torch.Tensor floating coordinates, received {type(coordinate).__name__}: "
+                f"torch.Tensor coordinates, received {type(coordinate).__name__}: "
                 f"{coordinate!r}"
             )
-        if not coordinate.is_floating_point():
+        if coordinate.dtype == torch.bool or coordinate.is_complex():
             raise TypeError(
                 f"TDM {field}{component_context}, boundary_index={boundary_index} expected "
-                f"real floating coordinates, received dtype={coordinate.dtype}"
+                f"real numeric coordinates, received dtype={coordinate.dtype}"
             )
         if not bool(torch.isfinite(coordinate).all().item()):
             raise ValueError(
                 f"TDM {field}{component_context}, boundary_index={boundary_index} expected "
-                f"finite floating coordinates, received {coordinate}"
+                f"finite coordinates, received {coordinate}"
             )
 
     @staticmethod
@@ -676,8 +680,10 @@ class TDMTrajectoryRuntimeMixin:
         left: torch.Tensor,
         right: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Normalize two validated coordinates to one promoted dtype and device."""
+        """Normalize two validated coordinates to one real promoted dtype and device."""
         common_dtype = torch.promote_types(left.dtype, right.dtype)
+        if not common_dtype.is_floating_point:
+            common_dtype = torch.get_default_dtype()
         return (
             left.to(device=left.device, dtype=common_dtype),
             right.to(device=left.device, dtype=common_dtype),

@@ -3515,6 +3515,20 @@ class BaseAdapter(ABC):
         """
         return bridge.get_replay_callback(self, batch, step_index, field)
 
+    def reference_guidance_kwargs(self, guidance_scale: float) -> Dict[str, object]:
+        """Map the canonical distillation reference guidance onto this adapter's forward.
+
+        Adapters whose forward uses a model-specific guidance name may override this
+        method without exposing that name to trainer code.
+
+        Args:
+            guidance_scale: Guidance strength for the frozen reference score.
+
+        Returns:
+            Forward keyword arguments that apply reference-only guidance.
+        """
+        return {"guidance_scale": guidance_scale}
+
     def get_state_active_numel(self, state: LatentState) -> Mapping[str, int]:
         """Count each component's active stochastic degrees of freedom.
 

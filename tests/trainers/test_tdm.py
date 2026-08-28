@@ -815,12 +815,11 @@ def test_tdm_rejects_interval_without_representable_interior() -> None:
 @pytest.mark.parametrize(
     ("video_times", "expected_type"),
     [
-        (torch.tensor([1000, 500, 0], dtype=torch.int64), "int64"),
         (torch.tensor([True, True, False]), "bool"),
         (torch.tensor([1000 + 0j, 500 + 0j, 0 + 0j]), "complex"),
     ],
 )
-def test_tdm_rejects_nonfloating_primary_coordinates(
+def test_tdm_rejects_nonreal_primary_coordinates(
     video_times: torch.Tensor,
     expected_type: str,
 ) -> None:
@@ -828,9 +827,22 @@ def test_tdm_rejects_nonfloating_primary_coordinates(
 
     with pytest.raises(
         TypeError,
-        match=rf"stored timestep.*component='video'.*floating.*{expected_type}",
+        match=rf"stored timestep.*component='video'.*real numeric.*{expected_type}",
     ):
         trainer._build_boundary_units([_sample(video_times=video_times)])
+
+
+def test_tdm_accepts_integral_primary_coordinates() -> None:
+    trainer = _trainer()
+    video_times = torch.tensor([1000, 500, 0], dtype=torch.int64)
+
+    units = trainer._build_boundary_units([_sample(video_times=video_times)])
+    sampled = trainer._sample_perturbation_times(units[0])
+
+    assert len(units) == 2
+    assert units[0].times.timestep["video"].dtype == torch.int64
+    assert sampled.is_floating_point()
+    assert bool(((sampled < 1000) & (sampled > 500)).all())
 
 
 @pytest.mark.parametrize("bad_value", [float("nan"), float("inf")])
@@ -848,9 +860,8 @@ def test_tdm_rejects_nonfinite_primary_coordinates(bad_value: float) -> None:
 @pytest.mark.parametrize(
     ("bad_value", "error_type", "match"),
     [
-        (torch.tensor([500], dtype=torch.int64), TypeError, r"floating.*int64"),
-        (torch.tensor([True]), TypeError, r"floating.*bool"),
-        (torch.tensor([500 + 0j]), TypeError, r"floating.*complex"),
+        (torch.tensor([True]), TypeError, r"real numeric.*bool"),
+        (torch.tensor([500 + 0j]), TypeError, r"real numeric.*complex"),
         (torch.tensor([float("nan")]), ValueError, r"finite"),
         (torch.tensor([float("inf")]), ValueError, r"finite"),
     ],

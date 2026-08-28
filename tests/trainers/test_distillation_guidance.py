@@ -39,19 +39,25 @@ def _args(**overrides: object) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
+def _adapter(guidance_key: str = "guidance_scale") -> SimpleNamespace:
+    return SimpleNamespace(
+        reference_guidance_kwargs=lambda scale: {guidance_key: scale},
+    )
+
+
 def test_only_the_real_score_receives_the_guided_scale() -> None:
     training_args = _args(guidance_scale=1.0, real_guidance_scale=4.0)
     batch: dict = {}
 
     assert replay_forward_kwargs(training_args, batch)["guidance_scale"] == 1.0
-    assert reference_forward_kwargs(training_args, batch)["guidance_scale"] == 4.0
+    assert reference_forward_kwargs(_adapter(), training_args, batch)["guidance_scale"] == 4.0
 
 
 def test_leaving_the_real_scale_unset_keeps_every_role_on_one_scale() -> None:
     training_args = _args(guidance_scale=3.0)
     batch: dict = {}
 
-    assert reference_forward_kwargs(training_args, batch)["guidance_scale"] == 3.0
+    assert reference_forward_kwargs(_adapter(), training_args, batch)["guidance_scale"] == 3.0
     assert replay_forward_kwargs(training_args, batch)["guidance_scale"] == 3.0
 
 
@@ -59,7 +65,19 @@ def test_a_batch_that_carries_guidance_still_wins() -> None:
     training_args = _args(guidance_scale=1.0, real_guidance_scale=4.0)
     batch = {"guidance_scale": 2.0}
 
-    assert "guidance_scale" not in reference_forward_kwargs(training_args, batch)
+    assert "guidance_scale" not in reference_forward_kwargs(_adapter(), training_args, batch)
+
+
+def test_adapter_maps_reference_guidance_to_its_forward_name() -> None:
+    training_args = _args(
+        guidance_scale=1.0,
+        real_guidance_scale=4.0,
+        extra_kwargs={"cfg_text_scale": 1.0},
+    )
+
+    assert reference_forward_kwargs(_adapter("cfg_text_scale"), training_args, {}) == {
+        "cfg_text_scale": 4.0,
+    }
 
 
 @pytest.mark.parametrize("value", [0.5, 0.0])

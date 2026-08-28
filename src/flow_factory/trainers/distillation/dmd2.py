@@ -431,4 +431,4 @@ class DMD2Trainer(BaseTrainer):
 
     def _reference_forward_kwargs(self, batch: StackedSampleBatch) -> Dict[str, object]:
         """Return forward arguments for the real score, which alone may be guided."""
-        return reference_forward_kwargs(self.training_args, batch)
+        return reference_forward_kwargs(self.adapter, self.training_args, batch)

@@ -245,13 +245,6 @@ def test_common_shift_transforms_reject_nonfinite_shift(shift: float) -> None:
     [
         (
             {
-                "video": (torch.tensor([1000, 0]), torch.tensor([1.0, 0.0])),
-                "audio": (torch.tensor([1000.0, 0.0]), torch.tensor([1.0, 0.0])),
-            },
-            r"video.*timesteps.*floating",
-        ),
-        (
-            {
                 "video": (
                     torch.tensor([1000.0, 400.0, 0.0]),
                     torch.tensor([1.0, 0.5, 0.0]),
@@ -293,6 +286,22 @@ def test_trajectory_schedule_validation_is_complete(
             state_index_map=state_map,
             schedule=schedule,
         )
+
+
+def test_trajectory_schedule_accepts_integral_timesteps() -> None:
+    trajectories = minimax_core.build_structured_trajectories(
+        states={
+            "video": torch.zeros(1, 2, 2, 96),
+            "audio": torch.zeros(1, 2, 3, 32),
+        },
+        state_index_map=torch.tensor([0, 1]),
+        schedule={
+            "video": (torch.tensor([1000, 0]), torch.tensor([1.0, 0.0])),
+            "audio": (torch.tensor([1000, 0]), torch.tensor([1.0, 0.0])),
+        },
+    )
+
+    assert len(trajectories) == 1
 
 
 def test_trajectory_schedule_accepts_one_ulp_coordinate_rounding() -> None:

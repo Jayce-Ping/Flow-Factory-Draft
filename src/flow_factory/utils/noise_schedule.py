@@ -107,15 +107,23 @@ def validate_flow_match_coordinates(
         sigma: Flow-matching sigma coordinates in ``[0, 1]``.
 
     Raises:
-        TypeError: If either coordinate is not a floating tensor.
+        TypeError: If timestep is not a real numeric tensor or sigma is not floating.
         ValueError: If shape, device, domain, or coordinate relation is invalid.
     """
-    for field, values in (("t_scheduler", t_scheduler), ("sigma", sigma)):
-        if not isinstance(values, torch.Tensor) or not values.is_floating_point():
-            raise TypeError(
-                f"expected {identifier} {field} as floating torch.Tensor, received "
-                f"{type(values).__name__}/{getattr(values, 'dtype', None)}"
-            )
+    if (
+        not isinstance(t_scheduler, torch.Tensor)
+        or t_scheduler.dtype == torch.bool
+        or t_scheduler.is_complex()
+    ):
+        raise TypeError(
+            f"expected {identifier} t_scheduler as real numeric torch.Tensor, received "
+            f"{type(t_scheduler).__name__}/{getattr(t_scheduler, 'dtype', None)}"
+        )
+    if not isinstance(sigma, torch.Tensor) or not sigma.is_floating_point():
+        raise TypeError(
+            f"expected {identifier} sigma as floating torch.Tensor, received "
+            f"{type(sigma).__name__}/{getattr(sigma, 'dtype', None)}"
+        )
     if t_scheduler.shape != sigma.shape:
         raise ValueError(
             f"expected {identifier} shapes to match, received "

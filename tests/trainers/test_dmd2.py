@@ -441,22 +441,25 @@ def test_dmd2_suppresses_structured_h3_media_through_adapter_owned_shape() -> No
         )
 
 
-def test_dmd2_rejects_bagel_per_sample_decode_contract() -> None:
+def test_dmd2_accepts_bagel_batched_decode_contract() -> None:
     trainer = _trainer()
 
     class BagelDecodeAdapter:
         __module__ = "flow_factory.models.bagel.bagel"
+        trajectory_component_order = ("latent",)
 
-        def decode_latents(self, *args: Any, **kwargs: Any) -> Any:
-            return None
+        def decode_latents(self, latents: torch.Tensor, **kwargs: Any) -> Any:
+            del latents, kwargs
+            raise AssertionError("real Bagel decoder must remain suppressed")
 
     trainer.adapter = BagelDecodeAdapter()
 
-    with pytest.raises(
-        ValueError,
-        match=r"DMD2 media-free rollout.*BagelDecodeAdapter.*unsupported media decode contract",
-    ):
-        trainer._validate_media_free_rollout()
+    trainer._validate_media_free_rollout()
+    with trainer._without_media_decoding():
+        assert trainer.adapter.decode_latents(
+            torch.zeros(2, 16, 64),
+            image_shape=(512, 512),
+        ) == [None, None]
 
 
 def test_dmd2_optimize_runs_fake_ttur_then_one_generator() -> None:
