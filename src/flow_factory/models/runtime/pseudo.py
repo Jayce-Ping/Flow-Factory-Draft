@@ -107,6 +107,7 @@ class PseudoPipelineRuntime(ComponentRuntime):
         excluded_paths: Sequence[tuple[str, ...]],
         device: Union[torch.device, str],
     ) -> None:
+        """Move auxiliary state inside a target-owned pseudo-pipeline root."""
         component = self._canonical_components[root]
         self._move_remainder(component, tuple(excluded_paths), device)
 
@@ -117,6 +118,9 @@ class PseudoPipelineRuntime(ComponentRuntime):
         excluded_paths: tuple[tuple[str, ...], ...],
         device: Union[torch.device, str],
     ) -> None:
+        """Recursively move a module tree while leaving excluded routes untouched."""
+        if () in excluded_paths:
+            return
         for parameter in module.parameters(recurse=False):
             parameter.data = parameter.data.to(device)
         for buffer in module.buffers(recurse=False):

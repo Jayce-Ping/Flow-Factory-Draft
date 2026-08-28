@@ -175,3 +175,11 @@ def test_pseudo_runtime_does_not_move_excluded_target_submodule() -> None:
 
     assert root.language_model.moves == []
     assert root.latent_pos_embed.moves == ["cuda"]
+
+    root.latent_pos_embed.moves.clear()
+    runtime.load_root_remainder(
+        "bagel",
+        excluded_paths=[()],
+        device="cpu",
+    )
+    assert root.latent_pos_embed.moves == []

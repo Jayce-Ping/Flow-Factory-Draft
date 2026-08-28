@@ -839,8 +839,9 @@ Component membership uses canonical lookup through declared specs, not `hasattr`
 When a logical target is a submodule alias of a larger physical root, declare
 `alias_routes` explicitly, for example
 `{"transformer": ("bagel", ("language_model",))}`. The load planner then marks
-the physical root as target-owned so auxiliary lifecycle code cannot move it;
-`BaseAdapter` freezes materialized roots before reopening the logical target.
+the physical root as target-owned; auxiliary lifecycle code can move frozen
+siblings but must leave the prepared target route untouched. `BaseAdapter`
+freezes materialized roots before reopening the logical target.
 
 Adapters should leave `supports_fsdp2_cpu_efficient_loading = False` unless their
 component source can selectively materialize TARGET state without applying the

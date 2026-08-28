@@ -96,19 +96,21 @@ class ModelLoadCoordinator:
         *,
         device: Any,
     ) -> None:
-        """Materialize replicated stage components inside the backend load scope."""
+        """Load replicas and target-owned auxiliary remainders without moving targets."""
         requested = self.adapter._resolve_component_names(components)
         replicated = [
             name
             for name in requested
             if self.plan.request_for_component(name).role is not ComponentRole.TARGET
         ]
-        remainder_roots = {
-            self.plan.descriptors[name].root
-            for name in requested
-            if self.plan.request_for_component(name).role is ComponentRole.TARGET
-            and self.plan.descriptors[name].role is ComponentRole.AUXILIARY
-        }
+        remainder_roots = list(
+            dict.fromkeys(
+                self.plan.descriptors[name].root
+                for name in requested
+                if self.plan.request_for_component(name).role is ComponentRole.TARGET
+                and self.plan.descriptors[name].role is ComponentRole.AUXILIARY
+            )
+        )
         if not replicated and not remainder_roots:
             return
         with self.load_scope(ComponentRole.AUXILIARY):

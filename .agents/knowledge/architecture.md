@@ -210,9 +210,10 @@ non-`None` modular specs but exclude absent classic optional components. The def
 `transformer -> SenseNovaDenoiser`. `adapter.pipeline` remains the backend compatibility alias,
 while `ModelBundle` and `RoutedComponentProxy` remain the sole distributed preparation runtime.
 `loading/` compiles logical component names into physical ownership roots before trainer-stage
-loads. `ModelLoadCoordinator` excludes target-owned roots from auxiliary movement, and
-`BackendLoadRuntime` owns FSDP target-buffer setup, replicated-load scopes, and cached sampled
-fingerprints. Trainer methods only request component loading and distributed preparation.
+loads. `ModelLoadCoordinator` excludes prepared target routes from auxiliary movement while
+allowing frozen siblings in the same composite root to become resident. `BackendLoadRuntime`
+owns FSDP target-buffer setup, replicated-load scopes, and cached sampled fingerprints. Trainer
+methods only request component loading and distributed preparation.
 `SchedulerGroup` separately provides immutable component names and ordered scheduler mode/seed
 dispatch; its primary scheduler remains available through `adapter.scheduler`.
 

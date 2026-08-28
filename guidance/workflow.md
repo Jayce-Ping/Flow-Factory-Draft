@@ -471,12 +471,13 @@ FP32 protections are applied before the post-load policy.
 
 At runtime, `ModelLoadCoordinator` compiles logical component names into
 exactly-once physical-root requests. This matters for aliases such as Bagel's
-`transformer -> bagel.language_model`: the `bagel` root is target-owned and must
-not be moved or synchronized as an auxiliary component. Backend strategies then
-apply these role contracts:
+`transformer -> bagel.language_model`: the `bagel` root is target-owned, so the
+prepared `language_model` route must stay in place while frozen siblings such as
+the ViT and positional embeddings may be moved independently. Backend strategies
+then apply these role contracts:
 
 - TARGET-owned logical routes enter the prepared DDP/DeepSpeed/FSDP bundle;
-  their containing physical roots are excluded from auxiliary device movement.
+  auxiliary movement of a containing physical root excludes those routes.
 - AUXILIARY and REWARD resources remain full per-rank replicas. FSDP auxiliary
   roots receive a cached sampled-fingerprint check; reward loaders receive an
   isolated replicated-load scope.
