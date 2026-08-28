@@ -19,6 +19,7 @@ import logging
 import os
 from collections import defaultdict
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import torch
@@ -65,6 +66,13 @@ class ZImageSample(T2ISample):
 class ZImageAdapter(ConfiguredImageOutputAdapterMixin, BaseAdapter):
     """Adapt Z-Image for online generation and offline image targets."""
 
+    offline_training_forward_overrides = MappingProxyType(
+        {
+            "guidance_scale": 0.0,
+            "cfg_normalization": False,
+            "cfg_truncation": 1.0,
+        }
+    )
     pipeline_io_contract = image_output_contract(
         negative_prompt=NegativePromptPolicy.OPTIONAL,
     )

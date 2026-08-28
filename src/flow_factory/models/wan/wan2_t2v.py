@@ -21,6 +21,7 @@ import os
 from collections import defaultdict
 from dataclasses import dataclass
 from numbers import Real
+from types import MappingProxyType
 from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import numpy as np
@@ -58,6 +59,9 @@ class WanT2VSample(T2VSample):
 
 
 class Wan2_T2V_Adapter(BaseAdapter):
+    offline_training_forward_overrides = MappingProxyType(
+        {"guidance_scale": 1.0, "guidance_scale_2": 1.0}
+    )
     # Wan2.2 trains both transformer and transformer_2 but uses only one per
     # timestep (boundary_ratio), so under DDP the other's trainable params get no
     # gradient in a given step. Ignored under DeepSpeed/FSDP.

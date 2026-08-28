@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import numpy as np
@@ -92,6 +93,15 @@ class SenseNovaAdapter(BaseAdapter):
     declares only ``transformer`` (the ``SenseNovaDenoiser`` wrapper), with no
     standalone Flow-Factory VAE or text encoder.
     """
+
+    offline_training_forward_overrides = MappingProxyType(
+        {
+            "guidance_scale": 1.0,
+            "image_guidance_scale": 1.0,
+            "cfg_norm": "none",
+            "cfg_interval": (0.0, 1.0),
+        }
+    )
 
     # Reference images have variable spatial sizes/counts and are re-encoded at
     # rollout/replay time. Persist them through the HF Image feature as PIL.

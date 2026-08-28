@@ -19,6 +19,7 @@ import logging
 import os
 from collections import defaultdict
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import numpy as np
@@ -91,6 +92,7 @@ CONDITION_IMAGE_SIZE = (1024, 1024)
 
 
 class Flux2Adapter(ConfiguredImageOutputAdapterMixin, BaseAdapter):
+    offline_training_forward_overrides = MappingProxyType({"guidance_scale": 3.5})
     pipeline_io_contract = image_output_contract(
         negative_prompt=NegativePromptPolicy.UNSUPPORTED,
         input_image_min_count=0,
@@ -228,7 +230,7 @@ class Flux2Adapter(ConfiguredImageOutputAdapterMixin, BaseAdapter):
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
         generator: Optional[torch.Generator] = None,
-    ) -> Dict[str, Union[List[List[torch.Tensor]], List[torch.Tensor]]]:
+    ) -> Dict[str, Union[List[List[torch.Tensor]], List[Optional[torch.Tensor]]]]:
         """
         Encode input condition image(s) into latent representations using the Flux.2 image encoder.
 
@@ -246,8 +248,8 @@ class Flux2Adapter(ConfiguredImageOutputAdapterMixin, BaseAdapter):
         Returns:
             Dictionary containing:
             - condition_images: List[List[torch.Tensor(3, H, W)]]
-            - image_latents: List[torch.Tensor(1, seq_len, C)]
-            - image_latent_ids: List[torch.Tensor(1, seq_len)]
+            - image_latents: List[Optional[torch.Tensor(1, seq_len, C)]]
+            - image_latent_ids: List[Optional[torch.Tensor(1, seq_len)]]
         """
         device = device or self.pipeline.vae.device
         dtype = dtype or self.pipeline.vae.dtype
@@ -257,13 +259,24 @@ class Flux2Adapter(ConfiguredImageOutputAdapterMixin, BaseAdapter):
         images = [images] if not self._is_multi_images_batch(images) else images
 
         # Standardize each batch to PIL format
-        images = [self._standardize_image_input(imgs, output_type="pil") for imgs in images]
+        images = [
+            (
+                []
+                if isinstance(imgs, list) and not imgs
+                else self._standardize_image_input(imgs, output_type="pil")
+            )
+            for imgs in images
+        ]
 
         # Resize all condition images
         condition_image_tensors: List[List[torch.Tensor]] = [
-            self._resize_condition_images(
-                condition_images=imgs,
-                condition_image_size=condition_image_size,
+            (
+                self._resize_condition_images(
+                    condition_images=imgs,
+                    condition_image_size=condition_image_size,
+                )
+                if imgs
+                else []
             )
             for imgs in images
         ]
@@ -272,6 +285,10 @@ class Flux2Adapter(ConfiguredImageOutputAdapterMixin, BaseAdapter):
         image_latents_list = []
         image_latent_ids_list = []
         for cond_img_tensors in condition_image_tensors:
+            if not cond_img_tensors:
+                image_latents_list.append(None)
+                image_latent_ids_list.append(None)
+                continue
             image_latents, image_latent_ids = prepare_flux2_condition_latents(
                 self,
                 cond_img_tensors,
@@ -350,13 +367,17 @@ class Flux2Adapter(ConfiguredImageOutputAdapterMixin, BaseAdapter):
         return is_ragged_batch
 
     @staticmethod
-    def _is_multi_image_latents(image_latents: Union[torch.Tensor, List[torch.Tensor]]):
+    def _is_multi_image_latents(
+        image_latents: Union[torch.Tensor, List[Optional[torch.Tensor]]],
+    ):
         is_ragged_image_latents = (
             isinstance(image_latents, list)
             and len(image_latents) > 0
-            and isinstance(image_latents[0], torch.Tensor)
-            and image_latents[0].ndim == 2
-        ) or (  # List[torch.Tensor : ndim=2 (seq_len, C)]
+            and all(
+                latent is None or (isinstance(latent, torch.Tensor) and latent.ndim == 2)
+                for latent in image_latents
+            )
+        ) or (  # List[Optional[torch.Tensor : ndim=2 (seq_len, C)]]
             isinstance(image_latents, torch.Tensor) and image_latents.ndim == 3
         )  # torch.Tensor : ndim=3 (B, seq_len, C)
         return is_ragged_image_latents
@@ -460,11 +481,7 @@ class Flux2Adapter(ConfiguredImageOutputAdapterMixin, BaseAdapter):
             if isinstance(images, list) and all(
                 isinstance(img, Image.Image) or img is None for img in images
             ):
-                images = [[img] for img in images]
-
-            has_images = any(img is not None for img_list in images for img in img_list)
-        else:
-            has_images = False
+                images = [[img] if img is not None else [] for img in images]
 
         # 2: Handle caption upsampling
         if caption_upsample_temperature is not None:
@@ -488,8 +505,10 @@ class Flux2Adapter(ConfiguredImageOutputAdapterMixin, BaseAdapter):
             text_encoder_out_layers=text_encoder_out_layers,
         )
 
-        # 4: Batch encode images if present
-        if has_images:
+        # 4: Keep image outputs stable whenever the source batch has an image
+        # field. Empty rows remain explicit slots so Arrow uses one schema across
+        # prompt-only and image-conditioned preprocessing chunks.
+        if images is not None:
             image_dict = self.encode_image(
                 images=images,
                 condition_image_size=condition_image_size,
@@ -949,8 +968,8 @@ class Flux2Adapter(ConfiguredImageOutputAdapterMixin, BaseAdapter):
         prompt_embeds: torch.Tensor,
         text_ids: Union[torch.Tensor, List[torch.Tensor]],
         # Optional for I2I (can be List for ragged batches)
-        image_latents: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-        image_latent_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
+        image_latents: Optional[Union[torch.Tensor, List[Optional[torch.Tensor]]]] = None,
+        image_latent_ids: Optional[Union[torch.Tensor, List[Optional[torch.Tensor]]]] = None,
         # Next timestep info
         t_next: Optional[torch.Tensor] = None,
         next_latents: Optional[torch.Tensor] = None,

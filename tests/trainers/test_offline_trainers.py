@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, Iterator, Mapping
 
 import pytest
@@ -49,7 +49,11 @@ class _TrainingArgs(dict):
     """Small mapping/attribute hybrid used by shared forward helpers."""
 
     def __init__(self) -> None:
-        super().__init__()
+        super().__init__(
+            guidance_scale=8.0,
+            guidance_scale_2=7.0,
+            image_guidance_scale=6.0,
+        )
         self.weighting_scheme = "uniform"
         self.num_train_timesteps = 2
         self.timestep_range = (0.0, 0.99)
@@ -90,6 +94,13 @@ class _Adapter:
     """Fake one-component codec and flow model with a reference scope."""
 
     trajectory_component_order = ("latent",)
+    offline_training_forward_overrides = MappingProxyType(
+        {
+            "guidance_scale": 2.75,
+            "guidance_scale_2": 1.25,
+            "image_guidance_scale": 1.5,
+        }
+    )
 
     def __init__(self) -> None:
         self.policy_weight = torch.nn.Parameter(torch.tensor(0.7))
@@ -98,6 +109,7 @@ class _Adapter:
         self.train_calls = 0
         self.encode_calls: list[str] = []
         self.forward_events: list[tuple[float, bool, bool]] = []
+        self.forward_override_events: list[tuple[float, bool, dict[str, float]]] = []
         self.drawn_noise: list[LatentState] = []
         self.reused_noise: list[LatentState] = []
         self.ref_scope_enters = 0
@@ -195,11 +207,25 @@ class _Adapter:
         times: ComponentTimes,
         **kwargs: Any,
     ) -> MultiModalStepOutput:
-        del kwargs
         arm = batch["arm_token"]
+        resolved_kwargs = {**batch, **kwargs}
         coordinate = times.timestep["latent"].float().reshape(arm.shape[0], 1) / 1000.0
         self.forward_events.append(
             (float(arm[0].item()), self._ref_active, torch.is_grad_enabled())
+        )
+        self.forward_override_events.append(
+            (
+                float(arm[0].item()),
+                self._ref_active,
+                {
+                    key: resolved_kwargs[key]
+                    for key in (
+                        "guidance_scale",
+                        "guidance_scale_2",
+                        "image_guidance_scale",
+                    )
+                },
+            )
         )
         if self._ref_active:
             velocity = 0.2 * coordinate - 0.3 * arm
@@ -254,7 +280,12 @@ def _batch(supervision_type: str, batch_size: int = 2) -> OfflineBatch:
             rejected_media=_media("rejected", batch_size),
         )
     return OfflineBatch(
-        condition={"prompt_embeds": torch.ones(batch_size, 2)},
+        condition={
+            "prompt_embeds": torch.ones(batch_size, 2),
+            "guidance_scale": 5.0,
+            "guidance_scale_2": 4.0,
+            "image_guidance_scale": 3.0,
+        },
         condition_ids=tuple(f"condition-{index}" for index in range(batch_size)),
         record_ids=tuple(f"record-{index}" for index in range(batch_size)),
         sources=tuple("source" for _ in range(batch_size)),
@@ -372,6 +403,32 @@ def test_sft_reencodes_targets_and_preserves_optimizer_cadence(
     assert len(optimizer_windows[0]["flow_matching_loss"]) == 2
 
 
+def test_sft_adapter_overrides_win_over_batch_and_sampling_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer, adapter, _ = _trainer(SFTTrainer, [True])
+    monkeypatch.setattr(
+        sft_module,
+        "sample_offline_timesteps",
+        lambda *args, **kwargs: torch.tensor([[500.0, 500.0]]),
+    )
+
+    trainer.optimize_batch(_batch("demonstration"))
+
+    assert trainer.training_args["guidance_scale"] == 8.0
+    assert adapter.forward_override_events == [
+        (
+            0.0,
+            False,
+            {
+                "guidance_scale": 2.75,
+                "guidance_scale_2": 1.25,
+                "image_guidance_scale": 1.5,
+            },
+        )
+    ]
+
+
 def test_offline_dpo_shares_schedule_noise_and_reference_scope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -400,6 +457,32 @@ def test_offline_dpo_shares_schedule_noise_and_reference_scope(
     assert len(reference_events) == len(policy_events) == 4
     assert all(not grad_enabled for _, _, grad_enabled in reference_events)
     assert all(grad_enabled for _, _, grad_enabled in policy_events)
+
+
+def test_offline_dpo_uses_one_adapter_override_mapping_for_policy_and_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer, adapter, _ = _trainer(OfflineDPOTrainer, [True])
+    monkeypatch.setattr(
+        offline_dpo_module,
+        "sample_offline_timesteps",
+        lambda *args, **kwargs: torch.tensor([[500.0, 500.0]]),
+    )
+
+    trainer.optimize_batch(_batch("preference"))
+
+    assert trainer.training_args["guidance_scale"] == 8.0
+    expected = {
+        "guidance_scale": 2.75,
+        "guidance_scale_2": 1.25,
+        "image_guidance_scale": 1.5,
+    }
+    assert adapter.forward_override_events == [
+        (0.0, False, expected),
+        (1.0, False, expected),
+        (0.0, True, expected),
+        (1.0, True, expected),
+    ]
 
 
 def test_offline_trainers_reject_the_other_supervision_branch() -> None:

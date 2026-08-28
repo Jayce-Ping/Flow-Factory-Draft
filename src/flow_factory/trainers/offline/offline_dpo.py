@@ -101,6 +101,7 @@ class OfflineDPOTrainer(BaseTrainer):
                         chosen_noised.state,
                         chosen_times,
                         source="offline DPO policy chosen",
+                        **self.adapter.offline_training_forward_overrides,
                     )
                     policy_rejected = forward_velocity_state(
                         self,
@@ -108,6 +109,7 @@ class OfflineDPOTrainer(BaseTrainer):
                         rejected_noised.state,
                         rejected_times,
                         source="offline DPO policy rejected",
+                        **self.adapter.offline_training_forward_overrides,
                     )
 
                 # A full-parameter snapshot is installed once for both arms.
@@ -119,6 +121,7 @@ class OfflineDPOTrainer(BaseTrainer):
                         chosen_noised.state,
                         chosen_times,
                         source="offline DPO reference chosen",
+                        **self.adapter.offline_training_forward_overrides,
                     )
                     reference_rejected = forward_velocity_state(
                         self,
@@ -126,6 +129,7 @@ class OfflineDPOTrainer(BaseTrainer):
                         rejected_noised.state,
                         rejected_times,
                         source="offline DPO reference rejected",
+                        **self.adapter.offline_training_forward_overrides,
                     )
 
                 policy_chosen_loss = flow_matching_per_sample_loss(

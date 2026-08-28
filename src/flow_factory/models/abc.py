@@ -24,6 +24,7 @@ import re
 from abc import ABC, abstractmethod
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, fields
+from types import MappingProxyType
 from typing import (
     Any,
     ClassVar,
@@ -237,6 +238,14 @@ class BaseAdapter(ABC):
     # while online algorithms may continue to construct and use the adapter.
     output_state_codec_unavailable_reason: ClassVar[Optional[str]] = None
     flow_velocity_direction: ClassVar[Literal["noise", "data"]] = "noise"
+    # Model conditioning for finite-data velocity matching. These arguments are
+    # deliberately independent of sampling configuration and take precedence over
+    # both training arguments and dataset conditions. Conventional CFG adapters
+    # inherit the neutral scale; adapters with learned guidance embeddings or
+    # additional CFG branches replace the complete immutable mapping.
+    offline_training_forward_overrides: ClassVar[Mapping[str, Any]] = MappingProxyType(
+        {"guidance_scale": 1.0}
+    )
 
     # Resolution-invariant latent axis roles for the model-agnostic latent state
     # API (see `latent_geometry.py`). ``None`` means "infer from latent ndim" via

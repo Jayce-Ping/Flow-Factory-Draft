@@ -56,6 +56,7 @@ from collections import defaultdict
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
@@ -192,6 +193,16 @@ class BagelAdapter(BaseAdapter):
       3. Denoising operates on packed latent sequences with position-aware indexing.
       4. CFG uses separate pre-computed KV caches for text-only and image-only conditions.
     """
+
+    offline_training_forward_overrides = MappingProxyType(
+        {
+            "cfg_text_scale": 1.0,
+            "cfg_img_scale": 1.0,
+            "cfg_interval": (0.0, 1.0),
+            "cfg_renorm_min": 0.0,
+            "cfg_renorm_type": "global",
+        }
+    )
 
     # Bagel stores raw, variable-size condition images (no fixed resize) and
     # re-encodes them at rollout/training. Persist them via the HF Image feature
@@ -475,7 +486,10 @@ class BagelAdapter(BaseAdapter):
             images = [[img] for img in images]
 
         # Convert to RGB
-        processed = [standardize_image_batch(img_list, output_type="pt") for img_list in images]
+        processed = [
+            standardize_image_batch(img_list, output_type="pt") if img_list else []
+            for img_list in images
+        ]
         return {"condition_images": processed}
 
     def encode_video(self, videos: Any) -> None:

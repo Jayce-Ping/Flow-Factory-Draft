@@ -19,6 +19,7 @@ import logging
 import os
 from collections import defaultdict
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import numpy as np
@@ -133,6 +134,7 @@ def adjust_image_dimension(
 class Flux1KontextAdapter(ConfiguredImageOutputAdapterMixin, BaseAdapter):
     """Concrete implementation for Flow Matching models (FLUX.1)."""
 
+    offline_training_forward_overrides = MappingProxyType({"guidance_scale": 3.5})
     pipeline_io_contract = image_output_contract(
         negative_prompt=NegativePromptPolicy.UNSUPPORTED,
         input_image_min_count=1,
@@ -220,13 +222,12 @@ class Flux1KontextAdapter(ConfiguredImageOutputAdapterMixin, BaseAdapter):
         if isinstance(images, Image.Image):
             images = [images]
         elif is_multi_image_batch(images):
-            images = [batch[0] for batch in images]
-            # A list of list of images
             if not self._has_warned_multi_image and any(len(batch) > 1 for batch in images):
                 self._has_warned_multi_image = True
                 logger.warning(
                     "Multiple condition images are not supported for Flux1-Kontext-dev. Only the first image of each batch will be used."
                 )
+            images = [batch[0] for batch in images]
 
         images = standardize_image_batch(
             images,

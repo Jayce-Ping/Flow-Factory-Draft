@@ -19,6 +19,7 @@ import logging
 import os
 from collections import defaultdict
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import numpy as np
@@ -70,6 +71,7 @@ class Flux1Sample(T2ISample):
 class Flux1Adapter(ConfiguredImageOutputAdapterMixin, BaseAdapter):
     """Concrete implementation for Flow Matching models (FLUX.1)."""
 
+    offline_training_forward_overrides = MappingProxyType({"guidance_scale": 3.5})
     pipeline_io_contract = image_output_contract(
         negative_prompt=NegativePromptPolicy.UNSUPPORTED,
     )

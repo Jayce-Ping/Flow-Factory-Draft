@@ -93,6 +93,7 @@ class SFTTrainer(BaseTrainer):
                         noised.state,
                         times,
                         source="SFT policy",
+                        **self.adapter.offline_training_forward_overrides,
                     )
                 time_losses.append(
                     flow_matching_per_sample_loss(

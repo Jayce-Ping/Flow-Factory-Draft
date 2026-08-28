@@ -327,7 +327,14 @@ def is_multi_image_batch(image_batches: Any) -> bool:
     ):  # If None, here will return False
         return False
 
-    return all(is_image_batch(batch) for batch in image_batches)
+    # Dataset preprocessing represents an absent optional condition as an
+    # empty per-sample list. It is still part of a MultiImageBatch when sibling
+    # samples contain images (or when an all-empty preprocessing shard belongs
+    # to a dataset that contains images elsewhere).
+    return all(
+        (isinstance(batch, list) and len(batch) == 0) or is_image_batch(batch)
+        for batch in image_batches
+    )
 
 
 # ----------------------------------- Normalization --------------------------------------

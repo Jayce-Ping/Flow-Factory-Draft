@@ -366,6 +366,19 @@ def test_kontext_condition_encoding_uses_explicit_posterior_argmax() -> None:
     assert torch.equal(condition["image_ids"][..., 0], torch.ones(2, 4))
 
 
+def test_kontext_flattens_one_condition_image_per_offline_sample() -> None:
+    """GeneralDataset's nested single-image batch remains valid for Kontext."""
+    adapter = object.__new__(Flux1KontextAdapter)
+    adapter._has_warned_multi_image = False
+    first = Image.new("RGB", (WIDTH, HEIGHT), color="red")
+    second = Image.new("RGB", (WIDTH, HEIGHT), color="blue")
+
+    standardized = adapter._standardize_image_input([[first], [second]], output_type="pil")
+
+    assert standardized == [first, second]
+    assert adapter._has_warned_multi_image is False
+
+
 def test_z_image_keeps_precision_aware_transformer_loading() -> None:
     """Offline codec support does not weaken the precision branch's model contract."""
     assert ZImageAdapter.component_load_dtype_defaults == {"transformer": torch.float32}

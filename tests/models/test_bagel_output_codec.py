@@ -241,6 +241,35 @@ def test_bagel_pipeline_contract_covers_t2i_and_ordered_multi_image_i2i(
     assert tuple(item.type for item in contract.output_media.items) == (MediaType.IMAGE,)
 
 
+def test_bagel_offline_training_disables_both_cfg_branches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter_cls = _load_bagel_adapter(monkeypatch)
+
+    assert dict(adapter_cls.offline_training_forward_overrides) == {
+        "cfg_text_scale": 1.0,
+        "cfg_img_scale": 1.0,
+        "cfg_interval": (0.0, 1.0),
+        "cfg_renorm_min": 0.0,
+        "cfg_renorm_type": "global",
+    }
+
+
+def test_bagel_condition_encoding_preserves_mixed_t2i_i2i_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty optional-image slot remains aligned with its prompt row."""
+    adapter_cls = _load_bagel_adapter(monkeypatch)
+    adapter = object.__new__(adapter_cls)
+    image = Image.new("RGB", (8, 8))
+
+    encoded = adapter.encode_image([[], [image]])
+
+    assert encoded["condition_images"][0] == []
+    assert len(encoded["condition_images"][1]) == 1
+    assert encoded["condition_images"][1][0].shape == (3, 8, 8)
+
+
 def test_bagel_codec_declaration_is_logical_and_does_not_touch_components(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

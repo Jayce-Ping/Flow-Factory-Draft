@@ -38,6 +38,7 @@ from flow_factory.models.flux.flux2_klein import Flux2KleinAdapter
 from flow_factory.models.qwen_image._output import encode_qwen_vae_image
 from flow_factory.models.qwen_image.qwen_image import QwenImageAdapter
 from flow_factory.models.qwen_image.qwen_image_edit_plus import QwenImageEditPlusAdapter
+from flow_factory.utils.image import is_multi_image_batch
 
 
 @dataclass(frozen=True)
@@ -277,6 +278,63 @@ def test_flux2_condition_transform_matches_pinned_diffusers() -> None:
 
     assert torch.equal(actual, expected)
     assert actual_vae.posteriors[0].mode_calls == 1
+
+
+@pytest.mark.parametrize("adapter_cls", [Flux2Adapter, Flux2KleinAdapter])
+def test_flux2_condition_encoding_preserves_mixed_t2i_i2i_slots(
+    adapter_cls: type,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Optional condition images use None latents without shifting batch rows."""
+    adapter = object.__new__(adapter_cls)
+    adapter.pipeline = SimpleNamespace(
+        vae=SimpleNamespace(device=torch.device("cpu"), dtype=torch.float32),
+        image_processor=SimpleNamespace(postprocess=lambda image, output_type: [image.squeeze(0)]),
+    )
+    adapter._standardize_image_input = lambda images, output_type: images
+    adapter._resize_condition_images = lambda condition_images, condition_image_size: [
+        torch.ones(1, 3, 2, 2)
+    ]
+    module = __import__(adapter_cls.__module__, fromlist=["prepare_flux2_condition_latents"])
+    monkeypatch.setattr(
+        module,
+        "prepare_flux2_condition_latents",
+        lambda *args, **kwargs: (torch.ones(1, 4, 2), torch.zeros(1, 4, 4)),
+    )
+    image = Image.new("RGB", (8, 8))
+
+    encoded = adapter.encode_image([[], [image]])
+
+    assert is_multi_image_batch([[], [image]])
+    assert encoded["condition_images"][0] == []
+    assert encoded["image_latents"][0] is None
+    assert encoded["image_latent_ids"][0] is None
+    assert encoded["image_latents"][1].shape == (4, 2)
+    assert encoded["image_latent_ids"][1].shape == (4, 4)
+
+
+@pytest.mark.parametrize("adapter_cls", [Flux2Adapter, Flux2KleinAdapter])
+def test_flux2_preprocess_keeps_optional_image_columns_for_empty_chunk(adapter_cls: type) -> None:
+    """Source-column presence fixes the cache schema even for an all-empty chunk."""
+    adapter = object.__new__(adapter_cls)
+    adapter.encode_prompt = lambda prompt, **kwargs: {"prompt_embeds": torch.ones(len(prompt), 2)}
+    adapter.encode_image = lambda images, **kwargs: {
+        "condition_images": [[] for _ in images],
+        "image_latents": [None for _ in images],
+        "image_latent_ids": [None for _ in images],
+    }
+
+    encoded = adapter.preprocess_func(prompt=["first", "second"], images=[[], []])
+
+    assert set(encoded) == {
+        "prompt_embeds",
+        "condition_images",
+        "image_latents",
+        "image_latent_ids",
+    }
+    assert encoded["condition_images"] == [[], []]
+    assert encoded["image_latents"] == [None, None]
+    assert encoded["image_latent_ids"] == [None, None]
 
 
 def test_qwen_target_codec_samples_five_dimensional_latents() -> None:
