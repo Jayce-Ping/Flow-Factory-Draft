@@ -45,6 +45,7 @@ from .distillation_runtime import (
     reference_forward_kwargs,
     reject_training_rewards,
     replay_forward_kwargs,
+    resolve_rollout_accumulation_steps,
     require_velocity,
     role_repeat_progress,
     run_distillation_training_step,
@@ -124,7 +125,7 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
         return reject_training_rewards(self, algorithm_name="TDM")
 
     def _run_training_step(self) -> None:
-        """Run GAS distinct trajectory rollouts and one fake/generator phase pair.
+        """Run timestep-aligned trajectory rollouts and one fake/generator phase pair.
 
         Overriding only this keeps the shared epoch loop, so checkpointing and
         eval-time reward monitoring behave exactly as they do for every other
@@ -151,53 +152,58 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
         del samples
 
     def optimize(self, samples: Sequence[Any]) -> None:
-        """Run fake TTUR updates, then one generator step, over GAS replay batches."""
+        """Run fake TTUR updates, then one generator step, over all boundaries."""
         if not samples:
             return
+        rollout_accumulation_steps = resolve_rollout_accumulation_steps(
+            self.training_args,
+        )
         microbatches = as_role_microbatches(
             samples,
             batch_size=self.training_args.per_device_batch_size,
-            accumulation_steps=self.training_args.gradient_accumulation_steps,
+            accumulation_steps=rollout_accumulation_steps,
             algorithm_name="TDM",
         )
+        boundary_units = self._flatten_boundary_units(microbatches)
         self.adapter.train()
         for _ in role_repeat_progress(
             self, role_name="fake", repeats=self.training_args.ttur_fake_updates
         ):
-            self._fake_phase(microbatches)
-        self._generator_phase(microbatches)
+            self._fake_phase(boundary_units)
+        self._generator_phase(boundary_units)
 
-    def _mean_boundary_loss(
+    def _flatten_boundary_units(
         self,
-        units: Sequence[TDMBoundaryUnit],
-        loss_fn,
-    ) -> torch.Tensor:
-        """Average one complete ordered boundary window into a single scalar."""
-        losses = [loss_fn(unit) for unit in units]
-        return torch.stack(losses).mean()
+        microbatches: Sequence[Sequence[BaseSample]],
+    ) -> List[TDMBoundaryUnit]:
+        """Flatten rollout-major boundaries into backend auto-GAS work items."""
+        units = [
+            unit for microbatch in microbatches for unit in self._build_boundary_units(microbatch)
+        ]
+        expected = self.training_args.gradient_accumulation_steps
+        if len(units) != expected:
+            raise RuntimeError(
+                f"TDM expected {expected} boundary work items from "
+                f"{len(microbatches)} rollout batches, received {len(units)}"
+            )
+        return units
 
-    def _fake_phase(self, microbatches: Sequence[Sequence[BaseSample]]) -> None:
-        """Fit the fake score over one complete ordered boundary window per microbatch."""
+    def _fake_phase(self, boundary_units: Sequence[TDMBoundaryUnit]) -> None:
+        """Fit the fake score over timestep-aligned boundary work items."""
         run_role_phase(
             self,
             "fake",
-            microbatches,
-            lambda batch: self._mean_boundary_loss(
-                self._build_boundary_units(batch),
-                self._fake_boundary_loss,
-            ),
+            boundary_units,
+            self._fake_boundary_loss,
         )
 
-    def _generator_phase(self, microbatches: Sequence[Sequence[BaseSample]]) -> None:
-        """Update the generator over the identical ordered boundary window per microbatch."""
+    def _generator_phase(self, boundary_units: Sequence[TDMBoundaryUnit]) -> None:
+        """Update the generator over the identical ordered boundary work items."""
         run_role_phase(
             self,
             "generator",
-            microbatches,
-            lambda batch: self._mean_boundary_loss(
-                self._build_boundary_units(batch),
-                self._generator_boundary_loss,
-            ),
+            boundary_units,
+            self._generator_boundary_loss,
         )
 
     def _fake_boundary_loss(self, unit: TDMBoundaryUnit) -> torch.Tensor:

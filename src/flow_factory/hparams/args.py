@@ -251,6 +251,15 @@ class Arguments(ArgABC):
                 "as an int; "
                 f"received gradient_accumulation_steps={accumulation_steps!r}"
             )
+        if (
+            isinstance(training_args, TDMTrainingArguments)
+            and accumulation_steps % training_args.num_inference_steps
+        ):
+            raise ValueError(
+                f"{training_args.trainer_type} requires gradient_accumulation_steps to "
+                f"be divisible by num_inference_steps={training_args.num_inference_steps}; "
+                f"received gradient_accumulation_steps={accumulation_steps}"
+            )
 
     def _validate_distillation_manual_geometry(self) -> None:
         """Reject distillation configs that do not tile, without auto-aligning them."""
@@ -1149,7 +1158,10 @@ class Arguments(ArgABC):
         value is treated as final.
         """
         if not self.training_args._manual_gradient_accumulation_steps:
-            if isinstance(self.training_args, DMD2TrainingArguments):
+            if isinstance(self.training_args, DMD2TrainingArguments) and not isinstance(
+                self.training_args,
+                TDMTrainingArguments,
+            ):
                 self.training_args.gradient_accumulation_steps = 1
             else:
                 num_train_timesteps = self.training_args.get_num_train_timesteps(self)

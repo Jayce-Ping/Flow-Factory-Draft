@@ -94,7 +94,7 @@ def test_multirole_defaults_and_frozen_reference_only_surface() -> None:
     assert tdm.gradient_step_per_epoch == 1
     assert tdm.use_huber is True
     assert tdm.num_inference_steps == 4
-    assert tdm.get_num_train_timesteps(None) == 1
+    assert tdm.get_num_train_timesteps(None) == 4
     assert tdm.replay_rtol == 1e-4
     assert tdm.replay_atol == 1e-4
 
@@ -279,7 +279,7 @@ def test_tdm_variants_accept_ttur_fake_updates(
     assert _parse_train(trainer_type, **kwargs).training_args.ttur_fake_updates == 2
 
 
-def test_dmd2_and_tdm_r1_auto_gas_stay_one() -> None:
+def test_dmd2_stays_one_while_tdm_r1_auto_gas_counts_boundaries() -> None:
     automatic = _parse_train("dmd2").training_args
     tdm_r1 = _parse_train(
         "tdm-r1",
@@ -289,10 +289,11 @@ def test_dmd2_and_tdm_r1_auto_gas_stay_one() -> None:
 
     assert automatic.num_batches_per_epoch == 8
     assert automatic.gradient_accumulation_steps == 1
-    assert tdm_r1.gradient_accumulation_steps == 1
+    assert tdm_r1.num_batches_per_epoch == 8
+    assert tdm_r1.gradient_accumulation_steps == 32
 
 
-@pytest.mark.parametrize("manual_gas", [2, 63, 64, 65, 128])
+@pytest.mark.parametrize("manual_gas", [4, 64, 128])
 def test_tdm_r1_accepts_manual_gas(
     manual_gas: int,
 ) -> None:
@@ -307,6 +308,24 @@ def test_tdm_r1_accepts_manual_gas(
 
     assert training_args.gradient_accumulation_steps == manual_gas
     assert training_args._manual_gradient_accumulation_steps is True
+
+
+@pytest.mark.parametrize("manual_gas", [2, 63, 65])
+def test_tdm_r1_rejects_manual_gas_not_divisible_by_boundaries(
+    manual_gas: int,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"gradient_accumulation_steps.*divisible.*num_inference_steps=4",
+    ):
+        _parse_train(
+            "tdm-r1",
+            train_overrides={
+                "group_size": 2,
+                "gradient_accumulation_steps": manual_gas,
+            },
+            rewards=[{"name": "score", "reward_model": "clip"}],
+        )
 
 
 def test_dmd2_default_geometry_resolves_one_batch_per_outer_iteration() -> None:

@@ -33,6 +33,7 @@ from .distillation_runtime import (
     generate_one_rollout_batch,
     query_score_velocity,
     record_distillation_metric,
+    resolve_rollout_accumulation_steps,
     require_velocity,
     role_repeat_progress,
     run_role_phase,
@@ -111,31 +112,32 @@ class TDMR1Trainer(TDMTrainer):
         """Run fake TTUR, one surrogate step, then one generator step."""
         if not samples:
             return
+        rollout_accumulation_steps = resolve_rollout_accumulation_steps(
+            self.training_args,
+        )
         microbatches = as_role_microbatches(
             samples,
             batch_size=self.training_args.per_device_batch_size,
-            accumulation_steps=self.training_args.gradient_accumulation_steps,
+            accumulation_steps=rollout_accumulation_steps,
             algorithm_name="TDM-R1",
         )
+        boundary_units = self._flatten_boundary_units(microbatches)
         self.adapter.train()
         for _ in role_repeat_progress(
             self, role_name="fake", repeats=self.training_args.ttur_fake_updates
         ):
-            self._fake_phase(microbatches)
-        self._surrogate_phase(microbatches)
-        self._generator_phase(microbatches)
+            self._fake_phase(boundary_units)
+        self._surrogate_phase(boundary_units)
+        self._generator_phase(boundary_units)
 
-    def _surrogate_phase(self, microbatches: Sequence[Sequence[BaseSample]]) -> None:
+    def _surrogate_phase(self, boundary_units: Sequence[TDMBoundaryUnit]) -> None:
         """Update the surrogate with group preference on endpoint advantages."""
         self._ensure_slow_surrogate()
         run_role_phase(
             self,
             "surrogate",
-            microbatches,
-            lambda batch: self._mean_boundary_loss(
-                self._build_boundary_units(batch),
-                self._surrogate_boundary_loss,
-            ),
+            boundary_units,
+            self._surrogate_boundary_loss,
         )
         # Increase snapshot lag gradually so the trust-region clip strengthens over time.
         decay = min(

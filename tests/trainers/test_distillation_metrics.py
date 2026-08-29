@@ -171,7 +171,11 @@ def test_an_epoch_logs_what_its_roles_recorded() -> None:
 
     trainer = SimpleNamespace(
         accelerator=SingleRankAccelerator(),
-        training_args=SimpleNamespace(gradient_accumulation_steps=2),
+        training_args=SimpleNamespace(
+            gradient_accumulation_steps=2,
+            get_num_train_timesteps=lambda config: 1,
+        ),
+        config=SimpleNamespace(),
         epoch=3,
         step=11,
         show_progress_bar=False,
@@ -185,6 +189,33 @@ def test_an_epoch_logs_what_its_roles_recorded() -> None:
     run_distillation_training_step(trainer)
 
     assert logged == [({"train/generator_loss": 7.0}, 11)]
+
+
+def test_timestep_aligned_gas_samples_only_its_rollout_factor() -> None:
+    sampled: list[str] = []
+    optimized: list[list[list[str]]] = []
+    trainer = SimpleNamespace(
+        accelerator=SingleRankAccelerator(),
+        training_args=SimpleNamespace(
+            gradient_accumulation_steps=8,
+            get_num_train_timesteps=lambda config: 4,
+        ),
+        config=SimpleNamespace(),
+        reward_buffer=None,
+        epoch=0,
+        step=0,
+        show_progress_bar=False,
+        sampling_context=_null_context,
+        sample=lambda: sampled.append("sample") or ["sample"],
+        prepare_feedback=lambda samples: None,
+        optimize=lambda microbatches: optimized.append(microbatches),
+        log_data=lambda data, step: None,
+    )
+
+    run_distillation_training_step(trainer)
+
+    assert sampled == ["sample", "sample"]
+    assert optimized == [[["sample"], ["sample"]]]
 
 
 def test_role_variant_stays_active_through_backward_recomputation() -> None:
@@ -238,14 +269,61 @@ def test_role_variant_stays_active_through_backward_recomputation() -> None:
     assert adapter.active == "generator"
 
 
-def test_each_rollout_scores_only_the_batch_it_just_generated() -> None:
-    """A buffer carried between iterations mismatches reward and sample counts.
+def test_timestep_work_items_match_explicit_mean_gradient() -> None:
+    events: list[tuple[str, float]] = []
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    reference = torch.nn.Parameter(torch.tensor(1.0))
 
-    The reward processor packs rewards beside per-sample ids before gathering, so a
-    stale batch in the buffer surfaces as a shape error deep in the advantage code
-    rather than anywhere near the rollout that caused it.
-    """
+    class Adapter:
+        @contextmanager
+        def use_component_variant(self, role_name: str) -> Iterator[None]:
+            del role_name
+            yield
 
+    class Coordinator:
+        roles = {"fake": SimpleNamespace(last_grad_norm=None)}
+
+        @contextmanager
+        def phase(self, role_name: str) -> Iterator[None]:
+            del role_name
+            yield
+
+        @contextmanager
+        def microbatch(self) -> Iterator[None]:
+            yield
+
+        def backward(self, loss: torch.Tensor) -> None:
+            events.append(("backward", float(loss.detach())))
+            (loss / 3).backward()
+
+    def boundary_loss(coefficient: float) -> torch.Tensor:
+        events.append(("forward", coefficient))
+        return parameter * coefficient
+
+    trainer = SimpleNamespace(
+        adapter=Adapter(),
+        role_optimization=Coordinator(),
+        epoch=0,
+        show_progress_bar=False,
+        _finish_role_microbatch=lambda: None,
+    )
+
+    run_role_phase(trainer, "fake", [1.0, 2.0, 3.0], boundary_loss)
+    torch.stack([reference * value for value in (1.0, 2.0, 3.0)]).mean().backward()
+
+    assert events == [
+        ("forward", 1.0),
+        ("backward", 1.0),
+        ("forward", 2.0),
+        ("backward", 2.0),
+        ("forward", 3.0),
+        ("backward", 3.0),
+    ]
+    assert parameter.grad is not None
+    torch.testing.assert_close(parameter.grad, reference.grad)
+
+
+def test_timestep_aligned_rollouts_finalize_one_shared_feedback_window() -> None:
     class RecordingBuffer:
         def __init__(self) -> None:
             self.samples: list = []
@@ -259,21 +337,43 @@ def test_each_rollout_scores_only_the_batch_it_just_generated() -> None:
             self.samples.extend(samples)
 
     buffer = RecordingBuffer()
+    feedback: list[tuple[list, list]] = []
     trainer = SimpleNamespace(
         dataloader=[["prompt"]],
         adapter=SimpleNamespace(rollout=lambda: None),
+        accelerator=SingleRankAccelerator(),
+        training_args=SimpleNamespace(
+            gradient_accumulation_steps=2,
+            get_num_train_timesteps=lambda config: 1,
+        ),
+        config=SimpleNamespace(),
+        reward_buffer=buffer,
+        epoch=0,
+        step=0,
+        show_progress_bar=False,
+        sampling_context=_null_context,
         _rollout_acceleration=_null_context,
         autocast=_null_context,
         sample_batch=lambda batch, **kwargs: (
             kwargs["reward_buffer"].add_samples(["sample"]) or ["sample"]
         ),
+        prepare_feedback=lambda samples: feedback.append((list(samples), list(buffer.samples))),
+        optimize=lambda microbatches: None,
+        log_data=lambda data, step: None,
+    )
+    trainer.sample = lambda: generate_one_rollout_batch(
+        trainer,
+        reward_buffer=buffer,
+        algorithm_name="TDM-R1",
     )
 
-    for _ in range(2):
-        generate_one_rollout_batch(trainer, reward_buffer=buffer, algorithm_name="TDM-R1")
+    run_distillation_training_step(trainer)
 
-    assert buffer.clears == 2
-    assert buffer.samples == ["sample"]
+    assert buffer.clears == 1
+    assert buffer.samples == ["sample", "sample"]
+    assert feedback == [
+        (["sample", "sample"], ["sample", "sample"]),
+    ]
 
 
 def test_an_epoch_that_records_nothing_logs_nothing() -> None:
@@ -281,7 +381,11 @@ def test_an_epoch_that_records_nothing_logs_nothing() -> None:
     logged: list = []
     trainer = SimpleNamespace(
         accelerator=SingleRankAccelerator(),
-        training_args=SimpleNamespace(gradient_accumulation_steps=1),
+        training_args=SimpleNamespace(
+            gradient_accumulation_steps=1,
+            get_num_train_timesteps=lambda config: 1,
+        ),
+        config=SimpleNamespace(),
         epoch=0,
         step=0,
         show_progress_bar=False,

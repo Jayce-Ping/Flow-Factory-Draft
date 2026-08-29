@@ -338,7 +338,7 @@ def _trainer(**overrides: Any) -> TDMTrainer:
         "num_inference_steps": 2,
         "num_inner_epochs": 1,
         "per_device_batch_size": 1,
-        "gradient_accumulation_steps": 1,
+        "gradient_accumulation_steps": 2,
         "ttur_fake_updates": 1,
         "use_huber": False,
         "huber_c": 1e-3,
@@ -348,6 +348,10 @@ def _trainer(**overrides: Any) -> TDMTrainer:
     }
     defaults.update(overrides)
     trainer.training_args = SimpleNamespace(**defaults)
+    trainer.training_args.get_num_train_timesteps = (
+        lambda config: trainer.training_args.num_inference_steps
+    )
+    trainer.config = SimpleNamespace()
     trainer.adapter = TinyTDMAdapter()
     trainer.accelerator = SimpleNamespace(device=torch.device("cpu"), is_local_main_process=True)
     trainer.log_args = SimpleNamespace(verbose=False)
@@ -376,7 +380,7 @@ def _boundary_times(
 
 
 def _objective_trainer() -> tuple[TDMTrainer, ObjectiveTDMAdapter, ObjectiveBundle]:
-    accelerator = Accelerator(cpu=True, gradient_accumulation_steps=1)
+    accelerator = Accelerator(cpu=True, gradient_accumulation_steps=2)
     bundle = ObjectiveBundle()
     adapter = ObjectiveTDMAdapter(bundle)
     configs = {
@@ -422,12 +426,13 @@ def _objective_trainer() -> tuple[TDMTrainer, ObjectiveTDMAdapter, ObjectiveBund
     trainer.training_args = TDMTrainingArguments(
         num_inference_steps=2,
         per_device_batch_size=1,
-        gradient_accumulation_steps=1,
+        gradient_accumulation_steps=2,
         ttur_fake_updates=1,
         use_huber=False,
         replay_rtol=0,
         replay_atol=0,
     )
+    trainer.config = SimpleNamespace()
     trainer.autocast = nullcontext
     trainer.step = 0
     trainer.epoch = 0
@@ -444,7 +449,7 @@ def test_tdm_config_counts_every_boundary_in_one_generator_window() -> None:
     training_args = TDMTrainingArguments()
 
     assert training_args.gradient_step_per_epoch == 1
-    assert training_args.get_num_train_timesteps(SimpleNamespace()) == 1
+    assert training_args.get_num_train_timesteps(SimpleNamespace()) == 4
 
     resolved = Arguments.from_dict(
         {
@@ -458,7 +463,7 @@ def test_tdm_config_counts_every_boundary_in_one_generator_window() -> None:
         }
     ).training_args
     assert resolved.num_batches_per_epoch == 8
-    assert resolved.gradient_accumulation_steps == 1
+    assert resolved.gradient_accumulation_steps == 32
 
 
 @pytest.mark.parametrize("manual_gas", [8, 16, 64])
@@ -1088,25 +1093,50 @@ def test_tdm_rejects_non_ode_before_building_units() -> None:
 
 
 def test_tdm_optimize_runs_fake_ttur_then_generator_over_identical_ordered_units() -> None:
-    trainer = _trainer(ttur_fake_updates=3)
-    events: list[tuple[str, tuple[int, ...]]] = []
+    trainer = _trainer(ttur_fake_updates=3, gradient_accumulation_steps=4)
+    events: list[tuple[str, tuple[tuple[int, float], ...]]] = []
 
-    def record(self: TDMTrainer, microbatches: list, name: str) -> None:
-        units = self._build_boundary_units(microbatches[0])
-        events.append((name, tuple(unit.boundary_index for unit in units)))
+    def record(self: TDMTrainer, units: list, name: str) -> None:
+        ordered = []
+        for unit in units:
+            trajectory = unit.samples[0].trajectory
+            assert trajectory is not None
+            ordered.append(
+                (
+                    unit.boundary_index,
+                    float(trajectory.components["video"].states[0].item()),
+                )
+            )
+        events.append((name, tuple(ordered)))
 
     trainer._fake_phase = MethodType(lambda self, units: record(self, units, "fake"), trainer)
     trainer._generator_phase = MethodType(
         lambda self, units: record(self, units, "generator"), trainer
     )
 
-    trainer.optimize([_sample()])
+    trainer.optimize(
+        [
+            [_sample()],
+            [
+                _sample(
+                    video_states=torch.tensor([[10.0], [11.0], [12.0]]),
+                    audio_states=torch.tensor([[20.0], [21.0], [22.0]]),
+                )
+            ],
+        ]
+    )
 
-    assert events == [("fake", (1, 2)), ("fake", (1, 2)), ("fake", (1, 2)), ("generator", (1, 2))]
+    ordered = ((1, 0.0), (2, 0.0), (1, 10.0), (2, 10.0))
+    assert events == [
+        ("fake", ordered),
+        ("fake", ordered),
+        ("fake", ordered),
+        ("generator", ordered),
+    ]
 
 
-def test_tdm_optimize_rejects_gas_microbatch_count_mismatch() -> None:
-    trainer = _trainer(gradient_accumulation_steps=2)
+def test_tdm_optimize_rejects_rollout_batch_count_mismatch() -> None:
+    trainer = _trainer(gradient_accumulation_steps=4)
 
     with pytest.raises(ValueError, match=r"TDM optimize expected 2 role microbatches.*received 1"):
         trainer.optimize([_sample()])
@@ -1238,10 +1268,10 @@ def test_tdm_media_suppression_restores_decoder_after_rollout_scope() -> None:
 
 def test_tdm_real_role_phases_advance_exact_gas_counters() -> None:
     trainer, _, _ = _objective_trainer()
-    microbatches = [[_sample()]]
+    boundary_units = trainer._flatten_boundary_units([[_sample()]])
 
-    trainer._fake_phase(microbatches)
-    trainer._generator_phase(microbatches)
+    trainer._fake_phase(boundary_units)
+    trainer._generator_phase(boundary_units)
 
     assert trainer.optimization_roles["fake"].step == 1
     assert trainer.optimization_roles["generator"].step == 1

@@ -70,7 +70,7 @@ def test_only_gpu_validated_multirole_examples_are_published() -> None:
     assert tdm_r1_config["train"]["per_device_batch_size"] == 24
     assert tdm_r1_config["train"]["group_size"] == 24
     assert tdm_r1_config["train"]["unique_sample_num_per_epoch"] == 48
-    assert tdm_r1_config["train"]["gradient_accumulation_steps"] == 3
+    assert tdm_r1_config["train"]["gradient_accumulation_steps"] == 12
     assert tdm_r1_config["train"]["tdm_weight"] == 0.3
     assert tdm_r1_config["train"]["surrogate_preference_beta"] == 10.0
     assert tdm_r1_config["train"]["cfg_reward_scale"] == 4.5

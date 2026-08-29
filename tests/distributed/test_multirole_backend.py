@@ -286,6 +286,7 @@ def _run_production_tdm_r1_optimize(
     )
     trainer.training_args = SimpleNamespace(
         gradient_accumulation_steps=gradient_accumulation_steps,
+        get_num_train_timesteps=lambda config: 1,
         ttur_fake_updates=1,
         per_device_batch_size=2,
         surrogate_slow_decay_min=0.001,

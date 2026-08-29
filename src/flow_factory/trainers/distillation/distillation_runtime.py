@@ -34,6 +34,7 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    TypeVar,
 )
 
 import torch
@@ -52,6 +53,7 @@ if TYPE_CHECKING:
     from ..rewards import RewardBuffer
 
 _REPLAY_FORWARD_KEYS: tuple[str, ...] = ("guidance_scale", "stg_scale", "true_cfg_scale")
+RoleWorkItem = TypeVar("RoleWorkItem")
 
 
 def validate_media_free_rollout(adapter: BaseAdapter, *, algorithm_name: str) -> None:
@@ -446,12 +448,6 @@ def generate_one_rollout_batch(
         trainer._rollout_data_iter = None
 
     trainer.adapter.rollout()
-    # Each outer iteration scores exactly the batch it just rolled out, matching
-    # BaseTrainer.generate_samples. Left uncleared, the buffer carries the previous
-    # iteration's samples into this one, and the reward count stops matching the
-    # sample count as soon as an epoch accumulates more than one batch.
-    if reward_buffer is not None:
-        reward_buffer.clear()
     if trainer._rollout_data_iter is None:
         if hasattr(trainer.dataloader, "set_epoch"):
             trainer.dataloader.set_epoch(trainer._rollout_dataloader_epoch)
@@ -618,19 +614,19 @@ def pop_distillation_metrics(trainer: Any) -> Dict[str, float]:
 def run_role_phase(
     trainer: Any,
     role_name: str,
-    microbatches: Sequence[Sequence[Any]],
-    loss_fn: Callable[[Sequence[Any]], torch.Tensor],
+    work_items: Sequence[RoleWorkItem],
+    loss_fn: Callable[[RoleWorkItem], torch.Tensor],
 ) -> None:
-    """Run one exclusive role phase over same-role GAS microbatches.
+    """Run one exclusive role phase over same-role auto-GAS work items.
 
     Args:
         trainer: Trainer owning the role coordinator.
         role_name: Active trainable role for this phase.
-        microbatches: Same-role accumulation window; one optimizer step at the end.
-        loss_fn: Maps one microbatch to a scalar loss.
+        work_items: Same-role accumulation window; one item per backward.
+        loss_fn: Maps one work item to one scalar loss.
     """
-    if not microbatches:
-        raise ValueError(f"{role_name} phase expected at least one microbatch, received none")
+    if not work_items:
+        raise ValueError(f"{role_name} phase expected at least one work item, received none")
     # Keep the role routed for the complete forward/backward window. Activation
     # checkpointing recomputes the forward during backward; if the inner loss
     # context has already restored another variant, FSDP1 observes a different
@@ -638,17 +634,17 @@ def run_role_phase(
     with trainer.role_optimization.phase(role_name), trainer.adapter.use_component_variant(
         role_name
     ):
-        # A single microbatch would render a 1/1 bar once per TTUR repeat, which is
+        # A single item would render a 1/1 bar once per TTUR repeat, which is
         # noise; the role's own progress is already carried by the caller's bar.
-        for microbatch in tqdm(
-            microbatches,
+        for work_item in tqdm(
+            work_items,
             desc=f"Epoch {trainer.epoch} {role_name.capitalize()}",
             position=2,
             leave=False,
-            disable=not trainer.show_progress_bar or len(microbatches) < 2,
+            disable=not trainer.show_progress_bar or len(work_items) < 2,
         ):
             with trainer.role_optimization.microbatch():
-                loss = loss_fn(microbatch)
+                loss = loss_fn(work_item)
                 record_distillation_metric(trainer, f"train/{role_name}_loss", loss)
                 # Nested score/reference contexts can change PEFT's active
                 # adapter without changing the registry's logical role. Re-enter
@@ -663,8 +659,29 @@ def run_role_phase(
         record_distillation_metric(trainer, f"train/{role_name}_grad_norm", grad_norm)
 
 
+def resolve_rollout_accumulation_steps(training_args: Any) -> int:
+    """Recover rollout batches from timestep-aligned backend GAS."""
+    accumulation_steps = training_args.gradient_accumulation_steps
+    losses_per_rollout = training_args.get_num_train_timesteps(None)
+    if (
+        not isinstance(losses_per_rollout, int)
+        or isinstance(losses_per_rollout, bool)
+        or losses_per_rollout < 1
+    ):
+        raise ValueError(
+            "expected get_num_train_timesteps() >= 1 as an int, received "
+            f"{type(losses_per_rollout).__name__}: {losses_per_rollout!r}"
+        )
+    if accumulation_steps % losses_per_rollout:
+        raise ValueError(
+            f"expected gradient_accumulation_steps={accumulation_steps} to be divisible "
+            f"by losses_per_rollout={losses_per_rollout}"
+        )
+    return accumulation_steps // losses_per_rollout
+
+
 def run_distillation_training_step(trainer: Any) -> None:
-    """Run one distillation epoch: accumulate ``GAS`` rollouts, then optimize once.
+    """Collect the rollout portion of timestep-aligned GAS, then optimize once.
 
     This is the only way a distillation epoch differs from any other. Everything
     around it - reseeding, checkpointing, evaluation, the EMA step - is the shared
@@ -689,17 +706,23 @@ def run_distillation_training_step(trainer: Any) -> None:
             "expected gradient_accumulation_steps >= 1 as an int, received "
             f"{type(accumulation_steps).__name__}: {accumulation_steps!r}"
         )
+    rollout_accumulation_steps = resolve_rollout_accumulation_steps(
+        trainer.training_args,
+    )
+    reward_buffer = getattr(trainer, "reward_buffer", None)
+    if reward_buffer is not None:
+        reward_buffer.clear()
     microbatches: List[List[BaseSample]] = []
     for _ in tqdm(
-        range(accumulation_steps),
+        range(rollout_accumulation_steps),
         desc=f"Epoch {trainer.epoch} Sampling",
         position=0,
         disable=not trainer.show_progress_bar,
     ):
         with trainer.sampling_context():
             samples = trainer.sample()
-        trainer.prepare_feedback(samples)
         microbatches.append(samples)
+    trainer.prepare_feedback([sample for microbatch in microbatches for sample in microbatch])
     trainer.optimize(microbatches)
 
     metrics = pop_distillation_metrics(trainer)
