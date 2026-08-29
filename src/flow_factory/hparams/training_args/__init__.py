@@ -21,6 +21,10 @@ against the monolithic ``training_args.py`` continue to work unchanged:
     from flow_factory.hparams.training_args import get_training_args_class
 """
 
+from ..gradient_checkpointing import (
+    GradientCheckpointingPolicy,
+    GradientCheckpointingSpec,
+)
 from ._base import EvaluationArguments, TrainingArguments
 from ._registry import get_training_args_class, list_registered_training_args
 from .awm import AWMTrainingArguments
@@ -36,10 +40,6 @@ from .opd import DiffusionOPDTrainingArguments, TeacherConfig
 from .sft import SFTTrainingArguments
 from .tdm import TDMTrainingArguments
 from .tdm_r1 import TDMR1TrainingArguments
-from ..gradient_checkpointing import (
-    GradientCheckpointingPolicy,
-    GradientCheckpointingSpec,
-)
 
 __all__ = [
     "EvaluationArguments",

@@ -34,8 +34,8 @@ from .distillation_runtime import (
     generate_one_rollout_batch,
     query_score_velocity,
     record_distillation_metric,
-    resolve_rollout_accumulation_steps,
     require_velocity,
+    resolve_rollout_accumulation_steps,
     role_repeat_progress,
     run_role_phase,
 )
