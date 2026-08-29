@@ -1458,9 +1458,8 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
 
         1. Generate samples using the dataset's DataLoader with per-dataset
            eval overrides (resolution, guidance_scale, num_inference_steps).
-        2. Compute rewards via the dataset-specific RewardBuffer.
-        3. Gather rewards across ranks.
-        4. Log metrics under ``eval/{dataset_name}/reward_{name}_{stat}``.
+        2. Optionally compute and gather configured eval rewards.
+        3. Always log generated media; add reward metrics when available.
 
         Logs are flushed per-dataset to avoid holding all generated samples
         in memory simultaneously.  Uses EMA parameters (if available) and
@@ -1476,10 +1475,8 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         with torch.no_grad(), self.autocast(), self.adapter.use_ema_parameters():
             for dataset_name, dataloader in self.eval_dataloaders.items():
                 buffer = self.eval_dataset_reward_buffers.get(dataset_name)
-                if buffer is None:
-                    logger.warning(f"No reward buffer for eval dataset '{dataset_name}', skipping.")
-                    continue
-                buffer.clear()
+                if buffer is not None:
+                    buffer.clear()
                 all_samples: List[BaseSample] = []
 
                 # Merge per-dataset eval overrides with shared eval_args
@@ -1509,21 +1506,22 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
                     )
                     all_samples.extend(samples)
 
-                rewards = buffer.finalize(store_to_samples=True, split="pointwise")
-
-                # Pack all reward columns so evaluation pays for one gather per
-                # dataset rather than one gather per reward model.
-                rewards_tensors = {
-                    key: torch.as_tensor(value).to(self.accelerator.device)
-                    for key, value in rewards.items()
-                }
-                gathered_rewards = {
-                    key: value.cpu().numpy()
-                    for key, value in gather_aligned_floating_tensors(
-                        self.accelerator,
-                        rewards_tensors,
-                    ).items()
-                }
+                gathered_rewards: Dict[str, np.ndarray] = {}
+                if buffer is not None:
+                    rewards = buffer.finalize(store_to_samples=True, split="pointwise")
+                    # Pack all reward columns so evaluation pays for one gather per
+                    # dataset rather than one gather per reward model.
+                    rewards_tensors = {
+                        key: torch.as_tensor(value).to(self.accelerator.device)
+                        for key, value in rewards.items()
+                    }
+                    gathered_rewards = {
+                        key: value.cpu().numpy()
+                        for key, value in gather_aligned_floating_tensors(
+                            self.accelerator,
+                            rewards_tensors,
+                        ).items()
+                    }
 
                 # Log per-dataset immediately to avoid accumulating all samples in memory
                 if self.accelerator.is_main_process:
