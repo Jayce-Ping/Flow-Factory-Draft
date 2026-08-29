@@ -632,31 +632,42 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
                 )
 
     def _apply_backend_checkpointing_constraints(self) -> None:
-        """Disable an FSDP1 checkpointing combination that recomputes a different graph."""
-        if (
-            self.accelerator.distributed_type != DistributedType.FSDP
-            or self.training_args.trainer_type != "tdm-r1"
-        ):
+        """Select one checkpoint owner and reject the unsafe TDM-R1/FSDP1 case."""
+        if self.accelerator.distributed_type != DistributedType.FSDP:
             return
         fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
-        if getattr(fsdp_plugin, "fsdp_version", 1) >= 2:
-            return
         model_checkpointing = bool(
-            getattr(self.training_args, "enable_gradient_checkpointing", False)
+            getattr(
+                self.training_args,
+                "gradient_checkpointing_enabled",
+                getattr(self.training_args, "enable_gradient_checkpointing", False),
+            )
         )
         fsdp_checkpointing = bool(getattr(fsdp_plugin, "activation_checkpointing", False))
-        if not model_checkpointing and not fsdp_checkpointing:
+        if (
+            self.training_args.trainer_type == "tdm-r1"
+            and getattr(fsdp_plugin, "fsdp_version", 1) < 2
+        ):
+            if not model_checkpointing and not fsdp_checkpointing:
+                return
+            self.adapter.disable_gradient_checkpointing()
+            self.training_args.enable_gradient_checkpointing = False
+            if fsdp_plugin is not None:
+                fsdp_plugin.activation_checkpointing = False
+            logger.warning(
+                "Disabled model and FSDP activation checkpointing for TDM-R1 on FSDP1: "
+                "the surrogate objective runs reference/snapshot forwards between its live "
+                "forward and backward, so FSDP1 recomputation saves a different graph. "
+                "FSDP2 does not require this fallback."
+            )
             return
-        self.adapter.disable_gradient_checkpointing()
-        self.training_args.enable_gradient_checkpointing = False
-        if fsdp_plugin is not None:
+
+        if model_checkpointing and fsdp_checkpointing:
             fsdp_plugin.activation_checkpointing = False
-        logger.warning(
-            "Disabled model and FSDP activation checkpointing for TDM-R1 on FSDP1: "
-            "the surrogate objective runs reference/snapshot forwards between its live "
-            "forward and backward, so FSDP1 recomputation saves a different graph. "
-            "FSDP2 does not require this fallback."
-        )
+            logger.info(
+                "Disabled FSDP activation checkpointing because train-level model "
+                "checkpointing is enabled; nested checkpoint boundaries duplicate recompute."
+            )
 
     def _initialization(self):
         self._validate_paradigm_dynamics()

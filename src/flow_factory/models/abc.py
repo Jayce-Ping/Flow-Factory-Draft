@@ -72,6 +72,7 @@ from safetensors.torch import load_file, save_file
 
 from ..ema import EMAModuleWrapper
 from ..hparams import *
+from ..hparams.gradient_checkpointing import GradientCheckpointingSpec
 from ..samples import (
     BaseSample,
     ComponentTimes,
@@ -101,6 +102,12 @@ from ..utils.image import MultiImageBatch
 from ..utils.logger_utils import setup_logger
 from ..utils.video import MultiVideoBatch
 from . import trajectory_bridge as bridge
+from .checkpointing import (
+    CheckpointUnit,
+    discover_gradient_checkpointing_units,
+    select_gradient_checkpointing_units,
+    selective_gradient_checkpointing_function,
+)
 from .latent_geometry import LatentAxes, infer_latent_axes
 from .model_bundle import RoutedComponentProxy
 from .precision import (
@@ -335,7 +342,12 @@ class BaseAdapter(ABC):
         # It is intentionally NOT set here.
 
         # Enable gradient checkpointing if needed
-        if self.training_args.enable_gradient_checkpointing:
+        checkpointing_enabled = getattr(
+            self.training_args,
+            "gradient_checkpointing_enabled",
+            bool(getattr(self.training_args, "enable_gradient_checkpointing", False)),
+        )
+        if checkpointing_enabled:
             self.enable_gradient_checkpointing()
 
     # ================================== Post Init =================================
@@ -1434,15 +1446,82 @@ class BaseAdapter(ABC):
         return self._named_parameters[name].ema_wrapper.ema_parameters
 
     # ============================== Gradient Checkpointing ==============================
-    def enable_gradient_checkpointing(self):
-        """Enable gradient checkpointing for target components."""
+    def _gradient_checkpointing_root(self, component: torch.nn.Module) -> torch.nn.Module:
+        """Peel distributed and PEFT wrappers before configuring checkpoint units."""
+        root = self._unwrap(component)
+        get_base_model = getattr(root, "get_base_model", None)
+        if callable(get_base_model):
+            root = get_base_model()
+        if not isinstance(root, torch.nn.Module):
+            raise TypeError(
+                "expected gradient checkpointing root as nn.Module, "
+                f"received {type(root).__name__}: {root!r}"
+            )
+        return root
+
+    def _gradient_checkpointing_units(
+        self,
+        component_name: str,
+        component: torch.nn.Module,
+    ) -> List[CheckpointUnit]:
+        """Return checkpointable blocks in their registered execution order."""
+        del component_name
+        return discover_gradient_checkpointing_units(component)
+
+    @staticmethod
+    def _enable_full_gradient_checkpointing(
+        component_name: str,
+        component: torch.nn.Module,
+    ) -> None:
+        """Bridge Diffusers and Transformers full-checkpointing APIs."""
+        enable = getattr(component, "enable_gradient_checkpointing", None)
+        if callable(enable):
+            enable()
+            return
+        enable = getattr(component, "gradient_checkpointing_enable", None)
+        if callable(enable):
+            enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            return
+        raise TypeError(
+            f"component {component_name!r} ({type(component).__name__}) does not expose "
+            "enable_gradient_checkpointing() or gradient_checkpointing_enable()"
+        )
+
+    def enable_gradient_checkpointing(self) -> None:
+        """Apply the normalized full or selective policy to target components."""
+        policy = self.training_args.enable_gradient_checkpointing
         for comp_name in self.model_args.target_components:
             component = self.get_component(comp_name)
-            if hasattr(component, "enable_gradient_checkpointing"):
-                component.enable_gradient_checkpointing()
-                logger.info(f"Enabled gradient checkpointing for {comp_name}")
-            else:
-                logger.warning(f"{comp_name} does not support gradient checkpointing")
+            root = self._gradient_checkpointing_root(component)
+            if isinstance(policy, bool) or policy.mode == "full":
+                self._enable_full_gradient_checkpointing(comp_name, root)
+                logger.info("Enabled full gradient checkpointing for %s", comp_name)
+                continue
+            if policy.mode == "none":
+                continue
+
+            enable = getattr(root, "enable_gradient_checkpointing", None)
+            if not callable(enable):
+                raise TypeError(
+                    f"selective gradient checkpointing for component {comp_name!r} "
+                    f"requires enable_gradient_checkpointing(custom_func), received "
+                    f"{type(root).__name__}"
+                )
+            units = self._gradient_checkpointing_units(comp_name, root)
+            selected = select_gradient_checkpointing_units(policy, units)
+            enable(selective_gradient_checkpointing_function(selected))
+            logger.info(
+                "Enabled selective gradient checkpointing for %s: mode=%s, selected=%d/%d",
+                comp_name,
+                policy.mode,
+                len(selected),
+                len(units),
+            )
+            logger.debug(
+                "Gradient checkpoint units for %s -> %s",
+                comp_name,
+                [name for name, _ in selected],
+            )
 
     def disable_gradient_checkpointing(self) -> None:
         """Disable checkpointing on every materialized trainable variant."""
@@ -1460,14 +1539,21 @@ class BaseAdapter(ABC):
             if id(component) in seen:
                 continue
             seen.add(id(component))
-            if hasattr(component, "disable_gradient_checkpointing"):
-                component.disable_gradient_checkpointing()
+            root = self._gradient_checkpointing_root(component)
+            disable = getattr(root, "disable_gradient_checkpointing", None)
+            if callable(disable):
+                disable()
                 logger.info("Disabled gradient checkpointing for %s", type(component).__name__)
-            else:
-                logger.warning(
-                    "%s does not support disabling gradient checkpointing",
-                    type(component).__name__,
-                )
+                continue
+            disable = getattr(root, "gradient_checkpointing_disable", None)
+            if callable(disable):
+                disable()
+                logger.info("Disabled gradient checkpointing for %s", type(component).__name__)
+                continue
+            logger.warning(
+                "%s does not support disabling gradient checkpointing",
+                type(component).__name__,
+            )
 
     # ============================== Precision Management ==============================
     def _cast_module_mixed_precision(

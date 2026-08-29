@@ -22,6 +22,12 @@ import yaml
 from ...utils.dist import get_world_size
 from ...utils.logger_utils import setup_logger
 from ..abc import ArgABC
+from ..gradient_checkpointing import (
+    GradientCheckpointingPolicy,
+    gradient_checkpointing_enabled,
+    normalize_gradient_checkpointing_policy,
+    serialize_gradient_checkpointing_policy,
+)
 
 logger = setup_logger(__name__, rank_zero_only=True)
 
@@ -235,9 +241,12 @@ class TrainingArguments(ArgABC):
         default=1e-8,
         metadata={"help": "Epsilon for AdamW optimizer."},
     )
-    enable_gradient_checkpointing: bool = field(
+    enable_gradient_checkpointing: GradientCheckpointingPolicy = field(
         default=False,
-        metadata={"help": "Whether to enable gradient checkpointing."},
+        metadata={
+            "help": "Bool for full/disabled gradient checkpointing, or a selective "
+            "mapping with mode full, none, fraction, every_n, or layers."
+        },
     )
     offload_samples_to_cpu: bool = field(
         default=False,
@@ -303,6 +312,9 @@ class TrainingArguments(ArgABC):
     )
 
     def __post_init__(self):
+        self.enable_gradient_checkpointing = normalize_gradient_checkpointing_policy(
+            self.enable_gradient_checkpointing
+        )
         # --- Resolution standardization ---
         if not self.resolution:
             logger.warning("`resolution` is not set, using default (512, 512).")
@@ -429,8 +441,17 @@ class TrainingArguments(ArgABC):
         """
         return self.guidance_scale
 
+    @property
+    def gradient_checkpointing_enabled(self) -> bool:
+        """Return whether the normalized model-level policy checkpoints any block."""
+        return gradient_checkpointing_enabled(self.enable_gradient_checkpointing)
+
     def to_dict(self) -> dict[str, Any]:
-        return super().to_dict()
+        values = super().to_dict()
+        values["enable_gradient_checkpointing"] = serialize_gradient_checkpointing_policy(
+            self.enable_gradient_checkpointing
+        )
+        return values
 
     def __str__(self) -> str:
         """Pretty print configuration as YAML."""

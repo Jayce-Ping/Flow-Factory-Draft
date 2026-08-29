@@ -27,6 +27,7 @@ from ...samples import (
 )
 from ...scheduler import MiniMaxH3SDEScheduler, SchedulerGroup
 from ..abc import BaseAdapter
+from ..checkpointing import CheckpointUnit
 from ..runtime import ModularPipelineRuntime
 from ._common import apply_forward_process_noise, draw_forward_process_noise
 from .workflow import (
@@ -62,6 +63,41 @@ class _MiniMaxH3WorkflowAdapter:
     # Official Diffusers recipe: load at BF16 and let each ModelMixin preserve
     # its declared FP32 islands (including both H3 autoencoders).
     component_load_dtype_defaults: ClassVar[torch.dtype] = torch.bfloat16
+
+    def _gradient_checkpointing_units(
+        self,
+        component_name: str,
+        component: torch.nn.Module,
+    ) -> List[CheckpointUnit]:
+        """Return H3's token-refiner then joint-transformer execution order."""
+        expected_name = self.transformer_component_name
+        if component_name != expected_name:
+            raise ValueError(
+                f"expected H3 checkpoint component {expected_name!r}, "
+                f"received {component_name!r}"
+            )
+        token_refiner = getattr(component, "token_refiner", None)
+        refiner_blocks = getattr(token_refiner, "refiner_blocks", None)
+        transformer_blocks = getattr(component, "transformer_blocks", None)
+        if not isinstance(refiner_blocks, torch.nn.ModuleList) or not isinstance(
+            transformer_blocks,
+            torch.nn.ModuleList,
+        ):
+            raise TypeError(
+                "expected MiniMax H3 checkpoint stacks as ModuleList, received "
+                f"token_refiner.refiner_blocks={type(refiner_blocks).__name__}, "
+                f"transformer_blocks={type(transformer_blocks).__name__}"
+            )
+        return [
+            *[
+                (f"token_refiner.refiner_blocks.{index}", block)
+                for index, block in enumerate(refiner_blocks)
+            ],
+            *[
+                (f"transformer_blocks.{index}", block)
+                for index, block in enumerate(transformer_blocks)
+            ],
+        ]
 
     def load_pipeline(self) -> Any:
         """Load this modular workflow from a local directory or Hugging Face repo."""

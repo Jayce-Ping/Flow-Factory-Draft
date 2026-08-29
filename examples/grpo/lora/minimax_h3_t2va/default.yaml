@@ -63,6 +63,7 @@ train:
   ema_update_interval: 4
   ema_device: "cuda"
   seed: 42
+  # Selective example: {mode: fraction, fraction: 0.25}
   enable_gradient_checkpointing: true
   offload_samples_to_cpu: true
 
