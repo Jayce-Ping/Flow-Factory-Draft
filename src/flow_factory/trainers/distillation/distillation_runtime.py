@@ -488,7 +488,6 @@ def _completed_rollout_batch_count(trainer: Any) -> int:
     progress = getattr(trainer, "progress", None)
     completed_iterations = getattr(progress, "rollout_iteration", 0)
     training_args = getattr(trainer, "training_args", None)
-    accumulation_steps = getattr(training_args, "gradient_accumulation_steps", 1)
     if (
         not isinstance(completed_iterations, int)
         or isinstance(completed_iterations, bool)
@@ -498,16 +497,8 @@ def _completed_rollout_batch_count(trainer: Any) -> int:
             "expected rollout_iteration >= 0 as an int, received "
             f"{type(completed_iterations).__name__}: {completed_iterations!r}"
         )
-    if (
-        not isinstance(accumulation_steps, int)
-        or isinstance(accumulation_steps, bool)
-        or accumulation_steps < 1
-    ):
-        raise ValueError(
-            "expected gradient_accumulation_steps >= 1 as an int, received "
-            f"{type(accumulation_steps).__name__}: {accumulation_steps!r}"
-        )
-    return completed_iterations * accumulation_steps
+    rollout_accumulation_steps = resolve_rollout_accumulation_steps(training_args)
+    return completed_iterations * rollout_accumulation_steps
 
 
 def _collect_rollout_loader_generators(dataloader: Any) -> List[torch.Generator]:
@@ -593,10 +584,11 @@ def _restore_rollout_data_cursor(
     """Rebuild one deterministic loader iterator at a global batch boundary.
 
     Exact checkpoints are published only between acquisition cycles. Each completed
-    distillation cycle consumes exactly ``gradient_accumulation_steps`` batches, so
-    the persisted rollout-iteration counter is the authoritative cursor. Rebuilding
-    from it avoids serializing a Python iterator and works for both finite
-    multi-source loaders and the framework's infinite grouped batch samplers.
+    distillation cycle consumes ``gradient_accumulation_steps`` divided by its
+    per-rollout loss count, so the persisted rollout-iteration counter is the
+    authoritative cursor. Rebuilding from it avoids serializing a Python iterator
+    and works for both finite multi-source loaders and the framework's infinite
+    grouped batch samplers.
     """
     if (
         not isinstance(consumed_batches, int)
@@ -854,6 +846,15 @@ def resolve_rollout_accumulation_steps(training_args: Any) -> int:
     """Recover rollout batches from timestep-aligned backend GAS."""
     accumulation_steps = training_args.gradient_accumulation_steps
     losses_per_rollout = training_args.get_num_train_timesteps(None)
+    if (
+        not isinstance(accumulation_steps, int)
+        or isinstance(accumulation_steps, bool)
+        or accumulation_steps < 1
+    ):
+        raise ValueError(
+            "expected gradient_accumulation_steps >= 1 as an int, received "
+            f"{type(accumulation_steps).__name__}: {accumulation_steps!r}"
+        )
     if (
         not isinstance(losses_per_rollout, int)
         or isinstance(losses_per_rollout, bool)

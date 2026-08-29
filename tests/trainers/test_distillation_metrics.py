@@ -128,13 +128,19 @@ class _ValueDataset(Dataset):
         return {"value": torch.tensor(self.values[index])}
 
 
-def _rollout_cursor_trainer(progress: TrainingProgress) -> SimpleNamespace:
+def _rollout_cursor_trainer(
+    progress: TrainingProgress,
+    *,
+    accumulation_steps: int = 2,
+    losses_per_rollout: int = 1,
+) -> SimpleNamespace:
     """Build the one-batch rollout surface around an infinite grouped loader."""
     return SimpleNamespace(
         progress=progress,
         training_args=SimpleNamespace(
-            gradient_accumulation_steps=2,
+            gradient_accumulation_steps=accumulation_steps,
             num_batches_per_epoch=3,
+            get_num_train_timesteps=lambda config: losses_per_rollout,
         ),
         dataloader=_InfiniteGroupedLoader(),
         adapter=SimpleNamespace(rollout=lambda: None),
@@ -185,6 +191,7 @@ def _real_rollout_cursor_trainer(
         training_args=SimpleNamespace(
             gradient_accumulation_steps=2,
             num_batches_per_epoch=3,
+            get_num_train_timesteps=lambda config: 1,
         ),
         dataloader=dataloader,
         adapter=SimpleNamespace(rollout=lambda: None),
@@ -256,6 +263,7 @@ def _finite_multi_source_trainer(
             # independently round their quotas. The finite wrapper length is the
             # authoritative result when those two values differ.
             num_batches_per_epoch=2,
+            get_num_train_timesteps=lambda config: 1,
         ),
         dataloader=_finite_multi_source_loader(),
         adapter=SimpleNamespace(rollout=lambda: None),
@@ -614,9 +622,13 @@ def test_exact_resume_reconstructs_infinite_grouped_rollout_cursor() -> None:
     assert resumed.dataloader.batch_sampler.set_epoch_calls == [1]
 
 
-def test_exact_resume_uses_gas_to_reconstruct_rollout_batch_count() -> None:
-    """Completed rollout iterations expand to the exact number of consumed batches."""
-    resumed = _rollout_cursor_trainer(TrainingProgress(rollout_iteration=4))
+def test_exact_resume_uses_rollout_factor_to_reconstruct_batch_count() -> None:
+    """Boundary-aligned GAS must not make exact resume skip extra prompt batches."""
+    resumed = _rollout_cursor_trainer(
+        TrainingProgress(rollout_iteration=2),
+        accumulation_steps=8,
+        losses_per_rollout=4,
+    )
 
     next_batch = generate_one_rollout_batch(
         resumed,
@@ -624,9 +636,9 @@ def test_exact_resume_uses_gas_to_reconstruct_rollout_batch_count() -> None:
         algorithm_name="TDM",
     )
 
-    assert next_batch == [(2, 2)]
-    assert resumed._rollout_batches_consumed == 9
-    assert resumed.dataloader.batch_sampler.set_epoch_calls == [2]
+    assert next_batch == [(1, 1)]
+    assert resumed._rollout_batches_consumed == 5
+    assert resumed.dataloader.batch_sampler.set_epoch_calls == [1]
 
 
 @pytest.mark.parametrize("use_explicit_generator", [False, True])

@@ -206,6 +206,14 @@ Based on the fix type, write the fix entry to the appropriate document:
 - **Lesson**: Contract tests for CUDA-only optional adapters must exercise the adapter through its dependency boundary so CPU and macOS collection remains valid; importing such adapters at module scope turns an optional dependency into a repository-wide test dependency.
 - **Related Constraint**: N/A
 
+### Distillation exact cursors count rollout batches, not backend work items
+- **Date**: 2026-08-29
+- **Symptom**: After timestep-aligned TDM accumulation made each trajectory boundary one backend work item, exact resume skipped `num_inference_steps` times too many prompt batches.
+- **Root Cause**: Cursor reconstruction still multiplied completed rollout iterations by backend `gradient_accumulation_steps`, even though one rollout now contributes multiple boundary losses to that accumulation window.
+- **Fix**: `trainers/distillation/distillation_runtime.py` now derives consumed prompt batches through `resolve_rollout_accumulation_steps()`, and the cursor regression locks `gradient_accumulation_steps=8`, four losses per rollout, and two completed iterations to four consumed batches.
+- **Lesson**: Persisted acquisition progress must be projected through the current acquisition-to-backend work-item ratio. Backend GAS is not a valid dataloader cursor when one acquired batch expands into multiple backward graphs.
+- **Related Constraint**: #18a
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)
