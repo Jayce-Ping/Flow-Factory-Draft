@@ -700,6 +700,7 @@ def _media_identity(
         "path": media.path,
         "fps": media.fps,
         "sample_rate": media.sample_rate,
+        "slot": media.slot,
         "content_sha256": _media_content_sha256(
             media.path,
             media_digest_cache=media_digest_cache,

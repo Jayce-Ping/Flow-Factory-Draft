@@ -14,7 +14,7 @@
 
 """Lightweight tests for the BaseAdapter output-state codec lifecycle seam."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Mapping, Optional, Tuple
 
@@ -35,6 +35,7 @@ from flow_factory.contracts import (
     RateRequirement,
 )
 from flow_factory.models.abc import BaseAdapter
+from flow_factory.models.condition_state import PreparedConditionState
 from flow_factory.models.output_state import (
     DecodedMediaBatch,
     EncodedOutputState,
@@ -148,6 +149,38 @@ class _Codec:
         return self.result or _encoded_image_batch(len(media_batch))
 
 
+class _ConditionPreparer:
+    required_components = ("vae",)
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.grad_enabled: Optional[bool] = None
+
+    def prepare_condition_state(
+        self,
+        condition: Mapping[str, Any],
+        generator: Optional[torch.Generator] = None,
+    ) -> PreparedConditionState:
+        del generator
+        self.calls += 1
+        self.grad_enabled = torch.is_grad_enabled()
+        return PreparedConditionState(
+            condition=condition,
+            forward_context={"condition_prefix": torch.zeros(1, 2)},
+            output_context={"codec_condition": torch.ones(1, 2)},
+        )
+
+
+class _StochasticConditionPreparer(_ConditionPreparer):
+    def prepare_condition_state(
+        self,
+        condition: Mapping[str, Any],
+        generator: Optional[torch.Generator] = None,
+    ) -> PreparedConditionState:
+        torch.rand((), generator=generator)
+        return super().prepare_condition_state(condition, generator)
+
+
 class _LifecycleAdapter(BaseAdapter):
     pipeline_io_contract = IMAGE_CONTRACT
 
@@ -234,6 +267,15 @@ class _DefaultGeometryAdapter(_LifecycleAdapter):
     _validate_encoded_output_geometry = BaseAdapter._validate_encoded_output_geometry
 
 
+class _PreparedLifecycleAdapter(_LifecycleAdapter):
+    def __init__(self, codec: Optional[_Codec], preparer: _ConditionPreparer) -> None:
+        self._preparer_to_build = preparer
+        super().__init__(codec)
+
+    def build_condition_state_preparer(self) -> _ConditionPreparer:
+        return self._preparer_to_build
+
+
 def test_codec_build_runs_after_component_and_scheduler_lifecycle() -> None:
     codec = _Codec()
 
@@ -242,6 +284,48 @@ def test_codec_build_runs_after_component_and_scheduler_lifecycle() -> None:
     assert adapter.codec_build_context == (True, True, True, True)
     assert adapter.output_state_codec is codec
     assert adapter.output_state_encoding_modules == ("vae",)
+
+
+def test_condition_preparer_is_declaration_only_and_runs_under_no_grad() -> None:
+    preparer = _ConditionPreparer()
+    adapter = _PreparedLifecycleAdapter(_Codec(), preparer)
+
+    prepared = adapter.prepare_condition_state({"prompt_embeds": torch.ones(1, 2)})
+
+    assert adapter.condition_state_preparer is preparer
+    assert adapter.condition_state_encoding_modules == ("vae",)
+    assert preparer.calls == 1
+    assert preparer.grad_enabled is False
+    assert tuple(prepared.forward_context) == ("condition_prefix",)
+    assert tuple(prepared.output_context) == ("codec_condition",)
+
+
+def test_raw_condition_encode_routes_through_declared_preparer() -> None:
+    preparer = _ConditionPreparer()
+    codec = _Codec()
+    adapter = _PreparedLifecycleAdapter(codec, preparer)
+    condition = {"prompt_embeds": torch.ones(1, 2)}
+
+    adapter.encode_output_state(_image_batch(1), condition)
+
+    assert preparer.calls == 1
+    assert codec.received is not None
+    assert tuple(codec.received[1]) == ("prompt_embeds", "codec_condition")
+    assert torch.equal(codec.received[1]["prompt_embeds"], condition["prompt_embeds"])
+    assert torch.equal(codec.received[1]["codec_condition"], torch.ones(1, 2))
+
+
+def test_default_condition_preparation_is_identity() -> None:
+    adapter = _LifecycleAdapter(_Codec())
+    condition = {"prompt_embeds": torch.ones(1, 2)}
+
+    prepared = adapter.prepare_condition_state(condition)
+
+    assert adapter.condition_state_preparer is None
+    assert adapter.condition_state_encoding_modules == ()
+    assert dict(prepared.condition) == condition
+    assert not prepared.forward_context
+    assert not prepared.output_context
 
 
 def test_codec_build_must_remain_declaration_only() -> None:
@@ -261,6 +345,22 @@ def test_contract_without_codec_preserves_online_adapter_construction() -> None:
     assert adapter.output_state_encoding_modules == ()
     with pytest.raises(RuntimeError, match=r"does not provide an output-state codec"):
         adapter.encode_output_state(_image_batch(1), {})
+
+
+def test_effective_pipeline_contract_can_narrow_checkpoint_capability() -> None:
+    class SingleSampleAdapter(_LifecycleAdapter):
+        def _resolve_pipeline_io_contract(self) -> PipelineIOContract:
+            return replace(
+                self.pipeline_io_contract,
+                batch_capability=BatchCapability.SINGLE_SAMPLE,
+            )
+
+    adapter = SingleSampleAdapter(_Codec())
+
+    assert adapter.pipeline_io_contract.batch_capability is BatchCapability.UNIFORM
+    assert adapter.effective_pipeline_io_contract.batch_capability is BatchCapability.SINGLE_SAMPLE
+    with pytest.raises(ValueError, match=r"single_sample.*batch size 1.*2"):
+        adapter.encode_output_state(_image_batch(2), {})
 
 
 def test_known_codec_blocker_is_actionable_at_direct_encode_boundary() -> None:
@@ -321,6 +421,12 @@ def test_codec_required_components_must_exist_in_runtime() -> None:
 
 
 def test_public_output_state_wrapper_cannot_be_overridden() -> None:
+    with pytest.raises(TypeError, match=r"must not override BaseAdapter.prepare_condition_state"):
+
+        class InvalidConditionAdapter(_LifecycleAdapter):
+            def prepare_condition_state(self, *args: Any, **kwargs: Any) -> Any:
+                return None
+
     with pytest.raises(TypeError, match=r"must not override BaseAdapter.encode_output_state"):
 
         class InvalidAdapter(_LifecycleAdapter):
@@ -363,12 +469,12 @@ def test_encode_output_state_validates_invokes_no_grad_and_applies_storage_dtype
     assert codec.grad_enabled is False
     assert codec.received is not None
     assert codec.received[0] is media_batch
-    assert codec.received[1] is condition
+    assert dict(codec.received[1]) == condition
     assert codec.received[2] is generator
     assert encoded.clean_state.components["latent"].dtype is torch.float16
     assert adapter.geometry_validation is not None
     assert adapter.geometry_validation[0] is media_batch
-    assert adapter.geometry_validation[1] is condition
+    assert dict(adapter.geometry_validation[1]) == condition
     assert adapter.geometry_validation[2] is encoded
 
 
@@ -382,6 +488,20 @@ def test_encode_output_state_rejects_candidate_before_invoking_codec() -> None:
 
     assert codec.calls == 0
     assert adapter.geometry_validation is None
+
+
+def test_encode_output_state_rejects_candidate_before_stochastic_preparation() -> None:
+    preparer = _StochasticConditionPreparer()
+    adapter = _PreparedLifecycleAdapter(_Codec(), preparer)
+    generator = torch.Generator().manual_seed(7)
+    original_state = generator.get_state().clone()
+    wrong_type = ((_DecodedMedia(type="video", payload=torch.zeros(1)),),)
+
+    with pytest.raises(ValueError, match=r"expected.*type 'image'.*'video'"):
+        adapter.encode_output_state(wrong_type, {}, generator)
+
+    assert preparer.calls == 0
+    assert torch.equal(generator.get_state(), original_state)
 
 
 @pytest.mark.parametrize(

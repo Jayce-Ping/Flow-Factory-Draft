@@ -37,7 +37,12 @@ from .adapters import (
     MiniMaxH3Ref2VAAdapter,
     MiniMaxH3T2VAAdapter,
 )
-from .blocks import encode_h3_workflow_inputs, prepare_h3_rollout_state, run_h3_blocks
+from .blocks import (
+    encode_h3_workflow_inputs,
+    prepare_h3_condition_prefixes,
+    prepare_h3_rollout_state,
+    run_h3_blocks,
+)
 from .decoding import decode_h3_targets
 from .denoise import forward_h3_state, run_h3_joint_transformer, step_h3_components
 from .dependency import require_minimax_h3_support
@@ -65,6 +70,7 @@ __all__ = [
     "model_time_to_framework_sigma",
     "pack_audio_latents",
     "pack_video_latents",
+    "prepare_h3_condition_prefixes",
     "prepare_h3_rollout_state",
     "require_minimax_h3_support",
     "run_h3_blocks",

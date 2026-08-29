@@ -31,7 +31,7 @@ from ..common.flow_matching import (
     flow_matching_per_sample_loss,
     sample_offline_timesteps,
 )
-from ..common.offline_batch import bind_output_forward_context, move_condition_to_device
+from ..common.offline_batch import bind_prepared_condition_output, move_condition_to_device
 from ..forward_process import forward_velocity_state
 
 
@@ -48,7 +48,7 @@ class SFTTrainer(BaseTrainer):
             accelerator=self.accelerator,
             preprocess_func=self.adapter.preprocess_func,
             supervision_type="demonstration",
-            pipeline_io_contract=self.adapter.pipeline_io_contract,
+            pipeline_io_contract=self.adapter.effective_pipeline_io_contract,
         )
         return dataloader, {}
 
@@ -69,8 +69,12 @@ class SFTTrainer(BaseTrainer):
         # microstep explicitly restores training mode before policy execution.
         self.adapter.train()
 
-        encoded = self.adapter.encode_output_state(output.target_media, condition)
-        model_batch = bind_output_forward_context(condition, encoded.forward_context)
+        prepared_condition = self.adapter.prepare_condition_state(condition)
+        encoded = self.adapter.encode_output_state(output.target_media, prepared_condition)
+        model_batch = bind_prepared_condition_output(
+            prepared_condition,
+            encoded.forward_context,
+        )
         all_timesteps = sample_offline_timesteps(
             self.training_args,
             batch_size=len(output.target_media),

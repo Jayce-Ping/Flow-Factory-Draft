@@ -1,6 +1,6 @@
 # Examples
 
-Training configs for all supported algorithm–model combinations.
+Curated training configs for representative supported algorithm–model combinations.
 
 ## Directory Structure
 
@@ -92,7 +92,9 @@ Its 64x96 canvas is intentionally a correctness geometry. The quality-oriented T
 default is now the shared-`vid_prompt`, LoRA-rank-64 baseline aligned with the LTX2
 T2AV recipe and uses both CLAP and ImageBind rewards. It is configuration/API
 validated; no completed long-run reward trend is claimed. FL2VA and Ref2VA are also
-**Schema/API validated only**, rather than claims of training stability or reward improvement.
+schema/API and local offline-path validated, rather than claims of real-weight training stability
+or reward improvement. The complete follow-up campaign is defined in the
+[GPU validation plan](../guidance/gpu_validation.md).
 
 The T2VA `quality_720p_fsdp2.yaml` recipe is the active native-quality path:
 768x1344, 124 frames, 24 denoising steps, LoRA rank 64 / alpha 128, and two

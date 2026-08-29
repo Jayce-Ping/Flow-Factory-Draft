@@ -171,10 +171,11 @@ def preprocess_h3_workflow(adapter: Any, **kwargs: Any) -> Dict[str, Any]:
         "num_frames": kwargs["num_frames"],
     }
     if adapter.workflow == "fl2va":
-        images = _validate_fl2va_condition_images(kwargs, "preprocess")
-        values["image"] = images[0]
-        if len(images) == 2:
-            values["last_image"] = images[1]
+        first_image, last_image = _validate_fl2va_condition_images(kwargs, "preprocess")
+        if first_image is not None:
+            values["image"] = first_image
+        if last_image is not None:
+            values["last_image"] = last_image
     elif adapter.workflow == "ref2va":
         references = _single_outer_value(kwargs.get("references"), "references", adapter.workflow)
         values["references"] = _build_pinned_references(references)
@@ -214,8 +215,18 @@ def infer_h3_workflow(adapter: Any, **kwargs: Any) -> List[Any]:
     _validate_public_no_cfg_inputs(adapter.workflow, kwargs, "inference")
     _validate_workflow_media_inputs(adapter.workflow, kwargs, "inference")
     condition_images = None
+    condition_image_slots = None
     if adapter.workflow == "fl2va":
-        condition_images = _validate_fl2va_condition_images(kwargs, "inference")
+        first_image, last_image = _validate_fl2va_condition_images(kwargs, "inference")
+        condition_images = tuple(image for image in (first_image, last_image) if image is not None)
+        condition_image_slots = tuple(
+            slot
+            for slot, image in (
+                ("first_frame", first_image),
+                ("last_frame", last_image),
+            )
+            if image is not None
+        )
     prompt = kwargs.get("prompt")
     prompt_value = _single_outer_value(prompt, "prompt", adapter.workflow)
     prompt_embeds = kwargs["prompt_embeds"]
@@ -420,6 +431,11 @@ def infer_h3_workflow(adapter: Any, **kwargs: Any) -> List[Any]:
             },
             "layout": layout,
             "geometry": geometry,
+            **(
+                {}
+                if condition_image_slots is None
+                else {"condition_image_slots": condition_image_slots}
+            ),
         },
     )
     return [sample]
@@ -732,23 +748,63 @@ def _validate_public_no_cfg_inputs(workflow: str, values: Mapping[str, Any], bou
         )
 
 
-def _validate_fl2va_condition_images(values: Mapping[str, Any], boundary: str) -> Sequence[Any]:
+def _validate_fl2va_condition_images(
+    values: Mapping[str, Any],
+    boundary: str,
+) -> tuple[Any | None, Any | None]:
+    direct_first = values.get("image")
+    direct_last = values.get("last_image")
     outer_images = values.get("images")
     if outer_images is None:
         outer_images = values.get("condition_images")
+    if (direct_first is not None or direct_last is not None) and outer_images is not None:
+        raise ValueError(
+            "MiniMax H3 workflow='fl2va' cannot combine direct image/last_image "
+            "arguments with grouped images"
+        )
+    if direct_first is not None or direct_last is not None:
+        return direct_first, direct_last
+
     images = _single_outer_value(outer_images, "images", "fl2va")
     if not isinstance(images, (list, tuple)) or not 1 <= len(images) <= 2:
         raise ValueError(
             f"MiniMax H3 workflow='fl2va' public {boundary} field='images' expected "
             f"one or two ordered images, received {images!r}"
         )
-    return images
+    outer_slots = values.get("image_slots")
+    if outer_slots is None:
+        slots = ("first_frame", "last_frame")[: len(images)]
+    else:
+        slots = _single_outer_value(outer_slots, "image_slots", "fl2va")
+        if not isinstance(slots, (list, tuple)) or len(slots) != len(images):
+            raise ValueError(
+                f"MiniMax H3 workflow='fl2va' public {boundary} field='image_slots' "
+                f"expected {len(images)} slot(s), received {slots!r}"
+            )
+        slots = tuple(slots)
+    if len(set(slots)) != len(slots) or any(
+        slot not in ("first_frame", "last_frame") for slot in slots
+    ):
+        raise ValueError(
+            f"MiniMax H3 workflow='fl2va' public {boundary} field='image_slots' "
+            f"expected unique first_frame/last_frame values, received {slots!r}"
+        )
+    bound = dict(zip(slots, images))
+    return bound.get("first_frame"), bound.get("last_frame")
 
 
 def _validate_workflow_media_inputs(
     workflow: str, values: Mapping[str, Any], boundary: str
 ) -> None:
-    media_fields = ("images", "condition_images", "videos", "audios", "references")
+    media_fields = (
+        "images",
+        "condition_images",
+        "image",
+        "last_image",
+        "videos",
+        "audios",
+        "references",
+    )
     present = {
         field for field in media_fields if field in values and _media_value_present(values[field])
     }
@@ -757,7 +813,14 @@ def _validate_workflow_media_inputs(
             f"MiniMax H3 workflow='t2va' {boundary} rejects media fields={tuple(sorted(present))}"
         )
     if workflow == "ref2va":
-        generic = present & {"images", "condition_images", "videos", "audios"}
+        generic = present & {
+            "images",
+            "condition_images",
+            "image",
+            "last_image",
+            "videos",
+            "audios",
+        }
         if generic:
             raise ValueError(
                 f"MiniMax H3 workflow='ref2va' {boundary} rejects generic media "

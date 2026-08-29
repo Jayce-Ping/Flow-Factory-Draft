@@ -110,6 +110,11 @@ from .checkpointing import (
     select_gradient_checkpointing_units,
     selective_gradient_checkpointing_function,
 )
+from .condition_state import (
+    ConditionStatePreparer,
+    PreparedConditionState,
+    validate_condition_preparer_required_components,
+)
 from .latent_geometry import LatentAxes, infer_latent_axes
 from .model_bundle import RoutedComponentProxy
 from .output_state import (
@@ -267,10 +272,12 @@ class BaseAdapter(ABC):
     # name. Overriding one would silently bypass that contract, so subclasses are
     # rejected at class creation instead of at training time.
     _BOUNDARY_OWNING_METHODS: ClassVar[Tuple[str, ...]] = (
+        "prepare_condition_state",
         "encode_output_state",
         "decode_output_state",
         "forward_state",
         "reduce_component_latent_values",
+        "reduce_flow_matching_objective_values",
         "reduce_latent_values",
     )
 
@@ -283,6 +290,8 @@ class BaseAdapter(ABC):
                         "Provide build_output_state_codec() and "
                         "_validate_encoded_output_geometry() instead."
                     )
+                elif name == "prepare_condition_state":
+                    override_hint = "Provide build_condition_state_preparer() instead."
                 elif name == "decode_output_state":
                     override_hint = "Override the protected hook _decode_output_state instead."
                 else:
@@ -329,6 +338,17 @@ class BaseAdapter(ABC):
                 "expected SchedulerGroup.primary to be the canonical pipeline scheduler, "
                 f"received primary component {self.scheduler_group.primary_name!r}"
             )
+        self._effective_pipeline_io_contract = self._resolve_pipeline_io_contract()
+        if self._effective_pipeline_io_contract is not None and not isinstance(
+            self._effective_pipeline_io_contract,
+            PipelineIOContract,
+        ):
+            raise TypeError(
+                f"adapter {type(self).__name__} expected _resolve_pipeline_io_contract() "
+                "to return PipelineIOContract or None, received "
+                f"{type(self._effective_pipeline_io_contract).__name__}: "
+                f"{self._effective_pipeline_io_contract!r}"
+            )
 
         # Compatibility alias: the runtime override mapping is the sole authoritative cache.
         self._components: Dict[str, torch.nn.Module] = cast(
@@ -337,6 +357,12 @@ class BaseAdapter(ABC):
         self.model_args.target_components = self.component_runtime.resolve_component_names(
             self.model_args.target_components
         )
+
+        # Build per-request input-condition realization after the component runtime
+        # exists, but before any codec may consume its declaration. Like the output
+        # codec, the preparer declares lifecycle metadata only.
+        self._condition_state_preparer = self._build_condition_state_preparer_declaration()
+        self._condition_state_encoding_modules = self._validate_condition_state_preparer_lifecycle()
 
         # Build target-media encoding only after load-dtype policy, component runtime,
         # scheduler group, and target-name canonicalization are established. The codec
@@ -455,6 +481,116 @@ class BaseAdapter(ABC):
             return state
         return LatentState(components, active_masks=state.active_masks)
 
+    # =========================== Condition-State Preparation =======================
+    @property
+    def effective_pipeline_io_contract(self) -> Optional[PipelineIOContract]:
+        """Return the checkpoint-realized pipeline input/output contract."""
+        return getattr(
+            self,
+            "_effective_pipeline_io_contract",
+            type(self).pipeline_io_contract,
+        )
+
+    def _resolve_pipeline_io_contract(self) -> Optional[PipelineIOContract]:
+        """Resolve checkpoint-specific capabilities from the class declaration.
+
+        Most adapters use one immutable class-level contract. An adapter wrapping
+        checkpoint variants with narrower input semantics may override this hook
+        and return a validated specialization after its pipeline config is known.
+
+        Returns:
+            Effective contract for this adapter instance, or ``None``.
+        """
+        return type(self).pipeline_io_contract
+
+    def _build_condition_state_preparer_declaration(
+        self,
+    ) -> Optional[ConditionStatePreparer]:
+        """Build preparer metadata without changing component runtime state."""
+        materialized_before = tuple(self.component_runtime.materialized_component_names)
+        overrides_before = tuple(self.component_runtime.override_components)
+        preparer = self.build_condition_state_preparer()
+        materialized_after = tuple(self.component_runtime.materialized_component_names)
+        overrides_after = tuple(self.component_runtime.override_components)
+        if materialized_after != materialized_before or overrides_after != overrides_before:
+            raise RuntimeError(
+                f"adapter {type(self).__name__}.build_condition_state_preparer() must be "
+                "declaration-only and cannot materialize or replace components: "
+                f"materialized_before={materialized_before}, "
+                f"materialized_after={materialized_after}, "
+                f"overrides_before={overrides_before}, overrides_after={overrides_after}"
+            )
+        return preparer
+
+    @property
+    def condition_state_preparer(self) -> Optional[ConditionStatePreparer]:
+        """Return the immutable preparer selected during adapter construction."""
+        return getattr(self, "_condition_state_preparer", None)
+
+    @property
+    def condition_state_encoding_modules(self) -> Tuple[str, ...]:
+        """Return validated component names required for condition realization."""
+        return self._condition_state_encoding_modules
+
+    def build_condition_state_preparer(self) -> Optional[ConditionStatePreparer]:
+        """Build the adapter-owned runtime condition preparer, if required.
+
+        The default identity path needs no declaration. A model whose input
+        condition depends on runtime geometry, stochastic augmentation, or an
+        on-device encoder returns a declaration-only preparer here.
+
+        Returns:
+            Adapter-owned preparer, or ``None`` for identity preparation.
+        """
+        return None
+
+    def _validate_condition_state_preparer_lifecycle(self) -> Tuple[str, ...]:
+        """Validate condition-preparer lifecycle metadata."""
+        preparer = self.condition_state_preparer
+        if preparer is None:
+            return ()
+        return validate_condition_preparer_required_components(
+            preparer,
+            tuple(self.component_runtime.declared_component_names),
+        )
+
+    def prepare_condition_state(
+        self,
+        condition: Mapping[str, Any],
+        generator: Optional[torch.Generator] = None,
+    ) -> PreparedConditionState:
+        """Realize one input-owned condition state for a request or batch.
+
+        Args:
+            condition: Cached input-only model condition.
+            generator: Optional generator for adapter-owned stochastic realization.
+
+        Returns:
+            Validated prepared condition reused by every candidate and forward
+            derived from this request.
+        """
+        if not isinstance(condition, Mapping):
+            raise TypeError(
+                "expected condition-state input to be Mapping[str, Any], "
+                f"received {type(condition).__name__}: {condition!r}"
+            )
+        if generator is not None and not isinstance(generator, torch.Generator):
+            raise TypeError(
+                "expected condition-state generator to be torch.Generator or None, "
+                f"received {type(generator).__name__}: {generator!r}"
+            )
+        preparer = self.condition_state_preparer
+        if preparer is None:
+            return PreparedConditionState.identity(condition)
+        with torch.no_grad():
+            prepared = preparer.prepare_condition_state(condition, generator)
+        if not isinstance(prepared, PreparedConditionState):
+            raise TypeError(
+                "condition-state preparer must return PreparedConditionState, "
+                f"received {type(prepared).__name__}"
+            )
+        return prepared
+
     # ============================ Output-State Encoding ============================
     def _build_output_state_codec_declaration(self) -> Optional[OutputStateCodec]:
         """Build codec metadata without changing component materialization or overrides."""
@@ -562,7 +698,7 @@ class BaseAdapter(ABC):
     def _validate_output_state_codec_lifecycle(self) -> Tuple[str, ...]:
         """Validate the adapter's pipeline contract and codec declaration."""
         unavailable_reason = type(self)._validated_output_state_codec_unavailable_reason()
-        contract = self.pipeline_io_contract
+        contract = self.effective_pipeline_io_contract
         if contract is not None and not isinstance(contract, PipelineIOContract):
             raise TypeError(
                 f"adapter {type(self).__name__} expected pipeline_io_contract to be "
@@ -590,14 +726,15 @@ class BaseAdapter(ABC):
     def encode_output_state(
         self,
         media_batch: DecodedMediaBatch,
-        condition: Mapping[str, Any],
+        condition: Union[Mapping[str, Any], PreparedConditionState],
         generator: Optional[torch.Generator] = None,
     ) -> EncodedOutputState:
         """Encode decoded targets through the adapter-owned validated boundary.
 
         Args:
             media_batch: Exact output-media sequence for every batch sample.
-            condition: Model-input condition for the same batch.
+            condition: Cached or already-prepared model-input condition for the
+                same batch.
             generator: Optional deterministic generator used by stochastic encoders.
 
         Returns:
@@ -614,7 +751,7 @@ class BaseAdapter(ABC):
                 f"offline output-state encoding is unavailable for adapter "
                 f"{type(self).__name__}: {unavailable_reason}"
             )
-        contract = self.pipeline_io_contract
+        contract = self.effective_pipeline_io_contract
         if contract is None:
             raise RuntimeError(
                 f"adapter {type(self).__name__} cannot encode output state because it does not "
@@ -626,11 +763,6 @@ class BaseAdapter(ABC):
                 f"adapter {type(self).__name__} declares pipeline_io_contract but does not "
                 "provide an output-state codec through build_output_state_codec()"
             )
-        if not isinstance(condition, Mapping):
-            raise TypeError(
-                "expected output-state condition to be Mapping[str, Any], "
-                f"received {type(condition).__name__}: {condition!r}"
-            )
         if generator is not None and not isinstance(generator, torch.Generator):
             raise TypeError(
                 "expected output-state generator to be torch.Generator or None, "
@@ -638,10 +770,21 @@ class BaseAdapter(ABC):
             )
 
         validated_media = validate_output_candidate_batch(media_batch, contract)
+        if isinstance(condition, PreparedConditionState):
+            prepared_condition = condition
+        elif isinstance(condition, Mapping):
+            prepared_condition = self.prepare_condition_state(condition, generator)
+        else:
+            raise TypeError(
+                "expected output-state condition to be Mapping[str, Any] or "
+                "PreparedConditionState, "
+                f"received {type(condition).__name__}: {condition!r}"
+            )
+        codec_condition = prepared_condition.output_codec_condition()
         with torch.no_grad():
             encoded = codec.encode_output_state(
                 validated_media,
-                condition,
+                codec_condition,
                 generator,
             )
 
@@ -672,7 +815,7 @@ class BaseAdapter(ABC):
                 device=self.device,
             )
 
-        self._validate_encoded_output_geometry(validated_media, condition, encoded)
+        self._validate_encoded_output_geometry(validated_media, codec_condition, encoded)
         return encoded
 
     def decode_output_state(
@@ -754,7 +897,8 @@ class BaseAdapter(ABC):
         raise NotImplementedError(
             f"adapter {type(self).__name__} provides an output-state codec but must override "
             "_validate_encoded_output_geometry() to validate geometry signatures against "
-            f"geometry_source={self.pipeline_io_contract.geometry_source.value!r}"
+            "geometry_source="
+            f"{self.effective_pipeline_io_contract.geometry_source.value!r}"
         )
 
     # ============================== Loading Components ==============================
@@ -4370,6 +4514,40 @@ class BaseAdapter(ABC):
             active_numel=active_numel,
             state=state,
         )
+
+    def reduce_flow_matching_objective_values(
+        self,
+        values: Mapping[str, torch.Tensor],
+        *,
+        state: Optional[LatentState] = None,
+    ) -> torch.Tensor:
+        """Reduce offline flow-matching errors to one scalar per sample.
+
+        This objective-specific boundary is deliberately separate from the
+        trajectory-wide element-weighted reducer used by online policy and
+        distillation algorithms. Most adapters inherit the existing global
+        reduction unchanged; multi-modal training recipes may override the
+        protected hook without changing rollout likelihood semantics.
+
+        Args:
+            values: Per-element squared errors in component order.
+            state: Noised state supplying active masks.
+
+        Returns:
+            One flow-matching objective value per batch sample.
+        """
+        batch_size = bridge.validate_reduction_inputs(self, values, state)
+        reduced = self._reduce_flow_matching_objective_values(values, state=state)
+        return bridge.validate_reduced_latent_values(self, reduced, batch_size)
+
+    def _reduce_flow_matching_objective_values(
+        self,
+        values: Mapping[str, torch.Tensor],
+        *,
+        state: Optional[LatentState] = None,
+    ) -> torch.Tensor:
+        """Use the existing globally element-weighted reduction by default."""
+        return self.reduce_latent_values(values, state=state)
 
     # ======================================= Sampling & Training =======================================
     @abstractmethod

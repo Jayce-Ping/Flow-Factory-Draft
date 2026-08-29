@@ -24,6 +24,7 @@ from accelerate.data_loader import BatchSamplerShard, DataLoaderShard
 from accelerate.utils import DistributedType
 from torch.utils.data import ConcatDataset, DataLoader, DistributedSampler
 
+from flow_factory.contracts import NegativePromptPolicy
 from flow_factory.contracts.execution import OFFLINE_EXECUTION_CONTRACT
 from flow_factory.data_utils.dataset import GeneralDataset
 from flow_factory.data_utils.multi_source import (
@@ -36,6 +37,7 @@ from flow_factory.hparams.optimizer_args import (
     AdamWOptimizerArguments,
     MultiOptimizerArguments,
 )
+from flow_factory.models.pipeline_contracts import image_output_contract
 from flow_factory.trainers.common.runtime_identity import (
     build_trainer_runtime_identity,
 )
@@ -201,10 +203,16 @@ class _Trainer:
         log_every: int = 10,
         max_grad_norm: float = 1.0,
         update_frequency: int = 1,
+        accepts_image_input: bool = False,
         dataloader: DataLoader | None = None,
     ) -> None:
         parameter = torch.nn.Parameter(torch.zeros(width, width))
         self.adapter = _Adapter()
+        self.adapter.effective_pipeline_io_contract = image_output_contract(
+            negative_prompt=NegativePromptPolicy.OPTIONAL,
+            input_image_min_count=0 if accepts_image_input else None,
+            input_image_max_count=1 if accepts_image_input else None,
+        )
         self.adapter.component_variant_registry = _Registry(
             {"base": (_Record("transformer", "weight", parameter),)}
         )
@@ -318,6 +326,15 @@ def test_parameter_and_optimizer_schema_changes_have_independent_digests() -> No
     assert changed_shape["parameter_schema_digest"] != baseline["parameter_schema_digest"]
     assert changed_optimizer["parameter_schema_digest"] == baseline["parameter_schema_digest"]
     assert changed_optimizer["optimizer_schema_digest"] != baseline["optimizer_schema_digest"]
+
+
+def test_effective_pipeline_contract_changes_execution_identity() -> None:
+    """Checkpoint-realized input semantics are exact-resume boundaries."""
+    baseline = build_trainer_runtime_identity(_Trainer(accepts_image_input=False))
+    changed = build_trainer_runtime_identity(_Trainer(accepts_image_input=True))
+
+    assert changed["execution_contract_digest"] != baseline["execution_contract_digest"]
+    assert changed["data_contract_digest"] == baseline["data_contract_digest"]
 
 
 @pytest.mark.parametrize(

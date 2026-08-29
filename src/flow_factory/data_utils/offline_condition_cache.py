@@ -30,6 +30,13 @@ from typing import Any, Dict, List, Mapping, MutableMapping, Sequence
 
 from datasets import Dataset as HFDataset
 
+from ..contracts import (
+    BatchCapability,
+    InputMediaBinding,
+    NegativePromptPolicy,
+    PipelineIOContract,
+    resolve_pipeline_input_media_slots,
+)
 from ..samples.references import canonicalize_reference_manifest
 from .dataset import (
     METADATA_COLUMN,
@@ -43,7 +50,7 @@ from .offline_dataset import (
 )
 from .schema import MediaAsset, NormalizedDatasetRecord
 
-_CONDITION_SOURCE_FORMAT = "flow-factory-offline-condition-v1"
+_CONDITION_SOURCE_FORMAT = "flow-factory-offline-condition-v3"
 
 
 def project_offline_condition_dataset(
@@ -51,6 +58,7 @@ def project_offline_condition_dataset(
     *,
     source_name: str,
     ordered_references: bool,
+    pipeline_io_contract: PipelineIOContract | None = None,
     _media_digest_cache: MutableMapping[str, str] | None = None,
 ) -> HFDataset:
     """Build an input-only raw dataset for ``GeneralDataset`` preprocessing.
@@ -65,6 +73,23 @@ def project_offline_condition_dataset(
         raise TypeError(
             "ordered_references must be a bool, " f"got {type(ordered_references).__name__}"
         )
+    if pipeline_io_contract is not None and not isinstance(
+        pipeline_io_contract, PipelineIOContract
+    ):
+        raise TypeError(
+            "pipeline_io_contract must be a PipelineIOContract or None, "
+            f"got {type(pipeline_io_contract).__name__}"
+        )
+    if pipeline_io_contract is not None:
+        expected_ordered_references = (
+            pipeline_io_contract.input_media.binding is InputMediaBinding.ORDERED_REFERENCES
+        )
+        if ordered_references != expected_ordered_references:
+            raise ValueError(
+                "offline condition projection binding disagrees with pipeline contract: "
+                f"ordered_references={ordered_references}, "
+                f"contract={pipeline_io_contract.input_media.binding.value!r}"
+            )
     stable_records = tuple(records)
     if not stable_records:
         raise ValueError("offline condition projection requires at least one record")
@@ -91,9 +116,28 @@ def project_offline_condition_dataset(
         "prompt": [record.model_input.prompt for record in stable_records],
         OFFLINE_CONDITION_ID_COLUMN: condition_ids,
     }
+    resolved_slots = []
+    for record in stable_records:
+        if pipeline_io_contract is None:
+            slots = tuple(None for _ in record.model_input.media)
+            if any(asset.slot is not None for asset in record.model_input.media):
+                raise ValueError(
+                    "offline condition projection requires pipeline_io_contract when "
+                    "input media declares semantic slots"
+                )
+        else:
+            slots = resolve_pipeline_input_media_slots(
+                record.model_input,
+                pipeline_io_contract,
+            )
+        resolved_slots.append(slots)
 
     negative_prompts = [record.model_input.negative_prompt for record in stable_records]
-    if any(value is not None for value in negative_prompts):
+    projects_negative_prompt = (
+        pipeline_io_contract is not None
+        and pipeline_io_contract.negative_prompt is not NegativePromptPolicy.UNSUPPORTED
+    )
+    if projects_negative_prompt or any(value is not None for value in negative_prompts):
         # Adapter tokenizers consume a homogeneous text batch. In a mixed V2
         # batch, an omitted optional negative prompt is semantically the empty
         # prompt, not a tokenizer-level ``None`` value.
@@ -110,37 +154,60 @@ def project_offline_condition_dataset(
             for index, record in enumerate(stable_records)
         ]
     else:
+        grouped_rows = [
+            _group_media_by_type_and_slot(
+                record.model_input.media,
+                slots,
+                pipeline_io_contract,
+            )
+            for record, slots in zip(stable_records, resolved_slots)
+        ]
         grouped_columns = {
-            "images": [
-                [asset.path for asset in record.model_input.media if asset.type == "image"]
-                for record in stable_records
-            ],
+            "images": [[asset.path for asset, _ in row["image"]] for row in grouped_rows],
             "videos": [
-                [
-                    _to_grouped_rate_spec(asset, rate_name="fps")
-                    for asset in record.model_input.media
-                    if asset.type == "video"
-                ]
-                for record in stable_records
+                [_to_grouped_rate_spec(asset, rate_name="fps") for asset, _ in row["video"]]
+                for row in grouped_rows
             ],
             "audios": [
-                [
-                    _to_grouped_rate_spec(asset, rate_name="sample_rate")
-                    for asset in record.model_input.media
-                    if asset.type == "audio"
-                ]
-                for record in stable_records
+                [_to_grouped_rate_spec(asset, rate_name="sample_rate") for asset, _ in row["audio"]]
+                for row in grouped_rows
             ],
+            "image_slots": [[slot for _, slot in row["image"]] for row in grouped_rows],
+            "video_slots": [[slot for _, slot in row["video"]] for row in grouped_rows],
+            "audio_slots": [[slot for _, slot in row["audio"]] for row in grouped_rows],
         }
-        columns.update(
-            {column_name: values for column_name, values in grouped_columns.items() if any(values)}
+        declared_rules = (
+            {}
+            if pipeline_io_contract is None
+            else {rule.format.type.value: rule for rule in pipeline_io_contract.input_media.rules}
         )
+        column_media_types = {
+            "images": "image",
+            "videos": "video",
+            "audios": "audio",
+            "image_slots": "image",
+            "video_slots": "video",
+            "audio_slots": "audio",
+        }
+        for column_name, values in grouped_columns.items():
+            media_type = column_media_types[column_name]
+            rule = declared_rules.get(media_type)
+            if column_name.endswith("_slots"):
+                include = rule is not None and bool(rule.slots)
+            else:
+                include = rule is not None if pipeline_io_contract is not None else any(values)
+            if include:
+                columns[column_name] = values
 
     return HFDataset.from_dict(columns)
 
 
-def compute_offline_condition_source_hash(condition_ids: Sequence[str]) -> str:
-    """Hash ordered input identities for an input-only cache fingerprint."""
+def compute_offline_condition_source_hash(
+    condition_ids: Sequence[str],
+    *,
+    pipeline_io_contract: PipelineIOContract | None = None,
+) -> str:
+    """Hash ordered inputs and their effective projection contract."""
     stable_ids = tuple(condition_ids)
     if not stable_ids:
         raise ValueError("offline condition source hash requires at least one condition id")
@@ -150,10 +217,19 @@ def compute_offline_condition_source_hash(condition_ids: Sequence[str]) -> str:
                 "offline condition ids must be non-empty strings, "
                 f"got {condition_id!r} at index {index}"
             )
+    if pipeline_io_contract is not None and not isinstance(
+        pipeline_io_contract,
+        PipelineIOContract,
+    ):
+        raise TypeError(
+            "pipeline_io_contract must be a PipelineIOContract or None, "
+            f"got {type(pipeline_io_contract).__name__}"
+        )
     payload = json.dumps(
         {
             "format": _CONDITION_SOURCE_FORMAT,
             "condition_ids": stable_ids,
+            "input_projection_contract": _input_projection_contract_identity(pipeline_io_contract),
         },
         ensure_ascii=False,
         allow_nan=False,
@@ -169,6 +245,7 @@ def build_offline_condition_cache(
     dataset_dir: str | os.PathLike[str],
     preprocess_func: PreprocessCallable,
     preprocess_kwargs: Mapping[str, Any] | None = None,
+    pipeline_io_contract: PipelineIOContract | None = None,
     cache_dir: str | os.PathLike[str] = "~/.cache/flow_factory/datasets",
     force_reprocess: bool = False,
     preprocessing_batch_size: int | None = None,
@@ -193,16 +270,24 @@ def build_offline_condition_cache(
         records,
         source_name=source_name,
         ordered_references=ordered_references,
+        pipeline_io_contract=pipeline_io_contract,
     )
     condition_ids = tuple(raw_dataset[OFFLINE_CONDITION_ID_COLUMN])
-    source_hash = compute_offline_condition_source_hash(condition_ids)
+    source_hash = compute_offline_condition_source_hash(
+        condition_ids,
+        pipeline_io_contract=pipeline_io_contract,
+    )
     normalized_dataset_dir = os.path.expanduser(os.fspath(dataset_dir))
     normalized_cache_dir = os.path.expanduser(os.fspath(cache_dir))
     normalized_preprocess_kwargs = dict(preprocess_kwargs or {})
     normalized_extra_hash_strs = list(extra_hash_strs or ())
 
+    requires_single_sample_batches = ordered_references or (
+        pipeline_io_contract is not None
+        and pipeline_io_contract.batch_capability is BatchCapability.SINGLE_SAMPLE
+    )
     if preprocessing_batch_size is None:
-        preprocessing_batch_size = 1 if ordered_references else 16
+        preprocessing_batch_size = 1 if requires_single_sample_batches else 16
     if (
         not isinstance(preprocessing_batch_size, int)
         or isinstance(preprocessing_batch_size, bool)
@@ -212,6 +297,8 @@ def build_offline_condition_cache(
             "preprocessing_batch_size must be a positive integer, "
             f"got {preprocessing_batch_size!r}"
         )
+    if requires_single_sample_batches:
+        preprocessing_batch_size = 1
 
     normalized_target_arrow_path: str
     if target_arrow_path is None:
@@ -261,12 +348,65 @@ def _to_legacy_reference(asset: MediaAsset) -> Dict[str, Any]:
     return reference
 
 
+def _input_projection_contract_identity(
+    contract: PipelineIOContract | None,
+) -> Dict[str, Any] | None:
+    """Return the canonical contract fields that can alter input preprocessing."""
+    if contract is None:
+        return None
+    input_media = contract.input_media
+    return {
+        "binding": input_media.binding.value,
+        "order": input_media.order.value,
+        "min_total_count": input_media.min_total_count,
+        "max_total_count": input_media.max_total_count,
+        "required_any_types": [value.value for value in input_media.required_any_types],
+        "rules": [
+            {
+                "type": rule.format.type.value,
+                "fps": rule.format.fps.value,
+                "sample_rate": rule.format.sample_rate.value,
+                "min_count": rule.min_count,
+                "max_count": rule.max_count,
+                "slots": list(rule.slots),
+                "required_slots": list(rule.required_slots),
+            }
+            for rule in input_media.rules
+        ],
+        "negative_prompt": contract.negative_prompt.value,
+        "batch_capability": contract.batch_capability.value,
+    }
+
+
 def _to_grouped_rate_spec(asset: MediaAsset, *, rate_name: str) -> Dict[str, Any]:
     spec: Dict[str, Any] = {"path": asset.path}
     rate = getattr(asset, rate_name)
     if rate is not None:
         spec[rate_name] = rate
     return spec
+
+
+def _group_media_by_type_and_slot(
+    media: Sequence[MediaAsset],
+    slots: Sequence[str | None],
+    contract: PipelineIOContract | None,
+) -> Dict[str, List[tuple[MediaAsset, str | None]]]:
+    """Group one record and canonicalize slotted media into declaration order."""
+    grouped: Dict[str, List[tuple[MediaAsset, str | None]]] = {
+        "image": [],
+        "video": [],
+        "audio": [],
+    }
+    for asset, slot in zip(media, slots):
+        grouped[asset.type].append((asset, slot))
+    if contract is None:
+        return grouped
+    for rule in contract.input_media.rules:
+        if not rule.slots:
+            continue
+        slot_order = {slot: index for index, slot in enumerate(rule.slots)}
+        grouped[rule.format.type.value].sort(key=lambda item: slot_order[item[1]])
+    return grouped
 
 
 __all__ = [

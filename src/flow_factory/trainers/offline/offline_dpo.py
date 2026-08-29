@@ -34,7 +34,7 @@ from ..common.flow_matching import (
     validate_preference_component_times,
     validate_preference_output_states,
 )
-from ..common.offline_batch import bind_output_forward_context, move_condition_to_device
+from ..common.offline_batch import bind_prepared_condition_output, move_condition_to_device
 from ..forward_process import forward_velocity_state
 
 MetricAccumulator = Dict[str, List[torch.Tensor]]
@@ -53,7 +53,7 @@ class OfflineDPOTrainer(BaseTrainer):
             accelerator=self.accelerator,
             preprocess_func=self.adapter.preprocess_func,
             supervision_type="preference",
-            pipeline_io_contract=self.adapter.pipeline_io_contract,
+            pipeline_io_contract=self.adapter.effective_pipeline_io_contract,
         )
         return dataloader, {}
 
@@ -63,12 +63,19 @@ class OfflineDPOTrainer(BaseTrainer):
         self.adapter.train()
 
         condition = move_condition_to_device(batch.condition, self.accelerator.device)
-        chosen = self.adapter.encode_output_state(preference.chosen_media, condition)
-        rejected = self.adapter.encode_output_state(preference.rejected_media, condition)
+        prepared_condition = self.adapter.prepare_condition_state(condition)
+        chosen = self.adapter.encode_output_state(preference.chosen_media, prepared_condition)
+        rejected = self.adapter.encode_output_state(preference.rejected_media, prepared_condition)
         validate_preference_output_states(chosen, rejected)
 
-        chosen_batch = bind_output_forward_context(condition, chosen.forward_context)
-        rejected_batch = bind_output_forward_context(condition, rejected.forward_context)
+        chosen_batch = bind_prepared_condition_output(
+            prepared_condition,
+            chosen.forward_context,
+        )
+        rejected_batch = bind_prepared_condition_output(
+            prepared_condition,
+            rejected.forward_context,
+        )
         all_timesteps = sample_offline_timesteps(
             self.training_args,
             batch_size=len(preference.chosen_media),

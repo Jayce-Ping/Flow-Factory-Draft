@@ -128,6 +128,11 @@ def build_default_execution_identity_payload(trainer: Any) -> dict[str, Any]:
     execution_contract = type(trainer).execution_contract
     acquisition = getattr(execution_contract, "acquisition", None)
     feedback = getattr(execution_contract, "feedback", None)
+    pipeline_io_contract = getattr(
+        trainer.adapter,
+        "effective_pipeline_io_contract",
+        None,
+    )
     return {
         "contract": {
             "acquisition": _enum_identity_value(
@@ -140,6 +145,7 @@ def build_default_execution_identity_payload(trainer: Any) -> dict[str, Any]:
             ),
             "paradigm": getattr(type(trainer), "paradigm", None),
         },
+        "pipeline_io_contract": pipeline_io_contract,
         "training": training,
         "scheduler": scheduler,
         "realized_scheduler_group": _scheduler_group_schema(trainer.adapter),

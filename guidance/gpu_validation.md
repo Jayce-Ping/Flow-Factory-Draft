@@ -1,0 +1,240 @@
+# GPU Validation Plan
+
+This document is the handoff contract for real-weight GPU validation. It does
+not claim that an unexecuted combination is supported. A combination becomes
+validated only after its artifacts satisfy the acceptance criteria below.
+
+## Environment gate
+
+Record the following once for every validation campaign:
+
+- Flow-Factory commit SHA and parent stacked-PR SHA.
+- Python, CUDA, PyTorch, Accelerate, DeepSpeed, and Diffusers versions.
+- `diffusers>=0.40.0`; do not mix results from an older official release.
+- GPU model, GPU count, per-GPU memory, driver, and NCCL versions.
+- Exact model revision and dataset-content hash.
+- `PYTHONPATH` and editable-install source must resolve to the tested worktree.
+
+Run a configuration/import preflight before allocating model weights:
+
+```bash
+python -m compileall -q src/flow_factory
+python -c "import diffusers; assert tuple(map(int, diffusers.__version__.split('.')[:2])) >= (0, 40)"
+```
+
+## Main experiment matrix
+
+The main campaign is the Cartesian product of the ten semantic modes, three
+distributed backends, and four algorithms below: **10 x 3 x 4 = 120 jobs**.
+Do not collapse first-frame and first/last-frame Wan rows: they exercise
+different condition layouts and active masks.
+
+### Semantic modes
+
+| ID | Mode | Representative checkpoint | Required input | Required output |
+|---|---|---|---|---|
+| `sd35-t2i` | SD3.5 text-to-image regression anchor | `stabilityai/stable-diffusion-3.5-medium` | prompt | image |
+| `bagel-mri2i` | Bagel ordered multi-reference-images-to-image regression anchor | `ByteDance-Seed/BAGEL-7B-MoT` | prompt plus exactly two ordered images per sample | image |
+| `wan-t2v` | Wan text-to-video | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | prompt | video |
+| `wan-i2v-first` | Wan first-frame-to-video | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | exactly one first-frame image | video |
+| `wan-flf2v` | Wan first/last-frame-to-video | `Wan-AI/Wan2.1-I2V-14B-480P-Diffusers` | ordered first and last images | video |
+| `ltx2-t2av` | LTX2 text-to-audio-video | `Lightricks/LTX-2` | prompt | ordered video and audio |
+| `ltx2-i2av` | LTX2 image-to-audio-video | `Lightricks/LTX-2` | prompt plus one image | ordered video and audio |
+| `h3-t2va` | MiniMax H3 text-to-video-audio | `MiniMaxAI/MiniMax-H3` | prompt | ordered video and audio |
+| `h3-fl2va` | MiniMax H3 sparse first/last-frame-to-video-audio | `MiniMaxAI/MiniMax-H3` | `first_frame`, `last_frame`, or both image slots | ordered video and audio |
+| `h3-ref2va` | MiniMax H3 ordered-reference-to-video-audio | `MiniMaxAI/MiniMax-H3` | 1-12 ordered heterogeneous references, including image or video | ordered video and audio |
+
+The public V2 schema uses the `type` discriminator and an optional input-only
+`slot`. An explicit slot reserves its adapter-declared semantic argument;
+unslotted media is only a positional shorthand that fills remaining slots in
+declaration order. Wan requires `first_frame` and optionally accepts
+`last_frame`; H3 FL accepts either slot or both. Supervision media does not
+repeat independent condition-image objects. Its video is nevertheless the full
+configured output sequence, whose first and/or last endpoint must correspond to
+the supplied endpoint conditions.
+
+### Backends
+
+| ID | `config_file` | Required observation |
+|---|---|---|
+| `ddp` | `config/accelerate_configs/multi_gpu.yaml` | Every rank executes the same branch and step count. |
+| `zero2` | `config/deepspeed/deepspeed_zero2.yaml` | Optimizer state is partitioned and both policy/reference scopes complete. |
+| `fsdp2` | `config/accelerate_configs/fsdp2.yaml` | Adapter wrap plan, DTensor parameters, checkpointing, and component routing remain valid. |
+
+### Algorithms and stopping rules
+
+| ID | `train.trainer_type` | Exact smoke length | Evaluation |
+|---|---|---|---|
+| `grpo` | `grpo` | two training epochs, one optimizer step per epoch | `eval.eval_freq: 0` |
+| `sft` | `sft` | exactly two rank-local dataloader batches | `eval.eval_freq: 0` |
+| `offline-dpo` | `offline-dpo` | exactly two rank-local dataloader batches | `eval.eval_freq: 0` |
+| `tdm` | `tdm` | two training epochs, one generator/fake update cycle per epoch | `eval.eval_freq: 0` |
+
+For SFT and offline DPO, build a finite dataset whose official
+`DistributedSampler` yields exactly two batches per rank, set
+`gradient_accumulation_steps: 1`, and run one complete dataloader epoch. One
+offline epoch means one complete dataloader traversal. Sampler tail padding is
+standard PyTorch behavior and does not change that definition.
+
+For GRPO and TDM, use `max_epochs: 2`,
+`gradient_step_per_epoch: 1`, the smallest valid group size, and no evaluation.
+Reduce resolution, frame count, and inference steps only within each adapter's
+declared geometry constraints. MiniMax H3 must retain at least five seconds of
+24-fps output even in a low-resolution smoke run.
+
+### Concrete smoke profiles
+
+Use these geometry and sampling overlays unless a real checkpoint rejects the
+reduced geometry. Any fallback must stay valid for the adapter contract and be
+recorded in the resolved YAML; do not silently return to a large quality recipe.
+
+| Mode | Starting recipe | Train geometry | Steps | Algorithm-specific notes |
+|---|---|---|---|---|
+| `sd35-t2i` | `examples/grpo/lora/sd3_5/default.yaml` | `resolution: 256` | `num_inference_steps: 2` | Use the checked-in SD3.5 SFT/offline-DPO/TDM recipe as the algorithm overlay. |
+| `bagel-mri2i` | `examples/grpo/lora/bagel/i2i.yaml` | `resolution: 256` | `num_inference_steps: 2` | Every row has exactly two ordered references; keep `shuffle_samples: false`. |
+| `wan-t2v` | `examples/grpo/lora/wan21/t2v.yaml` | `resolution: 240`, `num_frames: 5` | `num_inference_steps: 2` | Target video has at least five frames and carries its source `fps`. |
+| `wan-i2v-first` | `examples/grpo/lora/wan22/i2v.yaml` | `resolution: 240`, `num_frames: 5` | `num_inference_steps: 2` | Use TI2V-5B and exactly one condition image. |
+| `wan-flf2v` | `examples/grpo/lora/wan21/i2v.yaml` | `resolution: 240`, `num_frames: 5` | `num_inference_steps: 2` | Use two ordered condition images; do not use an expanded-timestep checkpoint. |
+| `ltx2-t2av` | `examples/grpo/lora/ltx2/t2av.yaml` | `resolution: [128, 192]`, `num_frames: 9`, `frame_rate: 24.0` | `num_inference_steps: 2` | AV targets cover the exact 9-frame clock; audio carries `sample_rate`. |
+| `ltx2-i2av` | `examples/grpo/lora/ltx2/i2av.yaml` | `resolution: [128, 192]`, `num_frames: 9`, `frame_rate: 24.0` | `num_inference_steps: 2` | One condition image; verify the first latent frame is inactive in the loss. |
+| `h3-t2va` | `examples/grpo/lora/minimax_h3_t2va/debug.yaml` | `resolution: [64, 96]`, `num_frames: 124`, `frame_rate: 24.0` | `num_inference_steps: 2` | Preserve the released five-second minimum and neutral guidance. |
+| `h3-fl2va` | `examples/grpo/lora/minimax_h3_fl2va/default.yaml` plus H3 debug geometry | `resolution: [64, 96]`, `num_frames: 124`, `frame_rate: 24.0` | `num_inference_steps: 2` | The two offline records are explicit `first_frame`-only and `last_frame`-only cases. Cover both slots together in the additional variant gate. |
+| `h3-ref2va` | `examples/grpo/lora/minimax_h3_ref2va/default.yaml` plus H3 debug geometry | `resolution: [64, 96]`, `num_frames: 124`, `frame_rate: 24.0` | `num_inference_steps: 2` | Preserve heterogeneous global reference order; include image, video, and audio references. |
+
+For GRPO set `group_size: 2`, `unique_sample_num_per_epoch: 1`, and
+`gradient_accumulation_steps: auto`; this avoids a degenerate one-candidate
+advantage while retaining one optimizer step per epoch. For TDM set
+`group_size: 1` and `gradient_accumulation_steps: auto`; with the two-step smoke
+profile the resolved accumulation count must be divisible by two. SFT and
+offline DPO use `gradient_accumulation_steps: 1`. Use at least two distributed
+ranks for every backend; increase the rank count only for checkpoint memory
+capacity, without changing the two iteration/batch stopping rule.
+
+The offline fixture must contain exactly `2 * world_size` records and use
+`per_device_batch_size: 1`, so `DistributedSampler(drop_last=False)` yields two
+non-padded batches on every rank. Demonstration and preference fixtures use the
+same input distribution. Preference rows must use distinct chosen/rejected
+media files with identical geometry. Before launch, validate conditioned target
+endpoints against their inputs: LTX2 I2AV and first-conditioned Wan/H3 targets
+must begin with the supplied first frame within the fixture tolerance; a target
+with a last-frame condition must end with that supplied frame. Store the
+comparison metric and tolerance in the fixture manifest.
+
+The campaign generator should materialize one job ID for every Cartesian-product
+cell as `{mode}__{backend}__{algorithm}` and assert that the set has exactly 120
+unique IDs before submission. A skipped or infrastructure-blocked cell remains
+in the result table with its failure classification; it must not silently reduce
+the matrix.
+
+## Checkpoint-variant coverage
+
+The 120-job main matrix uses one checkpoint per semantic mode. Run the following
+additional variant gate before declaring a family generally supported. The
+minimum gate is DDP plus SFT and offline DPO for two batches each; configuration
+construction and static contract validation must also pass under all three
+backends and all four algorithms.
+
+| Family mode | Additional checkpoint variants |
+|---|---|
+| Wan T2V | `Wan2.1-T2V-14B-Diffusers`, `Wan2.2-TI2V-5B-Diffusers`, `Wan2.2-T2V-A14B-Diffusers` |
+| Wan I2V first-only | `Wan2.1-I2V-14B-480P-Diffusers`, `Wan2.1-I2V-14B-720P-Diffusers`, `Wan2.2-I2V-A14B-Diffusers` |
+| Wan first/last | `Wan2.1-I2V-14B-720P-Diffusers`, `Wan2.2-I2V-A14B-Diffusers` |
+| LTX2 T2AV and I2AV | `Lightricks/LTX-2.3` or its canonical official-Diffusers repository revision |
+| MiniMax H3 | The same checkpoint is covered separately by T2VA, FL2VA, and Ref2VA inputs. Add an FL2VA first-plus-last fixture to complement the first-only/last-only main jobs. |
+
+Wan2.2 TI2V-5B uses expanded timesteps. Official Diffusers ignores a supplied
+last image in that mode, so its effective input contract is first-frame only;
+do not count it as a first/last checkpoint. Other Wan I2V checkpoints must prove
+both first-only and first/last execution.
+
+For the Wan2.2 A14B dual-transformer gate, force or instrument two offline
+timestep samples so that one routes below the transformer boundary and one
+routes at or above it. Record both sampled timesteps and the selected component.
+Two unconstrained random batches are not sufficient evidence that both intended
+trainable transformers updated.
+
+## Per-job overrides
+
+Start from the closest checked-in example and apply a reviewable overlay. Every
+generated job must make these values explicit:
+
+```yaml
+log:
+  logging_backend: none
+  save_freq: 0
+
+train:
+  per_device_batch_size: 1
+  ema_decay: 0
+  enable_gradient_checkpointing: true
+  seed: 42
+  max_epochs: 2  # Use 1 for the finite two-batch offline fixture.
+
+eval:
+  eval_freq: 0
+```
+
+Offline jobs additionally require a homogeneous V2 manifest, unit source
+weights, on-the-fly target media encoding, and `num_train_timesteps: 1`.
+Offline DPO chosen/rejected media must share one prepared condition state, the
+same component times, and the same diffusion noise. Do not add a target-latent
+preprocessing cache.
+
+GRPO jobs should use the smallest reward model that still exercises reward
+routing. TDM is reward-free and needs both generator and fake optimizer
+entries. Disable W&B and checkpoint saving for the smoke campaign.
+
+Bagel workers require the project `bagel` extra in addition to the selected
+distributed backend, including a compatible `flash-attn` build and OpenCV. For
+example, a DeepSpeed worker should install `.[deepspeed,bagel]`. Record the
+installed optional reward extras in the environment manifest as well; a missing
+Bagel or reward dependency is an `import` failure, not a model-support result.
+
+Keep the two-reference Bagel cardinality identical on every rank in the FSDP2
+main-matrix job. Ragged per-rank reference-round counts are a separate stress
+case because a sharded language model must execute the same number of parameter
+all-gathers on every rank.
+
+## Acceptance criteria
+
+A job passes only when all of the following are captured:
+
+1. Configuration parsing, registry lookup, and all imports succeed from the
+   tested worktree.
+2. Model loading preserves the adapter's component-dtype manifest and produces
+   no unexpected FP32/BF16/FP16 coercion.
+3. Every rank reports identical branch routing, batch count, optimizer-step
+   count, and terminal status; no rank hangs at a collective.
+4. Both iterations/batches produce finite loss, finite gradient norm, and a
+   confirmed parameter update for every intended trainable component.
+5. SFT target encoding runs on the fly. Offline DPO reuses one prepared input
+   realization for chosen and rejected outputs and keeps paired noise/time
+   coupling exact.
+6. Conditioned video/audio jobs retain their pinned condition regions through
+   noising and forward loss masks. Unconditioned target regions remain active.
+7. Joint audio-video jobs report both components, aligned durations, valid
+   component-specific scheduler times, and the intended objective reduction.
+8. GRPO replay likelihood and TDM replay checks satisfy the configured
+   tolerances. Condition media and derived prefixes are retained in every
+   conditioned mode. TDM may intentionally skip decoding generated output media
+   when its algorithm contract does not consume it.
+9. Peak allocated/reserved GPU memory and wall time are recorded for capacity
+   planning.
+10. The command, resolved YAML, stdout/stderr log, environment manifest, and a
+    compact metrics JSON are attached to the job result.
+
+## Failure classification
+
+Classify failures before retrying:
+
+- `contract`: schema, media cardinality/order, geometry, or capability mismatch.
+- `import`: dependency, registry, optional component, or worktree-resolution error.
+- `model`: official pipeline/adapter semantic mismatch.
+- `algorithm`: loss, replay, reference-policy, or objective coupling error.
+- `backend`: DDP/DeepSpeed/FSDP2 wrapping, collective, dtype, or checkpoint issue.
+- `capacity`: reproducible OOM after the allowed geometry reductions.
+- `infrastructure`: download, permission, driver, filesystem, or cluster failure.
+
+Do not mark `capacity` or `infrastructure` failures as unsupported model/algorithm
+combinations. Preserve the first failing artifact and link any follow-up fix to
+the exact job ID `{mode}__{backend}__{algorithm}`.

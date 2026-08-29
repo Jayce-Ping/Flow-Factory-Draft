@@ -71,13 +71,52 @@ def test_examples_readme_links_h3_and_separates_validation_levels() -> None:
         relative_link = f"../{root_link}"
         assert relative_link in text
         assert (ROOT / root_link).is_file()
-    assert "Schema/API validated only" in text
+    assert "schema/API and local offline-path validated" in text
+    assert "GPU validation plan" in text
     assert "hardware" in text
     assert "reward" in text
     assert "61 GB" in text
     assert "ImageBind" in text
     assert "facebookresearch/ImageBind.git" in text
     assert "NonCommercial" in text
+
+
+def test_gpu_validation_plan_declares_the_complete_smoke_matrix() -> None:
+    text = _text("guidance/gpu_validation.md")
+
+    assert "10 x 3 x 4 = 120 jobs" in text
+    for mode in (
+        "sd35-t2i",
+        "bagel-mri2i",
+        "wan-t2v",
+        "wan-i2v-first",
+        "wan-flf2v",
+        "ltx2-t2av",
+        "ltx2-i2av",
+        "h3-t2va",
+        "h3-fl2va",
+        "h3-ref2va",
+    ):
+        assert f"`{mode}`" in text
+    for backend in ("ddp", "zero2", "fsdp2"):
+        assert f"`{backend}`" in text
+    for algorithm in ("grpo", "sft", "offline-dpo", "tdm"):
+        assert f"`{algorithm}`" in text
+    assert "exactly two rank-local dataloader batches" in text
+    assert "two training epochs" in text
+    assert "eval.eval_freq: 0" in text
+    assert "DistributedSampler" in text
+
+
+def test_install_docs_use_the_released_diffusers_runtime() -> None:
+    readme = _text("README.md")
+    dockerfile = _text("docker/docker-cuda/Dockerfile")
+    docker_readme = _text("docker/README.md")
+
+    assert "diffusers>=0.40.0" in readme
+    assert "pip install -e ./diffusers" not in readme
+    assert "pip install -e ./diffusers" not in dockerfile
+    assert "submodule (required)" not in docker_readme
 
 
 def test_new_model_guide_documents_component_runtime_boundaries() -> None:

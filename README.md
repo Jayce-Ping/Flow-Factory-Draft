@@ -19,10 +19,9 @@ pip install 'diffusers>=0.40.0'
 pip install -e .
 ```
 
-* **[2026-04-25]** **LTX-2 Audio-Video** support! Generate synchronized audio-video content with RL fine-tuning. LTX-2 requires the bundled `diffusers` submodule (not yet in the official release):
+* **[2026-04-25]** **LTX-2 Audio-Video** support! Generate synchronized audio-video content with RL fine-tuning through the released Diffusers API:
 ```bash
-git submodule update --init
-pip install -e ./diffusers
+pip install 'diffusers>=0.40.0'
 ```
 
 * **[2026-02-01]** Support for multiple **Attention Backends**! Attention-backend selection now lives in the unified `acceleration:` block (the old `model.attn_backend` knob was removed), where it can be combined with `torch.compile` and feature caching — applied in list order:
@@ -80,8 +79,7 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
   <tr><td><a href="https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers">Wan2.2-TI2V-5B</a></td><td>5B</td><td>wan2_t2v</td></tr>
   <tr><td><a href="https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers">Wan2.2-T2V-A14B</a></td><td>A14B</td><td>wan2_t2v</td></tr>
 
-  <tr><td rowspan="5">Image-to-Video</td><td><a href="https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-480P-Diffusers">Wan2.1-I2V-14B-480P</a></td><td>14B</td><td>wan2_i2v</td></tr>
-  <tr><td><a href="https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-480P-Diffusers">Wan2.1-I2V-14B-480P</a></td><td>14B</td><td>wan2_i2v</td></tr>
+  <tr><td rowspan="4">Image-to-Video</td><td><a href="https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-480P-Diffusers">Wan2.1-I2V-14B-480P</a></td><td>14B</td><td>wan2_i2v</td></tr>
   <tr><td><a href="https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-720P-Diffusers">Wan2.1-I2V-14B-720P</a></td><td>14B</td><td>wan2_i2v</td></tr>
   <tr><td><a href="https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers">Wan2.2-TI2V-5B</a></td><td>5B</td><td>wan2_i2v</td></tr>
   <tr><td><a href="https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B-Diffusers">Wan2.2-I2V-A14B</a></td><td>A14B</td><td>wan2_i2v</td></tr>
@@ -99,17 +97,18 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
 
 > **Offline output support:** SFT and offline DPO currently support `sd3-5`, `flux1`,
 > `flux1-kontext`, `flux2`, `flux2-klein`, `qwen-image`, `qwen-image-edit-plus`, `z-image`,
-> `bagel`, `sensenova`, `wan2_t2v`, and `minimax-h3-t2va`. Wan I2V, LTX2, and the
-> conditioned MiniMax H3 FL2VA/Ref2VA workflows fail fast on their currently unresolved
-> output/condition semantics. MiniMax H3 T2VA targets use an exact ordered video/audio pair,
-> encoded on demand into its structured latent state. See the
+> `bagel`, `sensenova`, `wan2_t2v`, `wan2_i2v`, `ltx2_t2av`, `ltx2_i2av`, and all
+> MiniMax H3 workflows. Video/audio targets are encoded on demand and are never written to
+> the preprocessing cache. Conditioned adapters prepare one immutable condition state per batch;
+> offline DPO shares that exact realization across chosen and rejected arms. See the
 > [offline model matrix](guidance/datasets.md#offline-model-support).
 
 > **MiniMax H3 status:** the T2VA debug and
 > [native-quality FSDP2](examples/grpo/lora/minimax_h3_t2va/quality_720p_fsdp2.yaml)
 > paths are real-weight
 > validated; a completed long-run reward trend is not claimed. FL2VA and Ref2VA remain
-> schema/API validated. H3 requires B=1, has no CFG, uses neutral guidance `1.0`, and
+> schema/API and local offline-path validated, pending the documented real-weight GPU matrix.
+> H3 requires B=1, has no CFG, uses neutral guidance `1.0`, and
 > keeps separate video/audio trajectories.
 > Video uses shift 12, audio uses shift 3, and the model predicts data-ward velocity.
 > `num_inference_steps=N` means N transitions and N + 1 states.
@@ -160,16 +159,10 @@ pip install -e .[deepspeed]
 
 > **Note**: The Bagel adapter requires `flash-attn` (>= 2.5.8) and `opencv-python`. Install them with `pip install -e .[bagel]` (the `[bagel]` extra is intentionally not part of `[all]` because flash-attn is heavy to build).
 
-> **Dependency:** MiniMax H3 requires `diffusers>=0.40.0`. PyAV >=18.0.0 decodes
-> ordered video/audio references.
+> **Dependency:** MiniMax H3 and LTX2 require the released `diffusers>=0.40.0` API.
+> PyAV >=18.0.0 decodes ordered video/audio references and target media.
 
-> **Note**: Some models (e.g., LTX-2) require pipeline code not yet released in the official `diffusers` package. For these models, install the bundled diffusers submodule:
-> ```bash
-> git submodule update --init
-> pip install -e ./diffusers
-> ```
-
-A CUDA training image (Python 3.12, **uv**-based install, PyTorch 2.8 + `cu129`, `deepspeed`, `wandb`, bundled `diffusers`) is defined under [`docker/docker-cuda/`](docker/docker-cuda/Dockerfile). See [`docker/README.md`](docker/README.md) for build and run instructions (including `linux/amd64` on Apple Silicon).
+A CUDA training image (Python 3.12, **uv**-based install, PyTorch 2.8 + `cu129`, `deepspeed`, `wandb`, released `diffusers`) is defined under [`docker/docker-cuda/`](docker/docker-cuda/Dockerfile). See [`docker/README.md`](docker/README.md) for build and run instructions (including `linux/amd64` on Apple Silicon).
 
 ## Experiment Trackers
 
@@ -240,12 +233,17 @@ SFT and offline DPO use strict JSONL with `schema_version: 2`. Public media obje
 ```jsonl
 {"schema_version":2,"input":{"prompt":"A clean poster.","media":[]},"supervision":{"type":"demonstration","target":{"media":[{"type":"image","path":"targets/poster.png"}]}},"metadata":{}}
 {"schema_version":2,"input":{"prompt":"A clean poster.","media":[]},"supervision":{"type":"preference","chosen":{"media":[{"type":"image","path":"pairs/chosen.png"}]},"rejected":{"media":[{"type":"image","path":"pairs/rejected.png"}]}},"metadata":{}}
+{"schema_version":2,"input":{"prompt":"Animate toward this ending.","media":[{"type":"image","path":"conditions/end.png","slot":"last_frame"}]},"supervision":{"type":"demonstration","target":{"media":[{"type":"video","path":"targets/story.mp4","fps":24.0},{"type":"audio","path":"targets/story.wav","sample_rate":32000}]}},"metadata":{}}
 ```
+
+The optional input-only `slot` field binds sparse conditions to adapter-declared semantic
+arguments. Unslotted media fills remaining slots positionally; supervision outputs reject slots.
 
 Prompt and input-condition encodings are cached. Target, chosen, and rejected media are decoded and
 encoded on the fly; their VAE latents are never stored in the preprocessing cache. One offline
 epoch is one complete dataloader traversal sharded by PyTorch's official `DistributedSampler`. See the
-[dataset guide](guidance/datasets.md#offline-v2-records) for the full schema and cadence rules.
+[dataset guide](guidance/datasets.md#offline-v2-records) for the full schema and cadence rules, and
+the [GPU validation plan](guidance/gpu_validation.md) for the 120-job model/backend/algorithm matrix.
 
 ## Text-to-Image & Text-to-Video
 

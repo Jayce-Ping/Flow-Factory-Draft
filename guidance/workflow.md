@@ -139,8 +139,8 @@ def preprocess_func(self, prompt, images, ...):
 - **No HF default-cache copy**: Because each `map()` call sets `cache_file_name`, HuggingFace does **not** also write a duplicate `cache-*.arrow` under `~/.cache/huggingface/datasets/...`.
 - **Intelligent caching**: A hash fingerprint of `(dataset, split, max_dataset_size, preprocess_func source, preprocess_kwargs, extra_hash_strs)` (the last includes `model_type` and `model_name_or_path`) determines the cache path. Subsequent runs that match the fingerprint take the fast path without any `Dataset.map` invocation.
 - **Component offloading**: Text and condition encoders can be offloaded after cache creation. An
-  offline adapter's declared output codec components are reloaded through the component lifecycle
-  for on-the-fly target encoding.
+  offline adapter's declared runtime condition-preparer and output-codec components are reloaded
+  through the component lifecycle for on-the-fly condition realization and target encoding.
 - **No target cache**: SFT targets and offline-DPO chosen/rejected candidates are decoded per
   dataset access and encoded per training microbatch. Target payloads, latent states, and metadata
   never enter the Arrow condition cache.
@@ -171,9 +171,14 @@ sampler.set_epoch(data_epoch)
 for batch in dataloader:
     condition = cached prompt/input tensors
     output = freshly decoded target or chosen/rejected media
-    trainer.optimize_batch(batch)
+    trainer.optimize_batch(batch)  # prepares condition once inside the microbatch
 data_epoch += 1  # only after clean exhaustion
 ```
+
+Inside `optimize_batch`, the trainer calls
+`adapter.prepare_condition_state(condition)` exactly once, binds every target
+candidate through that prepared object, and reuses its model-forward view for all
+policy/reference passes. The driver must not prepare it a second time.
 
 One complete dataloader traversal is one offline epoch. Source weights must be `1`,
 `data.sampler_type` remains `auto`, and `gradient_accumulation_steps` is an explicit integer. The
@@ -202,15 +207,26 @@ evaluation adapters or rewards may consume global RNG before the next training a
 cannot currently save exact state because Accelerate does not serialize MPS RNG; use
 `log.save_model_only: true` on Apple Silicon.
 
+The adapter prepares an input-owned condition state exactly once per offline batch. An identity
+preparer returns cached fields unchanged. A conditioned model may instead realize geometry-bound
+VAE latents, masks, or stochastic prefixes and split them into model-forward and output-codec
+contexts. SFT reuses that state for its target; offline DPO reuses the same object for chosen and
+rejected encoding and for both policy/reference arms. Candidate-specific output context is bound
+only after this input state exists, so neither candidate can accidentally own or redraw an input
+condition.
+
 The target codec is adapter-owned but role-neutral at its numerical core. Condition and output
 encoding reuse the same pixel preprocessing, VAE transform, normalization, and packing helpers.
 Their semantic policies remain explicit: official condition paths commonly use posterior
-`argmax`, while stochastic target training uses posterior `sample` with an optional generator.
-Sharing a transform must never silently erase that role boundary.
+`argmax`, while stochastic target training may use posterior `sample` with an optional generator.
+Sharing a transform must never silently erase that role boundary. Target media remains on demand;
+the prepared-condition boundary does not introduce a target-pixel or target-latent cache.
 
-For offline DPO, chosen and rejected arms share the primary timestep, component-time mapping, and
-diffusion noise. Both policy arms run before one frozen-reference scope covers both reference
-forwards. SFT has no reference branch.
+For offline DPO, chosen and rejected arms share one prepared input state, the primary timestep,
+component-time mapping, and diffusion noise. Both policy arms run before one frozen-reference
+scope covers both reference forwards. SFT has no reference branch. Multi-component adapters may
+specialize only the offline flow-matching objective reduction (for example, a sum of per-modality
+means) without changing the trajectory-wide reducer used by online policy likelihoods.
 
 
 ## Stage 2: K-Repeat Sampling

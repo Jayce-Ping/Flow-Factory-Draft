@@ -15,12 +15,7 @@
 # src/flow_factory/models/wan/wan2_t2v.py
 from __future__ import annotations
 
-import logging
-import math
-import os
-from collections import defaultdict
 from dataclasses import dataclass
-from numbers import Real
 from types import MappingProxyType
 from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
@@ -31,15 +26,12 @@ from diffusers.pipelines.wan.pipeline_wan import WanPipeline, prompt_clean
 from peft import PeftModel
 from PIL import Image
 
-from ...contracts import GeometrySource, NegativePromptPolicy, RateRequirement
+from ...contracts import BatchCapability, GeometrySource, NegativePromptPolicy, RateRequirement
 from ...hparams import *
 from ...samples import T2VSample
 from ...scheduler import UniPCMultistepSDEScheduler, UniPCMultistepSDESchedulerOutput
-from ...utils.base import filter_kwargs
 from ...utils.logger_utils import setup_logger
 from ...utils.trajectory_collector import (
-    CallbackCollector,
-    TrajectoryCollector,
     TrajectoryIndicesType,
     create_callback_collector,
     create_trajectory_collector,
@@ -47,7 +39,13 @@ from ...utils.trajectory_collector import (
 from ..abc import BaseAdapter
 from ..output_state import DecodedMediaBatch, EncodedOutputState, OutputStateCodec
 from ..pipeline_contracts import video_output_contract
-from ._output import WanVideoOutputCodec
+from ._output import (
+    WanVideoOutputCodec,
+    configured_wan_video_output_geometry,
+    normalize_wan_video_latents,
+    resample_wan_output_video,
+    validate_wan_encoded_output_geometry,
+)
 
 logger = setup_logger(__name__)
 
@@ -76,6 +74,7 @@ class Wan2_T2V_Adapter(BaseAdapter):
         negative_prompt=NegativePromptPolicy.OPTIONAL,
         output_fps=RateRequirement.REQUIRED,
         geometry_source=GeometrySource.CONFIGURED,
+        batch_capability=BatchCapability.SINGLE_SAMPLE,
     )
 
     def __init__(self, config: Arguments, accelerator: Accelerator):
@@ -265,52 +264,7 @@ class Wan2_T2V_Adapter(BaseAdapter):
 
     def _configured_video_output_geometry(self) -> Tuple[int, int, int, float]:
         """Return configured Wan geometry after exact latent-grid validation."""
-        geometry = []
-        for name in ("height", "width", "num_frames"):
-            value = getattr(self.training_args, name, None)
-            if type(value) is not int or value <= 0:
-                raise ValueError(
-                    f"Wan output geometry requires positive integer train.{name}, "
-                    f"received {value!r}"
-                )
-            geometry.append(value)
-        frame_rate = getattr(self.training_args, "frame_rate", None)
-        if isinstance(frame_rate, bool) or not isinstance(frame_rate, Real):
-            raise TypeError(
-                "Wan output geometry requires finite positive train.frame_rate, "
-                f"received {type(frame_rate).__name__}: {frame_rate!r}"
-            )
-        frame_rate = float(frame_rate)
-        if not math.isfinite(frame_rate) or frame_rate <= 0:
-            raise ValueError(
-                "Wan output geometry requires finite positive train.frame_rate, "
-                f"received {frame_rate!r}"
-            )
-
-        height, width, num_frames = geometry
-        temporal_scale = self.pipeline.vae_scale_factor_temporal
-        spatial_scale = self.pipeline.vae_scale_factor_spatial
-        if (num_frames - 1) % temporal_scale:
-            raise ValueError(
-                "Wan output num_frames must satisfy "
-                f"(num_frames - 1) % {temporal_scale} == 0, received {num_frames}"
-            )
-        transformer = (
-            self.pipeline.transformer
-            if self.pipeline.transformer is not None
-            else self.pipeline.transformer_2
-        )
-        if transformer is None:
-            raise RuntimeError("Wan output geometry requires one materialized transformer")
-        patch_size = transformer.config.patch_size
-        height_multiple = spatial_scale * patch_size[1]
-        width_multiple = spatial_scale * patch_size[2]
-        if height % height_multiple or width % width_multiple:
-            raise ValueError(
-                "Wan output height/width must be divisible by transformer latent-grid "
-                f"multiples {(height_multiple, width_multiple)}, received {(height, width)}"
-            )
-        return height, width, num_frames, frame_rate
+        return configured_wan_video_output_geometry(self)
 
     @staticmethod
     def _resample_output_video(
@@ -321,63 +275,16 @@ class Wan2_T2V_Adapter(BaseAdapter):
         target_fps: float,
     ) -> np.ndarray:
         """Select deterministic nearest-time frames for configured target cadence."""
-        if video.dtype != np.uint8 or video.ndim != 4 or video.shape[-1] != 3:
-            raise ValueError(
-                "Wan decoded target video must be uint8 RGB shaped (F,H,W,3), "
-                f"received dtype={video.dtype}, shape={tuple(video.shape)}"
-            )
-        if video.shape[0] < 1:
-            raise ValueError("Wan decoded target video must contain at least one frame")
-        if isinstance(source_fps, bool) or not isinstance(source_fps, Real):
-            raise TypeError(
-                "Wan target video requires source fps metadata, "
-                f"received {type(source_fps).__name__}: {source_fps!r}"
-            )
-        source_fps = float(source_fps)
-        if not math.isfinite(source_fps) or source_fps <= 0:
-            raise ValueError(f"Wan target video requires positive finite fps, got {source_fps!r}")
-        indices = np.rint(
-            np.arange(target_frames, dtype=np.float64) * source_fps / target_fps
-        ).astype(np.int64)
-        if indices[-1] >= video.shape[0]:
-            required_duration = (target_frames - 1) / target_fps
-            available_duration = (video.shape[0] - 1) / source_fps
-            raise ValueError(
-                "Wan target video is too short for configured temporal geometry: "
-                f"requires {required_duration:.6f}s, has {available_duration:.6f}s"
-            )
-        return np.ascontiguousarray(video[indices])
+        return resample_wan_output_video(
+            video,
+            source_fps=source_fps,
+            target_frames=target_frames,
+            target_fps=target_fps,
+        )
 
     def _normalize_output_video_latents(self, latents: torch.Tensor) -> torch.Tensor:
         """Apply the exact inverse of Wan's existing decode normalization."""
-        if not isinstance(latents, torch.Tensor) or latents.ndim != 5:
-            raise ValueError(
-                "Wan VAE target latents must be rank-5 BCFHW, "
-                f"received {type(latents).__name__} with shape "
-                f"{getattr(latents, 'shape', None)}"
-            )
-        config = self.vae.config
-        z_dim = config.z_dim
-        if latents.shape[1] != z_dim:
-            raise ValueError(
-                f"Wan VAE target latent channels must equal z_dim={z_dim}, "
-                f"received {latents.shape[1]}"
-            )
-        latents_mean = torch.as_tensor(
-            config.latents_mean,
-            device=latents.device,
-            dtype=latents.dtype,
-        ).view(1, z_dim, 1, 1, 1)
-        inverse_std = (
-            torch.as_tensor(
-                config.latents_std,
-                device=latents.device,
-                dtype=latents.dtype,
-            )
-            .reciprocal()
-            .view(1, z_dim, 1, 1, 1)
-        )
-        return (latents - latents_mean) * inverse_std
+        return normalize_wan_video_latents(self, latents)
 
     def _validate_encoded_output_geometry(
         self,
@@ -386,39 +293,7 @@ class Wan2_T2V_Adapter(BaseAdapter):
         encoded: EncodedOutputState,
     ) -> None:
         """Require encoded signatures and decode metadata to match train geometry."""
-        del condition
-        height, width, num_frames, frame_rate = self._configured_video_output_geometry()
-        if len(encoded.geometry_signatures) != len(media_batch):
-            raise ValueError(
-                "Wan output codec must return one geometry signature per sample, "
-                f"received {len(encoded.geometry_signatures)} for {len(media_batch)}"
-            )
-        for sample_index, signature in enumerate(encoded.geometry_signatures):
-            geometry = signature.media[0]
-            received = (
-                geometry.height,
-                geometry.width,
-                geometry.frames,
-                geometry.fps,
-            )
-            expected = (height, width, num_frames, frame_rate)
-            if received != expected:
-                raise ValueError(
-                    "Wan encoded output geometry disagrees with configured geometry for "
-                    f"sample {sample_index}: expected {expected}, received {received}"
-                )
-        expected_context = {
-            "height": height,
-            "width": width,
-            "num_frames": num_frames,
-            "frame_rate": frame_rate,
-        }
-        for name, expected in expected_context.items():
-            if encoded.decode_context.get(name) != expected:
-                raise ValueError(
-                    f"Wan decode_context {name!r} must equal {expected!r}, "
-                    f"received {encoded.decode_context.get(name)!r}"
-                )
+        validate_wan_encoded_output_geometry(self, media_batch, condition, encoded)
 
     def decode_latents(
         self, latents: torch.Tensor, output_type: Literal["pt", "pil", "np"] = "pil"
@@ -778,6 +653,9 @@ class Wan2_T2V_Adapter(BaseAdapter):
                     return_dict=False,
                 )[0]
             velocity = velocity_uncond + current_guidance_scale * (velocity - velocity_uncond)
+
+        if not compute_log_prob and next_latents is None and tuple(return_kwargs) == ("velocity",):
+            return UniPCMultistepSDESchedulerOutput(velocity=velocity)
 
         # 5. Scheduler step
         output = self.scheduler.step(

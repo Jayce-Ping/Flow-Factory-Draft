@@ -32,6 +32,7 @@ from pydantic import (
     Field,
     JsonValue,
     field_validator,
+    model_validator,
 )
 
 MediaType = Literal["image", "video", "audio"]
@@ -52,12 +53,20 @@ class _MediaRefBase(_StrictFrozenModel):
     """Shared path contract for the exact-key media variants."""
 
     path: str
+    slot: str | None = None
 
     @field_validator("path")
     @classmethod
     def _validate_path(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("media path must be a non-empty string")
+        return value
+
+    @field_validator("slot")
+    @classmethod
+    def _validate_slot(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("media slot must be a non-empty string when provided")
         return value
 
 
@@ -100,6 +109,18 @@ class OutputCandidateSpec(_StrictFrozenModel):
 
     media: List[MediaRef] = Field(min_length=1)
 
+    @model_validator(mode="after")
+    def _reject_input_only_slots(self) -> "OutputCandidateSpec":
+        slotted_indices = tuple(
+            index for index, media in enumerate(self.media) if media.slot is not None
+        )
+        if slotted_indices:
+            raise ValueError(
+                "media slot is input-only and cannot appear in an output candidate; "
+                f"indices={slotted_indices!r}"
+            )
+        return self
+
 
 class DemonstrationSpec(_StrictFrozenModel):
     """A single supervised target without naming a training algorithm."""
@@ -139,6 +160,7 @@ class MediaAsset:
     path: str
     fps: float | None = None
     sample_rate: int | None = None
+    slot: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,6 +283,7 @@ def _normalize_media(
         path=path,
         fps=media.fps if isinstance(media, VideoRef) else None,
         sample_rate=media.sample_rate if isinstance(media, AudioRef) else None,
+        slot=media.slot,
     )
 
 

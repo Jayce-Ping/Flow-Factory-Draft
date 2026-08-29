@@ -30,6 +30,7 @@ from flow_factory.data_utils.offline_dataset import (
     PreferenceOutputBatch,
 )
 from flow_factory.data_utils.schema import NormalizedModelInput
+from flow_factory.models.condition_state import PreparedConditionState
 from flow_factory.models.output_state import (
     EncodedOutputState,
     GeometrySignature,
@@ -108,6 +109,8 @@ class _Adapter:
         self.pipeline_io_contract = object()
         self.train_calls = 0
         self.encode_calls: list[str] = []
+        self.prepare_calls = 0
+        self.prepared_condition_ids: list[int] = []
         self.forward_events: list[tuple[float, bool, bool]] = []
         self.forward_override_events: list[tuple[float, bool, dict[str, float]]] = []
         self.drawn_noise: list[LatentState] = []
@@ -119,13 +122,23 @@ class _Adapter:
         assert mode is True
         self.train_calls += 1
 
+    def prepare_condition_state(
+        self,
+        condition: Mapping[str, Any],
+        generator: torch.Generator | None = None,
+    ) -> PreparedConditionState:
+        del generator
+        self.prepare_calls += 1
+        return PreparedConditionState.identity(condition)
+
     def encode_output_state(
         self,
         media_batch: tuple[tuple[DecodedMedia, ...], ...],
-        condition: Mapping[str, Any],
+        condition: Mapping[str, Any] | PreparedConditionState,
         generator: torch.Generator | None = None,
     ) -> EncodedOutputState:
-        del condition, generator
+        self.prepared_condition_ids.append(id(condition))
+        del generator
         arm = str(media_batch[0][0].payload)
         self.encode_calls.append(arm)
         arm_value = 1.0 if arm == "rejected" else 0.0
@@ -255,6 +268,14 @@ class _Adapter:
         del state
         return values["latent"].flatten(1).mean(dim=1)
 
+    @staticmethod
+    def reduce_flow_matching_objective_values(
+        values: Mapping[str, torch.Tensor],
+        *,
+        state: LatentState,
+    ) -> torch.Tensor:
+        return _Adapter.reduce_latent_values(values, state=state)
+
 
 def _media(arm: str, batch_size: int = 2) -> tuple[tuple[DecodedMedia, ...], ...]:
     return tuple(
@@ -355,6 +376,7 @@ def test_offline_trainers_build_unprepared_distributed_loaders(
     trainer.adapter = SimpleNamespace(
         preprocess_func=object(),
         pipeline_io_contract=object(),
+        effective_pipeline_io_contract=object(),
     )
     sentinel = object()
     received: dict[str, Any] = {}
@@ -374,7 +396,7 @@ def test_offline_trainers_build_unprepared_distributed_loaders(
         "accelerator": trainer.accelerator,
         "preprocess_func": trainer.adapter.preprocess_func,
         "supervision_type": supervision_type,
-        "pipeline_io_contract": trainer.adapter.pipeline_io_contract,
+        "pipeline_io_contract": trainer.adapter.effective_pipeline_io_contract,
     }
     assert trainer.accelerator.prepare_calls == 0
 
@@ -395,6 +417,7 @@ def test_sft_reencodes_targets_and_preserves_optimizer_cadence(
 
     assert trainer.step == 1
     assert adapter.train_calls == 2
+    assert adapter.prepare_calls == 2
     assert adapter.encode_calls == ["target", "target"]
     assert len(trainer.accelerator.backward_losses) == 2
     assert len(trainer.accelerator.accumulate_roots) == 2
@@ -443,6 +466,8 @@ def test_offline_dpo_shares_schedule_noise_and_reference_scope(
 
     assert trainer.step == 1
     assert adapter.encode_calls == ["chosen", "rejected"]
+    assert adapter.prepare_calls == 1
+    assert adapter.prepared_condition_ids[0] == adapter.prepared_condition_ids[1]
     assert len(adapter.drawn_noise) == 2
     assert len(adapter.reused_noise) == 4
     assert adapter.reused_noise[0] is adapter.drawn_noise[0]

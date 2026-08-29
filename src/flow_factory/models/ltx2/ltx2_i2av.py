@@ -26,6 +26,12 @@ from diffusers.pipelines.ltx2.pipeline_ltx2_image2video import (
 )
 from PIL import Image
 
+from ...contracts import (
+    BatchCapability,
+    GeometrySource,
+    InputMediaRule,
+    NegativePromptPolicy,
+)
 from ...hparams import *
 from ...samples import (
     ComponentTimes,
@@ -58,6 +64,8 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ..output_state import DecodedMediaBatch, EncodedOutputState
+from ..pipeline_contracts import IMAGE_FORMAT, audio_video_output_contract
 from ._common import (
     LTX2_COMPONENT_ORDER,
     attach_ltx2_state_masks,
@@ -72,6 +80,14 @@ from ._common import (
     draw_ltx2_forward_process_noise,
     split_ltx2_callback_results,
     validate_i2av_forward_state_inputs,
+)
+from ._output import (
+    LTX2_OFFLINE_FORWARD_OVERRIDES,
+    LTX2AVOutputCodec,
+    LTX2FirstFrameConditionPreparer,
+    decode_ltx2_output_state,
+    reduce_ltx2_flow_matching_objective_values,
+    validate_ltx2_encoded_output_geometry,
 )
 
 logger = setup_logger(__name__)
@@ -177,11 +193,22 @@ class LTX2_I2AV_Adapter(BaseAdapter):
     Shared logic with LTX2_T2AV_Adapter is handled via code duplication.
     """
 
-    output_state_codec_unavailable_reason = (
-        "LTX2 I2AV offline targets require paired video/audio decoding, exact duration "
-        "alignment, and an active mask for the pinned first-frame condition; those lossless "
-        "audiovisual output semantics are not yet implemented"
+    component_load_dtype_defaults = {"audio_vae": torch.float32}
+    pipeline_io_contract = audio_video_output_contract(
+        negative_prompt=NegativePromptPolicy.OPTIONAL,
+        input_rules=(
+            InputMediaRule(
+                format=IMAGE_FORMAT,
+                min_count=1,
+                max_count=1,
+                slots=("first_frame",),
+                required_slots=("first_frame",),
+            ),
+        ),
+        geometry_source=GeometrySource.CONFIGURED,
+        batch_capability=BatchCapability.UNIFORM,
     )
+    offline_training_forward_overrides = LTX2_OFFLINE_FORWARD_OVERRIDES
 
     supports_diffusers_cache = True
     trajectory_component_order: ClassVar[Tuple[str, ...]] = LTX2_COMPONENT_ORDER
@@ -269,6 +296,51 @@ class LTX2_I2AV_Adapter(BaseAdapter):
     def inference_modules(self) -> List[str]:
         """Components needed during inference and training forward."""
         return ["transformer", "vae", "audio_vae", "connectors", "vocoder"]
+
+    def build_condition_state_preparer(self) -> LTX2FirstFrameConditionPreparer:
+        """Declare one-time deterministic first-frame condition encoding."""
+        return LTX2FirstFrameConditionPreparer(self)
+
+    def build_output_state_codec(self) -> LTX2AVOutputCodec:
+        """Declare deterministic on-the-fly encoding for paired AV targets."""
+        return LTX2AVOutputCodec(self, conditioned=True)
+
+    def _validate_encoded_output_geometry(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Mapping[str, Any],
+        encoded: EncodedOutputState,
+    ) -> None:
+        """Validate AV geometry and the pinned first-frame binding."""
+        validate_ltx2_encoded_output_geometry(
+            self,
+            media_batch,
+            condition,
+            encoded,
+            conditioned=True,
+        )
+
+    def _decode_output_state(
+        self,
+        encoded: EncodedOutputState,
+        *,
+        output_type: Literal["pil", "pt", "np"],
+    ) -> Any:
+        """Decode both components through the existing joint AV decoder."""
+        return decode_ltx2_output_state(self, encoded, output_type=output_type)
+
+    def _reduce_flow_matching_objective_values(
+        self,
+        values: Mapping[str, torch.Tensor],
+        *,
+        state: Optional[LatentState] = None,
+    ) -> torch.Tensor:
+        """Sum official video/audio means without changing online reducers."""
+        return reduce_ltx2_flow_matching_objective_values(
+            self,
+            values,
+            state=state,
+        )
 
     def _check_inputs(
         self,
@@ -586,6 +658,7 @@ class LTX2_I2AV_Adapter(BaseAdapter):
     def preprocess_func(
         self,
         prompt: List[str],
+        negative_prompt: Optional[Union[str, List[str]]] = None,
         images: Optional[List[Union[Image.Image, List[Image.Image]]]] = None,
         system_prompt: Optional[str] = None,
         prompt_enhancement_seed: int = 10,
@@ -613,6 +686,7 @@ class LTX2_I2AV_Adapter(BaseAdapter):
 
         batch = self.encode_prompt(
             prompt=prompt,
+            negative_prompt=negative_prompt,
             guidance_scale=guidance_scale,
             audio_guidance_scale=audio_guidance_scale,
             max_sequence_length=max_sequence_length,
@@ -771,6 +845,7 @@ class LTX2_I2AV_Adapter(BaseAdapter):
         compute_log_prob: bool = True,
         return_kwargs: List[str] = ["next_latents", "log_prob", "velocity"],
         use_cross_timestep: bool = False,
+        preserve_raw_model_velocity: bool = False,
         # Component-return mode, owned by ``_forward_state``
         _return_components: bool = False,
         **kwargs,
@@ -929,6 +1004,15 @@ class LTX2_I2AV_Adapter(BaseAdapter):
             )
         video_pred = video_pred.float()
         audio_pred = audio_pred.float()
+        raw_video_pred = video_pred
+        raw_audio_pred = audio_pred
+        uses_x0_guidance = (
+            do_cfg
+            or do_stg
+            or do_modality_isolation
+            or guidance_rescale > 0
+            or audio_guidance_rescale > 0
+        )
 
         # --- 2. Convert to x0-space and compute guidance deltas ---
         if do_cfg:
@@ -1022,9 +1106,35 @@ class LTX2_I2AV_Adapter(BaseAdapter):
                 audio_x0_guided, audio_x0, guidance_rescale=audio_guidance_rescale
             )
 
-        # --- 6. Convert back to velocity for scheduler step ---
-        video_pred = self.convert_x0_to_velocity(video_latents, video_x0_guided, sigma)
-        audio_pred = self.convert_x0_to_velocity(audio_latents, audio_x0_guided, sigma)
+        # --- 6. Convert back only when an x0-space guidance transform ran. ---
+        # The algebraic round trip is numerically unstable near sigma=0 and is
+        # unnecessary for SFT/offline-DPO's neutral-guidance forward.
+        if uses_x0_guidance or not preserve_raw_model_velocity:
+            video_pred = self.convert_x0_to_velocity(
+                video_latents,
+                video_x0_guided,
+                sigma,
+            )
+            audio_pred = self.convert_x0_to_velocity(
+                audio_latents,
+                audio_x0_guided,
+                sigma,
+            )
+        else:
+            video_pred = raw_video_pred
+            audio_pred = raw_audio_pred
+
+        velocity_only = (
+            not compute_log_prob and next_latents is None and tuple(return_kwargs) == ("velocity",)
+        )
+        if velocity_only:
+            if _return_components:
+                return MultiModalStepOutput(
+                    velocity=LatentState({"video": video_pred, "audio": audio_pred})
+                )
+            return FlowMatchEulerDiscreteSDESchedulerOutput(
+                velocity=torch.cat([video_pred, audio_pred], dim=1)
+            )
 
         # --- 7. [I2AV] Video scheduler step with frame-slicing ---
         if conditioning_mask is not None:

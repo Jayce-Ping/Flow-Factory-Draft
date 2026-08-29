@@ -109,6 +109,31 @@ def test_demonstration_normalization_preserves_media_order_and_resolves_paths(
     assert normalized.supervision.target.media[0].path == str(absolute_target)
 
 
+def test_input_media_slot_is_normalized_but_output_media_rejects_slots(
+    tmp_path: Path,
+) -> None:
+    raw = _demonstration_record(
+        input={
+            "prompt": "End on this frame.",
+            "media": [
+                {
+                    "type": "image",
+                    "path": "ending.png",
+                    "slot": "last_frame",
+                }
+            ],
+        }
+    )
+
+    normalized = normalize_v2_record(raw, dataset_dir=tmp_path)
+
+    assert normalized.model_input.media[0].slot == "last_frame"
+
+    raw["supervision"]["target"]["media"][0]["slot"] = "last_frame"
+    with pytest.raises(ValidationError, match="slot is input-only"):
+        DatasetRecordV2.model_validate(raw)
+
+
 def test_preference_normalization_keeps_both_arms_under_one_input(tmp_path: Path) -> None:
     raw = _demonstration_record(
         supervision={

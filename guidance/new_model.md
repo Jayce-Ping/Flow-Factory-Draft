@@ -218,7 +218,12 @@ preprocess_func(prompt, images, videos, audios, **kwargs):
     return results
 ```
 
-Text-to-image models override only `encode_prompt` and `encode_image`; image-to-video models add `encode_video`; audio-conditioned models add `encode_audio`. There is no need to add stub `pass` overrides for unused modalities — `BaseAdapter` already provides them.
+Text-to-image, text-to-video, and text-to-audio-video adapters usually override only
+`encode_prompt` because they have no condition media. Image-conditioned tasks add
+`encode_image`; video-conditioned tasks add `encode_video`; audio-conditioned tasks add
+`encode_audio`. These functions encode inputs, not supervised outputs—offline targets belong to
+the output-state codec. There is no need to add stub `pass` overrides for unused modalities;
+`BaseAdapter` already provides them.
 
 #### `encode_prompt`
 
@@ -554,17 +559,29 @@ Online-only adapters can keep the default `build_output_state_codec() -> None`. 
 offline DPO, an adapter must additionally declare both sides of its pipeline and provide an
 on-the-fly output codec:
 
-1. Set a class-level `pipeline_io_contract`. It owns input media counts/order/binding, negative
-   prompt policy, the exact ordered output media sequence, rate requirements, geometry source, and
-   batch capability.
-2. Override `build_output_state_codec()` with a declaration-only codec. Its
+1. Set a class-level `pipeline_io_contract`. It owns per-type and aggregate input counts,
+   order/binding, optional semantic input slots, negative prompt policy, the exact ordered output
+   media sequence, rate requirements, geometry source, and batch capability. Explicit V2 slots
+   reserve declared arguments; unslotted inputs fill the remaining slots in declaration order, and
+   output media must never carry slots. If checkpoints behind one adapter expose narrower behavior, override
+   `_resolve_pipeline_io_contract()` and return an immutable instance-specific specialization;
+   offline data validation consumes `effective_pipeline_io_contract`.
+2. If cached input fields are not already the exact forward condition, override
+   `build_condition_state_preparer()` with a declaration-only preparer. Its
+   `required_components` lists runtime encoders and `prepare_condition_state()` returns one
+   `PreparedConditionState` per batch. Put input-owned model fields in `forward_context` and
+   input-owned target-binding fields in `output_context`. The two runtime consumer views may
+   intentionally share an input-owned tensor (for example a mask or layout), but each merged
+   consumer view must remain collision-free with cached fields and later candidate-owned output
+   fields.
+3. Override `build_output_state_codec()` with a declaration-only codec. Its
    `required_components` names logical runtime components such as `("vae",)`; construction must
    not load, materialize, move, replace, or cast them.
-3. Return an `EncodedOutputState` containing a detached `LatentState`, output-derived forward and
+4. Return an `EncodedOutputState` containing a detached `LatentState`, output-derived forward and
    decode contexts, and one exact geometry signature per sample.
-4. Override `_validate_encoded_output_geometry()` so configured, condition-derived, and
+5. Override `_validate_encoded_output_geometry()` so configured, condition-derived, and
    output-derived dimensions cannot drift silently.
-5. Declare a complete immutable `offline_training_forward_overrides` mapping whenever the base
+6. Declare a complete immutable `offline_training_forward_overrides` mapping whenever the base
    `{"guidance_scale": 1.0}` contract does not describe the adapter. Offline trainers apply this
    mapping after sampling configuration and cached batch conditions, so it owns loss-time model
    conditioning. Conventional CFG branches must all be set to their neutral point (for example,
@@ -573,10 +590,11 @@ on-the-fly output codec:
    the complete mapping so permissive `**kwargs` forwards do not receive unrelated base keys.
 
 The dataset remains responsible only for strict V2 parsing and CPU media decoding. The adapter
-owns numerical output semantics. The SFT/offline-DPO trainer calls `encode_output_state()` on every
-microbatch under `torch.no_grad`; target, chosen, and rejected latents are not preprocessing-cache
-columns. The declared output components are loaded through `ModelLoadCoordinator`, never from
-inside the codec.
+owns numerical condition/output semantics. The SFT/offline-DPO trainer first calls
+`prepare_condition_state()` once, then calls `encode_output_state()` under `torch.no_grad`; offline
+DPO passes the same prepared object to both preference candidates. Target, chosen, and rejected
+latents are not preprocessing-cache columns. Declared condition and output components are loaded
+through `ModelLoadCoordinator`, never from inside a preparer or codec.
 
 Condition encoding and target encoding should share role-neutral numerical transforms instead of
 duplicating VAE math. Extract helpers for pixel preprocessing, posterior extraction, latent
@@ -604,6 +622,11 @@ An output codec is not merely an `encode_image()` alias. It may need output-spec
 multi-component state order, active masks, rate alignment, or forward context that condition
 encoding does not own. If those semantics are not lossless, set a concrete
 `output_state_codec_unavailable_reason` so offline selection fails before downloading weights.
+
+Multi-modal objectives may need a reduction different from trajectory likelihoods. Override the
+protected `_reduce_flow_matching_objective_values()` hook only for that objective. Do not change
+`reduce_latent_values()` merely to implement SFT: online policy gradients, replay log-probability,
+and distillation continue to rely on their established trajectory-wide reduction.
 
 SenseNova is an example of an important boundary: its existing condition schema uses grouped
 `images` with within-type order. Do not advertise heterogeneous ordered references merely because
@@ -901,7 +924,10 @@ Before submitting a new model adapter, verify:
 - [ ] **`inference()`** — Accepts both raw and pre-encoded inputs; returns `List[Sample]`
 - [ ] **`forward()`** — Single denoising step; ends with `self.scheduler.step()`; returns `SDESchedulerOutput`
 - [ ] **Pipeline I/O contract** — Declares exact input/output media, rate, geometry, and batch semantics before enabling offline training
+- [ ] **Effective checkpoint contract (when needed)** — `_resolve_pipeline_io_contract()` narrows a class-level superset without changing public dataset or algorithm code
+- [ ] **Condition-state preparer (when needed)** — Declaration-only logical component requirements; one input realization reused by every candidate/forward in the batch
 - [ ] **Output-state codec (when supported)** — Declaration-only logical component requirements; on-the-fly detached target encoding; exact geometry validation
+- [ ] **Objective reduction (when specialized)** — Override only the offline flow-matching hook; online trajectory reduction remains unchanged
 - [ ] **Offline forward overrides (when supported)** — Complete immutable adapter mapping; sampling controls never define offline loss semantics; every CFG branch is neutralized or every distilled guidance condition is explicitly pinned
 - [ ] **Role-neutral encoder math** — Condition/output paths reuse transforms but explicitly preserve official posterior `sample` versus `argmax` policy and generator routing
 - [ ] **Explicit offline blocker (when unsupported)** — `output_state_codec_unavailable_reason` names the missing lossless semantic boundary

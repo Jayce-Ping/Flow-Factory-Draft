@@ -245,7 +245,7 @@ def test_flow_matching_loss_computes_fp32_errors_before_adapter_reduction() -> N
     received: dict[str, Any] = {}
 
     class Adapter:
-        def reduce_latent_values(self, values: Any, *, state: Any):
+        def reduce_flow_matching_objective_values(self, values: Any, *, state: Any):
             received["values"] = values
             received["state"] = state
             total = torch.cat([value.flatten(1) for value in values.values()], dim=1)

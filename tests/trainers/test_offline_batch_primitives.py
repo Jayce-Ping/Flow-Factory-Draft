@@ -19,8 +19,10 @@ import pytest
 import torch
 
 from flow_factory.contracts import NON_MODEL_CONDITION_KEYS
+from flow_factory.models.condition_state import PreparedConditionState
 from flow_factory.trainers.common.offline_batch import (
     bind_output_forward_context,
+    bind_prepared_condition_output,
     move_condition_to_device,
 )
 
@@ -84,6 +86,30 @@ def test_bind_output_context_preserves_input_ownership_without_mutation() -> Non
     assert bound["img_ids"] is context["img_ids"]
     assert tuple(condition) == ("prompt_embeds",)
     assert tuple(context) == ("img_ids",)
+
+
+def test_bind_prepared_condition_preserves_input_and_output_ownership() -> None:
+    prepared = PreparedConditionState(
+        condition={"prompt_embeds": torch.ones(1, 2)},
+        forward_context={"condition_prefix": torch.zeros(1, 3)},
+        output_context={"codec_only": torch.ones(1)},
+    )
+
+    bound = bind_prepared_condition_output(prepared, {"output_ids": torch.zeros(4, 3)})
+
+    assert tuple(bound) == ("prompt_embeds", "condition_prefix", "output_ids")
+    assert "codec_only" not in bound
+
+
+def test_bind_prepared_condition_rejects_output_collision() -> None:
+    prepared = PreparedConditionState(
+        condition={"prompt_embeds": torch.ones(1, 2)},
+        forward_context={"condition_prefix": torch.zeros(1, 3)},
+        output_context={},
+    )
+
+    with pytest.raises(ValueError, match=r"collides.*condition_prefix"):
+        bind_prepared_condition_output(prepared, {"condition_prefix": torch.ones(1, 3)})
 
 
 def test_bind_output_context_rejects_ambiguous_key_ownership() -> None:

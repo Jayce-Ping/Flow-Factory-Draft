@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""On-the-fly audiovisual target encoding for MiniMax H3 T2VA."""
+"""On-the-fly audiovisual target encoding for all MiniMax H3 workflows."""
 
 from __future__ import annotations
 
@@ -75,7 +75,7 @@ class _H3ModelShape:
 
 @dataclass(frozen=True, slots=True)
 class MiniMaxH3AVOutputCodec:
-    """Encode one configured T2VA video/audio target into packed H3 rows."""
+    """Encode one configured H3 video/audio target into packed target rows."""
 
     adapter: Any
     required_components: ClassVar[Tuple[str, ...]] = ("vae", "audio_vae")
@@ -89,29 +89,28 @@ class MiniMaxH3AVOutputCodec:
         """Encode the exact ``(video, audio)`` target sequence for one sample.
 
         Diffusers defines H3's conditioning encoder, but not an offline target
-        encoder. Video posterior sampling is therefore a framework policy inferred
-        from latent-diffusion training objectives. In particular, the condition-only
-        float16 rounding step is intentionally not applied to clean targets. Audio
-        targets use the posterior mode because the official H3 pipeline never samples
-        the audio posterior. Both components are normalized and packed exactly like
-        generated target rows.
+        encoder. Both target posteriors therefore use their deterministic modes,
+        matching the released H3 SFT data flow. The condition-only float16 rounding
+        step is intentionally not applied to clean targets. Both components are
+        normalized and packed exactly like generated target rows.
 
         Args:
             media_batch: One decoded video/audio pair.
-            condition: Cached T2VA condition and its authoritative packed layout.
-            generator: Optional generator forwarded only to video posterior sampling.
+            condition: Cached H3 condition and its authoritative packed layout.
+            generator: Accepted for the shared codec protocol; H3 target modes are
+                deterministic and do not consume it.
 
         Returns:
             Detached clean video/audio rows plus the output-owned decode context.
         """
         if len(media_batch) != 1:
             raise ValueError(
-                f"MiniMax H3 T2VA output encoding requires B=1, received B={len(media_batch)}"
+                f"MiniMax H3 output encoding requires B=1, received B={len(media_batch)}"
             )
         candidate = media_batch[0]
         if len(candidate) != 2:
             raise ValueError(
-                "MiniMax H3 T2VA output codec expected exact (video, audio) media, "
+                "MiniMax H3 output codec expected exact (video, audio) media, "
                 f"received {len(candidate)} items"
             )
         video_media, audio_media = candidate
@@ -126,11 +125,8 @@ class MiniMaxH3AVOutputCodec:
             height=geometry["height"],
             width=geometry["width"],
         )
-        video_latents = encode_h3_target_video(
-            self.adapter,
-            video_pixels,
-            generator=generator,
-        )
+        del generator
+        video_latents = encode_h3_target_video(self.adapter, video_pixels)
         expected_video_shape = (
             1,
             model_shape.video_latent_channels,
@@ -180,7 +176,7 @@ class MiniMaxH3AVOutputCodec:
             }
         )
         validate_target_state(clean_state)
-        _validate_h3_t2va_input_layout(condition, clean_state)
+        _validate_h3_input_layout(condition, clean_state)
         frame_rate = float(self.adapter.pipeline.fps)
         signature = GeometrySignature(
             media=(
@@ -207,7 +203,7 @@ class MiniMaxH3AVOutputCodec:
 
 
 def resolve_h3_output_geometry(adapter: Any, condition: Mapping[str, Any]) -> Dict[str, int]:
-    """Resolve and validate configured geometry from the cached T2VA condition.
+    """Resolve and validate configured geometry from the cached H3 condition.
 
     Args:
         adapter: Active MiniMax H3 adapter with configured pipeline components.
@@ -458,22 +454,17 @@ def prepare_h3_target_video(
 def encode_h3_target_video(
     adapter: Any,
     pixel_values: torch.Tensor,
-    *,
-    generator: Optional[torch.Generator],
 ) -> torch.Tensor:
-    """Apply the framework's sampled-posterior policy for clean H3 targets.
+    """Encode clean H3 targets through the deterministic video posterior mode.
 
     Diffusers specifies a fixed-seed sample followed by float16 rounding only for
-    H3 *conditions*. Offline clean targets instead use the caller's generator and
-    retain the sampled posterior in float32 before normalization. This distinction
-    is an explicit framework inference from latent training, not an official H3
-    target-encoding recipe.
+    H3 *conditions*. Its released pipeline has no offline target encoder, so this
+    path follows the H3 SFT reference data flow: take the posterior mean/mode and
+    retain float32 precision before normalization.
 
     Args:
         adapter: Active MiniMax H3 adapter exposing the video VAE.
         pixel_values: Normalized-shape pixels ``(1, 3, F, H, W)`` in ``[0, 1]``.
-        generator: Optional posterior sampling generator.
-
     Returns:
         Normalized video latents shaped ``(1, 24, F', H', W')``.
     """
@@ -500,8 +491,7 @@ def encode_h3_target_video(
     encoded = vae.encode(normalized_pixels)
     latents = retrieve_vae_latents(
         encoded,
-        sample_mode="sample",
-        generator=generator,
+        sample_mode="argmax",
         source="MiniMax H3 target video",
     ).to(torch.float32)
     latent_mean, latent_std = _latent_statistics(
@@ -609,11 +599,11 @@ def encode_h3_target_audio(adapter: Any, waveform: torch.Tensor) -> torch.Tensor
     return (latents - latent_mean) / latent_std
 
 
-def _validate_h3_t2va_input_layout(
+def _validate_h3_input_layout(
     condition: Mapping[str, Any],
     clean_state: LatentState,
 ) -> None:
-    """Validate the authoritative flat T2VA layout retained in input conditions."""
+    """Validate target rows against an authoritative H3 input layout."""
     layout = _normalize_layout(condition)
     missing = tuple(field for field in _LAYOUT_FIELDS if field not in layout)
     if missing:
@@ -629,7 +619,7 @@ def _validate_h3_t2va_input_layout(
         or position_ids.dtype != torch.float64
     ):
         raise ValueError(
-            "MiniMax H3 T2VA position_ids expected float64 shape (N,3), "
+            "MiniMax H3 position_ids expected float64 shape (N,3), "
             f"received {type(position_ids).__name__}/{getattr(position_ids, 'shape', None)}/"
             f"{getattr(position_ids, 'dtype', None)}"
         )
@@ -639,37 +629,39 @@ def _validate_h3_t2va_input_layout(
         or token_tags.dtype != torch.long
     ):
         raise ValueError(
-            "MiniMax H3 T2VA token_tags expected one-dimensional torch.long, "
+            "MiniMax H3 token_tags expected one-dimensional torch.long, "
             f"received {type(token_tags).__name__}/{getattr(token_tags, 'shape', None)}/"
             f"{getattr(token_tags, 'dtype', None)}"
         )
     for field, values in zip(("video_indices", "audio_indices", "text_indices"), index_tensors):
         if not isinstance(values, torch.Tensor) or values.ndim != 1 or values.dtype != torch.long:
             raise ValueError(
-                f"MiniMax H3 T2VA {field} expected one-dimensional torch.long, "
+                f"MiniMax H3 {field} expected one-dimensional torch.long, "
                 f"received {type(values).__name__}/{getattr(values, 'shape', None)}/"
                 f"{getattr(values, 'dtype', None)}"
             )
 
     for component in ("video", "audio"):
         count_field = f"num_condition_{component}_rows"
-        if layout[count_field] != 0:
+        condition_rows = layout[count_field]
+        if condition_rows < 0:
             raise ValueError(
-                "MiniMax H3 T2VA offline layout requires no condition rows, "
-                f"received {count_field}={layout[count_field]}"
+                f"MiniMax H3 offline layout requires non-negative {count_field}, "
+                f"received {condition_rows}"
             )
         component_indices = layout[f"{component}_indices"]
-        expected_rows = clean_state.components[component].shape[1]
-        if component_indices.numel() != expected_rows:
+        target_rows = clean_state.components[component].shape[1]
+        expected_total_rows = condition_rows + target_rows
+        if component_indices.numel() != expected_total_rows:
             raise ValueError(
-                f"MiniMax H3 T2VA {component} layout expected {expected_rows} target rows, "
-                f"received {component_indices.numel()} indices"
+                f"MiniMax H3 {component} layout expected {condition_rows} condition + "
+                f"{target_rows} target rows, received {component_indices.numel()} indices"
             )
 
     sequence_length = sum(values.numel() for values in index_tensors)
     if position_ids.shape[0] != sequence_length or token_tags.numel() != sequence_length:
         raise ValueError(
-            "MiniMax H3 T2VA flat layout sequence lengths disagree: "
+            "MiniMax H3 flat layout sequence lengths disagree: "
             f"indices={sequence_length}, position_ids={position_ids.shape[0]}, "
             f"token_tags={token_tags.numel()}"
         )
@@ -679,9 +671,7 @@ def _validate_h3_t2va_input_layout(
         *(values.device for values in index_tensors),
     }
     if len(devices) != 1:
-        raise ValueError(
-            f"MiniMax H3 T2VA flat layout tensors must share one device, got {devices}"
-        )
+        raise ValueError(f"MiniMax H3 flat layout tensors must share one device, got {devices}")
     permutation = torch.cat(index_tensors).sort().values
     expected_permutation = torch.arange(
         sequence_length,
@@ -689,9 +679,7 @@ def _validate_h3_t2va_input_layout(
         device=permutation.device,
     )
     if not torch.equal(permutation, expected_permutation):
-        raise ValueError(
-            "MiniMax H3 T2VA video/audio/text indices must partition the packed sequence"
-        )
+        raise ValueError("MiniMax H3 video/audio/text indices must partition the packed sequence")
 
 
 def validate_h3_encoded_output_geometry(
@@ -700,7 +688,7 @@ def validate_h3_encoded_output_geometry(
     condition: Mapping[str, Any],
     encoded: EncodedOutputState,
 ) -> None:
-    """Prove codec geometry and contexts agree with the cached T2VA layout.
+    """Prove codec geometry and contexts agree with the cached H3 layout.
 
     Args:
         adapter: Active MiniMax H3 adapter.
@@ -781,10 +769,10 @@ def validate_h3_encoded_output_geometry(
 
     if encoded.forward_context:
         raise ValueError(
-            "MiniMax H3 T2VA output codec must not duplicate input-owned layout/prefix fields, "
+            "MiniMax H3 output codec must not duplicate input-owned layout/prefix fields, "
             f"received keys={tuple(encoded.forward_context)}"
         )
-    _validate_h3_t2va_input_layout(condition, encoded.clean_state)
+    _validate_h3_input_layout(condition, encoded.clean_state)
 
 
 def _resolve_h3_model_shape(adapter: Any) -> _H3ModelShape:

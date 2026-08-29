@@ -110,6 +110,8 @@ def video_output_contract(
     negative_prompt: NegativePromptPolicy,
     input_image_min_count: Optional[int] = None,
     input_image_max_count: Optional[int] = None,
+    input_image_slots: Tuple[str, ...] = (),
+    required_input_image_slots: Tuple[str, ...] = (),
     output_fps: RateRequirement = RateRequirement.OPTIONAL,
     geometry_source: GeometrySource = GeometrySource.OUTPUT_MEDIA,
     batch_capability: BatchCapability = BatchCapability.UNIFORM,
@@ -120,6 +122,8 @@ def video_output_contract(
         negative_prompt: Whether negative prompts are unsupported, optional, or required.
         input_image_min_count: Minimum condition-image count, or ``None`` for no image input.
         input_image_max_count: Maximum condition-image count when an image rule is present.
+        input_image_slots: Semantic image argument slots in positional fallback order.
+        required_input_image_slots: Slots that every valid request must fill.
         output_fps: Whether target video frame rate metadata is required.
         geometry_source: Boundary that determines output geometry.
         batch_capability: Whether the adapter accepts uniform batches or one sample only.
@@ -134,6 +138,8 @@ def video_output_contract(
                 format=IMAGE_FORMAT,
                 min_count=input_image_min_count,
                 max_count=input_image_max_count,
+                slots=input_image_slots,
+                required_slots=required_input_image_slots,
             ),
         )
     video_format = MediaFormat(
@@ -164,6 +170,9 @@ def audio_video_output_contract(
     input_rules: Tuple[InputMediaRule, ...] = (),
     input_binding: InputMediaBinding = InputMediaBinding.GROUPED_BY_TYPE,
     input_order: InputMediaOrder = InputMediaOrder.INSENSITIVE,
+    min_input_media_count: Optional[int] = None,
+    max_input_media_count: Optional[int] = None,
+    required_any_input_types: Tuple[MediaType, ...] = (),
     output_fps: RateRequirement = RateRequirement.REQUIRED,
     output_sample_rate: RateRequirement = RateRequirement.REQUIRED,
     geometry_source: GeometrySource = GeometrySource.OUTPUT_MEDIA,
@@ -173,15 +182,17 @@ def audio_video_output_contract(
 
     Supplying explicit input rules keeps this constructor neutral to how a model
     binds conditions: prompt-only, grouped image conditions, and globally ordered
-    heterogeneous references all use the same output contract. Cross-type total
-    cardinality constraints remain adapter-owned because ``InputMediaSpec``
-    represents per-type bounds only.
+    heterogeneous references all use the same output contract. Aggregate count
+    and required-any-type constraints cover cross-modality request invariants.
 
     Args:
         negative_prompt: Whether negative prompts are unsupported, optional, or required.
         input_rules: Canonically ordered per-type input-media rules.
         input_binding: How input media are projected into model-facing arguments.
         input_order: Which input-media ordering carries semantic meaning.
+        min_input_media_count: Optional minimum count across all input modalities.
+        max_input_media_count: Optional maximum count across all input modalities.
+        required_any_input_types: Media types of which at least one must be present.
         output_fps: Whether target-video frame-rate metadata is accepted or required.
         output_sample_rate: Whether target-audio sample-rate metadata is accepted or required.
         geometry_source: Boundary that determines aligned output geometry.
@@ -205,6 +216,9 @@ def audio_video_output_contract(
             rules=input_rules,
             binding=input_binding,
             order=input_order,
+            min_total_count=min_input_media_count,
+            max_total_count=max_input_media_count,
+            required_any_types=required_any_input_types,
         ),
         negative_prompt=negative_prompt,
         output_media=OutputMediaSequence(items=(video_format, audio_format)),

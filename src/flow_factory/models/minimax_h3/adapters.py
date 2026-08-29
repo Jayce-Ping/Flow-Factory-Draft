@@ -21,7 +21,13 @@ import torch
 from ...contracts import (
     BatchCapability,
     GeometrySource,
+    InputMediaBinding,
+    InputMediaOrder,
+    InputMediaRule,
+    MediaFormat,
+    MediaType,
     NegativePromptPolicy,
+    RateRequirement,
 )
 from ...samples import (
     ComponentTimes,
@@ -34,9 +40,14 @@ from ...scheduler import MiniMaxH3SDEScheduler, SchedulerGroup
 from ..abc import BaseAdapter
 from ..checkpointing import CheckpointUnit
 from ..output_state import DecodedMediaBatch, EncodedOutputState, OutputStateCodec
-from ..pipeline_contracts import audio_video_output_contract
+from ..pipeline_contracts import (
+    IMAGE_FORMAT,
+    VIDEO_FORMAT_OPTIONAL_FPS,
+    audio_video_output_contract,
+)
 from ..runtime import ModularPipelineRuntime
 from ._common import apply_forward_process_noise, draw_forward_process_noise
+from ._condition import MiniMaxH3ConditionStatePreparer
 from ._output import MiniMaxH3AVOutputCodec, validate_h3_encoded_output_geometry
 from .workflow import (
     build_h3_component_runtime,
@@ -53,7 +64,12 @@ from .workflow import (
 )
 
 _H3_PREPROCESS_CACHE_FIELDS = frozenset({"height", "width", "num_frames"})
-_H3_PREPROCESS_CACHE_VERSION = "minimax-h3-v1"
+_H3_PREPROCESS_CACHE_VERSION = "minimax-h3-v2"
+_H3_OPTIONAL_AUDIO_REFERENCE_FORMAT = MediaFormat(
+    type=MediaType.AUDIO,
+    fps=RateRequirement.NOT_APPLICABLE,
+    sample_rate=RateRequirement.OPTIONAL,
+)
 
 
 class _MiniMaxH3WorkflowAdapter:
@@ -132,6 +148,46 @@ class _MiniMaxH3WorkflowAdapter:
     def preprocess_func(self, **kwargs: Any) -> Dict[str, Any]:
         return preprocess_h3_workflow(self, **kwargs)
 
+    def build_condition_state_preparer(
+        self,
+    ) -> Optional[MiniMaxH3ConditionStatePreparer]:
+        """Declare runtime prefix preparation only for conditioned workflows."""
+        if self.workflow == "t2va":
+            return None
+        return MiniMaxH3ConditionStatePreparer(self)
+
+    def build_output_state_codec(self) -> OutputStateCodec:
+        """Declare the shared audiovisual target codec without loading components."""
+        return MiniMaxH3AVOutputCodec(self)
+
+    def _validate_encoded_output_geometry(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Mapping[str, Any],
+        encoded: EncodedOutputState,
+    ) -> None:
+        """Require encoded AV rows to match this workflow's cached layout."""
+        validate_h3_encoded_output_geometry(self, media_batch, condition, encoded)
+
+    def _decode_output_state(
+        self,
+        encoded: EncodedOutputState,
+        *,
+        output_type: Literal["pil", "pt", "np"],
+    ) -> Any:
+        """Decode both H3 target components through the existing decoder."""
+        geometry = encoded.decode_context.get("geometry")
+        if not isinstance(geometry, Mapping):
+            raise TypeError(
+                "MiniMax H3 decode_context requires a geometry mapping, "
+                f"received {type(geometry).__name__}: {geometry!r}"
+            )
+        return self.decode_latents(
+            encoded.clean_state,
+            geometry=geometry,
+            output_type=output_type,
+        )
+
     def build_training_component_times(
         self,
         primary_timesteps: torch.Tensor,
@@ -156,6 +212,21 @@ class _MiniMaxH3WorkflowAdapter:
         noise: LatentState,
     ) -> NoisedState:
         return apply_forward_process_noise(clean_state, times, noise)
+
+    def _reduce_flow_matching_objective_values(
+        self,
+        values: Mapping[str, torch.Tensor],
+        *,
+        state: Optional[LatentState] = None,
+    ) -> torch.Tensor:
+        """Sum the official video and audio means for offline flow matching.
+
+        H3's audiovisual objective gives each modality its own mean-squared-error
+        term.  This objective-specific hook intentionally leaves the globally
+        element-weighted reducer used by online likelihood objectives unchanged.
+        """
+        component_means = self.reduce_component_latent_values(values, state=state)
+        return component_means["video"] + component_means["audio"]
 
     def decode_latents(self, latents: Any, **kwargs: Any) -> Any:
         return decode_h3_adapter_latents(self, latents, **kwargs)
@@ -221,50 +292,24 @@ class MiniMaxH3T2VAAdapter(_MiniMaxH3WorkflowAdapter, BaseAdapter):
         "audio_vae",
     ]
 
-    def build_output_state_codec(self) -> OutputStateCodec:
-        """Declare the configured audiovisual target codec without loading components.
-
-        Returns:
-            Immutable MiniMax H3 audiovisual output codec declaration.
-        """
-        return MiniMaxH3AVOutputCodec(self)
-
-    def _validate_encoded_output_geometry(
-        self,
-        media_batch: DecodedMediaBatch,
-        condition: Mapping[str, Any],
-        encoded: EncodedOutputState,
-    ) -> None:
-        """Require encoded rows and rate metadata to match cached T2VA geometry."""
-        validate_h3_encoded_output_geometry(self, media_batch, condition, encoded)
-
-    def _decode_output_state(
-        self,
-        encoded: EncodedOutputState,
-        *,
-        output_type: Literal["pil", "pt", "np"],
-    ) -> Any:
-        """Decode the two-component target state through H3's existing decoder."""
-        geometry = encoded.decode_context.get("geometry")
-        if not isinstance(geometry, Mapping):
-            raise TypeError(
-                "MiniMax H3 decode_context requires a geometry mapping, "
-                f"received {type(geometry).__name__}: {geometry!r}"
-            )
-        return self.decode_latents(
-            encoded.clean_state,
-            geometry=geometry,
-            output_type=output_type,
-        )
-
 
 class MiniMaxH3FL2VAAdapter(_MiniMaxH3WorkflowAdapter, BaseAdapter):
     """Load the workflow-pruned MiniMax H3 first/last-frame partition."""
 
-    output_state_codec_unavailable_reason = (
-        "MiniMax H3 conditioned offline forward requires a shared, reproducible "
-        "conditioned-prefix binder; paired offline-DPO arms must reuse identical "
-        "condition posterior noise"
+    pipeline_io_contract = audio_video_output_contract(
+        negative_prompt=NegativePromptPolicy.UNSUPPORTED,
+        input_rules=(
+            InputMediaRule(
+                format=IMAGE_FORMAT,
+                min_count=1,
+                max_count=2,
+                slots=("first_frame", "last_frame"),
+            ),
+        ),
+        input_binding=InputMediaBinding.GROUPED_BY_TYPE,
+        input_order=InputMediaOrder.WITHIN_TYPE,
+        geometry_source=GeometrySource.CONFIGURED,
+        batch_capability=BatchCapability.SINGLE_SAMPLE,
     )
 
     workflow: ClassVar[str] = "fl2va"
@@ -287,10 +332,24 @@ class MiniMaxH3FL2VAAdapter(_MiniMaxH3WorkflowAdapter, BaseAdapter):
 class MiniMaxH3Ref2VAAdapter(_MiniMaxH3WorkflowAdapter, BaseAdapter):
     """Load the workflow-pruned MiniMax H3 omni-reference partition."""
 
-    output_state_codec_unavailable_reason = (
-        "MiniMax H3 conditioned offline forward requires a shared, reproducible "
-        "conditioned-prefix binder; paired offline-DPO arms must reuse identical "
-        "condition posterior noise"
+    pipeline_io_contract = audio_video_output_contract(
+        negative_prompt=NegativePromptPolicy.UNSUPPORTED,
+        input_rules=(
+            InputMediaRule(format=IMAGE_FORMAT, min_count=0, max_count=9),
+            InputMediaRule(format=VIDEO_FORMAT_OPTIONAL_FPS, min_count=0, max_count=3),
+            InputMediaRule(
+                format=_H3_OPTIONAL_AUDIO_REFERENCE_FORMAT,
+                min_count=0,
+                max_count=3,
+            ),
+        ),
+        input_binding=InputMediaBinding.ORDERED_REFERENCES,
+        input_order=InputMediaOrder.GLOBAL,
+        min_input_media_count=1,
+        max_input_media_count=12,
+        required_any_input_types=(MediaType.IMAGE, MediaType.VIDEO),
+        geometry_source=GeometrySource.CONFIGURED,
+        batch_capability=BatchCapability.SINGLE_SAMPLE,
     )
 
     workflow: ClassVar[str] = "ref2va"

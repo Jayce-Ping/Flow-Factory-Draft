@@ -73,9 +73,16 @@ Every V2 media object uses `type` as its only public discriminator. The accepted
 
 ```json
 {"type":"image","path":"images/source.png"}
+{"type":"image","path":"images/end.png","slot":"last_frame"}
 {"type":"video","path":"videos/clip.mp4","fps":24.0}
 {"type":"audio","path":"audios/clip.wav","sample_rate":48000}
 ```
+
+`slot` is an optional, input-only semantic binding. It is useful when position alone is ambiguous:
+an explicitly slotted item reserves that adapter-declared slot, while unslotted items fill the
+remaining slots in declaration order. Duplicate, unknown, and wrong-media-type slots fail during
+contract validation. Supervision outputs reject `slot` because their order is declared by the
+pipeline output contract rather than by condition-argument names.
 
 Do not write `kind` in a V2 record. Some ordered-reference adapters still consume a validated
 legacy `kind` mapping internally; the V2 condition projection creates that private bridge only at
@@ -137,9 +144,17 @@ V2 input
 V2 target, chosen, or rejected
   -> decode from the source file in Dataset.__getitem__
   -> collate decoded CPU media
-  -> adapter.encode_output_state under no-grad on every training microbatch
+  -> adapter.prepare_condition_state once under no-grad on every training microbatch
+  -> adapter.encode_output_state with that prepared state under no-grad
   -> clean latent state for the objective
 ```
+
+The prepared condition keeps immutable cached condition fields and exposes explicit model-forward
+and output-codec views. Those two views may intentionally reference the same prepared input tensor;
+the framework prevents accidental key overwrites rather than requiring artificial tensor copies.
+SFT uses the same object for target binding and the forward.
+Offline DPO uses one object for both chosen/rejected encodes and both policy/reference forwards, so
+stochastic condition realization cannot drift between preference arms.
 
 Target, chosen, and rejected payloads, their VAE latents, and supervision metadata are never
 written to the Arrow condition cache. There is no target-VAE preprocessing cache. This avoids a
@@ -151,7 +166,10 @@ During offline dataset construction, every unique normalized input and supervisi
 streamed once through SHA-256, with digests memoized only for that source build. These digests are
 identity metadata: media payloads, decoded pixels, and output latents are neither copied nor cached.
 Replacing an input condition file in place therefore changes its condition identity and invalidates
-the Arrow cache automatically. Replacing target, chosen, or rejected media in place changes the
+the Arrow cache automatically. The checkpoint-realized input projection contract is also part of
+the cache key, so changes to slot order, binding, aggregate rules, negative-prompt policy, or batch
+capability cannot reuse an incompatible Arrow schema. Replacing target, chosen, or rejected media
+in place changes the
 full record identity used by exact-resume checks; supervision is still decoded afresh and requires
 no target-cache invalidation step.
 
@@ -203,19 +221,38 @@ output semantics.
 |---|---|---|
 | Supported | `sd3-5`, `flux1`, `flux1-kontext`, `flux2`, `flux2-klein`, `qwen-image`, `qwen-image-edit-plus`, `z-image`, `bagel`, `sensenova` | Image-output codecs with adapter-specific geometry and packing. SenseNova uses the existing grouped `images` input with within-type order, not heterogeneous references. |
 | Supported | `wan2_t2v` | Video targets require `fps`; the codec resamples to configured frames/rate and samples the Wan VAE posterior on the fly. |
-| Supported | `minimax-h3-t2va` | Every candidate is an exact ordered `(video, audio)` pair with required `fps` and `sample_rate`. The codec aligns both streams to configured H3 geometry, samples the video posterior, takes the official audio-posterior mode, and packs structured video/audio rows on the fly. Condition preprocessing and training remain B=1. |
-| Blocked | `wan2_i2v` | Output geometry depends on the first-frame VAE latent/mask, while the current condition cache does not preserve the source pixels needed by that binder. |
-| Blocked | `ltx2_t2av`, `ltx2_i2av` | Their adapter codec still needs exact LTX-specific audio/video duration alignment, latent packing, and decode context; I2AV also needs the pinned first-frame active mask. |
-| Blocked | `minimax-h3-fl2va`, `minimax-h3-ref2va` | Their cached input media still need a shared, reproducible offline condition-prefix binder; offline DPO must reuse the same conditioned prefix noise for both preference arms. |
+| Supported | `wan2_i2v` | Input media binds a required `first_frame` image and an optional `last_frame` image. Condition pixels are cached at configured geometry, then encoded with VAE posterior mode once per batch. Expanded-timestep TI2V checkpoints accept the first frame only because official Diffusers ignores a last image in that mode. Video targets require `fps`. Offline execution is B=1. |
+| Supported | `ltx2_t2av`, `ltx2_i2av` | Every candidate is an exact ordered `(video, audio)` pair with required `fps` and `sample_rate`. Both streams are aligned to the official LTX2 clock and encoded/packed on the fly. I2AV requires the `first_frame` image slot, substitutes its posterior-mode first latent into each target, and excludes the pinned tokens with an active mask. |
+| Supported | `minimax-h3-t2va`, `minimax-h3-fl2va`, `minimax-h3-ref2va` | Every candidate is an exact ordered `(video, audio)` pair. FL2VA accepts `first_frame`, `last_frame`, or both slots; Ref2VA accepts 1-12 globally ordered references and requires at least one image or video. Conditioned workflows realize one official prefix per batch, shared by both offline-DPO candidates and policy/reference forwards. H3 remains B=1. |
 
-MiniMax H3 T2VA supervision lists video first and audio second. The target video must cover the
-configured 24-fps duration; it is deterministically sampled onto that frame grid and resized to the
-configured canvas. Audio is converted to stereo at the H3 audio-VAE rate, then trimmed or
-right-padded to the exact aligned latent duration. For example:
+Wan first/last semantics use generic semantic slots, not model-specific schema keys. The first
+frame is required; the last frame is optional. Unslotted input remains a positional convenience,
+but an explicit slot is recommended for sparse or generated manifests. The target is the complete
+generated video: its first frame, and its final frame when provided, correspond to the conditions.
+
+```jsonl
+{"schema_version":2,"input":{"prompt":"A paper boat crosses the pond.","media":[{"type":"image","path":"conditions/first.png","slot":"first_frame"}]},"supervision":{"type":"demonstration","target":{"media":[{"type":"video","path":"targets/first-only.mp4","fps":24.0}]}},"metadata":{}}
+{"schema_version":2,"input":{"prompt":"Interpolate the changing sky.","media":[{"type":"image","path":"conditions/first.png","slot":"first_frame"},{"type":"image","path":"conditions/last.png","slot":"last_frame"}]},"supervision":{"type":"preference","chosen":{"media":[{"type":"video","path":"pairs/chosen.mp4","fps":24.0}]},"rejected":{"media":[{"type":"video","path":"pairs/rejected.mp4","fps":24.0}]}},"metadata":{}}
+```
+
+LTX2 and MiniMax H3 supervision list video first and audio second. LTX2 aligns audio duration with
+the official `num_frames / frame_rate` clock. H3 target video must cover the configured 24-fps
+duration; it is deterministically sampled onto that frame grid and resized to the configured
+canvas. H3 audio is converted to stereo at the audio-VAE rate, then trimmed or right-padded to the
+exact aligned latent duration. For example:
 
 ```jsonl
 {"schema_version":2,"input":{"prompt":"Ocean waves beneath an aurora.","media":[]},"supervision":{"type":"demonstration","target":{"media":[{"type":"video","path":"targets/aurora.mp4","fps":24.0},{"type":"audio","path":"targets/aurora.wav","sample_rate":32000}]}},"metadata":{}}
 {"schema_version":2,"input":{"prompt":"Ocean waves beneath an aurora.","media":[]},"supervision":{"type":"preference","chosen":{"media":[{"type":"video","path":"pairs/chosen.mp4","fps":24.0},{"type":"audio","path":"pairs/chosen.wav","sample_rate":32000}]},"rejected":{"media":[{"type":"video","path":"pairs/rejected.mp4","fps":24.0},{"type":"audio","path":"pairs/rejected.wav","sample_rate":32000}]}},"metadata":{}}
+```
+
+For LTX2 I2AV, bind one image to `first_frame`. H3 FL2VA supports first-only, last-only, and
+first-plus-last records; use explicit slots for the last-only form. H3 Ref2VA puts the complete
+ordered image/video/audio reference sequence in `input.media`; the offline projection bridges those
+public `type` objects to the adapter's private legacy reference representation.
+
+```jsonl
+{"schema_version":2,"input":{"prompt":"Reveal the scene before this ending.","media":[{"type":"image","path":"conditions/end.png","slot":"last_frame"}]},"supervision":{"type":"demonstration","target":{"media":[{"type":"video","path":"targets/story.mp4","fps":24.0},{"type":"audio","path":"targets/story.wav","sample_rate":32000}]}},"metadata":{}}
 ```
 
 ## Common task formats
@@ -367,6 +404,10 @@ FL2VA uses an ordered `"images"` list:
 - Any other cardinality is invalid.
 - Order must not be sorted, deduplicated, or inferred from filenames.
 
+This legacy generation form cannot express last-only conditioning. Strict V2 offline records use
+the generic `slot: "last_frame"` binding shown above, so FL2VA can train on a final frame without a
+synthetic first frame.
+
 The example stores paths relative to the dataset root, so its YAML sets `image_dir` to the dataset
 directory. See the [FL2VA dataset fixture](../dataset/minimax_h3_fl2va/train.jsonl) and
 [FL2VA GRPO configuration](../examples/grpo/lora/minimax_h3_fl2va/default.yaml).
@@ -381,8 +422,8 @@ image, video, and audio entries:
 ```
 
 Array order is semantically significant. It is preserved during validation, encoding, caching, and
-sample identity hashing. At least one image or video reference is required; an audio-only array is
-invalid.
+sample identity hashing. The array accepts 1-12 entries and requires at least one image or video;
+an audio-only array is invalid.
 
 Supported entries:
 
@@ -394,7 +435,7 @@ Supported entries:
 
 `fps` and `sample_rate` overrides must be finite positive numbers. A video may use its embedded
 soundtrack or a separate dataset-relative `audio_path`; a video `sample_rate` override requires
-`audio_path`. Unknown keys and unsupported `kind` values fail before preprocessing.
+`audio_path`. Unknown keys and unsupported legacy `kind` values fail before preprocessing.
 
 This legacy online manifest is distinct from the strict V2 format above. A V2 record always uses
 `input.media[*].type`; offline condition projection performs any required legacy `kind` conversion
@@ -419,8 +460,9 @@ TXT/JSONL row
 
 Prompt encoders, condition VAEs, and processors are preprocessing components. Online RL can
 offload them after cache creation because optimization consumes cached conditions. Offline SFT and
-offline DPO reload any output-codec components declared by the adapter and encode target,
-chosen, and rejected media on the fly; those output states are never cached.
+offline DPO reload any condition-preparer and output-codec components declared by the adapter.
+They realize one prepared condition per batch, then encode target, chosen, and rejected media on
+the fly; those output states are never cached.
 
 Ref2VA adds an ordered-reference path:
 

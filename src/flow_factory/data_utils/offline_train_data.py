@@ -223,7 +223,7 @@ def build_offline_train_dataloader(
             preprocess_func=preprocess_func,
             preprocess_kwargs=normalized_preprocess_kwargs,
             preprocessing_batch_size=data_args.preprocessing_batch_size,
-            batch_capability=pipeline_io_contract.batch_capability,
+            pipeline_io_contract=pipeline_io_contract,
             force_reprocess=data_args.force_reprocess,
             extra_hash_strs=[*normalized_extra_hash_strs, f"offline_train_source:{source.name}"],
             preprocess_parallelism=data_args.preprocess_parallelism,
@@ -315,7 +315,7 @@ def _build_distributed_condition_cache(
     preprocess_func: PreprocessCallable,
     preprocess_kwargs: Mapping[str, Any],
     preprocessing_batch_size: int,
-    batch_capability: BatchCapability,
+    pipeline_io_contract: PipelineIOContract,
     force_reprocess: bool,
     extra_hash_strs: Sequence[str],
     preprocess_parallelism: Literal["global", "local"],
@@ -326,17 +326,22 @@ def _build_distributed_condition_cache(
     ordered_references = _supports_ordered_references(preprocess_func)
     effective_batch_size = (
         1
-        if ordered_references or batch_capability is BatchCapability.SINGLE_SAMPLE
+        if ordered_references
+        or pipeline_io_contract.batch_capability is BatchCapability.SINGLE_SAMPLE
         else preprocessing_batch_size
     )
     raw_dataset = project_offline_condition_dataset(
         records,
         source_name=source_name,
         ordered_references=ordered_references,
+        pipeline_io_contract=pipeline_io_contract,
         _media_digest_cache=_media_digest_cache,
     )
     condition_ids = tuple(raw_dataset[OFFLINE_CONDITION_ID_COLUMN])
-    source_hash = compute_offline_condition_source_hash(condition_ids)
+    source_hash = compute_offline_condition_source_hash(
+        condition_ids,
+        pipeline_io_contract=pipeline_io_contract,
+    )
     dataset_builder = _create_or_load_dataset(
         split=split,
         accelerator=accelerator,

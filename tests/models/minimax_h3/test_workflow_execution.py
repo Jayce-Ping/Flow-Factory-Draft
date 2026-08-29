@@ -16,7 +16,10 @@ from typing import Any, Dict, List
 
 import pytest
 import torch
+from PIL import Image
 
+from flow_factory.data_utils.offline_condition_cache import build_offline_condition_cache
+from flow_factory.data_utils.schema import normalize_v2_record
 from flow_factory.models.minimax_h3.adapters import (
     MiniMaxH3FL2VAAdapter,
     MiniMaxH3Ref2VAAdapter,
@@ -63,6 +66,20 @@ def _adapter(adapter_class: type, transformer: Any = None) -> Any:
                 "num_frames": 5,
             },
         ),
+        (
+            MiniMaxH3FL2VAAdapter,
+            {
+                "images": [["ending"]],
+                "image_slots": [["last_frame"]],
+            },
+            {
+                "prompt": "describe",
+                "last_image": "ending",
+                "height": 64,
+                "width": 96,
+                "num_frames": 5,
+            },
+        ),
     ],
 )
 def test_preprocess_uses_exact_workflow_inputs_and_b1(
@@ -87,14 +104,79 @@ def test_preprocess_uses_exact_workflow_inputs_and_b1(
         adapter.preprocess_func(prompt=["one", "two"], height=64, width=96, num_frames=5)
 
 
+def test_v2_last_only_condition_reaches_h3_preprocess_through_arrow(tmp_path, monkeypatch) -> None:
+    """The complete public-schema/cache path preserves a sparse last-frame binding."""
+    ending_path = tmp_path / "ending.png"
+    Image.new("RGB", (16, 16), color=(12, 34, 56)).save(ending_path)
+    record = normalize_v2_record(
+        {
+            "schema_version": 2,
+            "input": {
+                "prompt": "Reveal what led to this ending.",
+                "media": [
+                    {
+                        "type": "image",
+                        "path": ending_path.name,
+                        "slot": "last_frame",
+                    }
+                ],
+            },
+            "supervision": {
+                "type": "demonstration",
+                "target": {
+                    "media": [
+                        {"type": "video", "path": "target.mp4", "fps": 24.0},
+                        {
+                            "type": "audio",
+                            "path": "target.wav",
+                            "sample_rate": 32000,
+                        },
+                    ]
+                },
+            },
+            "metadata": {},
+        },
+        dataset_dir=tmp_path,
+    )
+    calls: List[Any] = []
+    monkeypatch.setattr(
+        "flow_factory.models.minimax_h3.workflow.encode_h3_workflow_inputs",
+        lambda pipeline, values, workflow: calls.append((workflow, values))
+        or {"prompt_embeds": torch.zeros(1, 2, 4)},
+    )
+    adapter = _adapter(MiniMaxH3FL2VAAdapter)
+
+    cache = build_offline_condition_cache(
+        [record],
+        source_name="h3-last-only",
+        dataset_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
+        preprocess_func=adapter.preprocess_func,
+        preprocess_kwargs={
+            "height": 64,
+            "width": 96,
+            "num_frames": 124,
+        },
+        pipeline_io_contract=adapter.pipeline_io_contract,
+        preprocessing_batch_size=1,
+    )
+
+    assert len(cache) == 1
+    assert len(calls) == 1
+    workflow, values = calls[0]
+    assert workflow == "fl2va"
+    assert "image" not in values
+    assert isinstance(values["last_image"], Image.Image)
+    assert values["last_image"].size == (16, 16)
+
+
 def test_preprocess_adds_outer_batch_to_arrow_cache_fields(monkeypatch) -> None:
     monkeypatch.setattr(
         "flow_factory.models.minimax_h3.workflow.encode_h3_workflow_inputs",
         lambda *args, **kwargs: {
             "prompt_embeds": torch.zeros(1, 2, 4),
-            "text_token_tags": torch.tensor([1, 1]),
+            "token_tags": torch.tensor([1, 1]),
             "height": 64,
-            "keyframe_anchors": (),
         },
     )
     adapter = _adapter(MiniMaxH3T2VAAdapter)
@@ -107,10 +189,9 @@ def test_preprocess_adds_outer_batch_to_arrow_cache_fields(monkeypatch) -> None:
     )
 
     assert result["prompt_embeds"].shape == (1, 2, 4)
-    assert len(result["text_token_tags"]) == 1
-    torch.testing.assert_close(result["text_token_tags"][0], torch.tensor([1, 1]))
+    assert len(result["token_tags"]) == 1
+    torch.testing.assert_close(result["token_tags"][0], torch.tensor([1, 1]))
     assert result["height"] == [64]
-    assert result["keyframe_anchors"] == [[]]
 
 
 def test_ref_preprocess_builds_ordered_pinned_objects_without_returning_them(monkeypatch) -> None:

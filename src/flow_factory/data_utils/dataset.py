@@ -350,6 +350,21 @@ class GeneralDataset(Dataset):
             source_hash_override=source_hash_override,
         )
 
+        # Every distributed rank must write the same Arrow schema. Infer it from
+        # the unsharded source before selecting the rank-local rows; otherwise an
+        # all-empty optional-media shard can become ``List(null)`` while another
+        # rank writes ``List(Image)`` and the merged cache cannot be loaded.
+        preprocess_features = self._infer_cross_chunk_features(
+            raw_dataset=raw_dataset,
+            preprocessing_batch_size=preprocessing_batch_size,
+            image_dir=self.image_dir,
+            video_dir=self.video_dir,
+            audio_dir=self.audio_dir,
+            force_reprocess=force_reprocess,
+            target_arrow_path=target_arrow_path,
+            require_explicit_features=bool(self.num_shards and self.num_shards > 1),
+        )
+
         if self.num_shards and self.num_shards > 1:
             if self.shard_index is None:
                 raise ValueError(
@@ -374,16 +389,6 @@ class GeneralDataset(Dataset):
         os.makedirs(self.cache_dir, exist_ok=True)
         if target_arrow_path is not None:
             os.makedirs(os.path.dirname(os.path.abspath(target_arrow_path)), exist_ok=True)
-
-        preprocess_features = self._infer_cross_chunk_features(
-            raw_dataset=raw_dataset,
-            preprocessing_batch_size=preprocessing_batch_size,
-            image_dir=self.image_dir,
-            video_dir=self.video_dir,
-            audio_dir=self.audio_dir,
-            force_reprocess=force_reprocess,
-            target_arrow_path=target_arrow_path,
-        )
 
         processed_dataset = raw_dataset.map(
             self._preprocess_batch,
@@ -417,6 +422,7 @@ class GeneralDataset(Dataset):
         audio_dir: Optional[str],
         force_reprocess: bool,
         target_arrow_path: Optional[str],
+        require_explicit_features: bool = False,
     ) -> Optional[HFFeatures]:
         """Infer one explicit schema when later map chunks introduce typed values.
 
@@ -429,13 +435,16 @@ class GeneralDataset(Dataset):
         adapter-owned mutable state is intentionally outside that guarantee.
 
         Args:
-            raw_dataset: Input dataset after any distributed sharding.
+            raw_dataset: Full input dataset before distributed sharding.
             preprocessing_batch_size: Map chunk size.
             image_dir: Image root forwarded to preprocessing.
             video_dir: Video root forwarded to preprocessing.
             audio_dir: Audio root forwarded to preprocessing.
             force_reprocess: Whether an existing explicit Arrow target is rebuilt.
             target_arrow_path: Optional explicit Arrow cache target.
+            require_explicit_features: Whether to infer a schema even when the
+                first source chunk is already representative. Distributed ranks
+                use this to share one global schema across disjoint shards.
 
         Returns:
             Explicit output features for a cross-chunk nullable transition, or
@@ -453,7 +462,9 @@ class GeneralDataset(Dataset):
             preprocessing_batch_size=preprocessing_batch_size,
         )
         if probe_batches is None:
-            return None
+            if not require_explicit_features or not len(raw_dataset):
+                return None
+            probe_batches = [list(range(min(preprocessing_batch_size, len(raw_dataset))))]
 
         explicit_generators = list(_iter_torch_generators(self._preprocess_kwargs))
         generator_states = [generator.get_state() for generator in explicit_generators]
@@ -581,7 +592,16 @@ class GeneralDataset(Dataset):
                 f"received B={len(batch['prompt'])} for split={self.split!r}"
             )
         # The columns that are used in preprocess and maintained in the final results.
-        PREPROCESS_COLUMNS = ("prompt", "negative_prompt", "images", "videos", "audios")
+        PREPROCESS_COLUMNS = (
+            "prompt",
+            "negative_prompt",
+            "images",
+            "videos",
+            "audios",
+            "image_slots",
+            "video_slots",
+            "audio_slots",
+        )
         metadata_excluded_columns = set(PREPROCESS_COLUMNS)
         metadata_excluded_columns.update(self._passthrough_columns)
         if self._uses_ordered_references:
@@ -703,6 +723,12 @@ class GeneralDataset(Dataset):
             reference_args["references"] = loaded_reference_batch
             batch["reference_manifest"] = canonical_manifests
 
+        slot_args = {
+            column: batch[column]
+            for column in ("image_slots", "video_slots", "audio_slots")
+            if column in batch
+        }
+
         # 5. Call preprocess function with filtered kwargs
         input_args = {
             **prompt_args,
@@ -710,6 +736,7 @@ class GeneralDataset(Dataset):
             **video_args,
             **audio_args,
             **reference_args,
+            **slot_args,
             **self._preprocess_kwargs,
         }
         filtered_args = filter_kwargs(self._preprocess_func, **input_args)

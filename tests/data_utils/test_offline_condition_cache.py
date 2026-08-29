@@ -15,6 +15,7 @@
 import gc
 import json
 import weakref
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -25,6 +26,20 @@ from datasets import Dataset as HFDataset
 from datasets import Image as HFImage
 from PIL import Image
 
+from flow_factory.contracts import (
+    BatchCapability,
+    GeometrySource,
+    InputMediaBinding,
+    InputMediaOrder,
+    InputMediaRule,
+    InputMediaSpec,
+    MediaFormat,
+    MediaType,
+    NegativePromptPolicy,
+    OutputMediaSequence,
+    PipelineIOContract,
+    RateRequirement,
+)
 from flow_factory.data_utils.dataset import GeneralDataset, _cross_chunk_schema_probe_batches
 from flow_factory.data_utils.offline_condition_cache import (
     build_offline_condition_cache,
@@ -33,9 +48,46 @@ from flow_factory.data_utils.offline_condition_cache import (
 )
 from flow_factory.data_utils.offline_dataset import (
     OFFLINE_CONDITION_ID_COLUMN,
+    OfflineDataset,
     compute_offline_condition_id,
 )
+from flow_factory.data_utils.offline_loader import build_offline_dataloader
 from flow_factory.data_utils.schema import NormalizedDatasetRecord, normalize_v2_record
+
+_IMAGE_FORMAT = MediaFormat(
+    type=MediaType.IMAGE,
+    fps=RateRequirement.NOT_APPLICABLE,
+    sample_rate=RateRequirement.NOT_APPLICABLE,
+)
+_SLOTTED_IMAGE_CONTRACT = PipelineIOContract(
+    input_media=InputMediaSpec(
+        rules=(
+            InputMediaRule(
+                format=_IMAGE_FORMAT,
+                min_count=1,
+                max_count=2,
+                slots=("first_frame", "last_frame"),
+            ),
+        ),
+        binding=InputMediaBinding.GROUPED_BY_TYPE,
+        order=InputMediaOrder.WITHIN_TYPE,
+    ),
+    negative_prompt=NegativePromptPolicy.UNSUPPORTED,
+    output_media=OutputMediaSequence(items=(_IMAGE_FORMAT,)),
+    geometry_source=GeometrySource.CONFIGURED,
+    batch_capability=BatchCapability.SINGLE_SAMPLE,
+)
+_OPTIONAL_IMAGE_CONTRACT = PipelineIOContract(
+    input_media=InputMediaSpec(
+        rules=(InputMediaRule(format=_IMAGE_FORMAT, min_count=0, max_count=1),),
+        binding=InputMediaBinding.GROUPED_BY_TYPE,
+        order=InputMediaOrder.INSENSITIVE,
+    ),
+    negative_prompt=NegativePromptPolicy.OPTIONAL,
+    output_media=OutputMediaSequence(items=(_IMAGE_FORMAT,)),
+    geometry_source=GeometrySource.CONFIGURED,
+    batch_capability=BatchCapability.UNIFORM,
+)
 
 
 class CountingPreprocessor:
@@ -112,6 +164,37 @@ class OptionalImagePreprocessor:
             "image_latents": image_latents,
             "image_latent_ids": image_latent_ids,
         }
+
+
+class OptionalSourcePreprocessor:
+    """Expose stable output keys for optional condition columns across sources."""
+
+    def preprocess(
+        self,
+        prompt: List[str],
+        negative_prompt: List[str],
+        images: List[List[Image.Image]],
+    ) -> Dict[str, torch.Tensor]:
+        return {
+            "prompt_lengths": torch.tensor([len(value) for value in prompt]),
+            "negative_prompt_lengths": torch.tensor([len(value) for value in negative_prompt]),
+            "image_counts": torch.tensor([len(value) for value in images]),
+        }
+
+
+class SingleSamplePreprocessor:
+    def __init__(self) -> None:
+        self.batch_sizes: List[int] = []
+
+    def preprocess(
+        self,
+        prompt: List[str],
+        images: List[List[Image.Image]],
+        **kwargs: Any,
+    ) -> Dict[str, torch.Tensor]:
+        del images, kwargs
+        self.batch_sizes.append(len(prompt))
+        return {"encoded": torch.ones(len(prompt), 1)}
 
 
 class ChunkBoundedDatasetSpy:
@@ -324,6 +407,33 @@ def test_projection_contains_only_input_and_identity_columns(tmp_path: Path) -> 
     assert "private-target.png" not in repr(projected[0])
 
 
+def test_projection_canonicalizes_explicit_and_positional_semantic_slots(
+    tmp_path: Path,
+) -> None:
+    Image.new("RGB", (2, 2), color=(1, 2, 3)).save(tmp_path / "first.png")
+    Image.new("RGB", (2, 2), color=(4, 5, 6)).save(tmp_path / "last.png")
+    record = _demonstration_record(
+        tmp_path,
+        input_media=[
+            {"type": "image", "path": "last.png", "slot": "last_frame"},
+            {"type": "image", "path": "first.png"},
+        ],
+    )
+
+    projected = project_offline_condition_dataset(
+        [record],
+        source_name="slotted",
+        ordered_references=False,
+        pipeline_io_contract=_SLOTTED_IMAGE_CONTRACT,
+    )
+
+    assert projected[0]["images"] == [
+        str(tmp_path / "first.png"),
+        str(tmp_path / "last.png"),
+    ]
+    assert projected[0]["image_slots"] == ["first_frame", "last_frame"]
+
+
 def test_projection_normalizes_missing_optional_negative_prompts_in_mixed_batch(
     tmp_path: Path,
 ) -> None:
@@ -338,6 +448,69 @@ def test_projection_normalizes_missing_optional_negative_prompts_in_mixed_batch(
     )
 
     assert projected["negative_prompt"] == ["", "bad quality"]
+
+
+def test_optional_condition_columns_are_stable_across_offline_sources(
+    tmp_path: Path,
+) -> None:
+    """ConcatDataset batches can mix an all-empty source with a populated source."""
+    Image.new("RGB", (2, 2), color=(1, 2, 3)).save(tmp_path / "reference.png")
+    Image.new("RGB", (2, 2), color=(4, 5, 6)).save(tmp_path / "target.png")
+    empty_record = _demonstration_record(tmp_path)
+    populated_record = _demonstration_record(
+        tmp_path,
+        input_media=[{"type": "image", "path": "reference.png"}],
+        negative_prompt="bad quality",
+    )
+    preprocessor = OptionalSourcePreprocessor()
+
+    empty_cache = build_offline_condition_cache(
+        [empty_record],
+        source_name="empty-source",
+        dataset_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
+        preprocess_func=preprocessor.preprocess,
+        pipeline_io_contract=_OPTIONAL_IMAGE_CONTRACT,
+        preprocessing_batch_size=1,
+    )
+    populated_cache = build_offline_condition_cache(
+        [populated_record],
+        source_name="populated-source",
+        dataset_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
+        preprocess_func=preprocessor.preprocess,
+        pipeline_io_contract=_OPTIONAL_IMAGE_CONTRACT,
+        preprocessing_batch_size=1,
+    )
+    assert set(empty_cache.column_names) == set(populated_cache.column_names)
+
+    empty_dataset = OfflineDataset(
+        [empty_record],
+        empty_cache,
+        source_name="empty-source",
+        source_id=0,
+        supervision_type="demonstration",
+    )
+    populated_dataset = OfflineDataset(
+        [populated_record],
+        populated_cache,
+        source_name="populated-source",
+        source_id=1,
+        supervision_type="demonstration",
+    )
+    loader = build_offline_dataloader(
+        [empty_dataset, populated_dataset],
+        source_weights=[1, 1],
+        batch_size=2,
+        num_replicas=1,
+        rank=0,
+        gradient_accumulation_steps=1,
+        shuffle=False,
+    )
+
+    batch = next(iter(loader))
+    assert batch.condition["image_counts"].tolist() == [0, 1]
+    assert batch.condition["negative_prompt_lengths"].tolist() == [0, 11]
 
 
 def test_preference_arms_never_enter_the_condition_projection(tmp_path: Path) -> None:
@@ -357,6 +530,31 @@ def test_condition_source_hash_is_order_sensitive() -> None:
     assert compute_offline_condition_source_hash(["first", "second"]) != (
         compute_offline_condition_source_hash(["second", "first"])
     )
+
+
+def test_condition_source_hash_includes_effective_slot_projection() -> None:
+    reversed_rule = replace(
+        _SLOTTED_IMAGE_CONTRACT.input_media.rules[0],
+        slots=("last_frame", "first_frame"),
+    )
+    reversed_contract = replace(
+        _SLOTTED_IMAGE_CONTRACT,
+        input_media=replace(
+            _SLOTTED_IMAGE_CONTRACT.input_media,
+            rules=(reversed_rule,),
+        ),
+    )
+
+    baseline = compute_offline_condition_source_hash(
+        ["same-input"],
+        pipeline_io_contract=_SLOTTED_IMAGE_CONTRACT,
+    )
+    changed = compute_offline_condition_source_hash(
+        ["same-input"],
+        pipeline_io_contract=reversed_contract,
+    )
+
+    assert changed != baseline
 
 
 def test_schema_probe_scans_only_bounded_pending_column_chunks() -> None:
@@ -521,6 +719,103 @@ def test_condition_cache_preserves_optional_image_schema_across_map_chunks(
         assert len(cache[row]["condition_images"]) == 1
         assert cache[row]["image_latents"].shape == (2, 3)
         assert cache[row]["image_latent_ids"].shape == (2, 4)
+
+
+def test_distributed_condition_cache_uses_one_global_optional_media_schema(
+    tmp_path: Path,
+) -> None:
+    """Disjoint empty/populated ranks consolidate with identical Arrow features."""
+    Image.new("RGB", (2, 2), color=(1, 2, 3)).save(tmp_path / "reference.png")
+    records = [
+        _demonstration_record(tmp_path),
+        _demonstration_record(tmp_path),
+        _demonstration_record(
+            tmp_path,
+            input_media=[{"type": "image", "path": "reference.png"}],
+        ),
+        _demonstration_record(
+            tmp_path,
+            input_media=[{"type": "image", "path": "reference.png"}],
+        ),
+    ]
+    raw_dataset = project_offline_condition_dataset(
+        records,
+        source_name="distributed-optional-images",
+        ordered_references=False,
+        pipeline_io_contract=_OPTIONAL_IMAGE_CONTRACT,
+    )
+    condition_ids = tuple(raw_dataset[OFFLINE_CONDITION_ID_COLUMN])
+    source_hash = compute_offline_condition_source_hash(
+        condition_ids,
+        pipeline_io_contract=_OPTIONAL_IMAGE_CONTRACT,
+    )
+    preprocessor = OptionalImagePreprocessor()
+    merged_cache_path = GeneralDataset.compute_cache_path(
+        dataset_dir=str(tmp_path),
+        split="train",
+        cache_dir=str(tmp_path / "cache"),
+        max_dataset_size=None,
+        preprocess_func=preprocessor.preprocess,
+        preprocess_kwargs={},
+        source_hash_override=source_hash,
+    )
+
+    for rank in range(2):
+        GeneralDataset(
+            dataset_dir=str(tmp_path),
+            split="train",
+            cache_dir=str(tmp_path / "cache"),
+            force_reprocess=True,
+            preprocessing_batch_size=2,
+            preprocess_func=preprocessor.preprocess,
+            num_shards=2,
+            shard_index=rank,
+            image_dir=str(tmp_path),
+            video_dir=str(tmp_path),
+            audio_dir=str(tmp_path),
+            target_arrow_path=GeneralDataset.build_part_arrow_path(
+                merged_cache_path,
+                rank,
+                2,
+            ),
+            raw_dataset=raw_dataset,
+            source_hash_override=source_hash,
+            passthrough_columns=(OFFLINE_CONDITION_ID_COLUMN,),
+        )
+
+    GeneralDataset.consolidate_parts(merged_cache_path, 2, split="train")
+    merged = GeneralDataset.load_merged(merged_cache_path).processed_dataset
+
+    assert isinstance(merged.features["condition_images"].feature, HFImage)
+    assert merged[0]["condition_images"] == []
+    assert len(merged[2]["condition_images"]) == 1
+
+
+def test_standalone_condition_cache_honors_single_sample_contract(
+    tmp_path: Path,
+) -> None:
+    Image.new("RGB", (2, 2), color=(1, 2, 3)).save(tmp_path / "first.png")
+    records = [
+        _demonstration_record(
+            tmp_path,
+            input_media=[{"type": "image", "path": "first.png", "slot": "first_frame"}],
+        )
+        for _ in range(2)
+    ]
+    preprocessor = SingleSamplePreprocessor()
+
+    build_offline_condition_cache(
+        records,
+        source_name="single-sample",
+        dataset_dir=tmp_path,
+        cache_dir=tmp_path / "cache",
+        preprocess_func=preprocessor.preprocess,
+        pipeline_io_contract=_SLOTTED_IMAGE_CONTRACT,
+        force_reprocess=True,
+        preprocessing_batch_size=8,
+    )
+
+    assert preprocessor.batch_sizes == [1, 1]
 
 
 def test_ordered_heterogeneous_references_cross_arrow_as_canonical_json(

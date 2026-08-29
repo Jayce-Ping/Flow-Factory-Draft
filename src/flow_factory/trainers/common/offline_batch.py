@@ -21,6 +21,7 @@ from typing import Any, Dict, Union
 import torch
 
 from ...contracts import NON_MODEL_CONDITION_KEYS
+from ...models.condition_state import PreparedConditionState
 
 
 def move_condition_to_device(
@@ -77,6 +78,30 @@ def bind_output_forward_context(
             f"{collisions}; input and output fields must have one owner"
         )
     return {**condition, **forward_context}
+
+
+def bind_prepared_condition_output(
+    prepared: PreparedConditionState,
+    output_forward_context: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Bind one realized input condition to candidate-specific output fields.
+
+    Args:
+        prepared: Input-owned realization shared by every candidate for a request.
+        output_forward_context: Candidate-specific output-derived model fields.
+
+    Returns:
+        A new complete model-forward mapping.
+    """
+    if not isinstance(prepared, PreparedConditionState):
+        raise TypeError(
+            "expected PreparedConditionState for prepared offline condition, "
+            f"received {type(prepared).__name__}: {prepared!r}"
+        )
+    return bind_output_forward_context(
+        prepared.model_forward_condition(),
+        output_forward_context,
+    )
 
 
 def _move_condition_value(
@@ -136,4 +161,8 @@ def _reject_non_model_keys(value: Mapping[str, Any], identifier: str) -> None:
         )
 
 
-__all__ = ["bind_output_forward_context", "move_condition_to_device"]
+__all__ = [
+    "bind_output_forward_context",
+    "bind_prepared_condition_output",
+    "move_condition_to_device",
+]

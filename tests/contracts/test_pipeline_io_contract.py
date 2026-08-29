@@ -35,6 +35,7 @@ from flow_factory.contracts import (
     OutputMediaSequence,
     PipelineIOContract,
     RateRequirement,
+    resolve_pipeline_input_media_slots,
     validate_pipeline_model_input,
     validate_pipeline_output_candidate,
 )
@@ -153,6 +154,7 @@ class _InputMediaFixture:
     type: str
     fps: float | None = None
     sample_rate: int | None = None
+    slot: str | None = None
 
 
 @dataclass
@@ -264,6 +266,195 @@ def test_model_input_validation_enforces_counts_and_required_rates() -> None:
         ),
         contract,
     )
+
+
+def test_semantic_slots_preserve_positional_shorthand_and_support_sparse_binding() -> None:
+    contract = PipelineIOContract(
+        input_media=InputMediaSpec(
+            rules=(
+                InputMediaRule(
+                    format=IMAGE_FORMAT,
+                    min_count=1,
+                    max_count=2,
+                    slots=("first_frame", "last_frame"),
+                ),
+            ),
+            binding=InputMediaBinding.GROUPED_BY_TYPE,
+            order=InputMediaOrder.WITHIN_TYPE,
+        ),
+        negative_prompt=NegativePromptPolicy.UNSUPPORTED,
+        output_media=OutputMediaSequence(items=(IMAGE_FORMAT,)),
+        geometry_source=GeometrySource.CONFIGURED,
+        batch_capability=BatchCapability.SINGLE_SAMPLE,
+    )
+
+    positional = _ModelInputFixture(
+        prompt="both",
+        media=(_InputMediaFixture("image"), _InputMediaFixture("image")),
+    )
+    assert resolve_pipeline_input_media_slots(positional, contract) == (
+        "first_frame",
+        "last_frame",
+    )
+
+    last_only = _ModelInputFixture(
+        prompt="end here",
+        media=(_InputMediaFixture("image", slot="last_frame"),),
+    )
+    assert resolve_pipeline_input_media_slots(last_only, contract) == ("last_frame",)
+
+    mixed = _ModelInputFixture(
+        prompt="explicit last first in the manifest",
+        media=(
+            _InputMediaFixture("image", slot="last_frame"),
+            _InputMediaFixture("image"),
+        ),
+    )
+    assert resolve_pipeline_input_media_slots(mixed, contract) == (
+        "last_frame",
+        "first_frame",
+    )
+
+
+def test_multi_slot_rules_require_within_type_positional_semantics() -> None:
+    """A contract cannot claim order-insensitivity while using positional fallback."""
+    with pytest.raises(ValueError, match="multi-slot.*within_type ordering"):
+        InputMediaSpec(
+            rules=(
+                InputMediaRule(
+                    format=IMAGE_FORMAT,
+                    min_count=1,
+                    max_count=2,
+                    slots=("first_frame", "last_frame"),
+                ),
+            ),
+            binding=InputMediaBinding.GROUPED_BY_TYPE,
+            order=InputMediaOrder.INSENSITIVE,
+        )
+
+
+def test_semantic_slots_reject_unknown_duplicate_and_missing_required_bindings() -> None:
+    rule = InputMediaRule(
+        format=IMAGE_FORMAT,
+        min_count=1,
+        max_count=2,
+        slots=("first_frame", "last_frame"),
+        required_slots=("first_frame",),
+    )
+    contract = PipelineIOContract(
+        input_media=InputMediaSpec(
+            rules=(rule,),
+            binding=InputMediaBinding.GROUPED_BY_TYPE,
+            order=InputMediaOrder.WITHIN_TYPE,
+        ),
+        negative_prompt=NegativePromptPolicy.UNSUPPORTED,
+        output_media=OutputMediaSequence(items=(IMAGE_FORMAT,)),
+        geometry_source=GeometrySource.CONFIGURED,
+        batch_capability=BatchCapability.SINGLE_SAMPLE,
+    )
+
+    with pytest.raises(ValueError, match="requires input media slots.*first_frame"):
+        validate_pipeline_model_input(
+            _ModelInputFixture(
+                prompt="last only",
+                media=(_InputMediaFixture("image", slot="last_frame"),),
+            ),
+            contract,
+        )
+    with pytest.raises(ValueError, match="slot 'middle_frame' is not accepted"):
+        validate_pipeline_model_input(
+            _ModelInputFixture(
+                prompt="unknown",
+                media=(_InputMediaFixture("image", slot="middle_frame"),),
+            ),
+            contract,
+        )
+    with pytest.raises(ValueError, match="assigned more than once"):
+        validate_pipeline_model_input(
+            _ModelInputFixture(
+                prompt="duplicate",
+                media=(
+                    _InputMediaFixture("image", slot="first_frame"),
+                    _InputMediaFixture("image", slot="first_frame"),
+                ),
+            ),
+            contract,
+        )
+
+
+def test_aggregate_input_constraints_cover_cross_modality_invariants() -> None:
+    video = MediaFormat(
+        type=MediaType.VIDEO,
+        fps=RateRequirement.OPTIONAL,
+        sample_rate=RateRequirement.NOT_APPLICABLE,
+    )
+    audio = MediaFormat(
+        type=MediaType.AUDIO,
+        fps=RateRequirement.NOT_APPLICABLE,
+        sample_rate=RateRequirement.OPTIONAL,
+    )
+    contract = PipelineIOContract(
+        input_media=InputMediaSpec(
+            rules=(
+                InputMediaRule(IMAGE_FORMAT, min_count=0, max_count=9),
+                InputMediaRule(video, min_count=0, max_count=3),
+                InputMediaRule(audio, min_count=0, max_count=3),
+            ),
+            binding=InputMediaBinding.ORDERED_REFERENCES,
+            order=InputMediaOrder.GLOBAL,
+            min_total_count=1,
+            max_total_count=12,
+            required_any_types=(MediaType.IMAGE, MediaType.VIDEO),
+        ),
+        negative_prompt=NegativePromptPolicy.UNSUPPORTED,
+        output_media=OutputMediaSequence(items=(IMAGE_FORMAT,)),
+        geometry_source=GeometrySource.CONFIGURED,
+        batch_capability=BatchCapability.SINGLE_SAMPLE,
+    )
+
+    with pytest.raises(ValueError, match="at least 1 input media item"):
+        validate_pipeline_model_input(_ModelInputFixture(prompt="empty"), contract)
+    with pytest.raises(ValueError, match="whose type is in.*image.*video"):
+        validate_pipeline_model_input(
+            _ModelInputFixture(
+                prompt="audio only",
+                media=(_InputMediaFixture("audio", sample_rate=16000),),
+            ),
+            contract,
+        )
+    validate_pipeline_model_input(
+        _ModelInputFixture(
+            prompt="valid",
+            media=(
+                _InputMediaFixture("audio", sample_rate=16000),
+                _InputMediaFixture("image"),
+            ),
+        ),
+        contract,
+    )
+
+
+@pytest.mark.parametrize(
+    ("min_total_count", "max_total_count", "match"),
+    (
+        (None, 1, "max_total_count cannot be smaller.*per-type minimums"),
+        (3, None, "min_total_count cannot exceed.*per-type maximums"),
+    ),
+)
+def test_aggregate_input_constraints_reject_impossible_rule_combinations(
+    min_total_count: int | None,
+    max_total_count: int | None,
+    match: str,
+) -> None:
+    """Unsatisfiable aggregate and per-type bounds fail at declaration time."""
+    with pytest.raises(ValueError, match=match):
+        InputMediaSpec(
+            rules=(InputMediaRule(IMAGE_FORMAT, min_count=2, max_count=2),),
+            binding=InputMediaBinding.GROUPED_BY_TYPE,
+            order=InputMediaOrder.WITHIN_TYPE,
+            min_total_count=min_total_count,
+            max_total_count=max_total_count,
+        )
 
 
 @pytest.mark.parametrize(
@@ -470,7 +661,7 @@ def test_pipeline_contract_rejects_raw_policy_values_and_algorithm_shape_fields(
 
 def test_input_media_geometry_requires_a_guaranteed_input() -> None:
     """A conditional geometry source cannot rely on an optional-only input layout."""
-    with pytest.raises(ValueError, match="requires at least one input media rule"):
+    with pytest.raises(ValueError, match="constraints that guarantee at least one"):
         PipelineIOContract(
             input_media=InputMediaSpec(
                 rules=(InputMediaRule(format=IMAGE_FORMAT, min_count=0, max_count=1),),
@@ -481,4 +672,60 @@ def test_input_media_geometry_requires_a_guaranteed_input() -> None:
             output_media=OutputMediaSequence(items=(IMAGE_FORMAT,)),
             geometry_source=GeometrySource.INPUT_MEDIA,
             batch_capability=BatchCapability.UNIFORM,
+        )
+
+
+@pytest.mark.parametrize(
+    "aggregate_fields",
+    [
+        {"min_total_count": 1},
+        {"required_any_types": (MediaType.IMAGE,)},
+    ],
+)
+def test_input_media_geometry_accepts_aggregate_nonempty_guarantees(
+    aggregate_fields: dict[str, object],
+) -> None:
+    contract = PipelineIOContract(
+        input_media=InputMediaSpec(
+            rules=(InputMediaRule(format=IMAGE_FORMAT, min_count=0, max_count=1),),
+            binding=InputMediaBinding.GROUPED_BY_TYPE,
+            order=InputMediaOrder.INSENSITIVE,
+            **aggregate_fields,
+        ),
+        negative_prompt=NegativePromptPolicy.OPTIONAL,
+        output_media=OutputMediaSequence(items=(IMAGE_FORMAT,)),
+        geometry_source=GeometrySource.INPUT_MEDIA,
+        batch_capability=BatchCapability.UNIFORM,
+    )
+
+    assert contract.geometry_source is GeometrySource.INPUT_MEDIA
+
+
+def test_required_any_types_requires_canonical_media_type_order() -> None:
+    video = MediaFormat(
+        type=MediaType.VIDEO,
+        fps=RateRequirement.OPTIONAL,
+        sample_rate=RateRequirement.NOT_APPLICABLE,
+    )
+
+    with pytest.raises(ValueError, match="required_any_types must use canonical type order"):
+        InputMediaSpec(
+            rules=(
+                InputMediaRule(format=IMAGE_FORMAT, min_count=0, max_count=1),
+                InputMediaRule(format=video, min_count=0, max_count=1),
+            ),
+            binding=InputMediaBinding.GROUPED_BY_TYPE,
+            order=InputMediaOrder.INSENSITIVE,
+            required_any_types=(MediaType.VIDEO, MediaType.IMAGE),
+        )
+
+
+def test_required_slots_require_declared_slot_order() -> None:
+    with pytest.raises(ValueError, match="required input media slots must use declared slot order"):
+        InputMediaRule(
+            format=IMAGE_FORMAT,
+            min_count=2,
+            max_count=2,
+            slots=("first_frame", "last_frame"),
+            required_slots=("last_frame", "first_frame"),
         )

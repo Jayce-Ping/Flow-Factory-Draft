@@ -786,7 +786,12 @@ def test_builder_delegates_distributed_condition_cache_to_rank_safe_orchestrator
     assert call["enable_distributed"] is True
     assert call["preprocess_parallelism"] == "global"
     raw_dataset = call["base_kwargs"]["raw_dataset"]
-    assert set(raw_dataset.column_names) == {"prompt", OFFLINE_CONDITION_ID_COLUMN}
+    assert set(raw_dataset.column_names) == {
+        "prompt",
+        "negative_prompt",
+        OFFLINE_CONDITION_ID_COLUMN,
+    }
+    assert raw_dataset["negative_prompt"] == ["", "", "", ""]
     assert "target-0.png" not in repr(raw_dataset[0])
     assert "revision" not in repr(raw_dataset[0])
     assert isinstance(loader.sampler, DistributedSampler)

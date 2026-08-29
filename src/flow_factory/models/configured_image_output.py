@@ -189,7 +189,7 @@ class ConfiguredImageOutputAdapterMixin:
             TypeError: If no pipeline contract is declared.
             ValueError: If output media or geometry ownership is incompatible.
         """
-        contract = self.pipeline_io_contract
+        contract = self.effective_pipeline_io_contract
         if contract is None:
             raise TypeError(
                 f"adapter {type(self).__name__} must declare pipeline_io_contract before "

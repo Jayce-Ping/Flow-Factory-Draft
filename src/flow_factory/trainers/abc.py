@@ -1121,6 +1121,7 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
             ONLINE_EXECUTION_CONTRACT,
         )
         if execution_contract.acquisition is AcquisitionMode.DATASET:
+            modules_to_load.extend(self.adapter.condition_state_encoding_modules)
             modules_to_load.extend(self.adapter.output_state_encoding_modules)
 
         if not self.config.data_args.enable_preprocess:

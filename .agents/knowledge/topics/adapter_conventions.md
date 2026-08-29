@@ -44,18 +44,18 @@ the complete mapping when its forward has different semantics or additional guid
   condition `guidance_scale=3.5`; this is a learned model embedding, not classifier-free guidance.
 - The currently supported Flux2-Klein forward always passes `guidance=None` into its transformer,
   so its `guidance_scale` remains conventional two-pass CFG and inherits the neutral `1.0`.
-- Wan T2V neutralizes both transformer stages with `guidance_scale=guidance_scale_2=1.0`.
+- Wan T2V/I2V neutralize both transformer stages with
+  `guidance_scale=guidance_scale_2=1.0`.
 - SenseNova neutralizes text and image guidance together and disables CFG normalization.
 - Bagel replaces the base mapping with its actual `cfg_text_scale` / `cfg_img_scale` arguments;
   it must not inherit an irrelevant `guidance_scale` key through its permissive `**kwargs`.
-- MiniMax H3 T2VA inherits neutral `guidance_scale=1.0`; its strict forward validates that
-  interface value even though the guidance-distilled checkpoint has no CFG branch.
+- MiniMax H3 T2VA/FL2VA/Ref2VA inherit neutral `guidance_scale=1.0`; their strict forward validates
+  that interface value even though the guidance-distilled checkpoint has no CFG branch.
+- LTX2 sets video/audio CFG scales and modality scales to `1.0`, CFG rescale and STG scales to
+  `0.0`, and neutralizes STG block selection with
+  `spatio_temporal_guidance_blocks=None`.
 
-Wan I2V and LTX2 remain behind explicit offline output-codec blockers. Wan I2V must mirror the two
-neutral Wan transformer scales before it is enabled. LTX2 must set video/audio CFG scales and
-modality scales to `1.0`, CFG rescale and STG scales to `0.0`, and neutralize its STG block
-selection with `spatio_temporal_guidance_blocks=None`. The mapping is adapter-owned model
-conditioning, never a sampling or algorithm knob.
+These mappings are adapter-owned model conditioning, never sampling or algorithm knobs.
 
 ### Models with model-specific CFG extensions
 
@@ -209,6 +209,17 @@ LTX2 packs `[video|audio]` into one `(B, Seq, C)` sequence, so it resolves as PA
 13. **SenseNova ragged I2I is per-sample, not NaViT-packed** — SenseNova-U1 1.0/1.5 accepts ordered, variable-size and variable-count reference images. Each sample's references become one variable-length NEO-Unify prefix and remain PIL across preprocessing, rollout and replay. A framework batch may contain several such samples, but `SenseNovaAdapter.inference()` / `forward()` iterate them and call `SenseNovaDenoiser` with B=1; unlike Bagel, independent samples are not concatenated into a packed attention sequence. The native model's `batch_size>1` path only expands one shared prompt/reference KV cache to generate multiple noises for the same condition and is not a ragged multi-sample batch API.
 
 14. **Offline forward overrides are model conditioning, not sampling CFG** — SFT and offline DPO expand the adapter's complete immutable `offline_training_forward_overrides` mapping into every policy and reference forward, after batch conditions and configured sampling arguments. Conventional CFG adapters use their CFG-off point; guidance-distilled adapters use the value expected by their learned guidance embedder; multi-branch adapters neutralize every active branch under its real forward argument names. Replace the base mapping rather than adding unrelated keys, and never infer it from cached negative embeddings or expose it as an algorithm knob.
+
+15. **Runtime condition realization has one input owner** — A conditioned offline adapter declares
+    `build_condition_state_preparer()` only when cached fields are not already the exact forward
+    condition. `prepare_condition_state()` runs once per batch. SFT reuses that realization for
+    target binding; offline DPO reuses the same tensor leaves for chosen/rejected and
+    policy/reference forwards. The input-owned `forward_context` and `output_context` may share
+    prepared tensors. Require collision-free keys only within each consumer's merged view: cached
+    plus forward fields, and input-owned plus candidate-owned output fields. The preparer declaration
+    lists logical components but must not materialize, move, replace, or cast them. Checkpoint
+    variants narrow the class-level I/O superset through `_resolve_pipeline_io_contract()` rather
+    than branching inside the dataset or algorithm.
 
 ## Fix Records
 

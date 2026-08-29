@@ -47,6 +47,7 @@ from .pipeline_io import (
     OutputMediaSequence,
     PipelineIOContract,
     RateRequirement,
+    resolve_pipeline_input_media_slots,
     validate_pipeline_model_input,
     validate_pipeline_output_candidate,
 )
@@ -78,6 +79,7 @@ __all__ = [
     "OutputMediaSequence",
     "PipelineIOContract",
     "RateRequirement",
+    "resolve_pipeline_input_media_slots",
     "ROLLOUT_STORAGE_KEYS",
     "TRAINER_METADATA_KEYS",
     "validate_pipeline_model_input",

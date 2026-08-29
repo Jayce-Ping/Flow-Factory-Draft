@@ -21,6 +21,11 @@ with a registry-based loading system for easy extensibility.
 """
 
 from .abc import BaseAdapter
+from .condition_state import (
+    ConditionStatePreparer,
+    PreparedConditionState,
+    validate_condition_preparer_required_components,
+)
 from .latent_geometry import LatentAxes, LatentLayout, infer_latent_axes
 from .loader import load_model
 from .model_bundle import ModelBundle, RoutedComponentProxy
@@ -42,6 +47,10 @@ from .registry import (
 __all__ = [
     # Core classes
     "BaseAdapter",
+    # Runtime input-condition preparation
+    "ConditionStatePreparer",
+    "PreparedConditionState",
+    "validate_condition_preparer_required_components",
     # Offline target encoding
     "DecodedMediaBatch",
     "EncodedOutputState",

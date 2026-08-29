@@ -164,16 +164,20 @@ def flow_matching_per_sample_loss(
             )
         squared_errors[name] = (predicted.float() - target.float()).square()
 
-    reduced = adapter.reduce_latent_values(squared_errors, state=noised.state)
+    reduced = adapter.reduce_flow_matching_objective_values(
+        squared_errors,
+        state=noised.state,
+    )
     if not isinstance(reduced, torch.Tensor):
         raise TypeError(
-            "adapter.reduce_latent_values must return torch.Tensor, "
+            "adapter.reduce_flow_matching_objective_values must return torch.Tensor, "
             f"received {type(reduced).__name__}"
         )
     batch_size = next(iter(squared_errors.values())).shape[0]
     if reduced.shape != (batch_size,):
         raise ValueError(
-            "adapter.reduce_latent_values must return one value per sample with shape "
+            "adapter.reduce_flow_matching_objective_values must return one value per sample "
+            "with shape "
             f"({batch_size},), received {tuple(reduced.shape)}"
         )
     if reduced.dtype is not torch.float32:

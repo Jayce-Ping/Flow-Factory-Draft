@@ -214,6 +214,109 @@ Based on the fix type, write the fix entry to the appropriate document:
 - **Lesson**: Persisted acquisition progress must be projected through the current acquisition-to-backend work-item ratio. Backend GAS is not a valid dataloader cursor when one acquired batch expands into multiple backward graphs.
 - **Related Constraint**: #18a
 
+### Sparse media arguments require semantic input slots
+- **Date**: 2026-08-29
+- **Symptom**: A last-frame-only MiniMax H3 record could not be represented without pretending its
+  image was the first frame, and heterogeneous Ref2VA cardinality rules could not be expressed by
+  independent per-type counts.
+- **Root Cause**: The public offline schema and pipeline contract treated media position and
+  per-modality cardinality as the complete binding model.
+- **Fix**: V2 input media now accepts an input-only semantic `slot`; contracts declare ordered and
+  required slots plus aggregate count/required-any-type rules; projection resolves explicit slots
+  first and fills remaining slots positionally. Outputs reject slots. Construction rejects
+  multi-slot rules that claim order-insensitivity and aggregate bounds that cannot satisfy their
+  per-type rules.
+- **Lesson**: Use generic argument-binding metadata for sparse conditions and keep model-specific
+  argument names in adapter contracts, not algorithm code or ad-hoc dataset columns.
+- **Related Constraint**: #5
+
+### Offline velocity objectives must bypass unused scheduler transitions
+- **Date**: 2026-08-29
+- **Symptom**: LTX2 near-clean offline targets lost velocity precision after a velocity-to-x0-to-
+  velocity round trip, while exact velocity-only Wan/LTX forwards still invoked scheduler steps that
+  their loss never consumed. LTX2 I2AV also dropped cached negative prompts during preprocessing.
+- **Root Cause**: Generation-oriented forward paths performed transition reconstruction before
+  checking the requested offline component, and the I2AV preprocessing override failed to forward
+  one base prompt argument.
+- **Fix**: LTX2 retains official online reconstruction by default but opts offline forwards into raw
+  model velocity; Wan and LTX return exact velocity requests before scheduler stepping; I2AV now
+  forwards `negative_prompt` explicitly. Component, parity, and initialization regressions cover
+  the split behavior.
+- **Lesson**: Offline objectives may share a model forward with generation but must not inherit
+  numerically lossy or RNG-consuming transition work that is outside their requested output.
+- **Related Constraint**: #7
+
+### Exact resume must lock the checkpoint-realized pipeline contract
+- **Date**: 2026-08-29
+- **Symptom**: Exact resume could accept a checkpoint after an in-place model configuration change
+  switched a Wan adapter between first-only and first/last-frame semantics.
+- **Root Cause**: Runtime identity hashed model arguments and trainer execution but omitted the
+  adapter's resolved `effective_pipeline_io_contract`.
+- **Fix**: The default execution identity now canonicalizes and hashes the realized pipeline I/O
+  contract after adapter initialization; a regression changes only that contract and observes only
+  the execution digest change.
+- **Lesson**: Any checkpoint-dependent specialization that changes legal inputs or forward binding
+  is future-execution state and belongs in exact-resume identity.
+- **Related Constraint**: #18
+
+### Offline condition caches need contract-stable schemas across sources
+- **Date**: 2026-08-29
+- **Symptom**: Changing only semantic slot order could reuse an Arrow cache with the old media
+  projection, while a multi-source batch could fail because an all-empty optional source omitted
+  columns that a populated source emitted.
+- **Root Cause**: The source hash covered record identities but not the effective input projection
+  contract, and projection decided column existence from each source's observed values.
+- **Fix**: Condition source identity now includes the canonical effective input contract. With a
+  contract, negative-prompt, declared media, and semantic-slot columns are projected consistently
+  even when every row in one source is empty. A real two-source `DistributedSampler` loader
+  regression mixes empty and populated optional conditions in one batch.
+- **Lesson**: A concatenated cache schema is defined by the model contract, not by local source
+  sparsity; cache identity must cover every declaration that can reorder or reshape projection.
+- **Related Constraint**: #9
+
+### Distributed Arrow schemas must be inferred before rank sharding
+- **Date**: 2026-08-29
+- **Symptom**: A distributed condition-cache build could write `List(null)` on an all-empty rank
+  and `List(Image)` on a populated rank, then fail when the per-rank Arrow files were consolidated.
+- **Root Cause**: Cross-chunk schema discovery ran after rank sharding, so each process inferred
+  features from only its local value distribution. The standalone cache entry point also ignored a
+  pipeline's single-sample preprocessing capability.
+- **Fix**: Distributed preprocessing now derives one explicit feature schema from the full source
+  before selecting rank-local rows, and both cache entry points force batch size one for ordered or
+  `SINGLE_SAMPLE` contracts. A real two-part Arrow regression separates empty and populated rows
+  across ranks, consolidates the files, and loads the merged dataset.
+- **Lesson**: Distributed writers need a global serialization contract even when their data is
+  disjoint. Batch capability is likewise part of the preprocessing boundary, not only trainer
+  orchestration.
+- **Related Constraint**: #9
+
+### Validate output candidates before stochastic condition preparation
+- **Date**: 2026-08-29
+- **Symptom**: An invalid offline target correctly raised an exception but first consumed condition
+  preparation RNG, so retrying with corrected media no longer reproduced the original encoding.
+- **Root Cause**: `BaseAdapter.encode_output_state()` prepared raw conditions before validating the
+  generator and exact output-media sequence.
+- **Fix**: The lifecycle wrapper now validates generator type and candidate media before invoking
+  any condition preparer or codec. A stochastic-preparer regression proves invalid media leaves the
+  explicit generator unchanged and performs no preparation work.
+- **Lesson**: Pure boundary validation must precede expensive or random transformations. Failed
+  inputs should not mutate the state that determines a later valid retry.
+- **Related Constraint**: #7
+
+### Aggregate media guarantees must be canonical contract state
+- **Date**: 2026-08-29
+- **Symptom**: `INPUT_MEDIA` geometry rejected a valid contract whose aggregate `min_total_count` or
+  `required_any_types` guaranteed a condition, while semantically identical required-type tuples
+  in different orders produced different cache and resume identities.
+- **Root Cause**: Geometry validation recognized only per-type minima, and the set-like aggregate
+  field had no canonical ordering rule.
+- **Fix**: Input-derived geometry now accepts every nonempty guarantee enforced by runtime
+  validation, `required_any_types` must follow canonical media-type order, and required slots must
+  follow their declaration order.
+- **Lesson**: Declarative invariants should be interpreted consistently at construction and runtime,
+  and set-like identity fields require one canonical representation.
+- **Related Constraint**: #5
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

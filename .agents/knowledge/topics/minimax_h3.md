@@ -45,39 +45,59 @@ and lets that boundary stay strict.
 ## Input contracts
 
 - T2VA accepts prompt-only workflow input.
-- FL2VA accepts one first image or two images ordered first then last.
-- Ref2VA preserves and hashes ordered image/video/audio manifests.
+- FL2VA accepts semantic `first_frame`, `last_frame`, or both image slots. Unslotted legacy
+  generation input retains first-then-last positional shorthand; strict V2 can express last-only.
+- Ref2VA preserves and hashes 1-12 ordered image/video/audio references and requires at least one
+  image or video.
 - Ref2VA declares `supports_ordered_references=True`; all H3 adapters explicitly declare hidden
   geometry cache fields and a preprocessing cache version.
 - Reference paths are dataset-relative. Positive finite `fps` and `sample_rate` overrides follow
   `samples/references.py`.
 - PyAV >=18.0.0 decodes video/audio references, including embedded or separate soundtracks.
 
-## Offline T2VA output contract
+## Offline audiovisual output contract
 
-`minimax-h3-t2va` supports SFT and offline DPO with one exact ordered output pair:
-video first, then audio. Both `fps` and `sample_rate` are required in V2 supervision.
+All three H3 workflows support SFT and offline DPO with one exact ordered output pair: video first,
+then audio. Both `fps` and `sample_rate` are required in V2 supervision.
 Targets are decoded on demand; neither pixels, waveforms, nor VAE latents enter the condition
 cache. The pipeline's single-sample capability also forces condition-cache preprocessing to B=1,
 independently of the global preprocessing batch-size setting.
 
-The codec cross-validates cached T2VA layout and geometry against the current training config. It
+The codec cross-validates cached layout and geometry against the current training config. It
 resamples video onto the configured fixed 24-fps grid and canvas, truncates audio on its declared
 source clock before a single conversion to the audio-VAE rate, and aligns stereo audio to the exact
-latent duration, samples and normalizes the video posterior, takes and normalizes the official
-audio posterior mode, then packs structured rows in `("video", "audio")` order. The codec does
+latent duration, takes and normalizes both posterior modes, then packs structured rows in
+`("video", "audio")` order. The deterministic video mode follows the H3 SFT reference data flow;
+the released Diffusers pipeline does not define an offline target encoder. The codec does
 not duplicate input-owned fields in output forward context. Replay nests the flat cached layout
 and derives empty T2VA condition prefixes from the current state, preserving storage dtype and
 device. Exact velocity-only offline forwards return before either component scheduler steps, so
 SFT and offline DPO do not sample unused transitions or perturb scheduler RNG cadence. Every
 encoded row count must match the cached layout before transformer execution.
 
-FL2VA and Ref2VA remain online-only. Their output AV encoding can reuse the T2VA numerical
-codec, but their cached media conditions still need a separately owned, reproducible
-condition-prefix binder. In particular, both offline-DPO arms must consume the same conditioned
-prefix noise; do not generate those prefixes independently inside the chosen/rejected codecs.
+FL2VA and Ref2VA use a separately owned runtime condition-prefix preparer. It realizes the official
+condition noise once per batch, then exposes immutable model-forward and output-binding views. Both
+offline-DPO arms and their policy/reference forwards consume the same prepared prefix object; target
+encoding never draws condition noise independently. Offline flow matching sums the separate video
+and audio means, while online likelihood and distillation retain their existing globally
+element-weighted reducer.
 
 ## Fix records
+
+### H3 offline targets preserve the reference posterior and modality objective
+
+- **Date**: 2026-08-29
+- **Symptom**: H3 clean video targets changed on every encode and audiovisual flow loss weighted
+  modalities by tensor cardinality, heavily downweighting audio.
+- **Root Cause**: The first offline codec inferred stochastic video-posterior sampling where
+  Diffusers has no target recipe, and inherited the online global reducer for a two-term SFT loss.
+- **Fix**: Video and audio target codecs now take deterministic posterior modes, matching the H3
+  SFT reference data flow, and the offline flow hook returns `video_mean + audio_mean` without
+  changing the online reducer. Unequal-cardinality regression tests lock both decisions.
+- **Lesson**: When an inference pipeline omits training semantics, use the nominated training
+  reference for posterior selection and keep objective-specific modality weighting separate from
+  trajectory likelihood aggregation.
+- **Related Constraint**: #7, #8
 
 ### Offline targets preserve configured geometry and logical source clocks
 
@@ -122,11 +142,12 @@ prefix noise; do not generate those prefixes independently inside the chosen/rej
 
 ## Verification boundary
 
-All workflows have pinned API/schema/no-weight verification. T2VA additionally completed
+All workflows have pinned API/schema/no-weight verification and local offline codec/forward
+coverage. T2VA additionally completed
 real-weight LoRA rollout, decode, reward, replay, backward, checkpoint, and resume tests on one
 GPU and with FSDP2 on 16 GPUs. The native-resolution path completed initialization, checkpoint,
-decode, and evaluation. FL2VA and Ref2VA remain no-weight validated. Do not claim long-run reward
-improvement, convergence, or numerical parity.
+decode, and evaluation. FL2VA/Ref2VA SFT and offline DPO still require the documented real-weight
+GPU matrix. Do not claim long-run reward improvement, convergence, or numerical parity.
 
 ## Upgrade checklist
 

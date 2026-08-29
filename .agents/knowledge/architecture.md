@@ -61,7 +61,8 @@ exhaustion; offline output media is decoded and encoded on the fly, while only p
 conditions enter the preprocessing cache.
 
 Exact runtime identity is built from realized prepared state. It locks optimizer/model/backend
-semantics, ordered training data, and the complete replayed evaluation path (cadence, arguments,
+semantics, the checkpoint-realized pipeline I/O contract, ordered training data, and the complete
+replayed evaluation path (cadence, arguments,
 per-dataset overrides, rewards, and ordered prepared loaders). Logging, checkpoint cadence, run
 budget, and resume location remain operational. Exact-state save fails before mutation on MPS
 because Accelerate does not persist the device RNG needed for exact continuation.
@@ -89,6 +90,9 @@ All four registries map string keys → lazy import paths. Resolution: registry 
 | `awm` | `AWMTrainer` | Decoupled | `BaseTrainer` |
 | `crd` | `CRDTrainer` | Decoupled | `BaseTrainer` |
 | `diffusion-opd` | `DiffusionOPDTrainer` | Distillation (on-policy) | `BaseTrainer` |
+| `dmd2` | `DMD2Trainer` | Distillation | `BaseTrainer` |
+| `tdm` | `TDMTrainer` | Distillation | `BaseTrainer` |
+| `tdm-r1` | `TDMR1Trainer` | Distillation + reward | `BaseTrainer` |
 
 **Flat hierarchy**: New trainers inherit from `BaseTrainer` directly. The sanctioned exceptions are `GRPOGuardTrainer → GRPOTrainer` and `DPPOTrainer → GRPOTrainer` (strict GRPO loss variants; see constraint #11).
 
@@ -107,6 +111,9 @@ All four registries map string keys → lazy import paths. Resolution: registry 
 | `wan2_i2v` | `Wan2_I2V_Adapter` | Image-to-Video |
 | `ltx2_t2av` | `LTX2_T2AV_Adapter` | Text-to-Audio-Video |
 | `ltx2_i2av` | `LTX2_I2AV_Adapter` | Image-to-Audio-Video |
+| `minimax-h3-t2va` | `MiniMaxH3T2VAAdapter` | Text-to-Video-Audio |
+| `minimax-h3-fl2va` | `MiniMaxH3FL2VAAdapter` | Sparse First/Last-Frame-to-Video-Audio |
+| `minimax-h3-ref2va` | `MiniMaxH3Ref2VAAdapter` | Ordered-Reference-to-Video-Audio |
 | `bagel` | `BagelAdapter` | Text-to-Image & Image(s)-to-Image (T2I & I2I both batched via NaViT packing; subset-round packing handles variable I2I reference-image count, no per-sample fallback — see `topics/adapter_conventions.md`) |
 | `sensenova` | `SenseNovaAdapter` | Text-to-Image & Image(s)-to-Image (SenseNova-U1 1.0/1.5; ordered variable-count references remain grouped in `images` and preserve within-type order; independent samples use B=1 prefixes rather than Bagel-style NaViT packing) |
 
@@ -157,15 +164,25 @@ Timesteps are `[0, 1000]` (scheduler scale); sigmas are `[0, 1]` (flow-matching 
 Each model adapter wraps a diffusers pipeline into the `BaseAdapter` interface:
 - `preprocess_func()` — prompt/input-condition preprocessing and cache projection
 - `pipeline_io_contract` — model-neutral input/output modality and geometry declaration
+- `effective_pipeline_io_contract` — checkpoint-realized specialization of the class contract
+- `prepare_condition_state()` — one validated input-owned runtime realization reused across
+  candidate encoding and model forwards
 - `encode_output_state()` — validated on-the-fly offline target encoding through an optional codec
 - `inference()` — full denoising loop (Stage 3)
 - `forward()` — single-step denoising (Stage 6)
 
 **Per-modality encoders** (`encode_prompt`, `encode_image`, `encode_video`, `encode_audio`) are no-op by default on `BaseAdapter` — override only the modalities your model consumes. `preprocess_func` dispatches to all four and skips any that return `None`, so text/image/video-only adapters need no stub overrides for unused modalities.
 
-Offline codecs declare logical required components without materializing them. Condition/output
-encoders share role-neutral transforms where possible, while callers retain explicit official
-posterior `sample` versus `argmax` semantics.
+Offline condition preparers and codecs declare logical required components without materializing
+them. Condition/output encoders share role-neutral transforms where possible, while callers retain
+explicit official posterior `sample` versus `argmax` semantics. Candidate-specific output context
+cannot overwrite cached or prepared input fields. A separate flow-matching objective reducer lets
+multi-modal SFT/DPO specialize loss aggregation without changing online trajectory reductions.
+
+Input contracts may declare semantic media slots and aggregate cross-type cardinality rules. In
+strict V2 data, an explicit input-only `slot` reserves its argument; unslotted media fills remaining
+slots in declaration order. Outputs reject slots. This keeps algorithm data model-neutral while the
+adapter owns bindings such as first/last frame and ordered heterogeneous references.
 
 **Flat hierarchy**: All adapters inherit directly from `BaseAdapter` — never from another adapter (see constraint #12). Shared logic within a model family uses helper functions, code duplication, or mixins — not adapter subclassing.
 

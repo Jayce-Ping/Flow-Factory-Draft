@@ -42,7 +42,7 @@ The authoritative list is `pyproject.toml` `[project.dependencies]` (20+ package
 | `torchvision` | >= 0.19.0 | Vision utilities |
 | `torchaudio` | >= 2.4.0 | Audio I/O (audio / audio-video models, CLAP) |
 | `transformers` | >= 4.57.1 | Text encoders, tokenizers |
-| `diffusers` | >= 0.37.0 | Diffusion pipelines, schedulers |
+| `diffusers` | >= 0.40.0 | Diffusion pipelines, schedulers, MiniMax H3 and LTX2 APIs |
 | `accelerate` | >= 1.11.0 | Distributed training, mixed precision |
 | `peft` | >= 0.17.0 | LoRA, parameter-efficient fine-tuning |
 | `datasets` | >= 3.3.2 | Dataset loading |
@@ -57,6 +57,8 @@ The authoritative list is `pyproject.toml` `[project.dependencies]` (20+ package
 - DeepSpeed is optional — Accelerate alone handles most distributed scenarios.
 
 ### diffusers
+- Use the released `diffusers>=0.40.0` package as the authoritative API. The repository submodule
+  may be used for upstream development, but must not silently override the declared runtime dependency.
 - Model adapters depend on specific pipeline classes from diffusers. Major version bumps may rename or remove pipeline classes.
 - `load_pipeline()` in each adapter returns a `DiffusionPipeline`-compatible object; breaking changes in diffusers' pipeline API require adapter updates.
 
@@ -75,7 +77,8 @@ The authoritative list is `pyproject.toml` `[project.dependencies]` (20+ package
 
 ### accelerate
 - Primary distributed backend. `accelerator.prepare()` wraps a single `ModelBundle` (all target components) plus the optimizer as one root (constraint #9).
-- The dataloader uses custom samplers and is NOT prepared via accelerate.
+- Online generation uses framework samplers. Finite SFT/offline-DPO data uses PyTorch's official
+  `DistributedSampler`; that already-sharded loader is not prepared via Accelerate.
 
 ### peft
 - Provides LoRA functionality. Applied via `BaseAdapter.apply_lora()` to components listed in `target_components`.
