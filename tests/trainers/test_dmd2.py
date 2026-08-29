@@ -48,6 +48,7 @@ def _trainer(**training_overrides: Any) -> DMD2Trainer:
         "num_inference_steps": 1,
         "per_device_batch_size": 1,
         "gradient_accumulation_steps": 1,
+        "get_num_train_timesteps": lambda _config: 1,
         "ttur_fake_updates": 5,
         "num_inner_epochs": 1,
     }
