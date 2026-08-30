@@ -1083,6 +1083,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         if self.use_moe:
             self.norm_moe_gen = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen2RotaryEmbedding(config=config)
+        self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1194,18 +1195,31 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 decoder_layer.cache_dic = self.cache_dic
                 decoder_layer.enable_taylorseer = True
                 self.current["layer"] = layer_idx
-            packed_query_sequence, past_key_values = decoder_layer(
-                packed_query_sequence=packed_query_sequence,
-                query_lens=query_lens,
-                packed_query_position_embeddings=packed_query_position_embeddings,
-                packed_query_indexes=packed_query_indexes,
-                past_key_values=past_key_values,
-                key_values_lens=key_values_lens,
-                packed_key_value_indexes=packed_key_value_indexes,
-                update_past_key_values=update_past_key_values,
-                is_causal=is_causal,
+            layer_kwargs = {
+                "packed_query_sequence": packed_query_sequence,
+                "query_lens": query_lens,
+                "packed_query_position_embeddings": packed_query_position_embeddings,
+                "packed_query_indexes": packed_query_indexes,
+                "past_key_values": past_key_values,
+                "key_values_lens": key_values_lens,
+                "packed_key_value_indexes": packed_key_value_indexes,
+                "update_past_key_values": update_past_key_values,
+                "is_causal": is_causal,
                 **extra_inputs,
+            }
+            checkpoint_layer = (
+                self.gradient_checkpointing
+                and self.training
+                and not update_past_key_values
+                and not enable_taylorseer
             )
+            if checkpoint_layer:
+                packed_query_sequence, past_key_values = self._gradient_checkpointing_func(
+                    decoder_layer.__call__,
+                    **layer_kwargs,
+                )
+            else:
+                packed_query_sequence, past_key_values = decoder_layer(**layer_kwargs)
 
         if self.use_moe:
             if mode == "und":

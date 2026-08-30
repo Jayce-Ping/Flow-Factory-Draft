@@ -48,6 +48,70 @@ def _load_bagel_types(monkeypatch: pytest.MonkeyPatch) -> tuple[type, type]:
     return module.BagelAdapter, module.BagelSample
 
 
+def _load_bagel_qwen_types(monkeypatch: pytest.MonkeyPatch) -> tuple[type, type]:
+    """Load Bagel's Qwen2-NaViT model behind the optional-kernel seam."""
+    _load_bagel_types(monkeypatch)
+    module = importlib.import_module("flow_factory.models.bagel.modeling.bagel.qwen2_navit")
+    return module.Qwen2Config, module.Qwen2ForCausalLM
+
+
+class _FakeRotaryEmbedding(torch.nn.Module):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del position_ids
+        values = torch.ones_like(hidden_states).unsqueeze(0)
+        return values, values
+
+
+class _CheckpointedDecoderLayer(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def forward(
+        self,
+        *,
+        packed_query_sequence: torch.Tensor,
+        past_key_values: Any,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, Any]:
+        del kwargs
+        self.calls += 1
+        return packed_query_sequence.square(), past_key_values
+
+
+def _checkpointing_qwen_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[torch.nn.Module, _CheckpointedDecoderLayer]:
+    qwen_config_type, qwen_causal_lm_type = _load_bagel_qwen_types(monkeypatch)
+    config = qwen_config_type(
+        vocab_size=8,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=16,
+        layer_module="Qwen2DecoderLayer",
+        qk_norm=False,
+        _attn_implementation="eager",
+        pad_token_id=0,
+    )
+    causal_lm = qwen_causal_lm_type(config)
+    model = causal_lm.model
+    decoder = _CheckpointedDecoderLayer()
+    model.layers = torch.nn.ModuleList([decoder])
+    model.rotary_emb = _FakeRotaryEmbedding()
+    model.norm = torch.nn.Identity()
+    model.use_moe = False
+    causal_lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.train()
+    return model, decoder
+
+
 def _adapter(adapter_type: type, decoder: Any) -> Any:
     adapter = object.__new__(adapter_type)
     adapter.decode_latents = MethodType(decoder, adapter)
@@ -67,6 +131,54 @@ def _result(batch_size: int = 2) -> dict[str, Any]:
         "callback_results": {},
         "callback_index_map": None,
     }
+
+
+def test_bagel_qwen_gradient_checkpointing_recomputes_decoder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model, decoder = _checkpointing_qwen_model(monkeypatch)
+
+    packed = torch.tensor([[2.0, 3.0]], requires_grad=True)
+    cache = object()
+    output = model.forward_inference(
+        packed_query_sequence=packed,
+        query_lens=torch.tensor([1]),
+        packed_query_position_ids=torch.tensor([0]),
+        packed_query_indexes=torch.tensor([0]),
+        past_key_values=cache,
+        key_values_lens=torch.tensor([0]),
+        packed_key_value_indexes=torch.tensor([], dtype=torch.long),
+        update_past_key_values=False,
+        is_causal=False,
+    )
+    output.packed_query_sequence.sum().backward()
+
+    assert model.gradient_checkpointing is True
+    assert decoder.calls == 2
+    assert output.past_key_values is cache
+    torch.testing.assert_close(packed.grad, torch.tensor([[4.0, 6.0]]))
+
+
+def test_bagel_qwen_checkpointing_does_not_replay_cache_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model, decoder = _checkpointing_qwen_model(monkeypatch)
+
+    packed = torch.tensor([[2.0, 3.0]], requires_grad=True)
+    output = model.forward_inference(
+        packed_query_sequence=packed,
+        query_lens=torch.tensor([1]),
+        packed_query_position_ids=torch.tensor([0]),
+        packed_query_indexes=torch.tensor([0]),
+        past_key_values=object(),
+        key_values_lens=torch.tensor([0]),
+        packed_key_value_indexes=torch.tensor([], dtype=torch.long),
+        update_past_key_values=True,
+        is_causal=False,
+    )
+    output.packed_query_sequence.sum().backward()
+
+    assert decoder.calls == 1
 
 
 def test_bagel_assembles_samples_from_one_batched_decode(
