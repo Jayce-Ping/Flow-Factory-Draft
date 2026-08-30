@@ -474,6 +474,11 @@ class RewardProcessor:
         for model in models.values():
             required_fields.update(model.required_fields)
 
+        # ``gather_samples`` reconstructs the concrete sample class from the
+        # transported fields. Preserve fields required by that class's constructor
+        # invariants even when the reward itself does not consume them.
+        required_fields.update(type(samples[0]).reconstruction_required_fields)
+
         # Always include the typed source bookkeeping — the gate needs
         # `source` (and ideally `source_id`) on the gathered side.  Now
         # that they're real dataclass fields on `BaseSample`, gathering

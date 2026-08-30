@@ -54,6 +54,14 @@ Based on the fix type, write the fix entry to the appropriate document:
 - **Lesson**: When extending a base contract for a partial-coverage feature (where only some subclasses will participate), no-op default + opt-in override beats forcing every subclass to acknowledge it. Reserve `@abstractmethod` for invariants that ALL subclasses must implement (e.g. `load_pipeline`, `decode_latents`, `forward`, `inference`).
 - **Related Constraint**: #12 (post-update text codifies "Optional encoder overrides (no-op default)").
 
+### Distributed reward gathering must preserve reconstruction invariants
+- **Date**: 2026-08-30
+- **Symptom**: Two-rank H3 Ref2VA GRPO failed before reward execution because `MiniMaxH3Ref2VASample` was reconstructed with `reference_manifest=None`.
+- **Root Cause**: The distributed group-reward path gathered only reward-consumed fields, although `gather_samples` reconstructs the concrete sample class and that class can require additional state.
+- **Fix**: `BaseSample` now declares an empty `reconstruction_required_fields` contract, `OrderedReferenceConditionSample` adds `reference_manifest`, and `RewardProcessor` unions that contract into its distributed gather fields without forwarding it to the reward call.
+- **Lesson**: Communication payload requirements and reward-call requirements are distinct contracts; partial gathers must preserve constructor invariants even for fields that downstream computation does not consume.
+- **Related Constraint**: N/A
+
 ### Preference-arm conditioning ownership
 - **Date**: 2026-08-11
 - **Symptom**: DPO evaluated the rejected H3 state with the chosen sample's prompt/reference conditioning.
