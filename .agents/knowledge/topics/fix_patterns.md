@@ -363,6 +363,19 @@ Based on the fix type, write the fix entry to the appropriate document:
   seam expected by Transformers and an execution-time checkpoint boundary in the forward path.
 - **Related Constraint**: #7
 
+### FSDP wrap metadata must follow the instantiated architecture variant
+- **Date**: 2026-08-30
+- **Symptom**: Every Bagel FSDP2 trainer failed during `accelerator.prepare()` because Accelerate
+  could not find the declared `Qwen2DecoderLayer` in the loaded model.
+- **Root Cause**: Bagel's custom Qwen2 classes inherited fixed `_no_split_modules` metadata from the
+  standard decoder even though `config.layer_module` instantiated a MoE or MoT decoder variant.
+- **Fix**: Both the inner Qwen2 model and outer causal LM now derive their no-split class from the
+  realized `layer_module`. CPU FSDP2 auto-wrap regressions verify all decoder variants resolve
+  through the same PEFT wrapper used by LoRA training.
+- **Lesson**: Distributed wrap metadata is realized model state. Config-selectable architectures
+  must not inherit a fixed block class that may be absent from the instantiated module tree.
+- **Related Constraint**: #9
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

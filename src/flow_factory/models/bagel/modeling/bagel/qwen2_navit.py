@@ -1069,6 +1069,7 @@ Decoder_layer_dict = {
 class Qwen2Model(Qwen2PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
+        self._no_split_modules = [config.layer_module]
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.use_moe = "Mo" in config.layer_module
@@ -1250,6 +1251,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
+        self._no_split_modules = [config.layer_module]
         self.model = Qwen2Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)

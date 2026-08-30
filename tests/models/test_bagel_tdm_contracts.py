@@ -23,8 +23,11 @@ from typing import Any
 
 import pytest
 import torch
+from accelerate import FullyShardedDataParallelPlugin
+from peft import LoraConfig, get_peft_model
 
 import flow_factory.utils.imports as import_utils
+from flow_factory.models.model_bundle import ModelBundle
 from flow_factory.samples import BaseSample
 from flow_factory.trainers.distillation.distillation_runtime import (
     validate_media_free_rollout,
@@ -179,6 +182,48 @@ def test_bagel_qwen_checkpointing_does_not_replay_cache_updates(
     output.packed_query_sequence.sum().backward()
 
     assert decoder.calls == 1
+
+
+@pytest.mark.parametrize(
+    "layer_module",
+    ["Qwen2DecoderLayer", "Qwen2MoEDecoderLayer", "Qwen2MoTDecoderLayer"],
+)
+def test_bagel_qwen_fsdp_wrap_policy_matches_decoder_variant(
+    monkeypatch: pytest.MonkeyPatch,
+    layer_module: str,
+) -> None:
+    qwen_config_type, qwen_causal_lm_type = _load_bagel_qwen_types(monkeypatch)
+    config = qwen_config_type(
+        vocab_size=8,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=16,
+        layer_module=layer_module,
+        qk_norm=False,
+        _attn_implementation="eager",
+        pad_token_id=0,
+    )
+    base_model = qwen_causal_lm_type(config)
+    decoder_type = type(base_model.model.layers[0])
+    model = get_peft_model(
+        base_model,
+        LoraConfig(r=2, lora_alpha=2, target_modules=["q_proj"]),
+    )
+    bundle = ModelBundle({"transformer": model})
+    plugin = FullyShardedDataParallelPlugin(
+        fsdp_version=2,
+        auto_wrap_policy="transformer_based_wrap",
+    )
+
+    plugin.set_auto_wrap_policy(bundle)
+
+    assert set(model._no_split_modules) == {decoder_type.__name__}
+    assert set(base_model.model._no_split_modules) == {decoder_type.__name__}
+    assert set(bundle._no_split_modules) == {decoder_type.__name__}
+    assert plugin.auto_wrap_policy.keywords["transformer_layer_cls"] == {decoder_type}
 
 
 def test_bagel_assembles_samples_from_one_batched_decode(
