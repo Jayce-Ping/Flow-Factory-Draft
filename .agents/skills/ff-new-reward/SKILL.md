@@ -1,118 +1,136 @@
 ---
 name: ff-new-reward
-description: "Complete workflow for adding a new reward model. Covers pointwise vs groupwise design, __call__ contract, registration, YAML config, multi-reward setup, and verification. Trigger: 'add reward', 'new reward model', 'custom reward', 'scoring function'."
+description: "Add a Flow-Factory reward model with pointwise/groupwise dispatch, media conversion, per-dataset routing, async execution, backend-safe loading, registry, configuration, and verification."
 ---
 
 # New Reward Model Integration
 
-> **Authoritative reference**: `guidance/rewards.md` — read it first.
-> **Template**: `src/flow_factory/rewards/my_reward.py`
+Read `../../../guidance/rewards.md`, `../../knowledge/constraints.md` #13, and the current
+`rewards/abc.py`, `rewards/reward_processor.py`, and `rewards/loader.py` contracts.
 
-## Prerequisites
+## 1. Choose the Dispatch Contract
 
-Determine your reward type:
-- **Pointwise**: Each sample scored independently (e.g., aesthetic score, CLIP similarity)
-- **Groupwise**: Scores depend on comparison within a group (e.g., ranking, preference)
+- **Pointwise**: each input is scored independently. A call receives a non-empty chunk whose length
+  is at most configured `batch_size`; tail chunks and per-dataset applicability gating can make it
+  smaller.
+- **Groupwise**: one call receives a complete `unique_id` group, either local or reconstructed
+  across ranks. Configured pointwise `batch_size` does not define this call.
 
-## Phase 1: Design
+Return exactly one finite score per input passed to the call, in the same order. Do not return NaN
+as a “not applicable” marker: `RewardProcessor` owns applicability masks, NaN padding outside model
+calls, and `sample.applicable_rewards`.
 
-1. **Choose base class**: `PointwiseRewardModel` or `GroupwiseRewardModel`
-2. **Identify required inputs**: What fields from `Sample` does your reward need?
-   - Common: `prompt`, `image`, `video`, `condition_images`, `condition_videos`
-   - Set `required_fields` tuple accordingly
-3. **Input format**: PIL Images (default) or Tensors?
-   - Set `use_tensor_inputs = True` if your model needs raw tensors
+Declare only fields needed from `BaseSample` in `required_fields`. Common fields include `prompt`,
+`image`, `video`, `audio`, `condition_images`, and `condition_videos`. Additional JSONL metadata is
+available as one JSON-encoded `metadata` string and must be parsed explicitly.
 
-## Phase 2: Implementation
+`required_fields` selects reward-consumer data; it does not replace a concrete sample class's
+`reconstruction_required_fields`. If adding a sample field that its constructor or `__post_init__`
+needs after a partial gather, update that inherited class contract separately. Collator
+`_shared_fields` is a third, independent concern.
 
-### Create the reward model file
+Set `use_tensor_inputs` deliberately:
+
+- `False`: images/video frames arrive as PIL and audio as NumPy;
+- `True`: media arrives as tensors.
+
+Condition media retains nested per-sample item structure.
+
+## 2. Implement the Model
 
 ```python
-# src/flow_factory/rewards/<my_reward>.py
-from .abc import PointwiseRewardModel, RewardModelOutput
-from ..hparams import RewardArguments
-from accelerate import Accelerator
-from typing import Optional, List
-from PIL import Image
+from typing import Any, List, Optional
+
 import torch
+from accelerate import Accelerator
+from PIL import Image
+
+from ..hparams import RewardArguments
+from .abc import PointwiseRewardModel, RewardModelOutput
+
 
 class MyRewardModel(PointwiseRewardModel):
+    """Score prompt-image alignment for each generated sample."""
+
     required_fields = ("prompt", "image")
     use_tensor_inputs = False
 
-    def __init__(self, config: RewardArguments, accelerator: Accelerator):
+    def __init__(self, config: RewardArguments, accelerator: Accelerator) -> None:
+        """Load the reward network using the configured device and dtype."""
         super().__init__(config, accelerator)
-        # Load your model, processor, etc.
-        # Use self.device and self.dtype from base class
+        ...
 
     @torch.no_grad()
     def __call__(
         self,
         prompt: List[str],
         image: Optional[List[Image.Image]] = None,
-        video: Optional[List[List[Image.Image]]] = None,
-        audio: Optional[List[torch.Tensor]] = None,
-        condition_images=None,
-        condition_videos=None,
-        **kwargs,
+        **kwargs: Any,
     ) -> RewardModelOutput:
-        # Compute rewards — shape must be (batch_size,) for Pointwise
-        # or (group_size,) for Groupwise
-        rewards = torch.zeros(len(prompt), device=self.device)
-        return RewardModelOutput(rewards=rewards)
+        """Return one finite score per received prompt-media pair."""
+        scores = ...
+        return RewardModelOutput(rewards=scores)
 ```
 
-### Key constraints for `__call__`:
-- **Pointwise**: Input length = `config.batch_size`. Return rewards shape `(batch_size,)`
-- **Groupwise**: Input length = `group_size`. You handle batching yourself. Return rewards shape `(group_size,)`
-- Always use `@torch.no_grad()` decorator
-- Return `RewardModelOutput` (not raw tensors)
+Use `self.device` and `self.dtype`; do not hardcode CUDA. Keep public signatures typed and
+Google-style. `@torch.no_grad()` is required for inference-only scoring.
 
-## Phase 3: Register
+Construction runs inside `ModelLoadCoordinator`'s REWARD load scope and reward resources remain
+full per-rank replicas. A reward implementation must not call `accelerator.prepare()`, enter
+target-only FSDP loading state, or mutate trainer component ownership.
 
-Add to `_REWARD_MODEL_REGISTRY` in `src/flow_factory/rewards/registry.py`:
-```python
-'my_reward': 'flow_factory.rewards.<my_reward>.MyRewardModel',
-```
+## 3. Register and Configure
 
-## Phase 4: Configuration
+Add a lowercase canonical lazy path to `_REWARD_MODEL_REGISTRY`. Preserve direct Python-path
+fallback; a decorator is optional and does not replace the static entry.
 
-Use in YAML config:
 ```yaml
 rewards:
-  - name: "my_reward"
-    reward_model: "my_reward"        # Must match registry key
-    model_path: "org/model-name"     # HuggingFace model path (if applicable)
-    dtype: "bfloat16"
-    device: "cuda"
+  - name: my_reward
+    reward_model: my_reward
+    model_path: org/model-name
+    dtype: bfloat16
+    device: cuda
     batch_size: 16
+    applicable_datasets: [alignment]
+    weight: 1.0
+    async_reward: false
+    num_workers: 1
 ```
 
-Multi-reward setup:
-```yaml
-rewards:
-  - name: "aesthetic"
-    reward_model: "PickScore"
-    weight: 0.7
-  - name: "custom"
-    reward_model: "my_reward"
-    weight: 0.3
-```
+`name` identifies the configured reward stream; `reward_model` resolves its implementation.
+`applicable_datasets` is resolved to dataset names/source IDs, and `weight` may be one scalar or a
+per-dataset mapping. Training and `eval_rewards:` are independent configurations. Runtime training
+rewards are valid only for an execution contract with `feedback=runtime_reward`; reward-free and
+offline trainers may still use evaluation rewards.
 
-## Phase 5: Verification
+The loader deduplicates train/eval entries with the same model identity. Do not keep mutable
+per-config-name state inside a shared model call.
 
-- [ ] `__init__` loads model without errors
-- [ ] `__call__` returns correct reward shape
-- [ ] Rewards are numerically reasonable (not all zeros, no NaN/Inf)
-- [ ] Works with `RewardProcessor` dispatch (Pointwise/Groupwise routing)
-- [ ] Works in multi-reward setup with weight aggregation
-- [ ] Device placement correct (respects `config.device`)
-- [ ] Registry entry resolves: `get_reward_model_class('my_reward')`
+When `async_reward` is enabled, calls run in worker threads and may use dedicated CUDA streams.
+Implementations must be thread-safe or require `num_workers: 1`; tail pointwise batches still run
+during finalize.
 
-## Common Pitfalls
+## 4. Verification
 
-1. **Wrong return shape** — Pointwise must return `(batch_size,)`, Groupwise `(group_size,)`
-2. **Forgetting `@torch.no_grad()`** — causes reward computation to build unnecessary graph, OOM
-3. **Hardcoding device** — use `self.device` from base class, not `torch.device('cuda')`
-4. **Not setting `required_fields`** — `RewardProcessor` won't pass the right data to your model
-5. **Mixing paradigms** — don't inherit `PointwiseRewardModel` if your reward needs group context
+- Direct pointwise calls at full and tail lengths, or one complete groupwise call.
+- Exact result shape/order and rejection of NaN/Inf.
+- Source-gated partial and no-applicable subsets through `RewardProcessor`.
+- Groupwise local and distributed reconstruction when applicable.
+- Selective groupwise gathers retain every concrete sample `reconstruction_required_fields` entry.
+- PIL/NumPy and tensor media conversion for every declared field.
+- Scalar and per-dataset weighted multi-reward aggregation.
+- Sync and async execution, including async tail flush and thread-safety assumptions.
+- Train/eval deduplication and exactly one REWARD load scope per unique model.
+- Registry lookup, direct-path fallback, device placement, and config parsing.
+- Run `/ff-review` before commit.
+
+## Common Failures
+
+- Assuming every pointwise call has exactly `config.batch_size` inputs.
+- Returning a raw scalar, wrong ordering, non-finite values, or framework-owned applicability NaNs.
+- Omitting a required field or flattening nested condition media.
+- Hardcoding a device or preparing/sharding a reward as a target component.
+- Mutating shared model state by reward configuration name.
+- Using a pointwise base for a group-dependent score, or enabling async workers for non-thread-safe
+  code.

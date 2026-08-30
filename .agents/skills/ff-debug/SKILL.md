@@ -1,128 +1,153 @@
 ---
 name: ff-debug
-description: "Bug fixing and debugging for ANY error, crash, loss divergence, gradient explosion, distributed hang, NaN, or unexpected behavior. Covers quick fixes and full protocol with 5-phase investigation. Trigger: 'fix bug', 'fix error', 'broken', 'crash', 'doesn't work', 'fails with', 'loss NaN', 'training hangs', 'OOM'."
+description: "Debug Flow-Factory crashes, hangs, OOMs, numerical failures, finite-loader errors, component routing, distributed preparation, optimizer roles, and checkpoint/resume mismatches. Use for bug fixing or unexpected training behavior."
 ---
 
 # Debug Workflow
 
-## Related Topics (read for numerical / consistency issues)
+## Load the Relevant Contracts
 
-- NaN, loss divergence, wrong gradients -> `topics/train_inference_consistency.md`
-- Dtype mismatch, overflow, precision -> `topics/dtype_precision.md`
-- Frozen/flat loss or KL ≈ 0 -> `topics/autocast_param_swap.md` (#20a)
+Always read Tier 1: `../../knowledge/constraints.md`, `../../knowledge/architecture.md`, and
+`../../knowledge/philosophy.md`. Then route by symptom:
 
-## Two Pathways
+| Symptom or area | Also read |
+|---|---|
+| Wrong gradients, ratio drift, bad output | `../../knowledge/topics/train_inference_consistency.md`, `../../knowledge/topics/parity_testing.md` |
+| Dtype mismatch, overflow, flat loss or KL | `../../knowledge/topics/dtype_precision.md`, `../../knowledge/topics/autocast_param_swap.md` |
+| Missing component, wrong device, lazy load, wrap/OOM | `../../knowledge/topics/component_runtime.md` |
+| Multi-component rollout or replay | `../../knowledge/topics/structured_trajectory.md` |
+| Variant, role cadence, optimizer group, Muon, role checkpoint | `../../knowledge/topics/component_variants.md` |
+| Finite dataset, target encoding, SFT/offline DPO | `../../../guidance/workflow.md`, `../../../guidance/datasets.md` |
 
-### Quick Path (obvious root cause)
+## Classify the Execution Path First
 
-Use when: Error message clearly points to the issue (typo, missing import, wrong type).
+Resolve the trainer and its algorithm-specific `TrainingArguments`; their immutable
+`ExecutionContract` values must be equal.
 
-1. Reproduce the error
-2. Check `.agents/knowledge/constraints.md` for relevant constraints
-3. Write targeted fix
-4. Verify with test
-5. Run `/ff-review`, commit
+| Composition | Expected path |
+|---|---|
+| `generation + runtime_reward` | `sample()` -> feedback/reward -> advantage -> `optimize()` |
+| `generation + none` | `sample()` -> `optimize()`; no training reward/advantage stage |
+| `dataset + none` | Exhaust one official finite `DistributedSampler` loader through `optimize_batch()` |
 
-If not resolved in 15 min -> switch to Full Protocol.
+Do not infer execution mode from batch fields. Track `optimizer_step` independently from
+`rollout_iteration` or `data_epoch`; a dataset epoch advances only after clean loader exhaustion.
 
-### Full Protocol (complex issues)
+## Quick Path
 
-Use when:
-- Distributed training bugs (deadlocks, rank mismatches)
-- Numerical issues (NaN, loss divergence, wrong gradients)
-- Silent failures (training runs but produces garbage)
-- Multiple failed fix attempts
+Use when the failure is deterministic and the stack trace identifies one local contract breach.
 
-## Full Protocol — Five Phases
+1. Reproduce it with the smallest representative test or config.
+2. Trace the owning boundary and relevant constraint.
+3. Add a regression that fails for the same reason.
+4. Apply the narrow fix and run affected contract tests.
+5. Run `/ff-review` before committing.
 
-### Phase 1: Root Cause Investigation
+If the cause is uncertain, distributed, numerical, or survives one focused attempt, use the full
+protocol.
 
-1. **Read complete error messages** — Full stack traces matter, don't skim
-2. **Consult constraints** — Check `.agents/knowledge/constraints.md`
-3. **Reproduce consistently** — Isolate the exact trigger condition
-4. **Trace execution path** — Follow through the 6-stage pipeline
-5. **Check recent changes** — `git log --oneline -10` — what changed recently?
+## Full Protocol
 
-#### Distributed-Specific Checklist
-- Does the error appear on all ranks or just one?
-- Is `accelerator.wait_for_everyone()` missing before the failure point?
-- Are frozen components synchronized across ranks? (Constraint #19)
-- Is ZeRO-3 being used? (Constraint #10 — unsupported)
+### 1. Establish the Failure Boundary
 
-### Phase 2: Pattern Analysis
+- Read every rank's complete traceback and first causal error.
+- Record the resolved trainer, adapter, execution contract, model I/O contract, backend, optimizer
+  types, finetune type, dtype policy, and checkpoint mode.
+- Compare against a working path one variable at a time, including YAML and backend config.
+- Identify when failure occurs: preflight, native component load, preprocessing, bundle prepare,
+  proxy-routed forward, acquisition, optimizer step, save, or resume.
+- Check recent changes with a focused file/commit diff; do not assume temporal correlation is cause.
 
-1. **Find working examples** — Compare with a similar model/algorithm that works
-2. **Diff analysis** — What's different between working and broken paths? Compare **completely** — diff line by line, not skim. Include config YAML and environment vars.
-3. **Isolate variables** — Change one thing at a time
-4. **Check dependencies** — Different diffusers version? Different PyTorch version?
+### 2. Check Ownership Invariants
 
-### Phase 3: Hypothesis Testing
+#### Dataset acquisition
 
-1. **One hypothesis per iteration** — Formulate a single falsifiable hypothesis
-2. **Minimal test case** — Reproduce with smallest possible config
-3. **Low confidence (<80%)?** — Add debug logging before applying fix
+- Uses PyTorch's official `DistributedSampler`, even at one rank, and calls
+  `set_epoch(data_epoch)`.
+- Uses explicit positive `gradient_accumulation_steps`; rank-local batch count closes every
+  accumulation window without an implicit flush.
+- Caches prompt/input conditions only. Target, chosen, and rejected media is decoded and encoded on
+  demand.
+- Calls `prepare_condition_state()` once per batch. Offline DPO reuses that object, schedule, noise,
+  and one reference scope across both arms.
+- Applies the adapter's complete `offline_training_forward_overrides`, not rollout CFG semantics.
 
-**Red flags — STOP and restart from Phase 1:**
-- "Let me just try changing X and see what happens"
-- "Quick fix for now, clean up later"
-- "It probably works, let me move on"
+#### Component runtime and loading
 
-**Verification gate** — before acting on a conclusion, check:
-- Does the evidence actually support this cause, or just correlate?
-- Could a different root cause produce the same symptoms?
-- What observation would disprove this hypothesis? Have you looked for it?
+- Resolve membership with `has_component`, `get_component`, or `_require_component`, never
+  `hasattr(adapter, name)`.
+- Keep canonical components, prepared/replacement overrides, declared specs, materialized modules,
+  optional `None`, and pseudo aliases distinct.
+- `materialize_components(None)` means already-materialized modules, not all lazy declarations.
+- Trace logical names to physical roots through `ModelLoadCoordinator`; adapters/trainers must not
+  reproduce FSDP loading state or broadcast weights directly.
+- All target and frozen-but-shardable routes enter one `ModelBundle` with one optimizer prepare
+  root. Adapter forwards after prepare route through `RoutedComponentProxy`.
+- For FSDP OOM, inspect bundle-exposed `_no_split_modules`/`_repeated_blocks`, wrap classes, adapter
+  memory capabilities, checkpoint replay, unshard stream, and backward prefetch before shrinking
+  the workload.
 
-### Phase 4: Fix Implementation
+#### Variants, optimizers, and distributed plans
 
-1. **Write failing test first** (if possible)
-2. **Implement targeted fix** — Only fix the bug, don't refactor
-3. **Check cross-algorithm impact** — Does this fix break GRPO? NFT? AWM?
-4. **Check cross-model impact** — Test with at least two model adapters
-5. Before committing: run `/ff-review` skill.
+- A temporal reference/EMA/snapshot is not a live component variant.
+- Variants are declared before prepare; role parameter and optimizer-group ownership is disjoint and
+  exhaustive.
+- Do not assume one group per role: Muon uses matrices plus an optional AdamW remainder inside one
+  `CompositeOptimizer` root.
+- Reject ZeRO-3. Reject Muon before model loading when its PyTorch API is absent or the backend is
+  DeepSpeed/FSDP1. Multi-role DeepSpeed requires ZeRO-1/2. Multi-role FSDP2 requires
+  `use_orig_params=True`; after prepare, registry and optimizer references must point to the
+  DTensor-backed parameters owned by the prepared model root.
+- Activation checkpointing has one owner. FSDP2 full policy is normalized to backend ownership;
+  selective model checkpointing is rejected. Inspect adapter-owned in-forward checkpointing only
+  when the adapter explicitly opts in.
 
-### Phase 5: Knowledge Capture
+#### Checkpoint and exact resume
 
-After fix is verified:
-- Update `constraints.md` if a new constraint was discovered
-- Add regression test if applicable
-- Document the root cause in the commit message
-- Follow fix archival process in `topics/fix_patterns.md`
+- Model-only export scope and resumable state scope are different. Resumable multi-role saves include
+  training-only roles, role counters, optimizer ownership, and variant snapshots.
+- Validate variant/runtime metadata before Accelerate mutates prepared state.
+- Exact identity covers changed objective, model/backend/optimizer semantics, realized data order,
+  and replayed evaluation configuration; cadence and resume location remain operational controls.
+- Preserve all-rank phase symmetry and atomic publication ordering.
+
+#### Numerical and reward paths
+
+- Wrap each policy/reference/EMA forward in its own autocast region when weights can change in place.
+- Consume trajectories only through adapter bridge methods and authoritative component order.
+- A partial cross-rank gather must union the concrete sample class's
+  `reconstruction_required_fields` before reconstruction. This is independent of reward
+  `required_fields` and collation `_shared_fields`.
+- Pointwise rewards return one finite value per actual input chunk, which may be smaller than
+  `batch_size`; groupwise rewards preserve complete `unique_id` order.
+- Per-dataset reward applicability is framework-owned; model NaN/Inf is an error, not a routing
+  sentinel.
+
+### 3. Test One Falsifiable Hypothesis
+
+State the proposed cause, the observation that would disprove it, and the smallest experiment that
+separates it from alternatives. Add instrumentation when confidence is below 80%. Avoid speculative
+fallbacks or several behavioral changes in one experiment.
+
+### 4. Fix and Verify in Scope
+
+- Write the regression first when practical.
+- Fix the authoritative owner rather than patching downstream consumers.
+- Verify the narrow unit contract, then affected compositions:
+  - execution kernel: GRPO, a reward-free generation trainer, and SFT/offline DPO as applicable;
+  - adapter/trajectory: legacy single-component and structured multimodal paths;
+  - runtime/loading: the affected classic/modular/pseudo runtime and supported backends;
+  - variants/optimizer: single-role AdamW plus multi-role/Muon cases when touched;
+  - checkpoint: model-only round trip and exact-state resume when touched.
+- Test at least two adapters only when the changed abstraction is shared across adapters.
+
+### 5. Capture the Fix
+
+Follow `../../knowledge/topics/fix_patterns.md`: record symptom, root cause, fix, lesson, related
+constraint, test evidence, and commit. Update Tier 1 only when the fix establishes a durable
+cross-module invariant.
 
 ## Three-Strike Rule
 
-If the same approach fails three times:
-1. **HALT** all fix attempts
-2. Question whether the underlying approach/architecture is wrong
-3. Step back and re-examine: are you solving the right problem?
-4. Report to user with analysis before continuing
-
-## Common Issue Categories
-
-### Training Loop Issues
-- [ ] Stage ordering violated? (Constraint #6)
-- [ ] Coupled/decoupled paradigm mismatch? (Constraint #7)
-- [ ] Component not on correct device? (Constraint #8)
-- [ ] Dataloader incorrectly prepared via accelerator? (Constraint #9)
-
-### Model Adapter Issues
-- [ ] `load_pipeline()` returning wrong type? (Constraint #5)
-- [ ] `target_module_map` mapping incorrect components?
-- [ ] `_shared_fields` causing data corruption? (Constraint #14)
-- [ ] Preprocessing modules not offloaded after Stage 1?
-
-### Reward Issues
-- [ ] Pointwise/Groupwise confusion? (Constraint #13)
-- [ ] Wrong reward shape returned?
-- [ ] `required_fields` not set correctly?
-- [ ] Device mismatch between reward model and generated samples?
-
-### Configuration Issues
-- [ ] YAML key doesn't match the dataclass field name? (Constraint #17)
-- [ ] Algorithm-specific args using wrong subclass? (Constraint #16)
-- [ ] Registry key doesn't match? (Constraint #1)
-
-### Distributed Issues
-- [ ] Missing synchronization barrier? (Constraint #18)
-- [ ] FSDP frozen components uninitialized on Rank > 0? (Constraint #19)
-- [ ] Mixed precision casting order incorrect? (Constraint #20) — see also `topics/dtype_precision.md` for precision diagnosis checklist
-- [ ] Using ZeRO-3? (Constraint #10 — not supported)
+After three failed approaches to the same cause, stop patching, document evidence and rejected
+hypotheses, reassess the ownership model, and request review before continuing.
