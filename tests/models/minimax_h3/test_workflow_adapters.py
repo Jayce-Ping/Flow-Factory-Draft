@@ -23,7 +23,10 @@ import torch.nn as nn
 from accelerate import DistributedType
 
 from flow_factory.models.abc import BaseAdapter
-from flow_factory.models.minimax_h3._chunking import H3_MAX_FEED_FORWARD_TOKENS
+from flow_factory.models.minimax_h3._chunking import (
+    H3_MAX_ATTENTION_NORM_TOKENS,
+    H3_MAX_FEED_FORWARD_TOKENS,
+)
 from flow_factory.models.minimax_h3.adapters import (
     MiniMaxH3FL2VAAdapter,
     MiniMaxH3Ref2VAAdapter,
@@ -66,6 +69,9 @@ class TransformerBlockFake(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
+        self.attn = nn.Module()
+        self.attn.norm_q = nn.RMSNorm(1, elementwise_affine=False)
+        self.attn.norm_k = nn.RMSNorm(1, elementwise_affine=False)
         self.ff = FeedForwardFake()
 
 
@@ -339,12 +345,18 @@ def test_workflow_adapter_loads_pruned_runtime_and_exact_setup_components(
     assert transformer_name in adapter.component_runtime.materialized_component_names
     transformer = adapter.get_component(transformer_name)
     assert H3_MAX_FEED_FORWARD_TOKENS == 1024
+    assert H3_MAX_ATTENTION_NORM_TOKENS == 1024
     configured_blocks = [
         *transformer.token_refiner.refiner_blocks,
         *transformer.transformer_blocks,
     ]
     assert all(
         getattr(block.ff, "max_tokens", None) == H3_MAX_FEED_FORWARD_TOKENS
+        for block in configured_blocks
+    )
+    assert all(
+        getattr(block.attn.norm_q, "max_tokens", None) == H3_MAX_ATTENTION_NORM_TOKENS
+        and getattr(block.attn.norm_k, "max_tokens", None) == H3_MAX_ATTENTION_NORM_TOKENS
         for block in configured_blocks
     )
     opposite = "transformer_ref" if transformer_name == "transformer" else "transformer"

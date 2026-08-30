@@ -17,9 +17,12 @@ from copy import deepcopy
 import pytest
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from flow_factory.models.minimax_h3._chunking import (
     _ChunkedFeedForward,
+    _ChunkedRMSNorm,
+    install_h3_attention_norm_chunking,
     install_h3_feed_forward_chunking,
 )
 
@@ -55,6 +58,9 @@ class FeedForwardFake(nn.Module):
 class BlockFake(nn.Module):
     def __init__(self) -> None:
         super().__init__()
+        self.attn = nn.Module()
+        self.attn.norm_q = nn.RMSNorm(5)
+        self.attn.norm_k = nn.RMSNorm(5)
         self.ff = FeedForwardFake()
 
 
@@ -149,3 +155,82 @@ def test_chunking_rejects_conflicting_reinstallation() -> None:
 
     with pytest.raises(ValueError, match="already uses max_tokens=4.*conflicting 8"):
         install_h3_feed_forward_chunking(transformer, max_tokens=8)
+
+
+def test_attention_norm_chunking_preserves_parameter_tree_and_is_idempotent() -> None:
+    transformer = TransformerFake()
+    state = deepcopy(transformer.state_dict())
+    keys_before = tuple(state)
+    parameter_ids_before = {
+        name: id(parameter) for name, parameter in transformer.named_parameters()
+    }
+
+    assert install_h3_attention_norm_chunking(transformer, max_tokens=4) == 10
+    assert install_h3_attention_norm_chunking(transformer, max_tokens=4) == 10
+
+    norms = [
+        norm
+        for block in (
+            *transformer.token_refiner.refiner_blocks,
+            *transformer.transformer_blocks,
+        )
+        for norm in (block.attn.norm_q, block.attn.norm_k)
+    ]
+    assert all(isinstance(norm, _ChunkedRMSNorm) for norm in norms)
+    assert tuple(transformer.state_dict()) == keys_before
+    assert {
+        name: id(parameter) for name, parameter in transformer.named_parameters()
+    } == parameter_ids_before
+    transformer.load_state_dict(state, strict=True)
+    assert "transformer_blocks.0.attn.norm_q.weight" in transformer.state_dict()
+    assert not any("inner" in name for name, _ in transformer.named_modules())
+
+
+def test_attention_norm_chunking_preserves_remainder_forward_backward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(23)
+    direct = TransformerFake().double()
+    chunked = deepcopy(direct)
+    install_h3_attention_norm_chunking(chunked, max_tokens=4)
+    direct_norm = direct.transformer_blocks[0].attn.norm_q
+    chunked_norm = chunked.transformer_blocks[0].attn.norm_q
+    direct_input = torch.randn(2, 9, 3, 5, dtype=torch.float64, requires_grad=True)
+    chunked_input = direct_input.detach().clone().requires_grad_(True)
+    output_gradient = torch.randn(2, 9, 3, 5, dtype=torch.float64)
+
+    direct_output = direct_norm(direct_input)
+    direct_output.backward(output_gradient)
+    chunk_sizes: list[int] = []
+    direct_rms_norm = F.rms_norm
+
+    def recording_rms_norm(hidden_states, normalized_shape, weight=None, eps=None):
+        chunk_sizes.append(hidden_states.shape[1])
+        return direct_rms_norm(hidden_states, normalized_shape, weight, eps)
+
+    monkeypatch.setattr(F, "rms_norm", recording_rms_norm)
+    chunked_output = chunked_norm(chunked_input)
+    chunked_output.backward(output_gradient)
+
+    assert chunk_sizes == [4, 4, 1]
+    torch.testing.assert_close(chunked_output, direct_output)
+    torch.testing.assert_close(chunked_input.grad, direct_input.grad)
+    torch.testing.assert_close(chunked_norm.weight.grad, direct_norm.weight.grad)
+
+
+def test_attention_norm_chunking_preserves_bfloat16_dtype() -> None:
+    transformer = TransformerFake().bfloat16()
+    direct = transformer.transformer_blocks[0].attn.norm_q(torch.randn(1, 7, 3, 5).bfloat16())
+    install_h3_attention_norm_chunking(transformer, max_tokens=4)
+
+    chunked = transformer.transformer_blocks[0].attn.norm_q(torch.randn(1, 7, 3, 5).bfloat16())
+
+    assert chunked.dtype == direct.dtype == torch.bfloat16
+
+
+def test_attention_norm_chunking_rejects_conflicting_reinstallation() -> None:
+    transformer = TransformerFake()
+    install_h3_attention_norm_chunking(transformer, max_tokens=4)
+
+    with pytest.raises(ValueError, match="already uses max_tokens=4.*conflicting 8"):
+        install_h3_attention_norm_chunking(transformer, max_tokens=8)

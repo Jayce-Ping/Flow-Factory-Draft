@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Bound peak memory for token-local MiniMax H3 feed-forward layers."""
+"""Bound peak memory for token-local MiniMax H3 operations."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ import torch
 from torch import nn
 
 H3_MAX_FEED_FORWARD_TOKENS = 1024
+H3_MAX_ATTENTION_NORM_TOKENS = 1024
 
 
 class _ChunkedFeedForward(nn.Module):
@@ -57,6 +58,40 @@ class _ChunkedFeedForward(nn.Module):
         )
 
 
+class _ChunkedRMSNorm(nn.RMSNorm):
+    """Bound row-wise RMSNorm temporaries while preserving its parameter path."""
+
+    def __init__(self, norm: nn.RMSNorm, *, max_tokens: int) -> None:
+        nn.Module.__init__(self)
+        self.normalized_shape = norm.normalized_shape
+        self.eps = norm.eps
+        self.elementwise_affine = norm.elementwise_affine
+        self.register_parameter("weight", norm.weight)
+        self.max_tokens = _positive_int(max_tokens, "max_tokens")
+
+    def _forward_chunk(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return nn.functional.rms_norm(
+            hidden_states,
+            self.normalized_shape,
+            self.weight,
+            self.eps,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Normalize independent token rows without materializing a full FP32 copy."""
+        if hidden_states.ndim < 3:
+            raise ValueError(
+                "MiniMax H3 RMSNorm chunking expected [batch, tokens, ..., hidden] "
+                f"input, received shape={tuple(hidden_states.shape)}"
+            )
+        if hidden_states.shape[1] <= self.max_tokens:
+            return self._forward_chunk(hidden_states)
+        return torch.cat(
+            [self._forward_chunk(chunk) for chunk in hidden_states.split(self.max_tokens, dim=1)],
+            dim=1,
+        )
+
+
 def install_h3_feed_forward_chunking(
     transformer: nn.Module,
     *,
@@ -73,7 +108,7 @@ def install_h3_feed_forward_chunking(
         Number of feed-forward layers configured across both stacks.
     """
     max_tokens = _positive_int(max_tokens, "max_tokens")
-    blocks = tuple(_h3_feed_forward_blocks(transformer))
+    blocks = tuple(_h3_repeated_blocks(transformer))
     configured = 0
     for name, block in blocks:
         feed_forward = getattr(block, "ff", None)
@@ -111,19 +146,7 @@ def install_h3_feed_forward_chunking(
             feed_forward.named_buffers(recurse=False)
         ):
             raise TypeError(f"MiniMax H3 {name}.ff expected no direct parameters or buffers")
-        hook_fields = (
-            "_forward_pre_hooks",
-            "_forward_hooks",
-            "_backward_pre_hooks",
-            "_backward_hooks",
-        )
-        active_hooks = tuple(field for field in hook_fields if getattr(feed_forward, field, None))
-        if active_hooks or getattr(feed_forward, "_hf_hook", None) is not None:
-            raise TypeError(
-                f"MiniMax H3 {name}.ff must be configured before execution hooks; "
-                f"received hooks={active_hooks}, hf_hook="
-                f"{type(getattr(feed_forward, '_hf_hook', None)).__name__}"
-            )
+        _reject_execution_hooks(feed_forward, f"{name}.ff")
         replacement = _ChunkedFeedForward(net, max_tokens=max_tokens)
         replacement.train(feed_forward.training)
         block.ff = replacement
@@ -131,7 +154,55 @@ def install_h3_feed_forward_chunking(
     return configured
 
 
-def _h3_feed_forward_blocks(transformer: nn.Module) -> Iterable[tuple[str, nn.Module]]:
+def install_h3_attention_norm_chunking(
+    transformer: nn.Module,
+    *,
+    max_tokens: int = H3_MAX_ATTENTION_NORM_TOKENS,
+) -> int:
+    """Install bounded Q/K head normalization on both H3 repeated stacks."""
+    max_tokens = _positive_int(max_tokens, "max_tokens")
+    configured = 0
+    for block_name, block in _h3_repeated_blocks(transformer):
+        attention = getattr(block, "attn", None)
+        if not isinstance(attention, nn.Module):
+            raise TypeError(
+                f"MiniMax H3 {block_name}.attn expected nn.Module, received "
+                f"{type(attention).__name__}"
+            )
+        for norm_name in ("norm_q", "norm_k"):
+            path = f"{block_name}.attn.{norm_name}"
+            norm = getattr(attention, norm_name, None)
+            if isinstance(norm, _ChunkedRMSNorm):
+                if norm.max_tokens != max_tokens:
+                    raise ValueError(
+                        f"MiniMax H3 {path} already uses max_tokens={norm.max_tokens}, "
+                        f"received conflicting {max_tokens}"
+                    )
+                configured += 1
+                continue
+            if not isinstance(norm, nn.RMSNorm):
+                raise TypeError(
+                    f"MiniMax H3 {path} expected nn.RMSNorm, received " f"{type(norm).__name__}"
+                )
+            if tuple(norm.named_children()) or tuple(norm.named_buffers(recurse=False)):
+                raise TypeError(f"MiniMax H3 {path} expected no child modules or direct buffers")
+            expected_parameters = ("weight",) if norm.elementwise_affine else ()
+            if (
+                tuple(name for name, _ in norm.named_parameters(recurse=False))
+                != expected_parameters
+            ):
+                raise TypeError(
+                    f"MiniMax H3 {path} expected direct parameters={expected_parameters}"
+                )
+            _reject_execution_hooks(norm, path)
+            replacement = _ChunkedRMSNorm(norm, max_tokens=max_tokens)
+            replacement.train(norm.training)
+            setattr(attention, norm_name, replacement)
+            configured += 1
+    return configured
+
+
+def _h3_repeated_blocks(transformer: nn.Module) -> Iterable[tuple[str, nn.Module]]:
     token_refiner = getattr(transformer, "token_refiner", None)
     stacks = (
         ("token_refiner.refiner_blocks", getattr(token_refiner, "refiner_blocks", None)),
@@ -145,6 +216,22 @@ def _h3_feed_forward_blocks(transformer: nn.Module) -> Iterable[tuple[str, nn.Mo
             )
         for index, block in enumerate(stack):
             yield f"{stack_name}.{index}", block
+
+
+def _reject_execution_hooks(module: nn.Module, path: str) -> None:
+    hook_fields = (
+        "_forward_pre_hooks",
+        "_forward_hooks",
+        "_backward_pre_hooks",
+        "_backward_hooks",
+    )
+    active_hooks = tuple(field for field in hook_fields if getattr(module, field, None))
+    if active_hooks or getattr(module, "_hf_hook", None) is not None:
+        raise TypeError(
+            f"MiniMax H3 {path} must be configured before execution hooks; "
+            f"received hooks={active_hooks}, hf_hook="
+            f"{type(getattr(module, '_hf_hook', None)).__name__}"
+        )
 
 
 def _positive_int(value: int, field: str) -> int:

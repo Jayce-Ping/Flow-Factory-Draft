@@ -547,6 +547,20 @@ Based on the fix type, write the fix entry to the appropriate document:
   parameter tree and accepting dynamic tail chunks.
 - **Related Constraint**: N/A
 
+### Head-space normalization should not upcast an entire packed sequence
+- **Date**: 2026-08-30
+- **Symptom**: MiniMax H3 Ref2VA FSDP2 GRPO exhausted a 95 GiB device while
+  `attn.norm_q` requested one 380 MiB allocation before reaching the feed-forward layer.
+- **Root Cause**: PyTorch RMSNorm promoted the complete `[1, 13889, 56, 128]` BF16 query to a
+  379.8 MiB FP32 temporary even though normalization reduces only the final head dimension.
+- **Fix**: H3 runtime setup now reuses each Q/K RMSNorm parameter inside a remainder-safe
+  1,024-token executor on both repeated block stacks. Parameter identities and
+  `attn.norm_q.weight` / `attn.norm_k.weight` state-dict paths remain unchanged.
+- **Lesson**: Row-local normalization can preserve its exact reduction semantics while bounding
+  the number of independent rows promoted at once. Chunk the non-reduced sequence dimension,
+  never the normalized head dimension.
+- **Related Constraint**: N/A
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)
