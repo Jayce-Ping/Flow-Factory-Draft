@@ -30,13 +30,12 @@ from ...samples import (
 )
 from ...scheduler import MiniMaxH3SDEScheduler, SchedulerGroup
 from ..runtime import ModularPipelineRuntime
+from ._chunking import install_h3_feed_forward_chunking
 from ._common import (
     build_structured_trajectories,
 )
 from ._common import build_training_component_times as build_h3_component_times
-from ._common import (
-    validate_target_state,
-)
+from ._common import validate_target_state
 from .blocks import encode_h3_workflow_inputs, prepare_h3_rollout_state
 from .decoding import decode_h3_targets
 from .denoise import forward_h3_state
@@ -98,6 +97,7 @@ def build_h3_component_runtime(adapter: Any) -> ModularPipelineRuntime:
     validate_h3_target_components(adapter)
     runtime = ModularPipelineRuntime.from_adapter(adapter, adapter.load_pipeline())
     runtime.materialize_components([adapter.transformer_component_name])
+    install_h3_feed_forward_chunking(runtime.get_component(adapter.transformer_component_name))
     return runtime
 
 

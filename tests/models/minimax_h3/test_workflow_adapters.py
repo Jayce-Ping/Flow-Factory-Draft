@@ -38,6 +38,36 @@ class UpstreamSchedulerFake:
     """Represent the lazy upstream scheduler replaced by Flow-Factory."""
 
 
+class SwiGLU(nn.Module):
+    """Match the upstream activation class name without adding parameters."""
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return value
+
+
+class FeedForwardFake(nn.Module):
+    """Expose the parameter-free upstream ``ff.net`` module structure."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        output = nn.Linear(1, 1, bias=False)
+        output.weight = None
+        self.net = nn.ModuleList([SwiGLU(), nn.Dropout(0.0), output])
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        for module in self.net:
+            value = module(value)
+        return value
+
+
+class TransformerBlockFake(nn.Module):
+    """Expose one feed-forward child without adding trainable parameters."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ff = FeedForwardFake()
+
+
 class TransformerFake(nn.Module):
     """Provide one parameter for BaseAdapter freeze and precision setup."""
 
@@ -46,6 +76,9 @@ class TransformerFake(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(1))
+        self.token_refiner = nn.Module()
+        self.token_refiner.refiner_blocks = nn.ModuleList([TransformerBlockFake()])
+        self.transformer_blocks = nn.ModuleList([TransformerBlockFake()])
         self.gradient_checkpointing_calls = 0
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
@@ -222,8 +255,7 @@ def test_workflow_loader_preserves_hub_source() -> None:
     assert isinstance(pipeline, WorkflowPipelineFake)
     assert WorkflowPipelineFake.calls == [(model_name_or_path, "t2va")]
     assert all(
-        spec.pretrained_model_name_or_path == model_name_or_path
-        and spec.revision == "main"
+        spec.pretrained_model_name_or_path == model_name_or_path and spec.revision == "main"
         for spec in pipeline._component_specs.values()
     )
 
@@ -304,6 +336,12 @@ def test_workflow_adapter_loads_pruned_runtime_and_exact_setup_components(
     assert len(adapter.audio_scheduler.timesteps) == 4
     assert not hasattr(adapter.pipeline, "unrelated")
     assert transformer_name in adapter.component_runtime.materialized_component_names
+    transformer = adapter.get_component(transformer_name)
+    configured_blocks = [
+        *transformer.token_refiner.refiner_blocks,
+        *transformer.transformer_blocks,
+    ]
+    assert all(getattr(block.ff, "max_tokens", None) == 4096 for block in configured_blocks)
     opposite = "transformer_ref" if transformer_name == "transformer" else "transformer"
     assert opposite not in adapter.component_runtime.declared_component_names
 

@@ -532,6 +532,21 @@ Based on the fix type, write the fix entry to the appropriate document:
   delaying a missing-sidecar failure until sample construction.
 - **Related Constraint**: N/A
 
+### Token-local H3 feed-forward work should bound packed-sequence temporaries
+- **Date**: 2026-08-30
+- **Symptom**: MiniMax H3 Ref2VA ZeRO-2 offline DPO and FSDP2 trainers exhausted a 95 GiB
+  device while allocating one 380 MiB SwiGLU activation for a 13,889-token packed sequence.
+- **Root Cause**: Diffusers' H3 blocks evaluated every feed-forward projection over the complete
+  dynamic sequence, and its generic chunk helper rejected non-divisible lengths such as 13,889.
+- **Fix**: H3 runtime setup now reuses each existing `ff.net` parameter tree inside a remainder-safe
+  4,096-token executor for both token-refiner and main transformer blocks. Installation precedes
+  Flow-Factory resume loading, LoRA, checkpointing, and distributed wrapping, so state-dict keys,
+  parameter identities, and execution policy remain consistent across rollout and training.
+- **Lesson**: A token-local operation does not need to inherit the peak allocation of a packed
+  attention sequence. Apply memory bounds at the operation boundary while preserving the original
+  parameter tree and accepting dynamic tail chunks.
+- **Related Constraint**: N/A
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)
