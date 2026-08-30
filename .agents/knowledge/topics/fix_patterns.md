@@ -413,6 +413,23 @@ Based on the fix type, write the fix entry to the appropriate document:
   must own FSDP2 full checkpointing instead of nesting model-level boundaries around sharded blocks.
 - **Related Constraint**: #9, #20
 
+### Adapter dtype manifests may span optional checkpoint components
+- **Date**: 2026-08-30
+- **Symptom**: Every Wan2.2 TI2V trainer rejected the Wan I2V adapter's `image_encoder` load-dtype
+  default even though the checkpoint legitimately omits that optional component.
+- **Root Cause**: The eager loader validated an adapter-wide dtype manifest only against components
+  present in one checkpoint, conflating the checkpoint instance with the pipeline class's wider
+  optional-component contract.
+- **Fix**: Eager pipeline loading now validates adapter manifest selectors against the union of the
+  checkpoint components and the pipeline class's declared optional components, while resolving
+  dtype arguments only for components actually present. User overrides remain strict against the
+  selected checkpoint. Regressions cover absent and present optional components, invalid manifest
+  selectors, and explicit user selection of an absent component.
+- **Lesson**: Adapter defaults may intentionally cover several checkpoint variants of one pipeline
+  class. Optional class-level declarations belong to manifest validation, but they must not create
+  components or weaken the fail-fast contract for checkpoint-specific user overrides.
+- **Related Constraint**: #20
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

@@ -963,12 +963,24 @@ class BaseAdapter(ABC):
                 for name, value in pipeline_config.items()
                 if isinstance(value, (list, tuple)) and len(value) >= 2
             ]
+            # Adapter defaults may cover several checkpoint variants of one pipeline
+            # class. Keep absent class-declared optional components valid for manifest
+            # validation, but resolve the actual dtype mapping only for this checkpoint.
+            manifest_declared_names = list(
+                dict.fromkeys(
+                    [
+                        *component_names,
+                        *getattr(pipeline_class, "_optional_components", ()),
+                    ]
+                )
+            )
             load_dtype_kwargs = build_component_load_dtype_kwargs(
                 user_policy=user_policy,
                 manifest_policy=manifest_policy,
                 component_names=component_names,
                 transformer_names=[name for name in component_names if "transformer" in name],
                 text_encoder_names=[name for name in component_names if "text_encoder" in name],
+                manifest_declared_names=manifest_declared_names,
                 preserve_unselected=True,
             )
             kwargs.update(

@@ -14,8 +14,8 @@
 
 import pytest
 import torch
-from diffusers import DiffusionPipeline
 
+from diffusers import DiffusionPipeline
 from flow_factory.models.abc import BaseAdapter
 from flow_factory.models.precision import (
     cast_module_role_dtypes,
@@ -44,6 +44,7 @@ _ProtectedDiffusersModel.__module__ = "diffusers.test_precision"
 
 class _PipelineFake(DiffusionPipeline):
     load_call = None
+    _optional_components = ["image_encoder"]
 
     @classmethod
     def load_config(cls, pretrained_model_name_or_path: str, **kwargs):
@@ -86,6 +87,17 @@ def test_user_default_null_disables_concrete_manifest_defaults() -> None:
     )
 
 
+def test_present_optional_manifest_selector_resolves_its_dtype() -> None:
+    assert component_dtype_mapping(
+        user_policy=None,
+        manifest_policy={"image_encoder": torch.float32},
+        component_names=["transformer", "image_encoder"],
+        transformer_names=["transformer"],
+        text_encoder_names=[],
+        manifest_declared_names=["transformer", "image_encoder"],
+    ) == {"image_encoder": torch.float32}
+
+
 def test_transformers_group_includes_reference_transformer() -> None:
     assert component_dtype_mapping(
         user_policy={"transformers": torch.bfloat16},
@@ -101,7 +113,10 @@ def test_eager_pipeline_loader_expands_role_selectors() -> None:
         "AdapterStub",
         (),
         {
-            "_component_load_dtype_manifest": {"transformers": torch.bfloat16},
+            "_component_load_dtype_manifest": {
+                "transformers": torch.bfloat16,
+                "image_encoder": torch.float32,
+            },
             "_component_load_dtype_overrides": None,
             "_resolve_component_load_dtype_mapping": (
                 BaseAdapter._resolve_component_load_dtype_mapping
@@ -130,6 +145,20 @@ def test_eager_pipeline_loader_expands_role_selectors() -> None:
     )
 
 
+def test_user_policy_cannot_select_an_absent_optional_component() -> None:
+    adapter = type(
+        "AdapterStub",
+        (),
+        {
+            "_component_load_dtype_manifest": None,
+            "_component_load_dtype_overrides": {"image_encoder": torch.float32},
+        },
+    )()
+
+    with pytest.raises(ValueError, match=r"unknown=.*image_encoder"):
+        BaseAdapter._load_diffusers_pipeline(adapter, _PipelineFake, "model")
+
+
 def test_unknown_load_policy_selector_fails_with_runtime_context() -> None:
     with pytest.raises(ValueError, match=r"unknown=.*missing.*declared=.*transformer"):
         component_dtype_mapping(
@@ -138,6 +167,18 @@ def test_unknown_load_policy_selector_fails_with_runtime_context() -> None:
             component_names=["transformer"],
             transformer_names=["transformer"],
             text_encoder_names=[],
+        )
+
+
+def test_unknown_manifest_selector_remains_strict_with_optional_declarations() -> None:
+    with pytest.raises(ValueError, match=r"unknown=.*missing"):
+        component_dtype_mapping(
+            user_policy=None,
+            manifest_policy={"missing": torch.bfloat16},
+            component_names=["transformer"],
+            transformer_names=["transformer"],
+            text_encoder_names=[],
+            manifest_declared_names=["transformer", "image_encoder"],
         )
 
 

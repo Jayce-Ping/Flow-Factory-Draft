@@ -123,10 +123,16 @@ def component_dtype_mapping(
     component_names: Sequence[str],
     transformer_names: Sequence[str],
     text_encoder_names: Sequence[str],
+    manifest_declared_names: Sequence[str] | None = None,
 ) -> dict[str, torch.dtype]:
-    """Resolve a policy to the concrete non-null mapping accepted by loaders."""
+    """Resolve policies for concrete components, with wider adapter-manifest declarations."""
     validate_dtype_policy_selectors(user_policy, declared_names=component_names)
-    validate_dtype_policy_selectors(manifest_policy, declared_names=component_names)
+    validate_dtype_policy_selectors(
+        manifest_policy,
+        declared_names=(
+            component_names if manifest_declared_names is None else manifest_declared_names
+        ),
+    )
     return {
         name: dtype
         for name in component_names
@@ -150,6 +156,7 @@ def build_component_load_dtype_kwargs(
     component_names: Sequence[str],
     transformer_names: Sequence[str],
     text_encoder_names: Sequence[str],
+    manifest_declared_names: Sequence[str] | None = None,
     requested_names: Sequence[str] | None = None,
     preserve_unselected: bool = False,
 ) -> Dict[str, object]:
@@ -165,6 +172,7 @@ def build_component_load_dtype_kwargs(
         component_names=component_names,
         transformer_names=transformer_names,
         text_encoder_names=text_encoder_names,
+        manifest_declared_names=manifest_declared_names,
     )
     if requested_names is not None:
         requested = set(requested_names)
