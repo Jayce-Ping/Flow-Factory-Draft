@@ -58,7 +58,10 @@ Based on the fix type, write the fix entry to the appropriate document:
 - **Date**: 2026-08-30
 - **Symptom**: Two-rank H3 Ref2VA GRPO failed before reward execution because `MiniMaxH3Ref2VASample` was reconstructed with `reference_manifest=None`.
 - **Root Cause**: The distributed group-reward path gathered only reward-consumed fields, although `gather_samples` reconstructs the concrete sample class and that class can require additional state.
-- **Fix**: `BaseSample` now declares an empty `reconstruction_required_fields` contract, `OrderedReferenceConditionSample` adds `reference_manifest`, and `RewardProcessor` unions that contract into its distributed gather fields without forwarding it to the reward call.
+- **Fix**: `BaseSample` now declares an empty `reconstruction_required_fields` contract,
+  `OrderedReferenceConditionSample` adds `reference_manifest`, and `gather_samples` automatically
+  unions that contract at the concrete reconstruction boundary. Reward callers therefore transport
+  constructor state without forwarding it to the reward call or duplicating gather policy.
 - **Lesson**: Communication payload requirements and reward-call requirements are distinct contracts; partial gathers must preserve constructor invariants even for fields that downstream computation does not consume.
 - **Related Constraint**: N/A
 
