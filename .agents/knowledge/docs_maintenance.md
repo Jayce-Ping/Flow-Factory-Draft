@@ -9,8 +9,8 @@
 The knowledge system uses a 3-layer design with bidirectional cross-references:
 
 ```
-Root:    AGENTS.md                          — project identity, behavioral principles (one-liners)
-Tier 1:  philosophy.md, constraints.md,     — core thesis + concise indexes (always read)
+Root:    AGENTS.md                          — project identity and universal operating guide
+Tier 1:  philosophy.md, constraints.md,     — always-read current authority + concise indexes
          architecture.md
 Routing: README.md                          — trigger-based table from Tier 1 to Tier 2
 Leaves:  topics/*.md                        — self-contained detail (read when triggered)
@@ -19,7 +19,13 @@ Skills:  skills/*/SKILL.md                  — workflows with downward refs to 
 
 ## Node Roles
 
-**Non-leaf** (root + Tier 1): State core thesis in 1-3 lines, then index to leaf docs via tables or pointers. No inline explanations, no code examples, no checklists — those belong in leaves.
+**Non-leaf** (root + Tier 1): Keep universal operating rules and current architecture summaries
+concise, then route specialized detail to leaves. `AGENTS.md` may retain universal commands and the
+commit workflow; `constraints.md` may include the minimum rationale needed to make a hard rule
+enforceable; `architecture.md` may retain the current module graph, registries, extension points,
+and short design summaries. Model-specific recipes, deep implementation walkthroughs, new
+chronological fix records, and specialized checklists belong in leaves. Do not add Tier-1 detail
+when a leaf pointer is sufficient.
 
 **Leaf** (`topics/*.md`): Self-contained, concise, essential knowledge. Include code refs, checklists, numbered gotchas. No filler prose, no introductory fluff, no restating what parent docs already say. Format examples: `adapter_conventions.md`, `train_inference_consistency.md`.
 

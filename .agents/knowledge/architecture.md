@@ -89,12 +89,14 @@ All four registries map string keys → lazy import paths. Resolution: registry 
 | `nft` | `DiffusionNFTTrainer` | Decoupled | `BaseTrainer` |
 | `awm` | `AWMTrainer` | Decoupled | `BaseTrainer` |
 | `crd` | `CRDTrainer` | Decoupled | `BaseTrainer` |
-| `diffusion-opd` | `DiffusionOPDTrainer` | Distillation (on-policy) | `BaseTrainer` |
-| `dmd2` | `DMD2Trainer` | Distillation | `BaseTrainer` |
-| `tdm` | `TDMTrainer` | Distillation | `BaseTrainer` |
-| `tdm-r1` | `TDMR1Trainer` | Distillation + reward | `BaseTrainer` |
+| `diffusion-opd` | `DiffusionOPDTrainer` | Distillation, generation + no feedback | `BaseTrainer` |
+| `dmd2` | `DMD2Trainer` | Distillation, generation + no feedback, ODE | `BaseTrainer` |
+| `tdm` | `TDMTrainer` | Distillation, generation + no feedback, ODE | `BaseTrainer` |
+| `tdm-r1` | `TDMR1Trainer` | Decoupled, generation + runtime reward, ODE | `TDMTrainer` |
 
-**Flat hierarchy**: New trainers inherit from `BaseTrainer` directly. The sanctioned exceptions are `GRPOGuardTrainer → GRPOTrainer` and `DPPOTrainer → GRPOTrainer` (strict GRPO loss variants; see constraint #11).
+**Flat hierarchy**: New trainers inherit from `BaseTrainer` directly. The sanctioned existing
+extensions are `GRPOGuardTrainer → GRPOTrainer`, `DPPOTrainer → GRPOTrainer`, and
+`TDMR1Trainer → TDMTrainer`; see constraint #11.
 
 **Model Adapters** (`models/registry.py`):
 | Key | Class | Task |
@@ -288,13 +290,13 @@ Details: `topics/component_variants.md`.
 
 ### Reward Processing
 `RewardProcessor` dispatches by model type:
-- **Pointwise**: batch by `batch_size`
+- **Pointwise**: applicable sub-batches of at most `batch_size`
 - **Groupwise**: group by `unique_id` (local or distributed path)
 - **Multi-reward**: weighted aggregation
 - **Async**: optional non-blocking computation
 
 ### Advantage Computation
-`AdvantageProcessor` (`advantage/advantage_processor.py`): communication-aware, auto-selects gather vs local path. Strategies: `"sum"` (GRPO) and `"gdpo"`. All reward-based trainers delegate to `self.advantage_processor.compute_advantages()`; the distillation trainer `diffusion-opd` is the exception (its `prepare_feedback()` is a no-op — no reward/advantage stage).
+`AdvantageProcessor` (`advantage/advantage_processor.py`): communication-aware, auto-selects gather vs local path. Strategies: `"sum"` (GRPO) and `"gdpo"`. Runtime-reward trainers delegate to `self.advantage_processor.compute_advantages()`. Feedback-`none` trainers (`diffusion-opd`, DMD2, and TDM) bypass reward and advantage stages structurally.
 
 ### Configuration Hierarchy
 ```

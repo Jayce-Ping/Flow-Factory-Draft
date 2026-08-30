@@ -241,5 +241,6 @@ LTX2 packs `[video|audio]` into one `(B, Seq, C)` sequence, so it resolves as PA
 
 ## Cross-refs
 
-- UP: `architecture.md` "Adapter Pattern", `constraints.md` #5 #11-12
-- PEER: `train_inference_consistency.md`, `parity_testing.md`, `ff-new-model` Pitfall #6
+- UP: [`constraints.md` #5](../constraints.md#5-adapter-component-runtime-contract), [`constraints.md` #11](../constraints.md#11-basetrainer-execution-contract), [`constraints.md` #12](../constraints.md#12-baseadapter-abstract-methods), [Architecture Adapter Pattern](../architecture.md#adapter-pattern-models)
+- PEER: [Train/Inference Consistency](train_inference_consistency.md), [Parity Testing](parity_testing.md)
+- WORKFLOW: [`ff-new-model`](../../skills/ff-new-model/SKILL.md)

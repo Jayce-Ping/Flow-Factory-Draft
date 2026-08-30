@@ -742,6 +742,5 @@ Based on the fix type, write the fix entry to the appropriate document:
 
 ## Cross-refs
 
-- `constraints.md` (archival target for constraint violations)
-- `architecture.md` (archival target for data-flow misunderstandings)
-- `ff-debug/SKILL.md` Phase 5 (knowledge capture workflow)
+- UP: [Hard Constraints](../constraints.md), [Architecture](../architecture.md)
+- WORKFLOW: [`ff-debug` Phase 5](../../skills/ff-debug/SKILL.md#5-capture-the-fix)

@@ -67,6 +67,5 @@ If rollout and training `forward()` diverge, `ratio` deviates from 1.0 at epoch 
 
 ## Cross-refs
 
-- `constraints.md` #7 (coupled/decoupled paradigm)
-- `dtype_precision.md` (precision boundaries, cast_latents)
-- `adapter_conventions.md` (inference/forward identity rule)
+- UP: [`constraints.md` #7](../constraints.md#7-coupled-vs-decoupled-paradigm), [Architecture Execution Pipelines](../architecture.md#execution-pipelines)
+- PEER: [Dtype and Precision](dtype_precision.md), [Adapter Conventions](adapter_conventions.md)

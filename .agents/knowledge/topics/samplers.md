@@ -332,6 +332,4 @@ data:
 
 ## Cross-refs
 
-- `constraints.md` #9, #9a (accelerator prepare scope, sampler geometric constraints)
-- `architecture.md` "Execution Pipelines" (generation acquisition)
-- `architecture.md` "Advantage Computation" (communication path depends on sampler type)
+- UP: [`constraints.md` #9](../constraints.md#9-accelerator-prepare-scope), [`constraints.md` #9a](../constraints.md#9a-sampler-geometric-constraints), [Architecture Execution Pipelines](../architecture.md#execution-pipelines), [Architecture Advantage Computation](../architecture.md#advantage-computation)

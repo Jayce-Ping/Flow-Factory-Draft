@@ -12,7 +12,11 @@ These constraints MUST NOT be violated. Consult this file before making any code
 The four registries (`_TRAINER_REGISTRY`, `_MODEL_ADAPTER_REGISTRY`, `_REWARD_MODEL_REGISTRY`, `_ACCELERATOR_REGISTRY`) map string identifiers to **fully qualified Python class paths** for lazy import. If you move, rename, or restructure a class, the corresponding registry entry MUST be updated, or `ImportError` will occur at runtime.
 
 ### 2. Registry Identifier Convention
-Registry keys are **case-insensitive** (lowered at lookup). Model adapter keys use lowercase with hyphens (e.g., `flux1-kontext`). Trainer keys use lowercase (e.g., `grpo-guard`). Reward keys use lowercase (e.g., `pickscore`). New entries must follow the same convention.
+Registry keys are **case-insensitive** (lowered at lookup). Preserve the canonical registered
+spelling: most model adapter keys use lowercase with hyphens (for example `flux1-kontext`), while
+the public Wan/LTX2 keys retain underscores (for example `wan2_t2v` and `ltx2_t2av`). Trainer and
+reward keys use lowercase (for example `grpo-guard` and `pickscore`). New entries must choose one
+canonical lowercase spelling and use it consistently across registries, arguments, and examples.
 
 ### 3. Dynamic Import Fallback
 All four registries support a **direct Python path** fallback (e.g., `my_package.models.CustomAdapter`). If an identifier is not found in the registry, it is treated as a fully qualified import path. Do not break this two-mode resolution logic.
@@ -47,8 +51,8 @@ either axis from batch fields or make it user-configurable independently of `tra
 
 ### 7. Coupled vs Decoupled Paradigm
 - **Coupled** (GRPO, GRPO-Guard, DPPO): Training timesteps are coupled with SDE-based sampling. Requires log-probability computation. Must use SDE dynamics (`Flow-SDE`, `Dance-SDE`, `CPS`).
-- **Decoupled** (SFT, offline DPO, online DPO, NFT, AWM, DGPO, CRD): Training timesteps are decoupled from sampling. Can use any dynamics including `ODE`.
-- **Distillation** (`diffusion-opd`): On-policy multi-teacher distillation; dynamics-agnostic (ODE or SDE) and has no reward/advantage stage.
+- **Decoupled** (SFT, offline DPO, online DPO, NFT, AWM, DGPO, CRD, TDM-R1): Training timesteps are decoupled from sampling. They may use ODE subject to algorithm-specific rules; TDM-R1 requires ODE.
+- **Distillation** (`diffusion-opd`, DMD2, TDM): Generated acquisition with no runtime reward/advantage stage. DiffusionOPD supports ODE or SDE; DMD2 and TDM require ODE.
 
 Mixing paradigms (e.g., using `ODE` dynamics with `GRPO`) will produce incorrect gradients silently.
 
@@ -75,7 +79,7 @@ offline epoch means one complete traversal of that resulting finite loader.
 Checkpoints are written and read for **trainable members only** — components whose `target_module_map[name]` is non-empty (`adapter.trainable_component_names`). Frozen-but-shardable bundle members (e.g. Wan2.2's `transformer_2`, kept in `target_components` only to be FSDP-sharded for memory; see #9) map to `None` and are skipped by both `save_checkpoint` and `_load_lora`/`_load_full_model`. Loaders MUST iterate `trainable_component_names`, not `target_components`, or resume logs a spurious error for a per-component subdir that was never written. `resume_type='state'` restores via `accelerator.load_state` into the prepared bundle root and is therefore keyed to bundle membership — resuming into a different `target_components` / bundle composition will mismatch.
 
 ### 10. DeepSpeed ZeRO-3 Is Unsupported
-Supported distributed plans are DDP, FSDP, and DeepSpeed ZeRO-1/2. Reward model sharding under ZeRO-3 is broken even with DeepSpeed's own `zero.GatheredParameters` context manager, and parameter sharding also breaks frozen-component synchronization. `validate_supported_distributed_plan` (`trainers/abc.py`) rejects it at `BaseTrainer.__init__`, before any weights load, and `config/deepspeed/` ships no ZeRO-3 profile. Multi-role training narrows this further: `_validate_multirole_backend` requires ZeRO-1/2 and, under FSDP2, `use_orig_params=True`.
+Supported distributed plans are DDP, FSDP, and DeepSpeed ZeRO-1/2. Reward model sharding under ZeRO-3 is broken even with DeepSpeed's own `zero.GatheredParameters` context manager, and parameter sharding also breaks frozen-component synchronization. `validate_supported_distributed_plan` is defined in `trainers/multirole/backend.py`; `trainers/loader.py` calls it before model construction, while `BaseTrainer.__init__` repeats the check defensively. `config/deepspeed/` ships no ZeRO-3 profile. Multi-role training narrows this further: `_validate_multirole_backend` requires ZeRO-1/2 and, under FSDP2, `use_orig_params=True`. Muon narrows the plan independently to DDP/FSDP2 and requires a build exposing `torch.optim.Muon`; `validate_optimizer_backend_plan` rejects DeepSpeed, FSDP1, and an unavailable Muon API before weights load.
 
 ---
 
@@ -94,7 +98,14 @@ preparation, rewards, and advantage processing.
 `optimize_batch()`. Online `DPOTrainer` forms pairs at `optimize()` entry. Offline DPO consumes
 dataset pairs directly.
 
-**Trainer hierarchy**: New trainers MUST inherit directly from `BaseTrainer`. The only sanctioned exceptions are strict behavioral variants of GRPO that change only the per-step loss while reusing GRPO's sampling/advantage/eval machinery: `GRPOGuardTrainer → GRPOTrainer` (adds ratio-normalization) and `DPPOTrainer → GRPOTrainer` (replaces the PPO ratio-clip with a KL trust-region mask). Trainer-to-trainer inheritance creates fragile coupling; when in doubt, inherit from `BaseTrainer` and extract shared logic into helper methods. All reward-based trainers delegate advantage computation to `self.advantage_processor.compute_advantages()`; the distillation trainer `diffusion-opd` is the exception (its `prepare_feedback()` is a no-op with no reward/advantage stage).
+**Trainer hierarchy**: New trainers MUST inherit directly from `BaseTrainer`. The sanctioned
+existing behavioral extensions are `GRPOGuardTrainer → GRPOTrainer`, `DPPOTrainer → GRPOTrainer`,
+and `TDMR1Trainer → TDMTrainer`; TDM-R1 reuses TDM's deterministic trajectory and multi-role
+runtime while restoring runtime reward feedback. Trainer-to-trainer inheritance creates fragile
+coupling; when in doubt, inherit from `BaseTrainer` and extract shared logic into helper methods.
+Every runtime-reward trainer delegates advantage computation to `AdvantageProcessor`. Trainers
+with feedback `none` (`diffusion-opd`, DMD2, and TDM) bypass reward/advantage structurally; their
+no-op `prepare_feedback()` overrides are compatibility shims, not the execution mechanism.
 
 ### 12. BaseAdapter Abstract Methods
 Subclasses of `BaseAdapter` MUST implement these **4 abstract methods**:
@@ -123,13 +134,19 @@ policy stays explicit at their semantic boundaries. Unsupported adapters declare
 **Adapter hierarchy**: All model adapters MUST inherit directly from `BaseAdapter` — never from another adapter. Shared logic between adapters for the same model family should use private helper functions, code duplication, or mixins — not adapter-to-adapter inheritance. Adapter subclassing creates fragile coupling where changes to a parent adapter silently break child adapters, and makes the 4-abstract-method contract harder to verify (the 4 per-modality encoders have no-op defaults, so a fresh subclass of `BaseAdapter` is always valid; chained inheritance hides which encoder a model actually overrides).
 
 ### 13. BaseRewardModel Paradigm Split
-- `PointwiseRewardModel.__call__` receives batches of size `batch_size`, returns rewards of shape `(batch_size,)`
-- `GroupwiseRewardModel.__call__` receives all samples in a group (size `group_size`), returns rewards of shape `(group_size,)`
+- `PointwiseRewardModel.__call__` receives an applicable sub-batch of at most configured
+  `batch_size` and returns one reward per received sample.
+- `GroupwiseRewardModel.__call__` receives one complete applicable `unique_id` group and returns
+  one reward per group member in input order.
 
 The `RewardProcessor` dispatches differently based on the model type. Do not change the calling convention.
 
 ### 14. Sample Dataclass Hierarchy
 `BaseSample` → `T2ISample`, `ImageConditionSample`, `T2VSample`, `T2AVSample`, etc. The `_shared_fields` class variable determines which fields are NOT stacked across a batch. Incorrect `_shared_fields` causes silent data corruption during collation.
+
+`reconstruction_required_fields` separately names fields required to instantiate a concrete sample
+after a partial distributed gather, even when the downstream consumer did not request them. See
+[`topics/sample_lifecycle.md`](topics/sample_lifecycle.md#partial-gather-reconstruction).
 
 **Two-layer hierarchy**: Task-level samples (`T2ISample`, `I2VSample`, `I2AVSample`, ...) are defined in `samples/samples.py` and inherit from `BaseSample` or its condition mixins (`ImageConditionSample`, `VideoConditionSample`). Model-specific samples (`LTX2Sample`, `LTX2I2AVSample`, ...) MUST inherit from the appropriate task-level sample — never from another model-specific sample across files. This mirrors the flat adapter hierarchy: `LTX2I2AVSample(I2AVSample)`, NOT `LTX2I2AVSample(LTX2Sample)`.
 

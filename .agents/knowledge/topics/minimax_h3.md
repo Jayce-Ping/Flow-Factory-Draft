@@ -143,11 +143,13 @@ element-weighted reducer.
 ## Verification boundary
 
 All workflows have pinned API/schema/no-weight verification and local offline codec/forward
-coverage. T2VA additionally completed
-real-weight LoRA rollout, decode, reward, replay, backward, checkpoint, and resume tests on one
-GPU and with FSDP2 on 16 GPUs. The native-resolution path completed initialization, checkpoint,
-decode, and evaluation. FL2VA/Ref2VA SFT and offline DPO still require the documented real-weight
-GPU matrix. Do not claim long-run reward improvement, convergence, or numerical parity.
+coverage. T2VA additionally completed real-weight LoRA rollout, decode, reward, replay, backward,
+checkpoint, and resume tests on one GPU and with FSDP2 on 16 GPUs. The native-resolution path
+completed initialization, checkpoint, decode, and evaluation. The
+[PR #220 matrix](../../../guidance/gpu_validation.md#pr-220-result) then completed all 36 H3
+real-weight smoke cells: T2VA, FL2VA, and Ref2VA across DDP/DeepSpeed ZeRO-2/FSDP2 and
+GRPO/SFT/offline DPO/TDM. The FL2VA first-plus-last SFT/offline-DPO variant gate also passed. Do
+not claim long-run reward improvement, convergence, quality parity, or numerical parity.
 
 ## Upgrade checklist
 
@@ -157,9 +159,10 @@ GPU matrix. Do not claim long-run reward improvement, convergence, or numerical 
 - [ ] Run H3 scheduler/runtime/registry/reference tests in the pinned environment.
 - [ ] Parse all H3 examples through `Arguments.load_from_yaml`.
 - [ ] Run the T2VA output-codec and common SFT/offline-DPO structured-state tests.
-- [ ] Rerun the documented T2VA real-weight smoke before changing support or memory claims.
+- [ ] Rerun the affected H3 cells in the documented real-weight matrix before changing support or
+      memory claims.
 
 ## Cross-refs
 
-- UP: [`constraints.md` #5](../constraints.md#5-adapter-component-runtime-contract), [`constraints.md` #14](../constraints.md#14-sample-dataclass-hierarchy), [`architecture.md` MiniMax H3](../architecture.md#minimax-h3)
+- UP: [`constraints.md` #5](../constraints.md#5-adapter-component-runtime-contract), [`constraints.md` #14](../constraints.md#14-sample-dataclass-hierarchy), [`architecture.md` registered components](../architecture.md#registered-components)
 - PEER: [Component Runtime](component_runtime.md), [Structured Trajectory](structured_trajectory.md), [Parity Testing](parity_testing.md)

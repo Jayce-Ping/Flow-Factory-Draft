@@ -44,6 +44,5 @@ Throughout the codebase, two related but distinct scales are used for time:
 
 ## Cross-refs
 
-- `constraints.md` #7 (coupled/decoupled paradigm — affects which timestep sampling is valid)
-- `topics/train_inference_consistency.md` (same `t` must produce same output in rollout vs training)
-- `topics/adapter_conventions.md` (adapter encapsulates timestep-to-model conversion)
+- UP: [`constraints.md` #7](../constraints.md#7-coupled-vs-decoupled-paradigm), [Architecture Timestep and Sigma Convention](../architecture.md#timestep--sigma-convention)
+- PEER: [Train/Inference Consistency](train_inference_consistency.md), [Adapter Conventions](adapter_conventions.md)
