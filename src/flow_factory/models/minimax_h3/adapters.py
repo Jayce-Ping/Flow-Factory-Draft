@@ -37,6 +37,7 @@ from ...samples import (
     StackedSampleBatch,
 )
 from ...scheduler import MiniMaxH3SDEScheduler, SchedulerGroup
+from ...utils.logger_utils import setup_logger
 from ..abc import BaseAdapter
 from ..checkpointing import CheckpointUnit
 from ..output_state import DecodedMediaBatch, EncodedOutputState, OutputStateCodec
@@ -46,6 +47,10 @@ from ..pipeline_contracts import (
     audio_video_output_contract,
 )
 from ..runtime import ModularPipelineRuntime
+from ._chunking import (
+    H3_MAX_LORA_PROJECTION_TOKENS,
+    install_h3_lora_projection_chunking,
+)
 from ._common import apply_forward_process_noise, draw_forward_process_noise
 from ._condition import MiniMaxH3ConditionStatePreparer
 from ._output import MiniMaxH3AVOutputCodec, validate_h3_encoded_output_geometry
@@ -65,6 +70,7 @@ from .workflow import (
 
 _H3_PREPROCESS_CACHE_FIELDS = frozenset({"height", "width", "num_frames"})
 _H3_PREPROCESS_CACHE_VERSION = "minimax-h3-v2"
+logger = setup_logger(__name__)
 _H3_OPTIONAL_AUDIO_REFERENCE_FORMAT = MediaFormat(
     type=MediaType.AUDIO,
     fps=RateRequirement.NOT_APPLICABLE,
@@ -375,3 +381,45 @@ class MiniMaxH3Ref2VAAdapter(_MiniMaxH3WorkflowAdapter, BaseAdapter):
         "video_processor",
         "audio_vae",
     ]
+
+    def apply_lora(
+        self,
+        target_modules: Union[str, List[str]],
+        components: Union[str, List[str]] = "transformer",
+        overwrite: bool = False,
+    ) -> Any:
+        """Apply PEFT and bound Ref2VA projection memory under FSDP2."""
+        component_names = (components,) if isinstance(components, str) else tuple(components)
+        result = super().apply_lora(
+            target_modules=target_modules,
+            components=components,
+            overwrite=overwrite,
+        )
+        if (
+            not result
+            or not self._is_fsdp2()
+            or self.transformer_component_name not in component_names
+        ):
+            return result
+
+        component = self.get_component(self.transformer_component_name)
+        get_base_model = getattr(component, "get_base_model", None)
+        if not callable(get_base_model):
+            raise TypeError(
+                "MiniMax H3 Ref2VA FSDP2 LoRA chunking expected a PEFT component "
+                f"with get_base_model(), received {type(component).__name__}"
+            )
+        transformer = get_base_model()
+        if not isinstance(transformer, torch.nn.Module):
+            raise TypeError(
+                "MiniMax H3 Ref2VA FSDP2 LoRA chunking expected an nn.Module base, "
+                f"received {type(transformer).__name__}"
+            )
+        configured = install_h3_lora_projection_chunking(transformer)
+        logger.info(
+            "Enabled token-chunked PEFT projections for MiniMax H3 Ref2VA FSDP2: "
+            "configured=%d, max_tokens=%d",
+            configured,
+            H3_MAX_LORA_PROJECTION_TOKENS,
+        )
+        return result

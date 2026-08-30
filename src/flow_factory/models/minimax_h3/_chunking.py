@@ -19,11 +19,13 @@ from __future__ import annotations
 from typing import Iterable
 
 import torch
+from peft.tuners.lora.layer import Linear as LoraLinear
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 H3_MAX_FEED_FORWARD_TOKENS = 1024
 H3_MAX_ATTENTION_NORM_TOKENS = 1024
+H3_MAX_LORA_PROJECTION_TOKENS = 1024
 
 
 class _ChunkedFeedForward(nn.Module):
@@ -105,6 +107,42 @@ class _ChunkedRMSNorm(nn.RMSNorm):
             [self._forward_chunk(chunk) for chunk in hidden_states.split(self.max_tokens, dim=1)],
             dim=1,
         )
+
+
+class _ChunkedLoraLinear(LoraLinear):
+    """Bound PEFT projection temporaries without replacing its module or state tree."""
+
+    flow_factory_max_tokens: int
+
+    def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        """Run the complete PEFT linear contract over sequence chunks."""
+        if kwargs.get("alora_offsets") is not None:
+            raise ValueError("MiniMax H3 LoRA projection chunking does not support aLoRA offsets")
+        max_tokens = self.flow_factory_max_tokens
+        if hidden_states.ndim < 3 or hidden_states.shape[1] <= max_tokens:
+            return super().forward(hidden_states, *args, **kwargs)
+
+        forward_chunk = super().forward
+        output = None
+        offset = 0
+        for chunk in hidden_states.split(max_tokens, dim=1):
+            chunk_output = forward_chunk(chunk, *args, **kwargs)
+            if chunk_output.shape[:-1] != chunk.shape[:-1]:
+                raise RuntimeError(
+                    "MiniMax H3 LoRA projection must preserve input prefix dimensions, "
+                    f"received input={tuple(chunk.shape)}, output={tuple(chunk_output.shape)}"
+                )
+            if output is None:
+                output = chunk_output.new_empty((*hidden_states.shape[:-1], chunk_output.shape[-1]))
+            output.narrow(1, offset, chunk_output.shape[1]).copy_(chunk_output)
+            offset += chunk_output.shape[1]
+
+        if output is None or offset != hidden_states.shape[1]:
+            raise RuntimeError(
+                "MiniMax H3 LoRA projection failed to assemble every input token, "
+                f"received input_tokens={hidden_states.shape[1]}, output_tokens={offset}"
+            )
+        return output
 
 
 def install_h3_feed_forward_chunking(
@@ -213,6 +251,98 @@ def install_h3_attention_norm_chunking(
             replacement = _ChunkedRMSNorm(norm, max_tokens=max_tokens)
             replacement.train(norm.training)
             setattr(attention, norm_name, replacement)
+            configured += 1
+    return configured
+
+
+def install_h3_lora_projection_chunking(
+    transformer: nn.Module,
+    *,
+    max_tokens: int = H3_MAX_LORA_PROJECTION_TOKENS,
+) -> int:
+    """Bound adapted H3 attention projections while preserving PEFT ownership.
+
+    The installer runs after PEFT injection and before distributed preparation. It
+    changes only the Python forward implementation on each existing PEFT Linear;
+    parameters, children, hooks, and state-dict paths remain owned by that same
+    module object.
+
+    Returns:
+        Number of adapted Q/K/V/output projections configured across both stacks.
+    """
+    max_tokens = _positive_int(max_tokens, "max_tokens")
+    configured = 0
+    for block_name, block in _h3_repeated_blocks(transformer):
+        attention = getattr(block, "attn", None)
+        if not isinstance(attention, nn.Module):
+            raise TypeError(
+                f"MiniMax H3 {block_name}.attn expected nn.Module, received "
+                f"{type(attention).__name__}"
+            )
+        if getattr(attention, "fused_projections", False):
+            raise TypeError(
+                f"MiniMax H3 {block_name}.attn must install LoRA chunking before "
+                "fusing its projections"
+            )
+        to_out = getattr(attention, "to_out", None)
+        if not isinstance(to_out, nn.ModuleList) or len(to_out) != 2:
+            raise TypeError(
+                f"MiniMax H3 {block_name}.attn.to_out expected two-entry ModuleList, "
+                f"received {type(to_out).__name__}"
+            )
+        projections = (
+            ("to_q", getattr(attention, "to_q", None)),
+            ("to_k", getattr(attention, "to_k", None)),
+            ("to_v", getattr(attention, "to_v", None)),
+            ("to_out.0", to_out[0]),
+        )
+        for projection_name, projection in projections:
+            path = f"{block_name}.attn.{projection_name}"
+            if isinstance(projection, _ChunkedLoraLinear):
+                if projection.flow_factory_max_tokens != max_tokens:
+                    raise ValueError(
+                        f"MiniMax H3 {path} already uses max_tokens="
+                        f"{projection.flow_factory_max_tokens}, received conflicting "
+                        f"{max_tokens}"
+                    )
+                configured += 1
+                continue
+            if not isinstance(projection, LoraLinear):
+                continue
+            if type(projection) is not LoraLinear:
+                raise TypeError(
+                    f"MiniMax H3 {path} expected the standard PEFT Linear before "
+                    f"chunking, received {type(projection).__name__}"
+                )
+            if "forward" in projection.__dict__:
+                raise TypeError(
+                    f"MiniMax H3 {path} must not shadow PEFT Linear.forward on the instance"
+                )
+            if getattr(projection, "_compiled_call_impl", None) is not None:
+                raise TypeError(
+                    f"MiniMax H3 {path} must install LoRA chunking before torch.compile"
+                )
+            if type(getattr(projection, "base_layer", None)) is not nn.Linear:
+                raise TypeError(
+                    f"MiniMax H3 {path} expected an exact nn.Linear base layer, received "
+                    f"{type(getattr(projection, 'base_layer', None)).__name__}"
+                )
+            if any(getattr(projection, "use_dora", {}).values()):
+                raise TypeError(f"MiniMax H3 {path} LoRA chunking does not support DoRA")
+            if getattr(projection, "lora_variant", {}):
+                raise TypeError(f"MiniMax H3 {path} LoRA chunking supports only vanilla LoRA")
+            for adapter_name, dropout in projection.lora_dropout.items():
+                if isinstance(dropout, nn.Identity) or (
+                    isinstance(dropout, nn.Dropout) and dropout.p == 0.0
+                ):
+                    continue
+                raise TypeError(
+                    f"MiniMax H3 {path} LoRA chunking requires zero dropout, received "
+                    f"adapter={adapter_name!r}, dropout={dropout!r}"
+                )
+            _reject_execution_hooks(projection, path)
+            projection.__class__ = _ChunkedLoraLinear
+            projection.flow_factory_max_tokens = max_tokens
             configured += 1
     return configured
 

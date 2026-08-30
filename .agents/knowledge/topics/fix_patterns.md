@@ -593,6 +593,22 @@ Based on the fix type, write the fix entry to the appropriate document:
   allocator flushes or weakening model semantics.
 - **Related Constraint**: N/A
 
+### PEFT projections should not materialize a full-sequence LoRA branch
+- **Date**: 2026-08-31
+- **Symptom**: MiniMax H3 Ref2VA FSDP2 GRPO passed every parameter all-gather but exhausted a
+  95 GiB device when one adapted K projection requested a 190 MiB LoRA output with only
+  114--134 MiB free.
+- **Root Cause**: PEFT evaluated the base projection and low-rank branch over the complete 13,889-token
+  packed sequence before adding them, so two full projection outputs overlapped at the memory peak.
+- **Fix**: Ref2VA FSDP2 changes each existing adapted Q/K/V/output PEFT Linear to a token-chunked
+  forward after LoRA injection. The complete PEFT contract runs per chunk and writes directly into
+  one preallocated final output, preserving module and parameter identities, hooks, adapter behavior,
+  and state-dict paths without a full-size concatenation copy.
+- **Lesson**: Bound parameter-efficient adaptation at the outer adapted-module boundary. Chunking only
+  the frozen base layer leaves the adapter branch unbounded, while concatenating chunk outputs can
+  recreate the same peak through an avoidable second full-size result.
+- **Related Constraint**: N/A
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

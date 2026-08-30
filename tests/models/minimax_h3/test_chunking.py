@@ -16,15 +16,18 @@ from copy import deepcopy
 
 import pytest
 import torch
+from peft import LoraConfig, get_peft_model
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from flow_factory.models.minimax_h3._chunking import (
     _ChunkedFeedForward,
+    _ChunkedLoraLinear,
     _ChunkedRMSNorm,
     install_h3_attention_norm_chunking,
     install_h3_feed_forward_chunking,
+    install_h3_lora_projection_chunking,
 )
 
 
@@ -60,8 +63,12 @@ class BlockFake(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.attn = nn.Module()
+        self.attn.to_q = nn.Linear(5, 5, bias=False)
+        self.attn.to_k = nn.Linear(5, 5, bias=False)
+        self.attn.to_v = nn.Linear(5, 5, bias=False)
         self.attn.norm_q = nn.RMSNorm(5)
         self.attn.norm_k = nn.RMSNorm(5)
+        self.attn.to_out = nn.ModuleList([nn.Linear(5, 5, bias=False), nn.Dropout(0.0)])
         self.ff = FeedForwardFake()
 
 
@@ -78,6 +85,23 @@ def _feed_forwards(transformer: TransformerFake) -> list[nn.Module]:
         *[block.ff for block in transformer.token_refiner.refiner_blocks],
         *[block.ff for block in transformer.transformer_blocks],
     ]
+
+
+def _lora_transformer(*, lora_dropout: float = 0.0) -> nn.Module:
+    model = get_peft_model(
+        TransformerFake(),
+        LoraConfig(
+            r=2,
+            lora_alpha=4,
+            target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+            init_lora_weights="gaussian",
+            lora_dropout=lora_dropout,
+        ),
+    )
+    for module in model.modules():
+        if hasattr(module, "lora_B") and "default" in module.lora_B:
+            nn.init.normal_(module.lora_B["default"].weight)
+    return model
 
 
 def test_chunking_preserves_parameter_tree_and_is_idempotent() -> None:
@@ -326,3 +350,123 @@ def test_attention_norm_chunking_rejects_conflicting_reinstallation() -> None:
 
     with pytest.raises(ValueError, match="already uses max_tokens=4.*conflicting 8"):
         install_h3_attention_norm_chunking(transformer, max_tokens=8)
+
+
+def test_lora_projection_chunking_preserves_peft_tree_and_is_idempotent() -> None:
+    model = _lora_transformer()
+    transformer = model.get_base_model()
+    state = deepcopy(model.state_dict())
+    keys_before = tuple(state)
+    parameter_ids_before = {name: id(parameter) for name, parameter in model.named_parameters()}
+
+    assert install_h3_lora_projection_chunking(transformer, max_tokens=4) == 20
+    assert install_h3_lora_projection_chunking(transformer, max_tokens=4) == 20
+
+    projections = [
+        projection
+        for block in (
+            *transformer.token_refiner.refiner_blocks,
+            *transformer.transformer_blocks,
+        )
+        for projection in (
+            block.attn.to_q,
+            block.attn.to_k,
+            block.attn.to_v,
+            block.attn.to_out[0],
+        )
+    ]
+    assert all(isinstance(projection, _ChunkedLoraLinear) for projection in projections)
+    assert tuple(model.state_dict()) == keys_before
+    assert {
+        name: id(parameter) for name, parameter in model.named_parameters()
+    } == parameter_ids_before
+    model.load_state_dict(state, strict=True)
+
+
+def test_lora_projection_chunking_preserves_remainder_forward_backward() -> None:
+    torch.manual_seed(29)
+    direct_model = _lora_transformer().double()
+    chunked_model = deepcopy(direct_model)
+    chunked_transformer = chunked_model.get_base_model()
+    install_h3_lora_projection_chunking(chunked_transformer, max_tokens=4)
+    direct = direct_model.get_base_model().transformer_blocks[0].attn.to_k
+    chunked = chunked_transformer.transformer_blocks[0].attn.to_k
+    chunk_sizes: list[int] = []
+    handle = chunked.base_layer.register_forward_pre_hook(
+        lambda _module, inputs: chunk_sizes.append(inputs[0].shape[1])
+    )
+    direct_input = torch.randn(2, 9, 5, dtype=torch.float64, requires_grad=True)
+    chunked_input = direct_input.detach().clone().requires_grad_(True)
+    output_gradient = torch.randn(2, 9, 5, dtype=torch.float64)
+
+    direct_output = direct(direct_input)
+    chunked_output = chunked(chunked_input)
+    direct_output.backward(output_gradient)
+    chunked_output.backward(output_gradient)
+    handle.remove()
+
+    assert chunk_sizes == [4, 4, 1]
+    torch.testing.assert_close(chunked_output, direct_output)
+    torch.testing.assert_close(chunked_input.grad, direct_input.grad)
+    for direct_parameter, chunked_parameter in zip(direct.parameters(), chunked.parameters()):
+        torch.testing.assert_close(chunked_parameter.grad, direct_parameter.grad)
+
+
+def test_lora_projection_chunking_preserves_mixed_batch_adapter_names() -> None:
+    direct_model = _lora_transformer()
+    chunked_model = deepcopy(direct_model)
+    install_h3_lora_projection_chunking(chunked_model.get_base_model(), max_tokens=4)
+    direct = direct_model.get_base_model().transformer_blocks[0].attn.to_v
+    chunked = chunked_model.get_base_model().transformer_blocks[0].attn.to_v
+    hidden_states = torch.randn(2, 9, 5)
+    adapter_names = ["default", "__base__"]
+
+    direct_output = direct(hidden_states, adapter_names=adapter_names)
+    chunked_output = chunked(hidden_states, adapter_names=adapter_names)
+
+    torch.testing.assert_close(chunked_output, direct_output)
+
+
+def test_lora_projection_chunking_rejects_conflicting_reinstallation() -> None:
+    transformer = _lora_transformer().get_base_model()
+    install_h3_lora_projection_chunking(transformer, max_tokens=4)
+
+    with pytest.raises(ValueError, match="already uses max_tokens=4.*conflicting 8"):
+        install_h3_lora_projection_chunking(transformer, max_tokens=8)
+
+
+def test_lora_projection_chunking_rejects_nonzero_dropout() -> None:
+    transformer = _lora_transformer(lora_dropout=0.1).get_base_model()
+
+    with pytest.raises(TypeError, match="requires zero dropout"):
+        install_h3_lora_projection_chunking(transformer, max_tokens=4)
+
+
+def test_lora_projection_chunking_rejects_existing_execution_hooks() -> None:
+    transformer = _lora_transformer().get_base_model()
+    transformer.transformer_blocks[0].attn.to_q.register_forward_pre_hook(
+        lambda _module, _inputs: None
+    )
+
+    with pytest.raises(TypeError, match="must be configured before execution hooks"):
+        install_h3_lora_projection_chunking(transformer, max_tokens=4)
+
+
+def test_lora_projection_chunking_preserves_non_reentrant_checkpoint_backward() -> None:
+    direct_model = _lora_transformer().double()
+    chunked_model = deepcopy(direct_model)
+    install_h3_lora_projection_chunking(chunked_model.get_base_model(), max_tokens=4)
+    direct = direct_model.get_base_model().transformer_blocks[0].attn.to_q
+    chunked = chunked_model.get_base_model().transformer_blocks[0].attn.to_q
+    direct_input = torch.randn(2, 9, 5, dtype=torch.float64, requires_grad=True)
+    chunked_input = direct_input.detach().clone().requires_grad_(True)
+
+    direct_output = direct(direct_input)
+    chunked_output = checkpoint(chunked, chunked_input, use_reentrant=False)
+    direct_output.sum().backward()
+    chunked_output.sum().backward()
+
+    torch.testing.assert_close(chunked_output, direct_output)
+    torch.testing.assert_close(chunked_input.grad, direct_input.grad)
+    for direct_parameter, chunked_parameter in zip(direct.parameters(), chunked.parameters()):
+        torch.testing.assert_close(chunked_parameter.grad, direct_parameter.grad)
