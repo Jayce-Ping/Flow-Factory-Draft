@@ -352,6 +352,25 @@ def test_attention_norm_chunking_rejects_conflicting_reinstallation() -> None:
         install_h3_attention_norm_chunking(transformer, max_tokens=8)
 
 
+def test_chunked_token_local_operations_avoid_full_output_concatenation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transformer = TransformerFake()
+    install_h3_feed_forward_chunking(transformer, max_tokens=4)
+    install_h3_attention_norm_chunking(transformer, max_tokens=4)
+
+    monkeypatch.setattr(
+        torch,
+        "cat",
+        lambda *args, **kwargs: pytest.fail("chunk aggregation must not call torch.cat"),
+    )
+
+    hidden_states = torch.randn(2, 9, 5, requires_grad=True)
+    feed_forward = transformer.transformer_blocks[0].ff(hidden_states)
+    normalized = transformer.transformer_blocks[0].attn.norm_q(hidden_states)
+    (feed_forward + normalized).sum().backward()
+
+
 def test_lora_projection_chunking_preserves_peft_tree_and_is_idempotent() -> None:
     model = _lora_transformer()
     transformer = model.get_base_model()

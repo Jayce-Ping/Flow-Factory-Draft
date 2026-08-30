@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Callable, Iterable
 
 import torch
 from peft.tuners.lora.layer import Linear as LoraLinear
@@ -55,23 +55,23 @@ class _ChunkedFeedForward(nn.Module):
             )
         if hidden_states.shape[1] <= self.max_tokens:
             return self._forward_chunk(hidden_states)
-        chunks = hidden_states.split(self.max_tokens, dim=1)
         if torch.is_grad_enabled():
-            return torch.cat(
-                [
-                    checkpoint(
-                        self._forward_chunk,
-                        chunk,
-                        use_reentrant=False,
-                        preserve_rng_state=True,
-                    )
-                    for chunk in chunks
-                ],
-                dim=1,
+            return _assemble_sequence_chunks(
+                hidden_states,
+                self.max_tokens,
+                lambda chunk: checkpoint(
+                    self._forward_chunk,
+                    chunk,
+                    use_reentrant=False,
+                    preserve_rng_state=True,
+                ),
+                operation="feed-forward",
             )
-        return torch.cat(
-            [self._forward_chunk(chunk) for chunk in chunks],
-            dim=1,
+        return _assemble_sequence_chunks(
+            hidden_states,
+            self.max_tokens,
+            self._forward_chunk,
+            operation="feed-forward",
         )
 
 
@@ -103,9 +103,11 @@ class _ChunkedRMSNorm(nn.RMSNorm):
             )
         if hidden_states.shape[1] <= self.max_tokens:
             return self._forward_chunk(hidden_states)
-        return torch.cat(
-            [self._forward_chunk(chunk) for chunk in hidden_states.split(self.max_tokens, dim=1)],
-            dim=1,
+        return _assemble_sequence_chunks(
+            hidden_states,
+            self.max_tokens,
+            self._forward_chunk,
+            operation="RMSNorm",
         )
 
 
@@ -123,26 +125,42 @@ class _ChunkedLoraLinear(LoraLinear):
             return super().forward(hidden_states, *args, **kwargs)
 
         forward_chunk = super().forward
-        output = None
-        offset = 0
-        for chunk in hidden_states.split(max_tokens, dim=1):
-            chunk_output = forward_chunk(chunk, *args, **kwargs)
-            if chunk_output.shape[:-1] != chunk.shape[:-1]:
-                raise RuntimeError(
-                    "MiniMax H3 LoRA projection must preserve input prefix dimensions, "
-                    f"received input={tuple(chunk.shape)}, output={tuple(chunk_output.shape)}"
-                )
-            if output is None:
-                output = chunk_output.new_empty((*hidden_states.shape[:-1], chunk_output.shape[-1]))
-            output.narrow(1, offset, chunk_output.shape[1]).copy_(chunk_output)
-            offset += chunk_output.shape[1]
+        return _assemble_sequence_chunks(
+            hidden_states,
+            max_tokens,
+            lambda chunk: forward_chunk(chunk, *args, **kwargs),
+            operation="LoRA projection",
+        )
 
-        if output is None or offset != hidden_states.shape[1]:
+
+def _assemble_sequence_chunks(
+    hidden_states: torch.Tensor,
+    max_tokens: int,
+    forward_chunk: Callable[[torch.Tensor], torch.Tensor],
+    *,
+    operation: str,
+) -> torch.Tensor:
+    """Write token-local chunk results into one final allocation."""
+    output = None
+    offset = 0
+    for chunk in hidden_states.split(max_tokens, dim=1):
+        chunk_output = forward_chunk(chunk)
+        if chunk_output.shape[:-1] != chunk.shape[:-1]:
             raise RuntimeError(
-                "MiniMax H3 LoRA projection failed to assemble every input token, "
-                f"received input_tokens={hidden_states.shape[1]}, output_tokens={offset}"
+                f"MiniMax H3 {operation} must preserve input prefix dimensions, "
+                f"received input={tuple(chunk.shape)}, output={tuple(chunk_output.shape)}"
             )
-        return output
+        if output is None:
+            output = chunk_output.new_empty((*hidden_states.shape[:-1], chunk_output.shape[-1]))
+        output.narrow(1, offset, chunk_output.shape[1]).copy_(chunk_output)
+        offset += chunk_output.shape[1]
+
+    if output is None or offset != hidden_states.shape[1]:
+        raise RuntimeError(
+            f"MiniMax H3 {operation} failed to assemble every input token, "
+            f"received input_tokens={hidden_states.shape[1]}, output_tokens={offset}"
+        )
+    return output
 
 
 def install_h3_feed_forward_chunking(

@@ -609,6 +609,20 @@ Based on the fix type, write the fix entry to the appropriate document:
   recreate the same peak through an avoidable second full-size result.
 - **Related Constraint**: N/A
 
+### Token chunk aggregation must not duplicate the complete packed output
+- **Date**: 2026-08-31
+- **Symptom**: After H3 Ref2VA FSDP2 crossed the adapted projection peak, training exhausted a
+  95 GiB device when Q RMSNorm's chunk aggregation requested a 190 MiB output with only
+  154--174 MiB free.
+- **Root Cause**: The chunk executors retained a list whose outputs already totaled the complete
+  packed tensor, then `torch.cat` allocated a second complete tensor to assemble that list.
+- **Fix**: H3 feed-forward, Q/K RMSNorm, and PEFT projection chunk executors now allocate their final
+  output once and copy each non-overlapping token slice into it. CopySlices preserves input and
+  parameter gradients, including nested non-reentrant checkpoint replay, without a concatenation copy.
+- **Lesson**: Bounding each operator invocation is insufficient if aggregation recreates a full-size
+  peak. Treat chunk assembly as part of the memory contract and retain exactly one final output.
+- **Related Constraint**: N/A
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)
