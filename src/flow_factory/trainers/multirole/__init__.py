@@ -3,6 +3,7 @@
 from .backend import (
     MultiRoleBackendValidationMixin,
     configure_deepspeed_micro_batch_size,
+    validate_optimizer_backend_plan,
     validate_supported_distributed_plan,
 )
 from .checkpointing import MULTIROLE_RUNTIME_CHILD_NAME, MultiRoleCheckpointingMixin
@@ -12,5 +13,6 @@ __all__ = [
     "MultiRoleCheckpointingMixin",
     "MULTIROLE_RUNTIME_CHILD_NAME",
     "configure_deepspeed_micro_batch_size",
+    "validate_optimizer_backend_plan",
     "validate_supported_distributed_plan",
 ]

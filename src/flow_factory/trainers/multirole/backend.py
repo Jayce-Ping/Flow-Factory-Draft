@@ -25,6 +25,47 @@ def validate_supported_distributed_plan(accelerator: Accelerator) -> None:
         )
 
 
+def validate_optimizer_backend_plan(
+    accelerator: Accelerator,
+    optimizer_args: Sequence[OptimizerArguments],
+) -> None:
+    """Reject optimizer/backend pairings before pretrained weights are loaded.
+
+    Args:
+        accelerator: Runtime backend whose optimizer support is being validated.
+        optimizer_args: Parsed optimizer configurations for every trainable role.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If Muon is paired with DeepSpeed or FSDP1.
+    """
+    if not uses_muon(optimizer_args):
+        return
+    if accelerator.distributed_type == DistributedType.DEEPSPEED:
+        raise ValueError(
+            "Muon with DeepSpeed is not verified in this framework: Muon rejects "
+            "non-matrix parameters, so it runs inside a CompositeOptimizer, and "
+            "DeepSpeed rebuilds its own optimizer wrapper around the object it "
+            "receives. Use DDP or FSDP2 with Muon, or select the adamw optimizer."
+        )
+    if accelerator.distributed_type != DistributedType.FSDP:
+        return
+    fsdp_plugin = getattr(accelerator.state, "fsdp_plugin", None)
+    fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) if fsdp_plugin else 1
+    if fsdp_version >= 2:
+        return
+    raise ValueError(
+        "Muon with FSDP1 does not work: FSDP1 flattens each wrapped unit into a "
+        "1D FlatParameter, so Muon is constructed over matrices and then receives "
+        "a 1D gradient, failing with 'Param gradient must be a 2D matrix' at the "
+        "first optimizer step. Set `fsdp_version: 2` in the accelerate config "
+        "(config/accelerate_configs/fsdp2.yaml), use DDP, or select the adamw "
+        "optimizer."
+    )
+
+
 def configure_deepspeed_micro_batch_size(
     accelerator: Accelerator, per_device_batch_size: int
 ) -> None:
@@ -61,29 +102,7 @@ class MultiRoleBackendValidationMixin:
         optimizer_args: Sequence[OptimizerArguments],
     ) -> None:
         """Reject optimizer and distributed-backend pairings that are not verified."""
-        if not uses_muon(optimizer_args):
-            return
-        if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
-            raise ValueError(
-                "Muon with DeepSpeed is not verified in this framework: Muon rejects "
-                "non-matrix parameters, so it runs inside a CompositeOptimizer, and "
-                "DeepSpeed rebuilds its own optimizer wrapper around the object it "
-                "receives. Use DDP or FSDP2 with Muon, or select the adamw optimizer."
-            )
-        if self.accelerator.distributed_type != DistributedType.FSDP:
-            return
-        fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
-        fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) if fsdp_plugin else 1
-        if fsdp_version >= 2:
-            return
-        raise ValueError(
-            "Muon with FSDP1 does not work: FSDP1 flattens each wrapped unit into a "
-            "1D FlatParameter, so Muon is constructed over matrices and then receives "
-            "a 1D gradient, failing with 'Param gradient must be a 2D matrix' at the "
-            "first optimizer step. Set `fsdp_version: 2` in the accelerate config "
-            "(config/accelerate_configs/fsdp2.yaml), use DDP, or select the adamw "
-            "optimizer."
-        )
+        validate_optimizer_backend_plan(self.accelerator, optimizer_args)
 
     def _validate_trainable_parameters_survived_prepare(self) -> None:
         """Reject a prepared root that no rank can train."""

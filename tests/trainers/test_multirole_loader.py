@@ -52,6 +52,7 @@ def _config(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         mixed_precision="no",
+        optimizer_args=(),
         model_args=SimpleNamespace(model_type="tiny"),
         training_args=SimpleNamespace(
             trainer_type=trainer_type,

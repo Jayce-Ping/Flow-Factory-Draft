@@ -691,6 +691,20 @@ Based on the fix type, write the fix entry to the appropriate document:
   a coupled objective or expose the workaround in algorithm code.
 - **Related Constraint**: #9, #20
 
+### Optimizer/backend compatibility must fail before model loading
+- **Date**: 2026-08-31
+- **Symptom**: A Muon run configured with DeepSpeed ZeRO-2 failed with the intended compatibility
+  error only after SD3.5 weights, LoRA adapters, and training data had been loaded.
+- **Root Cause**: Optimizer/backend validation lived only in `_init_optimizer`, whose lifecycle
+  position is necessarily after model adapter construction and data preprocessing.
+- **Fix**: The compatibility contract is now one shared backend-plan validator called by the
+  trainer loader before model construction and defensively called again before optimizer
+  construction. The two lifecycle gates therefore cannot drift to different rules.
+- **Lesson**: Validate compatibility from configuration as soon as the runtime backend is known.
+  Keep a second check at the resource-construction boundary, but delegate both checks to one
+  implementation so early rejection does not create a parallel source of truth.
+- **Related Constraint**: N/A
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)
