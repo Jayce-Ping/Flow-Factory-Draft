@@ -539,7 +539,7 @@ Based on the fix type, write the fix entry to the appropriate document:
 - **Root Cause**: Diffusers' H3 blocks evaluated every feed-forward projection over the complete
   dynamic sequence, and its generic chunk helper rejected non-divisible lengths such as 13,889.
 - **Fix**: H3 runtime setup now reuses each existing `ff.net` parameter tree inside a remainder-safe
-  4,096-token executor for both token-refiner and main transformer blocks. Installation precedes
+  2,048-token executor for both token-refiner and main transformer blocks. Installation precedes
   Flow-Factory resume loading, LoRA, checkpointing, and distributed wrapping, so state-dict keys,
   parameter identities, and execution policy remain consistent across rollout and training.
 - **Lesson**: A token-local operation does not need to inherit the peak allocation of a packed

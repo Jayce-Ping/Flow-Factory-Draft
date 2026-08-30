@@ -23,6 +23,7 @@ import torch.nn as nn
 from accelerate import DistributedType
 
 from flow_factory.models.abc import BaseAdapter
+from flow_factory.models.minimax_h3._chunking import H3_MAX_FEED_FORWARD_TOKENS
 from flow_factory.models.minimax_h3.adapters import (
     MiniMaxH3FL2VAAdapter,
     MiniMaxH3Ref2VAAdapter,
@@ -337,11 +338,15 @@ def test_workflow_adapter_loads_pruned_runtime_and_exact_setup_components(
     assert not hasattr(adapter.pipeline, "unrelated")
     assert transformer_name in adapter.component_runtime.materialized_component_names
     transformer = adapter.get_component(transformer_name)
+    assert H3_MAX_FEED_FORWARD_TOKENS == 2048
     configured_blocks = [
         *transformer.token_refiner.refiner_blocks,
         *transformer.transformer_blocks,
     ]
-    assert all(getattr(block.ff, "max_tokens", None) == 4096 for block in configured_blocks)
+    assert all(
+        getattr(block.ff, "max_tokens", None) == H3_MAX_FEED_FORWARD_TOKENS
+        for block in configured_blocks
+    )
     opposite = "transformer_ref" if transformer_name == "transformer" else "transformer"
     assert opposite not in adapter.component_runtime.declared_component_names
 
