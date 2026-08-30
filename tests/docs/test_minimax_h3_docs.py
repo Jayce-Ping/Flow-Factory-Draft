@@ -32,10 +32,10 @@ def test_readme_documents_h3_links_dependency_and_limits() -> None:
         "The configurations under `examples/` have been verified to yield measurable "
         "performance gains."
     ) not in text
-    assert "Validation status varies by example" in text
-    assert "hardware and reward-trend evidence" in text
-    assert "MiniMax H3 T2VA has real-weight LoRA validation" in text
-    assert "FL2VA and Ref2VA remain" in text
+    assert "all 120 model/backend/algorithm cells" in text
+    assert "smoke completion is not a claim of" in text
+    assert "all 36 real-weight smoke cells" in text
+    assert "FL2VA first-plus-last" in text
     assert "T2VA is real-weight validated on 1 and 16 GPUs" not in text
     assert text.count("<td>30B</td>") == 3
 
@@ -59,7 +59,7 @@ def test_readme_documents_h3_links_dependency_and_limits() -> None:
         "N transitions",
         "N + 1 states",
         "30B",
-        "completed long-run reward trend is not claimed",
+        "do not claim a completed long-run reward trend",
         "[Datasets](guidance/datasets.md)",
     ):
         assert required in text
@@ -71,9 +71,9 @@ def test_examples_readme_links_h3_and_separates_validation_levels() -> None:
         relative_link = f"../{root_link}"
         assert relative_link in text
         assert (ROOT / root_link).is_file()
-    assert "schema/API and local offline-path validated" in text
-    assert "GPU validation plan" in text
-    assert "hardware" in text
+    assert "all 36 H3 main cells" in text
+    assert "GPU validation matrix" in text
+    assert "execution coverage" in text
     assert "reward" in text
     assert "61 GB" in text
     assert "ImageBind" in text
@@ -81,10 +81,13 @@ def test_examples_readme_links_h3_and_separates_validation_levels() -> None:
     assert "NonCommercial" in text
 
 
-def test_gpu_validation_plan_declares_the_complete_smoke_matrix() -> None:
+def test_gpu_validation_matrix_declares_scope_and_completed_result() -> None:
     text = _text("guidance/gpu_validation.md")
 
     assert "10 x 3 x 4 = 120 jobs" in text
+    for result in ("144/144", "120/120", "22/22", "2/2", "132/132"):
+        assert result in text
+    assert "Four positive Muon jobs passed" in text
     for mode in (
         "sd35-t2i",
         "bagel-mri2i",

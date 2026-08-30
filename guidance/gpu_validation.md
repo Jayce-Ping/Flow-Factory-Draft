@@ -1,8 +1,26 @@
-# GPU Validation Plan
+# GPU Validation Matrix
 
-This document is the handoff contract for real-weight GPU validation. It does
-not claim that an unexecuted combination is supported. A combination becomes
-validated only after its artifacts satisfy the acceptance criteria below.
+This document defines the real-weight GPU validation contract and records the PR #220 result.
+A combination is validated only after its execution evidence satisfies the acceptance criteria
+below.
+
+## PR #220 result
+
+The complete dynamic smoke scope passed **144/144** unique jobs:
+
+- **120/120 main jobs**: 10 semantic modes x DDP/DeepSpeed ZeRO-2/FSDP2 x
+  GRPO/SFT/offline DPO/TDM.
+- **22/22 checkpoint-variant jobs**: Wan 2.1/2.2 T2V and I2V variants, all six strict Wan A14B
+  dual-transformer routing jobs, LTX 2.3 T2AV/I2AV, and H3 FL2VA first-plus-last coverage.
+- **2/2 supplemental jobs**: Flux1-Kontext image-to-image SFT and offline DPO.
+
+All **132/132** checkpoint-variant backend/algorithm cells also passed static configuration and
+contract validation. Four positive Muon jobs passed for DDP/FSDP2 with SFT and mixed-role TDM;
+the DeepSpeed ZeRO-2 negative gate rejected Muon before model loading as intended.
+
+These are reduced-geometry, finite-length execution smokes. They establish model loading,
+distributed routing, forward/backward, optimizer, and finite-data behavior; they do not claim
+convergence, long-run reward improvement, quality parity, or numerical parity.
 
 ## Environment gate
 

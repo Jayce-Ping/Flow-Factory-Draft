@@ -256,14 +256,17 @@ output semantics.
 |---|---|---|
 | Supported | `sd3-5`, `flux1`, `flux1-kontext`, `flux2`, `flux2-klein`, `qwen-image`, `qwen-image-edit-plus`, `z-image`, `bagel`, `sensenova` | Image-output codecs with adapter-specific geometry and packing. SenseNova uses the existing grouped `images` input with within-type order, not heterogeneous references. |
 | Supported | `wan2_t2v` | Video targets require `fps`; the codec resamples to configured frames/rate and samples the Wan VAE posterior on the fly. |
-| Supported | `wan2_i2v` | Input media binds a required `first_frame` image and an optional `last_frame` image. Condition pixels are cached at configured geometry, then encoded with VAE posterior mode once per batch. Expanded-timestep TI2V checkpoints accept the first frame only because official Diffusers ignores a last image in that mode. Video targets require `fps`. Offline execution is B=1. |
+| Supported | `wan2_i2v` | Input media uses a checkpoint-specific contract. Expanded-timestep TI2V and standard Wan2.1 I2V accept exactly `first_frame`; dedicated Wan2.1 FLF2V requires both `first_frame` and `last_frame`; Wan2.2 I2V-A14B accepts `first_frame` plus an optional VAE-only `last_frame`. Condition pixels are cached at configured geometry and encoded with VAE posterior mode once per batch. Video targets require `fps`; offline execution is B=1. |
 | Supported | `ltx2_t2av`, `ltx2_i2av` | Every candidate is an exact ordered `(video, audio)` pair with required `fps` and `sample_rate`. Both streams are aligned to the official LTX2 clock and encoded/packed on the fly. I2AV requires the `first_frame` image slot, substitutes its posterior-mode first latent into each target, and excludes the pinned tokens with an active mask. |
 | Supported | `minimax-h3-t2va`, `minimax-h3-fl2va`, `minimax-h3-ref2va` | Every candidate is an exact ordered `(video, audio)` pair. FL2VA accepts `first_frame`, `last_frame`, or both slots; Ref2VA accepts 1-12 globally ordered references and requires at least one image or video. Conditioned workflows realize one official prefix per batch, shared by both offline-DPO candidates and policy/reference forwards. H3 remains B=1. |
 
-Wan first/last semantics use generic semantic slots, not model-specific schema keys. The first
-frame is required; the last frame is optional. Unslotted input remains a positional convenience,
-but an explicit slot is recommended for sparse or generated manifests. The target is the complete
-generated video: its first frame, and its final frame when provided, correspond to the conditions.
+Wan endpoint semantics use generic semantic slots, not model-specific schema keys. The realized
+slot cardinality is checkpoint-specific: expanded-timestep TI2V and standard Wan2.1 I2V accept
+exactly `first_frame`; dedicated Wan2.1 FLF2V requires both endpoints; Wan2.2 I2V-A14B accepts
+`first_frame` plus an optional VAE-only `last_frame`. Unslotted input remains a positional
+convenience, but explicit slots are recommended for sparse or generated manifests. The target is
+the complete generated video, whose conditioned endpoint or endpoints must correspond to the
+supplied images.
 
 ```jsonl
 {"schema_version":2,"input":{"prompt":"A paper boat crosses the pond.","media":[{"type":"image","path":"conditions/first.png","slot":"first_frame"}]},"supervision":{"type":"demonstration","target":{"media":[{"type":"video","path":"targets/first-only.mp4","fps":24.0}]}},"metadata":{}}
@@ -407,9 +410,11 @@ checkpoint save/resume. Its 64x96 canvas validates
 correctness and memory fit, not visual quality or reward improvement.
 `quality_720p_fsdp2.yaml` has real-weight initialization, checkpoint, native-resolution
 decode, and evaluation coverage; no long-run reward trend is claimed. The aligned default uses
-the shared `dataset/vid_prompt` source, LoRA rank 64, and CLAP plus ImageBind rewards; it remains a
-configuration/API-validated baseline without a published long-run trend. FL2VA and Ref2VA remain
-schema/API-validated starting points.
+the shared `dataset/vid_prompt` source, LoRA rank 64, and CLAP plus ImageBind rewards. The PR #220
+smoke campaign completed all 36 H3 main cells: T2VA, FL2VA, and Ref2VA across
+DDP/DeepSpeed ZeRO-2/FSDP2 and GRPO/SFT/offline DPO/TDM. The FL2VA first-plus-last
+SFT/offline-DPO variant gate also passed. This is execution coverage, not a published long-run
+reward trend, convergence, or numerical-parity claim.
 
 ### T2VA: `minimax-h3-t2va`
 

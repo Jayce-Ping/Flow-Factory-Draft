@@ -86,9 +86,9 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
   <tr><td>First/Last-Frame-to-Video</td><td><a href="https://huggingface.co/Wan-AI/Wan2.1-FLF2V-14B-720P-diffusers">Wan2.1-FLF2V-14B-720P</a></td><td>14B</td><td>wan2_i2v</td></tr>
 
   <tr><td rowspan="2">Text-to-Audio-Video</td><td><a href="https://huggingface.co/Lightricks/LTX-2">LTX-2</a></td><td>19B</td><td>ltx2_t2av</td></tr>
-  <tr><td><a href="https://huggingface.co/Lightricks/LTX-2.3">LTX-2.3</a></td><td>22B</td><td>ltx2_t2av</td></tr>
+  <tr><td><a href="https://huggingface.co/dg845/LTX-2.3-Diffusers">LTX-2.3 (Diffusers)</a></td><td>22B</td><td>ltx2_t2av</td></tr>
   <tr><td rowspan="2">Image-to-Audio-Video</td><td><a href="https://huggingface.co/Lightricks/LTX-2">LTX-2</a></td><td>19B</td><td>ltx2_i2av</td></tr>
-  <tr><td><a href="https://huggingface.co/Lightricks/LTX-2.3">LTX-2.3</a></td><td>22B</td><td>ltx2_i2av</td></tr>
+  <tr><td><a href="https://huggingface.co/dg845/LTX-2.3-Diffusers">LTX-2.3 (Diffusers)</a></td><td>22B</td><td>ltx2_i2av</td></tr>
   <tr><td>Text-to-Audio-Video</td><td><a href="https://huggingface.co/MiniMaxAI/MiniMax-H3">MiniMax H3 T2VA</a></td><td>33B</td><td>minimax-h3-t2va</td></tr>
   <tr><td>First/Last-Frame-to-Audio-Video</td><td><a href="https://huggingface.co/MiniMaxAI/MiniMax-H3">MiniMax H3 FL2VA</a></td><td>33B</td><td>minimax-h3-fl2va</td></tr>
   <tr><td>Ordered-Reference-to-Audio-Video</td><td><a href="https://huggingface.co/MiniMaxAI/MiniMax-H3">MiniMax H3 Ref2VA</a></td><td>33B</td><td>minimax-h3-ref2va</td></tr>
@@ -104,11 +104,12 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
 > offline DPO shares that exact realization across chosen and rejected arms. See the
 > [offline model matrix](guidance/datasets.md#offline-model-support).
 
-> **MiniMax H3 status:** the T2VA debug and
-> [native-quality FSDP2](examples/grpo/lora/minimax_h3_t2va/quality_720p_fsdp2.yaml)
-> paths are real-weight
-> validated; a completed long-run reward trend is not claimed. FL2VA and Ref2VA remain
-> schema/API and local offline-path validated, pending the documented real-weight GPU matrix.
+> **MiniMax H3 status:** T2VA, FL2VA, and Ref2VA completed all 36 real-weight smoke cells in
+> the documented matrix: three workflows x DDP/DeepSpeed ZeRO-2/FSDP2 x
+> GRPO/SFT/offline DPO/TDM. The FL2VA first-plus-last SFT/offline-DPO gate also passed.
+> The T2VA [native-quality FSDP2](examples/grpo/lora/minimax_h3_t2va/quality_720p_fsdp2.yaml)
+> path has separate initialization, checkpoint, decode, and evaluation coverage. These results
+> do not claim a completed long-run reward trend, convergence, or numerical parity.
 > H3 requires B=1, has no CFG, uses neutral guidance `1.0`, and
 > keeps separate video/audio trajectories.
 > Video uses shift 12, audio uses shift 3, and the model predicts data-ward velocity.
@@ -135,10 +136,10 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
 
 See [`Algorithm Guidance`](guidance/algorithms.md) for more information.
 
-> Models and algorithms are decoupled at the framework interface. Validation status varies by example.
-> Training-verified examples carry hardware and reward-trend evidence.
-> MiniMax H3 T2VA has real-weight LoRA validation; FL2VA, Ref2VA, and unlisted
-> combinations require separate training evidence.
+> Models and algorithms are decoupled at the framework interface. The documented ten-mode
+> real-weight smoke matrix completed all 120 model/backend/algorithm cells. Combinations outside
+> that matrix still require separate execution evidence, and smoke completion is not a claim of
+> reward improvement.
 
 # 💾 Hardware Requirements
 
@@ -147,7 +148,7 @@ See [`Algorithm Guidance`](guidance/algorithms.md) for more information.
 ## Installation
 
 ```bash
-git clone https://github.com/Jayce-Ping/Flow-Factory.git
+git clone https://github.com/X-GenGroup/Flow-Factory.git
 cd Flow-Factory
 pip install -e .
 ```
@@ -244,7 +245,8 @@ Prompt and input-condition encodings are cached. Target, chosen, and rejected me
 encoded on the fly; their VAE latents are never stored in the preprocessing cache. One offline
 epoch is one complete dataloader traversal sharded by PyTorch's official `DistributedSampler`. See the
 [dataset guide](guidance/datasets.md#offline-v2-records) for the full schema and cadence rules, and
-the [GPU validation plan](guidance/gpu_validation.md) for the 120-job model/backend/algorithm matrix.
+the [completed GPU validation matrix](guidance/gpu_validation.md) for the 120 main jobs and 24
+additional dynamic gates.
 The [offline smoke builder](dataset/offline_smoke/README.md) reconstructs independent SFT and
 offline-DPO mini datasets for every currently implemented image, video, and audio-video profile.
 

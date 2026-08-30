@@ -88,13 +88,14 @@ The T2VA `debug.yaml` recipe is real-weight validated with the 61 GB checkpoint
 (61.74 GiB transformer):
 1 GPU and 16 GPUs across two nodes completed CPS rollout, video/audio decode,
 CLAP reward, GRPO replay/backward/optimizer step, and LoRA checkpoint save/resume.
-Its 64x96 canvas is intentionally a correctness geometry. The quality-oriented T2VA
-default is now the shared-`vid_prompt`, LoRA-rank-64 baseline aligned with the LTX2
-T2AV recipe and uses both CLAP and ImageBind rewards. It is configuration/API
-validated; no completed long-run reward trend is claimed. FL2VA and Ref2VA are also
-schema/API and local offline-path validated, rather than claims of real-weight training stability
-or reward improvement. The complete follow-up campaign is defined in the
-[GPU validation plan](../guidance/gpu_validation.md).
+Its 64x96 canvas is intentionally a correctness geometry. The PR #220 real-weight smoke campaign
+subsequently completed all 36 H3 main cells: T2VA, FL2VA, and Ref2VA across
+DDP/DeepSpeed ZeRO-2/FSDP2 and GRPO/SFT/offline DPO/TDM. The FL2VA first-plus-last
+SFT/offline-DPO variant gate also passed. The quality-oriented T2VA default remains the
+shared-`vid_prompt`, LoRA-rank-64 baseline aligned with the LTX2 T2AV recipe and uses both CLAP
+and ImageBind rewards. These smoke results establish execution coverage, not a completed
+long-run reward trend, convergence, or numerical parity. See the
+[GPU validation matrix](../guidance/gpu_validation.md).
 
 The T2VA `quality_720p_fsdp2.yaml` recipe is the active native-quality path:
 768x1344, 124 frames, 24 denoising steps, LoRA rank 64 / alpha 128, and two
