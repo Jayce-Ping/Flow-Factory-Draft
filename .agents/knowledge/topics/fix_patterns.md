@@ -561,6 +561,22 @@ Based on the fix type, write the fix entry to the appropriate document:
   never the normalized head dimension.
 - **Related Constraint**: N/A
 
+### Outer activation checkpoint replay can retain every inner token chunk
+- **Date**: 2026-08-30
+- **Symptom**: MiniMax H3 Ref2VA ZeRO-2 offline DPO reached backward replay but exhausted
+  a 95 GiB device when the final feed-forward chunk requested a 28 MiB SiLU allocation.
+- **Root Cause**: The block-level non-reentrant checkpoint replay rebuilt one autograd graph
+  containing the intermediates from every sequential feed-forward chunk. Smaller chunks reduced
+  each allocation but did not bound their cumulative saved activations.
+- **Fix**: Long, grad-enabled H3 feed-forward chunks now use nested non-reentrant activation
+  checkpoints. Each chunk is replayed independently during backward; no-grad rollout and short
+  sequences retain their direct execution paths. Checkpoint replay preserves RNG state so later
+  parameter-efficient adapters cannot silently change stochastic-gradient semantics.
+- **Lesson**: Splitting a local operator bounds forward temporaries but not necessarily backward
+  replay state. When an outer checkpoint recomputes a sequence of chunks, checkpoint each chunk
+  as the lifetime boundary for its saved activations.
+- **Related Constraint**: N/A
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

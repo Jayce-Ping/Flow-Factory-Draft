@@ -20,6 +20,7 @@ from typing import Iterable
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 H3_MAX_FEED_FORWARD_TOKENS = 1024
 H3_MAX_ATTENTION_NORM_TOKENS = 1024
@@ -52,8 +53,22 @@ class _ChunkedFeedForward(nn.Module):
             )
         if hidden_states.shape[1] <= self.max_tokens:
             return self._forward_chunk(hidden_states)
+        chunks = hidden_states.split(self.max_tokens, dim=1)
+        if torch.is_grad_enabled():
+            return torch.cat(
+                [
+                    checkpoint(
+                        self._forward_chunk,
+                        chunk,
+                        use_reentrant=False,
+                        preserve_rng_state=True,
+                    )
+                    for chunk in chunks
+                ],
+                dim=1,
+            )
         return torch.cat(
-            [self._forward_chunk(chunk) for chunk in hidden_states.split(self.max_tokens, dim=1)],
+            [self._forward_chunk(chunk) for chunk in chunks],
             dim=1,
         )
 

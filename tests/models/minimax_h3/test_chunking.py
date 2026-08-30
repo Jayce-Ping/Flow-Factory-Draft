@@ -18,6 +18,7 @@ import pytest
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from flow_factory.models.minimax_h3._chunking import (
     _ChunkedFeedForward,
@@ -121,7 +122,8 @@ def test_chunking_handles_remainder_and_preserves_forward_backward() -> None:
     chunked_output.backward(output_gradient)
     handle.remove()
 
-    assert chunk_sizes == [4, 4, 1]
+    assert chunk_sizes[:3] == [4, 4, 1]
+    assert sorted(chunk_sizes[3:]) == [1, 4, 4]
     torch.testing.assert_close(chunked_output, direct_output)
     torch.testing.assert_close(chunked_input.grad, direct_input.grad)
     for direct_parameter, chunked_parameter in zip(direct_ff.parameters(), chunked_ff.parameters()):
@@ -141,6 +143,96 @@ def test_short_feed_forward_uses_one_execution() -> None:
     handle.remove()
 
     assert chunk_sizes == [4]
+
+
+def test_chunking_preserves_nested_checkpoint_backward() -> None:
+    torch.manual_seed(19)
+    direct = TransformerFake().double()
+    chunked = deepcopy(direct)
+    install_h3_feed_forward_chunking(chunked, max_tokens=4)
+    direct_ff = direct.transformer_blocks[0].ff
+    chunked_ff = chunked.transformer_blocks[0].ff
+    direct_input = torch.randn(2, 9, 5, dtype=torch.float64, requires_grad=True)
+    chunked_input = direct_input.detach().clone().requires_grad_(True)
+    output_gradient = torch.randn(2, 9, 5, dtype=torch.float64)
+
+    direct_output = direct_ff(direct_input)
+    chunked_output = checkpoint(chunked_ff, chunked_input, use_reentrant=False)
+    direct_output.backward(output_gradient)
+    chunked_output.backward(output_gradient)
+
+    torch.testing.assert_close(chunked_output, direct_output)
+    torch.testing.assert_close(chunked_input.grad, direct_input.grad)
+    for direct_parameter, chunked_parameter in zip(direct_ff.parameters(), chunked_ff.parameters()):
+        torch.testing.assert_close(chunked_parameter.grad, direct_parameter.grad)
+
+
+def test_chunking_checkpoints_only_long_grad_enabled_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transformer = TransformerFake()
+    install_h3_feed_forward_chunking(transformer, max_tokens=4)
+    feed_forward = transformer.transformer_blocks[0].ff
+    calls: list[tuple[int, bool, bool]] = []
+
+    def recording_checkpoint(function, chunk, *, use_reentrant, preserve_rng_state):
+        calls.append((chunk.shape[1], use_reentrant, preserve_rng_state))
+        return function(chunk)
+
+    monkeypatch.setattr(
+        "flow_factory.models.minimax_h3._chunking.checkpoint",
+        recording_checkpoint,
+    )
+
+    feed_forward(torch.randn(2, 9, 5, requires_grad=True))
+    with torch.no_grad():
+        feed_forward(torch.randn(2, 9, 5))
+    feed_forward(torch.randn(2, 4, 5, requires_grad=True))
+
+    assert calls == [(4, False, True), (4, False, True), (1, False, True)]
+
+
+def test_chunking_supports_frozen_input_with_trainable_parameters() -> None:
+    direct = TransformerFake().double()
+    chunked = deepcopy(direct)
+    install_h3_feed_forward_chunking(chunked, max_tokens=4)
+    direct_ff = direct.transformer_blocks[0].ff
+    chunked_ff = chunked.transformer_blocks[0].ff
+    for parameter in direct_ff.parameters():
+        parameter.requires_grad_(False)
+    for parameter in chunked_ff.parameters():
+        parameter.requires_grad_(False)
+    direct_ff.net[2].weight.requires_grad_(True)
+    chunked_ff.net[2].weight.requires_grad_(True)
+    hidden_states = torch.randn(2, 9, 5, dtype=torch.float64)
+
+    direct_output = direct_ff(hidden_states)
+    chunked_output = chunked_ff(hidden_states)
+    direct_output.sum().backward()
+    chunked_output.sum().backward()
+
+    torch.testing.assert_close(chunked_output, direct_output)
+    torch.testing.assert_close(chunked_ff.net[2].weight.grad, direct_ff.net[2].weight.grad)
+
+
+def test_nested_chunk_checkpoint_preserves_cpu_autocast_dtype() -> None:
+    transformer = TransformerFake()
+    install_h3_feed_forward_chunking(transformer, max_tokens=4)
+    feed_forward = transformer.transformer_blocks[0].ff
+    hidden_states = torch.randn(2, 9, 5, requires_grad=True)
+    projected_dtypes: list[torch.dtype] = []
+    handle = feed_forward.net[2].register_forward_pre_hook(
+        lambda _module, inputs: projected_dtypes.append(inputs[0].dtype)
+    )
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        output = checkpoint(feed_forward, hidden_states, use_reentrant=False)
+    output.float().sum().backward()
+    handle.remove()
+
+    assert output.dtype == torch.bfloat16
+    assert len(projected_dtypes) >= 6
+    assert set(projected_dtypes) == {torch.bfloat16}
 
 
 @pytest.mark.parametrize("max_tokens", [0, -1, True, 1.5])
