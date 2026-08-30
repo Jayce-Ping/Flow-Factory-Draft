@@ -446,6 +446,20 @@ Based on the fix type, write the fix entry to the appropriate document:
   materialization rather than the requested name set.
 - **Related Constraint**: #9
 
+### Supported adapter paths require their upstream optional dependencies
+- **Date**: 2026-08-30
+- **Symptom**: Every Wan I2V trainer reached prompt preprocessing and then failed with
+  `NameError: name 'ftfy' is not defined` inside Diffusers prompt normalization.
+- **Root Cause**: Diffusers imports `ftfy` conditionally and declares it only in development/test
+  extras, while its Wan I2V prompt helper calls the package unconditionally. Flow-Factory exposes
+  Wan I2V as a core adapter but did not close that runtime dependency gap.
+- **Fix**: `ftfy` is now a core project dependency, with a metadata regression that keeps exactly
+  one install requirement for Wan prompt normalization.
+- **Lesson**: A framework that promotes an upstream optional code path to a supported core feature
+  also owns the path's transitive runtime dependencies; successful import of the upstream module
+  does not prove its conditionally imported helpers are callable.
+- **Related Constraint**: N/A
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

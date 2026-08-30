@@ -17,6 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 EXPECTED_DIFFUSERS_REQUIREMENT = "diffusers>=0.40.0"
+EXPECTED_WAN_PROMPT_DEPENDENCY = "ftfy"
 
 
 def test_project_metadata_requires_released_diffusers_with_h3_support() -> None:
@@ -27,4 +28,15 @@ def test_project_metadata_requires_released_diffusers_with_h3_support() -> None:
         "pyproject.toml must contain exactly one released diffusers requirement with "
         f"MiniMax H3 support; expected={EXPECTED_DIFFUSERS_REQUIREMENT!r}, "
         f"observed={diffusers_requirements!r}"
+    )
+
+
+def test_project_metadata_requires_wan_prompt_normalization_dependency() -> None:
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    ftfy_requirements = re.findall(r'"(ftfy[^"]*)"', pyproject)
+
+    assert ftfy_requirements == [EXPECTED_WAN_PROMPT_DEPENDENCY], (
+        "pyproject.toml must contain exactly one core ftfy requirement for Wan prompt "
+        f"normalization; expected={EXPECTED_WAN_PROMPT_DEPENDENCY!r}, "
+        f"observed={ftfy_requirements!r}"
     )

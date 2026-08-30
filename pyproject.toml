@@ -41,6 +41,7 @@ dependencies = [
     # Critical for T5/Flux
     "protobuf>=6.33.2",
     "sentencepiece>=0.2.1",
+    "ftfy",  # Required by Diffusers Wan prompt normalization
 
     # Basic Utils
     "av>=18.0.0",
