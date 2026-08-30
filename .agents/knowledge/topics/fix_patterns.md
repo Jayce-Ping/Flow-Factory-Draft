@@ -475,6 +475,20 @@ Based on the fix type, write the fix entry to the appropriate document:
   relying on an explicitly defined broadcast or mask contract.
 - **Related Constraint**: #7
 
+### Internal immutable media rows must cross sample boundaries as public batch types
+- **Date**: 2026-08-30
+- **Symptom**: Wan I2V rollouts finished denoising but failed while constructing each sample because
+  image canonicalization rejected a tuple of ordered first/last frames.
+- **Root Cause**: Wan's internal condition normalizer intentionally returns immutable tuple rows,
+  while `ImageConditionSample.condition_images` follows the public `ImageBatch` contract of lists,
+  tensors, or arrays. The adapter passed the internal representation across that boundary unchanged.
+- **Fix**: Wan now converts each ordered condition row to a list at sample construction. The
+  regression proves first/last color order survives sample canonicalization and replay stacking.
+- **Lesson**: Model-internal containers may enforce stronger invariants than shared sample APIs, but
+  adapters must translate them explicitly at the ownership boundary instead of broadening a common
+  media utility for one private representation.
+- **Related Constraint**: #5
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

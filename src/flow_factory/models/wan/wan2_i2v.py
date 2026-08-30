@@ -769,7 +769,7 @@ class Wan2_I2V_Adapter(BaseAdapter):
                 height=height,
                 width=width,
                 # Conditions
-                condition_images=condition_rows[b],
+                condition_images=list(condition_rows[b]),
                 latent_condition=condition[b],
                 first_frame_mask=(first_frame_mask[b] if first_frame_mask is not None else None),
                 image_embeds=per_sample_image_embeds[b],

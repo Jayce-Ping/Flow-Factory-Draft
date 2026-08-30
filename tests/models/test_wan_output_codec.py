@@ -442,12 +442,25 @@ def test_wan_i2v_expand_target_requires_prepared_active_mask_before_vae() -> Non
 
 
 def test_wan_i2v_normalization_never_truncates_optional_last_frame() -> None:
-    first = Image.new("RGB", (4, 4))
-    last = Image.new("RGB", (4, 4))
+    first = Image.new("RGB", (4, 4), color="red")
+    last = Image.new("RGB", (4, 4), color="blue")
 
     rows = normalize_wan_i2v_image_rows([[first, last]], expected_batch_size=1)
+    sample = WanI2VSample(condition_images=list(rows[0]))
+    stacked = WanI2VSample.stack([sample])
 
     assert rows == ((first, last),)
+    assert len(sample.condition_images) == 2
+    torch.testing.assert_close(sample.condition_images[0][:, 0, 0], torch.tensor([1.0, 0.0, 0.0]))
+    torch.testing.assert_close(sample.condition_images[1][:, 0, 0], torch.tensor([0.0, 0.0, 1.0]))
+    assert len(stacked["condition_images"]) == 1
+    assert len(stacked["condition_images"][0]) == 2
+    torch.testing.assert_close(
+        stacked["condition_images"][0][0][:, 0, 0], torch.tensor([1.0, 0.0, 0.0])
+    )
+    torch.testing.assert_close(
+        stacked["condition_images"][0][1][:, 0, 0], torch.tensor([0.0, 0.0, 1.0])
+    )
 
 
 def test_wan_i2v_online_prepare_latents_reuses_condition_mode_path() -> None:
