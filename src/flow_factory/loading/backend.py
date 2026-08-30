@@ -32,6 +32,15 @@ from .domain import ComponentRole, LoadPlan
 logger = setup_logger(__name__)
 
 
+def _unshard_fsdp2_checkpoint_replay(module: nn.Module, _inputs: Any) -> None:
+    """Backport the nested-FSDP multi-forward replay fix through public APIs."""
+    unshard = getattr(module, "unshard", None)
+    if not callable(unshard):
+        module_type = type(module).__name__
+        raise TypeError(f"FSDP2 checkpoint replay hook requires unshard(), received {module_type}")
+    unshard()
+
+
 def configure_backend_loading(accelerator: Accelerator, adapter_class: type) -> None:
     """Apply adapter capabilities before any pretrained component is loaded."""
     if accelerator.distributed_type != DistributedType.FSDP:
@@ -173,7 +182,11 @@ class FSDPBackendLoadRuntime(BackendLoadRuntime):
         disable_backward_prefetch = bool(
             getattr(self.adapter, "fsdp2_disable_backward_prefetch", False)
         )
-        if not use_default_stream and not disable_backward_prefetch:
+        if (
+            not use_in_forward_checkpointing
+            and not use_default_stream
+            and not disable_backward_prefetch
+        ):
             return prepared
 
         prepared_objects = prepared if isinstance(prepared, (list, tuple)) else (prepared,)
@@ -185,6 +198,37 @@ class FSDPBackendLoadRuntime(BackendLoadRuntime):
 
         if not prepared_modules:
             raise TypeError("FSDP2 memory policy requested without a prepared module")
+
+        if use_in_forward_checkpointing:
+            configured = 0
+            newly_registered = 0
+            for root in prepared_modules:
+                for module in root.modules():
+                    if not callable(getattr(module, "unshard", None)):
+                        continue
+                    configured += 1
+                    if any(
+                        hook is _unshard_fsdp2_checkpoint_replay
+                        for hook in module._forward_pre_hooks.values()
+                    ):
+                        continue
+                    # PyTorch <=2.10 returns early from its FSDP pre-forward hook
+                    # during activation-checkpoint replay. With two forward graphs,
+                    # a preceding post-backward may already have resharded this unit.
+                    # Appending this hook after FSDP's hook mirrors the upstream fix
+                    # and makes the public call a no-op when parameters remain full.
+                    module.register_forward_pre_hook(_unshard_fsdp2_checkpoint_replay)
+                    newly_registered += 1
+            if configured < 1:
+                raise TypeError(
+                    "adapter-owned FSDP2 checkpointing requires prepared FSDPModule roots"
+                )
+            logger.info(
+                "Enabled nested FSDP2 multi-forward checkpoint replay unshard: "
+                "configured=%d, newly_registered=%d",
+                configured,
+                newly_registered,
+            )
 
         if use_default_stream:
             configured = []

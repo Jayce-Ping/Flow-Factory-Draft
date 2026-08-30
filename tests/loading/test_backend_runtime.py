@@ -114,12 +114,16 @@ class _FSDPModuleFake(torch.nn.Linear):
         super().__init__(2, 2)
         self.unshard_async_op_calls = []
         self.backward_prefetch_calls = []
+        self.replay_hook_events = []
 
     def _set_unshard_async_op(self, enabled: bool) -> None:
         self.unshard_async_op_calls.append(enabled)
 
     def set_modules_to_backward_prefetch(self, modules) -> None:
         self.backward_prefetch_calls.append(modules)
+
+    def unshard(self) -> None:
+        self.replay_hook_events.append("unshard")
 
 
 def test_prepare_enables_adapter_requested_fsdp2_default_stream_unshard() -> None:
@@ -172,6 +176,13 @@ def test_prepare_extends_fsdp2_wrap_policy_before_distributed_preparation() -> N
 
 def test_prepare_delegates_fsdp2_activation_checkpointing_during_prepare() -> None:
     module = _FSDPModuleFake()
+    module.child = _FSDPModuleFake()
+    module.register_forward_pre_hook(
+        lambda _module, _inputs: module.replay_hook_events.append("fsdp-pre-forward")
+    )
+    module.child.register_forward_pre_hook(
+        lambda _module, _inputs: module.child.replay_hook_events.append("fsdp-pre-forward")
+    )
     module._no_split_modules = ["TransformerBlock"]
     accelerator = _AcceleratorFake(efficient=True)
     plugin = accelerator.state.fsdp_plugin
@@ -205,6 +216,30 @@ def test_prepare_delegates_fsdp2_activation_checkpointing_during_prepare() -> No
         (False, ("TransformerBlock", "ChunkedFeedForward")),
     ]
     assert plugin.activation_checkpointing is True
+    module(torch.ones(1, 2))
+    assert module.replay_hook_events == ["fsdp-pre-forward", "unshard"]
+    module.child(torch.ones(1, 2))
+    assert module.child.replay_hook_events == ["fsdp-pre-forward", "unshard"]
+
+
+def test_prepare_replay_unshard_hook_is_idempotent() -> None:
+    module = _FSDPModuleFake()
+    accelerator = _AcceleratorFake(efficient=True)
+    accelerator.state.fsdp_plugin.activation_checkpointing = True
+    runtime = FSDPBackendLoadRuntime(
+        accelerator,
+        _plan(),
+        SimpleNamespace(
+            fsdp2_use_in_forward_activation_checkpointing=True,
+            configure_fsdp2_in_forward_activation_checkpointing=lambda _root: 1,
+        ),
+    )
+
+    assert runtime.prepare(module) is module
+    assert runtime.prepare(module) is module
+    module(torch.ones(1, 2))
+
+    assert module.replay_hook_events == ["unshard"]
 
 
 @pytest.mark.parametrize(

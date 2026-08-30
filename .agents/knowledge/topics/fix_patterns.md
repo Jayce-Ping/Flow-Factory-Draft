@@ -672,6 +672,25 @@ Based on the fix type, write the fix entry to the appropriate document:
   parameter sharding may multiply activation lifetimes or overlap adjacent full-parameter units.
 - **Related Constraint**: #9, #20
 
+### Nested FSDP2 checkpoint replay must verify that parameters remain unsharded
+- **Date**: 2026-08-31
+- **Symptom**: MiniMax H3 Ref2VA FSDP2 offline DPO completed both policy-arm forwards but
+  failed during the second checkpoint replay with `got mixed torch.Tensor and DTensor`.
+- **Root Cause**: PyTorch FSDP2 releases a nested unit after the first arm's post-backward while
+  its state remains `PRE_BACKWARD`; the second arm's checkpoint replay therefore takes the
+  pre-forward early return and uses sharded DTensor parameters with ordinary tensor inputs. This
+  is the upstream PyTorch issue #153354, fixed only after PyTorch 2.10 by commit 6579652.
+- **Fix**: Adapter-owned FSDP2 activation checkpointing now appends a post-prepare pre-forward
+  hook to every prepared FSDP unit. The hook calls the public synchronous `unshard()` API after
+  FSDP's own pre-forward hook, which is a no-op for normal forwards and restores parameters only
+  when an earlier checkpoint graph has already resharded them. A two-rank nested-FSDP reproducer
+  now completes two forward graphs and one combined backward without changing DPO semantics.
+- **Lesson**: A distributed training state is not proof of parameter residency. Multiple
+  checkpointed forwards may interleave one unit's post-backward with another graph's replay, so a
+  compatibility backport must repair residency at the FSDP lifecycle boundary rather than split
+  a coupled objective or expose the workaround in algorithm code.
+- **Related Constraint**: #9, #20
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)
