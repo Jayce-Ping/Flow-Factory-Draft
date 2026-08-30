@@ -93,9 +93,9 @@ This experimental feature leverages `diffusers`'s `transformer.set_attention_bac
   <tr><td><a href="https://huggingface.co/Lightricks/LTX-2.3">LTX-2.3</a></td><td>22B</td><td>ltx2_t2av</td></tr>
   <tr><td rowspan="2">Image-to-Audio-Video</td><td><a href="https://huggingface.co/Lightricks/LTX-2">LTX-2</a></td><td>19B</td><td>ltx2_i2av</td></tr>
   <tr><td><a href="https://huggingface.co/Lightricks/LTX-2.3">LTX-2.3</a></td><td>22B</td><td>ltx2_i2av</td></tr>
-  <tr><td>Text-to-Audio-Video</td><td><a href="https://huggingface.co/MiniMaxAI/MiniMax-H3">MiniMax H3 T2VA</a></td><td>30B</td><td>minimax-h3-t2va</td></tr>
-  <tr><td>First/Last-Frame-to-Audio-Video</td><td><a href="https://huggingface.co/MiniMaxAI/MiniMax-H3">MiniMax H3 FL2VA</a></td><td>30B</td><td>minimax-h3-fl2va</td></tr>
-  <tr><td>Ordered-Reference-to-Audio-Video</td><td><a href="https://huggingface.co/MiniMaxAI/MiniMax-H3">MiniMax H3 Ref2VA</a></td><td>30B</td><td>minimax-h3-ref2va</td></tr>
+  <tr><td>Text-to-Audio-Video</td><td><a href="https://huggingface.co/MiniMaxAI/MiniMax-H3">MiniMax H3 T2VA</a></td><td>33B</td><td>minimax-h3-t2va</td></tr>
+  <tr><td>First/Last-Frame-to-Audio-Video</td><td><a href="https://huggingface.co/MiniMaxAI/MiniMax-H3">MiniMax H3 FL2VA</a></td><td>33B</td><td>minimax-h3-fl2va</td></tr>
+  <tr><td>Ordered-Reference-to-Audio-Video</td><td><a href="https://huggingface.co/MiniMaxAI/MiniMax-H3">MiniMax H3 Ref2VA</a></td><td>33B</td><td>minimax-h3-ref2va</td></tr>
 </table>
 
 > To support new models, see [Guidance/New Model](guidance/new_model.md).
