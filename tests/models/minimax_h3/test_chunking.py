@@ -16,18 +16,26 @@ from copy import deepcopy
 
 import pytest
 import torch
+from diffusers.models.transformers.transformer_minimax_h3 import (
+    MiniMaxH3AttnProcessor,
+    _apply_rotary_emb,
+)
 from peft import LoraConfig, get_peft_model
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from flow_factory.models.minimax_h3._chunking import (
+    _apply_h3_rotary_chunk,
+    _apply_h3_rotary_chunks,
     _ChunkedFeedForward,
+    _ChunkedH3AttnProcessor,
     _ChunkedLoraLinear,
     _ChunkedRMSNorm,
     install_h3_attention_norm_chunking,
     install_h3_feed_forward_chunking,
     install_h3_lora_projection_chunking,
+    install_h3_rotary_chunking,
 )
 
 
@@ -63,12 +71,15 @@ class BlockFake(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.attn = nn.Module()
+        self.attn.heads = 1
+        self.attn.fused_projections = False
         self.attn.to_q = nn.Linear(5, 5, bias=False)
         self.attn.to_k = nn.Linear(5, 5, bias=False)
         self.attn.to_v = nn.Linear(5, 5, bias=False)
         self.attn.norm_q = nn.RMSNorm(5)
         self.attn.norm_k = nn.RMSNorm(5)
         self.attn.to_out = nn.ModuleList([nn.Linear(5, 5, bias=False), nn.Dropout(0.0)])
+        self.attn.processor = MiniMaxH3AttnProcessor()
         self.ff = FeedForwardFake()
 
 
@@ -489,3 +500,119 @@ def test_lora_projection_chunking_preserves_non_reentrant_checkpoint_backward() 
     torch.testing.assert_close(chunked_input.grad, direct_input.grad)
     for direct_parameter, chunked_parameter in zip(direct.parameters(), chunked.parameters()):
         torch.testing.assert_close(chunked_parameter.grad, direct_parameter.grad)
+
+
+def test_rotary_chunking_preserves_remainder_forward_backward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(31)
+    direct_input = torch.randn(2, 9, 3, 8, dtype=torch.float64, requires_grad=True)
+    chunked_input = direct_input.detach().clone().requires_grad_(True)
+    direct_cos = torch.randn(9, 6, dtype=torch.float64, requires_grad=True)
+    chunked_cos = direct_cos.detach().clone().requires_grad_(True)
+    direct_sin = torch.randn(9, 6, dtype=torch.float64, requires_grad=True)
+    chunked_sin = direct_sin.detach().clone().requires_grad_(True)
+    output_gradient = torch.randn(2, 9, 3, 8, dtype=torch.float64)
+    chunk_sizes: list[int] = []
+
+    def recording_rotary_chunk(hidden_states, chunk_cos, chunk_sin):
+        chunk_sizes.append(hidden_states.shape[1])
+        return _apply_h3_rotary_chunk(hidden_states, chunk_cos, chunk_sin)
+
+    monkeypatch.setattr(
+        "flow_factory.models.minimax_h3._chunking._apply_h3_rotary_chunk",
+        recording_rotary_chunk,
+    )
+
+    direct_output = _apply_rotary_emb(direct_input, direct_cos, direct_sin)
+    chunked_output = _apply_h3_rotary_chunks(
+        chunked_input,
+        chunked_cos,
+        chunked_sin,
+        max_tokens=4,
+    )
+    direct_output.backward(output_gradient)
+    chunked_output.backward(output_gradient)
+
+    assert chunk_sizes == [4, 4, 1]
+    torch.testing.assert_close(chunked_output, direct_output)
+    torch.testing.assert_close(chunked_input.grad, direct_input.grad)
+    torch.testing.assert_close(chunked_cos.grad, direct_cos.grad)
+    torch.testing.assert_close(chunked_sin.grad, direct_sin.grad)
+
+
+def test_rotary_chunking_preserves_processor_and_parameter_tree() -> None:
+    transformer = TransformerFake()
+    attention_backend = object()
+    parallel_config = object()
+    first_processor = transformer.token_refiner.refiner_blocks[0].attn.processor
+    first_processor._attention_backend = attention_backend
+    first_processor._parallel_config = parallel_config
+    state = deepcopy(transformer.state_dict())
+    keys_before = tuple(state)
+    parameter_ids_before = {
+        name: id(parameter) for name, parameter in transformer.named_parameters()
+    }
+    processor_ids_before = [
+        id(block.attn.processor)
+        for block in (
+            *transformer.token_refiner.refiner_blocks,
+            *transformer.transformer_blocks,
+        )
+    ]
+
+    assert install_h3_rotary_chunking(transformer, max_tokens=4) == 5
+    assert install_h3_rotary_chunking(transformer, max_tokens=4) == 5
+
+    processors = [
+        block.attn.processor
+        for block in (
+            *transformer.token_refiner.refiner_blocks,
+            *transformer.transformer_blocks,
+        )
+    ]
+    assert all(isinstance(processor, _ChunkedH3AttnProcessor) for processor in processors)
+    assert [id(processor) for processor in processors] == processor_ids_before
+    assert processors[0]._attention_backend is attention_backend
+    assert processors[0]._parallel_config is parallel_config
+    assert tuple(transformer.state_dict()) == keys_before
+    assert {
+        name: id(parameter) for name, parameter in transformer.named_parameters()
+    } == parameter_ids_before
+    transformer.load_state_dict(state, strict=True)
+
+
+def test_rotary_chunking_processor_preserves_attention_forward_backward() -> None:
+    torch.manual_seed(37)
+    direct_transformer = TransformerFake().double()
+    chunked_transformer = deepcopy(direct_transformer)
+    install_h3_rotary_chunking(chunked_transformer, max_tokens=4)
+    direct = direct_transformer.transformer_blocks[0].attn
+    chunked = chunked_transformer.transformer_blocks[0].attn
+    direct_input = torch.randn(2, 9, 5, dtype=torch.float64, requires_grad=True)
+    chunked_input = direct_input.detach().clone().requires_grad_(True)
+    cos = torch.randn(9, 4, dtype=torch.float64)
+    sin = torch.randn(9, 4, dtype=torch.float64)
+    output_gradient = torch.randn(2, 9, 5, dtype=torch.float64)
+
+    direct_output = direct.processor(direct, direct_input, (cos, sin))
+    chunked_output = checkpoint(
+        lambda value: chunked.processor(chunked, value, (cos, sin)),
+        chunked_input,
+        use_reentrant=False,
+    )
+    direct_output.backward(output_gradient)
+    chunked_output.backward(output_gradient)
+
+    torch.testing.assert_close(chunked_output, direct_output)
+    torch.testing.assert_close(chunked_input.grad, direct_input.grad)
+    for direct_parameter, chunked_parameter in zip(direct.parameters(), chunked.parameters()):
+        torch.testing.assert_close(chunked_parameter.grad, direct_parameter.grad)
+
+
+def test_rotary_chunking_rejects_conflicting_reinstallation() -> None:
+    transformer = TransformerFake()
+    install_h3_rotary_chunking(transformer, max_tokens=4)
+
+    with pytest.raises(ValueError, match="already uses max_tokens=4.*conflicting 8"):
+        install_h3_rotary_chunking(transformer, max_tokens=8)

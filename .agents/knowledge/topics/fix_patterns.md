@@ -623,6 +623,20 @@ Based on the fix type, write the fix entry to the appropriate document:
   peak. Treat chunk assembly as part of the memory contract and retain exactly one final output.
 - **Related Constraint**: N/A
 
+### Rotary embedding should rotate packed rows in bounded slices
+- **Date**: 2026-08-31
+- **Symptom**: MiniMax H3 Ref2VA FSDP2 GRPO crossed projection, normalization, and aggregation
+  peaks but exhausted a 95 GiB device when rotary embedding requested a 144 MiB elementwise
+  product with only 74--134 MiB free.
+- **Root Cause**: Diffusers built rotate-half, cosine-product, sine-product, sum, and concatenation
+  intermediates over all 13,889 query or key rows simultaneously.
+- **Fix**: Ref2VA FSDP2 installs an instance-local H3 attention processor before distributed
+  preparation. It preserves projection, backend, and output behavior while applying Q/K rotary
+  embedding in aligned 1,024-token slices directly into one final output allocation.
+- **Lesson**: Positional rotation is row-local even when the following attention is global. Bound
+  its elementwise intermediates independently and keep cosine/sine slices aligned with token rows.
+- **Related Constraint**: N/A
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

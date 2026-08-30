@@ -202,6 +202,15 @@ class FakeMiniMaxH3Blocks:
     }
 
 
+class FakeMiniMaxH3AttnProcessor:
+    def __call__(self, *args, **kwargs):
+        return None
+
+
+def fake_dispatch_attention_fn(*args, **kwargs):
+    return None
+
+
 class FakeReference:
     pass
 
@@ -210,6 +219,8 @@ class FakeReference:
 class FakeSymbols:
     MiniMaxH3ModularPipeline: type = FakeModularPipeline
     MiniMaxH3Blocks: type = FakeMiniMaxH3Blocks
+    MiniMaxH3AttnProcessor: type = FakeMiniMaxH3AttnProcessor
+    dispatch_attention_fn: object = fake_dispatch_attention_fn
     PipelineState: type = FakePipelineState
     ResizeStep: type = ResizeStep
     RefSetupStep: type = RefSetupStep
@@ -1052,6 +1063,7 @@ def test_dependency_probe_rejects_block_without_pipeline_state_call_contract(mon
     [
         "PipelineState",
         "MiniMaxH3Blocks",
+        "MiniMaxH3AttnProcessor",
         "PrepareLatentsStep",
         "Ref2VATextEncoderStep",
         "SetTimestepsStep",
@@ -1073,6 +1085,17 @@ def test_dependency_probe_rejects_incompatible_api_with_actionable_requirement(
     assert "diffusers>=0.40.0" in message
     assert "pip install 'diffusers>=0.40.0'" in message
     assert broken_field in message
+
+
+def test_dependency_probe_rejects_non_callable_attention_dispatch(monkeypatch):
+    from flow_factory.models.minimax_h3 import dependency
+
+    bundle = dataclasses.replace(FakeSymbols(), dispatch_attention_fn=object())
+    monkeypatch.setattr(dependency, "_SYMBOLS", bundle)
+    monkeypatch.setattr(dependency, "_IMPORT_ERROR", None)
+
+    with pytest.raises(ImportError, match="dispatch_attention_fn must be callable"):
+        dependency.require_minimax_h3_support()
 
 
 def test_pyproject_requires_released_h3_diffusers():

@@ -23,9 +23,12 @@ from peft.tuners.lora.layer import Linear as LoraLinear
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
+from .dependency import require_minimax_h3_support
+
 H3_MAX_FEED_FORWARD_TOKENS = 1024
 H3_MAX_ATTENTION_NORM_TOKENS = 1024
 H3_MAX_LORA_PROJECTION_TOKENS = 1024
+H3_MAX_ROTARY_TOKENS = 1024
 
 
 class _ChunkedFeedForward(nn.Module):
@@ -131,6 +134,126 @@ class _ChunkedLoraLinear(LoraLinear):
             lambda chunk: forward_chunk(chunk, *args, **kwargs),
             operation="LoRA projection",
         )
+
+
+class _ChunkedH3AttnProcessor:
+    """Preserve the upstream H3 attention contract with bounded rotary work."""
+
+    _attention_backend = None
+    _parallel_config = None
+    flow_factory_max_tokens: int
+    flow_factory_dispatch_attention_fn: Callable[..., torch.Tensor]
+
+    def __call__(
+        self,
+        attn: nn.Module,
+        hidden_states: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if attn.fused_projections:
+            query, key, value = attn.to_qkv(hidden_states).chunk(3, dim=-1)
+        else:
+            query = attn.to_q(hidden_states)
+            key = attn.to_k(hidden_states)
+            value = attn.to_v(hidden_states)
+
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        if rotary_emb is not None:
+            query = _apply_h3_rotary_chunks(
+                query,
+                *rotary_emb,
+                max_tokens=self.flow_factory_max_tokens,
+            )
+            key = _apply_h3_rotary_chunks(
+                key,
+                *rotary_emb,
+                max_tokens=self.flow_factory_max_tokens,
+            )
+
+        hidden_states = self.flow_factory_dispatch_attention_fn(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            backend=self._attention_backend,
+            parallel_config=self._parallel_config,
+        )
+        hidden_states = hidden_states.flatten(2, 3).type_as(query)
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+        return hidden_states
+
+
+def _apply_h3_rotary_chunks(
+    hidden_states: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    max_tokens: int,
+) -> torch.Tensor:
+    """Apply row-local H3 rotary embedding without full-sequence temporaries."""
+    max_tokens = _positive_int(max_tokens, "max_tokens")
+    if hidden_states.ndim != 4:
+        raise ValueError(
+            "MiniMax H3 rotary embedding expected [batch, tokens, heads, head_dim], "
+            f"received shape={tuple(hidden_states.shape)}"
+        )
+    if cos.ndim != 2 or sin.shape != cos.shape:
+        raise ValueError(
+            "MiniMax H3 rotary embedding expected matching [tokens, rotary_dim] cos/sin, "
+            f"received cos={tuple(cos.shape)}, sin={tuple(sin.shape)}"
+        )
+    if cos.shape[0] != hidden_states.shape[1]:
+        raise ValueError(
+            "MiniMax H3 rotary embedding sequence mismatch, received "
+            f"hidden_tokens={hidden_states.shape[1]}, rotary_tokens={cos.shape[0]}"
+        )
+    rotary_dim = cos.shape[-1]
+    if rotary_dim < 2 or rotary_dim % 2 or rotary_dim > hidden_states.shape[-1]:
+        raise ValueError(
+            "MiniMax H3 rotary_dim must be positive, even, and no larger than head_dim, "
+            f"received rotary_dim={rotary_dim}, head_dim={hidden_states.shape[-1]}"
+        )
+
+    cos = cos.to(hidden_states.dtype)
+    sin = sin.to(hidden_states.dtype)
+    if hidden_states.shape[1] <= max_tokens:
+        return _apply_h3_rotary_chunk(hidden_states, cos, sin)
+
+    cos_chunks = iter(cos.split(max_tokens, dim=0))
+    sin_chunks = iter(sin.split(max_tokens, dim=0))
+    return _assemble_sequence_chunks(
+        hidden_states,
+        max_tokens,
+        lambda chunk: _apply_h3_rotary_chunk(chunk, next(cos_chunks), next(sin_chunks)),
+        operation="rotary embedding",
+    )
+
+
+def _apply_h3_rotary_chunk(
+    hidden_states: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the upstream rotate-half convention to one aligned token chunk."""
+    rotary_dim = cos.shape[-1]
+    hidden_states_rotary = hidden_states[..., :rotary_dim]
+    hidden_states_pass = hidden_states[..., rotary_dim:]
+    cos = cos[None, :, None, :]
+    sin = sin[None, :, None, :]
+    first, second = hidden_states_rotary.chunk(2, dim=-1)
+    hidden_states_rotated = torch.cat((-second, first), dim=-1)
+    hidden_states_rotary = hidden_states_rotary * cos + hidden_states_rotated * sin
+    return torch.cat((hidden_states_rotary, hidden_states_pass), dim=-1).contiguous()
 
 
 def _assemble_sequence_chunks(
@@ -362,6 +485,52 @@ def install_h3_lora_projection_chunking(
             projection.__class__ = _ChunkedLoraLinear
             projection.flow_factory_max_tokens = max_tokens
             configured += 1
+    return configured
+
+
+def install_h3_rotary_chunking(
+    transformer: nn.Module,
+    *,
+    max_tokens: int = H3_MAX_ROTARY_TOKENS,
+) -> int:
+    """Install the bounded processor on every standard H3 attention instance."""
+    max_tokens = _positive_int(max_tokens, "max_tokens")
+    symbols = require_minimax_h3_support()
+    processor_class = symbols.MiniMaxH3AttnProcessor
+    configured = 0
+    for block_name, block in _h3_repeated_blocks(transformer):
+        attention = getattr(block, "attn", None)
+        if not isinstance(attention, nn.Module):
+            raise TypeError(
+                f"MiniMax H3 {block_name}.attn expected nn.Module, received "
+                f"{type(attention).__name__}"
+            )
+        processor = getattr(attention, "processor", None)
+        if isinstance(processor, _ChunkedH3AttnProcessor):
+            if processor.flow_factory_max_tokens != max_tokens:
+                raise ValueError(
+                    f"MiniMax H3 {block_name}.attn.processor already uses max_tokens="
+                    f"{processor.flow_factory_max_tokens}, received conflicting {max_tokens}"
+                )
+            configured += 1
+            continue
+        if type(processor) is not processor_class:
+            raise TypeError(
+                f"MiniMax H3 {block_name}.attn expected the standard attention processor, "
+                f"received {type(processor).__name__}"
+            )
+        if "__call__" in processor.__dict__:
+            raise TypeError(
+                f"MiniMax H3 {block_name}.attn processor must not shadow __call__ on the instance"
+            )
+        attention_backend = getattr(processor, "_attention_backend", None)
+        parallel_config = getattr(processor, "_parallel_config", None)
+        processor.__class__ = _ChunkedH3AttnProcessor
+        processor.flow_factory_max_tokens = max_tokens
+        processor.flow_factory_dispatch_attention_fn = symbols.dispatch_attention_fn
+        processor._attention_backend = attention_backend
+        processor._parallel_config = parallel_config
+        configured += 1
     return configured
 
 

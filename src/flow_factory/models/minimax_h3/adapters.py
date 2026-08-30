@@ -49,7 +49,9 @@ from ..pipeline_contracts import (
 from ..runtime import ModularPipelineRuntime
 from ._chunking import (
     H3_MAX_LORA_PROJECTION_TOKENS,
+    H3_MAX_ROTARY_TOKENS,
     install_h3_lora_projection_chunking,
+    install_h3_rotary_chunking,
 )
 from ._common import apply_forward_process_noise, draw_forward_process_noise
 from ._condition import MiniMaxH3ConditionStatePreparer
@@ -138,7 +140,19 @@ class _MiniMaxH3WorkflowAdapter:
 
     def build_component_runtime(self) -> ModularPipelineRuntime:
         """Build the workflow-pruned modular runtime."""
-        return build_h3_component_runtime(self)
+        runtime = build_h3_component_runtime(self)
+        if self.workflow != "ref2va" or not self._is_fsdp2():
+            return runtime
+        configured = install_h3_rotary_chunking(
+            runtime.get_component(self.transformer_component_name)
+        )
+        logger.info(
+            "Enabled token-chunked rotary embedding for MiniMax H3 Ref2VA FSDP2: "
+            "configured=%d, max_tokens=%d",
+            configured,
+            H3_MAX_ROTARY_TOKENS,
+        )
+        return runtime
 
     def load_scheduler(self) -> MiniMaxH3SDEScheduler:
         """Build the canonical shift-12 video scheduler."""
