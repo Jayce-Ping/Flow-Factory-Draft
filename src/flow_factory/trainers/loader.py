@@ -32,7 +32,11 @@ from ..models.registry import get_model_adapter_class
 from ..utils.env_utils import reconcile_config
 from ..utils.logger_utils import setup_logger
 from .abc import BaseTrainer
-from .multirole import validate_optimizer_backend_plan, validate_supported_distributed_plan
+from .multirole import (
+    configure_checkpointing_backend_plan,
+    validate_optimizer_backend_plan,
+    validate_supported_distributed_plan,
+)
 from .registry import get_trainer_class, list_registered_trainers
 
 logger = setup_logger(__name__)
@@ -139,6 +143,7 @@ def load_trainer(config: Arguments) -> BaseTrainer:
     # rejecting it in BaseTrainer.__init__ is too late.
     validate_supported_distributed_plan(accelerator)
     validate_optimizer_backend_plan(accelerator, tuple(config.optimizer_args))
+    configure_checkpointing_backend_plan(accelerator, config.training_args)
     set_seed(config.training_args.seed, device_specific=True)
 
     # Reconcile config with runtime distributed state (before any consumer reads it)

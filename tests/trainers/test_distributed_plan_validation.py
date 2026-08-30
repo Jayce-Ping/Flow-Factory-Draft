@@ -90,7 +90,11 @@ def test_loader_rejects_zero_three_before_loading_model(monkeypatch: pytest.Monk
 def _fsdp_accelerator(fsdp_version: int) -> SimpleNamespace:
     """Build an Accelerator stub reporting the requested FSDP major version."""
     accelerator = _accelerator(DistributedType.FSDP)
-    accelerator.state.fsdp_plugin = SimpleNamespace(fsdp_version=fsdp_version)
+    accelerator.state.fsdp_plugin = SimpleNamespace(
+        fsdp_version=fsdp_version,
+        activation_checkpointing=False,
+        cpu_ram_efficient_loading=False,
+    )
     return accelerator
 
 
@@ -148,6 +152,105 @@ def test_loader_rejects_unsupported_muon_backend_before_loading_model(
         loader.load_trainer(config)
 
     assert model_load_attempted is False
+
+
+@pytest.mark.parametrize("backend_checkpointing", [False, True])
+def test_loader_rejects_selective_fsdp2_checkpointing_before_loading_model(
+    monkeypatch: pytest.MonkeyPatch,
+    backend_checkpointing: bool,
+) -> None:
+    """The trainer factory must reject selective FSDP2 checkpointing before loading."""
+    accelerator = _fsdp_accelerator(fsdp_version=2)
+    accelerator.state.fsdp_plugin.activation_checkpointing = backend_checkpointing
+    model_load_attempted = False
+
+    class Adapter:
+        ddp_find_unused_parameters = False
+
+    def unexpected_model_load(**kwargs: object) -> None:
+        del kwargs
+        nonlocal model_load_attempted
+        model_load_attempted = True
+        raise AssertionError("load_model must not run for selective FSDP2 checkpointing")
+
+    config = SimpleNamespace(
+        mixed_precision="bf16",
+        optimizer_args=(),
+        model_args=SimpleNamespace(model_type="test"),
+        log_args=SimpleNamespace(save_dir="/tmp", run_name="checkpoint-plan-rejection-test"),
+        training_args=SimpleNamespace(
+            gradient_accumulation_steps=1,
+            max_grad_norm=1.0,
+            seed=42,
+            trainer_type="grpo",
+            required_trainable_roles=None,
+            enable_gradient_checkpointing=SimpleNamespace(mode="every_n"),
+        ),
+    )
+    monkeypatch.setattr(loader, "get_model_adapter_class", lambda model_type: Adapter)
+    monkeypatch.setattr(loader, "Accelerator", lambda **kwargs: accelerator)
+    monkeypatch.setattr(loader, "load_model", unexpected_model_load)
+
+    with pytest.raises(ValueError, match="cannot preserve selective"):
+        loader.load_trainer(config)
+
+    assert model_load_attempted is False
+
+
+@pytest.mark.parametrize("backend_checkpointing", [False, True])
+def test_loader_selects_fsdp2_backend_checkpointing_before_loading_model(
+    monkeypatch: pytest.MonkeyPatch,
+    backend_checkpointing: bool,
+) -> None:
+    """A full model policy must become the safe backend owner before loading."""
+    accelerator = _fsdp_accelerator(fsdp_version=2)
+    accelerator.state.fsdp_plugin.activation_checkpointing = backend_checkpointing
+    observed_plan = []
+    adapter = object()
+
+    class Adapter:
+        ddp_find_unused_parameters = False
+
+    class FakeTrainer:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+    config = SimpleNamespace(
+        mixed_precision="bf16",
+        optimizer_args=(),
+        model_args=SimpleNamespace(model_type="test"),
+        log_args=SimpleNamespace(save_dir="/tmp", run_name="checkpoint-plan-owner-test"),
+        training_args=SimpleNamespace(
+            gradient_accumulation_steps=1,
+            max_grad_norm=1.0,
+            seed=42,
+            trainer_type="grpo",
+            required_trainable_roles=None,
+            enable_gradient_checkpointing=True,
+        ),
+    )
+
+    def load_model_with_resolved_plan(**kwargs: object) -> object:
+        del kwargs
+        observed_plan.append(
+            (
+                config.training_args.enable_gradient_checkpointing,
+                accelerator.state.fsdp_plugin.activation_checkpointing,
+            )
+        )
+        return adapter
+
+    monkeypatch.setattr(loader, "get_trainer_class", lambda trainer_type: FakeTrainer)
+    monkeypatch.setattr(loader, "get_model_adapter_class", lambda model_type: Adapter)
+    monkeypatch.setattr(loader, "Accelerator", lambda **kwargs: accelerator)
+    monkeypatch.setattr(loader, "set_seed", lambda *args, **kwargs: None)
+    monkeypatch.setattr(loader, "reconcile_config", lambda *args, **kwargs: None)
+    monkeypatch.setattr(loader, "load_model", load_model_with_resolved_plan)
+
+    trainer = loader.load_trainer(config)
+
+    assert observed_plan == [(False, True)]
+    assert trainer.kwargs["adapter"] is adapter
 
 
 @pytest.mark.parametrize("zero_stage", [1, 2])
@@ -289,10 +392,15 @@ def test_tdm_r1_fsdp1_disables_incompatible_activation_checkpointing() -> None:
     "checkpoint_policy",
     [True, SimpleNamespace(mode="full")],
 )
+@pytest.mark.parametrize("backend_checkpointing", [False, True])
 def test_fsdp2_disables_model_checkpointing_and_keeps_backend_checkpointing(
     checkpoint_policy: object,
+    backend_checkpointing: bool,
 ) -> None:
-    plugin = SimpleNamespace(fsdp_version=2, activation_checkpointing=True)
+    plugin = SimpleNamespace(
+        fsdp_version=2,
+        activation_checkpointing=backend_checkpointing,
+    )
     disabled = []
     trainer = SimpleNamespace(
         accelerator=SimpleNamespace(
@@ -337,8 +445,14 @@ def test_fsdp1_keeps_model_checkpointing_and_disables_nested_backend_checkpointi
     assert plugin.activation_checkpointing is False
 
 
-def test_fsdp2_rejects_selective_model_and_backend_checkpointing() -> None:
-    plugin = SimpleNamespace(fsdp_version=2, activation_checkpointing=True)
+@pytest.mark.parametrize("backend_checkpointing", [False, True])
+def test_fsdp2_rejects_selective_model_checkpointing(
+    backend_checkpointing: bool,
+) -> None:
+    plugin = SimpleNamespace(
+        fsdp_version=2,
+        activation_checkpointing=backend_checkpointing,
+    )
     trainer = SimpleNamespace(
         accelerator=SimpleNamespace(
             distributed_type=DistributedType.FSDP,
@@ -359,7 +473,7 @@ def test_fsdp2_rejects_selective_model_and_backend_checkpointing() -> None:
         BaseTrainer._apply_backend_checkpointing_constraints(trainer)
 
     assert trainer.training_args.enable_gradient_checkpointing.mode == "every_n"
-    assert plugin.activation_checkpointing is True
+    assert plugin.activation_checkpointing is backend_checkpointing
 
 
 def test_fsdp2_keeps_backend_checkpointing_when_model_policy_is_disabled() -> None:

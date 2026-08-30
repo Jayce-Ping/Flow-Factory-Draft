@@ -405,12 +405,13 @@ Based on the fix type, write the fix entry to the appropriate document:
 - **Root Cause**: Model-level checkpointing captured FP32 block inputs before FSDP2's forward-input
   cast, while backward replay re-entered a block in `PRE_BACKWARD` state where PyTorch deliberately
   skips that cast.
-- **Fix**: When full model checkpointing and FSDP2 activation checkpointing are both requested, the
-  trainer now disables model-level boundaries and keeps Accelerate's backend checkpoint wrappers,
-  which replay inside the fully-sharded mixed-precision boundary. Selective policies fail closed
-  because backend checkpointing cannot preserve their exact selection, while FSDP1 retains its
-  existing owner. Wan FSDP2 GRPO, TDM, SFT, and offline DPO plus SD3.5 and Bagel regressions verify
-  the shared path.
+- **Fix**: Before loading the model, the trainer resolves one checkpoint owner. Any FSDP2 full
+  model policy is normalized to Accelerate's backend checkpoint wrappers, even when backend
+  checkpointing was initially disabled, because those wrappers replay inside the fully-sharded
+  mixed-precision boundary. Every selective FSDP2 model policy fails closed because its boundary
+  remains outside the input cast. FSDP1 retains its existing owner, and direct trainer construction
+  defensively reuses the same resolver after model realization. Wan FSDP2 GRPO, TDM, SFT, and
+  offline DPO plus SD3.5 and Bagel regressions verify the shared path.
 - **Lesson**: Checkpoint placement is part of distributed precision semantics. A recompute boundary
   outside a sharded module may not replay its forward hooks, so backend-aligned checkpoint wrappers
   must own FSDP2 full checkpointing instead of nesting model-level boundaries around sharded blocks.

@@ -7,7 +7,11 @@ from accelerate import Accelerator
 from accelerate.utils import DistributedType
 
 from ...hparams.optimizer_args import OptimizerArguments
+from ...hparams.training_args import TrainingArguments
 from ...optimizer import uses_muon
+from ...utils.logger_utils import setup_logger
+
+logger = setup_logger(__name__)
 
 
 def validate_supported_distributed_plan(accelerator: Accelerator) -> None:
@@ -64,6 +68,81 @@ def validate_optimizer_backend_plan(
         "(config/accelerate_configs/fsdp2.yaml), use DDP, or select the adamw "
         "optimizer."
     )
+
+
+def configure_checkpointing_backend_plan(
+    accelerator: Accelerator,
+    training_args: TrainingArguments,
+) -> bool:
+    """Select a checkpoint owner before model loading and distributed preparation.
+
+    Args:
+        accelerator: Runtime backend whose checkpointing policy is being configured.
+        training_args: Parsed algorithm arguments containing the model checkpoint policy.
+
+    Returns:
+        Whether a previously realized adapter must disable model checkpointing.
+
+    Raises:
+        ValueError: If FSDP2 is paired with a selective model checkpoint policy.
+    """
+    if accelerator.distributed_type != DistributedType.FSDP:
+        return False
+    fsdp_plugin = getattr(accelerator.state, "fsdp_plugin", None)
+    model_checkpointing = bool(
+        getattr(
+            training_args,
+            "gradient_checkpointing_enabled",
+            getattr(training_args, "enable_gradient_checkpointing", False),
+        )
+    )
+    fsdp_checkpointing = bool(getattr(fsdp_plugin, "activation_checkpointing", False))
+    fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) or 1
+
+    if training_args.trainer_type == "tdm-r1" and fsdp_version < 2:
+        if not model_checkpointing and not fsdp_checkpointing:
+            return False
+        training_args.enable_gradient_checkpointing = False
+        if fsdp_plugin is not None:
+            fsdp_plugin.activation_checkpointing = False
+        logger.warning(
+            "Disabled model and FSDP activation checkpointing for TDM-R1 on FSDP1: "
+            "the surrogate objective runs reference/snapshot forwards between its live "
+            "forward and backward, so FSDP1 recomputation saves a different graph. "
+            "FSDP2 does not require this fallback."
+        )
+        return model_checkpointing
+
+    if fsdp_version >= 2 and model_checkpointing:
+        checkpoint_policy = training_args.enable_gradient_checkpointing
+        full_checkpointing = checkpoint_policy is True or (
+            getattr(checkpoint_policy, "mode", None) == "full"
+        )
+        if not full_checkpointing:
+            raise ValueError(
+                "FSDP2 activation checkpointing cannot preserve selective model "
+                "checkpointing boundaries. Disable model checkpointing or use "
+                "train.enable_gradient_checkpointing=true/mode=full."
+            )
+        training_args.enable_gradient_checkpointing = False
+        if fsdp_plugin is None:
+            raise RuntimeError(
+                "FSDP2 full activation checkpointing requires an FSDP plugin, received None"
+            )
+        fsdp_plugin.activation_checkpointing = True
+        logger.info(
+            "Selected FSDP2 backend activation checkpointing and disabled train-level "
+            "model checkpointing so recomputation stays inside the mixed-precision boundary."
+        )
+        return True
+
+    if fsdp_version < 2 and model_checkpointing and fsdp_checkpointing:
+        fsdp_plugin.activation_checkpointing = False
+        logger.info(
+            "Disabled FSDP activation checkpointing because train-level model "
+            "checkpointing is enabled; nested checkpoint boundaries duplicate recompute."
+        )
+    return False
 
 
 def configure_deepspeed_micro_batch_size(
