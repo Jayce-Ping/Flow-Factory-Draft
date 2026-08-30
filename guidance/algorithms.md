@@ -762,7 +762,7 @@ The dynamics support matrix is:
 | `v` | Yes | No | None |
 | `x0` | Yes | No | None |
 
-`v` and `x0` fail fast under non-ODE dynamics because the target conversion assumes the ODE relation `mu = x_t + v * dt`. The `xt` target remains valid for Flow-SDE, Dance-SDE, and CPS; after optional self-normalization it is divided by the scheduler transition variance. No target uses the historical `0.5` multiplier. Rewards are used **only** for periodic eval monitoring (`evaluate()`), never in the distillation loss.
+`v` and `x0` fail fast under non-ODE dynamics because the target conversion assumes the ODE relation `mu = x_t + v * dt`. The `xt` target remains valid for Flow-SDE, Dance-SDE, and CPS; after optional self-normalization it is divided by the scheduler transition variance. No target uses the historical `0.5` multiplier. DiffusionOPD rejects training `rewards` because its execution contract has no feedback stage. Configure periodic monitoring only under `eval_rewards`; those scores are used by `evaluate()` and never enter the distillation loss.
 
 ### How it works (2-pass per epoch)
 
@@ -806,7 +806,7 @@ scheduler:
   noise_level: 0.0
 ```
 
-Each teacher's `applicable_datasets` must reference declared `data.datasets[*].name` entries (validated at config load). The config schema allows several teachers to share a dataset for a future multi-teacher/ensemble trainer, but the current `DiffusionOPDTrainer` requires exactly one teacher per dataset and raises otherwise. See [`examples/opd/lora/sd3_5/`](../examples/opd/lora/sd3_5/) for two complete configs (`DiffusionOPD_aligned.yaml` to reproduce official results).
+Each teacher's `applicable_datasets` must reference declared `data.datasets[*].name` entries (validated at config load). The config schema allows several teachers to share a dataset for a future multi-teacher/ensemble trainer, but the current `DiffusionOPDTrainer` requires exactly one teacher per dataset and raises otherwise. See [`examples/opd/lora/sd3_5/`](../examples/opd/lora/sd3_5/) for three complete configs; `DiffusionOPD_aligned.yaml` reproduces the official setup.
 
 ## References
 

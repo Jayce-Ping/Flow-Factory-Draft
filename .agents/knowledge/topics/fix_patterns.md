@@ -727,6 +727,19 @@ Based on the fix type, write the fix entry to the appropriate document:
   string, while keeping a late defensive call at the construction boundary.
 - **Related Constraint**: N/A
 
+### No-feedback algorithms must keep monitoring rewards eval-only
+- **Date**: 2026-08-31
+- **Symptom**: Every shipped DiffusionOPD example failed argument loading even though its reward
+  comments described monitoring rather than a training signal.
+- **Root Cause**: The examples duplicated evaluation rewards under top-level `rewards`, but the
+  algorithm declares a no-feedback execution contract that rejects every training reward.
+- **Fix**: The DiffusionOPD examples now keep monitoring models only under `eval_rewards`; the
+  algorithm guide states that evaluation scores never enter the distillation loss, and the shared
+  distillation contract tests cover DiffusionOPD alongside DMD2 and TDM.
+- **Lesson**: Monitoring intent does not change configuration semantics. A no-feedback algorithm
+  must express quality metrics through the evaluation-only reward surface.
+- **Related Constraint**: #7
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)
