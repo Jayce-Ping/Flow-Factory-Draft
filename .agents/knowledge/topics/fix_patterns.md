@@ -489,6 +489,20 @@ Based on the fix type, write the fix entry to the appropriate document:
   media utility for one private representation.
 - **Related Constraint**: #5
 
+### Endpoint-conditioned checkpoints are not interchangeable with I2V checkpoints
+- **Date**: 2026-08-30
+- **Symptom**: Every Wan first/last-frame smoke reached the transformer but failed while concatenating
+  image and text states because their leading dimensions were two and one.
+- **Root Cause**: The FLF2V matrix profile selected a standard Wan2.1 I2V checkpoint, whose image
+  projection lacks the learned endpoint positional embedding that folds two ordered CLIP image rows
+  back into one logical sample.
+- **Fix**: The public smoke profile and GPU validation plan now select the dedicated Wan2.1 FLF2V
+  checkpoint, and the supported-model table documents that checkpoint explicitly.
+- **Lesson**: Checkpoints that share a Diffusers pipeline class can still implement distinct
+  conditioning contracts. Validation profiles must bind semantic modes to weights whose trained
+  embedding layout realizes that mode instead of relying only on adapter-class compatibility.
+- **Related Constraint**: N/A
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

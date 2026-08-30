@@ -209,7 +209,7 @@ _CHECKPOINTS = {
     "bagel-mri2i": "ByteDance-Seed/BAGEL-7B-MoT",
     "wan-t2v": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
     "wan-i2v-first": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-    "wan-flf2v": "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
+    "wan-flf2v": "Wan-AI/Wan2.1-FLF2V-14B-720P-diffusers",
     "ltx2-t2av": "Lightricks/LTX-2",
     "ltx2-i2av": "Lightricks/LTX-2",
     "h3-t2va": "MiniMaxAI/MiniMax-H3",

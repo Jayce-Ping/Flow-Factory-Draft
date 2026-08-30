@@ -37,7 +37,7 @@ different condition layouts and active masks.
 | `bagel-mri2i` | Bagel ordered multi-reference-images-to-image regression anchor | `ByteDance-Seed/BAGEL-7B-MoT` | prompt plus exactly two ordered images per sample | image |
 | `wan-t2v` | Wan text-to-video | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | prompt | video |
 | `wan-i2v-first` | Wan first-frame-to-video | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | exactly one first-frame image | video |
-| `wan-flf2v` | Wan first/last-frame-to-video | `Wan-AI/Wan2.1-I2V-14B-480P-Diffusers` | ordered first and last images | video |
+| `wan-flf2v` | Wan first/last-frame-to-video | `Wan-AI/Wan2.1-FLF2V-14B-720P-diffusers` | ordered first and last images | video |
 | `ltx2-t2av` | LTX2 text-to-audio-video | `Lightricks/LTX-2` | prompt | ordered video and audio |
 | `ltx2-i2av` | LTX2 image-to-audio-video | `Lightricks/LTX-2` | prompt plus one image | ordered video and audio |
 | `h3-t2va` | MiniMax H3 text-to-video-audio | `MiniMaxAI/MiniMax-H3` | prompt | ordered video and audio |
@@ -94,7 +94,7 @@ recorded in the resolved YAML; do not silently return to a large quality recipe.
 | `bagel-mri2i` | `examples/grpo/lora/bagel/i2i.yaml` | `resolution: 256` | `num_inference_steps: 2` | Every row has exactly two ordered references; keep `shuffle_samples: false`. |
 | `wan-t2v` | `examples/grpo/lora/wan21/t2v.yaml` | `resolution: 240`, `num_frames: 5` | `num_inference_steps: 2` | Target video has at least five frames and carries its source `fps`. |
 | `wan-i2v-first` | `examples/grpo/lora/wan22/i2v.yaml` | `resolution: 240`, `num_frames: 5` | `num_inference_steps: 2` | Use TI2V-5B and exactly one condition image. |
-| `wan-flf2v` | `examples/grpo/lora/wan21/i2v.yaml` | `resolution: 240`, `num_frames: 5` | `num_inference_steps: 2` | Use two ordered condition images; do not use an expanded-timestep checkpoint. |
+| `wan-flf2v` | `examples/grpo/lora/wan21/i2v.yaml` | `resolution: 240`, `num_frames: 5` | `num_inference_steps: 2` | Use the dedicated FLF2V checkpoint with two ordered condition images. |
 | `ltx2-t2av` | `examples/grpo/lora/ltx2/t2av.yaml` | `resolution: [128, 192]`, `num_frames: 9`, `frame_rate: 24.0` | `num_inference_steps: 2` | AV targets cover the exact 9-frame clock; audio carries `sample_rate`. |
 | `ltx2-i2av` | `examples/grpo/lora/ltx2/i2av.yaml` | `resolution: [128, 192]`, `num_frames: 9`, `frame_rate: 24.0` | `num_inference_steps: 2` | One condition image; verify the first latent frame is inactive in the loss. |
 | `h3-t2va` | `examples/grpo/lora/minimax_h3_t2va/debug.yaml` | `resolution: [64, 96]`, `num_frames: 124`, `frame_rate: 24.0` | `num_inference_steps: 2` | Preserve the released five-second minimum and neutral guidance. |
@@ -163,14 +163,15 @@ backends and all four algorithms.
 |---|---|
 | Wan T2V | `Wan2.1-T2V-14B-Diffusers`, `Wan2.2-TI2V-5B-Diffusers`, `Wan2.2-T2V-A14B-Diffusers` |
 | Wan I2V first-only | `Wan2.1-I2V-14B-480P-Diffusers`, `Wan2.1-I2V-14B-720P-Diffusers`, `Wan2.2-I2V-A14B-Diffusers` |
-| Wan first/last | `Wan2.1-I2V-14B-720P-Diffusers`, `Wan2.2-I2V-A14B-Diffusers` |
+| Wan first/last | `Wan2.2-I2V-A14B-Diffusers` |
 | LTX2 T2AV and I2AV | `dg845/LTX-2.3-Diffusers` |
 | MiniMax H3 | The same checkpoint is covered separately by T2VA, FL2VA, and Ref2VA inputs. Add an FL2VA first-plus-last fixture to complement the first-only/last-only main jobs. |
 
-Wan2.2 TI2V-5B uses expanded timesteps. Official Diffusers ignores a supplied
-last image in that mode, so its effective input contract is first-frame only;
-do not count it as a first/last checkpoint. Other Wan I2V checkpoints must prove
-both first-only and first/last execution.
+Wan2.2 TI2V-5B uses expanded timesteps, and standard CLIP-conditioned Wan2.1 I2V
+checkpoints lack endpoint positional embeddings; both are first-frame only. The
+dedicated Wan2.1 FLF2V checkpoint requires both endpoints. Wan2.2 I2V-A14B does
+not use CLIP image embeddings, so its VAE-only optional-last path remains a
+separate first/last variant gate.
 
 For the Wan2.2 A14B dual-transformer gate, force or instrument two offline
 timestep samples so that one routes below the transformer boundary and one

@@ -106,6 +106,9 @@ def test_gpu_validation_plan_declares_the_complete_smoke_matrix() -> None:
     assert "two training epochs" in text
     assert "eval.eval_freq: 0" in text
     assert "DistributedSampler" in text
+    assert "Wan-AI/Wan2.1-FLF2V-14B-720P-diffusers" in text
+    assert "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers` | ordered first and last" not in text
+    assert "| Wan first/last | `Wan2.2-I2V-A14B-Diffusers` |" in text
 
 
 def test_install_docs_use_the_released_diffusers_runtime() -> None:

@@ -106,6 +106,7 @@ def test_gpu_variants_keep_model_specific_clocks() -> None:
     assert (wan.height, wan.num_frames) == (240, 5)
     assert (ltx.height, ltx.width, ltx.num_frames, ltx.sample_rate) == (128, 192, 9, 16000)
     assert (h3.height, h3.width, h3.num_frames, h3.sample_rate) == (64, 96, 124, 32000)
+    assert cases["wan-flf2v"].checkpoint == "Wan-AI/Wan2.1-FLF2V-14B-720P-diffusers"
     assert p.get_profile("image-i2i") is p.CANONICAL_PROFILES["image_to_image"]
 
 
