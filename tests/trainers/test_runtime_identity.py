@@ -362,6 +362,95 @@ def test_optimizer_schema_rejects_parameters_outside_rebound_registry() -> None:
         build_trainer_runtime_identity(trainer)
 
 
+@pytest.mark.parametrize("zero_stage", (1, 2))
+def test_deepspeed_optimizer_schema_maps_flat_partitions_through_logical_groups(
+    zero_stage: int,
+) -> None:
+    """ZeRO flat optimizer partitions retain their logical variant ownership."""
+
+    def identity(partition_widths: tuple[int, int]) -> dict[str, Any]:
+        trainer = _Trainer()
+        fake_parameter = torch.nn.Parameter(torch.ones(3, 3))
+        trainer.adapter.component_variant_registry.records["fake"] = (
+            _Record("transformer", "fake_weight", fake_parameter),
+        )
+        trainer.optimizer.add_param_group(
+            {"params": [fake_parameter], "role_name": "fake", "lr": 2e-3}
+        )
+        trainer.config.optimizer_args = MultiOptimizerArguments(
+            optimizer_configs=[
+                AdamWOptimizerArguments(name="base", learning_rate=1e-3),
+                AdamWOptimizerArguments(name="fake", learning_rate=2e-3),
+            ]
+        )
+        trainer._required_trainable_roles = lambda: ("base", "fake")
+
+        basic_optimizer = trainer.optimizer
+        logical_groups = [list(group["params"]) for group in basic_optimizer.param_groups]
+        for group, width in zip(basic_optimizer.param_groups, partition_widths):
+            group["params"] = [torch.nn.Parameter(torch.zeros(width), requires_grad=True)]
+        zero_optimizer = SimpleNamespace(
+            bit16_groups=logical_groups,
+            optimizer=basic_optimizer,
+        )
+        trainer.optimizer = SimpleNamespace(
+            param_groups=basic_optimizer.param_groups,
+            optimizer=zero_optimizer,
+        )
+        trainer.accelerator.distributed_type = DistributedType.DEEPSPEED
+        trainer.accelerator.state.deepspeed_plugin = SimpleNamespace(
+            zero_stage=zero_stage,
+            deepspeed_config={"zero_optimization": {"stage": zero_stage}},
+            gradient_accumulation_steps=1,
+            gradient_clipping=1.0,
+            is_train_batch_min=True,
+        )
+        return build_trainer_runtime_identity(trainer)
+
+    rank_zero = identity((5, 7))
+    rank_one = identity((6, 8))
+
+    assert rank_zero["parameter_schema_digest"] == rank_one["parameter_schema_digest"]
+    assert rank_zero["optimizer_schema_digest"] == rank_one["optimizer_schema_digest"]
+
+
+def test_deepspeed_optimizer_schema_rejects_foreign_logical_parameters() -> None:
+    """ZeRO logical groups must still exhaust only registry-owned parameters."""
+    trainer = _Trainer()
+    trainer.accelerator.distributed_type = DistributedType.DEEPSPEED
+    trainer.accelerator.state.deepspeed_plugin = SimpleNamespace(zero_stage=2)
+    trainer.optimizer.optimizer = SimpleNamespace(
+        bit16_groups=[[torch.nn.Parameter(torch.zeros(1))]]
+    )
+
+    with pytest.raises(ValueError, match="not owned by the rebound variant registry"):
+        build_trainer_runtime_identity(trainer)
+
+
+@pytest.mark.parametrize(
+    ("logical_groups", "error_type", "message"),
+    (
+        (None, TypeError, "requires the logical model parameter groups"),
+        ([], ValueError, "logical and partitioned group counts to match"),
+    ),
+)
+def test_deepspeed_optimizer_schema_rejects_invalid_logical_groups(
+    logical_groups: list[list[torch.nn.Parameter]] | None,
+    error_type: type[Exception],
+    message: str,
+) -> None:
+    """ZeRO identity fails closed when its logical parameter seam is unavailable."""
+    trainer = _Trainer()
+    trainer.accelerator.distributed_type = DistributedType.DEEPSPEED
+    trainer.accelerator.state.deepspeed_plugin = SimpleNamespace(zero_stage=2)
+    trainer.optimizer.optimizer = SimpleNamespace()
+    if logical_groups is not None:
+        trainer.optimizer.optimizer.bit16_groups = logical_groups
+
+    with pytest.raises(error_type, match=message):
+        build_trainer_runtime_identity(trainer)
+
+
 def test_backend_and_precision_drift_change_the_resume_identity() -> None:
     """Backend checkpoint layouts are rejected before prepared-state mutation."""
     baseline_trainer = _Trainer()
@@ -456,6 +545,9 @@ def test_deepspeed_batch_and_accumulation_drift_changes_backend_digest() -> None
             gradient_accumulation_steps=accumulation_steps,
             gradient_clipping="auto",
             is_train_batch_min=True,
+        )
+        trainer.optimizer.optimizer = SimpleNamespace(
+            bit16_groups=[list(group["params"]) for group in trainer.optimizer.param_groups]
         )
         return build_trainer_runtime_identity(trainer)
 

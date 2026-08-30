@@ -25,6 +25,7 @@ from functools import partial
 from typing import Any
 
 import torch
+from accelerate.utils import DistributedType
 from torch.utils.data import ConcatDataset, DataLoader, Subset
 
 _EXECUTION_IDENTITY_HOOK = "runtime_execution_identity_payload"
@@ -930,10 +931,13 @@ def _parameter_schema(trainer: Any) -> tuple[list[dict[str, Any]], dict[int, str
 def _optimizer_schema(trainer: Any, parameter_keys: Mapping[int, str]) -> dict[str, Any]:
     """Return ordered optimizer groups linked to the stable parameter schema."""
     optimizer = trainer.optimizer
+    optimizer_groups = optimizer.param_groups
+    logical_parameter_groups = _logical_optimizer_parameter_groups(trainer, optimizer_groups)
     groups = []
-    consumed_parameters: set[int] = set()
-    for group_index, group in enumerate(optimizer.param_groups):
-        raw_parameters = group.get("params")
+    consumed_parameters: set[str] = set()
+    for group_index, (group, raw_parameters) in enumerate(
+        zip(optimizer_groups, logical_parameter_groups)
+    ):
         if not isinstance(raw_parameters, Sequence):
             raise TypeError(
                 f"optimizer group {group_index} params must be a sequence, "
@@ -947,9 +951,9 @@ def _optimizer_schema(trainer: Any, parameter_keys: Mapping[int, str]) -> dict[s
                     "optimizer schema contains a parameter not owned by the rebound "
                     f"variant registry at group {group_index}, index {parameter_index}"
                 )
-            if id(parameter) in consumed_parameters:
+            if key in consumed_parameters:
                 raise ValueError(f"optimizer schema references parameter {key!r} more than once")
-            consumed_parameters.add(id(parameter))
+            consumed_parameters.add(key)
             group_parameters.append(key)
         settings = {}
         for key, value in group.items():
@@ -970,16 +974,44 @@ def _optimizer_schema(trainer: Any, parameter_keys: Mapping[int, str]) -> dict[s
                 "settings": settings,
             }
         )
-    missing_parameters = frozenset(parameter_keys).difference(consumed_parameters)
+    missing_parameters = frozenset(parameter_keys.values()).difference(consumed_parameters)
     if missing_parameters:
-        missing_keys = tuple(parameter_keys[identity] for identity in missing_parameters)
         raise ValueError(
-            "optimizer schema does not exhaust rebound variant parameters: " f"{missing_keys!r}"
+            "optimizer schema does not exhaust rebound variant parameters: "
+            f"{tuple(sorted(missing_parameters))!r}"
         )
     return {
         "type_chain": _optimizer_type_chain(optimizer),
         "groups": groups,
     }
+
+
+def _logical_optimizer_parameter_groups(
+    trainer: Any,
+    optimizer_groups: Sequence[Mapping[str, Any]],
+) -> Sequence[Sequence[torch.Tensor]]:
+    """Return model-owned parameters before ZeRO replaces groups with flat partitions."""
+    accelerator = trainer.accelerator
+    deepspeed_plugin = getattr(getattr(accelerator, "state", None), "deepspeed_plugin", None)
+    if getattr(accelerator, "distributed_type", None) != DistributedType.DEEPSPEED or getattr(
+        deepspeed_plugin, "zero_stage", None
+    ) not in (1, 2):
+        return tuple(group.get("params") for group in optimizer_groups)
+
+    deepspeed_optimizer = getattr(trainer.optimizer, "optimizer", None)
+    logical_groups = getattr(deepspeed_optimizer, "bit16_groups", None)
+    if not isinstance(logical_groups, Sequence) or isinstance(logical_groups, (str, bytes)):
+        raise TypeError(
+            "DeepSpeed ZeRO-1/2 optimizer schema requires the logical model parameter "
+            f"groups from optimizer.bit16_groups, received {type(logical_groups).__name__}: "
+            f"{logical_groups!r}"
+        )
+    if len(logical_groups) != len(optimizer_groups):
+        raise ValueError(
+            "DeepSpeed ZeRO-1/2 optimizer schema expected logical and partitioned group "
+            f"counts to match, received {len(logical_groups)} and {len(optimizer_groups)}"
+        )
+    return logical_groups
 
 
 def _optimizer_type_chain(optimizer: Any) -> list[str]:

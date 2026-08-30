@@ -333,6 +333,20 @@ Based on the fix type, write the fix entry to the appropriate document:
   and set-like identity fields require one canonical representation.
 - **Related Constraint**: #5
 
+### ZeRO optimizer identity must use logical model groups
+- **Date**: 2026-08-30
+- **Symptom**: Every ZeRO-2 trainer failed during initialization because its optimizer schema
+  contained a parameter not owned by the rebound component-variant registry.
+- **Root Cause**: DeepSpeed ZeRO-1/2 replaces each public optimizer group with a rank-local flat
+  FP32 master partition, while runtime identity incorrectly treated those partitions as the live
+  model parameters owned by the registry.
+- **Fix**: Runtime identity now maps stable parameter ownership through DeepSpeed's retained
+  `bit16_groups` and continues to serialize settings from the public optimizer groups. It fails
+  closed if logical groups are absent or do not match the partitioned group count.
+- **Lesson**: A distributed optimizer's public parameter groups may be physical state partitions;
+  exact-resume identity must separate logical model ownership from physical group settings.
+- **Related Constraint**: #18a
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)
