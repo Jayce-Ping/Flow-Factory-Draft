@@ -21,7 +21,7 @@ from typing import Iterable
 import torch
 from torch import nn
 
-H3_MAX_FEED_FORWARD_TOKENS = 2048
+H3_MAX_FEED_FORWARD_TOKENS = 1024
 
 
 class _ChunkedFeedForward(nn.Module):

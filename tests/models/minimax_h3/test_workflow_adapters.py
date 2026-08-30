@@ -338,7 +338,7 @@ def test_workflow_adapter_loads_pruned_runtime_and_exact_setup_components(
     assert not hasattr(adapter.pipeline, "unrelated")
     assert transformer_name in adapter.component_runtime.materialized_component_names
     transformer = adapter.get_component(transformer_name)
-    assert H3_MAX_FEED_FORWARD_TOKENS == 2048
+    assert H3_MAX_FEED_FORWARD_TOKENS == 1024
     configured_blocks = [
         *transformer.token_refiner.refiner_blocks,
         *transformer.transformer_blocks,
