@@ -319,10 +319,11 @@ def prepare_wan_i2v_condition_tensors(
     ).to(device=device, dtype=dtype)
     latent_condition = normalize_wan_video_latents(adapter, latent_condition)
 
+    condition_latent_frames = (video_condition.shape[2] - 1) // temporal_scale + 1
     expected_latents = (
         batch_size,
         vae.config.z_dim,
-        num_latent_frames,
+        condition_latent_frames,
         latent_height,
         latent_width,
     )

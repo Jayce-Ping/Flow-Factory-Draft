@@ -72,11 +72,15 @@ class _VAE:
             latents_std=[2.0, 4.0, 5.0],
         )
         raw_channels = torch.tensor([3.0, 6.0, 8.0]).view(1, 3, 1, 1, 1)
-        self.posterior = _Posterior(raw_channels.expand(1, 3, 2, 2, 2).clone())
+        self.full_latents = raw_channels.expand(1, 3, 2, 2, 2).clone()
+        self.posterior = _Posterior(self.full_latents)
         self.encoded_pixels: list[torch.Tensor] = []
 
     def encode(self, pixels: torch.Tensor) -> Any:
         self.encoded_pixels.append(pixels)
+        self.posterior.latents = (
+            self.full_latents[:, :, :1] if pixels.shape[2] == 1 else self.full_latents
+        )
         return SimpleNamespace(latent_dist=self.posterior)
 
 
@@ -384,8 +388,14 @@ def test_wan_i2v_expand_condition_binds_target_active_mask() -> None:
 
     condition = prepared.forward_context["latent_condition"]
     mask = prepared.forward_context["first_frame_mask"]
-    assert condition.shape == (1, 3, 2, 2, 2)
+    assert condition.shape == (1, 3, 1, 2, 2)
     assert mask.shape == (1, 1, 2, 2, 2)
+    assert adapter.vae.encoded_pixels[0].shape[2] == 1
+    rollout_latents = torch.full((1, 3, 2, 2, 2), 2.0)
+    blended = (1 - mask) * condition + mask * rollout_latents
+    assert blended.shape == rollout_latents.shape
+    torch.testing.assert_close(blended[:, :, 0], condition[:, :, 0])
+    torch.testing.assert_close(blended[:, :, 1], rollout_latents[:, :, 1])
     torch.testing.assert_close(mask[:, :, 0], torch.zeros(1, 1, 2, 2))
     torch.testing.assert_close(mask[:, :, 1], torch.ones(1, 1, 2, 2))
     assert prepared.output_context["first_frame_mask"] is mask

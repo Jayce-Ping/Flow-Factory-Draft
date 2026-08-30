@@ -460,6 +460,21 @@ Based on the fix type, write the fix entry to the appropriate document:
   does not prove its conditionally imported helpers are callable.
 - **Related Constraint**: N/A
 
+### Condition-latent geometry follows the encoded source, not the rollout target
+- **Date**: 2026-08-30
+- **Symptom**: Wan2.2 TI2V rejected a one-frame VAE condition latent with temporal size one because
+  the rollout noise and target video had temporal latent size two.
+- **Root Cause**: The condition validator derived its expected temporal size from configured output
+  frames. In the expanded-timestep pipeline, Diffusers intentionally encodes only the first input
+  frame and broadcasts that one-frame condition through a full-length first-frame mask.
+- **Fix**: Wan condition validation now derives temporal geometry from the actual video tensor sent
+  to the VAE. The regression models one-frame encoding and proves the official broadcast produces
+  the full rollout shape while non-expanded conditions keep their full temporal encoding.
+- **Lesson**: Conditioning and generated states can share channels and spatial geometry without
+  sharing sequence length. Validate each representation against its own source transform before
+  relying on an explicitly defined broadcast or mask contract.
+- **Related Constraint**: #7
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)
