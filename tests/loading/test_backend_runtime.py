@@ -22,13 +22,17 @@ class _AcceleratorFake:
     num_processes = 2
     process_index = 0
 
-    def __init__(self, *, efficient: bool) -> None:
+    def __init__(self, *, efficient: bool, fsdp_version: int = 2) -> None:
         self.state = SimpleNamespace(
             fsdp_plugin=SimpleNamespace(
-                fsdp_version=2,
+                fsdp_version=fsdp_version,
                 cpu_ram_efficient_loading=efficient,
+                transformer_cls_names_to_wrap=None,
             )
         )
+
+    def prepare(self, *objects):
+        return list(objects) if len(objects) > 1 else objects[0]
 
     def wait_for_everyone(self) -> None:
         return None
@@ -103,6 +107,79 @@ def test_reward_scope_restores_target_loading_environment(
         assert os.environ["FSDP_CPU_RAM_EFFICIENT_LOADING"] == "false"
 
     assert os.environ["FSDP_CPU_RAM_EFFICIENT_LOADING"] == "true"
+
+
+class _FSDPModuleFake(torch.nn.Linear):
+    def __init__(self) -> None:
+        super().__init__(2, 2)
+        self.unshard_async_op_calls = []
+
+    def _set_unshard_async_op(self, enabled: bool) -> None:
+        self.unshard_async_op_calls.append(enabled)
+
+
+def test_prepare_enables_adapter_requested_fsdp2_default_stream_unshard() -> None:
+    module = _FSDPModuleFake()
+    optimizer = object()
+    runtime = FSDPBackendLoadRuntime(
+        _AcceleratorFake(efficient=True),
+        _plan(),
+        SimpleNamespace(fsdp2_use_default_stream_unshard=True),
+    )
+
+    prepared = runtime.prepare(module, optimizer)
+
+    assert prepared == [module, optimizer]
+    assert module.unshard_async_op_calls == [True]
+
+
+def test_prepare_extends_fsdp2_wrap_policy_before_distributed_preparation() -> None:
+    module = _FSDPModuleFake()
+    module._no_split_modules = ["TransformerBlock"]
+    accelerator = _AcceleratorFake(efficient=True)
+    runtime = FSDPBackendLoadRuntime(
+        accelerator,
+        _plan(),
+        SimpleNamespace(
+            fsdp2_additional_wrap_module_names=("ChunkedFeedForward",),
+        ),
+    )
+
+    assert runtime.prepare(module) is module
+    assert accelerator.state.fsdp_plugin.transformer_cls_names_to_wrap == [
+        "TransformerBlock",
+        "ChunkedFeedForward",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("fsdp_version", "requested"),
+    [(1, True), (2, False)],
+)
+def test_prepare_preserves_default_unshard_without_fsdp2_adapter_opt_in(
+    fsdp_version: int,
+    requested: bool,
+) -> None:
+    module = _FSDPModuleFake()
+    runtime = FSDPBackendLoadRuntime(
+        _AcceleratorFake(efficient=True, fsdp_version=fsdp_version),
+        _plan(),
+        SimpleNamespace(fsdp2_use_default_stream_unshard=requested),
+    )
+
+    assert runtime.prepare(module) is module
+    assert module.unshard_async_op_calls == []
+
+
+def test_prepare_rejects_missing_fsdp2_default_stream_unshard_api() -> None:
+    runtime = FSDPBackendLoadRuntime(
+        _AcceleratorFake(efficient=True),
+        _plan(),
+        SimpleNamespace(fsdp2_use_default_stream_unshard=True),
+    )
+
+    with pytest.raises(TypeError, match="requires prepared modules.*_set_unshard_async_op"):
+        runtime.prepare(torch.nn.Linear(2, 2))
 
 
 def test_physical_target_root_is_not_selected_as_auxiliary() -> None:

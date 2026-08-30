@@ -120,6 +120,53 @@ class FSDPBackendLoadRuntime(BackendLoadRuntime):
             else:
                 os.environ["FSDP_CPU_RAM_EFFICIENT_LOADING"] = previous
 
+    def prepare(self, *objects: Any) -> Any:
+        """Prepare roots and apply adapter-requested FSDP2 communication policy."""
+        self._extend_fsdp2_wrap_policy(objects)
+        prepared = super().prepare(*objects)
+        plugin = self.accelerator.state.fsdp_plugin
+        if (getattr(plugin, "fsdp_version", 1) or 1) < 2 or not getattr(
+            self.adapter, "fsdp2_use_default_stream_unshard", False
+        ):
+            return prepared
+
+        prepared_objects = prepared if isinstance(prepared, (list, tuple)) else (prepared,)
+        configured = []
+        for original, candidate in zip(objects, prepared_objects):
+            if not isinstance(original, nn.Module):
+                continue
+            configure = getattr(candidate, "_set_unshard_async_op", None)
+            if not callable(configure):
+                raise TypeError(
+                    "FSDP2 default-stream unshard requires prepared modules to expose "
+                    f"_set_unshard_async_op(), received {type(candidate).__name__}"
+                )
+            configure(True)
+            configured.append(type(candidate).__name__)
+        if not configured:
+            raise TypeError("FSDP2 default-stream unshard requested without a prepared module")
+        logger.info("Enabled FSDP2 default-stream unshard for roots: %s", configured)
+        return prepared
+
+    def _extend_fsdp2_wrap_policy(self, objects: Sequence[Any]) -> None:
+        plugin = self.accelerator.state.fsdp_plugin
+        additional = tuple(getattr(self.adapter, "fsdp2_additional_wrap_module_names", ()))
+        if (getattr(plugin, "fsdp_version", 1) or 1) < 2 or not additional:
+            return
+        configured = getattr(plugin, "transformer_cls_names_to_wrap", None)
+        if configured is None:
+            configured = [
+                name
+                for candidate in objects
+                if isinstance(candidate, nn.Module)
+                for name in (getattr(candidate, "_no_split_modules", None) or ())
+            ]
+        plugin.transformer_cls_names_to_wrap = list(dict.fromkeys([*configured, *additional]))
+        logger.info(
+            "Extended FSDP2 transformer wrap modules: %s",
+            plugin.transformer_cls_names_to_wrap,
+        )
+
     def bootstrap_targets(self) -> None:
         if not self.cpu_ram_efficient_loading or self.accelerator.num_processes <= 1:
             return

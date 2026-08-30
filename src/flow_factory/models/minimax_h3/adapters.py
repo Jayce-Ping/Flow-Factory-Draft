@@ -354,6 +354,12 @@ class MiniMaxH3Ref2VAAdapter(_MiniMaxH3WorkflowAdapter, BaseAdapter):
 
     workflow: ClassVar[str] = "ref2va"
     transformer_component_name: ClassVar[str] = "transformer_ref"
+    fsdp2_use_default_stream_unshard: ClassVar[bool] = True
+    fsdp2_additional_wrap_module_names: ClassVar[Tuple[str, ...]] = (
+        "_ChunkedFeedForward",
+        "MiniMaxH3AdaLayerNormModulation",
+        "MiniMaxH3Attention",
+    )
     supports_ordered_references: ClassVar[bool] = True
     preprocessing_modules: ClassVar[List[str]] = [
         "image_processor",

@@ -577,6 +577,22 @@ Based on the fix type, write the fix entry to the appropriate document:
   as the lifetime boundary for its saved activations.
 - **Related Constraint**: N/A
 
+### FSDP2 overlap can retain an all-gather buffer beyond a memory-tight block
+- **Date**: 2026-08-30
+- **Symptom**: MiniMax H3 Ref2VA FSDP2 GRPO exhausted a 95 GiB device when a block
+  pre-forward all-gather requested 1.21 GiB with only 1.03 GiB free.
+- **Root Cause**: Each H3 transformer block formed one 1.21 GiB gather unit, while FSDP2's default
+  implicit overlap also retained the current raw gather result through the next block's copy-in.
+  The long Ref2VA packed sequence left too little headroom for either lifetime.
+- **Fix**: Ref2VA extends the FSDP2 wrap policy with its attention, chunked feed-forward, and
+  496 MiB AdaLN modulation modules, splitting each block into call-ordered gather units. It also
+  opts into default-stream unshard immediately after distributed preparation so each raw gather
+  result is released after copy-out, trading communication overlap for lower peak allocation.
+- **Lesson**: When model activations nearly fill a device, communication overlap is also a memory
+  policy. Apply the backend's explicit lifetime control at the prepared root instead of adding
+  allocator flushes or weakening model semantics.
+- **Related Constraint**: N/A
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

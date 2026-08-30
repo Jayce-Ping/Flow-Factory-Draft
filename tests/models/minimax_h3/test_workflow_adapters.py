@@ -42,6 +42,19 @@ class UpstreamSchedulerFake:
     """Represent the lazy upstream scheduler replaced by Flow-Factory."""
 
 
+def test_only_ref2va_requests_fsdp2_default_stream_unshard() -> None:
+    assert MiniMaxH3Ref2VAAdapter.fsdp2_use_default_stream_unshard
+    assert MiniMaxH3Ref2VAAdapter.fsdp2_additional_wrap_module_names == (
+        "_ChunkedFeedForward",
+        "MiniMaxH3AdaLayerNormModulation",
+        "MiniMaxH3Attention",
+    )
+    assert not MiniMaxH3T2VAAdapter.fsdp2_use_default_stream_unshard
+    assert not MiniMaxH3T2VAAdapter.fsdp2_additional_wrap_module_names
+    assert not MiniMaxH3FL2VAAdapter.fsdp2_use_default_stream_unshard
+    assert not MiniMaxH3FL2VAAdapter.fsdp2_additional_wrap_module_names
+
+
 class SwiGLU(nn.Module):
     """Match the upstream activation class name without adding parameters."""
 

@@ -233,6 +233,9 @@ class BaseAdapter(ABC):
     # ``cache_context``. The rollout cache accelerator rejects the default.
     supports_diffusers_cache: ClassVar[bool] = False
     supports_fsdp2_cpu_efficient_loading: ClassVar[bool] = False
+    # Opt in only when FSDP2 communication overlap exceeds the model's activation headroom.
+    fsdp2_use_default_stream_unshard: ClassVar[bool] = False
+    fsdp2_additional_wrap_module_names: ClassVar[Tuple[str, ...]] = ()
     supports_ordered_references: ClassVar[bool] = False
     preprocess_cache_fields: ClassVar[frozenset[str]] = frozenset()
     preprocess_cache_version: ClassVar[str] = ""
