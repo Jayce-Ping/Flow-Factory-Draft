@@ -503,6 +503,20 @@ Based on the fix type, write the fix entry to the appropriate document:
   embedding layout realizes that mode instead of relying only on adapter-class compatibility.
 - **Related Constraint**: N/A
 
+### Wan endpoint cardinality follows the checkpoint embedding path
+- **Date**: 2026-08-30
+- **Symptom**: The Wan I2V adapter advertised one optional last frame for every checkpoint even
+  though standard Wan2.1 I2V and dedicated FLF2V weights require different exact image counts.
+- **Root Cause**: The effective pipeline contract specialized only expanded-timestep checkpoints
+  and ignored whether the loaded transformer used no CLIP image states, ordinary CLIP states, or
+  learned first/last endpoint positional embeddings.
+- **Fix**: Wan now resolves exact-one for expanded or ordinary CLIP-conditioned checkpoints,
+  exact-two for endpoint-positioned FLF2V weights, and preserves one-or-two for Wan2.2's VAE-only
+  condition path. The public FLF smoke profile independently requires both endpoint slots.
+- **Lesson**: A shared adapter's public superset contract must be narrowed from realized checkpoint
+  structure before dataset validation, cache identity, or exact-resume identity is derived.
+- **Related Constraint**: #5
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

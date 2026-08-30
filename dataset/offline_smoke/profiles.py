@@ -172,10 +172,10 @@ _I2V = video_output_contract(
 )
 _FL2V = video_output_contract(
     negative_prompt=_NO_NEGATIVE,
-    input_image_min_count=1,
+    input_image_min_count=2,
     input_image_max_count=2,
     input_image_slots=("first_frame", "last_frame"),
-    required_input_image_slots=("first_frame",),
+    required_input_image_slots=("first_frame", "last_frame"),
     output_fps=RateRequirement.REQUIRED,
 )
 _T2AV = audio_video_output_contract(negative_prompt=_NO_NEGATIVE)

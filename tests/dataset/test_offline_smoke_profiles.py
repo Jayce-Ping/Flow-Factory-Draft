@@ -79,8 +79,9 @@ def test_image_and_endpoint_profiles_keep_cardinality_order_and_slots() -> None:
     assert (first_video.slots, first_video.required_slots) == (("first_frame",), ("first_frame",))
     assert (fl_video.slots, fl_video.required_slots) == (
         ("first_frame", "last_frame"),
-        ("first_frame",),
+        ("first_frame", "last_frame"),
     )
+    assert (fl_video.min_count, fl_video.max_count) == (2, 2)
     assert (first_av.slots, first_av.required_slots) == (("first_frame",), ("first_frame",))
     assert (fl_av.slots, fl_av.required_slots) == (("first_frame", "last_frame"), ())
 

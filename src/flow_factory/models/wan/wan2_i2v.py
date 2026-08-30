@@ -122,9 +122,38 @@ class Wan2_I2V_Adapter(BaseAdapter):
         )
 
     def _resolve_pipeline_io_contract(self) -> PipelineIOContract:
-        """Narrow expand-timestep checkpoints to their first-frame-only semantics."""
+        """Resolve checkpoint-specific first/last-frame cardinality."""
+        supports_endpoint_pair = False
         if not self.pipeline.config.expand_timesteps:
-            return type(self).pipeline_io_contract
+            transformer_configs = tuple(
+                transformer.config
+                for transformer in (
+                    getattr(self.pipeline, "transformer", None),
+                    getattr(self.pipeline, "transformer_2", None),
+                )
+                if transformer is not None
+            )
+            clip_configs = tuple(
+                config
+                for config in transformer_configs
+                if getattr(config, "image_dim", None) is not None
+            )
+            if not clip_configs:
+                return type(self).pipeline_io_contract
+            supports_endpoint_pair = any(
+                getattr(config, "pos_embed_seq_len", None) is not None for config in clip_configs
+            )
+        if supports_endpoint_pair:
+            return video_output_contract(
+                negative_prompt=NegativePromptPolicy.OPTIONAL,
+                input_image_min_count=2,
+                input_image_max_count=2,
+                input_image_slots=("first_frame", "last_frame"),
+                required_input_image_slots=("first_frame", "last_frame"),
+                output_fps=RateRequirement.REQUIRED,
+                geometry_source=GeometrySource.CONFIGURED,
+                batch_capability=BatchCapability.SINGLE_SAMPLE,
+            )
         return video_output_contract(
             negative_prompt=NegativePromptPolicy.OPTIONAL,
             input_image_min_count=1,

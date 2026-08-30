@@ -299,7 +299,7 @@ def test_wan_geometry_validator_rejects_output_context_drift() -> None:
         )
 
 
-def test_wan_i2v_declares_ordered_first_optional_last_offline_contract() -> None:
+def test_wan_i2v_resolves_checkpoint_specific_endpoint_contract() -> None:
     contract = Wan2_I2V_Adapter.pipeline_io_contract
 
     assert contract.geometry_source is GeometrySource.CONFIGURED
@@ -322,8 +322,27 @@ def test_wan_i2v_declares_ordered_first_optional_last_offline_contract() -> None
 
     runtime = object.__new__(Wan2_I2V_Adapter)
     runtime.pipeline = _Adapter().pipeline
+    runtime.pipeline.transformer.config.image_dim = None
+    runtime.pipeline.transformer.config.pos_embed_seq_len = None
+    runtime.pipeline.transformer_2 = SimpleNamespace(
+        config=SimpleNamespace(image_dim=None, pos_embed_seq_len=None)
+    )
     effective = Wan2_I2V_Adapter._resolve_pipeline_io_contract(runtime)
-    assert effective.input_media.rules[0].max_count == 2
+    rule = effective.input_media.rules[0]
+    assert (rule.min_count, rule.max_count) == (1, 2)
+
+    runtime.pipeline.transformer_2 = None
+    runtime.pipeline.transformer.config.image_dim = 1280
+    effective = Wan2_I2V_Adapter._resolve_pipeline_io_contract(runtime)
+    rule = effective.input_media.rules[0]
+    assert (rule.min_count, rule.max_count) == (1, 1)
+
+    runtime.pipeline.transformer.config.pos_embed_seq_len = 514
+    effective = Wan2_I2V_Adapter._resolve_pipeline_io_contract(runtime)
+    rule = effective.input_media.rules[0]
+    assert (rule.min_count, rule.max_count) == (2, 2)
+    assert rule.required_slots == ("first_frame", "last_frame")
+
     runtime.pipeline.config.expand_timesteps = True
     effective = Wan2_I2V_Adapter._resolve_pipeline_io_contract(runtime)
     assert effective.input_media.rules[0].max_count == 1

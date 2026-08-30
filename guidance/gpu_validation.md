@@ -47,11 +47,12 @@ different condition layouts and active masks.
 The public V2 schema uses the `type` discriminator and an optional input-only
 `slot`. An explicit slot reserves its adapter-declared semantic argument;
 unslotted media is only a positional shorthand that fills remaining slots in
-declaration order. Wan requires `first_frame` and optionally accepts
-`last_frame`; H3 FL accepts either slot or both. Supervision media does not
-repeat independent condition-image objects. Its video is nevertheless the full
-configured output sequence, whose first and/or last endpoint must correspond to
-the supplied endpoint conditions.
+declaration order. Standard Wan2.1 I2V checkpoints require `first_frame`, the
+dedicated FLF2V checkpoint requires both endpoints, and Wan2.2 I2V-A14B retains
+an optional VAE-only `last_frame`; H3 FL accepts either slot or both. Supervision
+media does not repeat independent condition-image objects. Its video is
+nevertheless the full configured output sequence, whose first and/or last
+endpoint must correspond to the supplied endpoint conditions.
 
 ### Backends
 
