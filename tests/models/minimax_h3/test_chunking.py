@@ -35,6 +35,7 @@ from flow_factory.models.minimax_h3._chunking import (
     _ChunkedRMSNorm,
     install_h3_attention_norm_chunking,
     install_h3_feed_forward_chunking,
+    install_h3_in_forward_block_checkpointing,
     install_h3_lora_projection_chunking,
     install_h3_rotary_chunking,
 )
@@ -82,6 +83,9 @@ class BlockFake(nn.Module):
         self.attn.to_out = nn.ModuleList([nn.Linear(5, 5, bias=False), nn.Dropout(0.0)])
         self.attn.processor = MiniMaxH3AttnProcessor()
         self.ff = FeedForwardFake()
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.ff(hidden_states)
 
 
 class TransformerFake(nn.Module):
@@ -135,6 +139,77 @@ def test_chunking_preserves_parameter_tree_and_is_idempotent() -> None:
     transformer.load_state_dict(state, strict=True)
     assert "transformer_blocks.0.ff.net.0.proj.weight" in transformer.state_dict()
     assert not any("inner" in name for name, _ in transformer.named_modules())
+
+
+def test_in_forward_checkpointing_preserves_state_and_backward() -> None:
+    torch.manual_seed(13)
+    direct = TransformerFake().double()
+    checkpointed = deepcopy(direct)
+    state_keys = tuple(checkpointed.state_dict())
+    parameter_ids = {name: id(parameter) for name, parameter in checkpointed.named_parameters()}
+
+    assert install_h3_in_forward_block_checkpointing(checkpointed) == 5
+    assert install_h3_in_forward_block_checkpointing(checkpointed) == 5
+    assert tuple(checkpointed.state_dict()) == state_keys
+    assert {
+        name: id(parameter) for name, parameter in checkpointed.named_parameters()
+    } == parameter_ids
+
+    direct_input = torch.randn(2, 7, 5, dtype=torch.float64, requires_grad=True)
+    checkpointed_input = direct_input.detach().clone().requires_grad_(True)
+    direct_block = direct.transformer_blocks[0]
+    checkpointed_block = checkpointed.transformer_blocks[0]
+    direct_output = direct_block(direct_input)
+    checkpointed_output = checkpointed_block(checkpointed_input)
+    output_gradient = torch.randn_like(direct_output)
+    direct_output.backward(output_gradient)
+    checkpointed_output.backward(output_gradient)
+
+    torch.testing.assert_close(checkpointed_output, direct_output)
+    torch.testing.assert_close(checkpointed_input.grad, direct_input.grad)
+    for direct_parameter, checkpointed_parameter in zip(
+        direct_block.parameters(), checkpointed_block.parameters()
+    ):
+        torch.testing.assert_close(checkpointed_parameter.grad, direct_parameter.grad)
+
+
+def test_in_forward_checkpoint_starts_after_module_pre_forward_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transformer = TransformerFake().double()
+    install_h3_in_forward_block_checkpointing(transformer)
+    block = transformer.transformer_blocks[0]
+    checkpoint_dtypes = []
+    save_on_cpu_calls = []
+
+    class RecordingSaveOnCPU:
+        def __init__(self, *, pin_memory: bool, device_type: str) -> None:
+            save_on_cpu_calls.append((pin_memory, device_type))
+
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *exc_info) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "flow_factory.models.minimax_h3._chunking.save_on_cpu",
+        RecordingSaveOnCPU,
+    )
+    monkeypatch.setattr(
+        "flow_factory.models.minimax_h3._chunking.checkpoint",
+        lambda function, owner, hidden_states, **kwargs: checkpoint_dtypes.append(
+            hidden_states.dtype
+        )
+        or function(owner, hidden_states),
+    )
+    handle = block.register_forward_pre_hook(lambda _module, inputs: (inputs[0].to(torch.float64),))
+
+    block(torch.randn(2, 7, 5, dtype=torch.float32, requires_grad=True))
+    handle.remove()
+
+    assert checkpoint_dtypes == [torch.float64]
+    assert save_on_cpu_calls == [(False, "cpu")]
 
 
 def test_chunking_handles_remainder_and_preserves_forward_backward() -> None:

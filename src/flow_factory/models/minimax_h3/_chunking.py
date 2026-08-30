@@ -16,11 +16,13 @@
 
 from __future__ import annotations
 
+from types import MethodType
 from typing import Callable, Iterable
 
 import torch
 from peft.tuners.lora.layer import Linear as LoraLinear
 from torch import nn
+from torch.autograd.graph import save_on_cpu
 from torch.utils.checkpoint import checkpoint
 
 from .dependency import require_minimax_h3_support
@@ -29,6 +31,29 @@ H3_MAX_FEED_FORWARD_TOKENS = 1024
 H3_MAX_ATTENTION_NORM_TOKENS = 1024
 H3_MAX_LORA_PROJECTION_TOKENS = 1024
 H3_MAX_ROTARY_TOKENS = 1024
+
+
+def _checkpoint_h3_block_forward(self: nn.Module, *args, **kwargs):
+    """Checkpoint one block after its FSDP cast and offload saved inputs to CPU."""
+    original_forward = self.__dict__["flow_factory_uncheckpointed_forward"]
+    if not torch.is_grad_enabled():
+        return original_forward(self, *args, **kwargs)
+    input_device_type = next(
+        (argument.device.type for argument in args if isinstance(argument, torch.Tensor)),
+        "cuda",
+    )
+    with save_on_cpu(
+        pin_memory=input_device_type == "cuda" and torch.cuda.is_available(),
+        device_type=input_device_type,
+    ):
+        return checkpoint(
+            original_forward,
+            self,
+            *args,
+            use_reentrant=False,
+            preserve_rng_state=False,
+            **kwargs,
+        )
 
 
 class _ChunkedFeedForward(nn.Module):
@@ -346,6 +371,49 @@ def install_h3_feed_forward_chunking(
         replacement = _ChunkedFeedForward(net, max_tokens=max_tokens)
         replacement.train(feed_forward.training)
         block.ff = replacement
+        configured += 1
+    return configured
+
+
+def install_h3_in_forward_block_checkpointing(transformer: nn.Module) -> int:
+    """Place one checkpoint inside every repeated block's FSDP execution boundary.
+
+    Diffusers model-level checkpointing surrounds the block call and therefore saves
+    inputs before FSDP2 casts them for mixed-precision compute. Accelerate's generic
+    FSDP2 policy checkpoints each direct child separately. This instance-local
+    forward delegates the complete original block body to one non-reentrant
+    checkpoint after the block's FSDP pre-forward hook has already run. Its saved
+    BF16 block inputs live in pinned CPU memory until their backward replay.
+    """
+    configured = 0
+    for block_name, block in _h3_repeated_blocks(transformer):
+        installed = block.__dict__.get("flow_factory_uncheckpointed_forward")
+        shadowed_forward = block.__dict__.get("forward")
+        if installed is not None:
+            if not (
+                callable(installed)
+                and isinstance(shadowed_forward, MethodType)
+                and shadowed_forward.__func__ is _checkpoint_h3_block_forward
+            ):
+                raise TypeError(
+                    f"MiniMax H3 {block_name} has an inconsistent in-forward "
+                    "checkpoint installation"
+                )
+            configured += 1
+            continue
+        if shadowed_forward is not None:
+            raise TypeError(
+                f"MiniMax H3 {block_name} must not shadow forward before in-forward "
+                "checkpoint installation"
+            )
+        original_forward = type(block).forward
+        if not callable(original_forward):
+            raise TypeError(
+                f"MiniMax H3 {block_name} expected a callable class forward, received "
+                f"{original_forward!r}"
+            )
+        block.flow_factory_uncheckpointed_forward = original_forward
+        block.forward = MethodType(_checkpoint_h3_block_forward, block)
         configured += 1
     return configured
 

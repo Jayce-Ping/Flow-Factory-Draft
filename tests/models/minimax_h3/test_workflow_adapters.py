@@ -44,14 +44,20 @@ class UpstreamSchedulerFake:
 
 def test_only_ref2va_requests_fsdp2_default_stream_unshard() -> None:
     assert MiniMaxH3Ref2VAAdapter.fsdp2_use_default_stream_unshard
+    assert MiniMaxH3Ref2VAAdapter.fsdp2_use_in_forward_activation_checkpointing
+    assert MiniMaxH3Ref2VAAdapter.fsdp2_disable_backward_prefetch
     assert MiniMaxH3Ref2VAAdapter.fsdp2_additional_wrap_module_names == (
         "_ChunkedFeedForward",
         "MiniMaxH3AdaLayerNormModulation",
         "MiniMaxH3Attention",
     )
     assert not MiniMaxH3T2VAAdapter.fsdp2_use_default_stream_unshard
+    assert not MiniMaxH3T2VAAdapter.fsdp2_use_in_forward_activation_checkpointing
+    assert not MiniMaxH3T2VAAdapter.fsdp2_disable_backward_prefetch
     assert not MiniMaxH3T2VAAdapter.fsdp2_additional_wrap_module_names
     assert not MiniMaxH3FL2VAAdapter.fsdp2_use_default_stream_unshard
+    assert not MiniMaxH3FL2VAAdapter.fsdp2_use_in_forward_activation_checkpointing
+    assert not MiniMaxH3FL2VAAdapter.fsdp2_disable_backward_prefetch
     assert not MiniMaxH3FL2VAAdapter.fsdp2_additional_wrap_module_names
 
 

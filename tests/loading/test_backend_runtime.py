@@ -113,9 +113,13 @@ class _FSDPModuleFake(torch.nn.Linear):
     def __init__(self) -> None:
         super().__init__(2, 2)
         self.unshard_async_op_calls = []
+        self.backward_prefetch_calls = []
 
     def _set_unshard_async_op(self, enabled: bool) -> None:
         self.unshard_async_op_calls.append(enabled)
+
+    def set_modules_to_backward_prefetch(self, modules) -> None:
+        self.backward_prefetch_calls.append(modules)
 
 
 def test_prepare_enables_adapter_requested_fsdp2_default_stream_unshard() -> None:
@@ -131,6 +135,20 @@ def test_prepare_enables_adapter_requested_fsdp2_default_stream_unshard() -> Non
 
     assert prepared == [module, optimizer]
     assert module.unshard_async_op_calls == [True]
+
+
+def test_prepare_disables_default_fsdp2_backward_prefetch_recursively() -> None:
+    module = _FSDPModuleFake()
+    module.child = _FSDPModuleFake()
+    runtime = FSDPBackendLoadRuntime(
+        _AcceleratorFake(efficient=True),
+        _plan(),
+        SimpleNamespace(fsdp2_disable_backward_prefetch=True),
+    )
+
+    assert runtime.prepare(module) is module
+    assert module.backward_prefetch_calls == [[module]]
+    assert module.child.backward_prefetch_calls == [[module.child]]
 
 
 def test_prepare_extends_fsdp2_wrap_policy_before_distributed_preparation() -> None:
@@ -150,6 +168,43 @@ def test_prepare_extends_fsdp2_wrap_policy_before_distributed_preparation() -> N
         "TransformerBlock",
         "ChunkedFeedForward",
     ]
+
+
+def test_prepare_delegates_fsdp2_activation_checkpointing_during_prepare() -> None:
+    module = _FSDPModuleFake()
+    module._no_split_modules = ["TransformerBlock"]
+    accelerator = _AcceleratorFake(efficient=True)
+    plugin = accelerator.state.fsdp_plugin
+    plugin.activation_checkpointing = True
+    prepare_observations = []
+    accelerator.prepare = (
+        lambda *objects: prepare_observations.append(
+            (
+                plugin.activation_checkpointing,
+                tuple(plugin.transformer_cls_names_to_wrap),
+            )
+        )
+        or objects[0]
+    )
+    configured_roots = []
+    runtime = FSDPBackendLoadRuntime(
+        accelerator,
+        _plan(),
+        SimpleNamespace(
+            fsdp2_additional_wrap_module_names=("ChunkedFeedForward",),
+            fsdp2_use_in_forward_activation_checkpointing=True,
+            configure_fsdp2_in_forward_activation_checkpointing=lambda root: (
+                configured_roots.append(root) or 2
+            ),
+        ),
+    )
+
+    assert runtime.prepare(module) is module
+    assert configured_roots == [module]
+    assert prepare_observations == [
+        (False, ("TransformerBlock", "ChunkedFeedForward")),
+    ]
+    assert plugin.activation_checkpointing is True
 
 
 @pytest.mark.parametrize(

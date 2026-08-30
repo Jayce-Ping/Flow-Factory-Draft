@@ -236,6 +236,10 @@ class BaseAdapter(ABC):
     # Opt in only when FSDP2 communication overlap exceeds the model's activation headroom.
     fsdp2_use_default_stream_unshard: ClassVar[bool] = False
     fsdp2_additional_wrap_module_names: ClassVar[Tuple[str, ...]] = ()
+    # The adapter may place one checkpoint inside each FSDP-wrapped block forward.
+    fsdp2_use_in_forward_activation_checkpointing: ClassVar[bool] = False
+    # Opt in when backward all-gather overlap exceeds the model's peak headroom.
+    fsdp2_disable_backward_prefetch: ClassVar[bool] = False
     supports_ordered_references: ClassVar[bool] = False
     preprocess_cache_fields: ClassVar[frozenset[str]] = frozenset()
     preprocess_cache_version: ClassVar[str] = ""

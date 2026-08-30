@@ -122,30 +122,103 @@ class FSDPBackendLoadRuntime(BackendLoadRuntime):
 
     def prepare(self, *objects: Any) -> Any:
         """Prepare roots and apply adapter-requested FSDP2 communication policy."""
-        self._extend_fsdp2_wrap_policy(objects)
-        prepared = super().prepare(*objects)
         plugin = self.accelerator.state.fsdp_plugin
-        if (getattr(plugin, "fsdp_version", 1) or 1) < 2 or not getattr(
-            self.adapter, "fsdp2_use_default_stream_unshard", False
-        ):
+        use_in_forward_checkpointing = (
+            (getattr(plugin, "fsdp_version", 1) or 1) >= 2
+            and bool(getattr(plugin, "activation_checkpointing", False))
+            and bool(
+                getattr(
+                    self.adapter,
+                    "fsdp2_use_in_forward_activation_checkpointing",
+                    False,
+                )
+            )
+        )
+        if use_in_forward_checkpointing:
+            modules = [candidate for candidate in objects if isinstance(candidate, nn.Module)]
+            configure = getattr(
+                self.adapter,
+                "configure_fsdp2_in_forward_activation_checkpointing",
+                None,
+            )
+            if len(modules) != 1 or not callable(configure):
+                raise TypeError(
+                    "adapter-owned FSDP2 activation checkpointing requires exactly one "
+                    "model root and a callable configuration hook"
+                )
+            configured = configure(modules[0])
+            if not isinstance(configured, int) or isinstance(configured, bool) or configured < 1:
+                raise TypeError(
+                    "adapter-owned FSDP2 activation checkpointing expected a positive "
+                    f"configured block count, received {configured!r}"
+                )
+            plugin.activation_checkpointing = False
+            logger.info(
+                "Delegated FSDP2 activation checkpointing to adapter-owned in-forward "
+                "block boundaries: configured=%d",
+                configured,
+            )
+
+        try:
+            self._extend_fsdp2_wrap_policy(objects)
+            prepared = super().prepare(*objects)
+        finally:
+            if use_in_forward_checkpointing:
+                plugin.activation_checkpointing = True
+
+        if (getattr(plugin, "fsdp_version", 1) or 1) < 2:
+            return prepared
+
+        use_default_stream = bool(getattr(self.adapter, "fsdp2_use_default_stream_unshard", False))
+        disable_backward_prefetch = bool(
+            getattr(self.adapter, "fsdp2_disable_backward_prefetch", False)
+        )
+        if not use_default_stream and not disable_backward_prefetch:
             return prepared
 
         prepared_objects = prepared if isinstance(prepared, (list, tuple)) else (prepared,)
-        configured = []
+        prepared_modules = []
         for original, candidate in zip(objects, prepared_objects):
             if not isinstance(original, nn.Module):
                 continue
-            configure = getattr(candidate, "_set_unshard_async_op", None)
-            if not callable(configure):
+            prepared_modules.append(candidate)
+
+        if not prepared_modules:
+            raise TypeError("FSDP2 memory policy requested without a prepared module")
+
+        if use_default_stream:
+            configured = []
+            for candidate in prepared_modules:
+                configure = getattr(candidate, "_set_unshard_async_op", None)
+                if not callable(configure):
+                    raise TypeError(
+                        "FSDP2 default-stream unshard requires prepared modules to expose "
+                        f"_set_unshard_async_op(), received {type(candidate).__name__}"
+                    )
+                configure(True)
+                configured.append(type(candidate).__name__)
+            logger.info("Enabled FSDP2 default-stream unshard for roots: %s", configured)
+
+        if disable_backward_prefetch:
+            configured = 0
+            for root in prepared_modules:
+                for module in root.modules():
+                    configure = getattr(module, "set_modules_to_backward_prefetch", None)
+                    if not callable(configure):
+                        continue
+                    # FSDP2 treats an empty list as "use default next-unit prefetch".
+                    # Prefetching the current, already-unsharded unit is a public-API
+                    # no-op that selects explicit mode and disables that default.
+                    configure([module])
+                    configured += 1
+            if configured < 1:
                 raise TypeError(
-                    "FSDP2 default-stream unshard requires prepared modules to expose "
-                    f"_set_unshard_async_op(), received {type(candidate).__name__}"
+                    "FSDP2 backward-prefetch opt-out requires prepared FSDPModule roots"
                 )
-            configure(True)
-            configured.append(type(candidate).__name__)
-        if not configured:
-            raise TypeError("FSDP2 default-stream unshard requested without a prepared module")
-        logger.info("Enabled FSDP2 default-stream unshard for roots: %s", configured)
+            logger.info(
+                "Disabled default FSDP2 next-unit backward prefetch: configured=%d",
+                configured,
+            )
         return prepared
 
     def _extend_fsdp2_wrap_policy(self, objects: Sequence[Any]) -> None:

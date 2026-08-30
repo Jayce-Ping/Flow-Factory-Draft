@@ -651,6 +651,27 @@ Based on the fix type, write the fix entry to the appropriate document:
   the next full-size result.
 - **Related Constraint**: N/A
 
+### FSDP2 checkpoint and backward-prefetch policies must have independent memory boundaries
+- **Date**: 2026-08-31
+- **Symptom**: MiniMax H3 Ref2VA FSDP2 GRPO reached the training forward only after several
+  operator-level bounds, then exhausted each 95 GiB device during forward activation retention or
+  the first backward all-gather. The final backward failure requested 286 MiB while the 442 MiB
+  feed-forward unit was still resident.
+- **Root Cause**: Accelerate reused the FSDP2 transformer wrap policy for activation checkpointing
+  and checkpointed every direct child of each H3 block, retaining several complete packed-sequence
+  inputs per block. After replacing those boundaries, PyTorch's implicit backward prefetch still
+  overlapped the current feed-forward unit with the next attention unit's all-gather.
+- **Fix**: Ref2VA now installs one non-reentrant checkpoint inside every materialized H3 block after
+  the block's FSDP mixed-precision input cast, with its saved BF16 inputs held in pinned CPU memory.
+  Backend preparation disables Accelerate's duplicate checkpoint owner and opts every prepared
+  FSDP2 unit out of implicit next-unit backward prefetch, so the current unit reshards before its
+  successor gathers. All variant instances are configured only after materialization. A two-rank
+  GRPO sentinel completed two forward/backward/optimizer cycles with stable gradients.
+- **Lesson**: FSDP wrap granularity, activation recomputation, saved-input placement, and collective
+  prefetch are separate memory policies. Keep each boundary explicit; a policy that is correct for
+  parameter sharding may multiply activation lifetimes or overlap adjacent full-parameter units.
+- **Related Constraint**: #9, #20
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

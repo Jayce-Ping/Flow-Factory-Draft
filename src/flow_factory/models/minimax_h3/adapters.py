@@ -50,6 +50,7 @@ from ..runtime import ModularPipelineRuntime
 from ._chunking import (
     H3_MAX_LORA_PROJECTION_TOKENS,
     H3_MAX_ROTARY_TOKENS,
+    install_h3_in_forward_block_checkpointing,
     install_h3_lora_projection_chunking,
     install_h3_rotary_chunking,
 )
@@ -153,6 +154,26 @@ class _MiniMaxH3WorkflowAdapter:
             H3_MAX_ROTARY_TOKENS,
         )
         return runtime
+
+    def configure_fsdp2_in_forward_activation_checkpointing(
+        self,
+        model_root: torch.nn.Module,
+    ) -> int:
+        """Install one inner checkpoint on every materialized H3 block variant."""
+        members = getattr(model_root, "members", None)
+        if not isinstance(members, torch.nn.ModuleDict):
+            raise TypeError(
+                "MiniMax H3 FSDP2 checkpointing expected a ModelBundle ModuleDict, "
+                f"received {type(members).__name__}"
+            )
+        configured = 0
+        seen = set()
+        for component in members.values():
+            if id(component) in seen:
+                continue
+            seen.add(id(component))
+            configured += install_h3_in_forward_block_checkpointing(component)
+        return configured
 
     def load_scheduler(self) -> MiniMaxH3SDEScheduler:
         """Build the canonical shift-12 video scheduler."""
@@ -375,6 +396,8 @@ class MiniMaxH3Ref2VAAdapter(_MiniMaxH3WorkflowAdapter, BaseAdapter):
     workflow: ClassVar[str] = "ref2va"
     transformer_component_name: ClassVar[str] = "transformer_ref"
     fsdp2_use_default_stream_unshard: ClassVar[bool] = True
+    fsdp2_use_in_forward_activation_checkpointing: ClassVar[bool] = True
+    fsdp2_disable_backward_prefetch: ClassVar[bool] = True
     fsdp2_additional_wrap_module_names: ClassVar[Tuple[str, ...]] = (
         "_ChunkedFeedForward",
         "MiniMaxH3AdaLayerNormModulation",
