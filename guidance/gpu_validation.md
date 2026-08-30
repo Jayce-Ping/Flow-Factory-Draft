@@ -1,26 +1,32 @@
 # GPU Validation Matrix
 
-This document defines the real-weight GPU validation contract and records the PR #220 result.
-A combination is validated only after its execution evidence satisfies the acceptance criteria
+This document defines the real-weight GPU validation contract and records the PR #220 execution
+result. The historical direct runs establish successful launch and training completion; a future
+formal campaign should additionally capture every artifact listed in the acceptance criteria
 below.
 
 ## PR #220 result
 
-The complete dynamic smoke scope passed **144/144** unique jobs:
+The complete dynamic smoke scope reached its successful terminal marker for **144/144** unique
+jobs:
 
 - **120/120 main jobs**: 10 semantic modes x DDP/DeepSpeed ZeRO-2/FSDP2 x
   GRPO/SFT/offline DPO/TDM.
-- **22/22 checkpoint-variant jobs**: Wan 2.1/2.2 T2V and I2V variants, all six strict Wan A14B
-  dual-transformer routing jobs, LTX 2.3 T2AV/I2AV, and H3 FL2VA first-plus-last coverage.
+- **22/22 formal variant-gate jobs**: Wan 2.1/2.2 T2V and I2V routing variants (including
+  corrected redundant FLF2V coverage), all six strict Wan A14B dual-transformer routing jobs,
+  LTX 2.3 T2AV/I2AV, and H3 FL2VA first-plus-last coverage.
 - **2/2 supplemental jobs**: Flux1-Kontext image-to-image SFT and offline DPO.
 
 All **132/132** checkpoint-variant backend/algorithm cells also passed static configuration and
 contract validation. Four positive Muon jobs passed for DDP/FSDP2 with SFT and mixed-role TDM;
 the DeepSpeed ZeRO-2 negative gate rejected Muon before model loading as intended.
 
-These are reduced-geometry, finite-length execution smokes. They establish model loading,
-distributed routing, forward/backward, optimizer, and finite-data behavior; they do not claim
-convergence, long-run reward improvement, quality parity, or numerical parity.
+These are reduced-geometry, finite-length execution smokes. They establish archived real-weight
+execution coverage for model loading, distributed backends, optimizer paths, and finite-data
+termination. Capability-sensitive instrumented gates additionally checked routing and updates,
+but earlier direct runs did not uniformly capture the complete command, environment, and metrics
+artifact set required below. These results do not claim convergence, long-run reward improvement,
+quality parity, or numerical parity.
 
 ## Environment gate
 
@@ -180,7 +186,7 @@ backends and all four algorithms.
 
 | Family mode | Additional checkpoint variants |
 |---|---|
-| Wan T2V | `Wan2.1-T2V-14B-Diffusers`, `Wan2.2-TI2V-5B-Diffusers`, `Wan2.2-T2V-A14B-Diffusers` |
+| Wan T2V/TI2V family | `Wan2.1-T2V-14B-Diffusers`, `Wan2.2-TI2V-5B-Diffusers`, `Wan2.2-T2V-A14B-Diffusers` |
 | Wan I2V first-only | `Wan2.1-I2V-14B-480P-Diffusers`, `Wan2.1-I2V-14B-720P-Diffusers`, `Wan2.2-I2V-A14B-Diffusers` |
 | Wan first/last | `Wan2.2-I2V-A14B-Diffusers` |
 | LTX2 T2AV and I2AV | `dg845/LTX-2.3-Diffusers` |
