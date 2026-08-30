@@ -55,7 +55,7 @@ _REFERENCE_FIELDS: Tuple[str, ...] = ("ImageReference", "VideoReference", "Audio
 
 @dataclass(frozen=True)
 class MiniMaxH3Symbols:
-    """Hold all upstream classes used by the shared H3 core."""
+    """Hold all upstream symbols used by the shared H3 core."""
 
     ModularPipeline: Type[Any]
     MiniMaxH3ModularPipeline: Type[Any]

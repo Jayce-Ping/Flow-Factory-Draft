@@ -97,7 +97,9 @@ def build_optimizer(
         One optimizer whose ``param_groups`` carry a ``role_name`` per group.
 
     Raises:
-        ValueError: If a configuration has no parameters or an unknown type.
+        ValueError: If a configuration has no parameters, uses an unknown optimizer type,
+            selects Muon without matrix parameters, or the current PyTorch build lacks
+            ``torch.optim.Muon``.
     """
     adamw_groups: List[Dict[str, Any]] = []
     muon_groups: List[Dict[str, Any]] = []

@@ -1326,6 +1326,33 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         packed_text_indexes=None,
         packed_text_ids: Optional[torch.LongTensor] = None,
     ) -> BaseNavitOutputWithPast:
+        """Run one packed language-model forward from embeddings, token IDs, or both.
+
+        Args:
+            packed_query_sequence: Existing packed auxiliary sequence, or None for a text-only
+                cache update.
+            query_lens: Per-sample query lengths.
+            packed_query_position_ids: Packed query position IDs.
+            packed_query_indexes: Packed query indices.
+            past_key_values: Optional existing packed key/value cache.
+            key_values_lens: Per-sample existing cache lengths.
+            packed_key_value_indexes: Packed indices of existing cache entries.
+            update_past_key_values: Whether to append the query to the cache.
+            is_causal: Whether the query uses causal attention.
+            mode: Bagel language-model routing mode.
+            packed_vae_token_indexes: Optional positions of generative latent tokens.
+            packed_text_indexes: Destination indices when inserting raw text embeddings into an
+                existing packed sequence.
+            packed_text_ids: Raw token IDs to embed inside this prepared-root forward. Required
+                when ``packed_query_sequence`` is None.
+
+        Returns:
+            Packed model output with the updated cache when requested.
+
+        Raises:
+            ValueError: If neither input source is supplied, destination indices are missing, or
+                token and destination counts differ.
+        """
 
         # Keep token embedding inside the outer language-model forward. Distributed
         # wrappers attach their unshard hooks to this boundary, so callers must not

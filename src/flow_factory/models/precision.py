@@ -125,7 +125,24 @@ def component_dtype_mapping(
     text_encoder_names: Sequence[str],
     manifest_declared_names: Sequence[str] | None = None,
 ) -> dict[str, torch.dtype]:
-    """Resolve policies for concrete components, with wider adapter-manifest declarations."""
+    """Resolve user and adapter dtype policies for concrete components.
+
+    Args:
+        user_policy: User-selected dtype policy, which takes precedence.
+        manifest_policy: Adapter-declared fallback dtype policy.
+        component_names: Concrete component names to resolve into the returned mapping.
+        transformer_names: Concrete names matched by the ``transformers`` group selector.
+        text_encoder_names: Concrete names matched by the ``text_encoders`` group selector.
+        manifest_declared_names: Optional superset used only to validate adapter-manifest
+            selectors, including class-declared optional components. Resolution still iterates
+            ``component_names``. Defaults to ``component_names``.
+
+    Returns:
+        Concrete component names mapped to their resolved non-null dtypes.
+
+    Raises:
+        ValueError: If either policy contains a selector outside its declared namespace.
+    """
     validate_dtype_policy_selectors(user_policy, declared_names=component_names)
     validate_dtype_policy_selectors(
         manifest_policy,
@@ -160,7 +177,28 @@ def build_component_load_dtype_kwargs(
     requested_names: Sequence[str] | None = None,
     preserve_unselected: bool = False,
 ) -> Dict[str, object]:
-    """Build the one native-loader dtype argument for eager or selective loading."""
+    """Build the native-loader dtype argument for eager or selective loading.
+
+    Args:
+        user_policy: User-selected dtype policy, which takes precedence.
+        manifest_policy: Adapter-declared fallback dtype policy.
+        component_names: Concrete component names available to the loader.
+        transformer_names: Concrete names matched by the ``transformers`` group selector.
+        text_encoder_names: Concrete names matched by the ``text_encoders`` group selector.
+        manifest_declared_names: Optional superset used only to validate adapter-manifest
+            selectors, including class-declared optional components. Resolution still iterates
+            ``component_names``. Defaults to ``component_names``.
+        requested_names: Optional subset being loaded by this request.
+        preserve_unselected: Whether the loader mapping should retain an explicit null default so
+            unselected components keep their checkpoint dtype.
+
+    Returns:
+        Empty kwargs when no override applies, or one ``dtype`` keyword accepted by the native
+        component loader.
+
+    Raises:
+        ValueError: If either policy contains a selector outside its declared namespace.
+    """
     if isinstance(user_policy, torch.dtype):
         return {"dtype": user_policy}
     if user_policy is None and isinstance(manifest_policy, torch.dtype):

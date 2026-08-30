@@ -502,10 +502,10 @@ def gather_samples(
 
     Args:
         accelerator: Accelerator instance.
-        samples: Local samples on this rank.
-        field_names: Fields to gather.  When ``'extra_kwargs'`` is included,
-            each key inside the dict is gathered independently and reassembled.
-            Concrete sample reconstruction fields are added automatically.
+        samples: Local samples on this rank. All entries must share one concrete sample class.
+        field_names: Consumer-requested fields to gather. When ``extra_kwargs`` is included, each
+            key is gathered independently. Fields declared by the concrete class in
+            ``reconstruction_required_fields`` are always added before reconstruction.
         device: Target device for tensor fields in the returned samples.
 
     Returns:

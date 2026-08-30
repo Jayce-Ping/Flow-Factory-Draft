@@ -122,7 +122,10 @@ class Wan2_I2V_Adapter(BaseAdapter):
         )
 
     def _resolve_pipeline_io_contract(self) -> PipelineIOContract:
-        """Resolve checkpoint-specific first/last-frame cardinality."""
+        """Resolve exact-one for ordinary/expanded paths and exact-two for FLF2V weights.
+
+        Wan2.2's VAE-only path retains the class-level one-or-two input superset.
+        """
         supports_endpoint_pair = False
         if not self.pipeline.config.expand_timesteps:
             transformer_configs = tuple(

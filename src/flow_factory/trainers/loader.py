@@ -60,29 +60,20 @@ def _requires_ddp_unused_parameter_detection(
 
 
 def load_trainer(config: Arguments) -> BaseTrainer:
-    """
-    Factory function to instantiate trainer based on algorithm type.
-
-    Uses registry pattern for automatic trainer discovery and loading.
-    Supports both built-in trainers and custom algorithms via python paths.
+    """Instantiate the configured trainer after validating its execution plan.
 
     Args:
-        config: Configuration containing trainer_type and all hyperparameters
+        config: Parsed configuration containing the trainer, model, optimizer, and backend policy.
 
     Returns:
-        An instance of a BaseTrainer subclass
+        The initialized trainer selected by ``config.training_args.trainer_type``.
 
     Raises:
-        ImportError: If the trainer is not registered or cannot be imported
-
-    Examples:
-        # Using built-in trainer
-        config.training_args.trainer_type = "grpo"
-        trainer = load_trainer(config)
-
-        # Using custom trainer
-        config.training_args.trainer_type = "my_package.trainers.PPOTrainer"
-        trainer = load_trainer(config)
+        ImportError: If the requested trainer cannot be resolved or imported.
+        TypeError: If the registry entry does not resolve to a trainer class.
+        ValueError: If the trainer/adapter contract or distributed optimizer/checkpoint plan is
+            unsupported.
+        RuntimeError: If an FSDP2 checkpoint plan lacks the required plugin state.
     """
     # Resolve and validate algorithm semantics before constructing an Accelerator or
     # loading model weights. A stale trainer/argument registry pairing must fail with

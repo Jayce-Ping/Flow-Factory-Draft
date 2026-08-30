@@ -97,8 +97,8 @@ class BaseSample:
         {"height", "width", "latent_index_map", "log_prob_index_map"}
     )
 
-    # Fields that must be transported whenever a concrete sample is reconstructed
-    # from a partial cross-rank gather, even when no downstream consumer reads them.
+    # Fields ``gather_samples`` must transport to satisfy concrete-class reconstruction
+    # invariants, even when omitted from the consumer-requested field list.
     reconstruction_required_fields: ClassVar[frozenset[str]] = frozenset()
 
     # Denoiseing trajectory

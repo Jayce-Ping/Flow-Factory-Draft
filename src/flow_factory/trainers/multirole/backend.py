@@ -73,17 +73,19 @@ def configure_checkpointing_backend_plan(
     accelerator: Accelerator,
     training_args: TrainingArguments,
 ) -> bool:
-    """Select a checkpoint owner before model loading and distributed preparation.
+    """Select one checkpointing owner for the active distributed plan.
 
     Args:
         accelerator: Runtime backend whose checkpointing policy is being configured.
         training_args: Parsed algorithm arguments containing the model checkpoint policy.
 
     Returns:
-        Whether a previously realized adapter must disable model checkpointing.
+        True if model-level checkpointing was disabled and a caller holding an already-realized
+        adapter must remove its checkpoint wrappers; otherwise False.
 
     Raises:
         ValueError: If FSDP2 is paired with a selective model checkpoint policy.
+        RuntimeError: If FSDP2 backend checkpointing is selected without an FSDP plugin.
     """
     if accelerator.distributed_type != DistributedType.FSDP:
         return False

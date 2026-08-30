@@ -325,8 +325,16 @@ def install_h3_feed_forward_chunking(
     distributed wrapping. The mutation is idempotent and preserves every parameter
     object.
 
+    Args:
+        transformer: Materialized H3 transformer containing both repeated block stacks.
+        max_tokens: Positive maximum token count processed by one feed-forward invocation.
+
     Returns:
         Number of feed-forward layers configured across both stacks.
+
+    Raises:
+        TypeError: If the materialized upstream feed-forward structure or hooks are unsupported.
+        ValueError: If ``max_tokens`` is invalid or conflicts with an earlier installation.
     """
     max_tokens = _positive_int(max_tokens, "max_tokens")
     blocks = tuple(_h3_repeated_blocks(transformer))
@@ -382,8 +390,18 @@ def install_h3_in_forward_block_checkpointing(transformer: nn.Module) -> int:
     inputs before FSDP2 casts them for mixed-precision compute. Accelerate's generic
     FSDP2 policy checkpoints each direct child separately. This instance-local
     forward delegates the complete original block body to one non-reentrant
-    checkpoint after the block's FSDP pre-forward hook has already run. Its saved
-    BF16 block inputs live in pinned CPU memory until their backward replay.
+    checkpoint after the block's FSDP pre-forward hook has already run. Saved tensor inputs are
+    offloaded to CPU until backward replay, using pinned host memory for CUDA inputs. In the
+    intended BF16 FSDP2 path these are the post-cast BF16 block inputs.
+
+    Args:
+        transformer: Materialized H3 transformer containing both repeated block stacks.
+
+    Returns:
+        Number of repeated H3 blocks configured across both stacks.
+
+    Raises:
+        TypeError: If a block has an unsupported or conflicting forward installation.
     """
     configured = 0
     for block_name, block in _h3_repeated_blocks(transformer):
@@ -423,7 +441,19 @@ def install_h3_attention_norm_chunking(
     *,
     max_tokens: int = H3_MAX_ATTENTION_NORM_TOKENS,
 ) -> int:
-    """Install bounded Q/K head normalization on both H3 repeated stacks."""
+    """Install bounded Q/K head normalization on both H3 repeated stacks.
+
+    Args:
+        transformer: Materialized H3 transformer containing both repeated block stacks.
+        max_tokens: Positive maximum token count normalized by one local operation.
+
+    Returns:
+        Number of Q/K RMSNorm modules configured across both stacks.
+
+    Raises:
+        TypeError: If the materialized upstream attention or RMSNorm structure is unsupported.
+        ValueError: If ``max_tokens`` is invalid or conflicts with an earlier installation.
+    """
     max_tokens = _positive_int(max_tokens, "max_tokens")
     configured = 0
     for block_name, block in _h3_repeated_blocks(transformer):
@@ -478,8 +508,16 @@ def install_h3_lora_projection_chunking(
     parameters, children, hooks, and state-dict paths remain owned by that same
     module object.
 
+    Args:
+        transformer: Materialized H3 transformer after PEFT injection.
+        max_tokens: Positive maximum token count projected by one adapted invocation.
+
     Returns:
         Number of adapted Q/K/V/output projections configured across both stacks.
+
+    Raises:
+        TypeError: If the materialized attention or PEFT projection structure is unsupported.
+        ValueError: If ``max_tokens`` is invalid or conflicts with an earlier installation.
     """
     max_tokens = _positive_int(max_tokens, "max_tokens")
     configured = 0
@@ -563,7 +601,20 @@ def install_h3_rotary_chunking(
     *,
     max_tokens: int = H3_MAX_ROTARY_TOKENS,
 ) -> int:
-    """Install the bounded processor on every standard H3 attention instance."""
+    """Install the bounded processor on every standard H3 attention instance.
+
+    Args:
+        transformer: Materialized H3 transformer containing both repeated block stacks.
+        max_tokens: Positive maximum token count rotated by one local operation.
+
+    Returns:
+        Number of H3 attention processors configured across both stacks.
+
+    Raises:
+        ImportError: If the pinned MiniMax H3 attention processor is unavailable.
+        TypeError: If the materialized attention processor structure is unsupported.
+        ValueError: If ``max_tokens`` is invalid or conflicts with an earlier installation.
+    """
     max_tokens = _positive_int(max_tokens, "max_tokens")
     symbols = require_minimax_h3_support()
     processor_class = symbols.MiniMaxH3AttnProcessor

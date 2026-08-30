@@ -425,7 +425,22 @@ class MiniMaxH3Ref2VAAdapter(_MiniMaxH3WorkflowAdapter, BaseAdapter):
         components: Union[str, List[str]] = "transformer",
         overwrite: bool = False,
     ) -> Any:
-        """Apply PEFT and bound Ref2VA projection memory under FSDP2."""
+        """Apply PEFT and bound Ref2VA projection memory under FSDP2.
+
+        Args:
+            target_modules: PEFT target-module patterns forwarded to ``BaseAdapter.apply_lora``.
+            components: Canonical components that receive LoRA.
+            overwrite: Whether to replace an existing default adapter.
+
+        Returns:
+            The PEFT model, per-component PEFT mapping, or empty mapping returned by the base
+            method.
+
+        Raises:
+            TypeError: If Ref2VA FSDP2 projection chunking receives a nonstandard PEFT component,
+                a non-``nn.Module`` base model, or incompatible projection structure.
+            ValueError: If projection chunking conflicts with an earlier installation.
+        """
         component_names = (components,) if isinstance(components, str) else tuple(components)
         result = super().apply_lora(
             target_modules=target_modules,

@@ -301,6 +301,24 @@ class Bagel(PreTrainedModel):
         key_values_lens: torch.IntTensor,
         language_model_forward: Optional[Callable[..., Any]] = None,
     ):
+        """Append packed text tokens to the language-model cache.
+
+        Args:
+            past_key_values: Existing packed key/value cache.
+            packed_text_ids: Raw text token IDs to embed inside the routed model forward.
+            packed_text_position_ids: Packed position IDs for the appended text.
+            text_token_lens: Per-sample text query lengths.
+            packed_text_indexes: Packed query destination indices.
+            packed_key_value_indexes: Packed indices of the existing cache entries.
+            key_values_lens: Per-sample existing cache lengths.
+            language_model_forward: Optional outer language-model callable. Flow-Factory injects
+                the prepared/routed transformer so embedding, decoder, and final normalization
+                stay under the sharded root's forward hooks; standalone Bagel defaults to
+                ``self.language_model``.
+
+        Returns:
+            The updated packed key/value cache.
+        """
         # Flow-Factory injects its prepared component route here. Standalone Bagel
         # keeps the original physical language-model call as the default.
         if language_model_forward is None:
@@ -419,6 +437,29 @@ class Bagel(PreTrainedModel):
         key_values_lens: torch.IntTensor,
         language_model_forward: Optional[Callable[..., Any]] = None,
     ):
+        """Encode packed vision tokens and append them to the language-model cache.
+
+        Args:
+            past_key_values: Existing packed key/value cache.
+            packed_text_ids: Raw boundary-token IDs inserted into the packed query.
+            packed_text_indexes: Destination indices for the boundary-token embeddings.
+            packed_vit_tokens: Flattened image inputs consumed by the vision encoder.
+            packed_vit_token_indexes: Destination indices for encoded vision tokens.
+            packed_vit_position_ids: Packed vision position IDs.
+            vit_token_seqlens: Per-image vision token lengths.
+            packed_position_ids: Packed language-model query position IDs.
+            packed_seqlens: Per-sample query lengths.
+            packed_indexes: Packed query indices.
+            packed_key_value_indexes: Packed indices of the existing cache entries.
+            key_values_lens: Per-sample existing cache lengths.
+            language_model_forward: Optional outer language-model callable. Flow-Factory injects
+                the prepared/routed transformer so embedding, decoder, and final normalization
+                stay under the sharded root's forward hooks; standalone Bagel defaults to
+                ``self.language_model``.
+
+        Returns:
+            The updated packed key/value cache.
+        """
         if language_model_forward is None:
             language_model_forward = self.language_model
 
@@ -570,6 +611,31 @@ class Bagel(PreTrainedModel):
         packed_key_value_indexes: torch.Tensor,
         language_model_forward: Optional[Callable[..., Any]] = None,
     ):
+        """Encode packed image latents and append them to the language-model cache.
+
+        Args:
+            vae_model: VAE used to encode the padded image batch.
+            past_key_values: Existing packed key/value cache.
+            padded_images: Padded image tensors for the active reference round.
+            patchified_vae_latent_shapes: Per-image patch-grid heights and widths.
+            packed_vae_position_ids: Packed latent position IDs.
+            packed_timesteps: Timesteps used by the latent time embedder.
+            packed_vae_token_indexes: Destination indices for encoded latent tokens.
+            packed_text_ids: Raw boundary-token IDs inserted into the packed query.
+            packed_text_indexes: Destination indices for the boundary-token embeddings.
+            packed_position_ids: Packed language-model query position IDs.
+            packed_seqlens: Per-sample query lengths.
+            packed_indexes: Packed query indices.
+            key_values_lens: Per-sample existing cache lengths.
+            packed_key_value_indexes: Packed indices of the existing cache entries.
+            language_model_forward: Optional outer language-model callable. Flow-Factory injects
+                the prepared/routed transformer so embedding, decoder, and final normalization
+                stay under the sharded root's forward hooks; standalone Bagel defaults to
+                ``self.language_model``.
+
+        Returns:
+            The updated packed key/value cache.
+        """
         if language_model_forward is None:
             language_model_forward = self.language_model
 

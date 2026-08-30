@@ -551,12 +551,14 @@ class GeneralDataset(Dataset):
             2. Load and prepare image inputs
             3. Load and prepare video inputs
             4. Load and prepare audio inputs
-            5. Call preprocess function
-            6. Move result tensors to CPU for caching
-            7. Pack non-preprocessed columns into ``metadata``
+            5. Load ordered references and forward their canonical manifest sidecars
+            6. Call preprocess function
+            7. Move result tensors to CPU for caching
+            8. Pack non-preprocessed columns into ``metadata``
 
         Args:
             batch: Dictionary with batch data.
+            indices: Source row indices aligned with batch rows, used in validation diagnostics.
             image_dir: Directory containing images (``None`` skips image loading).
                 Per-sample paths are loaded as PIL Images and kept as a
                 ``List[Image]``; the column-level ``images`` field is therefore
@@ -697,6 +699,7 @@ class GeneralDataset(Dataset):
                     audio_args["audios"].append(audios)
                     batch["audios"].append(audios)
 
+        # 5. Load ordered references and retain their canonical reconstruction sidecars.
         reference_args: Dict[str, Any] = {}
         if self._uses_ordered_references:
             raw_references = batch.pop("references")
@@ -732,7 +735,7 @@ class GeneralDataset(Dataset):
             if column in batch
         }
 
-        # 5. Call preprocess function with filtered kwargs
+        # 6. Call preprocess function with filtered kwargs
         input_args = {
             **prompt_args,
             **image_args,
@@ -751,7 +754,7 @@ class GeneralDataset(Dataset):
                 f"{sorted(passthrough_collisions)!r}"
             )
 
-        # 6. Process results - move tensors to CPU for caching.
+        # 7. Process results - move tensors to CPU for caching.
         # Image-valued adapter outputs (declared via `python_format_columns`)
         # are stored as per-sample List[PIL] so HF serializes them via the Image
         # feature; ragged image tensors (variable size/count, e.g. multi-ref I2I)
@@ -783,7 +786,7 @@ class GeneralDataset(Dataset):
                 # Case C: Other types (None, int, etc)
                 final_res[k] = v
 
-        # 7. Prepare final results
+        # 8. Prepare final results
         batch_dict = {**batch, **final_res}
         if self._uses_ordered_references:
             _validate_arrow_safe_ordered_result(batch_dict, len(batch["prompt"]))

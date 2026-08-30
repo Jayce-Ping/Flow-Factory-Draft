@@ -239,7 +239,27 @@ def prepare_wan_i2v_condition_tensors(
     device: torch.device,
     last_image: Optional[torch.Tensor] = None,
 ) -> WanI2VConditionTensors:
-    """Encode ordered input frames with posterior mode and build Wan condition channels."""
+    """Encode ordered input frames with posterior mode and build Wan condition channels.
+
+    Args:
+        adapter: Realized Wan I2V adapter owning the pipeline and VAE.
+        image: First-frame pixels shaped ``(B, 3, H, W)``.
+        height: Configured output height.
+        width: Configured output width.
+        num_frames: Configured output frame count.
+        dtype: Floating dtype for returned condition tensors.
+        device: Device used for VAE encoding and returned tensors.
+        last_image: Optional last-frame pixels with the same shape as ``image``.
+
+    Returns:
+        Encoded condition channels and, for expanded-timestep checkpoints, the separate
+        first-frame mask.
+
+    Raises:
+        TypeError: If the requested output dtype or VAE dtype is invalid.
+        ValueError: If input tensors, pixel/latent geometry, endpoint support, or temporal
+            divisibility are incompatible with the realized checkpoint.
+    """
     if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point:
         raise TypeError(f"Wan I2V condition dtype must be floating, received {dtype!r}")
     if not isinstance(image, torch.Tensor) or image.ndim != 4:
@@ -319,6 +339,9 @@ def prepare_wan_i2v_condition_tensors(
     ).to(device=device, dtype=dtype)
     latent_condition = normalize_wan_video_latents(adapter, latent_condition)
 
+    # The condition VAE time axis belongs to the encoded source. Expanded-timestep checkpoints
+    # encode one frame and broadcast it across the target via first_frame_mask, so it must not be
+    # validated against the rollout's num_latent_frames.
     condition_latent_frames = (video_condition.shape[2] - 1) // temporal_scale + 1
     expected_latents = (
         batch_size,

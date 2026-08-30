@@ -96,7 +96,19 @@ def load_h3_workflow_pipeline(
 
 
 def build_h3_component_runtime(adapter: Any) -> ModularPipelineRuntime:
-    """Wrap one pruned pipeline and materialize only its training transformer."""
+    """Build the pruned runtime and prepare the H3 transformer for bounded execution.
+
+    Args:
+        adapter: H3 adapter that declares the target transformer and loads the modular pipeline.
+
+    Returns:
+        Runtime with the training transformer materialized and its feed-forward and attention
+        normalization operations configured for bounded token chunks.
+
+    Raises:
+        ValueError: If the adapter targets components outside the H3 training contract.
+        TypeError: If the materialized transformer structure cannot accept the required chunking.
+    """
     validate_h3_target_components(adapter)
     runtime = ModularPipelineRuntime.from_adapter(adapter, adapter.load_pipeline())
     runtime.materialize_components([adapter.transformer_component_name])

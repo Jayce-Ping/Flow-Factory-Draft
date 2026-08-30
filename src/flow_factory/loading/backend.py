@@ -130,7 +130,18 @@ class FSDPBackendLoadRuntime(BackendLoadRuntime):
                 os.environ["FSDP_CPU_RAM_EFFICIENT_LOADING"] = previous
 
     def prepare(self, *objects: Any) -> Any:
-        """Prepare roots and apply adapter-requested FSDP2 communication policy."""
+        """Apply adapter-owned FSDP2 wrap, checkpoint, replay, and communication policies.
+
+        Args:
+            *objects: Model roots and related objects forwarded to ``Accelerator.prepare``.
+
+        Returns:
+            The prepared object or tuple returned by ``Accelerator.prepare``.
+
+        Raises:
+            TypeError: If an adapter-requested FSDP2 policy cannot be installed on the supplied
+                or prepared roots.
+        """
         plugin = self.accelerator.state.fsdp_plugin
         use_in_forward_checkpointing = (
             (getattr(plugin, "fsdp_version", 1) or 1) >= 2
