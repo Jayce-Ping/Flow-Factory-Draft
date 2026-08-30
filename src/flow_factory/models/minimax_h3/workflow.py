@@ -959,7 +959,13 @@ def _normalize_layout(values: Mapping[str, Any]) -> Dict[str, Any]:
                 f"MiniMax H3 layout field={field!r} expected shape (N,D) or "
                 f"collated (B=1,N,D), received {tuple(value.shape)}"
             )
-        normalized[field] = value
+        if value.dtype not in (torch.float32, torch.float64):
+            raise ValueError(
+                f"MiniMax H3 layout field={field!r} expected dtype float32 or float64, "
+                f"received {value.dtype}"
+            )
+        # HF Dataset's torch formatter downcasts cached float64 coordinates.
+        normalized[field] = value.to(dtype=torch.float64)
     for field in _LAYOUT_INDEX_FIELDS:
         if field not in source:
             continue
