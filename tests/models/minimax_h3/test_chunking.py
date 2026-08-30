@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from copy import deepcopy
+from weakref import ref
 
 import pytest
 import torch
@@ -616,3 +617,25 @@ def test_rotary_chunking_rejects_conflicting_reinstallation() -> None:
 
     with pytest.raises(ValueError, match="already uses max_tokens=4.*conflicting 8"):
         install_h3_rotary_chunking(transformer, max_tokens=8)
+
+
+def test_chunked_attention_releases_qkv_before_output_projection() -> None:
+    transformer = TransformerFake()
+    install_h3_rotary_chunking(transformer, max_tokens=4)
+    attention = transformer.transformer_blocks[0].attn
+    qkv_refs = []
+
+    def recording_dispatch(query, key, value, **kwargs):
+        del kwargs
+        qkv_refs.extend((ref(query), ref(key), ref(value)))
+        return torch.zeros_like(query)
+
+    attention.processor.flow_factory_dispatch_attention_fn = recording_dispatch
+
+    def require_released_qkv(_module, _inputs):
+        assert len(qkv_refs) == 3
+        assert all(tensor_ref() is None for tensor_ref in qkv_refs)
+
+    handle = attention.to_out[0].register_forward_pre_hook(require_released_qkv)
+    attention.processor(attention, torch.randn(2, 9, 5))
+    handle.remove()

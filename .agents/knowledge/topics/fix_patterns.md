@@ -637,6 +637,20 @@ Based on the fix type, write the fix entry to the appropriate document:
   its elementwise intermediates independently and keep cosine/sine slices aligned with token rows.
 - **Related Constraint**: N/A
 
+### Checkpointed attention should release QKV before its output projection
+- **Date**: 2026-08-31
+- **Symptom**: After bounded rotary embedding passed, H3 Ref2VA FSDP2 GRPO missed a 144 MiB
+  output-projection allocation by roughly 10 MiB while the attention result was already available.
+- **Root Cause**: The attention processor kept strong Python references to complete Q/K/V tensors
+  through the output projection. FSDP2 activation checkpointing had discarded their saved-tensor
+  storage requirements, but the local variables still extended their lifetime.
+- **Fix**: The bounded H3 processor captures the output dtype, releases Q/K/V immediately after
+  attention dispatch, and only then flattens and projects the attention result.
+- **Lesson**: Under activation checkpointing, autograd may no longer own an intermediate while a
+  Python local still does. End large tensor lifetimes at their last semantic use before allocating
+  the next full-size result.
+- **Related Constraint**: N/A
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

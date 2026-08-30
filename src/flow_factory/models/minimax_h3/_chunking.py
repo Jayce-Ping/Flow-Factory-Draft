@@ -177,6 +177,7 @@ class _ChunkedH3AttnProcessor:
                 max_tokens=self.flow_factory_max_tokens,
             )
 
+        output_dtype = query.dtype
         hidden_states = self.flow_factory_dispatch_attention_fn(
             query,
             key,
@@ -187,7 +188,8 @@ class _ChunkedH3AttnProcessor:
             backend=self._attention_backend,
             parallel_config=self._parallel_config,
         )
-        hidden_states = hidden_states.flatten(2, 3).type_as(query)
+        del query, key, value
+        hidden_states = hidden_states.flatten(2, 3).to(dtype=output_dtype)
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
         return hidden_states
