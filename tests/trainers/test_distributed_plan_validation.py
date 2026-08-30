@@ -154,6 +154,46 @@ def test_loader_rejects_unsupported_muon_backend_before_loading_model(
     assert model_load_attempted is False
 
 
+def test_loader_rejects_unavailable_muon_before_loading_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A supported backend still requires the optimizer API before model loading."""
+    accelerator = _accelerator(DistributedType.MULTI_GPU)
+    model_load_attempted = False
+
+    class Adapter:
+        ddp_find_unused_parameters = False
+
+    def unexpected_model_load(**kwargs: object) -> None:
+        del kwargs
+        nonlocal model_load_attempted
+        model_load_attempted = True
+        raise AssertionError("load_model must not run without torch.optim.Muon")
+
+    config = SimpleNamespace(
+        mixed_precision="bf16",
+        optimizer_args=(MuonOptimizerArguments(name="base"),),
+        model_args=SimpleNamespace(model_type="test"),
+        log_args=SimpleNamespace(save_dir="/tmp", run_name="muon-api-rejection-test"),
+        training_args=SimpleNamespace(
+            gradient_accumulation_steps=1,
+            max_grad_norm=1.0,
+            seed=42,
+            trainer_type="grpo",
+            required_trainable_roles=None,
+        ),
+    )
+    monkeypatch.delattr(torch.optim, "Muon", raising=False)
+    monkeypatch.setattr(loader, "get_model_adapter_class", lambda model_type: Adapter)
+    monkeypatch.setattr(loader, "Accelerator", lambda **kwargs: accelerator)
+    monkeypatch.setattr(loader, "load_model", unexpected_model_load)
+
+    with pytest.raises(ValueError, match="torch.optim.Muon is unavailable"):
+        loader.load_trainer(config)
+
+    assert model_load_attempted is False
+
+
 @pytest.mark.parametrize("backend_checkpointing", [False, True])
 def test_loader_rejects_selective_fsdp2_checkpointing_before_loading_model(
     monkeypatch: pytest.MonkeyPatch,
@@ -284,7 +324,9 @@ def test_deepspeed_micro_batch_size_is_set_for_custom_train_loader() -> None:
     )
 
 
-def test_muon_with_deepspeed_is_rejected_as_unverified() -> None:
+def test_muon_with_deepspeed_is_rejected_as_unverified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Muon runs inside a composite; DeepSpeed rebuilds its own optimizer wrapper."""
     trainer = SimpleNamespace(accelerator=_accelerator(DistributedType.DEEPSPEED, zero_stage=2))
 
@@ -294,6 +336,7 @@ def test_muon_with_deepspeed_is_rejected_as_unverified() -> None:
     # AdamW is unaffected, and Muon is fine on the backends that preserve parameter rank.
     BaseTrainer._validate_optimizer_backend(trainer, (AdamWOptimizerArguments(name="base"),))
     fsdp2_trainer = SimpleNamespace(accelerator=_fsdp_accelerator(fsdp_version=2))
+    monkeypatch.setattr(torch.optim, "Muon", object(), raising=False)
     BaseTrainer._validate_optimizer_backend(fsdp2_trainer, (MuonOptimizerArguments(name="base"),))
 
 

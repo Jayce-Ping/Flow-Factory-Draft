@@ -30,6 +30,20 @@ from .composite import CompositeOptimizer
 MUON_MINIMUM_DIMENSIONS = 2
 
 
+def validate_muon_available() -> None:
+    """Require the optional PyTorch Muon implementation.
+
+    Raises:
+        ValueError: If this PyTorch build does not expose ``torch.optim.Muon``.
+    """
+    if not hasattr(torch.optim, "Muon"):
+        raise ValueError(
+            f"torch.optim.Muon is unavailable in PyTorch {torch.__version__}. Install a "
+            "PyTorch build that provides Muon (2.10 or newer in supported environments), "
+            "or select the adamw optimizer."
+        )
+
+
 def split_muon_parameters(
     parameters: Sequence[torch.nn.Parameter],
 ) -> Tuple[List[torch.nn.Parameter], List[torch.nn.Parameter]]:
@@ -136,6 +150,7 @@ def build_optimizer(
     if not muon_groups:
         return torch.optim.AdamW(adamw_groups)
 
+    validate_muon_available()
     children: List[torch.optim.Optimizer] = [torch.optim.Muon(muon_groups)]
     if adamw_groups:
         children.append(torch.optim.AdamW(adamw_groups))

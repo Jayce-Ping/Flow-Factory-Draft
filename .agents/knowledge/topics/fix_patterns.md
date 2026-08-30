@@ -709,6 +709,24 @@ Based on the fix type, write the fix entry to the appropriate document:
   implementation so early rejection does not create a parallel source of truth.
 - **Related Constraint**: N/A
 
+### Optional optimizer APIs must be validated before model loading
+- **Date**: 2026-08-31
+- **Symptom**: A Muon configuration on the supported PyTorch 2.6 baseline could pass backend
+  validation, load pretrained weights, and then fail when optimizer construction accessed the
+  unavailable `torch.optim.Muon` attribute.
+- **Root Cause**: Backend validation assumed that parsing a Muon optimizer configuration implied
+  its optional PyTorch implementation existed. Flow-Factory's minimum PyTorch version predates
+  that API, so configuration support and runtime capability are independent contracts.
+- **Fix**: One optimizer capability validator now checks the concrete `torch.optim.Muon` API.
+  The shared pre-load execution-plan validator calls it after rejecting intrinsically
+  incompatible backends, so supported DDP/FSDP2 plans fail before model loading with an
+  actionable upgrade message. Direct optimizer construction and the defensive pre-optimizer
+  plan check reuse the same rule.
+- **Lesson**: Optional APIs gated by dependency versions belong in the same early execution-plan
+  validation as backend compatibility. Detect the capability itself instead of trusting a version
+  string, while keeping a late defensive call at the construction boundary.
+- **Related Constraint**: N/A
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

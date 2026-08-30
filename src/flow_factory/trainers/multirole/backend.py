@@ -8,7 +8,7 @@ from accelerate.utils import DistributedType
 
 from ...hparams.optimizer_args import OptimizerArguments
 from ...hparams.training_args import TrainingArguments
-from ...optimizer import uses_muon
+from ...optimizer import uses_muon, validate_muon_available
 from ...utils.logger_utils import setup_logger
 
 logger = setup_logger(__name__)
@@ -43,7 +43,7 @@ def validate_optimizer_backend_plan(
         None.
 
     Raises:
-        ValueError: If Muon is paired with DeepSpeed or FSDP1.
+        ValueError: If Muon is unavailable or paired with DeepSpeed or FSDP1.
     """
     if not uses_muon(optimizer_args):
         return
@@ -54,20 +54,19 @@ def validate_optimizer_backend_plan(
             "DeepSpeed rebuilds its own optimizer wrapper around the object it "
             "receives. Use DDP or FSDP2 with Muon, or select the adamw optimizer."
         )
-    if accelerator.distributed_type != DistributedType.FSDP:
-        return
-    fsdp_plugin = getattr(accelerator.state, "fsdp_plugin", None)
-    fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) if fsdp_plugin else 1
-    if fsdp_version >= 2:
-        return
-    raise ValueError(
-        "Muon with FSDP1 does not work: FSDP1 flattens each wrapped unit into a "
-        "1D FlatParameter, so Muon is constructed over matrices and then receives "
-        "a 1D gradient, failing with 'Param gradient must be a 2D matrix' at the "
-        "first optimizer step. Set `fsdp_version: 2` in the accelerate config "
-        "(config/accelerate_configs/fsdp2.yaml), use DDP, or select the adamw "
-        "optimizer."
-    )
+    if accelerator.distributed_type == DistributedType.FSDP:
+        fsdp_plugin = getattr(accelerator.state, "fsdp_plugin", None)
+        fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) if fsdp_plugin else 1
+        if fsdp_version < 2:
+            raise ValueError(
+                "Muon with FSDP1 does not work: FSDP1 flattens each wrapped unit into a "
+                "1D FlatParameter, so Muon is constructed over matrices and then receives "
+                "a 1D gradient, failing with 'Param gradient must be a 2D matrix' at the "
+                "first optimizer step. Set `fsdp_version: 2` in the accelerate config "
+                "(config/accelerate_configs/fsdp2.yaml), use DDP, or select the adamw "
+                "optimizer."
+            )
+    validate_muon_available()
 
 
 def configure_checkpointing_backend_plan(

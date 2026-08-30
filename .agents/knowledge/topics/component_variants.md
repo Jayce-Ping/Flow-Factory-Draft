@@ -153,9 +153,10 @@ its children's groups as one list. An all-AdamW run still gets a plain
 `torch.optim.AdamW`, unchanged.
 
 Muon therefore gives one variant **two** parameter groups, which is why
-`OptimizationRole.optimizer_group_ids` is a tuple. Muon combined with DeepSpeed is
-rejected at startup as unverified: DDP and FSDP only read `param_groups` and call
-`step`, but DeepSpeed rebuilds its own optimizer wrapper around the object it receives.
+`OptimizationRole.optimizer_group_ids` is a tuple. It requires a PyTorch build that
+exposes `torch.optim.Muon`. DeepSpeed is rejected as unverified because it rebuilds
+its own optimizer wrapper, while FSDP1 is rejected because its flat parameters erase
+the required matrix rank; the supported distributed plans are DDP and FSDP2.
 
 ## Optimizer and backend contract
 
