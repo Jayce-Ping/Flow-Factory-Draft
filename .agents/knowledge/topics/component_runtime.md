@@ -70,6 +70,24 @@ instance attribute.
 - A target-owned composite root may still contain frozen auxiliary siblings. Pseudo runtimes move
   only that remainder and exclude every prepared target route.
 
+## Fix records
+
+### Repeated-block metadata must survive the distributed bundle boundary
+
+- **Date**: 2026-08-30
+- **Symptom**: Two-rank LTX2 FSDP2 runs exhausted a 95 GiB GPU while
+  `fully_shard()` initialized the prepared model root, before the first training step.
+- **Root Cause**: LTX2 declares its 48 transformer units through Diffusers'
+  `_repeated_blocks`, but `ModelBundle` surfaced only `_no_split_modules` to Accelerate;
+  the empty auto-wrap policy therefore sharded the complete 19B transformer as one unit.
+- **Fix**: `ModelBundle._no_split_modules` now falls back to `_repeated_blocks` for a
+  member that has no legacy no-split declaration, with a regression that resolves the
+  repeated block class through Accelerate's transformer-based FSDP policy.
+- **Lesson**: A distributed wrapper becomes the metadata boundary seen by backend
+  policy discovery. It must preserve both legacy and current model block declarations,
+  or a correct component graph can silently collapse into one memory-prohibitive shard.
+- **Related Constraint**: #9
+
 ## Failure modes
 
 - Expanding omitted materialization to all declarations loads tokenizers, configs, and weights

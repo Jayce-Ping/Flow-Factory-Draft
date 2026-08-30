@@ -20,6 +20,7 @@ from typing import Iterator
 
 import pytest
 import torch
+from accelerate import FullyShardedDataParallelPlugin
 from peft import LoraConfig, get_peft_model
 
 from flow_factory.models.abc import BaseAdapter
@@ -30,6 +31,29 @@ from flow_factory.models.variants import (
     ComponentVariantSpec,
     VariantParameter,
 )
+
+
+def test_model_bundle_exposes_diffusers_repeated_blocks_to_fsdp() -> None:
+    class RepeatedBlock(torch.nn.Module):
+        pass
+
+    class RepeatedBlockModel(torch.nn.Module):
+        _repeated_blocks = ["RepeatedBlock"]
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocks = torch.nn.ModuleList([RepeatedBlock(), RepeatedBlock()])
+
+    bundle = ModelBundle({"transformer": RepeatedBlockModel()})
+    plugin = FullyShardedDataParallelPlugin(
+        fsdp_version=2,
+        auto_wrap_policy="transformer_based_wrap",
+    )
+
+    plugin.set_auto_wrap_policy(bundle)
+
+    assert bundle._no_split_modules == ["RepeatedBlock"]
+    assert plugin.auto_wrap_policy.keywords["transformer_layer_cls"] == {RepeatedBlock}
 
 
 def _registry() -> ComponentVariantRegistry:
