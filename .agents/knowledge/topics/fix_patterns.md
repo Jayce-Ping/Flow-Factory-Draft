@@ -517,6 +517,21 @@ Based on the fix type, write the fix entry to the appropriate document:
   structure before dataset validation, cache identity, or exact-resume identity is derived.
 - **Related Constraint**: #5
 
+### Ordered-reference preprocessors need the canonical manifest sidecar
+- **Date**: 2026-08-30
+- **Symptom**: MiniMax H3 Ref2VA failed during distributed dataset preprocessing because its
+  strict workflow received decoded `references` but `reference_manifest=None`.
+- **Root Cause**: `GeneralDataset` canonicalized and retained each ordered-reference manifest for
+  Arrow output, but omitted that same manifest from the arguments passed to the adapter
+  preprocessor.
+- **Fix**: Ordered-reference preprocessing now forwards the canonical manifest beside the decoded
+  transient media, and the real-media round-trip regression requires the preprocessor to receive
+  the same canonical ordering that is stored in the cache.
+- **Lesson**: Identity and reconstruction sidecars must cross the same preprocessing boundary as
+  the transient inputs they describe. Preserve strict batch validation at the adapter instead of
+  delaying a missing-sidecar failure until sample construction.
+- **Related Constraint**: N/A
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

@@ -38,11 +38,13 @@ class OrderedPreprocessor:
 
     def __init__(self) -> None:
         self.received: List[List[Dict[str, Any]]] = []
+        self.received_manifests: List[str] = []
 
     def preprocess(
         self,
         prompt: List[str],
         references: List[List[Dict[str, Any]]],
+        reference_manifest: List[str],
         workflow: str,
         width: int,
         height: int = 512,
@@ -51,6 +53,7 @@ class OrderedPreprocessor:
         model_name_or_path: str = "MiniMaxAI/MiniMax-H3",
     ) -> Dict[str, Any]:
         self.received = references
+        self.received_manifests = reference_manifest
         assert workflow == "ref2va"
         return {"encoded": torch.tensor([[len(references[0])]], dtype=torch.float32)}
 
@@ -143,6 +146,7 @@ def test_ordered_references_round_trip_real_media_and_merged_cache(tmp_path: Pat
     assert preprocessor.received[0][0]["media"].size == (4, 3)
     assert preprocessor.received[0][1]["sample_rate"] == 22050
     assert preprocessor.received[0][1]["media"].shape[0] == 1
+    assert json.loads(preprocessor.received_manifests[0]) == references
     row = dataset[0]
     assert json.loads(row["reference_manifest"]) == references
     assert all(value is not None for value in row.values())

@@ -720,7 +720,10 @@ class GeneralDataset(Dataset):
                         for reference_index, entry in enumerate(json.loads(manifest))
                     ]
                 )
-            reference_args["references"] = loaded_reference_batch
+            reference_args.update(
+                references=loaded_reference_batch,
+                reference_manifest=canonical_manifests,
+            )
             batch["reference_manifest"] = canonical_manifests
 
         slot_args = {
