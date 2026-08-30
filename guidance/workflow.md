@@ -669,7 +669,8 @@ AdamW for its biases, normalization scales and embeddings, which the `fallback_`
 fields configure. `optimizer/loader.py` wraps that pair in a `CompositeOptimizer` so
 the framework still prepares exactly one root. An all-AdamW run gets a plain
 `torch.optim.AdamW`, unchanged. Muon requires a PyTorch build that exposes
-`torch.optim.Muon` (2.10 or newer in supported environments). Muon combined with
+`torch.optim.Muon` (included in standard releases from PyTorch 2.9; runtime capability detection
+is authoritative). Muon combined with
 DeepSpeed is refused at startup as unverified, and FSDP1 flattens matrices into
 incompatible parameters; use DDP or FSDP2.
 

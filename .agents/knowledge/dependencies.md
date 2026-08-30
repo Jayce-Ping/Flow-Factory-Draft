@@ -38,7 +38,7 @@ The authoritative list is `pyproject.toml` `[project.dependencies]` (20+ package
 
 | Package | Min Version | Purpose |
 |---------|-------------|---------|
-| `torch` | >= 2.6.0 | PyTorch core |
+| `torch` | >= 2.6.0 | PyTorch core and AdamW baseline; Muon needs the optional API noted below |
 | `torchvision` | >= 0.19.0 | Vision utilities |
 | `torchaudio` | >= 2.4.0 | Audio I/O (audio / audio-video models, CLAP) |
 | `transformers` | >= 4.57.1 | Text encoders, tokenizers |
@@ -55,6 +55,13 @@ The authoritative list is `pyproject.toml` `[project.dependencies]` (20+ package
 ### DeepSpeed
 - Only **ZeRO-1** and **ZeRO-2** are supported. ZeRO-3 is broken for reward model sharding (constraint #10).
 - DeepSpeed is optional — Accelerate alone handles most distributed scenarios.
+
+### Muon
+- The core `torch>=2.6.0` floor does not guarantee `torch.optim.Muon`. Selecting
+  `optimizer: muon` requires a build that exposes that API (included in standard releases from
+  PyTorch 2.9); runtime capability detection remains authoritative.
+- Muon is supported with DDP and FSDP2. The pre-load optimizer/backend validator rejects
+  DeepSpeed and FSDP1 before pretrained weights are loaded.
 
 ### diffusers
 - Use the released `diffusers>=0.40.0` package as the authoritative API. The repository submodule
@@ -101,5 +108,5 @@ The authoritative list is `pyproject.toml` `[project.dependencies]` (20+ package
 
 ## Cross-refs
 
-- `constraints.md` #10 (DeepSpeed ZeRO-3 unsupported)
-- `architecture.md` "Configuration Hierarchy" (hparams structure)
+- UP: [`constraints.md` #10](constraints.md#10-deepspeed-zero-3-is-unsupported), [Architecture Configuration Hierarchy](architecture.md#configuration-hierarchy)
+- PEER: [Component Variants](topics/component_variants.md)

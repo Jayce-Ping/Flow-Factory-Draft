@@ -39,7 +39,7 @@ def validate_muon_available() -> None:
     if not hasattr(torch.optim, "Muon"):
         raise ValueError(
             f"torch.optim.Muon is unavailable in PyTorch {torch.__version__}. Install a "
-            "PyTorch build that provides Muon (2.10 or newer in supported environments), "
+            "PyTorch build that provides Muon (standard releases include it from 2.9), "
             "or select the adamw optimizer."
         )
 

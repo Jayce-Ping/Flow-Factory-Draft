@@ -154,7 +154,8 @@ its children's groups as one list. An all-AdamW run still gets a plain
 
 Muon therefore gives one variant **two** parameter groups, which is why
 `OptimizationRole.optimizer_group_ids` is a tuple. It requires a PyTorch build that
-exposes `torch.optim.Muon`. DeepSpeed is rejected as unverified because it rebuilds
+exposes `torch.optim.Muon` (included in standard releases from PyTorch 2.9); the runtime feature
+check, rather than the version string alone, is authoritative. DeepSpeed is rejected as unverified because it rebuilds
 its own optimizer wrapper, while FSDP1 is rejected because its flat parameters erase
 the required matrix rank; the supported distributed plans are DDP and FSDP2.
 
@@ -192,5 +193,5 @@ family describes it.
 
 ## Cross-refs
 
-- UP: [`constraints.md` #10](../constraints.md), [`architecture.md` Component Management](../architecture.md#component-management)
+- UP: [`constraints.md` #10](../constraints.md#10-deepspeed-zero-3-is-unsupported), [`architecture.md` Component Management](../architecture.md#component-management)
 - PEER: [Component Runtime](component_runtime.md), [Structured Trajectory](structured_trajectory.md), [Autocast and Parameter Swaps](autocast_param_swap.md)
