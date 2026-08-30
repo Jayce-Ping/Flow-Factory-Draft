@@ -244,6 +244,8 @@ encoded on the fly; their VAE latents are never stored in the preprocessing cach
 epoch is one complete dataloader traversal sharded by PyTorch's official `DistributedSampler`. See the
 [dataset guide](guidance/datasets.md#offline-v2-records) for the full schema and cadence rules, and
 the [GPU validation plan](guidance/gpu_validation.md) for the 120-job model/backend/algorithm matrix.
+The [offline smoke builder](dataset/offline_smoke/README.md) reconstructs independent SFT and
+offline-DPO mini datasets for every currently implemented image, video, and audio-video profile.
 
 ## Text-to-Image & Text-to-Video
 

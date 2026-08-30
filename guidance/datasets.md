@@ -125,6 +125,41 @@ Tiny schema-complete fixtures and configs are available for
 [SFT](../examples/sft/lora/sd3_5/default.yaml) and
 [offline DPO](../examples/offline_dpo/lora/sd3_5/default.yaml).
 
+### Public offline smoke datasets
+
+The repository includes one builder for two independent, self-contained public mini datasets:
+
+- [Jayce-Ping/Flow-Factory-SFT-Smoke](https://huggingface.co/datasets/Jayce-Ping/Flow-Factory-SFT-Smoke)
+- [Jayce-Ping/Flow-Factory-Offline-DPO-Smoke](https://huggingface.co/datasets/Jayce-Ping/Flow-Factory-Offline-DPO-Smoke)
+
+Their runtime aliases cover the currently implemented image, video, and ordered `(video, audio)`
+output adapters. The catalog is expressed with the general `PipelineIOContract` output sequence;
+it does not encode audio-video as a special media type. A future audio-only or other ordered output
+can therefore use the same V2 schema and preparation path, although no fixture is published for a
+model family that does not exist in the framework today.
+
+Before a GPU smoke run, materialize exactly two rank-local batches from the pinned Hub revision:
+
+```bash
+python -m dataset.offline_smoke.prepare \
+  --algorithm sft \
+  --profile ltx2-t2av \
+  --world-size 8
+
+python -m dataset.offline_smoke.prepare \
+  --algorithm offline-dpo \
+  --profile h3-ref2va \
+  --world-size 8
+```
+
+The default output is `dataset/_prepared_offline_smoke/<algorithm>/<profile>/train.jsonl` with
+profile-local media. The preparation tool uses the locked immutable dataset revision, selects
+`world_size * per_device_batch_size * batches_per_rank` rows, and validates through the existing
+V2 and canonical task-profile contract boundaries. It does not preprocess target media or create
+latent caches.
+See [`dataset/offline_smoke`](../dataset/offline_smoke/README.md) for construction, provenance, and
+publication details.
+
 Evaluation still uses generation acquisition, including when the trainer is SFT or offline DPO.
 Consequently, a split enabled through `data.datasets[*].eval` must use one of the legacy
 prompt/condition formats documented under [Common task formats](#common-task-formats), not a

@@ -109,6 +109,10 @@ latest_checkpointed_iteration.txt
 # Dataset assets (keep metadata, ignore media)
 # ====================
 
+# Reconstructed/publication staging for the SFT and offline-DPO smoke datasets
+dataset/_prepared_offline_smoke/
+dataset/offline_smoke/_staging/
+
 # gitattributes in dataset
 dataset/**/.gitattributes
 

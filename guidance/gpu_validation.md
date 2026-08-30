@@ -101,6 +101,31 @@ recorded in the resolved YAML; do not silently return to a large quality recipe.
 | `h3-fl2va` | `examples/grpo/lora/minimax_h3_fl2va/default.yaml` plus H3 debug geometry | `resolution: [64, 96]`, `num_frames: 124`, `frame_rate: 24.0` | `num_inference_steps: 2` | The two offline records are explicit `first_frame`-only and `last_frame`-only cases. Cover both slots together in the additional variant gate. |
 | `h3-ref2va` | `examples/grpo/lora/minimax_h3_ref2va/default.yaml` plus H3 debug geometry | `resolution: [64, 96]`, `num_frames: 124`, `frame_rate: 24.0` | `num_inference_steps: 2` | Preserve heterogeneous global reference order; include image, video, and audio references. |
 
+For the two offline algorithms, construct each ready-to-use alias from its independent pinned
+public dataset before launching distributed workers:
+
+```bash
+python -m dataset.offline_smoke.prepare \
+  --algorithm sft \
+  --profile "${MODE}" \
+  --world-size "${WORLD_SIZE}" \
+  --per-device-batch-size 1 \
+  --batches-per-rank 2
+
+python -m dataset.offline_smoke.prepare \
+  --algorithm offline-dpo \
+  --profile "${MODE}" \
+  --world-size "${WORLD_SIZE}" \
+  --per-device-batch-size 1 \
+  --batches-per-rank 2
+```
+
+Run the command once per shared filesystem rather than once per distributed rank. The SFT and DPO
+repositories have the same alias/input distribution but different supervision and self-contained
+media. `image-i2i` is an additional contract gate outside the 120-job main matrix. The catalog and
+materializer operate on arbitrary ordered output media sequences; currently published fixtures are
+limited to the image, video, and `(video, audio)` outputs implemented by registered adapters.
+
 For GRPO set `group_size: 2`, `unique_sample_num_per_epoch: 1`, and
 `gradient_accumulation_steps: auto`; this avoids a degenerate one-candidate
 advantage while retaining one optimizer step per epoch. For TDM set
@@ -139,7 +164,7 @@ backends and all four algorithms.
 | Wan T2V | `Wan2.1-T2V-14B-Diffusers`, `Wan2.2-TI2V-5B-Diffusers`, `Wan2.2-T2V-A14B-Diffusers` |
 | Wan I2V first-only | `Wan2.1-I2V-14B-480P-Diffusers`, `Wan2.1-I2V-14B-720P-Diffusers`, `Wan2.2-I2V-A14B-Diffusers` |
 | Wan first/last | `Wan2.1-I2V-14B-720P-Diffusers`, `Wan2.2-I2V-A14B-Diffusers` |
-| LTX2 T2AV and I2AV | `Lightricks/LTX-2.3` or its canonical official-Diffusers repository revision |
+| LTX2 T2AV and I2AV | `dg845/LTX-2.3-Diffusers` |
 | MiniMax H3 | The same checkpoint is covered separately by T2VA, FL2VA, and Ref2VA inputs. Add an FL2VA first-plus-last fixture to complement the first-only/last-only main jobs. |
 
 Wan2.2 TI2V-5B uses expanded timesteps. Official Diffusers ignores a supplied

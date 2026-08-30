@@ -246,6 +246,14 @@ Based on the fix type, write the fix entry to the appropriate document:
   numerically lossy or RNG-consuming transition work that is outside their requested output.
 - **Related Constraint**: #7
 
+### Documented dataset tools must use their package invocation mode
+- **Date**: 2026-08-30
+- **Symptom**: Running the documented `python dataset/offline_smoke/prepare.py ...` command failed before argument parsing with `attempted relative import with no known parent package`.
+- **Root Cause**: The package uses relative imports, while the documentation incorrectly advertised direct file execution instead of Python's module mode.
+- **Fix**: All offline-smoke commands now use `python -m dataset.offline_smoke.<tool>` with unconditional package imports, and a subprocess regression executes the documented form.
+- **Lesson**: A checked-in CLI example is part of the public interface; standardize on one package-aware invocation and test that exact process rather than adding conditional import fallbacks.
+- **Related Constraint**: N/A
+
 ### Exact resume must lock the checkpoint-realized pipeline contract
 - **Date**: 2026-08-29
 - **Symptom**: Exact resume could accept a checkpoint after an in-place model configuration change
