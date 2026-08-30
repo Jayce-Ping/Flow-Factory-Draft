@@ -395,6 +395,24 @@ Based on the fix type, write the fix entry to the appropriate document:
   masks the first failure and breaks distributed lifecycle semantics.
 - **Related Constraint**: #9
 
+### FSDP2 activation checkpoints must replay inside the mixed-precision boundary
+- **Date**: 2026-08-30
+- **Symptom**: All four Wan FSDP2 trainers failed on their first backward because checkpointed
+  tensors were saved as BF16 but recomputed as FP32.
+- **Root Cause**: Model-level checkpointing captured FP32 block inputs before FSDP2's forward-input
+  cast, while backward replay re-entered a block in `PRE_BACKWARD` state where PyTorch deliberately
+  skips that cast.
+- **Fix**: When full model checkpointing and FSDP2 activation checkpointing are both requested, the
+  trainer now disables model-level boundaries and keeps Accelerate's backend checkpoint wrappers,
+  which replay inside the fully-sharded mixed-precision boundary. Selective policies fail closed
+  because backend checkpointing cannot preserve their exact selection, while FSDP1 retains its
+  existing owner. Wan FSDP2 GRPO, TDM, SFT, and offline DPO plus SD3.5 and Bagel regressions verify
+  the shared path.
+- **Lesson**: Checkpoint placement is part of distributed precision semantics. A recompute boundary
+  outside a sharded module may not replay its forward hooks, so backend-aligned checkpoint wrappers
+  must own FSDP2 full checkpointing instead of nesting model-level boundaries around sharded blocks.
+- **Related Constraint**: #9, #20
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

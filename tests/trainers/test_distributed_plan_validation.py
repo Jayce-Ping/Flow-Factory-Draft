@@ -233,9 +233,7 @@ def test_tdm_r1_fsdp1_disables_incompatible_activation_checkpointing() -> None:
             trainer_type="tdm-r1",
             enable_gradient_checkpointing=True,
         ),
-        adapter=SimpleNamespace(
-            disable_gradient_checkpointing=lambda: disabled.append(True)
-        ),
+        adapter=SimpleNamespace(disable_gradient_checkpointing=lambda: disabled.append(True)),
     )
 
     BaseTrainer._apply_backend_checkpointing_constraints(trainer)
@@ -245,7 +243,63 @@ def test_tdm_r1_fsdp1_disables_incompatible_activation_checkpointing() -> None:
     assert plugin.activation_checkpointing is False
 
 
-def test_fsdp2_keeps_model_checkpointing_and_disables_nested_backend_checkpointing() -> None:
+@pytest.mark.parametrize(
+    "checkpoint_policy",
+    [True, SimpleNamespace(mode="full")],
+)
+def test_fsdp2_disables_model_checkpointing_and_keeps_backend_checkpointing(
+    checkpoint_policy: object,
+) -> None:
+    from flow_factory.trainers.abc import BaseTrainer
+
+    plugin = SimpleNamespace(fsdp_version=2, activation_checkpointing=True)
+    disabled = []
+    trainer = SimpleNamespace(
+        accelerator=SimpleNamespace(
+            distributed_type=DistributedType.FSDP,
+            state=SimpleNamespace(fsdp_plugin=plugin),
+        ),
+        training_args=SimpleNamespace(
+            trainer_type="tdm-r1",
+            enable_gradient_checkpointing=checkpoint_policy,
+        ),
+        adapter=SimpleNamespace(disable_gradient_checkpointing=lambda: disabled.append(True)),
+    )
+
+    BaseTrainer._apply_backend_checkpointing_constraints(trainer)
+
+    assert disabled == [True]
+    assert trainer.training_args.enable_gradient_checkpointing is False
+    assert plugin.activation_checkpointing is True
+
+
+def test_fsdp1_keeps_model_checkpointing_and_disables_nested_backend_checkpointing() -> None:
+    from flow_factory.trainers.abc import BaseTrainer
+
+    plugin = SimpleNamespace(fsdp_version=1, activation_checkpointing=True)
+    trainer = SimpleNamespace(
+        accelerator=SimpleNamespace(
+            distributed_type=DistributedType.FSDP,
+            state=SimpleNamespace(fsdp_plugin=plugin),
+        ),
+        training_args=SimpleNamespace(
+            trainer_type="grpo",
+            enable_gradient_checkpointing=True,
+        ),
+        adapter=SimpleNamespace(
+            disable_gradient_checkpointing=lambda: pytest.fail(
+                "FSDP1 must keep model checkpointing enabled"
+            )
+        ),
+    )
+
+    BaseTrainer._apply_backend_checkpointing_constraints(trainer)
+
+    assert trainer.training_args.enable_gradient_checkpointing is True
+    assert plugin.activation_checkpointing is False
+
+
+def test_fsdp2_rejects_selective_model_and_backend_checkpointing() -> None:
     from flow_factory.trainers.abc import BaseTrainer
 
     plugin = SimpleNamespace(fsdp_version=2, activation_checkpointing=True)
@@ -255,20 +309,21 @@ def test_fsdp2_keeps_model_checkpointing_and_disables_nested_backend_checkpointi
             state=SimpleNamespace(fsdp_plugin=plugin),
         ),
         training_args=SimpleNamespace(
-            trainer_type="tdm-r1",
-            enable_gradient_checkpointing=True,
+            trainer_type="grpo",
+            enable_gradient_checkpointing=SimpleNamespace(mode="every_n"),
         ),
         adapter=SimpleNamespace(
             disable_gradient_checkpointing=lambda: pytest.fail(
-                "FSDP2 must keep model checkpointing enabled"
+                "selective checkpointing must fail before mutating the adapter"
             )
         ),
     )
 
-    BaseTrainer._apply_backend_checkpointing_constraints(trainer)
+    with pytest.raises(ValueError, match="cannot preserve selective"):
+        BaseTrainer._apply_backend_checkpointing_constraints(trainer)
 
-    assert trainer.training_args.enable_gradient_checkpointing is True
-    assert plugin.activation_checkpointing is False
+    assert trainer.training_args.enable_gradient_checkpointing.mode == "every_n"
+    assert plugin.activation_checkpointing is True
 
 
 def test_fsdp2_keeps_backend_checkpointing_when_model_policy_is_disabled() -> None:

@@ -69,12 +69,15 @@ Diffusers model's `_repeated_blocks` declaration. Adapters with multiple forward
 stacks should override `_gradient_checkpointing_units()` and return their blocks
 in execution order.
 
-Checkpointing has one owner. An explicit train-level model policy disables FSDP
-activation checkpointing to avoid nested recomputation; when the train-level
-policy is disabled, the backend may apply full FSDP activation checkpointing.
-Transformers-style components support full checkpointing through
-`gradient_checkpointing_enable()`, but must expose the Diffusers callback API to
-support selective modes.
+Checkpointing has one owner. When FSDP2 full model checkpointing and backend
+activation checkpointing are both enabled, the model policy yields ownership to
+the backend so recomputation stays inside the sharded mixed-precision boundary.
+FSDP1 keeps model-level ownership. FSDP2 rejects a selective train-level policy
+combined with backend activation checkpointing, because the backend cannot
+preserve the requested `fraction`, `every_n`, or `layers` boundary; disable
+backend activation checkpointing when using those policies. Transformers-style
+components support full checkpointing through `gradient_checkpointing_enable()`,
+but must expose the Diffusers callback API to support selective modes.
 
 ## Step-by-Step Implementation
 

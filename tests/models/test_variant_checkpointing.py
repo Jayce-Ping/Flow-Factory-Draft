@@ -27,9 +27,7 @@ from safetensors.torch import load_file, save_file
 from flow_factory.models.abc import BaseAdapter
 from flow_factory.models.model_bundle import ModelBundle, RoutedComponentProxy
 from flow_factory.models.variants import DEFAULT_BASE_VARIANT as BASE_VARIANT
-from flow_factory.models.variants import (
-    ComponentVariantRegistry,
-)
+from flow_factory.models.variants import ComponentVariantRegistry
 from flow_factory.trainers.abc import BaseTrainer
 from flow_factory.trainers.common.runtime_state import TrainerRuntimeState
 from flow_factory.trainers.distillation.tdm_r1 import (
@@ -255,6 +253,20 @@ def _trainer_runtime(
     )
     trainer.step = 0
     return trainer
+
+
+def test_disabling_gradient_checkpointing_visits_every_materialized_variant() -> None:
+    trainer = _trainer_runtime("full")
+    members = trainer.adapter.component_variant_registry.bundle_members()
+    disabled_routes = []
+    for route_name, component in members.items():
+        component.disable_gradient_checkpointing = (
+            lambda route_name=route_name: disabled_routes.append(route_name)
+        )
+
+    trainer.adapter.disable_gradient_checkpointing()
+
+    assert disabled_routes == list(members)
 
 
 def _step_fake_role(trainer: TinyTrainer) -> None:

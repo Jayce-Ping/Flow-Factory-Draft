@@ -1175,10 +1175,8 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
             )
         )
         fsdp_checkpointing = bool(getattr(fsdp_plugin, "activation_checkpointing", False))
-        if (
-            self.training_args.trainer_type == "tdm-r1"
-            and getattr(fsdp_plugin, "fsdp_version", 1) < 2
-        ):
+        fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) or 1
+        if self.training_args.trainer_type == "tdm-r1" and fsdp_version < 2:
             if not model_checkpointing and not fsdp_checkpointing:
                 return
             self.adapter.disable_gradient_checkpointing()
@@ -1194,11 +1192,30 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
             return
 
         if model_checkpointing and fsdp_checkpointing:
-            fsdp_plugin.activation_checkpointing = False
-            logger.info(
-                "Disabled FSDP activation checkpointing because train-level model "
-                "checkpointing is enabled; nested checkpoint boundaries duplicate recompute."
-            )
+            if fsdp_version >= 2:
+                checkpoint_policy = self.training_args.enable_gradient_checkpointing
+                full_checkpointing = checkpoint_policy is True or (
+                    getattr(checkpoint_policy, "mode", None) == "full"
+                )
+                if not full_checkpointing:
+                    raise ValueError(
+                        "FSDP2 activation checkpointing cannot preserve selective model "
+                        "checkpointing boundaries. Disable fsdp_activation_checkpointing or "
+                        "use train.enable_gradient_checkpointing=true/mode=full."
+                    )
+                self.adapter.disable_gradient_checkpointing()
+                self.training_args.enable_gradient_checkpointing = False
+                logger.info(
+                    "Disabled model gradient checkpointing because FSDP2 activation "
+                    "checkpointing is enabled; checkpoint recomputation must stay inside "
+                    "the FSDP2 mixed-precision boundary."
+                )
+            else:
+                fsdp_plugin.activation_checkpointing = False
+                logger.info(
+                    "Disabled FSDP activation checkpointing because train-level model "
+                    "checkpointing is enabled; nested checkpoint boundaries duplicate recompute."
+                )
 
     def _initialization(self):
         self._validate_paradigm_dynamics()
