@@ -56,6 +56,8 @@ class ClassicPipelineRuntime(ComponentRuntime):
         """Collapse logical aliases that reference one canonical module object."""
         self._validate_declared_names([name])
         component = self.declared_components[name]
+        if component is None:
+            return name, ()
         for canonical_name, canonical_component in self.canonical_components.items():
             if component is canonical_component:
                 return canonical_name, ()

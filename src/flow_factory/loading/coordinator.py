@@ -113,9 +113,18 @@ class ModelLoadCoordinator:
         )
         if not replicated and not remainder_roots:
             return
+        loaded_replicated: List[str] = []
         with self.load_scope(ComponentRole.AUXILIARY):
             if replicated:
                 self.adapter.on_load_components(components=replicated, device=device)
+                materialized_roots = set(
+                    self.adapter.component_runtime.materialized_component_names
+                )
+                loaded_replicated = [
+                    name
+                    for name in replicated
+                    if self.plan.descriptors[name].root in materialized_roots
+                ]
             for root in remainder_roots:
                 request = self.plan.request_for_root(root)
                 excluded_paths = [
@@ -128,8 +137,8 @@ class ModelLoadCoordinator:
                     excluded_paths=excluded_paths,
                     device=device,
                 )
-        if replicated:
-            self.components_loaded(replicated)
+        if loaded_replicated:
+            self.components_loaded(loaded_replicated)
 
     def prepare(self, *objects: Any) -> Any:
         return self.backend.prepare(*objects)

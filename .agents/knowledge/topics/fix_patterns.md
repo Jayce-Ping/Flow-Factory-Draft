@@ -430,6 +430,22 @@ Based on the fix type, write the fix entry to the appropriate document:
   components or weaken the fail-fast contract for checkpoint-specific user overrides.
 - **Related Constraint**: #20
 
+### Absent optional components need distinct physical roots
+- **Date**: 2026-08-30
+- **Symptom**: Every Wan2.2 TI2V trainer rejected its load plan because the physical
+  `image_encoder` root appeared to combine incompatible auxiliary and host roles.
+- **Root Cause**: The eager runtime used object identity to collapse logical aliases, so multiple
+  optional components whose value was the singleton `None` were mistaken for one shared physical
+  object.
+- **Fix**: Classic pipelines now preserve a declared optional `None` under its own logical root
+  while retaining identity aliasing for real objects. The load coordinator finalizes only
+  replicated roots that actually materialized, preventing FSDP replica checks from resolving an
+  allowed absent component.
+- **Lesson**: Object identity establishes physical aliasing only for materialized objects. Optional
+  declarations retain distinct lifecycle identities, and backend finalization must follow observed
+  materialization rather than the requested name set.
+- **Related Constraint**: #9
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)
