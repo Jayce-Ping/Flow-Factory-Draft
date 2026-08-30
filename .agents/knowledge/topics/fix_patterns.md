@@ -376,6 +376,25 @@ Based on the fix type, write the fix entry to the appropriate document:
   must not inherit a fixed block class that may be absent from the instantiated module tree.
 - **Related Constraint**: #9
 
+### Parameter-sharded submodule work must remain inside the prepared root forward
+- **Date**: 2026-08-30
+- **Symptom**: Every Bagel FSDP2 trainer reached sampling or offline replay but failed at token
+  embedding with a mixed `torch.Tensor` and `DTensor` operator error.
+- **Root Cause**: Bagel's cache helpers and denoising path reached through the physical pipeline to
+  `language_model.model.embed_tokens` before calling the routed transformer. Decoder layers owned
+  nested FSDP groups, but embedding and final normalization belonged to the prepared `ModelBundle`
+  root, whose unshard hook was bypassed by those direct calls.
+- **Fix**: The outer Qwen forward now accepts raw packed token IDs and inserts their embeddings into
+  an optional query-local auxiliary sequence. Bagel cache helpers accept an injected language-model
+  forward, and the adapter supplies its routed transformer for text, VAE, ViT, denoising, and CFG
+  passes. Each logical language-model pass therefore performs embedding, decoder execution, and
+  final normalization inside one prepared-root call.
+- **Lesson**: Under compositional FSDP, wrapping transformer blocks does not make arbitrary child
+  access safe. Any computation using parameters owned by the prepared root must execute beneath
+  that root's forward hooks; converting ordinary inputs to `DTensor` or manually unsharding only
+  masks the first failure and breaks distributed lifecycle semantics.
+- **Related Constraint**: #9
+
 ## Cross-refs
 
 - `constraints.md` (archival target for constraint violations)

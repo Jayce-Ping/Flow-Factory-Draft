@@ -1312,7 +1312,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
 
     def forward_inference(
         self,
-        packed_query_sequence: torch.Tensor,
+        packed_query_sequence: Optional[torch.Tensor],
         query_lens: torch.Tensor,
         packed_query_position_ids: torch.Tensor,
         packed_query_indexes: torch.Tensor,
@@ -1324,7 +1324,38 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         mode="und",
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
+        packed_text_ids: Optional[torch.LongTensor] = None,
     ) -> BaseNavitOutputWithPast:
+
+        # Keep token embedding inside the outer language-model forward. Distributed
+        # wrappers attach their unshard hooks to this boundary, so callers must not
+        # reach through to ``model.embed_tokens`` while the parameters are sharded.
+        if packed_text_ids is not None:
+            packed_text_embedding = self.model.embed_tokens(packed_text_ids)
+            if packed_query_sequence is None:
+                packed_query_sequence = packed_text_embedding
+            else:
+                if packed_text_indexes is None:
+                    raise ValueError(
+                        "packed_text_indexes is required when inserting packed_text_ids "
+                        "into an existing packed_query_sequence"
+                    )
+                if packed_text_ids.numel() != packed_text_indexes.numel():
+                    raise ValueError(
+                        "packed_text_ids and packed_text_indexes must contain the same "
+                        f"number of tokens, got {packed_text_ids.numel()} and "
+                        f"{packed_text_indexes.numel()}"
+                    )
+                packed_query_sequence = packed_query_sequence.index_copy(
+                    0,
+                    packed_text_indexes,
+                    packed_text_embedding.to(packed_query_sequence.dtype),
+                )
+        elif packed_query_sequence is None:
+            raise ValueError(
+                "Qwen2ForCausalLM.forward_inference requires packed_query_sequence "
+                "or packed_text_ids"
+            )
 
         outputs = self.model(
             packed_query_sequence=packed_query_sequence,
