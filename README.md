@@ -153,6 +153,9 @@ cd Flow-Factory
 pip install -e .
 ```
 
+Flow-Factory requires Python 3.11 or newer and PyTorch 2.10 or newer. PyTorch 2.10 includes the
+native `torch.optim.Muon` API used by Muon optimizer configs.
+
 Optional dependencies, such as `deepspeed`, are also available. Install them with:
 
 ```bash
@@ -163,8 +166,10 @@ pip install -e .[deepspeed]
 
 > **Dependency:** MiniMax H3 and LTX2 require the released `diffusers>=0.40.0` API.
 > PyAV >=18.0.0 decodes ordered video/audio references and target media.
+> TorchAudio 2.10 delegates audio loading and saving to TorchCodec, which also requires FFmpeg
+> shared libraries. The CUDA image installs those system libraries automatically.
 
-A CUDA training image (Python 3.12, **uv**-based install, PyTorch 2.8 + `cu129`, `deepspeed`, `wandb`, released `diffusers`) is defined under [`docker/docker-cuda/`](docker/docker-cuda/Dockerfile). See [`docker/README.md`](docker/README.md) for build and run instructions (including `linux/amd64` on Apple Silicon).
+A CUDA training image (Python 3.12, **uv**-based install, PyTorch 2.10 + `cu129`, `deepspeed`, `wandb`, released `diffusers`) is defined under [`docker/docker-cuda/`](docker/docker-cuda/Dockerfile). See [`docker/README.md`](docker/README.md) for build and run instructions (including `linux/amd64` on Apple Silicon).
 
 ## Experiment Trackers
 
@@ -341,7 +346,7 @@ The following reward models are pre-registered and ready to use:
 | `rational_rewards_edit` | Pointwise | A reasoning reward model that provides multi-aspect reward for image edit; four aspects → scalar in [0, 1] | [RationalRewards-8B-Edit](https://huggingface.co/TIGER-Lab/RationalRewards-8B-Edit) |
 | `qwen_image_bench` | Pointwise | Qwen-Image-Bench "Q-Judger"; hierarchical 5-dim / 56-facet scoring with per-prompt `dims_en` → scalar in [0, 1] | [Qwen-Image-Bench](https://github.com/QwenLM/Qwen-Image-Bench) |
 
-> **GenEval** requires extra dependencies (mmcv, mmdet, open_clip). Install with: `bash scripts/install_geneval_deps.sh` (Python 3.10 recommended). See [guidance/rewards.md](guidance/rewards.md#dataset-metadata-convention) for dataset format.
+> **GenEval** requires extra dependencies (mmcv, mmdet, open_clip). Install with: `bash scripts/install_geneval_deps.sh` (Python 3.11 or 3.12). See [guidance/rewards.md](guidance/rewards.md#dataset-metadata-convention) for dataset format.
 
 > **VLM-as-Judge** (remote vLLM / OpenAI-style HTTP) is covered in [guidance/rewards.md#vlm-as-judge](guidance/rewards.md#vlm-as-judge) (`vllm_evaluate`, Rational Rewards, `qwen_image_bench`, async tips). For [RationalRewards](https://github.com/TIGER-AI-Lab/RationalRewards) specifically, serve the judge with [`scripts/start_vllm_rational_reward.sh`](scripts/start_vllm_rational_reward.sh) and set YAML `api_base_url` / `vlm_model` to match `--served-model-name` (defaults: `RationalRewards-8B-T2I` / `RationalRewards-8B-Edit`). For [Qwen-Image-Bench](https://github.com/QwenLM/Qwen-Image-Bench), use [`scripts/start_vllm_qwen_image_bench.sh`](scripts/start_vllm_qwen_image_bench.sh) and build the dataset with `python dataset/qwen_image_bench/prepare.py`.
 

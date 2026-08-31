@@ -20,8 +20,10 @@ Some instructions for installation on CUDA 12.9:
 pip install paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
 pip install paddleocr
 pip install python-Levenshtein
-# Install torch2.8.0 and it will update nvcc toolkits automatically
-pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu129
+# Install the project baseline PyTorch stack and its audio codec runtime
+pip install \
+  torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 torchcodec==0.10.0 \
+  --index-url https://download.pytorch.org/whl/cu129
 # Maybe you will need this:
 yum install -y mesa-libGL glib2
 ```
@@ -83,9 +85,7 @@ class OCRRewardModel(PointwiseRewardModel):
         metadata: Optional[list[str]] = None,
     ) -> list[float]:
         """Compute mean target-text fidelity for each image."""
-        if len(prompt) != len(image) or (
-            metadata is not None and len(prompt) != len(metadata)
-        ):
+        if len(prompt) != len(image) or (metadata is not None and len(prompt) != len(metadata)):
             raise ValueError(
                 "expected equal OCR batch lengths for prompt and image, with optional "
                 "metadata matching that length; "
@@ -132,11 +132,7 @@ class OCRRewardModel(PointwiseRewardModel):
                 f"expected string prompt for OCR sample {sample_index}, "
                 f"received {type(prompt).__name__}: {prompt!r}"
             )
-        targets = [
-            target.strip()
-            for target in _QUOTED_TEXT.findall(prompt)
-            if target.strip()
-        ]
+        targets = [target.strip() for target in _QUOTED_TEXT.findall(prompt) if target.strip()]
         if not targets:
             raise ValueError(
                 f"expected quoted OCR target in prompt for sample {sample_index}, "

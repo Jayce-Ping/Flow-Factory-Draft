@@ -711,7 +711,7 @@ Based on the fix type, write the fix entry to the appropriate document:
 
 ### Optional optimizer APIs must be validated before model loading
 - **Date**: 2026-08-31
-- **Symptom**: A Muon configuration on the supported PyTorch 2.6 baseline could pass backend
+- **Symptom**: A Muon configuration on the then-declared PyTorch 2.6 baseline could pass backend
   validation, load pretrained weights, and then fail when optimizer construction accessed the
   unavailable `torch.optim.Muon` attribute.
 - **Root Cause**: Backend validation assumed that parsing a Muon optimizer configuration implied

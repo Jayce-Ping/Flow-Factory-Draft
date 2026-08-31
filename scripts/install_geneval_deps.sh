@@ -4,8 +4,8 @@
 # Install GenEval reward model dependencies (mmcv + mmdet + open_clip)
 #
 # Requirements:
-#   - Python 3.10 or 3.12 (tested)
-#   - PyTorch >= 2.0 with CUDA
+#   - Python 3.11 or 3.12
+#   - PyTorch >= 2.10 with CUDA
 #   - CUDA toolkit (nvcc) for mmcv CUDA ops compilation
 #   - uv (recommended) or pip
 #
@@ -39,8 +39,8 @@ fi
 
 PY_VERSION=$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 
-if [[ "$PY_VERSION" != "3.10" && "$PY_VERSION" != "3.12" ]]; then
-    warn "Python ${PY_VERSION} detected. This script has only been tested with Python 3.10 and 3.12."
+if [[ "$PY_VERSION" != "3.11" && "$PY_VERSION" != "3.12" ]]; then
+    warn "Python ${PY_VERSION} detected. Flow-Factory supports Python 3.11 and 3.12."
     warn "Proceeding anyway..."
     echo ""
 fi

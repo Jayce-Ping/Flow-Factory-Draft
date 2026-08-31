@@ -1,6 +1,6 @@
 # Docker (CUDA) — Flow-Factory Training Image
 
-Pre-built GPU training image for Flow-Factory: CUDA 12.9, Python 3.12, PyTorch 2.8, DeepSpeed, and W&B — ready to run `ff-train` out of the box.
+Pre-built GPU training image for Flow-Factory: CUDA 12.9, Python 3.12, PyTorch 2.10, DeepSpeed, and W&B — ready to run `ff-train` out of the box.
 
 ## Prerequisites
 

@@ -243,7 +243,7 @@ def load_audio(
     Note:
         Backend resolution (see :func:`_load_audio_backend`):
             1. ``torchaudio`` — primary backend, handles wav/mp3/flac/ogg/...
-               (``torchaudio>=2.4.0`` is a core dependency).
+               (``torchaudio>=2.10.0`` and its TorchCodec runtime are core dependencies).
             2. ``soundfile`` — used when ``torchaudio`` is unavailable;
                handles wav/flac/ogg.
             3. stdlib ``wave`` — last-resort fallback, WAV-only,
