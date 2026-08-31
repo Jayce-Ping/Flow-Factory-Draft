@@ -27,10 +27,10 @@ ff-train examples/grpo/lora/flux1/default.yaml
 ## Offline examples
 
 - [`sft` with SD3.5](sft/lora/sd3_5/default.yaml) consumes V2
-  `demonstration` records from [`examples/data/sft_sd3_5`](data/sft_sd3_5/train.jsonl).
+  `demonstration` records from [`dataset/sft_sd3_5`](../dataset/sft_sd3_5/train.jsonl).
 - [`offline-dpo` with SD3.5](offline_dpo/lora/sd3_5/default.yaml) consumes V2
   `preference` records from
-  [`examples/data/offline_dpo_sd3_5`](data/offline_dpo_sd3_5/train.jsonl).
+  [`dataset/offline_dpo_sd3_5`](../dataset/offline_dpo_sd3_5/train.jsonl).
 
 The two tiny manifests reuse repository images so their paths resolve without a separate dataset
 download. They are configuration and smoke-test fixtures, not quality-training datasets. Offline

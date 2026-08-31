@@ -1,4 +1,4 @@
-# Single-process SFT smoke recipe over a V2 demonstration manifest.
+# Single-process SFT smoke recipe over the checked-in dataset/sft_sd3_5 fixture.
 # Replace the tiny repository-image dataset with a real training corpus for quality runs.
 launcher: "accelerate"
 config_file: null
@@ -9,7 +9,7 @@ mixed_precision: "bf16"
 data:
   datasets:
     - name: offline_demonstrations
-      dataset_dir: "examples/data/sft_sd3_5"
+      dataset_dir: "dataset/sft_sd3_5"
       train:
         weight: 1  # Offline epochs require unit source weights and full traversal.
         max_dataset_size: 2

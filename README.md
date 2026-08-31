@@ -241,6 +241,10 @@ SFT and offline DPO use strict JSONL with `schema_version: 2`. Public media obje
 The optional input-only `slot` field binds sparse conditions to adapter-declared semantic
 arguments. Unslotted media fills remaining slots positionally; supervision outputs reject slots.
 
+The checked-in [SFT demonstration fixture](dataset/sft_sd3_5/train.jsonl) and
+[offline-DPO preference fixture](dataset/offline_dpo_sd3_5/train.jsonl) provide minimal examples
+under the repository's canonical `dataset/` root.
+
 Prompt and input-condition encodings are cached. Target, chosen, and rejected media are decoded and
 encoded on the fly; their VAE latents are never stored in the preprocessing cache. One offline
 epoch is one complete dataloader traversal sharded by PyTorch's official `DistributedSampler`. See the

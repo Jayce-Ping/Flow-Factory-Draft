@@ -121,9 +121,12 @@ Decoded audio is a detached CPU `float32` waveform shaped `(channels, samples)`.
 source-clock truncation, channel conversion, the single model-rate conversion, posterior selection,
 and latent packing remain adapter-owned.
 
-Tiny schema-complete fixtures and configs are available for
-[SFT](../examples/sft/lora/sd3_5/default.yaml) and
-[offline DPO](../examples/offline_dpo/lora/sd3_5/default.yaml).
+Tiny schema-complete fixtures live under the repository `dataset/` root:
+
+- [SFT demonstration manifest](../dataset/sft_sd3_5/train.jsonl) with its
+  [SD3.5 config](../examples/sft/lora/sd3_5/default.yaml).
+- [Offline-DPO preference manifest](../dataset/offline_dpo_sd3_5/train.jsonl) with its
+  [SD3.5 config](../examples/offline_dpo/lora/sd3_5/default.yaml).
 
 ### Public offline smoke datasets
 

@@ -1,4 +1,4 @@
-# Single-process offline-DPO smoke recipe over a V2 preference manifest.
+# Single-process offline-DPO smoke recipe over the checked-in dataset/offline_dpo_sd3_5 fixture.
 # Replace the tiny repository-image dataset with real preference pairs for quality runs.
 launcher: "accelerate"
 config_file: null
@@ -9,7 +9,7 @@ mixed_precision: "bf16"
 data:
   datasets:
     - name: offline_preferences
-      dataset_dir: "examples/data/offline_dpo_sd3_5"
+      dataset_dir: "dataset/offline_dpo_sd3_5"
       train:
         weight: 1  # Offline epochs require unit source weights and full traversal.
         max_dataset_size: 2

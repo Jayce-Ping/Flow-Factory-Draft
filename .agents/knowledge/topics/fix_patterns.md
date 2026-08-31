@@ -740,6 +740,20 @@ Based on the fix type, write the fix entry to the appropriate document:
   must express quality metrics through the evaluation-only reward surface.
 - **Related Constraint**: #7
 
+### Repository dataset fixtures must not live inside the example-config tree
+- **Date**: 2026-08-31
+- **Symptom**: The checked-in SD3.5 SFT and offline-DPO manifests lived under `examples/data`, while
+  every other repository dataset and the public dataset guide used the root `dataset/` hierarchy.
+- **Root Cause**: The initial smoke fixtures were colocated with their configs without preserving
+  the repository boundary between executable example configs and dataset assets.
+- **Fix**: The manifests moved to `dataset/sft_sd3_5` and `dataset/offline_dpo_sd3_5`; their YAML,
+  Markdown links, and directory-depth-sensitive asset paths moved with them. A production-parser
+  regression now loads both configs and manifests and verifies every supervision asset exists.
+- **Lesson**: Treat example configs and their datasets as separate public surfaces. When moving a
+  manifest, recompute every dataset-root-relative media path and test the resolved files rather
+  than checking only the configured directory string.
+- **Related Constraint**: N/A
+
 ## Cross-refs
 
 - UP: [Hard Constraints](../constraints.md), [Architecture](../architecture.md)

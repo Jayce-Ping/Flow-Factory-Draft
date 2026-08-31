@@ -1,0 +1,2 @@
+{"schema_version":2,"input":{"prompt":"Render a clean Flow-Factory emblem.","media":[]},"supervision":{"type":"demonstration","target":{"media":[{"type":"image","path":"../../assets/logo-no-bg.png"}]}},"metadata":{"fixture":"repository-image"}}
+{"schema_version":2,"input":{"prompt":"Render an experiment dashboard.","media":[]},"supervision":{"type":"demonstration","target":{"media":[{"type":"image","path":"../../assets/wandb_images.png"}]}},"metadata":{"fixture":"repository-image"}}
