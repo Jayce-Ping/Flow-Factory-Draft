@@ -485,8 +485,8 @@ def decode_video(asset: MediaAsset) -> np.ndarray:
     """
     if av is None:
         raise ImportError(
-            "offline target video decoding requires PyAV>=18.0.0; "
-            "install with `pip install 'av>=18.0.0'`"
+            "offline target video decoding requires PyAV>=17.0.0; "
+            "install with `pip install 'av>=17.0.0'`"
         )
     try:
         with av.open(asset.path) as container:

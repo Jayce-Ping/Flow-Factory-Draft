@@ -784,6 +784,19 @@ Based on the fix type, write the fix entry to the appropriate document:
   the same fact even when Git reports those files as clean.
 - **Related Constraint**: N/A
 
+### Dependency floors must preserve declared Python compatibility
+- **Date**: 2026-08-31
+- **Symptom**: Aligning the runtime metadata with `av>=18.0.0` raised Flow-Factory's Python floor
+  from 3.10 to 3.11 even though the framework and its Muon dependency stack still supported 3.10.
+- **Root Cause**: The media-decoder floor followed the latest tested PyAV release without checking
+  whether Flow-Factory used a PyAV 18-only API or whether PyAV 17 covered the same contract.
+- **Fix**: Restore `requires-python>=3.10`, set the tested decoder floor to `av>=17.0.0`, and align
+  classifiers, formatter targets, runtime errors, installation guidance, and agent documentation.
+- **Lesson**: A dependency-induced interpreter-floor increase is not automatically a framework
+  requirement. Verify the used API surface and test the last compatible dependency line before
+  dropping a supported Python version.
+- **Related Constraint**: N/A
+
 ## Cross-refs
 
 - UP: [Hard Constraints](../constraints.md), [Architecture](../architecture.md)

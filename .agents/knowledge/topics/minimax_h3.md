@@ -53,7 +53,7 @@ and lets that boundary stay strict.
   geometry cache fields and a preprocessing cache version.
 - Reference paths are dataset-relative. Positive finite `fps` and `sample_rate` overrides follow
   `samples/references.py`.
-- PyAV >=18.0.0 decodes video/audio references, including embedded or separate soundtracks.
+- PyAV >=17.0.0 decodes video/audio references, including embedded or separate soundtracks.
 
 ## Offline audiovisual output contract
 

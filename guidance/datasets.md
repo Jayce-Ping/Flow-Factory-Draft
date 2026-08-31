@@ -114,7 +114,7 @@ must carry the supervision type required by its trainer. Prompt-only rows, mixed
 preference rows, unknown keys, and non-V2 records fail during manifest loading.
 
 All V2 media paths are resolved against that source's `dataset_dir`; an absolute path is retained.
-Images, videos, and audio have built-in CPU decoders. Video targets require PyAV 18 or newer.
+Images, videos, and audio have built-in CPU decoders. Video targets require PyAV 17 or newer.
 Decoded audio is a detached CPU `float32` waveform shaped `(channels, samples)`. A manifest
 `sample_rate` is a logical source-clock override and does not pre-resample the decoded samples;
 source-clock truncation, channel conversion, the single model-rate conversion, posterior selection,

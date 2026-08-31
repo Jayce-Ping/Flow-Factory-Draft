@@ -50,7 +50,7 @@ def test_readme_documents_h3_links_dependency_and_limits() -> None:
     for required in (
         "diffusers>=0.40.0",
         "pip install -e .",
-        "PyAV >=18.0.0",
+        "PyAV >=17.0.0",
         "B=1",
         "no CFG",
         "shift 12",

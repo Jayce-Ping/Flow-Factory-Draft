@@ -7,7 +7,7 @@ Flow-Factory is a unified **online and offline fine-tuning framework** for diffu
 - **Algorithms**: SFT, offline DPO, online DPO, GRPO, GRPO-Guard, DPPO, DGPO, DiffusionNFT, AWM, CRD, DiffusionOPD, DMD2, TDM, TDM-R1
 - **Models**: FLUX.1 (+Kontext), FLUX.2 (+Klein), SD3.5, Qwen-Image (+Edit-Plus), Z-Image, Wan2 (T2V/I2V), LTX2 (T2AV/I2AV), MiniMax H3 (T2VA/FL2VA/Ref2VA), Bagel, SenseNova-U1 (1.0/1.5; T2I + ordered multi-reference I2I)
 - **Rewards**: PickScore (+Rank), CLIP, CLAP, ImageBind, OCR, GenEval/GenEval2, HPSv2, VLM-Evaluate, rational-rewards, and custom rewards
-- **Python**: >=3.11 | **PyTorch**: >=2.10.0 | **License**: Apache-2.0
+- **Python**: >=3.10 | **PyTorch**: >=2.10.0 | **License**: Apache-2.0
 
 **Language**: Match user's language.
 

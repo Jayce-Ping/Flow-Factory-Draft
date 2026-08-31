@@ -18,7 +18,7 @@ At least one image or video is required; audio-only manifests are invalid. A vid
 is valid only when that video also supplies `audio_path`. Manifest `fps` and `sample_rate`
 overrides take precedence over decoded metadata where supported.
 
-PyAV >=18.0.0 is required for reliable video/audio decoding. It preserves video frames and FPS,
+PyAV >=17.0.0 is required for reliable video/audio decoding. It preserves video frames and FPS,
 plus embedded or separately referenced audio and its sample rate. Only encoded tensors/layout and
 the canonical manifest enter the Arrow cache; upstream reference objects are transient.
 

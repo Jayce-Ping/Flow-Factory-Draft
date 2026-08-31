@@ -1422,8 +1422,8 @@ def _require_finite_positive_rate(
 def _require_pyav() -> Any:
     if av is None:
         raise ImportError(
-            "ordered video/audio references require PyAV>=18.0.0; "
-            "install with `pip install 'av>=18.0.0'`"
+            "ordered video/audio references require PyAV>=17.0.0; "
+            "install with `pip install 'av>=17.0.0'`"
         )
     return av
 
