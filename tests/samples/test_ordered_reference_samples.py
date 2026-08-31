@@ -21,20 +21,20 @@ from flow_factory.samples.references import (
 
 def test_reference_manifest_preserves_order_and_canonicalizes_keys() -> None:
     references = [
-        {"path": "style.png", "kind": "image"},
+        {"path": "style.png", "type": "image"},
         {
-            "kind": "video",
+            "type": "video",
             "path": "motion.mp4",
             "fps": 24,
             "audio_path": "sound.wav",
             "sample_rate": 48000,
         },
-        {"kind": "audio", "path": "ambience.wav", "sample_rate": 32000},
+        {"type": "audio", "path": "ambience.wav", "sample_rate": 32000},
     ]
 
     manifest = canonicalize_reference_manifest(references, row_index=3)
 
-    assert [entry["kind"] for entry in parse_reference_manifest(manifest, 3)] == [
+    assert [entry["type"] for entry in parse_reference_manifest(manifest, 3)] == [
         "image",
         "video",
         "audio",
@@ -51,14 +51,14 @@ def test_reference_sample_identity_includes_ordered_manifest() -> None:
     first = Ref2AVSample(
         prompt="animate",
         reference_manifest=canonicalize_reference_manifest(
-            [{"kind": "image", "path": "first.png"}],
+            [{"type": "image", "path": "first.png"}],
             0,
         ),
     )
     second = Ref2AVSample(
         prompt="animate",
         reference_manifest=canonicalize_reference_manifest(
-            [{"kind": "image", "path": "second.png"}],
+            [{"type": "image", "path": "second.png"}],
             0,
         ),
     )
@@ -70,12 +70,14 @@ def test_reference_sample_identity_includes_ordered_manifest() -> None:
     "references,match",
     [
         ([], "non-empty"),
-        ([{"kind": "audio", "path": "only.wav"}], "image or video"),
-        ([{"kind": "image", "path": ""}], "non-empty string"),
-        ([{"kind": "image", "path": "x.png", "fps": 24}], "unknown keys"),
-        ([{"kind": "video", "path": "x.mp4", "fps": float("nan")}], "finite positive"),
+        ([{"path": "missing-type.png"}], "expected type"),
+        ([{"type": "document", "path": "unsupported.pdf"}], "expected type"),
+        ([{"type": "audio", "path": "only.wav"}], "image or video"),
+        ([{"type": "image", "path": ""}], "non-empty string"),
+        ([{"type": "image", "path": "x.png", "fps": 24}], "unknown keys"),
+        ([{"type": "video", "path": "x.mp4", "fps": float("nan")}], "finite positive"),
         (
-            [{"kind": "video", "path": "x.mp4", "sample_rate": 32000}],
+            [{"type": "video", "path": "x.mp4", "sample_rate": 32000}],
             "requires audio_path",
         ),
     ],

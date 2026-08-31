@@ -421,14 +421,14 @@ def _candidate_assets(
         pool = pools[family]
         return {
             "chosen": {
-                kind: pool[f"chosen_{kind}"]
-                for kind in ("video", "audio")
-                if f"chosen_{kind}" in pool
+                media_type: pool[f"chosen_{media_type}"]
+                for media_type in ("video", "audio")
+                if f"chosen_{media_type}" in pool
             },
             "rejected": {
-                kind: pool[f"rejected_{kind}"]
-                for kind in ("video", "audio")
-                if f"rejected_{kind}" in pool
+                media_type: pool[f"rejected_{media_type}"]
+                for media_type in ("video", "audio")
+                if f"rejected_{media_type}" in pool
             },
         }
     pool = pools["image"]

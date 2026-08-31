@@ -633,8 +633,8 @@ and distillation continue to rely on their established trajectory-wide reduction
 
 SenseNova is an example of an important boundary: its existing condition schema uses grouped
 `images` with within-type order. Do not advertise heterogeneous ordered references merely because
-several images are accepted. The public V2 discriminator remains `type`; conversion to a legacy
-adapter-internal `kind` entry, when genuinely required, belongs only in the condition projection.
+several images are accepted. Dataset media and ordered-reference entries use `type` as their sole
+discriminator, including at the adapter preprocessing boundary.
 
 ## Advanced: Custom `preprocess_func`
 

@@ -653,20 +653,22 @@ def _build_pinned_references(entries: Sequence[Mapping[str, Any]]) -> List[Any]:
     symbols = require_minimax_h3_support()
     references = []
     for entry in entries:
-        kind = entry["kind"]
-        if kind == "image":
+        reference_type = entry["type"]
+        if reference_type == "image":
             references.append(symbols.ImageReference(image=entry["media"]))
-        elif kind == "video":
+        elif reference_type == "video":
             reference_kwargs = {"frames": entry["frames"], "fps": entry["fps"]}
             if entry.get("audio") is not None:
                 reference_kwargs.update(audio=entry["audio"], sample_rate=entry["sample_rate"])
             references.append(symbols.VideoReference(**reference_kwargs))
-        elif kind == "audio":
+        elif reference_type == "audio":
             references.append(
                 symbols.AudioReference(audio=entry["media"], sample_rate=entry["sample_rate"])
             )
         else:
-            raise ValueError(f"expected image/video/audio reference kind, received {kind!r}")
+            raise ValueError(
+                f"expected image/video/audio reference type, received {reference_type!r}"
+            )
     return references
 
 

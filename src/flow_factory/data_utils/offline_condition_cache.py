@@ -50,7 +50,7 @@ from .offline_dataset import (
 )
 from .schema import MediaAsset, NormalizedDatasetRecord
 
-_CONDITION_SOURCE_FORMAT = "flow-factory-offline-condition-v3"
+_CONDITION_SOURCE_FORMAT = "flow-factory-offline-condition-v4"
 
 
 def project_offline_condition_dataset(
@@ -65,9 +65,9 @@ def project_offline_condition_dataset(
 
     Grouped adapters receive ``prompt`` plus per-modality ``images``, ``videos``,
     and ``audios`` columns. Ordered-reference adapters receive one canonical JSON
-    string per row instead of an Arrow list-of-struct column. The string is
-    restored to validated legacy ``kind`` entries only at the adapter preprocess
-    boundary, avoiding Arrow's heterogeneous-struct null-key expansion.
+    string per row instead of an Arrow list-of-struct column. The string preserves
+    validated ``type`` entries through the adapter preprocess boundary, avoiding
+    Arrow's heterogeneous-struct null-key expansion.
     """
     if not isinstance(ordered_references, bool):
         raise TypeError(
@@ -148,7 +148,7 @@ def project_offline_condition_dataset(
     if ordered_references:
         columns["references"] = [
             canonicalize_reference_manifest(
-                [_to_legacy_reference(asset) for asset in record.model_input.media],
+                [_to_ordered_reference(asset) for asset in record.model_input.media],
                 row_index=index,
             )
             for index, record in enumerate(stable_records)
@@ -339,8 +339,8 @@ def build_offline_condition_cache(
     return condition_cache
 
 
-def _to_legacy_reference(asset: MediaAsset) -> Dict[str, Any]:
-    reference: Dict[str, Any] = {"kind": asset.type, "path": asset.path}
+def _to_ordered_reference(asset: MediaAsset) -> Dict[str, Any]:
+    reference: Dict[str, Any] = {"type": asset.type, "path": asset.path}
     if asset.type == "video" and asset.fps is not None:
         reference["fps"] = asset.fps
     elif asset.type == "audio" and asset.sample_rate is not None:

@@ -72,7 +72,7 @@ from .workflow import (
 )
 
 _H3_PREPROCESS_CACHE_FIELDS = frozenset({"height", "width", "num_frames"})
-_H3_PREPROCESS_CACHE_VERSION = "minimax-h3-v2"
+_H3_PREPROCESS_CACHE_VERSION = "minimax-h3-v3"
 logger = setup_logger(__name__)
 _H3_OPTIONAL_AUDIO_REFERENCE_FORMAT = MediaFormat(
     type=MediaType.AUDIO,

@@ -488,7 +488,7 @@ def test_builder_supports_homogeneous_offline_preference_sources(tmp_path: Path)
     assert "rejected.png" not in repr(dataset._condition_cache[0])
 
 
-def test_builder_uses_bridge_ordered_reference_boundary_with_single_row_batches(
+def test_builder_preserves_ordered_reference_type_with_single_row_batches(
     tmp_path: Path,
 ) -> None:
     dataset_dir = tmp_path / "ordered"
@@ -510,8 +510,7 @@ def test_builder_uses_bridge_ordered_reference_boundary_with_single_row_batches(
     )
 
     assert preprocessor.references is not None
-    assert preprocessor.references[0][0]["kind"] == "image"
-    assert "type" not in preprocessor.references[0][0]
+    assert preprocessor.references[0][0]["type"] == "image"
     (dataset,) = _source_datasets(loader)
     assert dataset[0].model_input.media[0].type == "image"
 

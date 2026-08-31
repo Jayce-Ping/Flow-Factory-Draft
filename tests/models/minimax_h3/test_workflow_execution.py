@@ -197,8 +197,10 @@ def test_preprocess_adds_outer_batch_to_arrow_cache_fields(monkeypatch) -> None:
 def test_ref_preprocess_builds_ordered_pinned_objects_without_returning_them(monkeypatch) -> None:
     constructed: List[Any] = []
 
-    def reference_type(kind: str):
-        return lambda **kwargs: constructed.append((kind, kwargs)) or SimpleNamespace(kind=kind)
+    def reference_type(media_type: str):
+        return lambda **kwargs: constructed.append((media_type, kwargs)) or SimpleNamespace(
+            media_type=media_type
+        )
 
     monkeypatch.setattr(
         "flow_factory.models.minimax_h3.workflow.require_minimax_h3_support",
@@ -217,16 +219,16 @@ def test_ref_preprocess_builds_ordered_pinned_objects_without_returning_them(mon
     )
     adapter = _adapter(MiniMaxH3Ref2VAAdapter)
     references = [
-        {"kind": "image", "path": "i.png", "media": "image"},
+        {"type": "image", "path": "i.png", "media": "image"},
         {
-            "kind": "video",
+            "type": "video",
             "path": "v.mp4",
             "frames": "frames",
             "fps": 24.0,
             "audio": torch.zeros(2, 8),
             "sample_rate": 32000,
         },
-        {"kind": "audio", "path": "a.wav", "media": torch.ones(1, 8), "sample_rate": 16000},
+        {"type": "audio", "path": "a.wav", "media": torch.ones(1, 8), "sample_rate": 16000},
     ]
 
     result = adapter.preprocess_func(
@@ -238,10 +240,14 @@ def test_ref_preprocess_builds_ordered_pinned_objects_without_returning_them(mon
         num_frames=5,
     )
 
-    assert [kind for kind, _ in constructed] == ["image", "video", "audio"]
+    assert [media_type for media_type, _ in constructed] == ["image", "video", "audio"]
     assert constructed[1][1]["frames"] == "frames"
     assert "video" not in constructed[1][1]
-    assert [ref.kind for ref in encoded_inputs["references"]] == ["image", "video", "audio"]
+    assert [ref.media_type for ref in encoded_inputs["references"]] == [
+        "image",
+        "video",
+        "audio",
+    ]
     assert result["reference_manifest"] == ["manifest"]
     assert "references" not in result
     assert all(not isinstance(value, SimpleNamespace) for value in result.values())

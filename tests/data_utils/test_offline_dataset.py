@@ -232,8 +232,8 @@ def test_manifest_reader_preserves_order_resolves_paths_and_requires_one_type(
                 {
                     "schema_version": 2,
                     "input": {
-                        "prompt": "legacy key",
-                        "media": [{"kind": "image", "path": "input.png"}],
+                        "prompt": "unknown media key",
+                        "media": [{"type": "image", "path": "input.png", "media_type": "image"}],
                     },
                     "supervision": {
                         "type": "demonstration",

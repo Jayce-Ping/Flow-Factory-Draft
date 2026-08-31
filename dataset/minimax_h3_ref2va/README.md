@@ -9,10 +9,10 @@ identity.
 
 Supported entries:
 
-- `image`: `kind` and dataset-relative `path`;
-- `video`: `kind`, dataset-relative `path`, optional finite positive `fps`, and optional
+- `image`: `type` and dataset-relative `path`;
+- `video`: `type`, dataset-relative `path`, optional finite positive `fps`, and optional
   dataset-relative `audio_path`;
-- `audio`: `kind`, dataset-relative `path`, and optional finite positive `sample_rate`.
+- `audio`: `type`, dataset-relative `path`, and optional finite positive `sample_rate`.
 
 At least one image or video is required; audio-only manifests are invalid. A video `sample_rate`
 is valid only when that video also supplies `audio_path`. Manifest `fps` and `sample_rate`

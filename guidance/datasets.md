@@ -84,9 +84,8 @@ remaining slots in declaration order. Duplicate, unknown, and wrong-media-type s
 contract validation. Supervision outputs reject `slot` because their order is declared by the
 pipeline output contract rather than by condition-argument names.
 
-Do not write `kind` in a V2 record. Some ordered-reference adapters still consume a validated
-legacy `kind` mapping internally; the V2 condition projection creates that private bridge only at
-the adapter preprocessing boundary. It is not part of the public V2 schema.
+The same `type` discriminator is preserved when V2 media are projected into ordered-reference
+adapter inputs, so public records and adapter preprocessing use one media-entry contract.
 
 ### Demonstration supervision
 
@@ -289,8 +288,8 @@ exact aligned latent duration. For example:
 
 For LTX2 I2AV, bind one image to `first_frame`. H3 FL2VA supports first-only, last-only, and
 first-plus-last records; use explicit slots for the last-only form. H3 Ref2VA puts the complete
-ordered image/video/audio reference sequence in `input.media`; the offline projection bridges those
-public `type` objects to the adapter's private legacy reference representation.
+ordered image/video/audio reference sequence in `input.media`; the offline projection preserves
+those ordered `type` entries at the adapter preprocessing boundary.
 
 ```jsonl
 {"schema_version":2,"input":{"prompt":"Reveal the scene before this ending.","media":[{"type":"image","path":"conditions/end.png","slot":"last_frame"}]},"supervision":{"type":"demonstration","target":{"media":[{"type":"video","path":"targets/story.mp4","fps":24.0},{"type":"audio","path":"targets/story.wav","sample_rate":32000}]}},"metadata":{}}
@@ -457,11 +456,11 @@ directory. See the [FL2VA dataset fixture](../dataset/minimax_h3_fl2va/train.jso
 
 ### Ref2VA: `minimax-h3-ref2va`
 
-The existing online Ref2VA loader uses a legacy non-empty ordered `"references"` array containing
-image, video, and audio entries:
+The online Ref2VA loader uses a non-empty ordered `"references"` array containing image, video,
+and audio entries. Each entry uses the same `type` discriminator as strict V2 media objects:
 
 ```jsonl
-{"prompt":"Create a coherent scene using the references in order.","references":[{"kind":"image","path":"references/style.png"},{"kind":"video","path":"references/motion.mp4","fps":12.0},{"kind":"audio","path":"references/ambience.wav","sample_rate":16000}]}
+{"prompt":"Create a coherent scene using the references in order.","references":[{"type":"image","path":"references/style.png"},{"type":"video","path":"references/motion.mp4","fps":12.0},{"type":"audio","path":"references/ambience.wav","sample_rate":16000}]}
 ```
 
 Array order is semantically significant. It is preserved during validation, encoding, caching, and
@@ -470,19 +469,19 @@ an audio-only array is invalid.
 
 Supported entries:
 
-| `kind` | Required keys | Optional keys | Decoded value |
+| `type` | Required keys | Optional keys | Decoded value |
 |---|---|---|---|
-| `image` | `kind`, `path` | none | RGB image |
-| `video` | `kind`, `path` | `fps`, `audio_path`, `sample_rate` | frames and optional soundtrack |
-| `audio` | `kind`, `path` | `sample_rate` | waveform |
+| `image` | `type`, `path` | none | RGB image |
+| `video` | `type`, `path` | `fps`, `audio_path`, `sample_rate` | frames and optional soundtrack |
+| `audio` | `type`, `path` | `sample_rate` | waveform |
 
 `fps` and `sample_rate` overrides must be finite positive numbers. A video may use its embedded
 soundtrack or a separate dataset-relative `audio_path`; a video `sample_rate` override requires
-`audio_path`. Unknown keys and unsupported legacy `kind` values fail before preprocessing.
+`audio_path`. Unknown keys and unsupported `type` values fail before preprocessing.
 
-This legacy online manifest is distinct from the strict V2 format above. A V2 record always uses
-`input.media[*].type`; offline condition projection performs any required legacy `kind` conversion
-internally.
+The compact online manifest and strict V2 format share the same media-entry discriminator. Offline
+condition projection preserves `input.media[*].type` when it constructs the ordered-reference
+manifest consumed by the adapter.
 
 See the [Ref2VA dataset fixture](../dataset/minimax_h3_ref2va/train.jsonl), its
 [local fixture notes](../dataset/minimax_h3_ref2va/README.md), and the

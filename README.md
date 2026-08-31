@@ -229,8 +229,8 @@ The unified structure of dataset is:
 
 ## Offline SFT and Preference Data
 
-SFT and offline DPO use strict JSONL with `schema_version: 2`. Public media objects always use the
-`type` discriminator; `kind` is not accepted in V2:
+SFT and offline DPO use strict JSONL with `schema_version: 2`. Public media objects use `type` as
+their sole discriminator:
 
 ```jsonl
 {"schema_version":2,"input":{"prompt":"A clean poster.","media":[]},"supervision":{"type":"demonstration","target":{"media":[{"type":"image","path":"targets/poster.png"}]}},"metadata":{}}

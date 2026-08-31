@@ -119,13 +119,13 @@ def test_sparse_indices_reject_invalid_type_range_and_duplicates(indices: Any) -
     ("adapter_class", "extra"),
     [
         (MiniMaxH3T2VAAdapter, {"images": [["frame"]]}),
-        (MiniMaxH3T2VAAdapter, {"references": [[{"kind": "image"}]]}),
+        (MiniMaxH3T2VAAdapter, {"references": [[{"type": "image"}]]}),
         (MiniMaxH3FL2VAAdapter, {"videos": [["video"]], "images": [["frame"]]}),
         (MiniMaxH3FL2VAAdapter, {"images": [[], []]}),
-        (MiniMaxH3Ref2VAAdapter, {"images": [["frame"]], "references": [[{"kind": "image"}]]}),
+        (MiniMaxH3Ref2VAAdapter, {"images": [["frame"]], "references": [[{"type": "image"}]]}),
         (
             MiniMaxH3Ref2VAAdapter,
-            {"audios": [[torch.zeros(1)]], "references": [[{"kind": "image"}]]},
+            {"audios": [[torch.zeros(1)]], "references": [[{"type": "image"}]]},
         ),
     ],
 )

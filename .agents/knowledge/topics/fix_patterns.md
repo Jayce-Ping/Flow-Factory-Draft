@@ -754,6 +754,23 @@ Based on the fix type, write the fix entry to the appropriate document:
   than checking only the configured directory string.
 - **Related Constraint**: N/A
 
+### Dataset media discriminators must survive projections unchanged
+- **Date**: 2026-08-31
+- **Symptom**: MiniMax H3 Ref2VA examples used a different media discriminator from strict V2
+  records, and offline condition projection translated between the two representations before
+  adapter preprocessing.
+- **Root Cause**: Ordered-reference support introduced a private compatibility representation
+  instead of preserving the public `MediaAsset.type` contract across canonicalization, decoding,
+  cache projection, and adapter dispatch.
+- **Fix**: Online Ref2VA manifests, canonical reference sidecars, decoded entries, offline
+  projection, and MiniMax H3 dispatch now use `type` end to end. The condition-source and H3
+  preprocessing cache versions were advanced so incompatible Arrow caches are rebuilt, and the
+  dataset guide, fixtures, and contract tests follow the same schema.
+- **Lesson**: A projection may change storage shape, such as list-of-struct to canonical JSON, but
+  it should not rename semantic fields. Keep the public discriminator stable until the concrete
+  third-party object-construction boundary and version every cache that stores the old shape.
+- **Related Constraint**: #5
+
 ## Cross-refs
 
 - UP: [Hard Constraints](../constraints.md), [Architecture](../architecture.md)

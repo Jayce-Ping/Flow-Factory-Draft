@@ -851,11 +851,11 @@ def test_ordered_heterogeneous_references_cross_arrow_as_canonical_json(
 
     assert isinstance(raw_manifest, str)
     assert [set(reference) for reference in raw_references] == [
-        {"kind", "path"},
-        {"kind", "path", "fps"},
-        {"kind", "path", "sample_rate"},
+        {"type", "path"},
+        {"type", "path", "fps"},
+        {"type", "path", "sample_rate"},
     ]
-    assert [reference["kind"] for reference in raw_references] == [
+    assert [reference["type"] for reference in raw_references] == [
         "image",
         "video",
         "audio",
@@ -872,9 +872,9 @@ def test_ordered_heterogeneous_references_cross_arrow_as_canonical_json(
     )
     loaded = preprocessor.references[0]
 
-    assert set(loaded[0]) == {"kind", "path", "media"}
-    assert set(loaded[1]) == {"kind", "path", "fps", "frames"}
-    assert set(loaded[2]) == {"kind", "path", "sample_rate", "media"}
+    assert set(loaded[0]) == {"type", "path", "media"}
+    assert set(loaded[1]) == {"type", "path", "fps", "frames"}
+    assert set(loaded[2]) == {"type", "path", "sample_rate", "media"}
     assert cache[0][OFFLINE_CONDITION_ID_COLUMN] == compute_offline_condition_id(
         record,
         index=0,

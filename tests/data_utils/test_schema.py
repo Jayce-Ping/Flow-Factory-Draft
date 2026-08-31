@@ -195,11 +195,11 @@ def test_normalization_expands_dataset_root_and_normalizes_absolute_paths(
 @pytest.mark.parametrize(
     "media",
     [
-        {"kind": "image", "path": "image.png"},
+        {"type": "image", "path": "image.png", "media_type": "image"},
         {"type": "image", "path": "image.png", "unknown": True},
     ],
 )
-def test_v2_media_rejects_legacy_kind_and_unknown_keys(media: Dict[str, Any]) -> None:
+def test_v2_media_rejects_unknown_keys(media: Dict[str, Any]) -> None:
     raw = _demonstration_record(input={"prompt": "strict", "media": [media]})
 
     with pytest.raises(ValidationError):

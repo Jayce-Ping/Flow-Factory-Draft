@@ -59,7 +59,7 @@ def test_conditioned_adapters_declare_preparer_but_t2va_keeps_identity() -> None
         MiniMaxH3T2VAAdapter.preprocess_cache_version,
         MiniMaxH3FL2VAAdapter.preprocess_cache_version,
         MiniMaxH3Ref2VAAdapter.preprocess_cache_version,
-    } == {"minimax-h3-v2"}
+    } == {"minimax-h3-v3"}
 
 
 def test_ref2va_preparer_realizes_prefix_once_and_routes_owned_contexts(

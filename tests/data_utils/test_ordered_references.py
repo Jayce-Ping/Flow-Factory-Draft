@@ -27,9 +27,9 @@ from flow_factory.data_utils.dataset import GeneralDataset, _load_ordered_refere
 from flow_factory.models.minimax_h3.adapters import MiniMaxH3Ref2VAAdapter
 
 REFERENCES = [
-    {"kind": "image", "path": "subject.png"},
-    {"kind": "video", "path": "motion.mp4", "fps": 29.97},
-    {"kind": "audio", "path": "voice.wav", "sample_rate": 44100},
+    {"type": "image", "path": "subject.png"},
+    {"type": "video", "path": "motion.mp4", "fps": 29.97},
+    {"type": "audio", "path": "voice.wav", "sample_rate": 44100},
 ]
 
 
@@ -125,8 +125,8 @@ def _write_video(path: Path, with_audio: bool) -> None:
 def test_ordered_references_round_trip_real_media_and_merged_cache(tmp_path: Path) -> None:
     dataset_dir = tmp_path / "dataset"
     references = [
-        {"kind": "image", "path": "subject.png"},
-        {"kind": "audio", "path": "voice.wav", "sample_rate": 22050},
+        {"type": "image", "path": "subject.png"},
+        {"type": "audio", "path": "voice.wav", "sample_rate": 22050},
     ]
     _write_jsonl(dataset_dir, references)
     Image.new("RGB", (4, 3), color=(12, 34, 56)).save(dataset_dir / "subject.png")
@@ -142,7 +142,7 @@ def test_ordered_references_round_trip_real_media_and_merged_cache(tmp_path: Pat
     )
 
     assert len(preprocessor.received) == 1
-    assert [entry["kind"] for entry in preprocessor.received[0]] == ["image", "audio"]
+    assert [entry["type"] for entry in preprocessor.received[0]] == ["image", "audio"]
     assert preprocessor.received[0][0]["media"].size == (4, 3)
     assert preprocessor.received[0][1]["sample_rate"] == 22050
     assert preprocessor.received[0][1]["media"].shape[0] == 1
@@ -162,7 +162,7 @@ def test_ordered_references_round_trip_real_media_and_merged_cache(tmp_path: Pat
 
 def test_video_reference_preserves_frames_fps_embedded_audio_and_rate(tmp_path: Path) -> None:
     dataset_dir = tmp_path / "dataset"
-    references = [{"kind": "video", "path": "motion.mp4"}]
+    references = [{"type": "video", "path": "motion.mp4"}]
     _write_jsonl(dataset_dir, references)
     video_path = dataset_dir / "motion.mp4"
     _write_video(video_path, with_audio=True)
@@ -188,8 +188,8 @@ def test_reference_decode_error_has_row_reference_and_cause(tmp_path: Path) -> N
     dataset_dir = tmp_path / "dataset"
     dataset_dir.mkdir()
     rows = [
-        {"prompt": "valid", "references": [{"kind": "image", "path": "valid.png"}]},
-        {"prompt": "missing", "references": [{"kind": "image", "path": "missing.png"}]},
+        {"prompt": "valid", "references": [{"type": "image", "path": "valid.png"}]},
+        {"prompt": "missing", "references": [{"type": "image", "path": "missing.png"}]},
     ]
     (dataset_dir / "train.jsonl").write_text(
         "".join(json.dumps(row) + "\n" for row in rows),
@@ -218,7 +218,7 @@ def test_soundtrack_decode_error_reports_soundtrack_path_and_context(tmp_path: P
     dataset_dir = tmp_path / "dataset"
     references = [
         {
-            "kind": "video",
+            "type": "video",
             "path": "motion.mp4",
             "audio_path": "missing-soundtrack.wav",
         }
@@ -229,7 +229,7 @@ def test_soundtrack_decode_error_reports_soundtrack_path_and_context(tmp_path: P
 
     with pytest.raises(
         ValueError,
-        match=r"row 0.*reference 0.*kind='video'.*missing-soundtrack\.wav",
+        match=r"row 0.*reference 0.*type='video'.*missing-soundtrack\.wav",
     ) as caught:
         GeneralDataset(
             dataset_dir=str(dataset_dir),
@@ -244,7 +244,7 @@ def test_soundtrack_decode_error_reports_soundtrack_path_and_context(tmp_path: P
 
 
 @pytest.mark.parametrize(
-    ("kind", "decode_target", "decode_result", "rate_name"),
+    ("media_type", "decode_target", "decode_result", "rate_name"),
     [
         (
             "video",
@@ -269,14 +269,17 @@ def test_soundtrack_decode_error_reports_soundtrack_path_and_context(tmp_path: P
 def test_decoded_rates_must_be_finite_positive_with_context(
     tmp_path: Path,
     monkeypatch,
-    kind: str,
+    media_type: str,
     decode_target: str,
     decode_result: Any,
     rate_name: str,
 ) -> None:
-    dataset_dir = tmp_path / f"dataset-{kind}-{rate_name}"
-    path = "media.mp4" if kind == "video" else "media.wav"
-    references = [{"kind": "image", "path": "valid.png"}, {"kind": kind, "path": path}]
+    dataset_dir = tmp_path / f"dataset-{media_type}-{rate_name}"
+    path = "media.mp4" if media_type == "video" else "media.wav"
+    references = [
+        {"type": "image", "path": "valid.png"},
+        {"type": media_type, "path": path},
+    ]
     _write_jsonl(dataset_dir, references)
     Image.new("RGB", (2, 2)).save(dataset_dir / "valid.png")
     monkeypatch.setattr(decode_target, lambda media_path: decode_result)
@@ -284,7 +287,7 @@ def test_decoded_rates_must_be_finite_positive_with_context(
 
     with pytest.raises(
         ValueError,
-        match=rf"row 0.*reference 1.*kind='{kind}'.*{rate_name}.*finite positive",
+        match=rf"row 0.*reference 1.*type='{media_type}'.*{rate_name}.*finite positive",
     ):
         GeneralDataset(
             dataset_dir=str(dataset_dir),
@@ -304,7 +307,7 @@ def test_video_uses_manifest_fps_when_decoder_has_no_rate(tmp_path: Path, monkey
     )
 
     loaded = _load_ordered_reference(
-        {"kind": "video", "path": "media.mp4", "fps": 24.0},
+        {"type": "video", "path": "media.mp4", "fps": 24.0},
         data_root=str(tmp_path),
         row_index=3,
         reference_index=4,
@@ -323,10 +326,10 @@ def test_video_without_override_rejects_missing_decoded_fps(tmp_path: Path, monk
 
     with pytest.raises(
         ValueError,
-        match=r"row 3.*reference 4.*kind='video'.*effective fps.*finite positive.*None",
+        match=r"row 3.*reference 4.*type='video'.*effective fps.*finite positive.*None",
     ):
         _load_ordered_reference(
-            {"kind": "video", "path": "media.mp4"},
+            {"type": "video", "path": "media.mp4"},
             data_root=str(tmp_path),
             row_index=3,
             reference_index=4,
@@ -335,7 +338,7 @@ def test_video_without_override_rejects_missing_decoded_fps(tmp_path: Path, monk
 
 @pytest.mark.parametrize("rate", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
 @pytest.mark.parametrize(
-    ("kind", "rate_name", "decode_target", "decode_result"),
+    ("media_type", "rate_name", "decode_target", "decode_result"),
     [
         (
             "video",
@@ -355,17 +358,17 @@ def test_effective_override_rates_must_be_finite_positive(
     tmp_path: Path,
     monkeypatch,
     rate: float,
-    kind: str,
+    media_type: str,
     rate_name: str,
     decode_target: str,
     decode_result: Any,
 ) -> None:
     monkeypatch.setattr(decode_target, lambda media_path: decode_result)
-    entry = {"kind": kind, "path": f"media.{kind}", rate_name: rate}
+    entry = {"type": media_type, "path": f"media.{media_type}", rate_name: rate}
 
     with pytest.raises(
         ValueError,
-        match=rf"row 3.*reference 4.*kind='{kind}'.*effective {rate_name}.*finite positive",
+        match=rf"row 3.*reference 4.*type='{media_type}'.*effective {rate_name}.*finite positive",
     ):
         _load_ordered_reference(
             entry,
@@ -474,14 +477,14 @@ def test_semantic_preprocess_argument_changes_cache_fingerprint(
     "changed_references",
     [
         [
-            {"kind": "image", "path": "subject.png"},
-            {"kind": "video", "path": "motion.mp4", "fps": 24.0},
-            {"kind": "audio", "path": "voice.wav", "sample_rate": 44100},
+            {"type": "image", "path": "subject.png"},
+            {"type": "video", "path": "motion.mp4", "fps": 24.0},
+            {"type": "audio", "path": "voice.wav", "sample_rate": 44100},
         ],
         [
-            {"kind": "image", "path": "subject.png"},
-            {"kind": "video", "path": "motion.mp4", "fps": 29.97},
-            {"kind": "audio", "path": "voice.wav", "sample_rate": 48000},
+            {"type": "image", "path": "subject.png"},
+            {"type": "video", "path": "motion.mp4", "fps": 29.97},
+            {"type": "audio", "path": "voice.wav", "sample_rate": 48000},
         ],
         list(reversed(REFERENCES)),
     ],

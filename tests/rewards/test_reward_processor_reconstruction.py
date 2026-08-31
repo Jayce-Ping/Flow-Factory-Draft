@@ -49,7 +49,7 @@ def test_distributed_group_reward_preserves_sample_reconstruction_fields() -> No
     )
     sample = MiniMaxH3Ref2VASample(
         prompt="A reference-conditioned prompt",
-        reference_manifest='[{"kind":"image","path":"condition.png"}]',
+        reference_manifest='[{"type":"image","path":"condition.png"}]',
     )
 
     rewards = processor.compute_rewards([sample], store_to_samples=False)

@@ -117,7 +117,7 @@ def test_gather_samples_packs_same_dtype_fields_and_preserves_other_fields():
 
 def test_gather_samples_preserves_concrete_reconstruction_fields() -> None:
     accelerator = GatherRecorder()
-    manifest = '[{"kind":"image","path":"condition.png"}]'
+    manifest = '[{"path":"condition.png","type":"image"}]'
     sample = MiniMaxH3Ref2VASample(
         prompt="A reference-conditioned prompt",
         reference_manifest=manifest,

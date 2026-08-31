@@ -165,7 +165,7 @@ def test_ref2va_manifests_are_ordered_valid_and_dataset_relative() -> None:
         for row_index, row in enumerate(rows):
             references = row["references"]
             canonical = json.loads(canonicalize_reference_manifest(references, row_index=row_index))
-            assert [entry["kind"] for entry in canonical] == [entry["kind"] for entry in references]
+            assert [entry["type"] for entry in canonical] == [entry["type"] for entry in references]
             for reference in references:
                 path = Path(reference["path"])
                 assert not path.is_absolute()
@@ -174,7 +174,7 @@ def test_ref2va_manifests_are_ordered_valid_and_dataset_relative() -> None:
                     audio_path = Path(reference["audio_path"])
                     assert not audio_path.is_absolute()
                     assert (dataset_dir / audio_path).is_file()
-        assert [entry["kind"] for entry in rows[0]["references"]] == [
+        assert [entry["type"] for entry in rows[0]["references"]] == [
             "image",
             "video",
             "audio",

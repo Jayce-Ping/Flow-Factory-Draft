@@ -1245,7 +1245,7 @@ def _supports_ordered_references(preprocess_func: Optional[Callable]) -> bool:
 
 
 def _canonicalize_ordered_reference_value(value: Any, row_index: int) -> str:
-    """Canonicalize either a legacy reference list or an opaque Arrow string."""
+    """Canonicalize either an ordered reference list or an opaque Arrow string."""
     if isinstance(value, str):
         references = parse_reference_manifest(value, row_index=row_index)
     else:
@@ -1319,14 +1319,14 @@ def _load_ordered_reference(
     reference_index: int,
 ) -> Dict[str, Any]:
     """Decode one ordered reference with dataset row/reference context."""
-    kind = entry["kind"]
+    reference_type = entry["type"]
     resolved_path = _resolve_path(data_root, entry["path"])
     failing_path = resolved_path
     loaded = dict(entry)
     try:
-        if kind == "image":
+        if reference_type == "image":
             loaded["media"] = Image.open(resolved_path).convert("RGB")
-        elif kind == "video":
+        elif reference_type == "video":
             frames, fps, audio, sample_rate = _decode_ordered_video(resolved_path)
             effective_fps = entry.get("fps", fps)
             _require_finite_positive_rate(
@@ -1334,7 +1334,7 @@ def _load_ordered_reference(
                 "effective fps",
                 row_index,
                 reference_index,
-                kind,
+                reference_type,
                 resolved_path,
             )
             loaded["frames"] = frames
@@ -1349,7 +1349,7 @@ def _load_ordered_reference(
                     "sample_rate",
                     row_index,
                     reference_index,
-                    kind,
+                    reference_type,
                     failing_path,
                 )
                 effective_sample_rate = entry.get("sample_rate", sample_rate)
@@ -1358,19 +1358,19 @@ def _load_ordered_reference(
                     "effective sample_rate",
                     row_index,
                     reference_index,
-                    kind,
+                    reference_type,
                     failing_path,
                 )
                 loaded["audio"] = audio
                 loaded["sample_rate"] = effective_sample_rate
-        elif kind == "audio":
+        elif reference_type == "audio":
             audio, sample_rate = _decode_ordered_audio(resolved_path)
             _require_finite_positive_rate(
                 sample_rate,
                 "sample_rate",
                 row_index,
                 reference_index,
-                kind,
+                reference_type,
                 resolved_path,
             )
             effective_sample_rate = entry.get("sample_rate", sample_rate)
@@ -1379,19 +1379,21 @@ def _load_ordered_reference(
                 "effective sample_rate",
                 row_index,
                 reference_index,
-                kind,
+                reference_type,
                 resolved_path,
             )
             loaded["media"] = audio
             loaded["sample_rate"] = effective_sample_rate
         else:
             raise ValueError(
-                "expected ordered reference kind in ('image', 'video', 'audio'), " f"got {kind!r}"
+                "expected ordered reference type in ('image', 'video', 'audio'), "
+                f"got {reference_type!r}"
             )
     except (FileNotFoundError, ImportError, OSError, RuntimeError, ValueError) as error:
         raise ValueError(
             f"failed to decode ordered reference at row {row_index}, "
-            f"reference {reference_index}, kind={kind!r}, path={failing_path!r}: {error}"
+            f"reference {reference_index}, type={reference_type!r}, "
+            f"path={failing_path!r}: {error}"
         ) from error
     return loaded
 
@@ -1401,7 +1403,7 @@ def _require_finite_positive_rate(
     rate_name: str,
     row_index: int,
     reference_index: int,
-    kind: str,
+    reference_type: str,
     media_path: str,
 ) -> None:
     if (
@@ -1411,7 +1413,7 @@ def _require_finite_positive_rate(
         or value <= 0
     ):
         raise ValueError(
-            f"at row {row_index}, reference {reference_index}, kind={kind!r}, "
+            f"at row {row_index}, reference {reference_index}, type={reference_type!r}, "
             f"path={media_path!r}, expected decoded {rate_name} to be finite positive, "
             f"got {value!r}"
         )
