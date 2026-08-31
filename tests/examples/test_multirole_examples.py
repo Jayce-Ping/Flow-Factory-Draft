@@ -60,6 +60,30 @@ def test_only_gpu_validated_multirole_examples_are_published() -> None:
         "fake",
     ]
 
+    h3_tdm_path = (
+        repository_root / "examples" / "tdm" / "lora" / "minimax_h3_t2va" / "default.yaml"
+    )
+    h3_tdm_text = h3_tdm_path.read_text()
+    h3_tdm_config = yaml.safe_load(h3_tdm_text)
+    assert "over 200 steps" in h3_tdm_text
+    assert h3_tdm_config["log"]["project"] == "Flow-Factory-TDM"
+    assert h3_tdm_config["log"]["save_dir"] == "saves/"
+    assert h3_tdm_config["log"]["run_name"] is None
+    assert h3_tdm_config["model"]["model_type"] == "minimax-h3-t2va"
+    assert h3_tdm_config["model"]["model_name_or_path"] == "MiniMaxAI/MiniMax-H3"
+    assert h3_tdm_config["train"]["trainer_type"] == "tdm"
+    assert h3_tdm_config["train"]["num_inference_steps"] == 6
+    assert h3_tdm_config["train"]["resolution"] == [512, 768]
+    assert h3_tdm_config["train"]["num_frames"] == 124
+    assert h3_tdm_config["train"]["per_device_batch_size"] == 1
+    assert h3_tdm_config["train"]["unique_sample_num_per_epoch"] == 64
+    assert h3_tdm_config["train"]["enable_gradient_checkpointing"] == {"mode": "full"}
+    assert h3_tdm_config["scheduler"]["dynamics_type"] == "ODE"
+    assert [optimizer["name"] for optimizer in h3_tdm_config["optimizers"]] == [
+        "generator",
+        "fake",
+    ]
+
     tdm_r1_path = repository_root / "examples" / "tdm_r1" / "lora" / "sd3_5" / "ocr.yaml"
     tdm_r1_config = yaml.safe_load(tdm_r1_path.read_text())
     assert tdm_r1_config["data"]["datasets"][0]["dataset_dir"] == "dataset/ocr"
