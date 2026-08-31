@@ -37,7 +37,7 @@ def test_readme_documents_h3_links_dependency_and_limits() -> None:
     assert "all 36 real-weight smoke cells" in text
     assert "FL2VA first-plus-last" in text
     assert "T2VA is real-weight validated on 1 and 16 GPUs" not in text
-    assert text.count("<td>30B</td>") == 3
+    assert text.count("<td>33B</td>") == 3
 
     for model_type, link in zip(
         ("minimax-h3-t2va", "minimax-h3-fl2va", "minimax-h3-ref2va"),
@@ -58,7 +58,7 @@ def test_readme_documents_h3_links_dependency_and_limits() -> None:
         "data-ward velocity",
         "N transitions",
         "N + 1 states",
-        "30B",
+        "33B",
         "do not claim a completed long-run reward trend",
         "[Datasets](guidance/datasets.md)",
     ):

@@ -771,6 +771,19 @@ Based on the fix type, write the fix entry to the appropriate document:
   third-party object-construction boundary and version every cache that stores the old shape.
 - **Related Constraint**: #5
 
+### Rebase conflict resolution includes downstream assertions
+- **Date**: 2026-08-31
+- **Symptom**: After rebasing onto a README correction for the MiniMax H3 parameter count, the
+  merged table was accurate but a child-branch documentation test still required the superseded
+  value.
+- **Root Cause**: The factual conflict was resolved in the edited document, while its regression
+  assertion lived in a cleanly rebased file and therefore received no conflict marker.
+- **Fix**: The documentation assertion now checks the corrected `33B` value inherited from main.
+- **Lesson**: Conflict markers identify overlapping text, not the complete semantic impact of a
+  rebase. After resolving a factual conflict, search for and run downstream assertions that encode
+  the same fact even when Git reports those files as clean.
+- **Related Constraint**: N/A
+
 ## Cross-refs
 
 - UP: [Hard Constraints](../constraints.md), [Architecture](../architecture.md)
