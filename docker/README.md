@@ -1,6 +1,6 @@
 # Docker (CUDA) — Flow-Factory Training Image
 
-Pre-built GPU training image for Flow-Factory: CUDA 12.9, Python 3.12, PyTorch 2.8, DeepSpeed, and W&B — ready to run `ff-train` out of the box.
+Pre-built GPU training image for Flow-Factory: CUDA 12.9, Python 3.12, PyTorch 2.10, DeepSpeed, and W&B — ready to run `ff-train` out of the box.
 
 ## Prerequisites
 
@@ -31,12 +31,11 @@ docker run --rm -it --gpus all ghcr.io/x-gengroup/flow-factory:0.1.0
 
 ### B. Build locally
 
-Clone with the `diffusers` submodule (required):
+Clone the repository:
 
 ```bash
-git clone --recursive https://github.com/X-GenGroup/Flow-Factory.git
+git clone https://github.com/X-GenGroup/Flow-Factory.git
 cd Flow-Factory
-# or, if already cloned: git submodule update --init --recursive
 ```
 
 Build from the **repository root**:
@@ -103,7 +102,7 @@ Do not commit secrets; use environment variables or your orchestrator's secret s
 |---|---|---|
 | `nvidia-smi` not found in container | NVIDIA Container Toolkit not installed | [Install the toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) and restart Docker |
 | `CUDA out of memory` | Batch size too large for GPU VRAM | Reduce batch size, enable DeepSpeed ZeRO-2, or use FSDP |
-| Build fails on `diffusers` install | Submodule not initialized | Run `git submodule update --init --recursive` |
+| Diffusers API import fails | Installed package is older than 0.40.0 | Rebuild the image or install `diffusers>=0.40.0` |
 | Every source change triggers full rebuild | Expected with `COPY . /app` | The Dockerfile uses two-phase COPY for layer caching; ensure `pyproject.toml` is unchanged for cache hits |
 
 ## Building tips

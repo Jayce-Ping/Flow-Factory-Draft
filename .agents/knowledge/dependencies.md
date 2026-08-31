@@ -20,11 +20,11 @@ pip install -e ".[deepspeed]"   # Core + DeepSpeed only
 pyproject.toml
 ├── [project.dependencies]              Core deps (always installed)
 ├── [project.optional-dependencies]
-│   ├── deepspeed       DeepSpeed >= 0.15.4
+│   ├── deepspeed       DeepSpeed >= 0.18.3
 │   ├── quantization    bitsandbytes >= 0.45.3
 │   ├── wandb           Weights & Biases tracking
 │   ├── swanlab         SwanLab tracking
-│   ├── nvidia          xformers, nvidia-ml-py
+│   ├── nvidia          xformers >= 0.0.35, nvidia-ml-py
 │   ├── bagel           flash-attn, opencv-python
 │   ├── geneval         mmcv, mmengine, mmdet, open_clip_torch
 │   ├── geneval2        scipy (exact GenEval2 GM parity)
@@ -36,14 +36,16 @@ pyproject.toml
 
 The authoritative list is `pyproject.toml` `[project.dependencies]` (20+ packages). Key ones:
 
-| Package | Min Version | Purpose |
+| Package | Supported Version | Purpose |
 |---------|-------------|---------|
-| `torch` | >= 2.6.0 | PyTorch core |
-| `torchvision` | >= 0.19.0 | Vision utilities |
-| `torchaudio` | >= 2.4.0 | Audio I/O (audio / audio-video models, CLAP) |
+| `torch` | >= 2.10.0 | PyTorch core, AdamW, and the native `torch.optim.Muon` API |
+| `torchvision` | >= 0.25.0 | Vision utilities; paired baseline for PyTorch 2.10 |
+| `torchaudio` | >= 2.10.0 | Audio I/O (audio / audio-video models, CLAP) |
+| `torchcodec` | >= 0.10.0 | Runtime used by TorchAudio 2.10 `load` / `save` APIs |
 | `transformers` | >= 4.57.1 | Text encoders, tokenizers |
-| `diffusers` | >= 0.37.0 | Diffusion pipelines, schedulers |
-| `accelerate` | >= 1.11.0 | Distributed training, mixed precision |
+| `diffusers` | >= 0.40.0 | Diffusion pipelines, schedulers, MiniMax H3 and LTX2 APIs |
+| `accelerate` | >= 1.14.0 | Distributed training, mixed precision, and max reduction |
+| `av` | >= 17.0.0 | CPU video/audio decoding with Python 3.10 support |
 | `peft` | >= 0.17.0 | LoRA, parameter-efficient fine-tuning |
 | `datasets` | >= 3.3.2 | Dataset loading |
 | `huggingface-hub` | >= 0.35.3 | Model/dataset downloads |
@@ -56,7 +58,28 @@ The authoritative list is `pyproject.toml` `[project.dependencies]` (20+ package
 - Only **ZeRO-1** and **ZeRO-2** are supported. ZeRO-3 is broken for reward model sharding (constraint #10).
 - DeepSpeed is optional — Accelerate alone handles most distributed scenarios.
 
+### Muon
+- The `torch>=2.10.0` baseline includes `torch.optim.Muon`. Runtime capability detection remains
+  authoritative for vendor or custom builds that may omit the API.
+- Muon is supported with DDP and FSDP2. The pre-load optimizer/backend validator rejects
+  DeepSpeed and FSDP1 before pretrained weights are loaded.
+
+### TorchAudio and TorchCodec
+- TorchAudio 2.10 delegates `torchaudio.load` and `torchaudio.save` to TorchCodec. The matching
+  baseline is TorchCodec 0.10, and its native extension also needs FFmpeg 4–8 shared libraries.
+- The CUDA Docker image installs FFmpeg. Non-container installations must provide compatible
+  system FFmpeg libraries; the `imageio[ffmpeg]` executable bundle does not provide those shared
+  libraries.
+
+### PyAV
+- The tested floor is `av>=17.0.0`. Python 3.10 resolves to a compatible 17.x release because
+  PyAV 18 requires Python 3.11; Python 3.11 and newer may resolve to later PyAV releases.
+- Flow-Factory uses the container, stream, frame, and resampler APIs available in PyAV 17; it does
+  not require a PyAV 18-only API.
+
 ### diffusers
+- Use the released `diffusers>=0.40.0` package as the authoritative API. The repository submodule
+  may be used for upstream development, but must not silently override the declared runtime dependency.
 - Model adapters depend on specific pipeline classes from diffusers. Major version bumps may rename or remove pipeline classes.
 - `load_pipeline()` in each adapter returns a `DiffusionPipeline`-compatible object; breaking changes in diffusers' pipeline API require adapter updates.
 
@@ -75,7 +98,10 @@ The authoritative list is `pyproject.toml` `[project.dependencies]` (20+ package
 
 ### accelerate
 - Primary distributed backend. `accelerator.prepare()` wraps a single `ModelBundle` (all target components) plus the optimizer as one root (constraint #9).
-- The dataloader uses custom samplers and is NOT prepared via accelerate.
+- Version 1.14 or newer is required because distributed runtime-identity checks use
+  `Accelerator.reduce(..., reduction="max")`; earlier releases do not implement max reduction.
+- Online generation uses framework samplers. Finite SFT/offline-DPO data uses PyTorch's official
+  `DistributedSampler`; that already-sharded loader is not prepared via Accelerate.
 
 ### peft
 - Provides LoRA functionality. Applied via `BaseAdapter.apply_lora()` to components listed in `target_components`.
@@ -98,5 +124,5 @@ The authoritative list is `pyproject.toml` `[project.dependencies]` (20+ package
 
 ## Cross-refs
 
-- `constraints.md` #10 (DeepSpeed ZeRO-3 unsupported)
-- `architecture.md` "Configuration Hierarchy" (hparams structure)
+- UP: [`constraints.md` #10](constraints.md#10-deepspeed-zero-3-is-unsupported), [Architecture Configuration Hierarchy](architecture.md#configuration-hierarchy)
+- PEER: [Component Variants](topics/component_variants.md)

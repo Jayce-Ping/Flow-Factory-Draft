@@ -45,21 +45,111 @@ and lets that boundary stay strict.
 ## Input contracts
 
 - T2VA accepts prompt-only workflow input.
-- FL2VA accepts one first image or two images ordered first then last.
-- Ref2VA preserves and hashes ordered image/video/audio manifests.
+- FL2VA accepts semantic `first_frame`, `last_frame`, or both image slots. Unslotted legacy
+  generation input retains first-then-last positional shorthand; strict V2 can express last-only.
+- Ref2VA preserves and hashes 1-12 ordered image/video/audio references and requires at least one
+  image or video.
 - Ref2VA declares `supports_ordered_references=True`; all H3 adapters explicitly declare hidden
   geometry cache fields and a preprocessing cache version.
 - Reference paths are dataset-relative. Positive finite `fps` and `sample_rate` overrides follow
   `samples/references.py`.
-- PyAV >=18.0.0 decodes video/audio references, including embedded or separate soundtracks.
+- PyAV >=17.0.0 decodes video/audio references, including embedded or separate soundtracks.
+
+## Offline audiovisual output contract
+
+All three H3 workflows support SFT and offline DPO with one exact ordered output pair: video first,
+then audio. Both `fps` and `sample_rate` are required in V2 supervision.
+Targets are decoded on demand; neither pixels, waveforms, nor VAE latents enter the condition
+cache. The pipeline's single-sample capability also forces condition-cache preprocessing to B=1,
+independently of the global preprocessing batch-size setting.
+
+The codec cross-validates cached layout and geometry against the current training config. It
+resamples video onto the configured fixed 24-fps grid and canvas, truncates audio on its declared
+source clock before a single conversion to the audio-VAE rate, and aligns stereo audio to the exact
+latent duration, takes and normalizes both posterior modes, then packs structured rows in
+`("video", "audio")` order. The deterministic video mode follows the H3 SFT reference data flow;
+the released Diffusers pipeline does not define an offline target encoder. The codec does
+not duplicate input-owned fields in output forward context. Replay nests the flat cached layout
+and derives empty T2VA condition prefixes from the current state, preserving storage dtype and
+device. Exact velocity-only offline forwards return before either component scheduler steps, so
+SFT and offline DPO do not sample unused transitions or perturb scheduler RNG cadence. Every
+encoded row count must match the cached layout before transformer execution.
+
+FL2VA and Ref2VA use a separately owned runtime condition-prefix preparer. It realizes the official
+condition noise once per batch, then exposes immutable model-forward and output-binding views. Both
+offline-DPO arms and their policy/reference forwards consume the same prepared prefix object; target
+encoding never draws condition noise independently. Offline flow matching sums the separate video
+and audio means, while online likelihood and distillation retain their existing globally
+element-weighted reducer.
+
+## Fix records
+
+### H3 offline targets preserve the reference posterior and modality objective
+
+- **Date**: 2026-08-29
+- **Symptom**: H3 clean video targets changed on every encode and audiovisual flow loss weighted
+  modalities by tensor cardinality, heavily downweighting audio.
+- **Root Cause**: The first offline codec inferred stochastic video-posterior sampling where
+  Diffusers has no target recipe, and inherited the online global reducer for a two-term SFT loss.
+- **Fix**: Video and audio target codecs now take deterministic posterior modes, matching the H3
+  SFT reference data flow, and the offline flow hook returns `video_mean + audio_mean` without
+  changing the online reducer. Unequal-cardinality regression tests lock both decisions.
+- **Lesson**: When an inference pipeline omits training semantics, use the nominated training
+  reference for posterior selection and keep objective-specific modality weighting separate from
+  trajectory likelihood aggregation.
+- **Related Constraint**: #7, #8
+
+### Offline targets preserve configured geometry and logical source clocks
+
+- **Date**: 2026-08-28
+- **Symptom**: An internally valid stale H3 condition cache could select another output canvas or
+  frame count, while an audio `sample_rate` override caused decoder resampling followed by a
+  second codec resample.
+- **Root Cause**: The output codec trusted cached geometry without comparing the current training
+  config, and the generic audio decoder treated source-rate metadata as a target decode rate.
+- **Fix**: The codec now cross-validates cached H/W and the officially aligned frame count against
+  current training arguments. Audio decoding preserves file samples; the codec truncates on the
+  declared source clock before exactly one model-rate conversion.
+- **Lesson**: Cached geometry must be checked against its configured authority, and media rate
+  overrides describe logical source clocks rather than preprocessing requests.
+- **Related Constraint**: #8, #26
+
+### Velocity-only H3 forwards bypass both schedulers
+
+- **Date**: 2026-08-28
+- **Symptom**: SFT and offline DPO requested only velocity but still sampled unused video/audio
+  scheduler transitions, wasting memory and changing RNG cadence.
+- **Root Cause**: The adapter boundary did not route the exact velocity-only request to the
+  existing scheduler-free `forward_h3_state` path.
+- **Fix**: The adapter detects a non-log-probability `("velocity",)` request with no replay next
+  state, returns `MultiModalStepOutput(velocity=...)`, and never enters either scheduler.
+- **Lesson**: Decoupled velocity objectives must stop at model prediction; requesting fewer return
+  fields is not sufficient if the adapter still executes transition side effects.
+- **Related Constraint**: #7
+
+### Single-sample capability governs condition preprocessing
+
+- **Date**: 2026-08-28
+- **Symptom**: A multi-row H3 offline manifest could reach its B=1 preprocessor with the global
+  condition-cache batch size, even though the training loader correctly rejected B>1.
+- **Root Cause**: The offline cache builder forced row-wise preprocessing only for ordered
+  references and did not apply the adapter's general batching capability.
+- **Fix**: The cache builder now derives its effective preprocessing batch size from both ordered
+  reference binding and `BatchCapability.SINGLE_SAMPLE`.
+- **Lesson**: One adapter-owned batching contract must govern preprocessing and model execution;
+  otherwise framework stages can disagree before training starts.
+- **Related Constraint**: #8, #12
 
 ## Verification boundary
 
-All workflows have pinned API/schema/no-weight verification. T2VA additionally completed
-real-weight LoRA rollout, decode, reward, replay, backward, checkpoint, and resume tests on one
-GPU and with FSDP2 on 16 GPUs. The native-resolution path completed initialization, checkpoint,
-decode, and evaluation. FL2VA and Ref2VA remain no-weight validated. Do not claim long-run reward
-improvement, convergence, or numerical parity.
+All workflows have pinned API/schema/no-weight verification and local offline codec/forward
+coverage. T2VA additionally completed real-weight LoRA rollout, decode, reward, replay, backward,
+checkpoint, and resume tests on one GPU and with FSDP2 on 16 GPUs. The native-resolution path
+completed initialization, checkpoint, decode, and evaluation. The
+[PR #220 matrix](../../../guidance/gpu_validation.md#pr-220-result) then completed all 36 H3
+real-weight smoke cells: T2VA, FL2VA, and Ref2VA across DDP/DeepSpeed ZeRO-2/FSDP2 and
+GRPO/SFT/offline DPO/TDM. The FL2VA first-plus-last SFT/offline-DPO variant gate also passed. Do
+not claim long-run reward improvement, convergence, quality parity, or numerical parity.
 
 ## Upgrade checklist
 
@@ -68,9 +158,11 @@ improvement, convergence, or numerical parity.
 - [ ] Rerun the real public-symbol and no-weight component-spec/workflow probes.
 - [ ] Run H3 scheduler/runtime/registry/reference tests in the pinned environment.
 - [ ] Parse all H3 examples through `Arguments.load_from_yaml`.
-- [ ] Rerun the documented T2VA real-weight smoke before changing support or memory claims.
+- [ ] Run the T2VA output-codec and common SFT/offline-DPO structured-state tests.
+- [ ] Rerun the affected H3 cells in the documented real-weight matrix before changing support or
+      memory claims.
 
 ## Cross-refs
 
-- UP: [`constraints.md` #5](../constraints.md#5-adapter-component-runtime-contract), [`constraints.md` #14](../constraints.md#14-sample-dataclass-hierarchy), [`architecture.md` MiniMax H3](../architecture.md#minimax-h3)
+- UP: [`constraints.md` #5](../constraints.md#5-adapter-component-runtime-contract), [`constraints.md` #14](../constraints.md#14-sample-dataclass-hierarchy), [`architecture.md` registered components](../architecture.md#registered-components)
 - PEER: [Component Runtime](component_runtime.md), [Structured Trajectory](structured_trajectory.md), [Parity Testing](parity_testing.md)

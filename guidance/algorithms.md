@@ -15,6 +15,10 @@
 
 - [DPPO](#dppo)
 
+- [SFT](#sft)
+
+- [Offline DPO](#offline-dpo)
+
 - [DPO](#dpo)
 
 - [DGPO](#dgpo)
@@ -37,12 +41,26 @@
 
 ## Overview
 
-Flow-Factory provides unified implementations of state-of-the-art RL algorithms for flow-matching models. All algorithms share the same model adapter and reward interfaces, enabling direct comparison under controlled conditions.
+Flow-Factory provides unified online RL, distillation, and offline objectives for flow-matching
+models. Algorithms share model and dataset contracts while keeping objective-specific policy
+updates independent.
+
+Two execution dimensions are separate from the mathematical paradigm:
+
+| Dimension | Values | Meaning |
+|---|---|---|
+| Acquisition | `generation`, `dataset` | Generate a rollout collection or fetch every batch from a finite dataloader. |
+| Feedback | `runtime_reward`, `none` | Run reward/advantage processing or optimize without runtime feedback. |
+
+GRPO and online DPO use `generation + runtime_reward`. Generation-based distillation uses
+`generation + none`. SFT and offline DPO use `dataset + none`: their sampling stage is the dataset
+acquisition driver, so `adapter.inference()` and `sample()` are not called for training. This keeps
+online/offline selection out of model adapters and loss functions.
 
 At a high level, the supported algorithms fall into three paradigms:
 
 - **Coupled paradigm (GRPO and variants)**: Training timesteps are coupled with the SDE-based sampling dynamics, requiring tractable log-probability computation for policy gradient optimization.
-- **Decoupled paradigm (DPO, DiffusionNFT, AWM, DGPO, CRD, TDM-R1)**: Training timesteps are decoupled from the actual sampling dynamics, making them inherently solver-agnostic.
+- **Decoupled paradigm (SFT, offline DPO, online DPO, DiffusionNFT, AWM, DGPO, CRD, TDM-R1)**: Training timesteps are decoupled from the actual sampling dynamics, making them inherently solver-agnostic.
 - **Distillation paradigm (DiffusionOPD, DMD2, TDM)**: Students match flow-matching targets. DiffusionOPD uses a teacher; DMD2 and TDM keep a fake score on one model bundle and update it before the generator.
 
 DMD2, TDM, and TDM-R1 update fake first. TDM-R1 then updates the surrogate
@@ -190,9 +208,76 @@ train:
 
 Like GRPO, DPPO is **coupled** and must use SDE dynamics (`Flow-SDE`, `Dance-SDE`, `CPS`). `DPPOTrainingArguments` does not inherit `GRPOTrainingArguments` (no `clip_range`) — its field set is intentionally minimal. When `kl_beta > 0`, the KL-vs-reference term is evaluated at `kl_guidance_scale`; this is reflected in `DPPOTrainingArguments.get_preprocess_guidance_scale()` so negative prompts are encoded at preprocessing whenever `kl_guidance_scale > 1.0`. Example configs: `examples/dppo/lora/{flux2_klein_base,sd3_5}/geneval2_{single,multi}.yaml`.
 
+## SFT
+
+SFT trains directly from V2 `demonstration` records. The target media is decoded from its source
+file and encoded to the model's clean output state on every microbatch. At each independently
+sampled flow time, the trainer noises that clean state, predicts velocity through the ordinary
+adapter `forward()` contract, and minimizes the per-sample flow-matching error. Several
+`num_train_timesteps` terms are averaged inside the microbatch before one backward pass.
+
+```yaml
+train:
+  trainer_type: sft
+  max_epochs: 4
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 4
+  weighting_scheme: logit_normal  # logit_normal or uniform
+  num_train_timesteps: 1
+  timestep_range: 0.99            # scalar -> (0, scalar), or [lower, upper]
+  time_shift: 1.0
+  logit_mean: 0.0
+  logit_std: 1.0
+```
+
+`max_epochs` counts complete dataloader traversals. `num_train_timesteps` is a Monte Carlo axis,
+not a hidden gradient-accumulation multiplier. SFT has no reference model and rejects training
+`rewards`; `eval_rewards` remain available for generation-based evaluation.
+
+See the [SFT configuration](../examples/sft/lora/sd3_5/default.yaml) and the
+[V2 demonstration schema](datasets.md#demonstration-supervision).
+
+## Offline DPO
+
+Offline DPO applies the Diffusion-DPO objective [[11]](#ref11) to V2 `preference` records rather
+than generating and reward-ranking samples.
+Chosen and rejected media are encoded on the fly under the same input condition. For each loss
+term they share the primary timestep, exact component-time mapping, and diffusion noise. The
+current policy and a frozen reference each produce chosen/rejected flow-matching errors; the
+shared DPO objective applies `beta` to the policy-versus-reference error delta.
+
+```yaml
+train:
+  trainer_type: offline-dpo
+  max_epochs: 1
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 1
+  beta: 2000.0
+  weighting_scheme: logit_normal
+  num_train_timesteps: 1
+  timestep_range: 0.99
+  time_shift: 1.0
+  logit_mean: 0.0
+  logit_std: 1.0
+  ref_param_device: cpu
+```
+
+The reference is mandatory; `reference_free` is not implemented. LoRA runs use the base model by
+disabling trainable adapters inside the reference scope. Full-parameter runs keep the frozen
+reference snapshot on `ref_param_device`. Training rewards and online pair formation are not part
+of this path.
+
+See the [offline-DPO configuration](../examples/offline_dpo/lora/sd3_5/default.yaml), the
+[V2 preference schema](datasets.md#preference-supervision), and the current
+[offline model matrix](datasets.md#offline-model-support).
+
 ## DPO
 
-DPO (Direct Preference Optimization) [[11]](#ref11) is a **decoupled** algorithm that optimises a pairwise preference loss on flow-matching velocity targets. Instead of per-sample policy-gradient ratios, it forms chosen/rejected pairs within each group (based on per-sample advantages), then minimises a Bradley-Terry preference loss over the DSM errors of the two policies (current vs. frozen reference). To use this algorithm, set:
+The existing `dpo` trainer is **online DPO** [[11]](#ref11). It is a decoupled algorithm that generates samples,
+scores them with runtime rewards, and forms chosen/rejected pairs within each prompt group from
+the resulting advantages. It then minimizes a Bradley-Terry preference loss over the DSM errors
+of the current and frozen-reference policies. Use `offline-dpo` instead when the dataset already
+contains preference pairs. To select online DPO, set:
 
 ```yaml
 train:
@@ -677,7 +762,7 @@ The dynamics support matrix is:
 | `v` | Yes | No | None |
 | `x0` | Yes | No | None |
 
-`v` and `x0` fail fast under non-ODE dynamics because the target conversion assumes the ODE relation `mu = x_t + v * dt`. The `xt` target remains valid for Flow-SDE, Dance-SDE, and CPS; after optional self-normalization it is divided by the scheduler transition variance. No target uses the historical `0.5` multiplier. Rewards are used **only** for periodic eval monitoring (`evaluate()`), never in the distillation loss.
+`v` and `x0` fail fast under non-ODE dynamics because the target conversion assumes the ODE relation `mu = x_t + v * dt`. The `xt` target remains valid for Flow-SDE, Dance-SDE, and CPS; after optional self-normalization it is divided by the scheduler transition variance. No target uses the historical `0.5` multiplier. DiffusionOPD rejects training `rewards` because its execution contract has no feedback stage. Configure periodic monitoring only under `eval_rewards`; those scores are used by `evaluate()` and never enter the distillation loss.
 
 ### How it works (2-pass per epoch)
 
@@ -721,7 +806,7 @@ scheduler:
   noise_level: 0.0
 ```
 
-Each teacher's `applicable_datasets` must reference declared `data.datasets[*].name` entries (validated at config load). The config schema allows several teachers to share a dataset for a future multi-teacher/ensemble trainer, but the current `DiffusionOPDTrainer` requires exactly one teacher per dataset and raises otherwise. See [`examples/opd/lora/sd3_5/`](../examples/opd/lora/sd3_5/) for two complete configs (`DiffusionOPD_aligned.yaml` to reproduce official results).
+Each teacher's `applicable_datasets` must reference declared `data.datasets[*].name` entries (validated at config load). The config schema allows several teachers to share a dataset for a future multi-teacher/ensemble trainer, but the current `DiffusionOPDTrainer` requires exactly one teacher per dataset and raises otherwise. See [`examples/opd/lora/sd3_5/`](../examples/opd/lora/sd3_5/) for three complete configs; `DiffusionOPD_aligned.yaml` reproduces the official setup.
 
 ## References
 

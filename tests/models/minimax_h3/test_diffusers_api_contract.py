@@ -22,6 +22,7 @@ from packaging.version import Version
 from PIL import Image
 
 from flow_factory.models.minimax_h3 import dependency
+from flow_factory.models.minimax_h3.blocks import prepare_h3_rollout_state
 from flow_factory.models.runtime import ModularPipelineRuntime
 
 EXECUTED_NO_WEIGHT_BLOCKS = frozenset(
@@ -68,9 +69,9 @@ def test_h3_capable_environment_uses_supported_diffusers_release(
     del h3_symbols
     installed = metadata.version("diffusers")
     required = dependency.MINIMAX_H3_DIFFUSERS_MIN_VERSION
-    assert Version(installed) >= Version(required), (
-        f"MiniMax H3 requires diffusers>={required}, received {installed}"
-    )
+    assert Version(installed) >= Version(
+        required
+    ), f"MiniMax H3 requires diffusers>={required}, received {installed}"
 
 
 def test_real_h3_symbols_preserve_workflows_and_callable_surfaces(h3_symbols) -> None:
@@ -147,9 +148,7 @@ def test_real_h3_blocks_execute_no_weight_pipeline_state_transitions(h3_symbols)
             "num_frames": 124,
         }
     )
-    returned_pipeline, t2va_state = h3_symbols.NoKeyframeAnchorsStep()(
-        t2va_pipeline, t2va_state
-    )
+    returned_pipeline, t2va_state = h3_symbols.NoKeyframeAnchorsStep()(t2va_pipeline, t2va_state)
     assert returned_pipeline is t2va_pipeline
     assert t2va_state.values["keyframe_anchors"] == ()
     executed.add("NoKeyframeAnchorsStep")
@@ -178,9 +177,7 @@ def test_real_h3_blocks_execute_no_weight_pipeline_state_transitions(h3_symbols)
             "condition_latents": [torch.zeros(1, 24, 1, 2, 2)],
         }
     )
-    _, condition_state = h3_symbols.PrepareConditionLatentsStep()(
-        t2va_pipeline, condition_state
-    )
+    _, condition_state = h3_symbols.PrepareConditionLatentsStep()(t2va_pipeline, condition_state)
     assert condition_state.values["condition_rows"].shape == (1, 96)
     executed.add("PrepareConditionLatentsStep")
 
@@ -209,6 +206,18 @@ def test_real_h3_blocks_execute_no_weight_pipeline_state_transitions(h3_symbols)
     _, resize_state = h3_symbols.ResizeStep()(fl2va_pipeline, resize_state)
     assert resize_state.values["keyframe_anchors"] == ("first",)
     assert resize_state.values["keyframes"][0].size == (32, 32)
+
+    last_only_state = h3_symbols.PipelineState(
+        values={
+            "image": None,
+            "last_image": Image.new("RGB", (16, 16)),
+            "height": 32,
+            "width": 32,
+        }
+    )
+    _, last_only_state = h3_symbols.ResizeStep()(fl2va_pipeline, last_only_state)
+    assert last_only_state.values["keyframe_anchors"] == ("last",)
+    assert last_only_state.values["keyframes"][0].size == (32, 32)
     executed.add("ResizeStep")
 
     fl2va_state = h3_symbols.PipelineState(
@@ -269,9 +278,7 @@ def test_real_h3_blocks_execute_no_weight_pipeline_state_transitions(h3_symbols)
             "audio_latents": torch.zeros(2, 32),
         }
     )
-    _, ref_latents_state = h3_symbols.Ref2VAPrepareLatentsStep()(
-        ref2va_pipeline, ref_latents_state
-    )
+    _, ref_latents_state = h3_symbols.Ref2VAPrepareLatentsStep()(ref2va_pipeline, ref_latents_state)
     assert ref_latents_state.values["latents"].shape == (3, 96)
     assert ref_latents_state.values["audio_latents"].shape == (3, 32)
     executed.add("Ref2VAPrepareLatentsStep")
@@ -279,6 +286,129 @@ def test_real_h3_blocks_execute_no_weight_pipeline_state_transitions(h3_symbols)
     assert executed == EXECUTED_NO_WEIGHT_BLOCKS
     assert EXECUTED_NO_WEIGHT_BLOCKS | set(SIGNATURE_ONLY_BLOCK_REASONS) == set(
         dependency._BLOCK_FIELDS
+    )
+
+
+def test_shared_rollout_prefix_helper_matches_official_fl2va_chain_and_rng(
+    h3_symbols,
+) -> None:
+    pipeline = h3_symbols.MiniMaxH3ModularPipeline.from_config({"workflow": "fl2va"})
+    scheduler_class = pipeline.get_component_spec("scheduler").type_hint
+    pipeline.register_components(
+        scheduler=scheduler_class(shift=12.0),
+        audio_scheduler=scheduler_class(shift=3.0),
+    )
+    condition = torch.arange(96, dtype=torch.float32).reshape(1, 24, 1, 2, 2) / 100
+    cached = {
+        "num_latent_frames": 1,
+        "latent_height": 2,
+        "latent_width": 2,
+        "num_audio_latents": 1,
+        "num_condition_video_rows": 1,
+        "num_condition_audio_rows": 0,
+        "condition_latents": [condition],
+        "video_indices": torch.tensor([0, 1]),
+        "audio_indices": torch.tensor([2, 3]),
+    }
+    framework_generator = torch.Generator().manual_seed(123)
+    oracle_generator = torch.Generator().manual_seed(123)
+
+    targets, prefixes = prepare_h3_rollout_state(
+        pipeline,
+        cached,
+        workflow="fl2va",
+        generator=framework_generator,
+    )
+
+    oracle_state = h3_symbols.PipelineState(
+        values={
+            **cached,
+            "generator": oracle_generator,
+            "latents": None,
+            "audio_latents": None,
+        }
+    )
+    for block_type in (
+        h3_symbols.PrepareConditionLatentsStep,
+        h3_symbols.PrepareLatentsStep,
+        h3_symbols.FL2VAPrepareLatentsStep,
+    ):
+        _, oracle_state = block_type()(pipeline, oracle_state)
+
+    torch.testing.assert_close(prefixes["video"][0], oracle_state.values["latents"][:1])
+    torch.testing.assert_close(targets.components["video"][0], oracle_state.values["latents"][1:])
+    torch.testing.assert_close(
+        targets.components["audio"][0],
+        oracle_state.values["audio_latents"],
+    )
+    assert prefixes["audio"].shape == (1, 0, 32)
+    torch.testing.assert_close(
+        torch.rand((), generator=framework_generator),
+        torch.rand((), generator=oracle_generator),
+    )
+
+
+def test_shared_rollout_prefix_helper_matches_official_ref2va_audio_order(
+    h3_symbols,
+) -> None:
+    pipeline = h3_symbols.MiniMaxH3ModularPipeline.from_config({"workflow": "ref2va"})
+    scheduler_class = pipeline.get_component_spec("scheduler").type_hint
+    pipeline.register_components(
+        scheduler=scheduler_class(shift=12.0),
+        audio_scheduler=scheduler_class(shift=3.0),
+    )
+    audio_conditions = [
+        torch.full((1, 32), 4.0),
+        torch.stack([torch.full((32,), 5.0), torch.full((32,), 6.0)]),
+    ]
+    cached = {
+        "num_latent_frames": 1,
+        "latent_height": 2,
+        "latent_width": 2,
+        "num_audio_latents": 1,
+        "num_condition_video_rows": 1,
+        "num_condition_audio_rows": 3,
+        "condition_latents": [torch.ones(1, 24, 1, 2, 2)],
+        "audio_condition_latents": audio_conditions,
+        "video_indices": torch.tensor([0, 1]),
+        "audio_indices": torch.tensor([2, 3, 4, 5, 6]),
+    }
+    framework_generator = torch.Generator().manual_seed(321)
+    oracle_generator = torch.Generator().manual_seed(321)
+
+    targets, prefixes = prepare_h3_rollout_state(
+        pipeline,
+        cached,
+        workflow="ref2va",
+        generator=framework_generator,
+    )
+
+    oracle_state = h3_symbols.PipelineState(
+        values={
+            **cached,
+            "generator": oracle_generator,
+            "latents": None,
+            "audio_latents": None,
+        }
+    )
+    for block_type in (
+        h3_symbols.PrepareConditionLatentsStep,
+        h3_symbols.PrepareLatentsStep,
+        h3_symbols.Ref2VAPrepareLatentsStep,
+    ):
+        _, oracle_state = block_type()(pipeline, oracle_state)
+
+    torch.testing.assert_close(prefixes["video"][0], oracle_state.values["latents"][:1])
+    torch.testing.assert_close(prefixes["audio"][0], oracle_state.values["audio_latents"][:3])
+    torch.testing.assert_close(targets.components["video"][0], oracle_state.values["latents"][1:])
+    torch.testing.assert_close(
+        targets.components["audio"][0],
+        oracle_state.values["audio_latents"][3:],
+    )
+    torch.testing.assert_close(prefixes["audio"][0, :, 0], torch.tensor([4.0, 5.0, 6.0]))
+    torch.testing.assert_close(
+        torch.rand((), generator=framework_generator),
+        torch.rand((), generator=oracle_generator),
     )
 
 

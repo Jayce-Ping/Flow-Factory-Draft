@@ -95,9 +95,7 @@ def _serialize_dtype_policy(value: DTypePolicy) -> Any:
     """Serialize one normalized dtype policy for YAML output."""
     if isinstance(value, dict):
         return {
-            selector: (
-                None if configured_dtype is None else str(configured_dtype).split(".")[-1]
-            )
+            selector: (None if configured_dtype is None else str(configured_dtype).split(".")[-1])
             for selector, configured_dtype in value.items()
         }
     if value is not None:
@@ -174,7 +172,6 @@ class ModelArguments(ArgABC):
         "z-image",
         "wan2_t2v",
         "wan2_i2v",
-        "wan2_v2v",
         "bagel",
         "sensenova",
         "ltx2_t2av",

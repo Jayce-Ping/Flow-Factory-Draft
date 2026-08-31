@@ -86,10 +86,15 @@ The round-trip ensures that the precision of stored latents matches what trainin
 - **Lesson**: Compute precision and boundary representation are separate contracts. Restore representation at the producer boundary instead of weakening adapter validation or casting from global configuration.
 - **Related Constraint**: N/A
 
+### H3 cached layout coordinates lost their semantic dtype
+- **Date**: 2026-08-30
+- **Symptom**: MiniMax H3 offline SFT and DPO rejected cached `position_ids` as float32 even though the preprocessing cache schema declared float64 coordinates.
+- **Root Cause**: Hugging Face Dataset's torch formatter defaults floating Arrow columns to float32, and H3 layout normalization preserved that runtime downcast.
+- **Fix**: H3 layout normalization now restores matrix coordinates to float64 before output encoding, with a regression covering a float32 cached tensor.
+- **Lesson**: An Arrow schema dtype does not guarantee the dtype returned by a runtime formatter. Restore model-semantic precision at the adapter normalization boundary before strict validation.
+- **Related Constraint**: #20
+
 ## Cross-refs
 
-- `constraints.md` #18 (all-rank synchronization — precision errors may manifest differently per rank)
-- `constraints.md` #20 (mixed precision consistency)
-- `topics/autocast_param_swap.md` (#20a)
-- `train_inference_consistency.md` (log_prob mismatch from precision)
-- `topics/timestep_sigma.md` (scheduler math always float32)
+- UP: [`constraints.md` #18](../constraints.md#18-all-rank-synchronization-points), [`constraints.md` #20](../constraints.md#20-mixed-precision-consistency)
+- PEER: [Autocast and Parameter Swaps](autocast_param_swap.md), [Train/Inference Consistency](train_inference_consistency.md), [Timestep and Sigma](timestep_sigma.md)

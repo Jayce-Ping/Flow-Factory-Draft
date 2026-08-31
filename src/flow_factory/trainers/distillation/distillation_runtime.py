@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import inspect
 import math
+import random
 import zlib
 from contextlib import contextmanager
 from numbers import Real
@@ -37,6 +38,7 @@ from typing import (
     TypeVar,
 )
 
+import numpy as np
 import torch
 from tqdm import tqdm
 
@@ -127,9 +129,10 @@ def without_media_decoding(
                     for component, tensor in value.components.items()
                     if isinstance(tensor, torch.Tensor) and tensor.ndim >= 1
                 }
-                if len(component_sizes) != len(value.components) or len(
-                    set(component_sizes.values())
-                ) != 1:
+                if (
+                    len(component_sizes) != len(value.components)
+                    or len(set(component_sizes.values())) != 1
+                ):
                     raise ValueError(
                         f"{algorithm_name} media-free decoder adapter={adapter_name!r}, "
                         f"signature={decoder_signature} received invalid LatentState batch "
@@ -442,24 +445,34 @@ def generate_one_rollout_batch(
             "dataloader exists. `data.datasets` has no entry with `train: enabled` "
             "(eval-only config); a trainer should not enter the sampling loop here."
         )
-    if not hasattr(trainer, "_rollout_dataloader_epoch"):
-        trainer._rollout_dataloader_epoch = 0
     if not hasattr(trainer, "_rollout_data_iter"):
         trainer._rollout_data_iter = None
+    if not hasattr(trainer, "_rollout_batches_consumed"):
+        trainer._rollout_batches_consumed = None
 
     trainer.adapter.rollout()
     if trainer._rollout_data_iter is None:
-        if hasattr(trainer.dataloader, "set_epoch"):
-            trainer.dataloader.set_epoch(trainer._rollout_dataloader_epoch)
-        trainer._rollout_data_iter = iter(trainer.dataloader)
+        _restore_rollout_data_cursor(
+            trainer,
+            consumed_batches=_completed_rollout_batch_count(trainer),
+            algorithm_name=algorithm_name,
+        )
     try:
         batch = next(trainer._rollout_data_iter)
     except StopIteration:
-        trainer._rollout_dataloader_epoch += 1
-        if hasattr(trainer.dataloader, "set_epoch"):
-            trainer.dataloader.set_epoch(trainer._rollout_dataloader_epoch)
-        trainer._rollout_data_iter = iter(trainer.dataloader)
-        batch = next(trainer._rollout_data_iter)
+        _restore_rollout_data_cursor(
+            trainer,
+            consumed_batches=trainer._rollout_batches_consumed,
+            algorithm_name=algorithm_name,
+        )
+        try:
+            batch = next(trainer._rollout_data_iter)
+        except StopIteration as error:
+            raise RuntimeError(
+                f"{algorithm_name} training dataloader produced no batches after "
+                "restoring its deterministic rollout cursor"
+            ) from error
+    trainer._rollout_batches_consumed += 1
 
     with trainer._rollout_acceleration(), torch.no_grad(), trainer.autocast():
         return trainer.sample_batch(
@@ -468,6 +481,175 @@ def generate_one_rollout_batch(
             compute_log_prob=compute_log_prob,
             trajectory_indices=trajectory_indices,
         )
+
+
+def _completed_rollout_batch_count(trainer: Any) -> int:
+    """Derive the next rollout batch from checkpointed acquisition progress."""
+    progress = getattr(trainer, "progress", None)
+    completed_iterations = getattr(progress, "rollout_iteration", 0)
+    training_args = getattr(trainer, "training_args", None)
+    if (
+        not isinstance(completed_iterations, int)
+        or isinstance(completed_iterations, bool)
+        or completed_iterations < 0
+    ):
+        raise ValueError(
+            "expected rollout_iteration >= 0 as an int, received "
+            f"{type(completed_iterations).__name__}: {completed_iterations!r}"
+        )
+    rollout_accumulation_steps = resolve_rollout_accumulation_steps(training_args)
+    return completed_iterations * rollout_accumulation_steps
+
+
+def _collect_rollout_loader_generators(dataloader: Any) -> List[torch.Generator]:
+    """Collect explicit generators whose state iterator construction may advance."""
+    generators: List[torch.Generator] = []
+    seen_generators: set[int] = set()
+    seen_nodes: set[int] = set()
+
+    def add_generator(value: Any) -> None:
+        if not isinstance(value, torch.Generator) or id(value) in seen_generators:
+            return
+        seen_generators.add(id(value))
+        generators.append(value)
+
+    def visit_sampler(sampler: Any) -> None:
+        if sampler is None or id(sampler) in seen_nodes:
+            return
+        seen_nodes.add(id(sampler))
+        add_generator(getattr(sampler, "generator", None))
+        nested_sampler = getattr(sampler, "sampler", None)
+        if nested_sampler is not sampler:
+            visit_sampler(nested_sampler)
+
+    def visit_loader(loader: Any) -> None:
+        if loader is None or id(loader) in seen_nodes:
+            return
+        seen_nodes.add(id(loader))
+        add_generator(getattr(loader, "generator", None))
+        visit_sampler(getattr(loader, "sampler", None))
+        visit_sampler(getattr(loader, "batch_sampler", None))
+        loaders_by_source = getattr(loader, "dataloaders_by_source", None)
+        if loaders_by_source is None:
+            loaders_by_source = getattr(loader, "_loaders_by_source", None)
+        if isinstance(loaders_by_source, Mapping):
+            for source_loader in loaders_by_source.values():
+                visit_loader(source_loader)
+
+    visit_loader(dataloader)
+    return generators
+
+
+@contextmanager
+def _preserve_rollout_cursor_rng(dataloader: Any) -> Iterator[None]:
+    """Restore every supported parent-process RNG after cursor reconstruction."""
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    cpu_state = torch.random.get_rng_state()
+    cuda_states = None
+    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+        cuda_states = torch.cuda.get_rng_state_all()
+    mps_state = None
+    if torch.backends.mps.is_available() and hasattr(torch.mps, "get_rng_state"):
+        mps_state = torch.mps.get_rng_state()
+    generators = _collect_rollout_loader_generators(dataloader)
+    generator_states = [generator.get_state() for generator in generators]
+    try:
+        yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.random.set_rng_state(cpu_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+        if mps_state is not None:
+            torch.mps.set_rng_state(mps_state)
+        for generator, state in zip(generators, generator_states):
+            generator.set_state(state)
+
+
+def _materialize_lazy_rollout_iterators(dataloader: Any) -> None:
+    """Initialize known lazy loader children inside the RNG-preserving scope."""
+    ensure_iters = getattr(dataloader, "_ensure_iters", None)
+    if callable(ensure_iters):
+        ensure_iters()
+
+
+def _restore_rollout_data_cursor(
+    trainer: Any,
+    *,
+    consumed_batches: int,
+    algorithm_name: str,
+) -> None:
+    """Rebuild one deterministic loader iterator at a global batch boundary.
+
+    Exact checkpoints are published only between acquisition cycles. Each completed
+    distillation cycle consumes ``gradient_accumulation_steps`` divided by its
+    per-rollout loss count, so the persisted rollout-iteration counter is the
+    authoritative cursor. Rebuilding from it avoids serializing a Python iterator
+    and works for both finite multi-source loaders and the framework's infinite
+    grouped batch samplers.
+    """
+    if (
+        not isinstance(consumed_batches, int)
+        or isinstance(consumed_batches, bool)
+        or consumed_batches < 0
+    ):
+        raise ValueError(
+            f"{algorithm_name} expected consumed rollout batches >= 0 as an int, "
+            f"received {type(consumed_batches).__name__}: {consumed_batches!r}"
+        )
+    epoch_size = _rollout_batches_per_dataloader_epoch(trainer, algorithm_name)
+    dataloader_epoch, batch_offset = divmod(consumed_batches, epoch_size)
+    with _preserve_rollout_cursor_rng(trainer.dataloader):
+        _set_rollout_dataloader_epoch(trainer.dataloader, dataloader_epoch)
+        data_iter = iter(trainer.dataloader)
+        _materialize_lazy_rollout_iterators(trainer.dataloader)
+        for _ in range(batch_offset):
+            try:
+                next(data_iter)
+            except StopIteration as error:
+                raise RuntimeError(
+                    f"{algorithm_name} training dataloader ended before its resolved "
+                    f"num_batches_per_epoch={epoch_size} while restoring batch offset "
+                    f"{batch_offset}"
+                ) from error
+    trainer._rollout_data_iter = data_iter
+    trainer._rollout_batches_consumed = consumed_batches
+
+
+def _rollout_batches_per_dataloader_epoch(trainer: Any, algorithm_name: str) -> int:
+    """Resolve the immutable online sampler epoch geometry."""
+    try:
+        epoch_size = len(trainer.dataloader)
+    except (TypeError, AttributeError):
+        epoch_size = None
+    if epoch_size is None:
+        batch_sampler = getattr(trainer.dataloader, "batch_sampler", None)
+        epoch_size = getattr(batch_sampler, "num_batches_per_epoch", None)
+    if epoch_size is None:
+        training_args = getattr(trainer, "training_args", None)
+        epoch_size = getattr(training_args, "num_batches_per_epoch", None)
+    if not isinstance(epoch_size, int) or isinstance(epoch_size, bool) or epoch_size < 1:
+        raise ValueError(
+            f"{algorithm_name} exact rollout cursor requires a positive "
+            "num_batches_per_epoch from dataloader, batch_sampler, or training_args; "
+            f"received {epoch_size!r}"
+        )
+    return epoch_size
+
+
+def _set_rollout_dataloader_epoch(dataloader: Any, epoch: int) -> None:
+    """Set one framework loader or its official/custom sampler epoch."""
+    set_epoch = getattr(dataloader, "set_epoch", None)
+    if callable(set_epoch):
+        set_epoch(epoch)
+        return
+    for name in ("batch_sampler", "sampler"):
+        sampler_set_epoch = getattr(getattr(dataloader, name, None), "set_epoch", None)
+        if callable(sampler_set_epoch):
+            sampler_set_epoch(epoch)
+            return
 
 
 def role_repeat_progress(trainer: Any, *, role_name: str, repeats: int) -> Iterator[int]:
@@ -631,8 +813,9 @@ def run_role_phase(
     # checkpointing recomputes the forward during backward; if the inner loss
     # context has already restored another variant, FSDP1 observes a different
     # graph (and, worse, can recompute with the wrong role's weights).
-    with trainer.role_optimization.phase(role_name), trainer.adapter.use_component_variant(
-        role_name
+    with (
+        trainer.role_optimization.phase(role_name),
+        trainer.adapter.use_component_variant(role_name),
     ):
         # A single item would render a 1/1 bar once per TTUR repeat, which is
         # noise; the role's own progress is already carried by the caller's bar.
@@ -663,6 +846,15 @@ def resolve_rollout_accumulation_steps(training_args: Any) -> int:
     """Recover rollout batches from timestep-aligned backend GAS."""
     accumulation_steps = training_args.gradient_accumulation_steps
     losses_per_rollout = training_args.get_num_train_timesteps(None)
+    if (
+        not isinstance(accumulation_steps, int)
+        or isinstance(accumulation_steps, bool)
+        or accumulation_steps < 1
+    ):
+        raise ValueError(
+            "expected gradient_accumulation_steps >= 1 as an int, received "
+            f"{type(accumulation_steps).__name__}: {accumulation_steps!r}"
+        )
     if (
         not isinstance(losses_per_rollout, int)
         or isinstance(losses_per_rollout, bool)

@@ -18,14 +18,19 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
+from types import MappingProxyType
+from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
+from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image
 
-from diffusers.utils.torch_utils import randn_tensor
-
+from ...contracts import (
+    GeometrySource,
+    InputMediaOrder,
+    NegativePromptPolicy,
+)
 from ...samples import I2ISample, T2ISample
 from ...scheduler import (
     FlowMatchEulerDiscreteSDEScheduler,
@@ -38,7 +43,10 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ..output_state import DecodedMediaBatch, EncodedOutputState, OutputStateCodec
+from ..pipeline_contracts import image_output_contract
 from ..runtime import ComponentRuntime, PseudoPipelineRuntime
+from ._output import SenseNovaPixelOutputCodec
 from .modeling.neo_unify.modeling_neo_chat import (
     SYSTEM_MESSAGE_FOR_GEN,
     clear_flash_kv_cache,
@@ -86,11 +94,27 @@ class SenseNovaAdapter(BaseAdapter):
     standalone Flow-Factory VAE or text encoder.
     """
 
+    offline_training_forward_overrides = MappingProxyType(
+        {
+            "guidance_scale": 1.0,
+            "image_guidance_scale": 1.0,
+            "cfg_norm": "none",
+            "cfg_interval": (0.0, 1.0),
+        }
+    )
+
     # Reference images have variable spatial sizes/counts and are re-encoded at
     # rollout/replay time. Persist them through the HF Image feature as PIL.
     python_format_columns: ClassVar[frozenset[str]] = frozenset({"condition_images"})
     ddp_find_unused_parameters = True
     flow_velocity_direction: ClassVar[Literal["noise", "data"]] = "noise"
+    pipeline_io_contract = image_output_contract(
+        negative_prompt=NegativePromptPolicy.UNSUPPORTED,
+        input_image_min_count=0,
+        input_image_max_count=None,
+        input_order=InputMediaOrder.WITHIN_TYPE,
+        geometry_source=GeometrySource.CONFIGURED,
+    )
 
     def load_pipeline(self) -> SenseNovaPseudoPipeline:
         """Load the custom Transformers checkpoint and tokenizer."""
@@ -176,6 +200,47 @@ class SenseNovaAdapter(BaseAdapter):
 
     def encode_video(self, videos: Any, **kwargs: Any) -> None:
         """SenseNova-U1 has no video input in this adapter."""
+
+    def build_output_state_codec(self) -> OutputStateCodec:
+        """Declare direct pixel-state target encoding without model materialization."""
+        return SenseNovaPixelOutputCodec(self)
+
+    def _configured_output_image_geometry(self) -> Tuple[int, int]:
+        """Return configured H/W after validating the official patch merge grid."""
+        return self._image_shape(
+            getattr(self.training_args, "height", None),
+            getattr(self.training_args, "width", None),
+            None,
+        )
+
+    def _validate_encoded_output_geometry(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Mapping[str, Any],
+        encoded: EncodedOutputState,
+    ) -> None:
+        """Require target signatures and decode metadata to match configured H/W."""
+        del condition
+        height, width = self._configured_output_image_geometry()
+        if len(encoded.geometry_signatures) != len(media_batch):
+            raise ValueError(
+                "SenseNova output codec must return one geometry signature per sample, "
+                f"received {len(encoded.geometry_signatures)} for {len(media_batch)}"
+            )
+        for sample_index, signature in enumerate(encoded.geometry_signatures):
+            geometry = signature.media[0]
+            received = (geometry.height, geometry.width)
+            if received != (height, width):
+                raise ValueError(
+                    "SenseNova encoded output geometry disagrees with configured H/W for "
+                    f"sample {sample_index}: expected {(height, width)}, received {received}"
+                )
+        for name, value in (("height", height), ("width", width)):
+            if encoded.decode_context.get(name) != value:
+                raise ValueError(
+                    f"SenseNova decode_context {name!r} must equal {value}, "
+                    f"received {encoded.decode_context.get(name)!r}"
+                )
 
     def decode_latents(
         self,

@@ -36,7 +36,6 @@ _CLASSIC_ADAPTERS = (
     ("flow_factory.models.z_image.z_image", "ZImageAdapter"),
     ("flow_factory.models.wan.wan2_t2v", "Wan2_T2V_Adapter"),
     ("flow_factory.models.wan.wan2_i2v", "Wan2_I2V_Adapter"),
-    ("flow_factory.models.wan.wan2_v2v", "Wan2_V2V_Adapter"),
     ("flow_factory.models.ltx2.ltx2_t2av", "LTX2_T2AV_Adapter"),
     ("flow_factory.models.ltx2.ltx2_i2av", "LTX2_I2AV_Adapter"),
 )
@@ -139,7 +138,10 @@ def test_bagel_adapter_imports_with_its_optional_kernel_contract(
     flash_attn = types.ModuleType("flash_attn")
     flash_attn.__spec__ = importlib.machinery.ModuleSpec("flash_attn", loader=None)
     flash_attn.flash_attn_varlen_func = lambda *args, **kwargs: None
+    cv2 = types.ModuleType("cv2")
+    cv2.__spec__ = importlib.machinery.ModuleSpec("cv2", loader=None)
     monkeypatch.setitem(sys.modules, "flash_attn", flash_attn)
+    monkeypatch.setitem(sys.modules, "cv2", cv2)
     monkeypatch.setattr(import_utils, "is_flash_attn_available", lambda *args: True)
     monkeypatch.setattr(import_utils, "get_flash_attn_version", lambda: "test")
 
@@ -223,7 +225,6 @@ def test_model_specific_load_dtype_defaults_are_explicit_and_narrow() -> None:
     )
     from flow_factory.models.wan.wan2_i2v import Wan2_I2V_Adapter
     from flow_factory.models.wan.wan2_t2v import Wan2_T2V_Adapter
-    from flow_factory.models.wan.wan2_v2v import Wan2_V2V_Adapter
     from flow_factory.models.z_image.z_image import ZImageAdapter
 
     assert {
@@ -248,7 +249,6 @@ def test_model_specific_load_dtype_defaults_are_explicit_and_narrow() -> None:
         "vae": torch.float32,
     }
     assert Wan2_T2V_Adapter.component_load_dtype_defaults == expected_wan_defaults
-    assert Wan2_V2V_Adapter.component_load_dtype_defaults == expected_wan_defaults
     assert Wan2_I2V_Adapter.component_load_dtype_defaults == {
         **expected_wan_defaults,
         "image_encoder": torch.float32,

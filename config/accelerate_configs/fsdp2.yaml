@@ -4,7 +4,7 @@ downcast_bf16: 'no'
 fsdp_config:
   fsdp_version: 2
   fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
-  # Accelerate 1.13 FSDP2 always uses original DTensor parameters and normalizes
+  # Accelerate 1.14+ FSDP2 always uses original DTensor parameters and normalizes
   # use_orig_params to None. Do not add the obsolete fsdp_use_orig_params key.
   # FSDP2 also rejects any explicit forward_prefetch value, including false.
   fsdp_offload_params: false

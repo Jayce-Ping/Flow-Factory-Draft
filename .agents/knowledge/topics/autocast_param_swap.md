@@ -35,6 +35,6 @@ Ref/EMA/named snapshots share **one** model and swap in place via `EMAModuleWrap
 
 ## Cross-refs
 
-- `constraints.md` #20a, #20, #10
-- `topics/dtype_precision.md`, `train_inference_consistency.md`
-- `models/abc.py` `use_ref_parameters` / `use_ema_parameters` / `use_named_parameters`; `ema/ema.py` `EMAModuleWrapper`
+- UP: [`constraints.md` #20a](../constraints.md#20a-autocast-weight-cache-must-not-span-a-forward), [`constraints.md` #20](../constraints.md#20-mixed-precision-consistency), [`constraints.md` #10](../constraints.md#10-deepspeed-zero-3-is-unsupported)
+- PEER: [Dtype and Precision](dtype_precision.md), [Train/Inference Consistency](train_inference_consistency.md)
+- CODE: [`BaseAdapter` parameter-swap contexts](../../../src/flow_factory/models/abc.py), [`EMAModuleWrapper`](../../../src/flow_factory/ema/ema.py)

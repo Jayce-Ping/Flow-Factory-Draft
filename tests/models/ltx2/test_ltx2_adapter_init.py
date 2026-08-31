@@ -51,11 +51,18 @@ class PipelineStub:
     def __init__(self) -> None:
         self.scheduler = FlowMatchEulerDiscreteScheduler(shift=3.0)
         self.transformer = TransformerStub()
+        self.vae = torch.nn.Identity()
+        self.audio_vae = torch.nn.Identity()
 
     @property
     def components(self) -> Dict[str, Any]:
         """Return the eager component declaration the classic runtime reads."""
-        return {"scheduler": self.scheduler, "transformer": self.transformer}
+        return {
+            "scheduler": self.scheduler,
+            "transformer": self.transformer,
+            "vae": self.vae,
+            "audio_vae": self.audio_vae,
+        }
 
 
 def _config() -> SimpleNamespace:
@@ -195,3 +202,23 @@ def test_constructor_dispatches_lifecycle_calls_in_component_order(cls: type) ->
     adapter.set_trajectory_seed(21)
 
     assert seeded == [("video", 21), ("audio", 21)]
+
+
+def test_i2av_preprocess_forwards_cached_negative_prompt_to_text_encoder() -> None:
+    adapter = object.__new__(LTX2_I2AV_Adapter)
+    captured: Dict[str, Any] = {}
+
+    def encode_prompt(**kwargs: Any) -> Dict[str, Any]:
+        captured.update(kwargs)
+        return {"connector_prompt_embeds": torch.zeros(1, 1, 1)}
+
+    adapter.encode_prompt = encode_prompt
+
+    adapter.preprocess_func(
+        prompt=["describe"],
+        negative_prompt=["avoid blur"],
+        images=None,
+        guidance_scale=4.0,
+    )
+
+    assert captured["negative_prompt"] == ["avoid blur"]

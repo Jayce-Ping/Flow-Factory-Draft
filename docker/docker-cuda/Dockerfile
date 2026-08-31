@@ -1,4 +1,4 @@
-# Build from repository root (includes diffusers submodule):
+# Build from repository root:
 #   docker buildx build --platform linux/amd64 -f docker/docker-cuda/Dockerfile -t flow-factory:local --load .
 #
 # Apple Silicon: always pass --platform linux/amd64 for this training image.
@@ -46,9 +46,10 @@ RUN mkdir -p /app/src/flow_factory && touch /app/src/flow_factory/__init__.py
 
 ARG PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cu129
 RUN uv pip install \
-    torch==2.8.0 \
-    torchvision==0.23.0 \
-    torchaudio==2.8.0 \
+    torch==2.10.0 \
+    torchvision==0.25.0 \
+    torchaudio==2.10.0 \
+    torchcodec==0.10.0 \
     --index-url "${PYTORCH_INDEX_URL}"
 
 RUN uv pip install ".[deepspeed,wandb]"
@@ -56,10 +57,9 @@ RUN uv pip install ".[deepspeed,wandb]"
 # --- Phase 2: copy full source and re-link editable installs ---
 COPY . /app
 RUN uv pip install --no-deps -e .
-RUN uv pip install -e ./diffusers
 
 # Fail fast if any layer is broken
-RUN python -c "import deepspeed, torch, wandb; print('torch', torch.__version__)" && ff-train --help >/dev/null
+RUN python -c "import deepspeed, diffusers, torch, torchcodec, wandb; assert hasattr(torch.optim, 'Muon'); assert tuple(map(int, diffusers.__version__.split('.')[:2])) >= (0, 40); print('torch', torch.__version__, 'torchcodec', torchcodec.__version__, 'diffusers', diffusers.__version__)" && ff-train --help >/dev/null
 
 # Intentionally root: DeepSpeed / NCCL may need elevated IPC access.
 CMD ["/bin/bash"]

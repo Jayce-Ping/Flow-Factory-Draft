@@ -19,9 +19,9 @@ import math
 from typing import Any, Dict, List
 
 _REFERENCE_KEYS = {
-    "image": frozenset({"kind", "path"}),
-    "video": frozenset({"kind", "path", "fps", "audio_path", "sample_rate"}),
-    "audio": frozenset({"kind", "path", "sample_rate"}),
+    "image": frozenset({"type", "path"}),
+    "video": frozenset({"type", "path", "fps", "audio_path", "sample_rate"}),
+    "audio": frozenset({"type", "path", "sample_rate"}),
 }
 
 
@@ -39,10 +39,10 @@ def canonicalize_reference_manifest(references: Any, row_index: int) -> str:
         _validate_reference_entry(entry, row_index, reference_index)
         for reference_index, entry in enumerate(references)
     ]
-    if not any(entry["kind"] in ("image", "video") for entry in validated):
+    if not any(entry["type"] in ("image", "video") for entry in validated):
         raise ValueError(
             f"at row {row_index}, reference 0, expected at least one image or video "
-            f"reference, got audio-only kinds={[entry['kind'] for entry in validated]!r}"
+            f"reference, got audio-only types={[entry['type'] for entry in validated]!r}"
         )
     return json.dumps(validated, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
@@ -69,11 +69,11 @@ def _validate_reference_entry(
             f"expected object at row {row_index}, reference {reference_index}, "
             f"got {type(entry).__name__}: {entry!r}"
         )
-    kind = entry.get("kind")
-    if not isinstance(kind, str) or kind not in _REFERENCE_KEYS:
+    reference_type = entry.get("type")
+    if not isinstance(reference_type, str) or reference_type not in _REFERENCE_KEYS:
         raise ValueError(
-            f"at row {row_index}, reference {reference_index}, expected kind in "
-            f"{tuple(_REFERENCE_KEYS)}, got {kind!r}"
+            f"at row {row_index}, reference {reference_index}, expected type in "
+            f"{tuple(_REFERENCE_KEYS)}, got {reference_type!r}"
         )
     path = entry.get("path")
     if not isinstance(path, str) or not path:
@@ -82,11 +82,11 @@ def _validate_reference_entry(
             f"a non-empty string, got {path!r}"
         )
 
-    unknown_keys = set(entry) - _REFERENCE_KEYS[kind]
+    unknown_keys = set(entry) - _REFERENCE_KEYS[reference_type]
     if unknown_keys:
         raise ValueError(
             f"at row {row_index}, reference {reference_index}, unknown keys "
-            f"{sorted(unknown_keys)} for kind {kind!r}"
+            f"{sorted(unknown_keys)} for type {reference_type!r}"
         )
     for rate_name in ("fps", "sample_rate"):
         if rate_name in entry:
@@ -101,7 +101,7 @@ def _validate_reference_entry(
                     f"at row {row_index}, reference {reference_index}, expected "
                     f"{rate_name} to be finite positive numeric, got {rate!r}"
                 )
-    if kind == "video":
+    if reference_type == "video":
         audio_path = entry.get("audio_path")
         if audio_path is not None and (not isinstance(audio_path, str) or not audio_path):
             raise ValueError(

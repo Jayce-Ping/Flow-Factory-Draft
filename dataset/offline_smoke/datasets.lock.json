@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "datasets": {
+    "offline-dpo": {
+      "repo_id": "Jayce-Ping/Flow-Factory-Offline-DPO-Smoke",
+      "revision": "b6ec289238eefdd6c855b7fb8f87ccc80ee3040f",
+      "supervision_type": "preference"
+    },
+    "sft": {
+      "repo_id": "Jayce-Ping/Flow-Factory-SFT-Smoke",
+      "revision": "50e7f0e897ed2ce4160b14340fc8a982fe6c6919",
+      "supervision_type": "demonstration"
+    }
+  }
+}

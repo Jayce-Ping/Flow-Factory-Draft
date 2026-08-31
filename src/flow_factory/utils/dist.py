@@ -502,9 +502,10 @@ def gather_samples(
 
     Args:
         accelerator: Accelerator instance.
-        samples: Local samples on this rank.
-        field_names: Fields to gather.  When ``'extra_kwargs'`` is included,
-            each key inside the dict is gathered independently and reassembled.
+        samples: Local samples on this rank. All entries must share one concrete sample class.
+        field_names: Consumer-requested fields to gather. When ``extra_kwargs`` is included, each
+            key is gathered independently. Fields declared by the concrete class in
+            ``reconstruction_required_fields`` are always added before reconstruction.
         device: Target device for tensor fields in the returned samples.
 
     Returns:
@@ -517,8 +518,10 @@ def gather_samples(
     device = torch.device(device)
 
     # Separate extra_kwargs from regular fields
-    has_extra_kwargs = "extra_kwargs" in field_names
-    regular_fields = sorted(f for f in field_names if f != "extra_kwargs")
+    reconstruction_fields = sample_cls.reconstruction_required_fields
+    gathered_fields = set(field_names) | set(reconstruction_fields)
+    has_extra_kwargs = "extra_kwargs" in gathered_fields
+    regular_fields = sorted(f for f in gathered_fields if f != "extra_kwargs")
     extra_keys: List[str] = []
     if has_extra_kwargs:
         extra_keys = sorted({k for s in samples for k in s.extra_kwargs})

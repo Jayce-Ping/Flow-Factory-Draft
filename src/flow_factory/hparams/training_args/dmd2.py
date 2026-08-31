@@ -20,6 +20,10 @@ import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Optional, Tuple, cast
 
+from ...contracts.execution import (
+    ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT,
+    ExecutionContract,
+)
 from ..optimizer_args import AdamWOptimizerArguments
 from ._base import TrainingArguments
 
@@ -48,6 +52,8 @@ def _finite_float(value: object, field_name: str, *, allow_zero: bool) -> float:
 @dataclass
 class DMD2TrainingArguments(TrainingArguments):
     """Configure data-free DMD2 distribution matching."""
+
+    execution_contract: ClassVar[ExecutionContract] = ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT
 
     gradient_step_per_epoch: int = field(
         default=1,

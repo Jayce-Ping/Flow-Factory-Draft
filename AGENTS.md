@@ -2,12 +2,12 @@
 
 ## Project Overview
 
-Flow-Factory is a unified **online RL fine-tuning framework** for diffusion/flow-matching models. It provides a modular architecture where trainers, model adapters, and reward models are independently extensible via a registry-based plugin system.
+Flow-Factory is a unified **online and offline fine-tuning framework** for diffusion/flow-matching models. It provides a modular architecture where trainers, model adapters, data acquisition, and reward models are independently extensible through typed contracts and registries.
 
-- **Algorithms**: GRPO, GRPO-Guard, DPPO, DPO, DGPO, DiffusionNFT, AWM, CRD, DiffusionOPD, DMD2, TDM, TDM-R1
-- **Models**: FLUX.1 (+Kontext), FLUX.2 (+Klein), SD3.5, Qwen-Image (+Edit-Plus), Z-Image, Wan2 (T2V/I2V/V2V), LTX2 (T2AV/I2AV), Bagel, SenseNova-U1 (1.0/1.5; T2I + ordered multi-reference I2I)
+- **Algorithms**: SFT, offline DPO, online DPO, GRPO, GRPO-Guard, DPPO, DGPO, DiffusionNFT, AWM, CRD, DiffusionOPD, DMD2, TDM, TDM-R1
+- **Models**: FLUX.1 (+Kontext), FLUX.2 (+Klein), SD3.5, Qwen-Image (+Edit-Plus), Z-Image, Wan2 (T2V/I2V), LTX2 (T2AV/I2AV), MiniMax H3 (T2VA/FL2VA/Ref2VA), Bagel, SenseNova-U1 (1.0/1.5; T2I + ordered multi-reference I2I)
 - **Rewards**: PickScore (+Rank), CLIP, CLAP, ImageBind, OCR, GenEval/GenEval2, HPSv2, VLM-Evaluate, rational-rewards, and custom rewards
-- **Python**: >=3.10 | **PyTorch**: >=2.6.0 | **License**: Apache-2.0
+- **Python**: >=3.10 | **PyTorch**: >=2.10.0 | **License**: Apache-2.0
 
 **Language**: Match user's language.
 
@@ -23,8 +23,8 @@ On session start, read **Tier 1** (see `.agents/knowledge/README.md`):
 ## Core Operating Principles
 
 1. **Constraints first** — Read `constraints.md` + `architecture.md` before changes; search codebase before attempting fixes.
-2. **Cross-component awareness** — Changes to `abc.py` affect ALL subclasses; verify across algorithms (GRPO + NFT/AWM).
-3. **Plan before implement** — Multi-file tasks -> TodoWrite. Plan must state which skills apply.
+2. **Cross-component awareness** — Changes to base classes or typed contracts affect every registry-resolved implementation; verify the affected coupled-reward, decoupled-reward, no-feedback, and dataset-acquisition paths.
+3. **Plan before implement** — Multi-file tasks require an explicit task plan using the agent's supported planning mechanism. The plan must state which skills apply.
 4. **Challenge first, execute second** — Spot logic flaws or simpler alternatives? Raise before executing.
 5. **Escalation** — After three failed approaches, document findings and request review.
 6. **Fix capture** — After every bug fix, generate summary per `.agents/knowledge/topics/fix_patterns.md` template.
@@ -59,8 +59,8 @@ See `.agents/knowledge/architecture.md` "Module Dependency Graph" for full detai
 
 | Document | Purpose |
 |----------|---------|
-| `guidance/workflow.md` | 6-stage training pipeline with code examples |
-| `guidance/algorithms.md` | All algorithms (GRPO, GRPO-Guard, DPPO, DPO, DGPO, DiffusionNFT, AWM, CRD, DiffusionOPD, DMD2, TDM, TDM-R1) deep dive |
+| `guidance/workflow.md` | Unified generation/dataset acquisition contracts plus the online 6-stage pipeline |
+| `guidance/algorithms.md` | All algorithms (SFT, offline DPO, GRPO, GRPO-Guard, DPPO, online DPO, DGPO, DiffusionNFT, AWM, CRD, DiffusionOPD, DMD2, TDM, TDM-R1) deep dive |
 | `guidance/rewards.md` | Reward system design, custom model creation |
 | `guidance/new_model.md` | Step-by-step model adapter integration |
 | `guidance/acceleration.md` | Acceleration plugin layer (compile, attention backend, feature caching) |
@@ -76,7 +76,7 @@ Skills follow the [Agent Skills](https://agentskills.io) open standard. Each ski
 | `/ff-review` | Pre-commit code review | Before committing changes |
 | `/ff-new-model` | Model adapter integration | Adding support for a new diffusion model |
 | `/ff-new-reward` | Reward model integration | Adding a new reward function |
-| `/ff-new-algorithm` | RL algorithm integration | Adding a new training algorithm |
+| `/ff-new-algorithm` | Online/offline algorithm integration | Adding a new training algorithm |
 
 ### Quick Decision Guide
 

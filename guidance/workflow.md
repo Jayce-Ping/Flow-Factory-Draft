@@ -4,6 +4,7 @@
 
 - [Overview](#overview)
 - [Stage 1: Data Preprocessing](#stage-1-data-preprocessing)
+- [Offline Dataset Training](#offline-dataset-training)
 - [Stage 2: K-Repeat Sampling](#stage-2-k-repeat-sampling)
 - [Stage 3: Trajectory Generation](#stage-3-trajectory-generation)
 - [Stage 4: Reward Computation](#stage-4-reward-computation)
@@ -13,11 +14,35 @@
 
 ## Overview
 
-Flow-Factory follows an **online RL** training paradigm for diffusion/flow-matching models. Each epoch executes a six-stage pipeline:
+Flow-Factory has one training kernel with orthogonal execution contracts. An algorithm declares
+where examples come from and whether they need runtime feedback:
+
+| Contract axis | Value | Runtime behavior |
+|---|---|---|
+| Acquisition | `generation` | Run adapter inference to create a rollout collection. |
+| Acquisition | `dataset` | Fetch and optimize every batch from a finite dataloader. |
+| Feedback | `runtime_reward` | Compute rewards and advantages before optimization. |
+| Feedback | `none` | Pass acquired examples directly to the objective. |
+
+This produces three currently useful compositions:
+
+```text
+online RL                 generation + runtime_reward
+generation distillation   generation + none
+SFT / offline DPO         dataset    + none
+```
+
+Acquisition is not a model concern, and feedback is not inferred from a batch shape. The trainer,
+its algorithm-specific arguments, and the shared driver must declare the same immutable contract.
+Pipeline I/O is a separate adapter contract that validates input modalities, ordered references,
+output modality/rates, geometry ownership, and batch capability. The data schema therefore does
+not need model-specific tensor names, while the objective does not need file-format branches.
+
+The familiar online RL path still executes six stages:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                          Flow-Factory Training Epoch                            │
+│                        Flow-Factory Online Rollout Cycle                        │
 │                                                                                 │
 │  ┌─────────────┐    ┌──────────┐    ┌──────────────┐    ┌───────────────┐       │
 │  │    Data     │    │ K-Repeat │    │  Trajectory  │    │    Reward     │       │
@@ -32,21 +57,24 @@ Flow-Factory follows an **online RL** training paradigm for diffusion/flow-match
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The high-level training loop lives once in `BaseTrainer.start()`; no algorithm restates it:
+The high-level loop lives once in `BaseTrainer.start()`. Its acquisition driver selects either a
+generated collection or one finite dataset traversal:
 
 ```python
 # src/flow_factory/trainers/abc.py — BaseTrainer.start()
 def start(self):
     while self.should_continue_training():
-        # Reseed, checkpoint on save_freq, evaluate on eval_freq (omitted for brevity)
-        self._run_training_step()      # Stages 2-6, the algorithm-specific middle
-        self.adapter.ema_step(step=self.epoch)
-        self._after_optimizer_step()
-        self.epoch += 1
+        driver.prepare_cycle(self, progress, seed=train.seed)
+        driver.run_cycle(self, progress)
+        if contract.acquisition is AcquisitionMode.GENERATION:
+            self.adapter.ema_step(step=progress.rollout_iteration)
+        # Runs once per completed rollout iteration or fully exhausted data epoch.
+        self._after_acquisition_cycle()
+        # Advance only after the selected acquisition completes successfully.
+        progress = progress.advance_acquisition(contract.acquisition, completed=True)
 ```
 
-The default `_run_training_step` is the familiar three-stage sequence, so a reward-based
-algorithm only implements `optimize()`:
+Generation acquisition retains the familiar sequence:
 
 ```python
 samples = self.sample()            # Stages 2 + 3
@@ -54,19 +82,24 @@ self.prepare_feedback(samples)     # Stages 4 + 5 (rewards + advantages)
 self.optimize(samples)             # Stage 6 (DPO: pair formation + loss here)
 ```
 
-> **Note**: Stage 1 (preprocessing) runs *once* before training begins and is cached to disk. Stages 2–6 repeat every epoch. The three methods above map directly to those stages: `sample` → trajectory rollouts; `prepare_feedback` → finalize rewards from the buffer and compute advantages; `optimize` → policy update (DPO additionally forms chosen/rejected pairs at the start of `optimize` before the loss). `optimize()` is the only abstract one; vary the rest through `sampling_context`, `_run_training_step` and `_after_optimizer_step`.
+Dataset acquisition never calls `sample()` or `adapter.inference()` for training. It calls
+`optimize_batch(batch)` for every loader batch and advances the data epoch only after exhaustion.
+This is the concrete form of treating the RL sampling stage as a no-op/fetch operation for an
+offline algorithm, without teaching online trainers about offline batch formats.
 
 
 ## Stage 1: Data Preprocessing
 
-**Goal**: Encode raw text prompts (and optional images / videos / audio files) into model-ready tensor representations *before* training begins, eliminating redundant computation during the RL loop and enabling components offloading such as **text-encoder**, **image-encoder**, and **audio-encoder** (when applicable).
+**Goal**: Encode raw text prompts (and optional condition images / videos / audio files) into
+model-ready tensor representations before repeated training work, eliminating redundant condition
+encoding and enabling component offloading.
 
 ### Input / Output
 
 | | Description |
 |---|---|
-| **Input** | Raw dataset: `train.jsonl` or `train.txt` containing prompts, optional image / video / audio paths |
-| **Output** | Cached HuggingFace Dataset on disk with pre-encoded tensors (`prompt_embeds`, `prompt_ids`, `pooled_prompt_embeds`, `image_latents`, etc.) |
+| **Input** | Raw dataset containing prompts and optional condition media paths. Offline objectives use the `input` portion of strict V2 records. |
+| **Output** | Cached HuggingFace Dataset with input tensors (`prompt_embeds`, `prompt_ids`, condition latents, etc.). Output supervision is excluded. |
 
 ### How It Works
 
@@ -105,13 +138,21 @@ def preprocess_func(self, prompt, images, ...):
 - **Cache layout**: The merged cache directory looks like `{cache_dir}/{fingerprint}/_parts/rank_{i:05d}_of_{N:05d}/cache-{fingerprint}_shard{i}of{N-1}.arrow`, plus the top-level `state.json` and `dataset_info.json`. While preprocessing is in flight, the same content lives under `{cache_dir}/{fingerprint}.tmp/`, with a `_build_meta.json` sentinel that records `num_shards` so a subsequent run with the same `num_shards` can resume from any per-rank Arrow files that were already written before a crash, while a different `num_shards` triggers a clean wipe.
 - **No HF default-cache copy**: Because each `map()` call sets `cache_file_name`, HuggingFace does **not** also write a duplicate `cache-*.arrow` under `~/.cache/huggingface/datasets/...`.
 - **Intelligent caching**: A hash fingerprint of `(dataset, split, max_dataset_size, preprocess_func source, preprocess_kwargs, extra_hash_strs)` (the last includes `model_type` and `model_name_or_path`) determines the cache path. Subsequent runs that match the fingerprint take the fast path without any `Dataset.map` invocation.
-- **Component offloading**: Text encoders and VAEs are loaded for preprocessing, then offloaded before the training loop to free VRAM for the denoising model.
+- **Component offloading**: Text and condition encoders can be offloaded after cache creation. An
+  offline adapter's declared runtime condition-preparer and output-codec components are reloaded
+  through the component lifecycle for on-the-fly condition realization and target encoding.
+- **No target cache**: SFT targets and offline-DPO chosen/rejected candidates are decoded per
+  dataset access and encoded per training microbatch. Target payloads, latent states, and metadata
+  never enter the Arrow condition cache.
 
 ### Configuration
 
 ```yaml
 data:
-  dataset: "path/to/dataset"
+  datasets:
+    - name: example
+      dataset_dir: "path/to/dataset"
+      train: {weight: 1}
   enable_preprocess: true          # Enable offline preprocessing
   force_reprocess: false           # Force re-encoding even if cache exists; essential if code is modified without changing config
   preprocessing_batch_size: 16     # Batch size for encoding
@@ -119,8 +160,79 @@ data:
   preprocess_parallelism: "local"  # "local" = per-node parallelism (no shared FS required); "global" = cross-node (shared FS required)
 ```
 
+## Offline Dataset Training
+
+SFT and offline DPO use strict V2 JSONL manifests described in the
+[dataset guide](datasets.md#offline-v2-records). Their finite loader is constructed with PyTorch's
+official `DistributedSampler`, even for `num_replicas=1`, and is not prepared by Accelerator:
+
+```text
+sampler.set_epoch(data_epoch)
+for batch in dataloader:
+    condition = cached prompt/input tensors
+    output = freshly decoded target or chosen/rejected media
+    trainer.optimize_batch(batch)  # prepares condition once inside the microbatch
+data_epoch += 1  # only after clean exhaustion
+```
+
+Inside `optimize_batch`, the trainer calls
+`adapter.prepare_condition_state(condition)` exactly once, binds every target
+candidate through that prepared object, and reuses its model-forward view for all
+policy/reference passes. The driver must not prepare it a second time.
+
+One complete dataloader traversal is one offline epoch. Source weights must be `1`,
+`data.sampler_type` remains `auto`, and `gradient_accumulation_steps` is an explicit integer. The
+rank-local batch count must be divisible by gradient accumulation; the framework does not add
+batches to close a partial accumulation window or flush one at epoch end. The official
+`DistributedSampler` retains its standard `drop_last=False` behavior and may repeat global tail
+indices to equalize rank lengths. Those indices are part of the finite loader traversal.
+
+Progress uses three independent counters:
+
+| Counter | Advances when | Used by |
+|---|---|---|
+| `rollout_iteration` | One generation acquisition completes. | Online rollout cadence and its compatibility `epoch`. |
+| `data_epoch` | One finite offline dataloader traversal completes. | Offline epoch, sampler shuffle epoch, save/eval boundaries. |
+| `optimizer_step` | One optimizer update completes. | Training metrics and optimizer-step state. |
+
+Offline EMA updates on optimizer-step cadence because one data epoch may contain many optimizer
+updates. Online algorithms retain their rollout-cycle EMA cadence. Similarly,
+`num_train_timesteps` means independently sampled flow-matching terms averaged inside one offline
+microbatch; it neither advances `optimizer_step` nor multiplies gradient accumulation.
+
+An exact-state checkpoint (`log.save_model_only: false`) locks the realized training loader plus
+evaluation cadence, sampling arguments, ordered eval loaders, per-dataset overrides, and eval
+reward configuration. Online resume replays evaluation after its pre-rollout checkpoint, and
+evaluation adapters or rewards may consume global RNG before the next training acquisition. MPS
+cannot currently save exact state because Accelerate does not serialize MPS RNG; use
+`log.save_model_only: true` on Apple Silicon.
+
+The adapter prepares an input-owned condition state exactly once per offline batch. An identity
+preparer returns cached fields unchanged. A conditioned model may instead realize geometry-bound
+VAE latents, masks, or stochastic prefixes and split them into model-forward and output-codec
+contexts. SFT reuses that state for its target; offline DPO reuses the same object for chosen and
+rejected encoding and for both policy/reference arms. Candidate-specific output context is bound
+only after this input state exists, so neither candidate can accidentally own or redraw an input
+condition.
+
+The target codec is adapter-owned but role-neutral at its numerical core. Condition and output
+encoding reuse the same pixel preprocessing, VAE transform, normalization, and packing helpers.
+Their semantic policies remain explicit: official condition paths commonly use posterior
+`argmax`, while stochastic target training may use posterior `sample` with an optional generator.
+Sharing a transform must never silently erase that role boundary. Target media remains on demand;
+the prepared-condition boundary does not introduce a target-pixel or target-latent cache.
+
+For offline DPO, chosen and rejected arms share one prepared input state, the primary timestep,
+component-time mapping, and diffusion noise. Both policy arms run before one frozen-reference
+scope covers both reference forwards. SFT has no reference branch. Multi-component adapters may
+specialize only the offline flow-matching objective reduction (for example, a sum of per-modality
+means) without changing the trajectory-wide reducer used by online policy likelihoods.
+
 
 ## Stage 2: K-Repeat Sampling
+
+Stages 2–6 in this guide describe generation acquisition. Dataset acquisition replaces Stages 2–5
+with the finite-loader path above and enters its objective through `optimize_batch()`.
 
 **Goal**: Construct batches where each unique prompt appears exactly $K$ times (`group_size`), enabling group-relative advantage computation.
 
@@ -350,13 +462,13 @@ train:
 
 ## Stage 6: Policy Optimization
 
-**Goal**: Update the denoising model's parameters using the computed advantages and PPO-style clipped policy gradient.
+**Goal**: Update the denoising model through the selected online or offline objective.
 
 ### Input / Output
 
 | | Description |
 |---|---|
-| **Input** | `List[BaseSample]` with advantages, trajectories, and log-probs stored |
+| **Input** | Generated `List[BaseSample]` for generation acquisition, or one typed offline batch for dataset acquisition. |
 | **Output** | Updated model parameters; logged loss metrics |
 
 ### How It Works (GRPO)
@@ -412,7 +524,9 @@ def optimize(self, samples):
 | **AWM** | Samples fresh timesteps; weights velocity matching loss by advantage; PPO clipping + EMA-KL regularization |
 | **DGPO** | Samples fresh timesteps via `TimeSampler`; applies group-level preference objective with optional PPO clipping and EMA-reference KL |
 | **CRD** | Samples fresh timesteps; reward distillation against CFG-guided teacher with adaptive KL; old/sampling model snapshots and centered advantages |
-| **DPO** | Preference loss on chosen/rejected pairs; pairs formed at the start of `optimize` after advantages |
+| **DPO** | Online preference loss on reward-ranked pairs formed at the start of `optimize` after advantages |
+| **SFT** | On-the-fly target encoding followed by independently noised flow-matching loss in `optimize_batch` |
+| **Offline DPO** | On-the-fly chosen/rejected encoding, shared timestep/noise, and policy-vs-reference DPO loss in `optimize_batch` |
 
 ### Optimizer Configuration
 
@@ -554,12 +668,15 @@ so a Muon variant is driven by two algorithms at once: Muon for its matrices and
 AdamW for its biases, normalization scales and embeddings, which the `fallback_`
 fields configure. `optimizer/loader.py` wraps that pair in a `CompositeOptimizer` so
 the framework still prepares exactly one root. An all-AdamW run gets a plain
-`torch.optim.AdamW`, unchanged. Muon combined with DeepSpeed is refused at startup as
-unverified; use DDP or FSDP.
+`torch.optim.AdamW`, unchanged. Muon requires a PyTorch build that exposes
+`torch.optim.Muon` (included in standard releases from PyTorch 2.9; runtime capability detection
+is authoritative). Muon combined with
+DeepSpeed is refused at startup as unverified, and FSDP1 flattens matrices into
+incompatible parameters; use DDP or FSDP2.
 
 ### Key Points
 
-- **Inner epochs**: Samples can be reused for multiple optimization passes (`num_inner_epochs`), amortizing the cost of sampling.
+- **Generation inner epochs**: Generated samples can be reused for multiple optimization passes (`num_inner_epochs`), amortizing rollout cost. Offline `max_epochs` instead counts full loader traversals.
 - **Gradient accumulation**: The `accelerator.accumulate()` context handles gradient accumulation across timesteps and micro-batches, with optimizer steps only at sync boundaries.
 - **KL regularization**: Optional penalty keeping the policy close to a reference model (or EMA model for AWM), preventing reward hacking.
 - **Per-timestep iteration**: GRPO iterates over each stored trajectory timestep, computing loss at each. NFT, AWM, DGPO, and CRD sample fresh timesteps independently of the sampling trajectory.
@@ -593,7 +710,25 @@ Epoch N
     └── Optimizer step at sync boundaries
 ```
 
-*DPO*: form chosen/rejected pairs at the **start** of `optimize()` (after advantages exist), then run the preference loss; there is no pair formation in `prepare_feedback()`.
+*Online DPO*: form chosen/rejected pairs at the **start** of `optimize()` (after advantages exist), then run the preference loss; there is no pair formation in `prepare_feedback()`.
+
+A complete offline epoch is a different acquisition shape:
+
+```text
+Data epoch N
+├── DistributedSampler.set_epoch(N)
+├── Exhaust every rank-local dataloader batch
+│   ├── Reuse cached prompt/input condition
+│   ├── Decode target or chosen/rejected media from source
+│   ├── Encode output state on the fly
+│   ├── Compute SFT or offline-DPO loss
+│   └── Optimizer step at explicit GAS sync boundaries
+└── Advance data_epoch only after clean exhaustion
+```
+
+There is no rollout, training reward, advantage computation, or online pair formation in this
+path. Save/evaluation boundaries use the completed data epoch; training metrics use the independent
+optimizer-step counter.
 
 ## Structured multimodal trajectories
 

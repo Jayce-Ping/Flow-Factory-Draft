@@ -119,13 +119,13 @@ def test_sparse_indices_reject_invalid_type_range_and_duplicates(indices: Any) -
     ("adapter_class", "extra"),
     [
         (MiniMaxH3T2VAAdapter, {"images": [["frame"]]}),
-        (MiniMaxH3T2VAAdapter, {"references": [[{"kind": "image"}]]}),
+        (MiniMaxH3T2VAAdapter, {"references": [[{"type": "image"}]]}),
         (MiniMaxH3FL2VAAdapter, {"videos": [["video"]], "images": [["frame"]]}),
         (MiniMaxH3FL2VAAdapter, {"images": [[], []]}),
-        (MiniMaxH3Ref2VAAdapter, {"images": [["frame"]], "references": [[{"kind": "image"}]]}),
+        (MiniMaxH3Ref2VAAdapter, {"images": [["frame"]], "references": [[{"type": "image"}]]}),
         (
             MiniMaxH3Ref2VAAdapter,
-            {"audios": [[torch.zeros(1)]], "references": [[{"kind": "image"}]]},
+            {"audios": [[torch.zeros(1)]], "references": [[{"type": "image"}]]},
         ),
     ],
 )
@@ -299,10 +299,11 @@ def test_pinned_preprocessing_runs_under_no_grad(monkeypatch) -> None:
 
 
 def test_layout_normalization_uses_field_specific_shapes() -> None:
+    position_ids = torch.arange(21, dtype=torch.float32).reshape(1, 7, 3) / 3
     layout = workflow._normalize_layout(
         {
             "layout": {
-                "position_ids": torch.zeros(1, 7, 3),
+                "position_ids": position_ids,
                 "token_tags": torch.arange(7).unsqueeze(0),
                 "video_indices": torch.arange(2).unsqueeze(0),
                 "num_condition_video_rows": [1],
@@ -311,9 +312,16 @@ def test_layout_normalization_uses_field_specific_shapes() -> None:
     )
 
     assert layout["position_ids"].shape == (7, 3)
+    assert layout["position_ids"].dtype == torch.float64
+    assert torch.equal(layout["position_ids"], position_ids[0].to(torch.float64))
     assert layout["token_tags"].shape == (7,)
     assert layout["video_indices"].shape == (2,)
     assert layout["num_condition_video_rows"] == 1
+
+
+def test_layout_normalization_rejects_non_floating_position_ids() -> None:
+    with pytest.raises(ValueError, match="expected dtype float32 or float64, received torch.int64"):
+        workflow._normalize_layout({"position_ids": torch.zeros(7, 3, dtype=torch.int64)})
 
 
 def test_decode_materializes_exact_frozen_components(monkeypatch) -> None:
@@ -656,6 +664,8 @@ def _training_batch() -> StackedSampleBatch:
 def _patch_h3_forward(monkeypatch) -> None:
     def forward(*args, **kwargs):
         state = args[1]
+        if kwargs.get("velocity_only"):
+            return state
         return MultiModalStepOutput(
             next_state=state,
             next_state_mean=state,

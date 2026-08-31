@@ -25,14 +25,15 @@ classifiers = [
 # Core
 dependencies = [
     # Deep Learning Core
-    "torch>=2.6.0",
-    "torchvision>=0.19.0",
-    "torchaudio>=2.4.0",
+    "torch>=2.10.0",
+    "torchvision>=0.25.0",
+    "torchaudio>=2.10.0",
+    "torchcodec>=0.10.0",
     
     # Hugging Face Ecosystem
     "transformers>=4.57.1",  # Compatible with both v4.x and v5.x
     "diffusers>=0.40.0",
-    "accelerate>=1.11.0",
+    "accelerate>=1.14.0",
     "peft>=0.17.0",
     "datasets>=3.3.2",
     "tokenizers>=0.22.1",
@@ -41,9 +42,10 @@ dependencies = [
     # Critical for T5/Flux
     "protobuf>=6.33.2",
     "sentencepiece>=0.2.1",
+    "ftfy",  # Required by Diffusers Wan prompt normalization
 
     # Basic Utils
-    "av>=18.0.0",
+    "av>=17.0.0",
     "imageio[ffmpeg]>=2.37.2",
     "numpy>=1.26.4",
     "pillow>=10.4.0",
@@ -57,7 +59,7 @@ dependencies = [
 [project.optional-dependencies]
 # DeepSpeed (ZeRO optimization)
 deepspeed = [
-    "deepspeed>=0.15.4",
+    "deepspeed>=0.18.3",
 ]
 
 # Quantization (8-bit/4-bit)
@@ -79,7 +81,7 @@ wandb = [ "wandb" ]
 swanlab = [ "swanlab" ]
 
 nvidia = [
-    "xformers>=0.0.27",
+    "xformers>=0.0.35",
     "nvidia-ml-py",
 ]
 

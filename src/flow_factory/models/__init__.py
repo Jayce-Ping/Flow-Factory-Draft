@@ -21,9 +21,24 @@ with a registry-based loading system for easy extensibility.
 """
 
 from .abc import BaseAdapter
+from .condition_state import (
+    ConditionStatePreparer,
+    PreparedConditionState,
+    validate_condition_preparer_required_components,
+)
 from .latent_geometry import LatentAxes, LatentLayout, infer_latent_axes
 from .loader import load_model
 from .model_bundle import ModelBundle, RoutedComponentProxy
+from .output_state import (
+    DecodedMediaBatch,
+    EncodedOutputState,
+    GeometrySignature,
+    MediaGeometrySignature,
+    OutputStateCodec,
+    validate_codec_required_components,
+    validate_encoded_output_state,
+    validate_output_candidate_batch,
+)
 from .registry import (
     get_model_adapter_class,
     list_registered_models,
@@ -32,6 +47,19 @@ from .registry import (
 __all__ = [
     # Core classes
     "BaseAdapter",
+    # Runtime input-condition preparation
+    "ConditionStatePreparer",
+    "PreparedConditionState",
+    "validate_condition_preparer_required_components",
+    # Offline target encoding
+    "DecodedMediaBatch",
+    "EncodedOutputState",
+    "GeometrySignature",
+    "MediaGeometrySignature",
+    "OutputStateCodec",
+    "validate_codec_required_components",
+    "validate_encoded_output_state",
+    "validate_output_candidate_batch",
     # Latent geometry
     "LatentAxes",
     "LatentLayout",

@@ -17,9 +17,9 @@
 EMA Module Wrapper with functional decay scheduling.
 """
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 import torch
 
@@ -28,6 +28,19 @@ from ..utils.logger_utils import setup_logger
 from .ema_utils import DecayFn, create_decay_fn
 
 logger = setup_logger(__name__)
+
+EMA_STATE_VERSION = 1
+_EMA_STATE_KEYS = frozenset(
+    {
+        "version",
+        "decay",
+        "update_step_interval",
+        "ema_parameters",
+        "num_updates",
+        "decay_schedule",
+        "schedule_params",
+    }
+)
 
 
 class EMAModuleWrapper:
@@ -179,20 +192,167 @@ class EMAModuleWrapper:
 
     def state_dict(self) -> dict:
         """Save state for checkpointing."""
-        return {
+        for index, parameter in enumerate(self.ema_parameters):
+            if type(parameter) is not torch.Tensor:
+                raise TypeError(
+                    "EMA runtime checkpointing supports only replicated plain tensors; "
+                    f"parameter {index} is {type(parameter).__name__}. Sharded/DTensor EMA "
+                    "state requires a distributed-aware gather implementation."
+                )
+        state = {
+            "version": EMA_STATE_VERSION,
             "decay": self.decay,
+            "update_step_interval": self.update_step_interval,
             "ema_parameters": self.ema_parameters,
             "num_updates": self.num_updates,
             "decay_schedule": self._decay_schedule,
-            "schedule_params": self._schedule_params,
+            "schedule_params": dict(self._schedule_params),
         }
+        # Saving while EMA weights are temporarily installed would pair the EMA
+        # policy with the pre-swap runtime payload and make resume permanently use
+        # the wrong live parameters. Reuse the strict, non-mutating load validator
+        # so every state we emit is also one this wrapper can restore.
+        self._validated_state_dict(state)
+        return state
 
-    def load_state_dict(self, state_dict: dict) -> None:
-        """Load state from checkpoint."""
-        self.decay = state_dict.get("decay", self.decay)
-        self.ema_parameters = state_dict["ema_parameters"]
-        self.num_updates = state_dict.get("num_updates", 0)
+    def validate_state_dict(self, state_dict: Mapping[str, Any]) -> None:
+        """Validate a checkpoint payload without mutating the live EMA state."""
+        self._validated_state_dict(state_dict)
+
+    def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
+        """Load a compatible replicated EMA state after complete validation."""
+        parameters, num_updates = self._validated_state_dict(state_dict)
+        self.ema_parameters = [parameter.detach().clone() for parameter in parameters]
+        self.num_updates = num_updates
         self.to(self.device)
+
+    def _validated_state_dict(
+        self,
+        state_dict: Mapping[str, Any],
+    ) -> tuple[list[torch.Tensor], int]:
+        """Return validated tensor and counter values without changing this wrapper."""
+        if not isinstance(state_dict, Mapping):
+            raise TypeError(
+                "expected EMA state as a mapping, "
+                f"received {type(state_dict).__name__}: {state_dict!r}"
+            )
+        non_string_keys = tuple(key for key in state_dict if type(key) is not str)
+        if non_string_keys:
+            raise TypeError(f"expected EMA state keys to be str, received {non_string_keys!r}")
+        received_keys = frozenset(state_dict)
+        if received_keys != _EMA_STATE_KEYS:
+            raise ValueError(
+                f"EMA state keys mismatch: expected {tuple(sorted(_EMA_STATE_KEYS))!r}, "
+                f"received {tuple(sorted(received_keys))!r}"
+            )
+
+        version = state_dict["version"]
+        if type(version) is not int:
+            raise TypeError(
+                "expected EMA state version to be int, "
+                f"received {type(version).__name__}: {version!r}"
+            )
+        if version != EMA_STATE_VERSION:
+            raise ValueError(
+                f"EMA state version mismatch: expected {EMA_STATE_VERSION}, received {version}"
+            )
+
+        decay = state_dict["decay"]
+        if type(decay) not in (int, float):
+            raise TypeError(
+                "expected EMA state decay to be int or float, "
+                f"received {type(decay).__name__}: {decay!r}"
+            )
+        if float(decay) != float(self.decay):
+            raise ValueError(f"EMA state decay mismatch: expected {self.decay}, received {decay}")
+
+        update_step_interval = state_dict["update_step_interval"]
+        if type(update_step_interval) is not int:
+            raise TypeError(
+                "expected EMA state update_step_interval to be int, "
+                f"received {type(update_step_interval).__name__}: "
+                f"{update_step_interval!r}"
+            )
+        if update_step_interval < 0:
+            raise ValueError(
+                "expected EMA state update_step_interval as a non-negative int, "
+                f"received {update_step_interval!r}"
+            )
+        if update_step_interval != self.update_step_interval:
+            raise ValueError(
+                "EMA state update_step_interval mismatch: expected "
+                f"{self.update_step_interval}, received {update_step_interval}"
+            )
+
+        decay_schedule = state_dict["decay_schedule"]
+        if type(decay_schedule) is not str:
+            raise TypeError(
+                "expected EMA state decay_schedule to be str, "
+                f"received {type(decay_schedule).__name__}: {decay_schedule!r}"
+            )
+        if decay_schedule != self._decay_schedule:
+            raise ValueError(
+                "EMA state decay_schedule mismatch: expected "
+                f"{self._decay_schedule!r}, received {decay_schedule!r}"
+            )
+
+        schedule_params = state_dict["schedule_params"]
+        if not isinstance(schedule_params, Mapping):
+            raise TypeError(
+                "expected EMA state schedule_params as a mapping, "
+                f"received {type(schedule_params).__name__}: {schedule_params!r}"
+            )
+        if dict(schedule_params) != self._schedule_params:
+            raise ValueError(
+                "EMA state schedule_params mismatch: expected "
+                f"{self._schedule_params!r}, received {dict(schedule_params)!r}"
+            )
+
+        num_updates = state_dict["num_updates"]
+        if type(num_updates) is not int:
+            raise TypeError(
+                "expected EMA state num_updates to be int, "
+                f"received {type(num_updates).__name__}: {num_updates!r}"
+            )
+        if num_updates < 0:
+            raise ValueError(
+                "expected EMA state num_updates as a non-negative int, " f"received {num_updates!r}"
+            )
+
+        parameters = state_dict["ema_parameters"]
+        if not isinstance(parameters, list):
+            raise TypeError(
+                "expected EMA state ema_parameters as a list, "
+                f"received {type(parameters).__name__}: {parameters!r}"
+            )
+        if len(parameters) != len(self.ema_parameters):
+            raise ValueError(
+                "EMA state parameter count mismatch: expected "
+                f"{len(self.ema_parameters)}, received {len(parameters)}"
+            )
+        for index, (received, expected) in enumerate(
+            zip(parameters, self.ema_parameters, strict=True)
+        ):
+            if type(received) is not torch.Tensor:
+                raise TypeError(
+                    "expected EMA state parameter "
+                    f"{index} to be a plain torch.Tensor, received "
+                    f"{type(received).__name__}: {received!r}"
+                )
+            if received.shape != expected.shape:
+                raise ValueError(
+                    f"EMA state parameter {index} shape mismatch: expected "
+                    f"{tuple(expected.shape)}, received {tuple(received.shape)}"
+                )
+            if received.dtype != expected.dtype:
+                raise ValueError(
+                    f"EMA state parameter {index} dtype mismatch: expected "
+                    f"{expected.dtype}, received {received.dtype}"
+                )
+
+        if self.temp_stored_parameters is not None:
+            raise RuntimeError("cannot load EMA state while EMA parameters are installed")
+        return parameters, num_updates
 
     @staticmethod
     def get_decay_for_impact(impact: float, num_steps: int) -> float:

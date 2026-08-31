@@ -1,120 +1,187 @@
 ---
 name: ff-new-model
-description: "Complete workflow for adding a new model adapter. Covers analysis, sample dataclass, adapter implementation (4 abstract methods + per-modality encoder overrides), registry, example YAML, and verification. Trigger: 'add model', 'support new model', 'integrate model', 'new adapter'."
+description: "Add a Flow-Factory model adapter, including component runtime, model I/O, online trajectory, offline output-state, distributed loading, checkpointing, registry, examples, and parity verification."
 ---
 
 # New Model Adapter Integration
 
-> **Authoritative reference**: `guidance/new_model.md` — read it first.
+Read `../../../guidance/new_model.md`, Tier 1,
+`../../knowledge/topics/adapter_conventions.md`, `../../knowledge/topics/component_runtime.md`, and
+`../../knowledge/topics/parity_testing.md`. Read
+`../../knowledge/topics/structured_trajectory.md` for multi-component models and
+`../../../guidance/datasets.md` when adding offline support.
 
-## Prerequisites
+## 1. Design the Adapter Contracts
 
-Before starting, ensure you understand:
-1. The target model's diffusers pipeline (or that you'll need a pseudo-pipeline)
-2. The task type: Text-to-Image, Image-to-Image, Text-to-Video, Image-to-Video
-3. Which Sample dataclass to extend
+Decide before implementation:
 
-## Phase 1: Analysis
+- task inputs and outputs: image, video, audio-video, first/last frame, or ordered heterogeneous
+  references;
+- eager Diffusers, lazy modular, or explicit pseudo component runtime;
+- canonical logical components, physical ownership roots, optional components, and aliases;
+- legacy single-component or structured multi-component trajectory;
+- online-only or lossless SFT/offline-DPO output-state support;
+- class-level I/O superset and any checkpoint-realized specialization;
+- supported finetune types, batch semantics, dtype policy, and FSDP2 capabilities.
 
-1. **Identify the diffusers pipeline** for the target model
-   - Check if it exists in `diffusers`: `from diffusers import <Pipeline>`
-   - If not, you'll need a pseudo-pipeline (see `guidance/new_model.md` advanced section)
-2. **Study an existing adapter** of the same task type:
-   - T2I: `models/flux/flux1.py` or `models/stable_diffusion/sd3_5.py`
-   - I2I: `models/flux/flux1_kontext.py` or `models/qwen_image/qwen_image_edit_plus.py`
-   - T2V: `models/wan/wan2_t2v.py`
-   - I2V: `models/wan/wan2_i2v.py`
-3. **Map pipeline components** to adapter responsibilities:
-   - Text encoders → `encode_prompt()`, `preprocessing_modules`
-   - VAE → `encode_image()` / `decode_latents()`, `preprocessing_modules`
-   - Audio encoder/VAE (if any) → `encode_audio()`, `preprocessing_modules`
-   - Transformer/UNet → `forward()`, `default_target_modules` (LoRA target layer names), `inference_modules`
-4. **Also read**: `topics/adapter_conventions.md` for upstream alignment rules; `topics/dtype_precision.md` for precision handling in `cast_latents()`.
+Study a reference by contract rather than name alone: Flux/SD3 for classic image pipelines, Wan for
+conditioned video, LTX2 for structured AV, MiniMax H3 for modular ordered AV, and Bagel/SenseNova for
+pseudo multi-reference runtimes.
 
-## Phase 2: Implementation
+All adapters inherit directly from `BaseAdapter`. Model-specific samples inherit the matching
+task-level sample (`T2ISample`, `I2VSample`, `T2AVSample`, `I2AVSample`, etc.), never another
+model-specific sample.
 
-### Step 1 — Define Sample Dataclass
+## 2. Build the Component Runtime
 
-```python
-# src/flow_factory/models/<family>/<model>.py
-@dataclass
-class MyModelSample(T2ISample):  # or appropriate base
-    _shared_fields: ClassVar[frozenset[str]] = frozenset({})
-    # Add model-specific fields if needed
-```
+All adapters implement `load_pipeline()`. The default `build_component_runtime()` wraps it in
+`ClassicPipelineRuntime`. Lazy modular or explicit-container adapters override
+`build_component_runtime()` and retain `adapter.pipeline` as the compatibility alias.
 
-### Step 2 — Create Adapter Class
+Declare component behavior precisely:
 
-```python
-class MyModelAdapter(BaseAdapter):
+- canonical lookup owns component identity;
+- overrides hold prepared proxies or checkpoint/LoRA replacements;
+- declared specs are available for explicit lookup and role discovery;
+- lifecycle enumeration contains materialized canonical `torch.nn.Module` values only;
+- optional `None`, lazy-only specs, pseudo aliases, and prepared overrides are not implicit
+  lifecycle roots;
+- `materialize_components(None)` means already materialized modules. Name lazy requirements
+  explicitly.
 
-    @property
-    def preprocessing_modules(self) -> List[str]:
-        return ["text_encoder", "vae"]  # Components for Stage 1
+Use `has_component`, `get_component`, and `_require_component`; never gate component behavior with
+`hasattr(adapter, name)`. Declare `preprocessing_modules` and `inference_modules`. Condition/output
+encoding components are declared by their preparer/codec rather than loaded inside an encode call.
 
-    @property
-    def inference_modules(self) -> List[str]:
-        return ["vae"]  # Components needed at inference time
+Do not call Accelerator prepare, FSDP wrapping, rank broadcasts, or manual target movement in an
+adapter. `ModelLoadCoordinator` maps logical names to physical roots, and trainer initialization
+prepares one `ModelBundle` plus one optimizer. After prepare, adapter access routes through
+`RoutedComponentProxy`.
 
-    @property
-    def default_target_modules(self) -> List[str]:
-        # LoRA target module names used when YAML sets `target_modules: default`.
-        # Override only if your transformer uses non-standard attention layer names.
-        return ["to_q", "to_k", "to_v", "to_out.0"]
-```
+## 3. Implement the Core Adapter Surface
 
-> Which components are trainable is **config-driven**: the YAML `target_components` / `target_modules` fields are resolved by `BaseAdapter._parse_target_modules()` into `self.target_module_map` (set in `__init__`). Adapters do **not** override `target_module_map`.
+`BaseAdapter` keeps four abstract methods:
 
-### Step 3 — Implement Required Methods
+| Method | Contract |
+|---|---|
+| `load_pipeline()` | Return the native pipeline/container used by the runtime. |
+| `decode_latents()` | Decode generated latent state to media. |
+| `inference()` | Run the full denoising/generation loop. |
+| `forward()` | Run one model step; this is the train-inference parity boundary. |
 
-| Method | Purpose | Stage | Abstract? |
-|--------|---------|-------|-----------|
-| `load_pipeline()` | Load diffusers pipeline | Init | Yes |
-| `decode_latents()` | Latents → pixels | 3 | Yes |
-| `inference()` | Full multi-step denoising | 3 | Yes |
-| `forward()` | Single-step denoising loss | 6 | Yes |
-| `encode_prompt()` | Text → embeddings | 1 | No (no-op default; override if your model consumes text) |
-| `encode_image()` | Image → latents | 1 | No (no-op default; override if your model consumes images) |
-| `encode_video()` | Video frames → latents | 1 | No (no-op default; override if your model consumes videos) |
-| `encode_audio()` | Audio → embeddings/features | 1 | No (no-op default; override if your model consumes audio) |
-| `preprocess_func()` | Raw inputs → cached tensors (dispatches to the 4 encoders) | 1 | No (concrete, override only for cross-modal preprocessing) |
+`encode_prompt`, `encode_image`, `encode_video`, and `encode_audio` are opt-in no-op encoders.
+`preprocess_func()` dispatches them and should be overridden only for cross-modal preprocessing.
+Preserve exact batch nesting: the outer list indexes samples and inner lists hold each sample's
+media items; empty samples contribute `[]`, never `None` or a bare singleton.
 
-### Step 4 — Register
+Configure training through `default_target_modules`; YAML `target_components`/`target_modules`
+builds `target_module_map`. Do not override the realized map.
 
-Add to `_MODEL_ADAPTER_REGISTRY` in `src/flow_factory/models/registry.py`:
-```python
-'my-model': 'flow_factory.models.<family>.<model>.MyModelAdapter',
-```
+`forward()` and `inference()` must agree on all generation-affecting inputs, scheduler state,
+precision, and component order. Use `cast_latents()` symmetrically. Keep algorithm-specific logic
+out of the adapter.
 
-## Phase 3: Configuration
+## 4. Add Structured State When Components Differ
 
-Create example YAML config in `examples/grpo/lora/<model>/default.yaml`:
-```yaml
-model:
-  model_type: "my-model"
-  model_name_or_path: "org/model-name"
-  finetune_type: "lora"
-  target_components: ["transformer"]
-```
+For independently shaped or scheduled latent components:
 
-## Phase 4: Verification
+- declare immutable `trajectory_component_order`;
+- build a `SchedulerGroup` with exactly the same names and a canonical primary scheduler;
+- emit `StructuredTrajectory` only, leaving legacy trajectory fields `None`;
+- retain per-component schedules, state/log-prob index maps, callbacks, and active masks;
+- extend protected state/bridge/reduction hooks so trainers consume terminal state, replay steps,
+  forward-process noise, and reductions without inspecting storage format;
+- derive scheduler/RNG/reduction order from the declared tuple, never mapping iteration.
 
-Also read: `topics/parity_testing.md` for the 4-layer verification protocol.
+Single-component adapters may retain legacy storage. Do not generalize their reduction order unless
+the change preserves parity.
 
-- [ ] `load_pipeline()` successfully loads the model
-- [ ] `preprocess_func()` produces correct cached tensors
-- [ ] `inference()` generates valid images/videos
-- [ ] `forward()` computes loss without errors
-- [ ] Training runs end-to-end with GRPO for ≥2 steps
-- [ ] LoRA weights save and reload correctly
-- [ ] Registry entry resolves correctly: `get_model_adapter_class('my-model')`
-- [ ] Example YAML config is valid and complete
+If a new concrete sample field is required by `__post_init__`, identity normalization, or
+constructor invariants after a partial distributed gather, union it into the inherited
+`reconstruction_required_fields`. That transport contract is separate from collator
+`_shared_fields` and reward-model `required_fields`.
 
-## Common Pitfalls
+## 5. Declare Offline Output-State Support Explicitly
 
-1. **Forgetting to set `preprocessing_modules`** — causes text encoder to stay on GPU, OOM during training
-2. **Wrong `target_components` / `target_modules` (or `default_target_modules`)** — LoRA applied to wrong components/layers, no training effect
-3. **Mismatched `_shared_fields`** — data corruption during batch collation
-4. **Not handling `enable_preprocess=False`** — encoding components not loaded at inference time
-5. **Inconsistent custom field types across samples** — if a custom sample field is `Tensor` on some samples and `List[Tensor]` on others, `gather_samples` will fall back to slow pickle-based `gather_object`. Always canonicalize to a single type in `__post_init__`; prefer `List[Tensor]` for variable-length data.
-6. **Wrong `images`/`condition_images`/`audios` convention** — `preprocess_func()`, `encode_image()`, `encode_video()`, `encode_audio()`, and `inference()` all operate at **batch level**: `images` is `List[List[Image.Image]]` (`MultiImageBatch`), `condition_images` is `List[List[Tensor(C,H,W)]]` (or `List[List[PIL.Image]]` for adapters that declare `python_format_columns`, e.g. Bagel and SenseNova), and `audios` is `List[List[Tensor]]` (`MultiAudioBatch`), where the outer list indexes samples in the batch and the inner list holds each sample's items. Empty samples contribute `[]` (never `None`); single-item samples contribute `[item]` (never a bare element). Never pass a flat `List[Image]` / `List[Tensor]` or unwrap single-element lists — that breaks Arrow's homogeneous-column requirement and forces every downstream consumer to handle three input shapes. For single-condition models, `_standardize_image_input` / `_standardize_video_input` must detect the nested format with `is_multi_image_batch` / `is_multi_video_batch`, extract the first element per sample (`[batch[0] for batch in images]`), and warn if extra conditions are discarded (e.g. `Wan2_I2V._standardize_image_input`, `LTX2_I2AV._standardize_image_input`). See `topics/adapter_conventions.md` Gotcha #5 and #6.
+An adapter that claims SFT/offline-DPO support must provide every boundary below:
+
+1. An immutable `PipelineIOContract` describing model-neutral ordered input/output media,
+   semantic slots/cardinality, rates, geometry owner, and batch capability.
+2. `_resolve_pipeline_io_contract()` only when checkpoint metadata narrows a class-level superset.
+3. A declaration-only `OutputStateCodec` from `build_output_state_codec()`. It declares logical
+   required components but cannot materialize, load, move, replace, or recast them.
+4. `_validate_encoded_output_geometry()` comparing codec output against adapter-owned facts.
+5. A declaration-only `ConditionStatePreparer` only when cached conditions are not the exact
+   forward/output-codec condition.
+6. One `PreparedConditionState` reused across every candidate and policy/reference forward.
+7. A complete immutable `offline_training_forward_overrides` mapping. These values define finite-
+   data model conditioning and are independent of rollout CFG settings.
+8. An offline flow-matching objective reducer only when modality aggregation differs from online
+   trajectory reduction.
+
+Input-condition caches never contain target/chosen/rejected pixels or latent states. Shared numeric
+transforms may serve condition and output paths, but posterior `sample` versus `argmax` policy stays
+explicit at the semantic boundary. Candidate output context cannot overwrite input-owned fields.
+
+If the adapter cannot represent output state losslessly, set a non-empty actionable
+`output_state_codec_unavailable_reason`. Dataset acquisition then fails before model weights load;
+online construction remains valid.
+
+Do not override public boundary-owning wrappers such as `prepare_condition_state`,
+`encode_output_state`, `forward_state`, or the shared reducers. Extend the protected hooks named by
+their errors/docs.
+
+## 6. Preserve Distributed and Checkpoint Ownership
+
+- Declare every target component and frozen-but-shardable sibling needed in the prepared bundle.
+- Preserve `_no_split_modules` or `_repeated_blocks` metadata so FSDP wrap discovery survives the
+  bundle boundary.
+- Opt into `supports_fsdp2_cpu_efficient_loading` only when selective rank-zero/meta target
+  construction is correct. Treat additional wrap classes, default-stream unshard, backward-prefetch
+  opt-out, and in-forward checkpointing as explicit model capabilities.
+- Do not enable activation checkpointing inside `load_pipeline()`. The early backend plan selects
+  one owner: FSDP2 moves a full model policy to backend ownership and rejects selective model
+  policies; adapter-owned in-forward block boundaries require explicit opt-in.
+- Apply component load dtype during native load, then frozen/trainable storage policy. Ensure lazy
+  materialization receives both policies.
+- Save/load trainable components symmetrically. Frozen-but-shardable bundle members do not own
+  checkpoint artifacts. Test through prepared proxies as well as unprepared model-only load.
+
+## 7. Register and Add Examples
+
+Add a lowercase canonical key and lazy class path to `_MODEL_ADAPTER_REGISTRY`; preserve direct
+Python-path fallback. Follow
+`examples/{algorithm}/{finetune_type}/{model_type}/{variant}.yaml` and update path references.
+
+Add a generation example. For declared offline support, add SFT/offline-DPO examples or tested
+fixtures whose strict V2 media matches the effective checkpoint contract. Document supported modes,
+batch limits, geometry, rates, and intentionally unsupported paths.
+
+## 8. Verification
+
+- Runtime construction and lifecycle tests for the chosen classic/modular/pseudo runtime.
+- Native pipeline config, components, one-step forward, final latent, and visual parity.
+- Rollout/training `forward()` parity and initial on-policy ratio for coupled support.
+- Legacy or structured trajectory bridge, active-mask, noise, and reducer tests.
+- Selective-field distributed gather reconstructs every concrete sample with its inherited
+  `reconstruction_required_fields` intact.
+- DDP, ZeRO-2, and FSDP2 initialization/step where supported; verify bundle/proxy routing and FSDP
+  wrap/checkpoint policy.
+- LoRA/full and model-only checkpoint round trips only for finetune types claimed.
+- One complete SFT epoch and offline-DPO epoch for every declared offline I/O mode, including exact
+  geometry and prepared-condition reuse.
+- An online-only adapter's offline selection fails before heavyweight loading.
+- Registry and example parsing tests. Run `/ff-review` before commit.
+
+## Common Failures
+
+- Membership through adapter attributes, eager materialization of all lazy specs, or alias double
+  movement.
+- Preparing components outside the bundle or dropping repeated-block wrap metadata.
+- Scheduler order from a mapping or multimodal state written into legacy fields.
+- Adapter-to-adapter or model-sample-to-model-sample inheritance.
+- Codec/preparer construction with materialization or device/dtype side effects.
+- Using the class I/O superset instead of the checkpoint-effective contract.
+- Redrawing an input condition per preference candidate or leaking sampling CFG into offline loss.
+- Overriding public contract wrappers instead of protected hooks.
+- Enabling both model and backend activation checkpointing.

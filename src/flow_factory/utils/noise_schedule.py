@@ -263,6 +263,40 @@ class TimeSampler:
         return t.unsqueeze(1).expand(num_timesteps, batch_size)
 
     @staticmethod
+    def independent_logit_normal_shifted(
+        batch_size: int,
+        num_timesteps: int,
+        timestep_range: Union[float, Tuple[float, float]],
+        logit_mean: float = 0.0,
+        logit_std: float = 1.0,
+        time_shift: float = 1.0,
+        device: torch.device = torch.device("cpu"),
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        """Draw an independent logit-normal coordinate per term and sample.
+
+        Unlike :meth:`logit_normal_shifted`, this offline-oriented method
+        materializes ``(num_timesteps, batch_size)`` rather than expanding one
+        coordinate across each batch row. The legacy online RNG path remains
+        unchanged.
+        """
+        _require_positive_int(batch_size, "batch_size")
+        _require_positive_int(num_timesteps, "num_timesteps")
+        output_device = torch.device(device)
+        rng_device = _rng_device(generator, output_device)
+        u_standard = torch.randn(
+            (num_timesteps, batch_size),
+            generator=generator,
+            device=rng_device,
+        )
+        raw = torch.sigmoid(u_standard * logit_std + logit_mean)
+        raw = time_shift * raw / (1 + (time_shift - 1) * raw)
+        raw = torch.clamp(raw, min=0.01, max=1.0 - 1e-6)
+        frac_lo, frac_hi = _normalize_timestep_range(timestep_range)
+        frac = frac_lo + raw * (frac_hi - frac_lo)
+        return (TIMESTEP_MAX * (1.0 - frac)).to(output_device)
+
+    @staticmethod
     def uniform(
         batch_size: int,
         num_timesteps: int,
@@ -289,6 +323,31 @@ class TimeSampler:
             f = time_shift * f / (1 + (time_shift - 1) * f)
         t = TIMESTEP_MAX * (1.0 - f)
         return t.to(device).unsqueeze(1).expand(-1, batch_size)
+
+    @staticmethod
+    def independent_uniform(
+        batch_size: int,
+        num_timesteps: int,
+        timestep_range: Union[float, Tuple[float, float]],
+        time_shift: float = 1.0,
+        device: torch.device = torch.device("cpu"),
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        """Draw an independent uniform coordinate per term and sample."""
+        _require_positive_int(batch_size, "batch_size")
+        _require_positive_int(num_timesteps, "num_timesteps")
+        output_device = torch.device(device)
+        rng_device = _rng_device(generator, output_device)
+        frac_lo, frac_hi = _normalize_timestep_range(timestep_range)
+        fraction = torch.rand(
+            (num_timesteps, batch_size),
+            generator=generator,
+            device=rng_device,
+        )
+        fraction = frac_lo + fraction * (frac_hi - frac_lo)
+        if abs(time_shift - 1.0) > 1e-6:
+            fraction = time_shift * fraction / (1 + (time_shift - 1) * fraction)
+        return (TIMESTEP_MAX * (1.0 - fraction)).to(output_device)
 
     @staticmethod
     def discrete(
@@ -366,3 +425,13 @@ class TimeSampler:
         lower, upper = boundaries[:-1].long(), boundaries[1:].long()
         rand_u = torch.rand(num_samples, generator=generator, device=rng_device).to(device)
         return lower + (rand_u * (upper - lower)).long()
+
+
+def _require_positive_int(value: object, field_name: str) -> None:
+    """Require a positive exact integer for materialized sampler shapes."""
+    if type(value) is not int:
+        raise TypeError(
+            f"expected {field_name} to be int, received {type(value).__name__}: {value!r}"
+        )
+    if value < 1:
+        raise ValueError(f"expected {field_name} >= 1, received {value}")

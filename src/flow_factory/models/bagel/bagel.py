@@ -53,8 +53,10 @@ from __future__ import annotations
 import os
 import random
 from collections import defaultdict
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
@@ -65,6 +67,12 @@ from accelerate import Accelerator
 from PIL import Image
 from tqdm import tqdm
 
+from ...contracts import (
+    BatchCapability,
+    GeometrySource,
+    InputMediaOrder,
+    NegativePromptPolicy,
+)
 from ...hparams import Arguments
 from ...samples import I2ISample, T2ISample
 from ...scheduler import (
@@ -88,7 +96,13 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ..output_state import DecodedMediaBatch, EncodedOutputState, OutputStateCodec
+from ..pipeline_contracts import image_output_contract
 from ..runtime import ComponentRuntime, PseudoPipelineRuntime
+from ._output import (
+    BagelOutputStateCodec,
+    validate_bagel_encoded_output_geometry,
+)
 
 # Bagel's LLM attention (qwen2_navit) hard-requires flash-attn's varlen kernel,
 # imported transitively by the `.modeling` imports below. Fail fast here with
@@ -180,11 +194,29 @@ class BagelAdapter(BaseAdapter):
       4. CFG uses separate pre-computed KV caches for text-only and image-only conditions.
     """
 
+    offline_training_forward_overrides = MappingProxyType(
+        {
+            "cfg_text_scale": 1.0,
+            "cfg_img_scale": 1.0,
+            "cfg_interval": (0.0, 1.0),
+            "cfg_renorm_min": 0.0,
+            "cfg_renorm_type": "global",
+        }
+    )
+
     # Bagel stores raw, variable-size condition images (no fixed resize) and
     # re-encodes them at rollout/training. Persist them via the HF Image feature
     # so ragged multi-reference batches serialize; they read back as PIL and are
     # re-normalized by ``_normalize_condition_images``.
     python_format_columns: ClassVar[frozenset[str]] = frozenset({"condition_images"})
+    pipeline_io_contract = image_output_contract(
+        negative_prompt=NegativePromptPolicy.UNSUPPORTED,
+        input_image_min_count=0,
+        input_image_max_count=None,
+        input_order=InputMediaOrder.WITHIN_TYPE,
+        geometry_source=GeometrySource.OUTPUT_MEDIA,
+        batch_capability=BatchCapability.UNIFORM,
+    )
 
     # Bagel is a mixture-of-transformer-experts model: the generation path uses
     # *_moe_gen experts while the understanding/ViT path is unused during RL
@@ -266,6 +298,30 @@ class BagelAdapter(BaseAdapter):
             aliases={"transformer": pipeline.transformer},
             alias_routes={"transformer": ("bagel", ("language_model",))},
         )
+
+    def build_output_state_codec(self) -> OutputStateCodec:
+        """Declare Bagel's on-the-fly stochastic target-image codec.
+
+        Returns:
+            Codec requiring the logical Bagel and VAE components at encode time.
+        """
+        return BagelOutputStateCodec(self)
+
+    def _validate_encoded_output_geometry(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Mapping[str, Any],
+        encoded: EncodedOutputState,
+    ) -> None:
+        """Verify target geometry against Bagel's output-media transform.
+
+        Args:
+            media_batch: Decoded target images validated by the shared boundary.
+            condition: Input condition paired with the targets.
+            encoded: Codec result after generic validation.
+        """
+        del condition
+        validate_bagel_encoded_output_geometry(self, media_batch, encoded)
 
     def load_scheduler(self) -> FlowMatchEulerDiscreteSDEScheduler:
         """
@@ -430,7 +486,10 @@ class BagelAdapter(BaseAdapter):
             images = [[img] for img in images]
 
         # Convert to RGB
-        processed = [standardize_image_batch(img_list, output_type="pt") for img_list in images]
+        processed = [
+            standardize_image_batch(img_list, output_type="pt") if img_list else []
+            for img_list in images
+        ]
         return {"condition_images": processed}
 
     def encode_video(self, videos: Any) -> None:
@@ -755,7 +814,9 @@ class BagelAdapter(BaseAdapter):
         )
         generation_input = move_tensors_to_device(generation_input, device, max_depth=1)
         past_key_values = bagel.forward_cache_update_text(
-            gen_context["past_key_values"], **generation_input
+            gen_context["past_key_values"],
+            language_model_forward=self.transformer,
+            **generation_input,
         )
         return {"kv_lens": kv_lens, "ropes": ropes, "past_key_values": past_key_values}
 
@@ -802,7 +863,10 @@ class BagelAdapter(BaseAdapter):
             )
             gen_input = move_tensors_to_device(gen_input, device, max_depth=1)
             past_key_values = bagel.forward_cache_update_vae(
-                vae_model, past_key_values, **gen_input
+                vae_model,
+                past_key_values,
+                language_model_forward=self.transformer,
+                **gen_input,
             )
 
         if vit:
@@ -814,7 +878,11 @@ class BagelAdapter(BaseAdapter):
                 new_token_ids=self.new_token_ids,
             )
             gen_input = move_tensors_to_device(gen_input, device, max_depth=1)
-            past_key_values = bagel.forward_cache_update_vit(past_key_values, **gen_input)
+            past_key_values = bagel.forward_cache_update_vit(
+                past_key_values,
+                language_model_forward=self.transformer,
+                **gen_input,
+            )
 
         return {"kv_lens": kv_lens, "ropes": ropes, "past_key_values": past_key_values}
 
@@ -892,14 +960,6 @@ class BagelAdapter(BaseAdapter):
         cfg_img_packed_key_value_indexes: Optional[torch.LongTensor] = None,
         cfg_type: str = "parallel",
     ):
-        packed_text_embedding = self.pipeline.transformer.model.embed_tokens(
-            packed_text_ids
-        ).float()
-        packed_sequence = packed_text_embedding.new_zeros(
-            (sum(packed_seqlens), self.pipeline.bagel.hidden_size), dtype=torch.float32
-        )
-        packed_sequence[packed_text_indexes] = packed_text_embedding
-
         # ``x_t`` is the packed VAE-token tensor (sum_vae_tokens, patch_dim). A stray
         # leading batch dim of 1 (callers passing (1, tokens, dim)) is squeezed off.
         # ``timestep`` is one sigma per VAE token (expanded per sample upstream), so it
@@ -914,6 +974,9 @@ class BagelAdapter(BaseAdapter):
         packed_pos_embed = self.pipeline.bagel.latent_pos_embed(packed_vae_position_ids)
         packed_timestep_embeds = self.pipeline.bagel.time_embedder(timestep)
         x_t = self.pipeline.bagel.vae2llm(x_t) + packed_timestep_embeds + packed_pos_embed
+        packed_sequence = x_t.new_zeros(
+            (sum(packed_seqlens), self.pipeline.bagel.hidden_size), dtype=torch.float32
+        )
         if x_t.dtype != packed_sequence.dtype:
             x_t = x_t.to(packed_sequence.dtype)
         packed_sequence[packed_vae_token_indexes] = x_t
@@ -923,7 +986,6 @@ class BagelAdapter(BaseAdapter):
             extra_inputs = {
                 "mode": "gen",
                 "packed_vae_token_indexes": packed_vae_token_indexes,
-                "packed_text_indexes": packed_text_indexes,
             }
         output = self.transformer(
             packed_query_sequence=packed_sequence,
@@ -935,6 +997,8 @@ class BagelAdapter(BaseAdapter):
             packed_key_value_indexes=packed_key_value_indexes,
             update_past_key_values=False,
             is_causal=False,
+            packed_text_ids=packed_text_ids,
+            packed_text_indexes=packed_text_indexes,
             **extra_inputs,
         )
         v_t = self.pipeline.bagel.llm2vae(output.packed_query_sequence)
@@ -950,6 +1014,8 @@ class BagelAdapter(BaseAdapter):
                 packed_key_value_indexes=cfg_text_packed_key_value_indexes,
                 update_past_key_values=False,
                 is_causal=False,
+                packed_text_ids=packed_text_ids,
+                packed_text_indexes=packed_text_indexes,
                 **extra_inputs,
             )
             cfg_text_v_t = self.pipeline.bagel.llm2vae(cfg_text_output.packed_query_sequence)
@@ -965,6 +1031,8 @@ class BagelAdapter(BaseAdapter):
                 packed_key_value_indexes=cfg_img_packed_key_value_indexes,
                 update_past_key_values=False,
                 is_causal=False,
+                packed_text_ids=packed_text_ids,
+                packed_text_indexes=packed_text_indexes,
                 **extra_inputs,
             )
             cfg_img_v_t = self.pipeline.bagel.llm2vae(cfg_img_output.packed_query_sequence)

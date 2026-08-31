@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from flow_factory.models.minimax_h3 import blocks
 from flow_factory.models.minimax_h3._common import MINIMAX_H3_COMPONENT_ORDER
 from flow_factory.samples import ComponentTimes, LatentState
 from flow_factory.scheduler import SDESchedulerOutput
@@ -201,6 +202,15 @@ class FakeMiniMaxH3Blocks:
     }
 
 
+class FakeMiniMaxH3AttnProcessor:
+    def __call__(self, *args, **kwargs):
+        return None
+
+
+def fake_dispatch_attention_fn(*args, **kwargs):
+    return None
+
+
 class FakeReference:
     pass
 
@@ -209,6 +219,8 @@ class FakeReference:
 class FakeSymbols:
     MiniMaxH3ModularPipeline: type = FakeModularPipeline
     MiniMaxH3Blocks: type = FakeMiniMaxH3Blocks
+    MiniMaxH3AttnProcessor: type = FakeMiniMaxH3AttnProcessor
+    dispatch_attention_fn: object = fake_dispatch_attention_fn
     PipelineState: type = FakePipelineState
     ResizeStep: type = ResizeStep
     RefSetupStep: type = RefSetupStep
@@ -257,8 +269,6 @@ def _fake_pipeline():
 
 
 def test_block_executor_propagates_shared_state_and_selects_outputs(monkeypatch):
-    from flow_factory.models.minimax_h3 import blocks
-
     monkeypatch.setattr(blocks, "require_minimax_h3_support", lambda: FakeSymbols())
     pipeline = SimpleNamespace(calls=[])
     first = RecordingBlock("first", {"tensor": torch.tensor([1.0])})
@@ -274,8 +284,6 @@ def test_block_executor_propagates_shared_state_and_selects_outputs(monkeypatch)
 
 
 def test_block_executor_reports_missing_output_and_preserves_exception(monkeypatch):
-    from flow_factory.models.minimax_h3 import blocks
-
     monkeypatch.setattr(blocks, "require_minimax_h3_support", lambda: FakeSymbols())
     with pytest.raises(ValueError, match="workflow='t2va'.*field='missing'"):
         blocks.run_h3_blocks(
@@ -302,7 +310,7 @@ def test_block_executor_reports_missing_output_and_preserves_exception(monkeypat
         (
             "t2va",
             ["TextEncoderStep", "NoKeyframeAnchorsStep", "PrepareLayoutStep"],
-            {"prompt_embeds", "keyframe_anchors", "video_indices", "audio_indices"},
+            {"prompt_embeds", "video_indices", "audio_indices"},
         ),
         (
             "fl2va",
@@ -312,7 +320,7 @@ def test_block_executor_reports_missing_output_and_preserves_exception(monkeypat
                 "KeyframeEncoderStep",
                 "PrepareLayoutStep",
             ],
-            {"prompt_embeds", "keyframes", "condition_latents", "video_indices"},
+            {"prompt_embeds", "condition_latents", "video_indices"},
         ),
         (
             "ref2va",
@@ -324,7 +332,6 @@ def test_block_executor_reports_missing_output_and_preserves_exception(monkeypat
             ],
             {
                 "prompt_embeds",
-                "normalized_references",
                 "condition_latents",
                 "audio_condition_latents",
             },
@@ -334,8 +341,6 @@ def test_block_executor_reports_missing_output_and_preserves_exception(monkeypat
 def test_encoding_workflows_use_pinned_block_order_and_cache_contract(
     monkeypatch, workflow, expected_order, required_fields
 ):
-    from flow_factory.models.minimax_h3 import blocks
-
     monkeypatch.setattr(blocks, "require_minimax_h3_support", lambda: FakeSymbols())
     pipeline = _fake_pipeline()
     cache = blocks.encode_h3_workflow_inputs(pipeline, {"prompt": "test"}, workflow=workflow)
@@ -345,6 +350,12 @@ def test_encoding_workflows_use_pinned_block_order_and_cache_contract(
     assert set(cache) == set(blocks.ENCODE_WORKFLOW_FIELDS[workflow])
     assert "generator" not in cache
     assert "text_encoder" not in cache
+    assert not {
+        "keyframes",
+        "keyframe_anchors",
+        "normalized_references",
+        "text_token_tags",
+    }.intersection(cache)
 
 
 @pytest.mark.parametrize(
@@ -376,8 +387,6 @@ def test_encoding_workflows_use_pinned_block_order_and_cache_contract(
 def test_rollout_uses_condition_video_audio_rng_order_and_exact_split(
     monkeypatch, workflow, video_conditions, audio_conditions, expected_order
 ):
-    from flow_factory.models.minimax_h3 import blocks
-
     monkeypatch.setattr(blocks, "require_minimax_h3_support", lambda: FakeSymbols())
     pipeline = _fake_pipeline()
     cache = _fake_layout_cache(video_conditions, audio_conditions)
@@ -399,9 +408,34 @@ def test_rollout_uses_condition_video_audio_rng_order_and_exact_split(
     assert prefixes["audio"].shape[1] == audio_conditions
 
 
-def test_rollout_rejects_full_rows_mismatching_layout_before_split(monkeypatch):
-    from flow_factory.models.minimax_h3 import blocks
+def test_condition_prefix_helper_accepts_collated_b1_tensor_containers(monkeypatch):
+    monkeypatch.setattr(blocks, "require_minimax_h3_support", lambda: FakeSymbols())
+    pipeline = _fake_pipeline()
+    cache = _fake_layout_cache(video_conditions=1, audio_conditions=2)
+    cache["video_indices"] = cache["video_indices"].unsqueeze(0)
+    cache["audio_indices"] = cache["audio_indices"].unsqueeze(0)
+    cache["num_condition_video_rows"] = torch.tensor([1])
+    cache["num_condition_audio_rows"] = [2]
+    cache["condition_latents"] = torch.ones(1, 1, 1, 24, 1, 2, 2)
+    cache["audio_condition_latents"] = torch.stack(
+        [torch.full((1, 32), 4.0), torch.full((1, 32), 5.0)]
+    ).unsqueeze(0)
 
+    prefixes = blocks.prepare_h3_condition_prefixes(
+        pipeline,
+        cache,
+        workflow="ref2va",
+        generator=torch.Generator().manual_seed(7),
+    )
+
+    assert pipeline.calls == ["PrepareConditionLatentsStep"]
+    assert [name for name, _ in pipeline.draws] == ["condition"]
+    assert prefixes["video"].shape == (1, 1, 96)
+    assert prefixes["audio"].shape == (1, 2, 32)
+    torch.testing.assert_close(prefixes["audio"][0, :, 0], torch.tensor([4.0, 5.0]))
+
+
+def test_rollout_rejects_full_rows_mismatching_layout_before_split(monkeypatch):
     monkeypatch.setattr(blocks, "require_minimax_h3_support", lambda: FakeSymbols())
     cache = _fake_layout_cache(video_conditions=1)
     cache["video_indices"] = torch.arange(4)
@@ -423,8 +457,6 @@ def test_rollout_rejects_full_rows_mismatching_layout_before_split(monkeypatch):
 
 
 def test_rollout_rejects_zero_target_rows_with_exact_diagnostic(monkeypatch):
-    from flow_factory.models.minimax_h3 import blocks
-
     class EmptyTargetPrepareLatentsStep(FakeWorkflowBlock):
         def __call__(self, pipeline, state):
             pipeline.calls.append(type(self).__name__)
@@ -1031,6 +1063,7 @@ def test_dependency_probe_rejects_block_without_pipeline_state_call_contract(mon
     [
         "PipelineState",
         "MiniMaxH3Blocks",
+        "MiniMaxH3AttnProcessor",
         "PrepareLatentsStep",
         "Ref2VATextEncoderStep",
         "SetTimestepsStep",
@@ -1052,6 +1085,17 @@ def test_dependency_probe_rejects_incompatible_api_with_actionable_requirement(
     assert "diffusers>=0.40.0" in message
     assert "pip install 'diffusers>=0.40.0'" in message
     assert broken_field in message
+
+
+def test_dependency_probe_rejects_non_callable_attention_dispatch(monkeypatch):
+    from flow_factory.models.minimax_h3 import dependency
+
+    bundle = dataclasses.replace(FakeSymbols(), dispatch_attention_fn=object())
+    monkeypatch.setattr(dependency, "_SYMBOLS", bundle)
+    monkeypatch.setattr(dependency, "_IMPORT_ERROR", None)
+
+    with pytest.raises(ImportError, match="dispatch_attention_fn must be callable"):
+        dependency.require_minimax_h3_support()
 
 
 def test_pyproject_requires_released_h3_diffusers():

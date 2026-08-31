@@ -97,6 +97,10 @@ class BaseSample:
         {"height", "width", "latent_index_map", "log_prob_index_map"}
     )
 
+    # Fields ``gather_samples`` must transport to satisfy concrete-class reconstruction
+    # invariants, even when omitted from the consumer-requested field list.
+    reconstruction_required_fields: ClassVar[frozenset[str]] = frozenset()
+
     # Denoiseing trajectory
     timesteps: Optional[torch.Tensor] = None  # (T+1,)
     all_latents: Optional[torch.Tensor] = None  # (num_steps, Seq_len, C)
@@ -633,8 +637,9 @@ class T2AVSample(BaseSample):
 class OrderedReferenceConditionSample(BaseSample):
     """Sample conditioned by an ordered heterogeneous reference manifest."""
 
-    _id_fields: ClassVar[frozenset[str]] = BaseSample._id_fields | frozenset(
-        {"reference_manifest"}
+    _id_fields: ClassVar[frozenset[str]] = BaseSample._id_fields | frozenset({"reference_manifest"})
+    reconstruction_required_fields: ClassVar[frozenset[str]] = (
+        BaseSample.reconstruction_required_fields | frozenset({"reference_manifest"})
     )
 
     reference_manifest: Optional[str] = None

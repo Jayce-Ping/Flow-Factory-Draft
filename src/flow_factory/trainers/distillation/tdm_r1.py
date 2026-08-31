@@ -22,6 +22,7 @@ from typing import Any, ClassVar, List, Literal, Optional, Sequence
 import torch
 from accelerate import Accelerator
 
+from ...contracts.execution import ONLINE_EXECUTION_CONTRACT, ExecutionContract
 from ...hparams import Arguments, TDMR1TrainingArguments
 from ...hparams.training_args.tdm_r1 import TDM_R1_DEFAULT_OPTIMIZERS
 from ...models.abc import BaseAdapter
@@ -33,8 +34,8 @@ from .distillation_runtime import (
     generate_one_rollout_batch,
     query_score_velocity,
     record_distillation_metric,
-    resolve_rollout_accumulation_steps,
     require_velocity,
+    resolve_rollout_accumulation_steps,
     role_repeat_progress,
     run_role_phase,
 )
@@ -50,6 +51,7 @@ class TDMR1Trainer(TDMTrainer):
     """Reinforce deterministic TDM trajectories through a frozen-reference surrogate."""
 
     paradigm: ClassVar[Literal["decoupled"]] = "decoupled"
+    execution_contract: ClassVar[ExecutionContract] = ONLINE_EXECUTION_CONTRACT
 
     def _optimizer_args_for_role(self, role_name: str):
         """Resolve this role's optimizer, falling back to TDM-R1's published defaults.
@@ -78,6 +80,11 @@ class TDMR1Trainer(TDMTrainer):
     ) -> None:
         super().__init__(accelerator=accelerator, config=config, adapter=adapter)
         self.training_args: TDMR1TrainingArguments
+
+    def _initialize_snapshots(self) -> None:
+        """Declare the slow surrogate before exact-state compatibility preflight."""
+        super()._initialize_snapshots()
+        self.adapter.declare_variant_snapshot("surrogate", SLOW_SURROGATE_SNAPSHOT)
 
     def _init_reward_model(self):
         """Use train-time rewards instead of TDM's reward-free runtime."""
@@ -148,7 +155,7 @@ class TDMR1Trainer(TDMTrainer):
         record_distillation_metric(self, "train/surrogate_slow_decay", decay)
 
     def _ensure_slow_surrogate(self) -> None:
-        """Create the trust-region snapshot after trainable roles exist."""
+        """Retain lazy compatibility for lightweight, non-constructor test hosts."""
         if not self.adapter.has_variant_snapshot(SLOW_SURROGATE_SNAPSHOT):
             self.adapter.declare_variant_snapshot("surrogate", SLOW_SURROGATE_SNAPSHOT)
 

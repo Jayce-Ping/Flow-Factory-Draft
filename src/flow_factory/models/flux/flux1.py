@@ -19,7 +19,8 @@ import logging
 import os
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
+from types import MappingProxyType
+from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -27,6 +28,7 @@ from accelerate import Accelerator
 from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
 from PIL import Image
 
+from ...contracts import NegativePromptPolicy
 from ...hparams import *
 from ...samples import T2ISample
 from ...scheduler import (
@@ -45,6 +47,12 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ..configured_image_output import (
+    ConfiguredImageOutputAdapterMixin,
+    EncodedImageTensor,
+)
+from ..pipeline_contracts import image_output_contract
+from ._output import prepare_flux1_output_latents
 
 logger = setup_logger(__name__)
 
@@ -60,8 +68,13 @@ class Flux1Sample(T2ISample):
     img_ids: Optional[torch.Tensor] = None
 
 
-class Flux1Adapter(BaseAdapter):
+class Flux1Adapter(ConfiguredImageOutputAdapterMixin, BaseAdapter):
     """Concrete implementation for Flow Matching models (FLUX.1)."""
+
+    offline_training_forward_overrides = MappingProxyType({"guidance_scale": 3.5})
+    pipeline_io_contract = image_output_contract(
+        negative_prompt=NegativePromptPolicy.UNSUPPORTED,
+    )
 
     def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
@@ -70,8 +83,7 @@ class Flux1Adapter(BaseAdapter):
 
     def load_pipeline(self) -> FluxPipeline:
         return self._load_diffusers_pipeline(
-            FluxPipeline,
-            self.model_args.model_name_or_path, low_cpu_mem_usage=False
+            FluxPipeline, self.model_args.model_name_or_path, low_cpu_mem_usage=False
         )
 
     @property
@@ -143,6 +155,25 @@ class Flux1Adapter(BaseAdapter):
     def encode_video(self, videos: Union[torch.Tensor, List[torch.Tensor]]) -> None:
         """Not needed for FLUX text-to-image models."""
         pass
+
+    def _output_geometry_multiple(self) -> int:
+        """Require the VAE grid and 2x2 latent packing used by Diffusers."""
+        return self.pipeline.vae_scale_factor * 2
+
+    def _encode_output_images(
+        self,
+        pixel_values: torch.Tensor,
+        condition: Mapping[str, Any],
+        generator: Optional[torch.Generator],
+    ) -> EncodedImageTensor:
+        """Sample FLUX.1 targets and attach their packed position identifiers."""
+        del condition
+        packed, img_ids = prepare_flux1_output_latents(self, pixel_values, generator)
+        return EncodedImageTensor(
+            latents=packed,
+            forward_context={"img_ids": img_ids},
+            decode_context={},
+        )
 
     def decode_latents(
         self,

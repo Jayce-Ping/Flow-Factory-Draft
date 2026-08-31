@@ -489,6 +489,49 @@ def test_reduce_latent_values_uses_global_element_weighting() -> None:
         )
 
 
+def test_flow_matching_objective_reduction_defaults_to_global_weighting() -> None:
+    adapter = _structured_adapter()
+    values = {
+        "video": torch.tensor([[1.0, 3.0], [2.0, 4.0]]),
+        "audio": torch.tensor([[10.0], [20.0]]),
+    }
+
+    assert torch.equal(
+        adapter.reduce_flow_matching_objective_values(values),
+        adapter.reduce_latent_values(values),
+    )
+
+
+class FlowObjectiveReducerFake(StructuredAdapterFake):
+    """Adapter summing independently normalized modality objectives."""
+
+    def _reduce_flow_matching_objective_values(
+        self,
+        values: Mapping[str, torch.Tensor],
+        *,
+        state: Optional[LatentState] = None,
+    ) -> torch.Tensor:
+        reduced = self.reduce_component_latent_values(values, state=state)
+        return reduced["video"] + reduced["audio"]
+
+
+def test_flow_matching_objective_reduction_can_preserve_online_reducer() -> None:
+    adapter = object.__new__(FlowObjectiveReducerFake)
+    values = {
+        "video": torch.tensor([[1.0, 3.0], [2.0, 4.0]]),
+        "audio": torch.tensor([[10.0], [20.0]]),
+    }
+
+    assert torch.equal(
+        adapter.reduce_flow_matching_objective_values(values),
+        torch.tensor([12.0, 23.0]),
+    )
+    assert torch.equal(
+        adapter.reduce_latent_values(values),
+        torch.tensor([14.0 / 3.0, 26.0 / 3.0]),
+    )
+
+
 def test_reduce_latent_values_preserves_single_component_scalar_scale() -> None:
     values = torch.tensor([2.0, 3.0])
 

@@ -15,11 +15,9 @@
 # src/flow_factory/models/wan/wan2_t2v.py
 from __future__ import annotations
 
-import logging
-import os
-from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
+from types import MappingProxyType
+from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -28,19 +26,26 @@ from diffusers.pipelines.wan.pipeline_wan import WanPipeline, prompt_clean
 from peft import PeftModel
 from PIL import Image
 
+from ...contracts import BatchCapability, GeometrySource, NegativePromptPolicy, RateRequirement
 from ...hparams import *
 from ...samples import T2VSample
 from ...scheduler import UniPCMultistepSDEScheduler, UniPCMultistepSDESchedulerOutput
-from ...utils.base import filter_kwargs
 from ...utils.logger_utils import setup_logger
 from ...utils.trajectory_collector import (
-    CallbackCollector,
-    TrajectoryCollector,
     TrajectoryIndicesType,
     create_callback_collector,
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ..output_state import DecodedMediaBatch, EncodedOutputState, OutputStateCodec
+from ..pipeline_contracts import video_output_contract
+from ._output import (
+    WanVideoOutputCodec,
+    configured_wan_video_output_geometry,
+    normalize_wan_video_latents,
+    resample_wan_output_video,
+    validate_wan_encoded_output_geometry,
+)
 
 logger = setup_logger(__name__)
 
@@ -52,6 +57,9 @@ class WanT2VSample(T2VSample):
 
 
 class Wan2_T2V_Adapter(BaseAdapter):
+    offline_training_forward_overrides = MappingProxyType(
+        {"guidance_scale": 1.0, "guidance_scale_2": 1.0}
+    )
     # Wan2.2 trains both transformer and transformer_2 but uses only one per
     # timestep (boundary_ratio), so under DDP the other's trainable params get no
     # gradient in a given step. Ignored under DeepSpeed/FSDP.
@@ -62,6 +70,12 @@ class Wan2_T2V_Adapter(BaseAdapter):
         "text_encoders": torch.bfloat16,
         "vae": torch.float32,
     }
+    pipeline_io_contract = video_output_contract(
+        negative_prompt=NegativePromptPolicy.OPTIONAL,
+        output_fps=RateRequirement.REQUIRED,
+        geometry_source=GeometrySource.CONFIGURED,
+        batch_capability=BatchCapability.SINGLE_SAMPLE,
+    )
 
     def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
@@ -238,11 +252,48 @@ class Wan2_T2V_Adapter(BaseAdapter):
 
     def encode_image(self, images: Union[Image.Image, torch.Tensor, List[torch.Tensor]]):
         """Not needed for Wan text-to-video models."""
-        pass
+        return None
 
     def encode_video(self, videos: Union[torch.Tensor, List[torch.Tensor]]):
         """Not needed for Wan text-to-video models."""
-        pass
+        return None
+
+    def build_output_state_codec(self) -> OutputStateCodec:
+        """Declare the on-the-fly target-video codec without loading components."""
+        return WanVideoOutputCodec(self)
+
+    def _configured_video_output_geometry(self) -> Tuple[int, int, int, float]:
+        """Return configured Wan geometry after exact latent-grid validation."""
+        return configured_wan_video_output_geometry(self)
+
+    @staticmethod
+    def _resample_output_video(
+        video: np.ndarray,
+        *,
+        source_fps: Optional[float],
+        target_frames: int,
+        target_fps: float,
+    ) -> np.ndarray:
+        """Select deterministic nearest-time frames for configured target cadence."""
+        return resample_wan_output_video(
+            video,
+            source_fps=source_fps,
+            target_frames=target_frames,
+            target_fps=target_fps,
+        )
+
+    def _normalize_output_video_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        """Apply the exact inverse of Wan's existing decode normalization."""
+        return normalize_wan_video_latents(self, latents)
+
+    def _validate_encoded_output_geometry(
+        self,
+        media_batch: DecodedMediaBatch,
+        condition: Mapping[str, Any],
+        encoded: EncodedOutputState,
+    ) -> None:
+        """Require encoded signatures and decode metadata to match train geometry."""
+        validate_wan_encoded_output_geometry(self, media_batch, condition, encoded)
 
     def decode_latents(
         self, latents: torch.Tensor, output_type: Literal["pt", "pil", "np"] = "pil"
@@ -602,6 +653,9 @@ class Wan2_T2V_Adapter(BaseAdapter):
                     return_dict=False,
                 )[0]
             velocity = velocity_uncond + current_guidance_scale * (velocity - velocity_uncond)
+
+        if not compute_log_prob and next_latents is None and tuple(return_kwargs) == ("velocity",):
+            return UniPCMultistepSDESchedulerOutput(velocity=velocity)
 
         # 5. Scheduler step
         output = self.scheduler.step(

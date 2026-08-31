@@ -6,7 +6,7 @@ import torch
 
 import flow_factory.utils.dist as dist_utils
 from flow_factory.advantage import AdvantageProcessor
-from flow_factory.samples import BaseSample
+from flow_factory.samples import BaseSample, MiniMaxH3Ref2VASample
 from flow_factory.utils.dist import gather_aligned_floating_tensors, gather_samples
 
 
@@ -113,6 +113,22 @@ def test_gather_samples_packs_same_dtype_fields_and_preserves_other_fields():
         gathered[3].negative_prompt_embeds, samples[1].negative_prompt_embeds
     )
     torch.testing.assert_close(gathered[2].prompt_ids, samples[0].prompt_ids)
+
+
+def test_gather_samples_preserves_concrete_reconstruction_fields() -> None:
+    accelerator = GatherRecorder()
+    manifest = '[{"path":"condition.png","type":"image"}]'
+    sample = MiniMaxH3Ref2VASample(
+        prompt="A reference-conditioned prompt",
+        reference_manifest=manifest,
+    )
+
+    gathered = gather_samples(accelerator, [sample], ["prompt"])
+
+    assert len(gathered) == 1
+    assert isinstance(gathered[0], MiniMaxH3Ref2VASample)
+    assert gathered[0].prompt == sample.prompt
+    assert gathered[0].reference_manifest == manifest
 
 
 def test_gather_samples_keeps_large_cpu_fields_on_separate_paths(monkeypatch):

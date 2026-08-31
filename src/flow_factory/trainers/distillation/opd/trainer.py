@@ -50,13 +50,17 @@ import math
 import os
 from collections import defaultdict
 from functools import partial
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union, cast
+from typing import Any, ClassVar, Dict, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
 import tqdm as tqdm_
 
 tqdm = partial(tqdm_.tqdm, dynamic_ncols=True)
 
+from ....contracts.execution import (
+    ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT,
+    ExecutionContract,
+)
 from ....hparams import DiffusionOPDTrainingArguments
 from ....hparams.training_args.opd import resolve_distill_step_band
 from ....samples import (
@@ -87,6 +91,71 @@ class DiffusionOPDTrainer(BaseTrainer):
     # Distillation paradigm: no reward/advantage stage and rollout log-probs do not
     # enter the loss, so lossy rollout acceleration is permitted (constraints.md #7).
     paradigm = "distillation"
+    execution_contract: ClassVar[ExecutionContract] = ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT
+
+    def _algorithm_runtime_child_names(self) -> Tuple[str, ...]:
+        """Declare teacher snapshot names directly from validated configuration."""
+        return tuple(
+            teacher.name or f"opd_teacher_{index}"
+            for index, teacher in enumerate(self.training_args.teachers)
+        )
+
+    def _initialize_snapshots(self) -> None:
+        """Realize every teacher snapshot before exact-state compatibility checks.
+
+        Exact resume creates shape-compatible placeholders rather than loading the
+        external teacher checkpoints and mutating the prepared student before the
+        runtime manifest has passed preflight. The checkpoint payload replaces those
+        placeholders after Accelerator restores the core state.
+        """
+        teacher_names = self._algorithm_runtime_child_names()
+        state_resume = bool(self.model_args.resume_path and self.model_args.resume_type == "state")
+        if state_resume:
+            if self.model_args.finetune_type != "lora":
+                raise ValueError(
+                    "DiffusionOPD teacher snapshots require LoRA finetuning, but "
+                    f"model_args.finetune_type={self.model_args.finetune_type!r}."
+                )
+            target_components = [
+                component
+                for component, modules in self.adapter.target_module_map.items()
+                if modules
+            ]
+            if not target_components:
+                raise ValueError(
+                    "DiffusionOPD adapter has no trainable LoRA components for "
+                    "teacher snapshot placeholders."
+                )
+            snapshot_device = (
+                self.accelerator.device
+                if self.training_args.teacher_param_device == "cuda"
+                else torch.device("cpu")
+            )
+            for teacher_name in teacher_names:
+                self.adapter.add_named_parameters(
+                    teacher_name,
+                    target_components=target_components,
+                    device=snapshot_device,
+                    overwrite=True,
+                )
+            loaded_names = list(teacher_names)
+        else:
+            teachers = self.training_args.teachers
+            loaded_names = load_teachers(
+                self.adapter,
+                [teacher.path for teacher in teachers],
+                self.training_args.teacher_param_device,
+                [teacher.name for teacher in teachers],
+            )
+            if tuple(loaded_names) != teacher_names:
+                raise RuntimeError(
+                    "DiffusionOPD teacher snapshot declaration drifted during loading: "
+                    f"declared={teacher_names!r}, loaded={tuple(loaded_names)!r}"
+                )
+
+        self._teacher_names = loaded_names
+        for teacher_name in teacher_names:
+            self._register_named_parameter_runtime_child(teacher_name)
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -104,14 +173,9 @@ class DiffusionOPDTrainer(BaseTrainer):
             float(scheduler_group.primary.noise_level) if self._is_sde else 0.0
         )
 
-        # --- Teachers: load each LoRA checkpoint into a named snapshot ---
+        # Teacher snapshots are initialized by the BaseTrainer lifecycle before
+        # exact-state compatibility preflight.
         teachers = self.training_args.teachers
-        self._teacher_names: List[str] = load_teachers(
-            self.adapter,
-            [teacher.path for teacher in teachers],
-            self.training_args.teacher_param_device,
-            [teacher.name for teacher in teachers],
-        )
         student_gs = float(self.training_args.guidance_scale)
         self._teacher_gs: List[float] = [
             float(teacher.guidance_scale) if teacher.guidance_scale is not None else student_gs

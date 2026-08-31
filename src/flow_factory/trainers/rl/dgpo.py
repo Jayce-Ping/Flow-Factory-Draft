@@ -128,6 +128,37 @@ class DGPOTrainer(BaseTrainer):
 
     # Decoupled paradigm: lossy rollout acceleration is permitted (constraints.md #7).
     paradigm = "decoupled"
+    runtime_child_names = ("ema_ref",)
+
+    def _algorithm_runtime_child_names(self) -> Tuple[str, ...]:
+        """Declare the old-policy snapshot only when DGPO consumes it."""
+        training_args: DGPOTrainingArguments = self.training_args  # type: ignore[assignment]
+        requires_ema_ref = (
+            training_args.clip_dsm or training_args.clip_kl or training_args.use_ema_ref
+        )
+        return type(self).runtime_child_names if requires_ema_ref else ()
+
+    def _initialize_snapshots(self) -> None:
+        """Initialize the optional old-policy snapshot before exact state resume."""
+        if not self._algorithm_runtime_child_names():
+            return
+        training_args: DGPOTrainingArguments = self.training_args  # type: ignore[assignment]
+        ema_ref_device = (
+            self.accelerator.device
+            if training_args.ema_ref_device == "cuda"
+            else torch.device("cpu")
+        )
+        self.adapter.add_named_parameters(
+            "ema_ref",
+            device=ema_ref_device,
+            overwrite=True,
+        )
+        self._register_named_parameter_runtime_child("ema_ref")
+        logger.info(
+            f"Initialized old-policy EMA ref on {ema_ref_device} "
+            f"(max_decay={training_args.ema_ref_max_decay}, "
+            f"ramp_rate={training_args.ema_ref_ramp_rate})."
+        )
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -174,19 +205,6 @@ class DGPOTrainer(BaseTrainer):
         self.ema_ref_max_decay = ta.ema_ref_max_decay
         self.ema_ref_ramp_rate = ta.ema_ref_ramp_rate
         self._requires_ema_ref = self.clip_dsm or self.clip_kl or self.use_ema_ref
-        if self._requires_ema_ref:
-            ema_ref_device = (
-                self.accelerator.device if ta.ema_ref_device == "cuda" else torch.device("cpu")
-            )
-            self.adapter.add_named_parameters(
-                "ema_ref",
-                device=ema_ref_device,
-                overwrite=True,
-            )
-            logger.info(
-                f"Initialized old-policy EMA ref on {ema_ref_device} "
-                f"(max_decay={self.ema_ref_max_decay}, ramp_rate={self.ema_ref_ramp_rate})."
-            )
 
     # =========================== Properties ============================
     @property

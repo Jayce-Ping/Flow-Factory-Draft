@@ -26,6 +26,37 @@ All adapters that support CFG must follow a consistent two-stage pattern. Guidan
 
 `flux/flux2_klein.py` — `encode_prompt()` and `_forward()`.
 
+### Offline flow-matching guidance
+
+Finite-data SFT and offline DPO must not reuse `train.guidance_scale`: that field controls
+generation, and on a conventional CFG adapter it would turn the conditional velocity into a
+conditional/unconditional composite whenever negative embeddings are cached. These trainers
+expand the immutable `adapter.offline_training_forward_overrides` mapping into every SFT policy
+and offline-DPO policy/reference forward. The mapping is layered after both configured training
+arguments and dataset conditions, so adapter-owned model semantics always win.
+
+The base mapping sets `guidance_scale=1.0`, the conventional CFG-off point. An adapter replaces
+the complete mapping when its forward has different semantics or additional guidance branches:
+
+- Z-Image uses `guidance_scale=0.0` because its CFG threshold is `> 0.0`, with normalization and
+  truncation fixed to their neutral settings.
+- Guidance-distilled FLUX.1, FLUX.1-Kontext, and FLUX.2 use the official Diffusers training
+  condition `guidance_scale=3.5`; this is a learned model embedding, not classifier-free guidance.
+- The currently supported Flux2-Klein forward always passes `guidance=None` into its transformer,
+  so its `guidance_scale` remains conventional two-pass CFG and inherits the neutral `1.0`.
+- Wan T2V/I2V neutralize both transformer stages with
+  `guidance_scale=guidance_scale_2=1.0`.
+- SenseNova neutralizes text and image guidance together and disables CFG normalization.
+- Bagel replaces the base mapping with its actual `cfg_text_scale` / `cfg_img_scale` arguments;
+  it must not inherit an irrelevant `guidance_scale` key through its permissive `**kwargs`.
+- MiniMax H3 T2VA/FL2VA/Ref2VA inherit neutral `guidance_scale=1.0`; their strict forward validates
+  that interface value even though the guidance-distilled checkpoint has no CFG branch.
+- LTX2 sets video/audio CFG scales and modality scales to `1.0`, CFG rescale and STG scales to
+  `0.0`, and neutralizes STG block selection with
+  `spatio_temporal_guidance_blocks=None`.
+
+These mappings are adapter-owned model conditioning, never sampling or algorithm knobs.
+
 ### Models with model-specific CFG extensions
 
 | Model | Extension | Notes |
@@ -124,7 +155,7 @@ Defined in `models/abc.py` (`preprocessing_modules` / `inference_modules` proper
 - `inference()` condition parameters (`images`, `videos`, `audios`) arrive as `MultiImageBatch` / `MultiVideoBatch` / `MultiAudioBatch` (nested batch, e.g. `List[List[Image.Image]]`, `List[List[Tensor]]`) from the training pipeline collator (`data_utils/dataset.py` `collate_fn`). Type annotations on `inference()` must use the multi-form, not the bare `ImageBatch` / `VideoBatch` / `AudioBatch`.
 - **Multi-media batch homogeneity**: `_preprocess_batch` (`data_utils/dataset.py`) guarantees `List[List[Media]]` for every modality column — empty samples contribute `[]`, single-item samples contribute `[item]`, multi-item samples contribute `[item1, ..., itemN]`. This keeps HF Arrow columns homogeneous and lets every `encode_*` consume a single shape.
 - **Image-column persistence (HF Image feature)**: the raw `images` column and any `encode_image` output listed in `python_format_columns` (ClassVar on `BaseAdapter`, empty by default) are stored via the HuggingFace `Image` feature (PNG bytes) instead of raw tensors, and **read back as PIL** (`List[List[PIL.Image]]`). This is what lets ragged multi-reference batches (variable size/count) serialize — raw tensors are only Arrow-serializable when uniform. Opt in per adapter only for genuine RGB images (e.g. Bagel and SenseNova `condition_images`); never declare preprocessed/non-RGB tensors (VAE-ready video tensors, latents) — PIL conversion is lossy and breaks tensor consumers (e.g. LTX2-I2AV `condition_images` stays a tensor). Consumers must normalize via `_standardize_image_input` / `standardize_image_batch` before any tensor op. To keep PIL on the **sample** too (not just the dataset cache), the adapter's `ImageConditionSample` subclass must set `condition_images_as_pil = True` (else `__post_init__` re-canonicalizes to `List[Tensor(C,H,W)]` [0,1]); e.g. `BagelI2ISample` and `SenseNovaI2ISample`.
-- Single-condition adapters must flatten internally via `_standardize_image_input` / `_standardize_video_input` using `is_multi_image_batch` / `is_multi_video_batch` to extract the first element per sample (e.g. `Wan2_I2V._standardize_image_input`, `Wan2_V2V._standardize_video_input`, `LTX2_I2AV._standardize_image_input`). Multi-condition adapters (e.g. `Flux2`, Bagel, and SenseNova) consume the nested structure directly.
+- Single-condition adapters must flatten internally via `_standardize_image_input` / `_standardize_video_input` using `is_multi_image_batch` / `is_multi_video_batch` to extract the first element per sample (e.g. `Wan2_I2V._standardize_image_input`, `LTX2_I2AV._standardize_image_input`). Multi-condition adapters (e.g. `Flux2`, Bagel, and SenseNova) consume the nested structure directly.
 
 ## Latent Geometry
 
@@ -150,13 +181,13 @@ Only axis roles are stored, never dynamic sizes (Seq/H/W/T). Packed models fold 
 
 ### Per-adapter
 
-All 15 adapters resolve correctly via default ndim inference — none override `LATENT_AXES`:
+All 14 adapters resolve correctly via default ndim inference — none override `LATENT_AXES`:
 
 | Adapter(s) | Layout |
 |---|---|
 | FLUX.1/Kontext/2/Klein, Qwen-Image/Edit-Plus, Bagel, LTX2 T2AV/I2AV | PACKED |
 | SD3.5, Z-Image, SenseNova | CONV |
-| Wan2 T2V/I2V/V2V | VIDEO |
+| Wan2 T2V/I2V | VIDEO |
 
 LTX2 packs `[video|audio]` into one `(B, Seq, C)` sequence, so it resolves as PACKED (the split point lives in the adapter's own `forward` via `video_seq_len`, not in the geometry layer). I2I/I2V/Edit store only the generated latent in `all_latents` (condition is concatenated inside `forward()` / kept in separate fields), so the standard layout applies and reference-image count is irrelevant. Override `LATENT_AXES` only for a genuinely non-standard rank/channel layout.
 
@@ -171,13 +202,45 @@ LTX2 packs `[video|audio]` into one `(B, Seq, C)` sequence, so it resolves as PA
 7. **CFG two-stage consistency** — `encode_prompt()` and `forward()` must use the same threshold for CFG activation (`guidance_scale > 1.0`, or `> 0.0` for Z-Image). `forward()` must gracefully handle the case where `guidance_scale > threshold` but negative embeds are `None` (warn + fallback, never error). See "Classifier-Free Guidance (CFG) Convention" section above.
 8. **Bagel batch handling (NaViT subset-round packing)** — Bagel uses sequence packing, not a leading batch dim. **Both T2I and I2I** pack all B samples into one block-diagonal forward (`_build_gen_context` + `_forward_packed`; the framework's `(B, num_tokens, dim)` latents reshape to packed `(B*num_tokens, dim)` and back). For I2I, reference images are added in per-image rounds (`num_rounds = max per-sample count`); a sample without an r-th image is passed as `None` to `prepare_vae_images` / `prepare_vit_images`, which keep its cached KV and add a **zero-length query segment**. So a **variable per-sample reference-image count** (and varying sizes) is handled by packing directly — there is no per-sample (`batch_size=1`) fallback. The cache merge requires every sample to remain on the key/value side, so only the query may be a subset. The prefill is `@torch.no_grad` and every round has >=1 active image (`max_seqlen_q > 1`), avoiding flash-attn zero-length pitfalls (no backward, no `max_seqlen_q==1`). `_is_i2i(condition_images)` depends only on condition-image presence (distributed-safe). CFG global renorm is computed **per sample** over `packed_seqlens - 2`, and `forward()` returns per-sample `(B,)` log-prob (not per-token). **Distributed**: the prefill makes a data-dependent number of `language_model` forward calls (`2*num_rounds + 2`); `language_model` is the only FSDP-sharded module (frozen ViT/VAE are unsharded, so they don't count). Under FSDP FULL_SHARD/HYBRID (and ZeRO-3) each call AllGathers `language_model`'s shard, so per-rank counts mismatch and deadlock — `_assert_variable_count_supported` fails fast there (`@torch.no_grad` does not help; FSDP still all-gathers to compute). DDP / DeepSpeed ZeRO-1/2 (the Bagel I2I backends) replicate params (local forward, fixed grad sync at backward), so variable counts are safe. The FSDP-safe alternative is to gather `language_model` once for the generation (`summon_full_params` / `reshard_after_forward=False`).
 9. **Image columns persist via HF Image feature (variable-size/count I2I)** — preprocessing stores image data as PIL via the HF `Image` feature, not raw tensors; ragged tensor columns (multi-reference images of varying size/count) are NOT Arrow-serializable and otherwise crash in `Dataset.map` with `TypeError: a bytes-like object is required, not 'Tensor'` / `OverflowError`. The raw `images` column is always stored this way; an `encode_image` output is stored this way only when its name is listed in the adapter's `python_format_columns` ClassVar (default empty — opt in for RGB images only, e.g. Bagel and SenseNova `condition_images`). These columns **read back as PIL** (`List[List[PIL.Image]]`); the `torch` format excludes them (`_apply_torch_format` in `dataset.py`), and `collate_fn` keeps them as a `MultiImageBatch`. To keep PIL end-to-end on the **sample** (not just the cache), the adapter's `ImageConditionSample` subclass must also set `condition_images_as_pil=True` (else `ImageConditionSample.__post_init__` re-canonicalizes to `List[Tensor(C,H,W)]` [0,1]); e.g. `BagelI2ISample` and `SenseNovaI2ISample`. Bump `_PREPROCESS_FORMAT_VERSION` if the on-disk image format changes again.
-10. **Latent geometry override is rarely needed** — `resolve_latent_axes` infers axis roles from latent ndim (3=packed, 4=conv, 5=video), correct for all 15 adapters. Set the `LATENT_AXES` ClassVar only for a genuinely non-standard rank/channel layout. LTX2's packed `[video|audio]` resolves as PACKED; SenseNova's generated pixels resolve as CONV. Modality splits and conditioning remain adapter-owned and do not change the generated trajectory layout. See "Latent Geometry".
+10. **Latent geometry override is rarely needed** — `resolve_latent_axes` infers axis roles from latent ndim (3=packed, 4=conv, 5=video), correct for all 14 adapters. Set the `LATENT_AXES` ClassVar only for a genuinely non-standard rank/channel layout. LTX2's packed `[video|audio]` resolves as PACKED; SenseNova's generated pixels resolve as CONV. Modality splits and conditioning remain adapter-owned and do not change the generated trajectory layout. See "Latent Geometry".
 11. **Diffusers cache readiness is explicit** — set `supports_diffusers_cache = True` only when every transformer forward branch, including CFG/STG variants and every transformer in a multi-transformer adapter, runs inside `cache_context`. The rollout accelerator rejects the default `False` before enabling any component. See `guidance/acceleration.md` "Model cache-readiness".
 12. **LTX2 rollouts publish structured trajectories only** — `LTX2_T2AV_Adapter` / `LTX2_I2AV_Adapter` `inference()` fill `BaseSample.trajectory` with one `StructuredTrajectory` per sample (per-component states, full per-component schedules, joint + per-component log probabilities, and the latent-shaped callbacks in `LTX2_STRUCTURED_CALLBACK_FIELDS`) and leave every legacy field (`timesteps`, `all_latents`, `latent_index_map`, `log_probs`, `log_prob_index_map`) `None`. Non-latent callbacks (e.g. `std_dev_t`, `noise_level`) stay in `extra_kwargs` with their `callback_index_map`, which is present only when such a callback was actually collected. Trainers must read the trajectory through the adapter bridge (`get_terminal_state`, `get_replay_step`, `get_replay_callback`), never by indexing the legacy fields. I2AV additionally carries a video `active_mask` derived from `~conditioning_mask`, so the conditioning frame is excluded from every reduction, log-prob weighting and forward-process noising.
 
 13. **SenseNova ragged I2I is per-sample, not NaViT-packed** — SenseNova-U1 1.0/1.5 accepts ordered, variable-size and variable-count reference images. Each sample's references become one variable-length NEO-Unify prefix and remain PIL across preprocessing, rollout and replay. A framework batch may contain several such samples, but `SenseNovaAdapter.inference()` / `forward()` iterate them and call `SenseNovaDenoiser` with B=1; unlike Bagel, independent samples are not concatenated into a packed attention sequence. The native model's `batch_size>1` path only expands one shared prompt/reference KV cache to generate multiple noises for the same condition and is not a ragged multi-sample batch API.
 
+14. **Offline forward overrides are model conditioning, not sampling CFG** — SFT and offline DPO expand the adapter's complete immutable `offline_training_forward_overrides` mapping into every policy and reference forward, after batch conditions and configured sampling arguments. Conventional CFG adapters use their CFG-off point; guidance-distilled adapters use the value expected by their learned guidance embedder; multi-branch adapters neutralize every active branch under its real forward argument names. Replace the base mapping rather than adding unrelated keys, and never infer it from cached negative embeddings or expose it as an algorithm knob.
+
+15. **Runtime condition realization has one input owner** — A conditioned offline adapter declares
+    `build_condition_state_preparer()` only when cached fields are not already the exact forward
+    condition. `prepare_condition_state()` runs once per batch. SFT reuses that realization for
+    target binding; offline DPO reuses the same tensor leaves for chosen/rejected and
+    policy/reference forwards. The input-owned `forward_context` and `output_context` may share
+    prepared tensors. Require collision-free keys only within each consumer's merged view: cached
+    plus forward fields, and input-owned plus candidate-owned output fields. The preparer declaration
+    lists logical components but must not materialize, move, replace, or cast them. Checkpoint
+    variants narrow the class-level I/O superset through `_resolve_pipeline_io_contract()` rather
+    than branching inside the dataset or algorithm.
+
+## Fix Records
+
+### Sampling CFG leaked into finite-data velocity matching
+
+- **Date**: 2026-08-28
+- **Symptom**: SFT and offline DPO could optimize a CFG-composite velocity when
+  `train.guidance_scale > 1.0`, while their target remained the conditional flow-matching
+  velocity.
+- **Root Cause**: The shared forward helper copied the generation-oriented training arguments
+  into offline forwards without an adapter-owned model-conditioning override.
+- **Fix**: Added the immutable `BaseAdapter.offline_training_forward_overrides` mapping, declared
+  complete model-specific neutral or guidance-distilled mappings (including Wan T2V, SenseNova,
+  and Bagel multi-branch CFG), and expanded it into every offline policy/reference forward after
+  configured and batch arguments.
+- **Lesson**: Generation controls and finite-data model conditioning may share a low-level
+  argument name but must have separate semantic owners.
+- **Related Constraint**: #7
+
 ## Cross-refs
 
-- UP: `architecture.md` "Adapter Pattern", `constraints.md` #5 #11-12
-- PEER: `train_inference_consistency.md`, `parity_testing.md`, `ff-new-model` Pitfall #6
+- UP: [`constraints.md` #5](../constraints.md#5-adapter-component-runtime-contract), [`constraints.md` #11](../constraints.md#11-basetrainer-execution-contract), [`constraints.md` #12](../constraints.md#12-baseadapter-abstract-methods), [Architecture Adapter Pattern](../architecture.md#adapter-pattern-models)
+- PEER: [Train/Inference Consistency](train_inference_consistency.md), [Parity Testing](parity_testing.md)
+- WORKFLOW: [`ff-new-model`](../../skills/ff-new-model/SKILL.md)

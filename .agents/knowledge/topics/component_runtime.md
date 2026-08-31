@@ -70,6 +70,43 @@ instance attribute.
 - A target-owned composite root may still contain frozen auxiliary siblings. Pseudo runtimes move
   only that remainder and exclude every prepared target route.
 
+## Activation-checkpoint ownership
+
+`configure_checkpointing_backend_plan()` resolves one owner before model loading; direct trainer
+construction repeats the same plan defensively after adapter realization.
+
+| FSDP plan | Activation-checkpoint owner |
+|---|---|
+| FSDP1 with train-level model checkpointing | Model-side owner; a simultaneously enabled backend owner is disabled |
+| FSDP1 + TDM-R1 | Both owners are disabled because reference/snapshot forwards invalidate FSDP1 recomputation |
+| FSDP2 with no train-level model policy | The configured backend policy is retained; otherwise checkpointing stays off |
+| FSDP2 with a full train-level policy | Accelerate/FSDP2 backend wrappers own recomputation; the train-level model policy is disabled |
+| FSDP2 with a selective train-level policy | Rejected because backend wrappers cannot preserve selective model boundaries |
+| FSDP2 with an adapter-owned in-forward capability | The adapter installs block-local boundaries after the FSDP input cast; the duplicate plugin owner is disabled during preparation |
+
+MiniMax H3 Ref2VA currently owns the adapter-specific exception. Its prepared FSDP units also
+receive a replay-time public `unshard()` hook for the affected PyTorch lifecycle, where a second
+checkpoint graph can replay after another graph resharded the same unit. These flags are
+model-specific memory policy and must not be copied to another adapter without evidence.
+
+## Fix records
+
+### Repeated-block metadata must survive the distributed bundle boundary
+
+- **Date**: 2026-08-30
+- **Symptom**: Two-rank LTX2 FSDP2 runs exhausted a 95 GiB GPU while
+  `fully_shard()` initialized the prepared model root, before the first training step.
+- **Root Cause**: LTX2 declares its 48 transformer units through Diffusers'
+  `_repeated_blocks`, but `ModelBundle` surfaced only `_no_split_modules` to Accelerate;
+  the empty auto-wrap policy therefore sharded the complete 19B transformer as one unit.
+- **Fix**: `ModelBundle._no_split_modules` now falls back to `_repeated_blocks` for a
+  member that has no legacy no-split declaration, with a regression that resolves the
+  repeated block class through Accelerate's transformer-based FSDP policy.
+- **Lesson**: A distributed wrapper becomes the metadata boundary seen by backend
+  policy discovery. It must preserve both legacy and current model block declarations,
+  or a correct component graph can silently collapse into one memory-prohibitive shard.
+- **Related Constraint**: #9
+
 ## Failure modes
 
 - Expanding omitted materialization to all declarations loads tokenizers, configs, and weights
@@ -89,8 +126,9 @@ instance attribute.
 - [ ] `adapter.pipeline`, `adapter.scheduler`, and public lifecycle hooks remain compatible.
 - [ ] Scheduler names equal `trajectory_component_order`.
 - [ ] Distributed preparation still routes through `ModelBundle`/`RoutedComponentProxy`.
+- [ ] Exactly one activation-checkpoint owner remains active for the selected FSDP plan.
 
 ## Cross-refs
 
 - UP: [`constraints.md` #5](../constraints.md#5-adapter-component-runtime-contract), [`architecture.md` Component Management](../architecture.md#component-management)
-- PEER: [Structured Trajectory](structured_trajectory.md), [Component Variants](component_variants.md), [Adapter Conventions](adapter_conventions.md)
+- PEER: [Structured Trajectory](structured_trajectory.md), [Component Variants](component_variants.md), [Adapter Conventions](adapter_conventions.md), [MiniMax H3](minimax_h3.md)

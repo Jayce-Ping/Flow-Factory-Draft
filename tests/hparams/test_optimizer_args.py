@@ -22,6 +22,11 @@ from flow_factory.hparams.optimizer_args import (
 )
 from flow_factory.optimizer import CompositeOptimizer, build_optimizer, split_muon_parameters
 
+requires_muon_api = pytest.mark.skipif(
+    not hasattr(torch.optim, "Muon"),
+    reason="functional Muon tests require torch.optim.Muon",
+)
+
 
 def test_the_optimizer_key_selects_the_arguments_subclass() -> None:
     """AdamW and Muon hyperparameters live on separate classes, chosen by one key."""
@@ -66,6 +71,7 @@ def test_all_adamw_configurations_build_one_plain_adamw() -> None:
     assert [group["role_name"] for group in optimizer.param_groups] == ["base"]
 
 
+@requires_muon_api
 def test_muon_splits_a_variant_into_its_matrices_and_the_adamw_remainder() -> None:
     """torch.optim.Muon rejects non-matrix parameters, so the rest needs AdamW."""
     matrix = torch.nn.Parameter(torch.randn(4, 3))
@@ -84,6 +90,7 @@ def test_muon_splits_a_variant_into_its_matrices_and_the_adamw_remainder() -> No
     assert [group["role_name"] for group in optimizer.param_groups] == ["base", "base"]
 
 
+@requires_muon_api
 def test_a_composite_steps_every_child_and_round_trips_its_state() -> None:
     """The framework prepares one optimizer, so the composite must behave like one."""
     matrix = torch.nn.Parameter(torch.randn(4, 3))
@@ -111,6 +118,7 @@ def test_a_composite_steps_every_child_and_round_trips_its_state() -> None:
     assert matrix.grad is None
 
 
+@requires_muon_api
 def test_mixed_optimizers_across_variants_share_one_root() -> None:
     """One variant on Muon and another on AdamW still yields a single optimizer."""
     generator = torch.nn.Parameter(torch.randn(4, 3))
@@ -137,6 +145,18 @@ def test_muon_requires_at_least_one_matrix_parameter() -> None:
         )
 
 
+def test_muon_requires_the_optional_pytorch_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Direct optimizer construction must share the trainer's capability error."""
+    monkeypatch.delattr(torch.optim, "Muon", raising=False)
+
+    with pytest.raises(ValueError, match="torch.optim.Muon is unavailable"):
+        build_optimizer(
+            (MuonOptimizerArguments(name="base"),),
+            {"base": [torch.nn.Parameter(torch.randn(4, 3))]},
+        )
+
+
+@requires_muon_api
 def test_a_composite_refuses_to_have_its_groups_reassigned() -> None:
     """The group list is a view; reassigning it would detach the children silently."""
     optimizer = build_optimizer(

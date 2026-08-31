@@ -1069,6 +1069,7 @@ Decoder_layer_dict = {
 class Qwen2Model(Qwen2PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
+        self._no_split_modules = [config.layer_module]
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.use_moe = "Mo" in config.layer_module
@@ -1083,6 +1084,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         if self.use_moe:
             self.norm_moe_gen = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen2RotaryEmbedding(config=config)
+        self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1194,18 +1196,31 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 decoder_layer.cache_dic = self.cache_dic
                 decoder_layer.enable_taylorseer = True
                 self.current["layer"] = layer_idx
-            packed_query_sequence, past_key_values = decoder_layer(
-                packed_query_sequence=packed_query_sequence,
-                query_lens=query_lens,
-                packed_query_position_embeddings=packed_query_position_embeddings,
-                packed_query_indexes=packed_query_indexes,
-                past_key_values=past_key_values,
-                key_values_lens=key_values_lens,
-                packed_key_value_indexes=packed_key_value_indexes,
-                update_past_key_values=update_past_key_values,
-                is_causal=is_causal,
+            layer_kwargs = {
+                "packed_query_sequence": packed_query_sequence,
+                "query_lens": query_lens,
+                "packed_query_position_embeddings": packed_query_position_embeddings,
+                "packed_query_indexes": packed_query_indexes,
+                "past_key_values": past_key_values,
+                "key_values_lens": key_values_lens,
+                "packed_key_value_indexes": packed_key_value_indexes,
+                "update_past_key_values": update_past_key_values,
+                "is_causal": is_causal,
                 **extra_inputs,
+            }
+            checkpoint_layer = (
+                self.gradient_checkpointing
+                and self.training
+                and not update_past_key_values
+                and not enable_taylorseer
             )
+            if checkpoint_layer:
+                packed_query_sequence, past_key_values = self._gradient_checkpointing_func(
+                    decoder_layer.__call__,
+                    **layer_kwargs,
+                )
+            else:
+                packed_query_sequence, past_key_values = decoder_layer(**layer_kwargs)
 
         if self.use_moe:
             if mode == "und":
@@ -1236,6 +1251,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
+        self._no_split_modules = [config.layer_module]
         self.model = Qwen2Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -1296,7 +1312,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
 
     def forward_inference(
         self,
-        packed_query_sequence: torch.Tensor,
+        packed_query_sequence: Optional[torch.Tensor],
         query_lens: torch.Tensor,
         packed_query_position_ids: torch.Tensor,
         packed_query_indexes: torch.Tensor,
@@ -1308,7 +1324,65 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         mode="und",
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
+        packed_text_ids: Optional[torch.LongTensor] = None,
     ) -> BaseNavitOutputWithPast:
+        """Run one packed language-model forward from embeddings, token IDs, or both.
+
+        Args:
+            packed_query_sequence: Existing packed auxiliary sequence, or None for a text-only
+                cache update.
+            query_lens: Per-sample query lengths.
+            packed_query_position_ids: Packed query position IDs.
+            packed_query_indexes: Packed query indices.
+            past_key_values: Optional existing packed key/value cache.
+            key_values_lens: Per-sample existing cache lengths.
+            packed_key_value_indexes: Packed indices of existing cache entries.
+            update_past_key_values: Whether to append the query to the cache.
+            is_causal: Whether the query uses causal attention.
+            mode: Bagel language-model routing mode.
+            packed_vae_token_indexes: Optional positions of generative latent tokens.
+            packed_text_indexes: Destination indices when inserting raw text embeddings into an
+                existing packed sequence.
+            packed_text_ids: Raw token IDs to embed inside this prepared-root forward. Required
+                when ``packed_query_sequence`` is None.
+
+        Returns:
+            Packed model output with the updated cache when requested.
+
+        Raises:
+            ValueError: If neither input source is supplied, destination indices are missing, or
+                token and destination counts differ.
+        """
+
+        # Keep token embedding inside the outer language-model forward. Distributed
+        # wrappers attach their unshard hooks to this boundary, so callers must not
+        # reach through to ``model.embed_tokens`` while the parameters are sharded.
+        if packed_text_ids is not None:
+            packed_text_embedding = self.model.embed_tokens(packed_text_ids)
+            if packed_query_sequence is None:
+                packed_query_sequence = packed_text_embedding
+            else:
+                if packed_text_indexes is None:
+                    raise ValueError(
+                        "packed_text_indexes is required when inserting packed_text_ids "
+                        "into an existing packed_query_sequence"
+                    )
+                if packed_text_ids.numel() != packed_text_indexes.numel():
+                    raise ValueError(
+                        "packed_text_ids and packed_text_indexes must contain the same "
+                        f"number of tokens, got {packed_text_ids.numel()} and "
+                        f"{packed_text_indexes.numel()}"
+                    )
+                packed_query_sequence = packed_query_sequence.index_copy(
+                    0,
+                    packed_text_indexes,
+                    packed_text_embedding.to(packed_query_sequence.dtype),
+                )
+        elif packed_query_sequence is None:
+            raise ValueError(
+                "Qwen2ForCausalLM.forward_inference requires packed_query_sequence "
+                "or packed_text_ids"
+            )
 
         outputs = self.model(
             packed_query_sequence=packed_query_sequence,

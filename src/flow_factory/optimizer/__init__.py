@@ -15,11 +15,17 @@
 """Build the single optimizer root from per-variant configurations."""
 
 from .composite import CompositeOptimizer
-from .loader import build_optimizer, split_muon_parameters, uses_muon
+from .loader import (
+    build_optimizer,
+    split_muon_parameters,
+    uses_muon,
+    validate_muon_available,
+)
 
 __all__ = [
     "CompositeOptimizer",
     "build_optimizer",
     "split_muon_parameters",
     "uses_muon",
+    "validate_muon_available",
 ]

@@ -24,13 +24,19 @@ import os
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import ProjectConfiguration, set_seed
 
+from ..contracts.execution import ExecutionContract
 from ..hparams import Arguments, get_training_args_class
+from ..loading.backend import configure_backend_loading
 from ..models.loader import load_model
 from ..models.registry import get_model_adapter_class
-from ..loading.backend import configure_backend_loading
 from ..utils.env_utils import reconcile_config
 from ..utils.logger_utils import setup_logger
-from .abc import BaseTrainer, validate_supported_distributed_plan
+from .abc import BaseTrainer
+from .multirole import (
+    configure_checkpointing_backend_plan,
+    validate_optimizer_backend_plan,
+    validate_supported_distributed_plan,
+)
 from .registry import get_trainer_class, list_registered_trainers
 
 logger = setup_logger(__name__)
@@ -54,30 +60,45 @@ def _requires_ddp_unused_parameter_detection(
 
 
 def load_trainer(config: Arguments) -> BaseTrainer:
-    """
-    Factory function to instantiate trainer based on algorithm type.
-
-    Uses registry pattern for automatic trainer discovery and loading.
-    Supports both built-in trainers and custom algorithms via python paths.
+    """Instantiate the configured trainer after validating its execution plan.
 
     Args:
-        config: Configuration containing trainer_type and all hyperparameters
+        config: Parsed configuration containing the trainer, model, optimizer, and backend policy.
 
     Returns:
-        An instance of a BaseTrainer subclass
+        The initialized trainer selected by ``config.training_args.trainer_type``.
 
     Raises:
-        ImportError: If the trainer is not registered or cannot be imported
-
-    Examples:
-        # Using built-in trainer
-        config.training_args.trainer_type = "grpo"
-        trainer = load_trainer(config)
-
-        # Using custom trainer
-        config.training_args.trainer_type = "my_package.trainers.PPOTrainer"
-        trainer = load_trainer(config)
+        ImportError: If the requested trainer cannot be resolved or imported.
+        TypeError: If the registry entry does not resolve to a trainer class.
+        ValueError: If the trainer/adapter contract or distributed optimizer/checkpoint plan is
+            unsupported.
+        RuntimeError: If an FSDP2 checkpoint plan lacks the required plugin state.
     """
+    # Resolve and validate algorithm semantics before constructing an Accelerator or
+    # loading model weights. A stale trainer/argument registry pairing must fail with
+    # no external allocation side effects.
+    trainer_type = config.training_args.trainer_type
+    try:
+        trainer_cls = get_trainer_class(trainer_type)
+    except ImportError as e:
+        registered_trainers = list(list_registered_trainers().keys())
+        raise ImportError(
+            f"Failed to load trainer '{trainer_type}'. "
+            f"Available trainers: {registered_trainers}"
+        ) from e
+    if not isinstance(trainer_cls, type):
+        raise TypeError(
+            f"trainer {trainer_type!r} must resolve to a class, " f"received {trainer_cls!r}"
+        )
+    uses_execution_kernel = issubclass(trainer_cls, BaseTrainer)
+    has_typed_training_contract = isinstance(
+        getattr(type(config.training_args), "execution_contract", None),
+        ExecutionContract,
+    )
+    if uses_execution_kernel and has_typed_training_contract:
+        trainer_cls.validate_training_arguments_contract(config.training_args)
+
     # Resolve DDP find_unused_parameters from the adapter class (opt-in per
     # model). Resolving via the registry imports only the class (no
     # instantiation). This kwarg only affects the DDP backend; FSDP/DeepSpeed
@@ -85,6 +106,8 @@ def load_trainer(config: Arguments) -> BaseTrainer:
     # all-reduce with backward; adapters that leave trainable params ungraded in
     # some iterations (e.g. Qwen-Image) opt in via ddp_find_unused_parameters.
     adapter_cls = get_model_adapter_class(config.model_args.model_type)
+    if uses_execution_kernel:
+        trainer_cls.validate_adapter_class_execution_contract(adapter_cls)
     find_unused = _requires_ddp_unused_parameter_detection(config, adapter_cls)
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=find_unused)
 
@@ -110,6 +133,8 @@ def load_trainer(config: Arguments) -> BaseTrainer:
     # constructing an adapter under ZeRO-3 can shard parameters immediately, so
     # rejecting it in BaseTrainer.__init__ is too late.
     validate_supported_distributed_plan(accelerator)
+    validate_optimizer_backend_plan(accelerator, tuple(config.optimizer_args))
+    configure_checkpointing_backend_plan(accelerator, config.training_args)
     set_seed(config.training_args.seed, device_specific=True)
 
     # Reconcile config with runtime distributed state (before any consumer reads it)
@@ -117,18 +142,6 @@ def load_trainer(config: Arguments) -> BaseTrainer:
 
     # Initialize model adapter
     adapter = load_model(config=config, accelerator=accelerator)
-
-    # Get trainer class from registry
-    trainer_type = config.training_args.trainer_type
-
-    try:
-        trainer_cls = get_trainer_class(trainer_type)
-    except ImportError as e:
-        registered_trainers = list(list_registered_trainers().keys())
-        raise ImportError(
-            f"Failed to load trainer '{trainer_type}'. "
-            f"Available trainers: {registered_trainers}"
-        ) from e
 
     return trainer_cls(
         config=config,

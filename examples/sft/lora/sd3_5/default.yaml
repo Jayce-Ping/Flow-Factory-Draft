@@ -1,0 +1,70 @@
+# Single-process SFT smoke recipe over the checked-in dataset/sft_sd3_5 fixture.
+# Replace the tiny repository-image dataset with a real training corpus for quality runs.
+launcher: "accelerate"
+config_file: null
+num_processes: 1
+main_process_port: 29500
+mixed_precision: "bf16"
+
+data:
+  datasets:
+    - name: offline_demonstrations
+      dataset_dir: "dataset/sft_sd3_5"
+      train:
+        weight: 1  # Offline epochs require unit source weights and full traversal.
+        max_dataset_size: 2
+  enable_preprocess: true
+  preprocessing_batch_size: 2
+  dataloader_num_workers: 0
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  sampler_type: "auto"  # Offline training selects torch DistributedSampler.
+
+model:
+  finetune_type: "lora"
+  lora_rank: 16
+  lora_alpha: 16
+  target_modules: "default"
+  model_name_or_path: "stabilityai/stable-diffusion-3.5-medium"
+  model_type: "sd3-5"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: "sd3_5_sft_smoke"
+  project: "Flow-Factory"
+  logging_backend: "none"
+  save_dir: "saves/"
+  save_freq: 0
+  save_model_only: true
+
+train:
+  trainer_type: "sft"
+  max_epochs: 1  # One epoch is one complete dataloader traversal.
+  resolution: 512
+  guidance_scale: 1.0
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 1
+  weighting_scheme: "logit_normal"  # Options: "logit_normal", "uniform"
+  num_train_timesteps: 1  # Monte Carlo terms averaged inside each microbatch.
+  timestep_range: 0.99
+  time_shift: 1.0
+  logit_mean: 0.0
+  logit_std: 1.0
+  ema_decay: 0.0
+  enable_gradient_checkpointing: false
+  seed: 42
+
+scheduler:
+  dynamics_type: "ODE"
+
+eval:
+  eval_freq: 0
+
+optimizers:
+  - name: default
+    learning_rate: 1.0e-5
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    max_grad_norm: 1.0

@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import torch
 from accelerate import Accelerator
@@ -27,6 +27,7 @@ from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import (
 )
 from PIL import Image
 
+from ...contracts import NegativePromptPolicy
 from ...hparams import *
 from ...samples import BaseSample
 from ...scheduler import (
@@ -45,6 +46,12 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ..configured_image_output import (
+    ConfiguredImageOutputAdapterMixin,
+    EncodedImageTensor,
+    encode_shift_scale_vae_image,
+)
+from ..pipeline_contracts import image_output_contract
 
 logger = setup_logger(__name__)
 
@@ -60,8 +67,12 @@ class SD3_5Sample(BaseSample):
     negative_pooled_prompt_embeds: Optional[torch.Tensor] = None
 
 
-class SD3_5Adapter(BaseAdapter):
+class SD3_5Adapter(ConfiguredImageOutputAdapterMixin, BaseAdapter):
     """Concrete implementation for Stable Diffusion 3 medium."""
+
+    pipeline_io_contract = image_output_contract(
+        negative_prompt=NegativePromptPolicy.OPTIONAL,
+    )
 
     def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
@@ -93,6 +104,31 @@ class SD3_5Adapter(BaseAdapter):
     @property
     def tokenizer(self) -> Any:
         return self.pipeline.tokenizer_3
+
+    def _output_geometry_multiple(self) -> int:
+        """Match the spatial divisibility enforced by Diffusers SD3 inputs."""
+        return self.pipeline.vae_scale_factor * self.pipeline.patch_size
+
+    def _encode_output_images(
+        self,
+        pixel_values: torch.Tensor,
+        condition: Mapping[str, Any],
+        generator: Optional[torch.Generator],
+    ) -> EncodedImageTensor:
+        """Sample and normalize SD3.5 target latents on demand."""
+        del condition
+        latents = encode_shift_scale_vae_image(
+            self,
+            pixel_values,
+            sample_mode="sample",
+            generator=generator,
+            source="SD3.5 target VAE encode",
+        )
+        return EncodedImageTensor(
+            latents=latents,
+            forward_context={},
+            decode_context={},
+        )
 
     # ============================ Encoding & Decoding ============================
     def encode_prompt(

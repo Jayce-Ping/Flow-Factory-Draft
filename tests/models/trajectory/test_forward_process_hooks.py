@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, List
 
 import pytest
@@ -20,6 +20,7 @@ import torch
 from diffusers.utils.torch_utils import randn_tensor
 
 from flow_factory.models.abc import BaseAdapter
+from flow_factory.models.trajectory_bridge import resolve_replay_projection_times
 from flow_factory.samples import BaseSample, ComponentTimes, LatentState
 from flow_factory.scheduler import SchedulerGroup, SDESchedulerOutput
 from flow_factory.utils.base import to_broadcast_tensor
@@ -166,6 +167,18 @@ def test_default_component_times_consume_no_randomness() -> None:
     adapter.build_training_component_times(torch.tensor([1000.0, 250.0]))
 
     assert torch.equal(torch.get_rng_state(), state_before)
+
+
+def test_default_component_times_accept_a_generic_mapping_batch() -> None:
+    adapter = _adapter()
+    primary = torch.tensor([1000.0, 250.0])
+
+    times = adapter.build_training_component_times(
+        primary,
+        batch=MappingProxyType({"offline": True}),
+    )
+
+    assert torch.equal(times.timestep["latent"], primary)
 
 
 def test_default_component_times_reject_an_unbatched_coordinate() -> None:
@@ -423,6 +436,55 @@ def test_explicit_noise_application_supports_heterogeneous_components() -> None:
             (1 - sigma_broadcast) * clean + sigma_broadcast * noise,
         )
         assert torch.equal(noised.target_velocity.components[name], noise - clean)
+
+
+def test_explicit_noise_application_uses_the_adapter_velocity_direction() -> None:
+    adapter = _structured_adapter(DataWardAdapterFake)
+    clean = LatentState({"video": torch.ones(2, 3), "audio": torch.full((2, 4), 2.0)})
+    noise = LatentState({"video": torch.full((2, 3), 5.0), "audio": torch.full((2, 4), 7.0)})
+
+    noised = adapter.apply_forward_process_noise(clean, _heterogeneous_times(), noise)
+
+    for name in clean.component_names:
+        assert torch.equal(
+            noised.target_velocity.components[name],
+            clean.components[name] - noise.components[name],
+        )
+
+
+def test_replay_projection_preserves_stored_component_sigmas_and_generic_batch() -> None:
+    adapter = _structured_adapter()
+    stored = ComponentTimes(
+        timestep={
+            "video": torch.tensor([990.4219970703125], dtype=torch.float32),
+            "audio": torch.tensor([750.0], dtype=torch.float64),
+        },
+        next_timestep={
+            "video": torch.tensor([0.0], dtype=torch.float32),
+            "audio": torch.tensor([0.0], dtype=torch.float64),
+        },
+        sigma={
+            "video": torch.tensor([0.9904220700263977], dtype=torch.float32),
+            "audio": torch.tensor([0.75], dtype=torch.float64),
+        },
+        next_sigma={
+            "video": torch.tensor([0.0], dtype=torch.float32),
+            "audio": torch.tensor([0.0], dtype=torch.float64),
+        },
+    )
+    adapter.build_training_component_times = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("stored sigmas are authoritative and must not be reconstructed")
+    )
+
+    resolved = resolve_replay_projection_times(
+        adapter,
+        stored,
+        batch=MappingProxyType({"offline": True}),
+    )
+
+    assert resolved is stored
+    assert resolved.sigma["video"].dtype is torch.float32
+    assert resolved.sigma["audio"].dtype is torch.float64
 
 
 def test_explicit_noise_application_consumes_no_randomness() -> None:

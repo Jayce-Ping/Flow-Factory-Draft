@@ -15,7 +15,7 @@
 
 import inspect
 from dataclasses import dataclass
-from typing import Any, Tuple, Type
+from typing import Any, Callable, Tuple, Type
 
 import torch
 
@@ -55,11 +55,13 @@ _REFERENCE_FIELDS: Tuple[str, ...] = ("ImageReference", "VideoReference", "Audio
 
 @dataclass(frozen=True)
 class MiniMaxH3Symbols:
-    """Hold all upstream classes used by the shared H3 core."""
+    """Hold all upstream symbols used by the shared H3 core."""
 
     ModularPipeline: Type[Any]
     MiniMaxH3ModularPipeline: Type[Any]
     MiniMaxH3Blocks: Type[Any]
+    MiniMaxH3AttnProcessor: Type[Any]
+    dispatch_attention_fn: Callable[..., torch.Tensor]
     PipelineState: Type[Any]
     ResizeStep: Type[Any]
     RefSetupStep: Type[Any]
@@ -85,7 +87,8 @@ class MiniMaxH3Symbols:
 
 
 try:
-    from diffusers import ModularPipeline
+    from diffusers.models.attention_dispatch import dispatch_attention_fn
+    from diffusers.models.transformers.transformer_minimax_h3 import MiniMaxH3AttnProcessor
     from diffusers.modular_pipelines.minimax_h3.before_denoise import (
         MiniMaxH3FL2VAPrepareLatentsStep,
         MiniMaxH3NoKeyframeAnchorsStep,
@@ -121,10 +124,14 @@ try:
     )
     from diffusers.modular_pipelines.modular_pipeline import PipelineState
 
+    from diffusers import ModularPipeline
+
     _SYMBOLS = MiniMaxH3Symbols(
         ModularPipeline=ModularPipeline,
         MiniMaxH3ModularPipeline=MiniMaxH3ModularPipeline,
         MiniMaxH3Blocks=MiniMaxH3Blocks,
+        MiniMaxH3AttnProcessor=MiniMaxH3AttnProcessor,
+        dispatch_attention_fn=dispatch_attention_fn,
         PipelineState=PipelineState,
         ResizeStep=MiniMaxH3ResizeStep,
         RefSetupStep=MiniMaxH3Ref2VASetupStep,
@@ -172,6 +179,11 @@ def require_minimax_h3_support() -> MiniMaxH3Symbols:
 
 
 def _probe_symbol_bundle(symbols: MiniMaxH3Symbols) -> None:
+    processor = symbols.MiniMaxH3AttnProcessor()
+    if not callable(processor):
+        raise TypeError("MiniMaxH3AttnProcessor instance must be callable")
+    if not callable(symbols.dispatch_attention_fn):
+        raise TypeError("dispatch_attention_fn must be callable")
     state_values = {"probe": object()}
     try:
         state = symbols.PipelineState(values=state_values)

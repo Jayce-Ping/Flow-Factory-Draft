@@ -19,7 +19,7 @@ import logging
 import os
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import torch
 from accelerate import Accelerator
@@ -29,6 +29,7 @@ from torch.nn.utils.rnn import pad_sequence
 
 import diffusers
 
+from ...contracts import NegativePromptPolicy
 from ...hparams import *
 from ...samples import T2ISample
 from ...scheduler import (
@@ -48,6 +49,12 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ..configured_image_output import (
+    ConfiguredImageOutputAdapterMixin,
+    EncodedImageTensor,
+)
+from ..pipeline_contracts import image_output_contract
+from ._output import encode_qwen_output_images
 from ._utils import _pad_seq_dim
 
 logger = setup_logger(__name__)
@@ -65,13 +72,16 @@ class QwenImageSample(T2ISample):
     img_shapes: Optional[List[Tuple[int, int, int]]] = None
 
 
-class QwenImageAdapter(BaseAdapter):
+class QwenImageAdapter(ConfiguredImageOutputAdapterMixin, BaseAdapter):
     """Adapter for Qwen-Image text-to-image models."""
 
     # Qwen-Image runs with guidance=None, so the transformer's guidance embedder
     # receives no gradient and DDP must scan for unused parameters.
     ddp_find_unused_parameters = True
     supports_diffusers_cache = True
+    pipeline_io_contract = image_output_contract(
+        negative_prompt=NegativePromptPolicy.OPTIONAL,
+    )
 
     def __init__(self, config: Arguments, accelerator: Accelerator):
         if not is_version_at_least("diffusers", "0.37.0"):
@@ -91,8 +101,7 @@ class QwenImageAdapter(BaseAdapter):
 
     def load_pipeline(self) -> QwenImagePipeline:
         return self._load_diffusers_pipeline(
-            QwenImagePipeline,
-            self.model_args.model_name_or_path, low_cpu_mem_usage=False
+            QwenImagePipeline, self.model_args.model_name_or_path, low_cpu_mem_usage=False
         )
 
     @property
@@ -232,13 +241,29 @@ class QwenImageAdapter(BaseAdapter):
 
         return results
 
-    def encode_image(self, image: Union[Image.Image, torch.Tensor, List[torch.Tensor]]):
+    def encode_image(
+        self,
+        image: Union[Image.Image, torch.Tensor, List[torch.Tensor]],
+    ) -> None:
         """Not needed for Qwen-Image text-to-image models."""
-        pass
+        return None
 
-    def encode_video(self, video: Union[torch.Tensor, List[torch.Tensor]]):
+    def encode_video(self, video: Union[torch.Tensor, List[torch.Tensor]]) -> None:
         """Not needed for Qwen-Image text-to-image models."""
-        pass
+        return None
+
+    def _output_geometry_multiple(self) -> int:
+        """Require the VAE grid and 2x2 latent packing used by Diffusers."""
+        return self.pipeline.vae_scale_factor * 2
+
+    def _encode_output_images(
+        self,
+        pixel_values: torch.Tensor,
+        condition: Mapping[str, Any],
+        generator: Optional[torch.Generator],
+    ) -> EncodedImageTensor:
+        """Sample target images through Qwen's five-dimensional VAE path."""
+        return encode_qwen_output_images(self, pixel_values, condition, generator)
 
     def decode_latents(
         self,

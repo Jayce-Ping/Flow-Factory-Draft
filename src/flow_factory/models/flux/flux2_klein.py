@@ -19,7 +19,7 @@ import logging
 import os
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -28,6 +28,7 @@ from diffusers.pipelines.flux2.pipeline_flux2_klein import Flux2KleinPipeline, c
 from PIL import Image
 from transformers import Qwen2TokenizerFast, Qwen3ForCausalLM
 
+from ...contracts import InputMediaOrder, NegativePromptPolicy
 from ...hparams import *
 from ...samples import I2ISample
 from ...scheduler import (
@@ -55,6 +56,12 @@ from ...utils.trajectory_collector import (
     create_trajectory_collector,
 )
 from ..abc import BaseAdapter
+from ..configured_image_output import (
+    ConfiguredImageOutputAdapterMixin,
+    EncodedImageTensor,
+)
+from ..pipeline_contracts import image_output_contract
+from ._output import encode_flux2_output_images, prepare_flux2_condition_latents
 
 logger = setup_logger(__name__)
 
@@ -76,8 +83,14 @@ class Flux2KleinSample(I2ISample):
 CONDITION_IMAGE_SIZE = (1024, 1024)
 
 
-class Flux2KleinAdapter(BaseAdapter):
+class Flux2KleinAdapter(ConfiguredImageOutputAdapterMixin, BaseAdapter):
     supports_diffusers_cache = True
+    pipeline_io_contract = image_output_contract(
+        negative_prompt=NegativePromptPolicy.OPTIONAL,
+        input_image_min_count=0,
+        input_image_max_count=None,
+        input_order=InputMediaOrder.WITHIN_TYPE,
+    )
 
     def __init__(self, config: Arguments, accelerator: Accelerator):
         super().__init__(config, accelerator)
@@ -89,8 +102,7 @@ class Flux2KleinAdapter(BaseAdapter):
 
     def load_pipeline(self) -> Flux2KleinPipeline:
         return self._load_diffusers_pipeline(
-            Flux2KleinPipeline,
-            self.model_args.model_name_or_path, low_cpu_mem_usage=False
+            Flux2KleinPipeline, self.model_args.model_name_or_path, low_cpu_mem_usage=False
         )
 
     @property
@@ -246,9 +258,9 @@ class Flux2KleinAdapter(BaseAdapter):
         images: Union[ImageSingle, ImageBatch, MultiImageBatch],
         condition_image_size: Union[int, Tuple[int, int]] = CONDITION_IMAGE_SIZE,
         device: Optional[torch.device] = None,
-        dtype: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
         generator: Optional[torch.Generator] = None,
-    ) -> Dict[str, Union[List[List[torch.Tensor]], torch.Tensor]]:
+    ) -> Dict[str, Union[List[List[torch.Tensor]], List[Optional[torch.Tensor]]]]:
         """Preprocess the image(s) into latents using the FLUX.2 Klein VAE encoder."""
         device = self.pipeline.vae.device if device is None else device
         dtype = self.pipeline.vae.dtype if dtype is None else dtype
@@ -256,22 +268,37 @@ class Flux2KleinAdapter(BaseAdapter):
         if not self._is_multi_images_batch(images):
             images = [images]  # Wrap into a batch
 
-        images = [self._standardize_image_input(imgs, output_type="pil") for imgs in images]
+        images = [
+            (
+                []
+                if isinstance(imgs, list) and not imgs
+                else self._standardize_image_input(imgs, output_type="pil")
+            )
+            for imgs in images
+        ]
 
         condition_image_tensors: List[List[torch.Tensor]] = [
-            self._resize_condition_images(
-                condition_images=imgs,
-                condition_image_size=condition_image_size,
+            (
+                self._resize_condition_images(
+                    condition_images=imgs,
+                    condition_image_size=condition_image_size,
+                )
+                if imgs
+                else []
             )
             for imgs in images
         ]
         image_latents_list = []
         image_latent_ids_list = []
         for cond_img_tensors in condition_image_tensors:
-            image_latents, image_latent_ids = self.pipeline.prepare_image_latents(
-                images=cond_img_tensors,
+            if not cond_img_tensors:
+                image_latents_list.append(None)
+                image_latent_ids_list.append(None)
+                continue
+            image_latents, image_latent_ids = prepare_flux2_condition_latents(
+                self,
+                cond_img_tensors,
                 batch_size=1,
-                generator=generator,
                 device=device,
                 dtype=dtype,
             )
@@ -302,13 +329,17 @@ class Flux2KleinAdapter(BaseAdapter):
         return isinstance(images, list) and is_multi_image_batch(images)
 
     @staticmethod
-    def _is_multi_image_latents(image_latents: Union[torch.Tensor, List[torch.Tensor]]):
+    def _is_multi_image_latents(
+        image_latents: Union[torch.Tensor, List[Optional[torch.Tensor]]],
+    ):
         is_ragged_image_latents = (
             isinstance(image_latents, list)
             and len(image_latents) > 0
-            and isinstance(image_latents[0], torch.Tensor)
-            and image_latents[0].ndim == 2
-        ) or (  # List[torch.Tensor : ndim=2 (seq_len, C)]
+            and all(
+                latent is None or (isinstance(latent, torch.Tensor) and latent.ndim == 2)
+                for latent in image_latents
+            )
+        ) or (  # List[Optional[torch.Tensor : ndim=2 (seq_len, C)]]
             isinstance(image_latents, torch.Tensor) and image_latents.ndim == 3
         )  # torch.Tensor : ndim=3 (B, seq_len, C)
         return is_ragged_image_latents
@@ -376,7 +407,21 @@ class Flux2KleinAdapter(BaseAdapter):
     # ------------------------- Video Encoding ------------------------
     def encode_video(self, videos: Any) -> None:
         """Flux.2 does not support video encoding."""
-        pass
+        return None
+
+    def _output_geometry_multiple(self) -> int:
+        """Require the VAE grid and 2x2 latent patching used by Diffusers."""
+        return self.pipeline.vae_scale_factor * 2
+
+    def _encode_output_images(
+        self,
+        pixel_values: torch.Tensor,
+        condition: Mapping[str, Any],
+        generator: Optional[torch.Generator],
+    ) -> EncodedImageTensor:
+        """Sample and pack target images with the FLUX.2 Klein latent recipe."""
+        del condition
+        return encode_flux2_output_images(self, pixel_values, generator)
 
     # ============================== Decode Latents =========================================
 
@@ -672,8 +717,8 @@ class Flux2KleinAdapter(BaseAdapter):
         negative_text_ids: Optional[torch.Tensor] = None,
         # Encoded images
         condition_images: Optional[MultiImageBatch] = None,
-        image_latents: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-        image_latent_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
+        image_latents: Optional[Union[torch.Tensor, List[Optional[torch.Tensor]]]] = None,
+        image_latent_ids: Optional[Union[torch.Tensor, List[Optional[torch.Tensor]]]] = None,
         # Other arguments
         compute_log_prob: bool = False,
         extra_call_back_kwargs: List[str] = [],
@@ -928,8 +973,8 @@ class Flux2KleinAdapter(BaseAdapter):
         prompt_embeds: torch.Tensor,
         text_ids: Union[torch.Tensor, List[torch.Tensor]],
         # Optional for I2I (can be List for ragged batches)
-        image_latents: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-        image_latent_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
+        image_latents: Optional[Union[torch.Tensor, List[Optional[torch.Tensor]]]] = None,
+        image_latent_ids: Optional[Union[torch.Tensor, List[Optional[torch.Tensor]]]] = None,
         # Optional for CFG
         negative_prompt_embeds: Optional[torch.Tensor] = None,
         negative_text_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,

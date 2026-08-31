@@ -114,11 +114,19 @@ def _distillation_config(trainer_type: str, **sections: Any) -> Arguments:
     }
     if trainer_type == "tdm-r1":
         config["train"]["group_size"] = 2
+    if trainer_type == "diffusion-opd":
+        config["train"]["teachers"] = [
+            {
+                "name": "teacher",
+                "path": "teacher/lora",
+                "applicable_datasets": ["prompts"],
+            }
+        ]
     config.update(sections)
     return Arguments.from_dict(config)
 
 
-@pytest.mark.parametrize("trainer_type", ["dmd2", "tdm"])
+@pytest.mark.parametrize("trainer_type", ["dmd2", "tdm", "diffusion-opd"])
 def test_reward_free_distillation_accepts_eval_rewards_only(trainer_type: str) -> None:
     """Quality monitoring is an evaluation concern; the loss stays reward-free."""
     config = _distillation_config(
@@ -131,7 +139,7 @@ def test_reward_free_distillation_accepts_eval_rewards_only(trainer_type: str) -
     assert config.eval_reward_args.get_by_name("quality").applicable_datasets == ["bench"]
 
 
-@pytest.mark.parametrize("trainer_type", ["dmd2", "tdm"])
+@pytest.mark.parametrize("trainer_type", ["dmd2", "tdm", "diffusion-opd"])
 def test_reward_free_distillation_still_rejects_training_rewards(trainer_type: str) -> None:
     """An eval-only reward must not become a training signal by accident."""
     with pytest.raises(ValueError, match="rewards"):

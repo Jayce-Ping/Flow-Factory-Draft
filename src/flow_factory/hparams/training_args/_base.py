@@ -15,10 +15,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Literal, Mapping, Optional, Tuple, Union
 
 import yaml
 
+from ...contracts.execution import (
+    ONLINE_EXECUTION_CONTRACT,
+    AcquisitionMode,
+    ExecutionContract,
+)
 from ...utils.dist import get_world_size
 from ...utils.logger_utils import setup_logger
 from ..abc import ArgABC
@@ -122,6 +127,8 @@ class EvaluationArguments(ArgABC):
 class TrainingArguments(ArgABC):
     r"""Base training arguments shared across all algorithms."""
 
+    execution_contract: ClassVar[ExecutionContract] = ONLINE_EXECUTION_CONTRACT
+
     # --- Trainer type ---
     trainer_type: str = field(
         default="grpo",
@@ -159,7 +166,9 @@ class TrainingArguments(ArgABC):
         default=None,
         metadata={
             "help": (
-                "Maximum number of outer training epochs (counter `epoch` runs 0 .. max_epochs-1). "
+                "Maximum acquisition cycles: rollout iterations for generation and complete "
+                "dataloader epochs for dataset acquisition. The compatibility `epoch` counter "
+                "runs from 0 through max_epochs - 1. "
                 "None or a negative value means no limit (train until interrupted)."
             ),
         },
@@ -347,14 +356,54 @@ class TrainingArguments(ArgABC):
 
         self.height, self.width = self.resolution
 
-        # --- Batch size calculation ---
-        # NOTE: M alignment and derived quantities (num_batches_per_epoch,
-        # gradient_accumulation_steps) are computed in Arguments._align_batch_geometry()
-        # because the correct alignment strategy depends on the resolved sampler type,
-        # which requires cross-component information (data_args, reward_args) only
-        # available at the Arguments level.
-        # Placeholder values are set here so the fields exist; they will be
-        # overwritten by _align_batch_geometry() before any consumer reads them.
+        self._initialize_batch_geometry()
+
+        # --- Optimizer defaults ---
+        # Explicit float() casts guard against scientific-notation values (e.g. 1e-4)
+        # arriving as strings from non-standard config sources or future CLI overrides.
+        self.adam_betas = (float(self.adam_betas[0]), float(self.adam_betas[1]))
+        self.adam_weight_decay = float(self.adam_weight_decay)
+        self.adam_epsilon = float(self.adam_epsilon)
+        self.max_grad_norm = float(self.max_grad_norm)
+
+        if self.learning_rate is None:
+            if "lora" in self.trainer_type.lower():
+                self.learning_rate = 1e-4
+            else:
+                self.learning_rate = 1e-5
+            logger.info(
+                f"`learning_rate` is not set, using default {self.learning_rate} for `{self.trainer_type}` training."
+            )
+        else:
+            self.learning_rate = float(self.learning_rate)
+
+    def _initialize_batch_geometry(self) -> None:
+        """Initialize acquisition-specific batch fields without mixing samplers."""
+        contract = getattr(type(self), "execution_contract", None)
+        if not isinstance(contract, ExecutionContract):
+            raise TypeError(
+                f"training arguments {type(self).__name__}.execution_contract must be "
+                f"ExecutionContract, got {type(contract).__name__}: {contract!r}"
+            )
+        if contract.acquisition is AcquisitionMode.DATASET:
+            accumulation_steps = self.gradient_accumulation_steps
+            if type(accumulation_steps) is not int:
+                raise TypeError(
+                    "dataset acquisition requires explicit integer "
+                    "gradient_accumulation_steps >= 1, received "
+                    f"{type(accumulation_steps).__name__}: {accumulation_steps!r}"
+                )
+            if accumulation_steps < 1:
+                raise ValueError(
+                    "dataset acquisition requires gradient_accumulation_steps >= 1, "
+                    f"received {accumulation_steps}"
+                )
+            self._manual_gradient_accumulation_steps = True
+            self.num_batches_per_epoch = 0
+            return
+
+        # Grouped generation geometry is finalized by Arguments after the sampler
+        # strategy is resolved. These are only the pre-resolution placeholders.
         world_size = get_world_size()
         logger.info(f"World Size: {world_size}")
 
@@ -375,25 +424,6 @@ class TrainingArguments(ArgABC):
                     f"`gradient_accumulation_steps` must be >= 1, "
                     f"got {self.gradient_accumulation_steps}."
                 )
-
-        # --- Optimizer defaults ---
-        # Explicit float() casts guard against scientific-notation values (e.g. 1e-4)
-        # arriving as strings from non-standard config sources or future CLI overrides.
-        self.adam_betas = (float(self.adam_betas[0]), float(self.adam_betas[1]))
-        self.adam_weight_decay = float(self.adam_weight_decay)
-        self.adam_epsilon = float(self.adam_epsilon)
-        self.max_grad_norm = float(self.max_grad_norm)
-
-        if self.learning_rate is None:
-            if "lora" in self.trainer_type.lower():
-                self.learning_rate = 1e-4
-            else:
-                self.learning_rate = 1e-5
-            logger.info(
-                f"`learning_rate` is not set, using default {self.learning_rate} for `{self.trainer_type}` training."
-            )
-        else:
-            self.learning_rate = float(self.learning_rate)
 
     def compute_gradient_accumulation_steps(
         self,
@@ -445,6 +475,30 @@ class TrainingArguments(ArgABC):
     def gradient_checkpointing_enabled(self) -> bool:
         """Return whether the normalized model-level policy checkpoints any block."""
         return gradient_checkpointing_enabled(self.enable_gradient_checkpointing)
+
+    @classmethod
+    def from_dict(cls, args_dict: Mapping[str, Any]):
+        """Parse fields while keeping execution semantics algorithm-owned.
+
+        Args:
+            args_dict: User training configuration.
+
+        Returns:
+            Resolved training arguments instance.
+        """
+        if not isinstance(args_dict, Mapping):
+            raise TypeError(
+                "expected training arguments as a mapping, received "
+                f"{type(args_dict).__name__}: {args_dict!r}"
+            )
+        explicit_extras = args_dict.get("extra_kwargs")
+        if "execution_contract" in args_dict or (
+            isinstance(explicit_extras, Mapping) and "execution_contract" in explicit_extras
+        ):
+            raise ValueError(
+                "train.execution_contract is selected by trainer_type and cannot be configured"
+            )
+        return super().from_dict(dict(args_dict))
 
     def to_dict(self) -> dict[str, Any]:
         values = super().to_dict()

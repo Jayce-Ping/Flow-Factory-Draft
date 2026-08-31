@@ -41,7 +41,7 @@ Three tiers, intentionally deviating from the strict ALL-YAML rule in `.cursor/r
 
 | Tier | Models | YAML field | Rationale |
 |------|--------|------------|-----------|
-| T1 | Wan video (T2V / I2V / V2V) + LTX2 (T2AV / I2AV) | explicit `true` | per-sample tensors are GB-scale; `sample()`/`optimize()` OOMs without offload |
+| T1 | Wan video (T2V / I2V) + LTX2 (T2AV / I2AV) | explicit `true` | per-sample tensors are GB-scale; `sample()`/`optimize()` OOMs without offload |
 | T2 | Flux2 / Flux2-Klein / Qwen-Image-Edit-Plus (+ OPD SD3.5) | explicit `false` + multi-line pros/cons comment | moderate VRAM pressure; user-decision point with documentation co-located |
 | T3 | FLUX1 / SD3 / Qwen-Image / Z-Image / DPO / template | not added; relies on code default `False` | low pressure; zero-migration cost |
 
@@ -102,11 +102,21 @@ Effect of the offload pipeline: `sample.to('cpu')` and `sample.to(device)` both 
 
 If a future custom adapter stores large GPU tensors in `extra_kwargs`, either handle them adapter-side or refactor `BaseSample.to` to delegate to `move_tensors_to_device(value, device, max_depth=1)` in an independent PR (note: that refactor will start moving `extra_kwargs['advantage']` together with the sample, which is benign for the current data flow but is a contract change).
 
+## Partial-gather reconstruction
+
+`gather_samples()` may transport only fields requested by a distributed consumer, then reconstruct
+the original concrete `BaseSample` subclass. A field that is required by the concrete class's
+`__post_init__`, identity normalization, or constructor invariant must therefore be included in the
+class-level `reconstruction_required_fields`, even when the reward or trainer does not consume it.
+Always union with the inherited set; `OrderedReferenceConditionSample` adds
+`reference_manifest` this way.
+
+This contract is independent of both `_shared_fields` (batch collation) and a reward model's
+`required_fields` (distributed groupwise consumer data). Add a regression that gathers a narrower
+field selection and proves the reconstructed concrete sample still carries every required field.
+
 ## Cross-refs
 
-- `constraints.md` #11 (BaseTrainer hook order: `sample()` → `prepare_feedback()` → `optimize()`)
-- `constraints.md` #14 (BaseSample dataclass hierarchy and `_shared_fields`)
-- `constraints.md` #15 + `.cursor/rules/examples-yaml-sync.mdc` (the three-tier strategy is an intentional deviation)
-- `topics/train_inference_consistency.md` item #4 (EMA swap without restore — preserved by per-batch interleave)
-- `topics/dtype_precision.md` (device-move never changes dtype; orthogonal to autocast)
-- `topics/autocast_param_swap.md` (#20a)
+- UP: [`constraints.md` #11](../constraints.md#11-basetrainer-execution-contract), [`constraints.md` #14](../constraints.md#14-sample-dataclass-hierarchy), [`constraints.md` #15](../constraints.md#15-pydantic-hparams-synchronization)
+- PEER: [Train/Inference Consistency](train_inference_consistency.md), [Dtype and Precision](dtype_precision.md), [Autocast and Parameter Swaps](autocast_param_swap.md)
+- RULE: [Examples YAML Synchronization](../../../.cursor/rules/examples-yaml-sync.mdc)

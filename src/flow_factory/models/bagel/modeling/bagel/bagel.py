@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -299,15 +299,37 @@ class Bagel(PreTrainedModel):
         packed_text_indexes: torch.LongTensor,
         packed_key_value_indexes: torch.LongTensor,
         key_values_lens: torch.IntTensor,
+        language_model_forward: Optional[Callable[..., Any]] = None,
     ):
-        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+        """Append packed text tokens to the language-model cache.
+
+        Args:
+            past_key_values: Existing packed key/value cache.
+            packed_text_ids: Raw text token IDs to embed inside the routed model forward.
+            packed_text_position_ids: Packed position IDs for the appended text.
+            text_token_lens: Per-sample text query lengths.
+            packed_text_indexes: Packed query destination indices.
+            packed_key_value_indexes: Packed indices of the existing cache entries.
+            key_values_lens: Per-sample existing cache lengths.
+            language_model_forward: Optional outer language-model callable. Flow-Factory injects
+                the prepared/routed transformer so embedding, decoder, and final normalization
+                stay under the sharded root's forward hooks; standalone Bagel defaults to
+                ``self.language_model``.
+
+        Returns:
+            The updated packed key/value cache.
+        """
+        # Flow-Factory injects its prepared component route here. Standalone Bagel
+        # keeps the original physical language-model call as the default.
+        if language_model_forward is None:
+            language_model_forward = self.language_model
 
         extra_inputs = {}
         if self.use_moe:
             extra_inputs = {"mode": "und"}
 
-        output = self.language_model.forward_inference(
-            packed_query_sequence=packed_text_embedding,
+        output = language_model_forward(
+            packed_query_sequence=None,
             query_lens=text_token_lens,
             packed_query_position_ids=packed_text_position_ids,
             packed_query_indexes=packed_text_indexes,
@@ -316,6 +338,7 @@ class Bagel(PreTrainedModel):
             key_values_lens=key_values_lens,
             update_past_key_values=True,
             is_causal=True,
+            packed_text_ids=packed_text_ids,
             **extra_inputs,
         )
         past_key_values = output.past_key_values
@@ -412,10 +435,33 @@ class Bagel(PreTrainedModel):
         packed_indexes: torch.LongTensor,
         packed_key_value_indexes: torch.LongTensor,
         key_values_lens: torch.IntTensor,
+        language_model_forward: Optional[Callable[..., Any]] = None,
     ):
-        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
-        packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
-        packed_sequence[packed_text_indexes] = packed_text_embedding
+        """Encode packed vision tokens and append them to the language-model cache.
+
+        Args:
+            past_key_values: Existing packed key/value cache.
+            packed_text_ids: Raw boundary-token IDs inserted into the packed query.
+            packed_text_indexes: Destination indices for the boundary-token embeddings.
+            packed_vit_tokens: Flattened image inputs consumed by the vision encoder.
+            packed_vit_token_indexes: Destination indices for encoded vision tokens.
+            packed_vit_position_ids: Packed vision position IDs.
+            vit_token_seqlens: Per-image vision token lengths.
+            packed_position_ids: Packed language-model query position IDs.
+            packed_seqlens: Per-sample query lengths.
+            packed_indexes: Packed query indices.
+            packed_key_value_indexes: Packed indices of the existing cache entries.
+            key_values_lens: Per-sample existing cache lengths.
+            language_model_forward: Optional outer language-model callable. Flow-Factory injects
+                the prepared/routed transformer so embedding, decoder, and final normalization
+                stay under the sharded root's forward hooks; standalone Bagel defaults to
+                ``self.language_model``.
+
+        Returns:
+            The updated packed key/value cache.
+        """
+        if language_model_forward is None:
+            language_model_forward = self.language_model
 
         cu_seqlens = torch.nn.functional.pad(torch.cumsum(vit_token_seqlens, dim=0), (1, 0))
         cu_seqlens = cu_seqlens.to(torch.int32)
@@ -429,6 +475,9 @@ class Bagel(PreTrainedModel):
         packed_vit_token_embed = self.connector(packed_vit_token_embed)
         pos_emb = self.vit_pos_embed(packed_vit_position_ids)
         packed_vit_token_embed = packed_vit_token_embed + pos_emb
+        packed_sequence = packed_vit_token_embed.new_zeros(
+            (sum(packed_seqlens), self.hidden_size), dtype=self.language_model.dtype
+        )
         if packed_vit_token_embed.dtype != packed_sequence.dtype:
             packed_vit_token_embed = packed_vit_token_embed.to(packed_sequence.dtype)
         packed_sequence[packed_vit_token_indexes] = packed_vit_token_embed
@@ -437,7 +486,7 @@ class Bagel(PreTrainedModel):
         if self.use_moe:
             extra_inputs = {"mode": "und"}
 
-        output = self.language_model.forward_inference(
+        output = language_model_forward(
             packed_query_sequence=packed_sequence,
             query_lens=packed_seqlens,
             packed_query_position_ids=packed_position_ids,
@@ -447,6 +496,8 @@ class Bagel(PreTrainedModel):
             key_values_lens=key_values_lens,
             update_past_key_values=True,
             is_causal=False,
+            packed_text_ids=packed_text_ids,
+            packed_text_indexes=packed_text_indexes,
             **extra_inputs,
         )
         past_key_values = output.past_key_values
@@ -558,10 +609,35 @@ class Bagel(PreTrainedModel):
         packed_indexes: torch.LongTensor,
         key_values_lens: torch.IntTensor,
         packed_key_value_indexes: torch.Tensor,
+        language_model_forward: Optional[Callable[..., Any]] = None,
     ):
-        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
-        packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
-        packed_sequence[packed_text_indexes] = packed_text_embedding
+        """Encode packed image latents and append them to the language-model cache.
+
+        Args:
+            vae_model: VAE used to encode the padded image batch.
+            past_key_values: Existing packed key/value cache.
+            padded_images: Padded image tensors for the active reference round.
+            patchified_vae_latent_shapes: Per-image patch-grid heights and widths.
+            packed_vae_position_ids: Packed latent position IDs.
+            packed_timesteps: Timesteps used by the latent time embedder.
+            packed_vae_token_indexes: Destination indices for encoded latent tokens.
+            packed_text_ids: Raw boundary-token IDs inserted into the packed query.
+            packed_text_indexes: Destination indices for the boundary-token embeddings.
+            packed_position_ids: Packed language-model query position IDs.
+            packed_seqlens: Per-sample query lengths.
+            packed_indexes: Packed query indices.
+            key_values_lens: Per-sample existing cache lengths.
+            packed_key_value_indexes: Packed indices of the existing cache entries.
+            language_model_forward: Optional outer language-model callable. Flow-Factory injects
+                the prepared/routed transformer so embedding, decoder, and final normalization
+                stay under the sharded root's forward hooks; standalone Bagel defaults to
+                ``self.language_model``.
+
+        Returns:
+            The updated packed key/value cache.
+        """
+        if language_model_forward is None:
+            language_model_forward = self.language_model
 
         padded_latent = vae_model.encode(padded_images)
 
@@ -575,6 +651,9 @@ class Bagel(PreTrainedModel):
         packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
         packed_timestep_embeds = self.time_embedder(packed_timesteps)
         packed_latent = self.vae2llm(packed_latent) + packed_timestep_embeds + packed_pos_embed
+        packed_sequence = packed_latent.new_zeros(
+            (sum(packed_seqlens), self.hidden_size), dtype=self.language_model.dtype
+        )
         if packed_latent.dtype != packed_sequence.dtype:
             packed_latent = packed_latent.to(packed_sequence.dtype)
         packed_sequence[packed_vae_token_indexes] = packed_latent
@@ -584,10 +663,9 @@ class Bagel(PreTrainedModel):
             extra_inputs = {
                 "mode": "gen",
                 "packed_vae_token_indexes": packed_vae_token_indexes,
-                "packed_text_indexes": packed_text_indexes,
             }
 
-        output = self.language_model.forward_inference(
+        output = language_model_forward(
             packed_query_sequence=packed_sequence,
             query_lens=packed_seqlens,
             packed_query_position_ids=packed_position_ids,
@@ -597,6 +675,8 @@ class Bagel(PreTrainedModel):
             packed_key_value_indexes=packed_key_value_indexes,
             update_past_key_values=True,
             is_causal=False,
+            packed_text_ids=packed_text_ids,
+            packed_text_indexes=packed_text_indexes,
             **extra_inputs,
         )
         past_key_values = output.past_key_values

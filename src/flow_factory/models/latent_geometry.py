@@ -21,7 +21,7 @@ sequence axes across every adapter layout:
 
 - ``PACKED`` ``(B, Seq, C)``     -- FLUX*, Qwen-Image*, LTX2*, Bagel
 - ``CONV``   ``(B, C, H, W)``    -- SD3.5, Z-Image
-- ``VIDEO``  ``(B, C, T, H, W)`` -- Wan2 T2V/I2V/V2V
+- ``VIDEO``  ``(B, C, T, H, W)`` -- Wan2 T2V/I2V
 
 The geometry records *which axis plays which role*, never concrete sizes, so it
 stays valid as resolution, frame count, or reference-image count change at runtime.

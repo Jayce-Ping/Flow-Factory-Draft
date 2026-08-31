@@ -176,6 +176,7 @@ class CRDTrainer(BaseTrainer):
 
     _OLD_PARAMS_NAME = "_crd_old"
     _SAMPLING_PARAMS_NAME = "_crd_sampling"
+    runtime_child_names = (_OLD_PARAMS_NAME, _SAMPLING_PARAMS_NAME)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -211,14 +212,11 @@ class CRDTrainer(BaseTrainer):
             )
             self.kl_type = "v-based"
 
-        # Initialize model snapshots: "old" (for implicit reward) and "sampling" (for rollout)
-        self._init_model_snapshots()
-
     # ========================= Initialization =========================
 
-    def _init_model_snapshots(self):
+    def _initialize_snapshots(self) -> None:
         """
-        Initialize both model snapshots by storing copies of current trainable parameters.
+        Initialize and register both model snapshots before exact state resume.
 
         In the original CRD, this corresponds to:
         - ``transformer.add_adapter("old", ...)``  +  copy from "default"
@@ -231,6 +229,7 @@ class CRDTrainer(BaseTrainer):
             name=self._OLD_PARAMS_NAME,
             device=ref_device,
         )
+        self._register_named_parameter_runtime_child(self._OLD_PARAMS_NAME)
         logger.info("CRD: Initialized 'old' model snapshot for implicit reward estimation.")
 
         # Sampling model snapshot (for off-policy rollout generation)
@@ -238,6 +237,7 @@ class CRDTrainer(BaseTrainer):
             name=self._SAMPLING_PARAMS_NAME,
             device=ref_device,
         )
+        self._register_named_parameter_runtime_child(self._SAMPLING_PARAMS_NAME)
         logger.info("CRD: Initialized 'sampling' model snapshot for rollout generation.")
 
     @property
@@ -262,8 +262,8 @@ class CRDTrainer(BaseTrainer):
 
     # ========================= Main Training Loop =========================
 
-    def _after_optimizer_step(self) -> None:
-        """Advance CRD's two auxiliary snapshots alongside the optimizer EMA."""
+    def _after_acquisition_cycle(self) -> None:
+        """Advance CRD's two auxiliary snapshots after each rollout iteration."""
         self._update_old_model()
         self._update_sampling_model()
 

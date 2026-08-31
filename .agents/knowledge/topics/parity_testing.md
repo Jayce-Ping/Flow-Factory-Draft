@@ -58,5 +58,5 @@ def compare_tensors(name: str, a: torch.Tensor, b: torch.Tensor, atol: float = 1
 
 ## Cross-refs
 
-- `adapter_conventions.md` (inference/forward identity, upstream alignment rules)
-- `dtype_precision.md` (tensor dtype for comparison tolerance)
+- UP: [`constraints.md` #12](../constraints.md#12-baseadapter-abstract-methods), [Architecture Adapter Pattern](../architecture.md#adapter-pattern-models)
+- PEER: [Adapter Conventions](adapter_conventions.md), [Dtype and Precision](dtype_precision.md)

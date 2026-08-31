@@ -45,6 +45,27 @@ def test_classic_runtime_collapses_same_object_aliases() -> None:
     assert runtime.physical_route("text_encoder") == ("text_encoder_2", ())
 
 
+def test_classic_runtime_keeps_absent_optional_components_as_distinct_roots() -> None:
+    pipeline = SimpleNamespace(
+        components={"image_encoder": None, "image_processor": None},
+        image_encoder=None,
+        image_processor=None,
+    )
+    runtime = ClassicPipelineRuntime(pipeline)
+    adapter = SimpleNamespace(
+        component_runtime=runtime,
+        model_args=SimpleNamespace(target_components=[]),
+        _resolve_component_names=runtime.resolve_component_names,
+    )
+
+    plan = build_adapter_load_plan(adapter)
+
+    assert runtime.physical_route("image_encoder") == ("image_encoder", ())
+    assert runtime.physical_route("image_processor") == ("image_processor", ())
+    assert plan.request_for_component("image_encoder").role is ComponentRole.AUXILIARY
+    assert plan.request_for_component("image_processor").role is ComponentRole.HOST
+
+
 def test_coordinator_expands_target_component_groups() -> None:
     transformer = torch.nn.Linear(2, 2)
     runtime = PseudoPipelineRuntime(
@@ -122,9 +143,10 @@ def test_coordinator_moves_only_auxiliary_remainder_of_target_owned_root() -> No
         _resolve_component_names=lambda components: list(components),
         on_load_components=lambda components, device: calls.append(("load", components, device)),
         component_runtime=SimpleNamespace(
+            materialized_component_names=["bagel", "vae"],
             load_root_remainder=lambda root, excluded_paths, device: calls.append(
                 ("remainder", root, excluded_paths, device)
-            )
+            ),
         ),
     )
     coordinator.load_scope = lambda role: nullcontext()
@@ -143,6 +165,43 @@ def test_coordinator_moves_only_auxiliary_remainder_of_target_owned_root() -> No
             [("language_model",)],
             torch.device("cpu"),
         ),
+        ("finalize", ["vae"]),
+    ]
+
+
+def test_coordinator_finalizes_only_materialized_replicas() -> None:
+    plan = LoadPlanner().build(
+        [
+            ComponentDescriptor(
+                name="image_encoder",
+                root="image_encoder",
+                role=ComponentRole.AUXILIARY,
+            ),
+            ComponentDescriptor(
+                name="vae",
+                root="vae",
+                role=ComponentRole.AUXILIARY,
+            ),
+        ]
+    )
+    calls = []
+    coordinator = object.__new__(ModelLoadCoordinator)
+    coordinator.plan = plan
+    coordinator.adapter = SimpleNamespace(
+        _resolve_component_names=lambda components: list(components),
+        on_load_components=lambda components, device: calls.append(("load", components, device)),
+        component_runtime=SimpleNamespace(materialized_component_names=["vae"]),
+    )
+    coordinator.load_scope = lambda role: nullcontext()
+    coordinator.components_loaded = lambda components: calls.append(("finalize", components))
+
+    coordinator.load_components(
+        ["image_encoder", "vae"],
+        device=torch.device("cpu"),
+    )
+
+    assert calls == [
+        ("load", ["image_encoder", "vae"], torch.device("cpu")),
         ("finalize", ["vae"]),
     ]
 

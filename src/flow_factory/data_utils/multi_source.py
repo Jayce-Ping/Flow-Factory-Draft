@@ -21,19 +21,28 @@ are composed by ``data_utils.loader.get_train_dataloader`` when more than one
 training source is declared.
 """
 
+import hashlib
 from typing import Any, Dict, Iterator, List, Optional
 
 import torch
 from torch.utils.data import DataLoader
+
+_SCHEDULE_SEED_DOMAIN = "flow_factory.multi_source_schedule.v1"
+
+
+def _stable_schedule_seed(seed: int, epoch: int) -> int:
+    """Derive a process-independent seed for one source-schedule epoch."""
+    payload = f"{_SCHEDULE_SEED_DOMAIN}:{seed}:{epoch}".encode("ascii")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], byteorder="big", signed=False)
 
 
 class WeightedSourceBatchScheduler:
     """Deterministic shared-across-ranks list of source names, length per epoch.
 
     Built by repeating each source's ``num_batches_per_source[name]`` times
-    and shuffling under a ``torch.Generator`` seeded by ``seed + epoch``.
-    All ranks see the same list every epoch (constructor takes only seed +
-    counts; no rank-dependent randomness).
+    and shuffling under a ``torch.Generator`` seeded by a stable digest of
+    ``seed`` and ``epoch``. All ranks see the same list every epoch
+    (constructor takes only seed + counts; no rank-dependent randomness).
 
     The input dict's iteration order is **ignored** — sources are processed
     in ``sorted(name)`` order so the generated schedule is byte-identical
@@ -67,9 +76,7 @@ class WeightedSourceBatchScheduler:
             return
 
         g = torch.Generator()
-        g.manual_seed(
-            hash((self._seed, self._epoch, "multi_source_schedule")) & 0xFFFF_FFFF_FFFF_FFFF
-        )
+        g.manual_seed(_stable_schedule_seed(self._seed, self._epoch))
         perm = torch.randperm(len(flat), generator=g).tolist()
         self._schedule = [flat[i] for i in perm]
 

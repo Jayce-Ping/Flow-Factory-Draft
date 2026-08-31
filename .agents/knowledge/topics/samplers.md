@@ -6,7 +6,10 @@
 
 ## Overview
 
-Flow-Factory uses **K-Repeat Sampling** (Stage 2 of the pipeline) to generate `K` copies of each unique prompt for group-wise advantage estimation. Three sampler implementations exist, differing in **how repeated samples are distributed across ranks**.
+Generation acquisition uses **K-Repeat Sampling** to create `K` copies of each unique prompt for
+group-wise advantage estimation. Three framework samplers differ in how repeated samples are
+distributed across ranks. Dataset acquisition is a separate path and uses PyTorch's official
+`DistributedSampler` without K-repeat geometry.
 
 | Property | DistributedKRepeatSampler | GroupContiguousSampler | GroupDistributedSampler |
 |----------|--------------------------|----------------------|------------------------|
@@ -15,6 +18,16 @@ Flow-Factory uses **K-Repeat Sampling** (Stage 2 of the pipeline) to generate `K
 | **Geometric constraints** | 1 constraint (base) | 2 constraints (base + divisibility) | 2 constraints (`K % W == 0`, `(W*B) % K == 0`) |
 | **Auto-adjustment** | GCD-based rounding | LCM-based rounding (stricter) | O(√B) divisor search (`_align_for_group_distributed`) |
 | **Use case** | Fallback when geometric constraints for group_contiguous are unsatisfied | Default when constraints are met (minimal communication) | DGPO — rank-identical prompt contract for local `torch.unique` |
+
+### Offline Dataset Sampler
+
+SFT and offline DPO always use `torch.utils.data.DistributedSampler`, call
+`set_epoch(data_epoch)`, and exhaust the finite loader once per data epoch. Every source weight is
+`1`; `gradient_accumulation_steps` is explicit; and each rank's batch count must be divisible by
+it. The loader is not passed to `Accelerator.prepare()`. With the official sampler's default
+`drop_last=False`, a non-divisible global tail is repeated deterministically to equalize rank
+lengths; the complete resulting loader traversal, rather than global sample uniqueness, defines
+the epoch.
 
 ---
 
@@ -303,7 +316,7 @@ These are caught at sampler construction time. The auto-adjustment in `_align_ba
 
 ## Impact on Other Components
 
-- **Constraint #9 in [`../constraints.md`](../constraints.md)**: The dataloader is NOT prepared via `accelerator.prepare()` — both samplers handle distribution themselves.
+- **Constraint #9 in [`../constraints.md`](../constraints.md)**: No train dataloader is prepared via `accelerator.prepare()`; its selected grouped or official sampler owns distribution.
 - **RewardProcessor**: When GroupContiguousSampler is active, groupwise rewards can be computed locally per rank. When DistributedKRepeatSampler is active, the RewardProcessor must gather group members across ranks.
 - **AdvantageProcessor**: Automatically skips `accelerator.gather()` calls when `sampler_type == "group_contiguous"` (all group members already local); uses `all_reduce(count, sum, sum_sq)` for global_std (3 scalars). When `sampler_type == "distributed_k_repeat"`, packs all rewards + unique_ids into a single tensor for one `accelerator.gather()` call.
 
@@ -319,6 +332,4 @@ data:
 
 ## Cross-refs
 
-- `constraints.md` #9, #9a (accelerator prepare scope, sampler geometric constraints)
-- `architecture.md` "Six-Stage Training Pipeline" (Stage 2: K-Repeat Sampling)
-- `architecture.md` "Advantage Computation" (communication path depends on sampler type)
+- UP: [`constraints.md` #9](../constraints.md#9-accelerator-prepare-scope), [`constraints.md` #9a](../constraints.md#9a-sampler-geometric-constraints), [Architecture Execution Pipelines](../architecture.md#execution-pipelines), [Architecture Advantage Computation](../architecture.md#advantage-computation)

@@ -758,3 +758,32 @@ def test_legacy_concatenated_forward_stays_numerically_unchanged(cls: type) -> N
     assert torch.allclose(output.next_latents, torch.cat([expected_video, expected_audio], dim=1))
     assert torch.allclose(output.velocity, torch.cat([video_velocity, audio_velocity], dim=1))
     assert output.log_prob.shape == (BATCH_SIZE,)
+
+
+@pytest.mark.parametrize("cls", [LTX2_T2AV_Adapter, LTX2_I2AV_Adapter])
+def test_neutral_guidance_preserves_raw_velocity_near_clean_endpoint(cls: type) -> None:
+    adapter = _adapter(cls)
+    video = _video_latents()
+    audio = _audio_latents()
+    extra = {"conditioning_mask": _conditioning_mask()} if cls is LTX2_I2AV_Adapter else {}
+
+    output = adapter.forward(
+        t=torch.full((BATCH_SIZE,), 0.06),
+        t_next=torch.zeros(BATCH_SIZE),
+        latents=torch.cat([video, audio], dim=1),
+        video_seq_len=VIDEO_SEQ_LEN,
+        compute_log_prob=False,
+        return_kwargs=["velocity"],
+        preserve_raw_model_velocity=True,
+        **extra,
+        **_forward_kwargs(),
+    )
+
+    expected_video = video * 0.5 + 1.0
+    expected_audio = audio * -0.25 + 2.0
+    assert torch.equal(
+        output.velocity,
+        torch.cat([expected_video, expected_audio], dim=1),
+    )
+    assert adapter.scheduler.steps == []
+    assert adapter.audio_scheduler.steps == []

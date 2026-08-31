@@ -23,6 +23,10 @@ from typing import Any, ClassVar, Dict, Iterator, List, Literal, Sequence, Tuple
 import torch
 from accelerate import Accelerator
 
+from ...contracts.execution import (
+    ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT,
+    ExecutionContract,
+)
 from ...hparams import Arguments, TDMTrainingArguments
 from ...hparams.training_args.dmd2 import DMD2_DEFAULT_OPTIMIZERS
 from ...models.abc import BaseAdapter
@@ -45,8 +49,8 @@ from .distillation_runtime import (
     reference_forward_kwargs,
     reject_training_rewards,
     replay_forward_kwargs,
-    resolve_rollout_accumulation_steps,
     require_velocity,
+    resolve_rollout_accumulation_steps,
     role_repeat_progress,
     run_distillation_training_step,
     run_role_phase,
@@ -80,6 +84,7 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
     """Optimize every boundary of a deterministic few-step generator trajectory."""
 
     paradigm: ClassVar[Literal["distillation"]] = "distillation"
+    execution_contract: ClassVar[ExecutionContract] = ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT
 
     def _optimizer_args_for_role(self, role_name: str):
         """Resolve this role's optimizer, falling back to TDM's published defaults.
@@ -109,7 +114,7 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
         super().__init__(accelerator=accelerator, config=config, adapter=adapter)
         self.training_args: TDMTrainingArguments
         self._rollout_data_iter: Iterator[Any] | None = None
-        self._rollout_dataloader_epoch = 0
+        self._rollout_batches_consumed: int | None = None
         self._validate_trajectory_configuration()
 
     def _init_reward_model(self) -> Tuple[Dict[str, object], Dict[str, object]]:

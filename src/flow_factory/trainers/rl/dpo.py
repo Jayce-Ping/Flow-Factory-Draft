@@ -33,7 +33,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 import tqdm as tqdm_
 from accelerate.utils import broadcast_object_list
 
@@ -46,6 +45,7 @@ from ...utils.dist import gather_samples
 from ...utils.logger_utils import setup_logger
 from ...utils.noise_schedule import TimeSampler
 from ..abc import BaseTrainer
+from ..common import dpo_objective
 from ..common.state_validation import require_latent_state, state_batch_size
 from ..forward_process import forward_velocity_state
 
@@ -448,23 +448,13 @@ class DPOTrainer(BaseTrainer):
         Returns:
             Scalar loss and the per-sample implicit reward / accuracy metrics.
         """
-        beta = self.training_args.beta
-        w_diff = theta_w_err - ref_w_err
-        l_diff = theta_l_err - ref_l_err
-        w_l_diff = w_diff - l_diff
-        inside_term = -0.5 * beta * w_l_diff
-        loss = -F.logsigmoid(inside_term).mean()
-        with torch.no_grad():
-            implicit_reward_chosen = -0.5 * beta * w_diff
-            implicit_reward_rejected = -0.5 * beta * l_diff
-            metrics = {
-                "implicit_reward_chosen": implicit_reward_chosen,
-                "implicit_reward_rejected": implicit_reward_rejected,
-                "implicit_accuracy": (implicit_reward_chosen > implicit_reward_rejected)
-                .float()
-                .mean(),
-            }
-        return loss, metrics
+        return dpo_objective(
+            policy_chosen_loss=theta_w_err,
+            policy_rejected_loss=theta_l_err,
+            reference_chosen_loss=ref_w_err,
+            reference_rejected_loss=ref_l_err,
+            beta=self.training_args.beta,
+        )
 
     # ====================== Reward / advantage (Stages 4--5) ======================
     def prepare_feedback(self, samples: List[BaseSample]) -> None:

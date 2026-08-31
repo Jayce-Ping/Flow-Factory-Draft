@@ -33,6 +33,10 @@ from typing import (
 import torch
 from accelerate import Accelerator
 
+from ...contracts.execution import (
+    ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT,
+    ExecutionContract,
+)
 from ...hparams import Arguments, DMD2TrainingArguments
 from ...hparams.training_args.dmd2 import DMD2_DEFAULT_OPTIMIZERS
 from ...models.abc import BaseAdapter
@@ -68,6 +72,7 @@ class DMD2Trainer(BaseTrainer):
     """Optimize a deterministic few-step generator without real training data."""
 
     paradigm: ClassVar[Literal["distillation"]] = "distillation"
+    execution_contract: ClassVar[ExecutionContract] = ONLINE_NO_FEEDBACK_EXECUTION_CONTRACT
 
     def _optimizer_args_for_role(self, role_name: str):
         """Resolve this role's optimizer, falling back to DMD2's published defaults.
@@ -98,7 +103,7 @@ class DMD2Trainer(BaseTrainer):
         self.training_args: DMD2TrainingArguments
         self._validate_generation_schedule()
         self._rollout_data_iter: Optional[Iterator[Any]] = None
-        self._rollout_dataloader_epoch = 0
+        self._rollout_batches_consumed: Optional[int] = None
         non_ode = {
             name: scheduler.dynamics_type
             for name, scheduler in self.adapter.scheduler_group.items()
