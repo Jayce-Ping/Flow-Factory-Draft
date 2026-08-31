@@ -27,6 +27,7 @@ from accelerate.utils import ProjectConfiguration, set_seed
 from ..hparams import Arguments, get_training_args_class
 from ..models.loader import load_model
 from ..models.registry import get_model_adapter_class
+from ..loading.backend import configure_backend_loading
 from ..utils.env_utils import reconcile_config
 from ..utils.logger_utils import setup_logger
 from .abc import BaseTrainer, validate_supported_distributed_plan
@@ -104,6 +105,7 @@ def load_trainer(config: Arguments) -> BaseTrainer:
         gradient_accumulation_steps=config.training_args.gradient_accumulation_steps,
         kwargs_handlers=[ddp_kwargs],
     )
+    configure_backend_loading(accelerator, adapter_cls)
     # Validate the runtime backend before loading model weights. In particular,
     # constructing an adapter under ZeRO-3 can shard parameters immediately, so
     # rejecting it in BaseTrainer.__init__ is too late.

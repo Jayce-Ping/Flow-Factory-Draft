@@ -23,6 +23,7 @@ from .noising import (
     apply_forward_process_noise,
     build_training_component_times,
     project_velocity_to_clean_state,
+    resolve_replay_projection_times,
 )
 from .reduction import (
     default_reduce_component_latent_values,
@@ -69,6 +70,7 @@ __all__ = [
     "project_flow_match_clean_to_score_state",
     "project_velocity_to_clean_state",
     "replay_generator_boundary",
+    "resolve_replay_projection_times",
     "resolve_component_latent_axes",
     "validate_projected_score_state",
     "validate_reduced_component_values",

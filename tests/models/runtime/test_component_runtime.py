@@ -530,6 +530,7 @@ class AcceleratorFake:
     device = torch.device("cpu")
     distributed_type = DistributedType.NO
     is_fsdp2 = False
+    is_main_process = True
     mixed_precision = "no"
 
     def unwrap_model(self, module: nn.Module) -> nn.Module:
@@ -743,6 +744,8 @@ def test_stage_materialization_applies_explicit_frozen_dtype_policy(
     adapter.on_load_components(["text_encoder"], device=torch.device("cpu"))
 
     assert adapter.pipeline.text_encoder.weight.dtype == torch.float16
+    assert not adapter.pipeline.text_encoder.weight.requires_grad
+    assert not adapter.pipeline.text_encoder.training
 
 
 def test_component_frozen_dtype_policy_applies_to_lazy_modules(
@@ -767,6 +770,8 @@ def test_component_frozen_dtype_policy_applies_to_lazy_modules(
 
     assert adapter.pipeline.text_encoder.weight.dtype == torch.float16
     assert adapter.pipeline.vae.weight.dtype == torch.float32
+    assert not adapter.pipeline.text_encoder.weight.requires_grad
+    assert not adapter.pipeline.vae.weight.requires_grad
 
 
 def test_concrete_frozen_dtype_overrides_group_and_default(
@@ -876,20 +881,28 @@ class LifecycleAdapterFake:
         self.calls.append(("resolve", components))
         return ["transformer", "vae"]
 
-    def uses_fsdp_cpu_efficient_loading(self) -> bool:
-        """Return whether frozen components require rank-zero synchronization."""
-        return self.fsdp_cpu_efficient_loading
-
 
 class TrainerAcceleratorFake:
     """Minimal trainer accelerator fake."""
 
     device = torch.device("cpu")
+    distributed_type = DistributedType.NO
     num_processes = 1
     process_index = 0
 
     def wait_for_everyone(self) -> None:
         """Record no-op synchronization."""
+
+
+class LoadCoordinatorFake:
+    def __init__(self, adapter: LifecycleAdapterFake, *, record_finalize: bool = False):
+        self.adapter = adapter
+        self.record_finalize = record_finalize
+
+    def load_components(self, components: Any, *, device: torch.device) -> None:
+        self.adapter.on_load_components(components=components, device=device)
+        if self.record_finalize:
+            self.adapter.calls.append(("synchronize", components))
 
 
 def test_trainer_preprocessing_routes_through_adapter_public_lifecycle(
@@ -900,6 +913,7 @@ def test_trainer_preprocessing_routes_through_adapter_public_lifecycle(
         adapter=adapter,
         accelerator=TrainerAcceleratorFake(),
         config=SimpleNamespace(data_args=SimpleNamespace(eval_datasets=[])),
+        load_coordinator=LoadCoordinatorFake(adapter),
     )
     monkeypatch.setattr(
         "flow_factory.trainers.abc.get_train_dataloader",
@@ -915,18 +929,15 @@ def test_trainer_preprocessing_routes_through_adapter_public_lifecycle(
     ]
 
 
-def test_trainer_synchronizes_lazy_frozen_components_after_materialization(
+def test_trainer_finalizes_lazy_frozen_components_after_materialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter = LifecycleAdapterFake()
-    adapter.fsdp_cpu_efficient_loading = True
     trainer = SimpleNamespace(
         adapter=adapter,
         accelerator=TrainerAcceleratorFake(),
         config=SimpleNamespace(data_args=SimpleNamespace(eval_datasets=[])),
-        _synchronize_frozen_components=lambda components: adapter.calls.append(
-            ("synchronize", components)
-        ),
+        load_coordinator=LoadCoordinatorFake(adapter, record_finalize=True),
     )
     monkeypatch.setattr(
         "flow_factory.trainers.abc.get_train_dataloader",
@@ -949,6 +960,7 @@ def test_trainer_inference_load_routes_through_adapter_public_lifecycle() -> Non
         adapter=adapter,
         accelerator=TrainerAcceleratorFake(),
         config=SimpleNamespace(data_args=SimpleNamespace(enable_preprocess=True)),
+        load_coordinator=LoadCoordinatorFake(adapter),
     )
 
     BaseTrainer._load_inference_components(trainer, trainable_module_names=[])
@@ -959,16 +971,13 @@ def test_trainer_inference_load_routes_through_adapter_public_lifecycle() -> Non
     ]
 
 
-def test_trainer_synchronizes_lazy_inference_components_after_materialization() -> None:
+def test_trainer_finalizes_lazy_inference_components_after_materialization() -> None:
     adapter = LifecycleAdapterFake()
-    adapter.fsdp_cpu_efficient_loading = True
     trainer = SimpleNamespace(
         adapter=adapter,
         accelerator=TrainerAcceleratorFake(),
         config=SimpleNamespace(data_args=SimpleNamespace(enable_preprocess=True)),
-        _synchronize_frozen_components=lambda components: adapter.calls.append(
-            ("synchronize", components)
-        ),
+        load_coordinator=LoadCoordinatorFake(adapter, record_finalize=True),
     )
 
     BaseTrainer._load_inference_components(trainer, trainable_module_names=[])
@@ -978,41 +987,6 @@ def test_trainer_synchronizes_lazy_inference_components_after_materialization() 
         ("load", ["transformer", "vae"], trainer.accelerator.device),
         ("synchronize", ["transformer", "vae"]),
     ]
-
-
-def test_frozen_component_sync_skips_non_modules_and_broadcasts_buffers(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    module = nn.Linear(2, 2)
-    module.register_buffer("running_value", torch.ones(1))
-    components = {"tokenizer": object(), "vae": module}
-
-    class SyncAdapterFake:
-        def _resolve_component_names(self, requested: Any = None) -> List[str]:
-            return list(components) if requested is None else list(requested)
-
-        def _should_manage_device(self, name: str) -> bool:
-            return True
-
-        def get_component(self, name: str) -> Any:
-            return components[name]
-
-    accelerator = TrainerAcceleratorFake()
-    accelerator.num_processes = 2
-    broadcast_tensors: List[torch.Tensor] = []
-    monkeypatch.setattr(
-        "flow_factory.trainers.abc.dist.broadcast",
-        lambda tensor, src: broadcast_tensors.append(tensor),
-    )
-    trainer = SimpleNamespace(adapter=SyncAdapterFake(), accelerator=accelerator)
-
-    BaseTrainer._synchronize_frozen_components(trainer, ["tokenizer", "vae"])
-
-    assert len(broadcast_tensors) == len(list(module.parameters())) + len(list(module.buffers()))
-    assert any(
-        value.shape == module.running_value.shape and torch.equal(value, module.running_value)
-        for value in broadcast_tensors
-    )
 
 
 def test_declared_component_owns_parameters_without_being_an_adapter_attribute(

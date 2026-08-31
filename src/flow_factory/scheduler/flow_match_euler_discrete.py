@@ -31,6 +31,7 @@ from diffusers.utils.torch_utils import randn_tensor
 
 from ..utils.base import to_broadcast_tensor
 from ..utils.logger_utils import setup_logger
+from ..utils.noise_schedule import flow_match_sigma
 from .abc import SDESchedulerMixin, SDESchedulerOutput
 
 logger = setup_logger(__name__)
@@ -326,8 +327,8 @@ class FlowMatchEulerDiscreteSDEScheduler(FlowMatchEulerDiscreteScheduler, SDESch
             sigma_prev = self.sigmas[[i + 1 for i in step_index]]
         else:
             # `timestep_next` provided
-            sigma = timestep / 1000
-            sigma_prev = timestep_next / 1000
+            sigma = flow_match_sigma(torch.as_tensor(timestep, device=latents.device))
+            sigma_prev = flow_match_sigma(torch.as_tensor(timestep_next, device=latents.device))
 
         # 1. Numerical Preparation
         # Remember input dtype so we can quantize freshly-sampled next_latents

@@ -36,7 +36,7 @@ model:
   lora_rank: 64
   lora_alpha: 128
   target_modules: "default"
-  model_name_or_path: "sensenova/SenseNova-U1.5-8B-MoT"
+  model_name_or_path: "sensenova/SenseNova-U1.5-8B-MoT-SFT"
   model_type: "sensenova"
   resume_path: null
   resume_type: null

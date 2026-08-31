@@ -103,13 +103,32 @@ class Qwen2RotaryEmbedding(nn.Module):
             self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        self.rope_init_fn = (
+            self.compute_default_rope_parameters
+            if self.rope_type == "default"
+            else ROPE_INIT_FUNCTIONS[self.rope_type]
+        )
 
         inv_freq, self.attention_scaling = self.rope_init_fn(
             self.config, device, **self.rope_kwargs
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
+
+    @staticmethod
+    def compute_default_rope_parameters(config, device=None, **kwargs):
+        """Compute default RoPE frequencies without relying on removed registry entries."""
+        if config is None:
+            base = kwargs["base"]
+            dim = kwargs["dim"]
+        else:
+            base = config.rope_theta
+            head_dim = getattr(config, "head_dim", None) or (
+                config.hidden_size // config.num_attention_heads
+            )
+            dim = int(head_dim * getattr(config, "partial_rotary_factor", 1.0))
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        return inv_freq.to(device), 1.0
 
     def _dynamic_frequency_update(self, position_ids, device):
         """

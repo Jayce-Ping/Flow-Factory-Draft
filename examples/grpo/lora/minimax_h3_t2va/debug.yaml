@@ -28,14 +28,11 @@ model:
   target_modules: default
   model_name_or_path: MiniMaxAI/MiniMax-H3
   model_type: minimax-h3-t2va
+  component_load_dtypes: bf16  # Official recipe; Diffusers preserves FP32 islands.
   resume_path: null
   resume_type: null
-  frozen_parameters_dtype:
-    default: null
-    transformers: bf16
-    text_encoders: bf16
-    vae: fp32
-    audio_vae: fp32
+  # Do not override the loader-managed mixed dtype after materialization.
+  frozen_parameters_dtype: null
   trainable_parameters_dtype: bf16
 
 log:

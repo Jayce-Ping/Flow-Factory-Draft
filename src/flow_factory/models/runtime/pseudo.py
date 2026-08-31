@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
+import torch
 import torch.nn as nn
 
 from .abc import ComponentRuntime
@@ -34,6 +35,7 @@ class PseudoPipelineRuntime(ComponentRuntime):
         pipeline: Any,
         components: Mapping[str, Any],
         aliases: Optional[Mapping[str, Any]] = None,
+        alias_routes: Optional[Mapping[str, tuple[str, Sequence[str]]]] = None,
     ) -> None:
         """Initialize an explicit pseudo-pipeline runtime.
 
@@ -41,6 +43,7 @@ class PseudoPipelineRuntime(ComponentRuntime):
             pipeline: Compatibility pipeline/container.
             components: Canonical modules managed by stage lifecycle.
             aliases: Addressable module aliases excluded from stage lifecycle.
+            alias_routes: Alias ownership as ``alias -> (physical root, path)``.
 
         Raises:
             TypeError: If a component or alias is not a ``torch.nn.Module``.
@@ -66,6 +69,21 @@ class PseudoPipelineRuntime(ComponentRuntime):
             )
         self._canonical_components: Dict[str, Any] = dict(components)
         self._alias_components: Dict[str, Any] = dict(aliases)
+        alias_routes = alias_routes or {}
+        self._alias_routes: Dict[str, tuple[str, tuple[str, ...]]] = {}
+        for alias_name, route in alias_routes.items():
+            if alias_name not in self._alias_components:
+                raise ValueError(
+                    f"Pseudo-pipeline alias route {alias_name!r} has no matching alias; "
+                    f"expected one of {sorted(self._alias_components)}"
+                )
+            root, path = route
+            if root not in self._canonical_components:
+                raise ValueError(
+                    f"Pseudo-pipeline alias {alias_name!r} references unknown root={root!r}; "
+                    f"expected one of {sorted(self._canonical_components)}"
+                )
+            self._alias_routes[alias_name] = (root, tuple(path))
 
     @property
     def canonical_components(self) -> Mapping[str, Any]:
@@ -76,6 +94,48 @@ class PseudoPipelineRuntime(ComponentRuntime):
     def alias_components(self) -> Mapping[str, Any]:
         """Return explicit addressable aliases excluded from device lifecycle."""
         return self._alias_components
+
+    def physical_route(self, name: str) -> tuple[str, tuple[str, ...]]:
+        if name in self._alias_routes:
+            return self._alias_routes[name]
+        return super().physical_route(name)
+
+    def load_root_remainder(
+        self,
+        root: str,
+        *,
+        excluded_paths: Sequence[tuple[str, ...]],
+        device: Union[torch.device, str],
+    ) -> None:
+        """Move auxiliary state inside a target-owned pseudo-pipeline root."""
+        component = self._canonical_components[root]
+        self._move_remainder(component, tuple(excluded_paths), device)
+
+    @classmethod
+    def _move_remainder(
+        cls,
+        module: nn.Module,
+        excluded_paths: tuple[tuple[str, ...], ...],
+        device: Union[torch.device, str],
+    ) -> None:
+        """Recursively move a module tree while leaving excluded routes untouched."""
+        if () in excluded_paths:
+            return
+        for parameter in module.parameters(recurse=False):
+            parameter.data = parameter.data.to(device)
+        for buffer in module.buffers(recurse=False):
+            buffer.data = buffer.data.to(device)
+
+        excluded_by_child: Dict[str, List[tuple[str, ...]]] = {}
+        for path in excluded_paths:
+            if path:
+                excluded_by_child.setdefault(path[0], []).append(path[1:])
+        for child_name, child in module.named_children():
+            child_exclusions = excluded_by_child.get(child_name)
+            if child_exclusions is None:
+                child.to(device)
+            elif () not in child_exclusions:
+                cls._move_remainder(child, tuple(child_exclusions), device)
 
     def _get_materialized_component(self, name: str) -> Any:
         if name in self._alias_components:

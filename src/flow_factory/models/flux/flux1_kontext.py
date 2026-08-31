@@ -134,7 +134,8 @@ class Flux1KontextAdapter(BaseAdapter):
         self._has_warned_multi_image = False
 
     def load_pipeline(self) -> FluxKontextPipeline:
-        return FluxKontextPipeline.from_pretrained(
+        return self._load_diffusers_pipeline(
+            FluxKontextPipeline,
             self.model_args.model_name_or_path, low_cpu_mem_usage=False
         )
 

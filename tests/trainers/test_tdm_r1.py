@@ -256,6 +256,8 @@ def test_tdm_r1_constructs_without_guidance_branch_hook() -> None:
         num_inference_steps=1,
         num_inner_epochs=1,
     )
+    trainer.training_args.get_num_train_timesteps = lambda config: 1
+    trainer.config = SimpleNamespace()
     events: list[str] = []
     trainer.epoch = 0
     trainer.log_args = SimpleNamespace(verbose=False)

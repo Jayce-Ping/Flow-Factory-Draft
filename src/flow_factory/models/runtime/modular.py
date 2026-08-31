@@ -14,11 +14,32 @@
 
 from typing import Any, List, Mapping
 
+from ..precision import DTypePolicy, build_component_load_dtype_kwargs
 from .abc import ComponentRuntime
 
 
 class ModularPipelineRuntime(ComponentRuntime):
     """Manage a lazy modular pipeline without importing model-specific classes."""
+
+    def __init__(
+        self,
+        pipeline: Any,
+        *,
+        component_load_dtype_manifest: DTypePolicy = None,
+        component_load_dtype_overrides: DTypePolicy = None,
+    ) -> None:
+        super().__init__(pipeline)
+        self.component_load_dtype_manifest = component_load_dtype_manifest
+        self.component_load_dtype_overrides = component_load_dtype_overrides
+
+    @classmethod
+    def from_adapter(cls, adapter: Any, pipeline: Any) -> "ModularPipelineRuntime":
+        """Build a modular runtime from the adapter's resolved load policy."""
+        return cls(
+            pipeline,
+            component_load_dtype_manifest=adapter._component_load_dtype_manifest,
+            component_load_dtype_overrides=adapter._component_load_dtype_overrides,
+        )
 
     @property
     def canonical_components(self) -> Mapping[str, Any]:
@@ -67,7 +88,17 @@ class ModularPipelineRuntime(ComponentRuntime):
                     f"`load_components(names=...)` is unavailable; expected={unloaded}, "
                     f"received={self._materialized_component_names()}."
                 )
-            load_components(names=unloaded)
+            manifest_policy = self.component_load_dtype_manifest
+            user_policy = self.component_load_dtype_overrides
+            load_kwargs = build_component_load_dtype_kwargs(
+                user_policy=user_policy,
+                manifest_policy=manifest_policy,
+                component_names=self.declared_component_names,
+                transformer_names=self.transformer_names,
+                text_encoder_names=self.text_encoder_names,
+                requested_names=unloaded,
+            )
+            load_components(names=unloaded, **load_kwargs)
 
         missing = [name for name in names if self._get_materialized_component(name) is None]
         if missing:

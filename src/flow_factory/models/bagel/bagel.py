@@ -229,9 +229,16 @@ class BagelAdapter(BaseAdapter):
 
     def load_pipeline(self) -> BagelPseudoPipeline:
         """Load the Bagel model and VAE into a pseudo-pipeline."""
+        component_dtypes = self._resolve_component_load_dtype_mapping(
+            component_names=["bagel", "transformer", "vae"],
+            transformer_names=["transformer"],
+            text_encoder_names=[],
+        )
         pipeline = BagelPseudoPipeline.from_pretrained(
             self._model_path,
             low_cpu_mem_usage=False,
+            component_dtypes=component_dtypes,
+            pad_token_id=self._tokenizer.pad_token_id,
             **self.model_args.extra_kwargs,
         )
         # Train-inference consistency (I2I): the condition-image VAE encode is rebuilt
@@ -257,6 +264,7 @@ class BagelAdapter(BaseAdapter):
                 "vae": pipeline.vae,
             },
             aliases={"transformer": pipeline.transformer},
+            alias_routes={"transformer": ("bagel", ("language_model",))},
         )
 
     def load_scheduler(self) -> FlowMatchEulerDiscreteSDEScheduler:
@@ -557,6 +565,10 @@ class BagelAdapter(BaseAdapter):
                 )
 
     # ======================== Decoding ========================
+
+    def reference_guidance_kwargs(self, guidance_scale: float) -> Dict[str, object]:
+        """Map canonical reference guidance to Bagel's text-CFG forward argument."""
+        return {"cfg_text_scale": guidance_scale}
 
     def decode_latents(
         self,
@@ -1164,11 +1176,21 @@ class BagelAdapter(BaseAdapter):
         log_probs_stacked = torch.stack(all_log_probs, dim=0) if all_log_probs is not None else None
         callback_results = result.get("callback_results") or {}
 
+        images = self.decode_latents(final_latents, image_shape=image_shape)
+        if not isinstance(images, list):
+            raise TypeError(
+                "expected Bagel batched decode to return a list, "
+                f"received {type(images).__name__} for final_latents shape="
+                f"{tuple(final_latents.shape)}"
+            )
+        if len(images) != batch_size:
+            raise ValueError(
+                "expected one Bagel decoded image per sample, "
+                f"received {len(images)} images for batch_size={batch_size}"
+            )
+
         samples: List[BagelSample] = []
         for b in range(batch_size):
-            final_latent = final_latents[b].float()  # (n, d)
-            image = self.decode_latents(final_latent, image_shape=image_shape)
-
             cur_cond_images = (
                 condition_images_list[b] if condition_images_list is not None else None
             )
@@ -1193,7 +1215,7 @@ class BagelAdapter(BaseAdapter):
                 # Image
                 height=height,
                 width=width,
-                image=image,
+                image=images[b],
                 image_shape=image_shape,
                 # Condition images (for I2I)
                 **(

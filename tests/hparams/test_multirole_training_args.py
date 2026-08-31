@@ -94,7 +94,7 @@ def test_multirole_defaults_and_frozen_reference_only_surface() -> None:
     assert tdm.gradient_step_per_epoch == 1
     assert tdm.use_huber is True
     assert tdm.num_inference_steps == 4
-    assert tdm.get_num_train_timesteps(None) == 1
+    assert tdm.get_num_train_timesteps(None) == 4
     assert tdm.replay_rtol == 1e-4
     assert tdm.replay_atol == 1e-4
 
@@ -159,35 +159,47 @@ def test_per_role_optimizers_parse_from_the_top_level_list() -> None:
     assert surrogate.learning_rate == 6e-5
 
 
+def test_multirole_config_rejects_invalid_declared_fields() -> None:
+    with pytest.raises((TypeError, ValueError), match="perturbation_timestep_range"):
+        _parse_train(
+            "dmd2",
+            train_overrides={"perturbation_timestep_range": [False, True]},
+        )
+
+
 @pytest.mark.parametrize(
-    "train_overrides,match",
-    [
-        ({"fake_optmizer": {"learning_rate": 1e-5}}, "fake_optmizer"),
-        ({"fake_updates_per_generator": 3}, "fake_updates_per_generator"),
-        ({"perturbation_timestep_range": [False, True]}, "perturbation_timestep_range"),
-        ({"dfake_gen_update_ratio": 0}, "dfake_gen_update_ratio"),
-        ({"dfake_gen_update_ratio": 1.5}, "dfake_gen_update_ratio"),
-    ],
+    "args_cls",
+    [DMD2TrainingArguments, TDMTrainingArguments, TDMR1TrainingArguments],
 )
-def test_multirole_config_rejects_unknown_or_mistyped_fields(
-    train_overrides: dict,
-    match: str,
-) -> None:
-    with pytest.raises((TypeError, ValueError), match=match):
-        _parse_train("dmd2", train_overrides=train_overrides)
+def test_multirole_training_args_declare_shared_model_inference_fields(args_cls) -> None:
+    args = args_cls.from_dict(
+        {
+            "num_frames": 124,
+            "frame_rate": 24.0,
+            "extra_kwargs": {"timestep_shift": 3.0},
+        }
+    )
+
+    assert args.num_frames == 124
+    assert args.frame_rate == 24.0
+    assert args.extra_kwargs == {"timestep_shift": 3.0}
+    assert dict(args)["num_frames"] == 124
+    assert dict(args)["frame_rate"] == 24.0
+    assert dict(args)["timestep_shift"] == 3.0
 
 
 @pytest.mark.parametrize(
     "field_name",
     ["surrogate_beta", "generator_kl_beta", "dm_step_scale", "dm_loss_type"],
 )
-def test_tdm_r1_rejects_removed_generalized_fields(field_name: str) -> None:
-    with pytest.raises(ValueError, match=field_name):
-        _parse_train(
-            "tdm-r1",
-            train_overrides={"group_size": 2, field_name: 1.0},
-            rewards=[{"name": "score", "reward_model": "clip"}],
-        )
+def test_tdm_r1_forwards_undeclared_fields_through_extra_kwargs(field_name: str) -> None:
+    config = _parse_train(
+        "tdm-r1",
+        train_overrides={"group_size": 2, field_name: 1.0},
+        rewards=[{"name": "score", "reward_model": "clip"}],
+    )
+
+    assert config.training_args.extra_kwargs[field_name] == 1.0
 
 
 def test_role_plans_and_base_trainer_config_seams_are_exact() -> None:
@@ -267,7 +279,7 @@ def test_tdm_variants_accept_ttur_fake_updates(
     assert _parse_train(trainer_type, **kwargs).training_args.ttur_fake_updates == 2
 
 
-def test_dmd2_and_tdm_r1_auto_gas_stay_one() -> None:
+def test_dmd2_stays_one_while_tdm_r1_auto_gas_counts_boundaries() -> None:
     automatic = _parse_train("dmd2").training_args
     tdm_r1 = _parse_train(
         "tdm-r1",
@@ -277,10 +289,11 @@ def test_dmd2_and_tdm_r1_auto_gas_stay_one() -> None:
 
     assert automatic.num_batches_per_epoch == 8
     assert automatic.gradient_accumulation_steps == 1
-    assert tdm_r1.gradient_accumulation_steps == 1
+    assert tdm_r1.num_batches_per_epoch == 8
+    assert tdm_r1.gradient_accumulation_steps == 32
 
 
-@pytest.mark.parametrize("manual_gas", [2, 63, 64, 65, 128])
+@pytest.mark.parametrize("manual_gas", [4, 64, 128])
 def test_tdm_r1_accepts_manual_gas(
     manual_gas: int,
 ) -> None:
@@ -295,6 +308,24 @@ def test_tdm_r1_accepts_manual_gas(
 
     assert training_args.gradient_accumulation_steps == manual_gas
     assert training_args._manual_gradient_accumulation_steps is True
+
+
+@pytest.mark.parametrize("manual_gas", [2, 63, 65])
+def test_tdm_r1_rejects_manual_gas_not_divisible_by_boundaries(
+    manual_gas: int,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"gradient_accumulation_steps.*divisible.*num_inference_steps=4",
+    ):
+        _parse_train(
+            "tdm-r1",
+            train_overrides={
+                "group_size": 2,
+                "gradient_accumulation_steps": manual_gas,
+            },
+            rewards=[{"name": "score", "reward_model": "clip"}],
+        )
 
 
 def test_dmd2_default_geometry_resolves_one_batch_per_outer_iteration() -> None:

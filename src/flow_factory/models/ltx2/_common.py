@@ -33,7 +33,7 @@ from ...samples import (
 )
 from ...scheduler import SDESchedulerOutput
 from ...utils.base import filter_kwargs
-from ...utils.noise_schedule import flow_match_sigma
+from ...utils.noise_schedule import flow_match_sigma, validate_flow_match_coordinates
 from ..component_reduction import reduce_component_log_probs
 
 # Both LTX2 adapters expose one joint video+audio policy, so the authoritative
@@ -604,6 +604,11 @@ def _validate_ltx2_component_schedule(
                 f"rollout transition plus the terminal coordinate, shape (T + 1,) with T >= 1, "
                 f"received {tuple(timesteps.shape)}"
             )
+        validate_flow_match_coordinates(
+            timesteps,
+            sigmas,
+            identifier=f"{name} component {component!r} schedule timesteps/sigmas",
+        )
         if float(timesteps[-1]) != 0.0 or float(sigmas[-1]) != 0.0:
             raise ValueError(
                 f"expected the {name} component {component!r} full schedule to end at the "

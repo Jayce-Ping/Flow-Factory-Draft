@@ -58,16 +58,16 @@ class TDMTrainingArguments(DMD2TrainingArguments):
         )
 
     def get_num_train_timesteps(self, args: Any) -> int:
-        """Count one accumulation unit per rollout; K boundaries are averaged.
+        """Count one backend accumulation unit per trajectory boundary.
 
         Args:
             args: Parent arguments object; unused because TDM owns the unit count.
 
         Returns:
-            ``1`` so auto GAS stays one generator step per outer iteration.
+            Number of independently backpropagated trajectory boundaries.
         """
         del args
-        return 1
+        return self.num_inference_steps
 
     @staticmethod
     def _validate_replay_tolerance(value: object, field_name: str) -> float:

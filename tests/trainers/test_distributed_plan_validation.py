@@ -245,7 +245,7 @@ def test_tdm_r1_fsdp1_disables_incompatible_activation_checkpointing() -> None:
     assert plugin.activation_checkpointing is False
 
 
-def test_tdm_r1_fsdp2_keeps_activation_checkpointing_enabled() -> None:
+def test_fsdp2_keeps_model_checkpointing_and_disables_nested_backend_checkpointing() -> None:
     from flow_factory.trainers.abc import BaseTrainer
 
     plugin = SimpleNamespace(fsdp_version=2, activation_checkpointing=True)
@@ -260,7 +260,7 @@ def test_tdm_r1_fsdp2_keeps_activation_checkpointing_enabled() -> None:
         ),
         adapter=SimpleNamespace(
             disable_gradient_checkpointing=lambda: pytest.fail(
-                "FSDP2 must keep checkpointing enabled"
+                "FSDP2 must keep model checkpointing enabled"
             )
         ),
     )
@@ -268,4 +268,25 @@ def test_tdm_r1_fsdp2_keeps_activation_checkpointing_enabled() -> None:
     BaseTrainer._apply_backend_checkpointing_constraints(trainer)
 
     assert trainer.training_args.enable_gradient_checkpointing is True
+    assert plugin.activation_checkpointing is False
+
+
+def test_fsdp2_keeps_backend_checkpointing_when_model_policy_is_disabled() -> None:
+    from flow_factory.trainers.abc import BaseTrainer
+
+    plugin = SimpleNamespace(fsdp_version=2, activation_checkpointing=True)
+    trainer = SimpleNamespace(
+        accelerator=SimpleNamespace(
+            distributed_type=DistributedType.FSDP,
+            state=SimpleNamespace(fsdp_plugin=plugin),
+        ),
+        training_args=SimpleNamespace(
+            trainer_type="grpo",
+            enable_gradient_checkpointing=False,
+        ),
+        adapter=SimpleNamespace(),
+    )
+
+    BaseTrainer._apply_backend_checkpointing_constraints(trainer)
+
     assert plugin.activation_checkpointing is True

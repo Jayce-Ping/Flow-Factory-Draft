@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 import torch
 import torch.nn as nn
@@ -147,6 +147,7 @@ class BagelPseudoPipeline:
         model_path: str,
         vae_path: Optional[str] = None,
         low_cpu_mem_usage: bool = False,
+        component_dtypes: Optional[Mapping[str, torch.dtype]] = None,
         **kwargs,
     ) -> "BagelPseudoPipeline":
         """
@@ -173,6 +174,7 @@ class BagelPseudoPipeline:
                       Defaults to ``<model_path>/ae.safetensors``.
             low_cpu_mem_usage: If True, use ``init_empty_weights`` to defer
                                weight materialization (for multi-GPU dispatch).
+            component_dtypes: Optional resolved dtype per Bagel runtime component.
             **kwargs: Extra arguments.  HuggingFace download keys
                       (``revision``, ``cache_dir``, ``token``, …) are
                       forwarded to ``snapshot_download``; model-building
@@ -186,6 +188,7 @@ class BagelPseudoPipeline:
         llm_config = Qwen2Config.from_json_file(os.path.join(model_path, "llm_config.json"))
         llm_config.qk_norm = True
         llm_config.tie_word_embeddings = False
+        llm_config.pad_token_id = kwargs.get("pad_token_id", llm_config.eos_token_id)
         llm_config.layer_module = kwargs.get("layer_module", "Qwen2MoTDecoderLayer")
 
         # ---- ViT Config ----
@@ -230,6 +233,16 @@ class BagelPseudoPipeline:
             if os.path.exists(ema_path):
                 state_dict = load_file(ema_path)
                 model.load_state_dict(state_dict, strict=False)
+
+        component_dtypes = component_dtypes or {}
+        bagel_dtype = component_dtypes.get("bagel")
+        transformer_dtype = component_dtypes.get("transformer")
+        if bagel_dtype is not None:
+            model.to(dtype=bagel_dtype)
+        if transformer_dtype is not None and transformer_dtype != bagel_dtype:
+            model.language_model.to(dtype=transformer_dtype)
+        if "vae" in component_dtypes:
+            vae_model.to(dtype=component_dtypes["vae"])
 
         return cls(
             bagel=model,

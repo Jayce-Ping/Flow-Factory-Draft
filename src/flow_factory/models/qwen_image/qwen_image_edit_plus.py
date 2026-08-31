@@ -136,7 +136,8 @@ class QwenImageEditPlusAdapter(BaseAdapter):
         self._has_warned_inference_auto_resize = False
 
     def load_pipeline(self) -> QwenImageEditPlusPipeline:
-        return QwenImageEditPlusPipeline.from_pretrained(
+        return self._load_diffusers_pipeline(
+            QwenImageEditPlusPipeline,
             self.model_args.model_name_or_path, low_cpu_mem_usage=False
         )
 

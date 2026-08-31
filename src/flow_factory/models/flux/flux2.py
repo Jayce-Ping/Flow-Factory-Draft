@@ -94,7 +94,8 @@ class Flux2Adapter(BaseAdapter):
         self._has_warned_preprocess_fallback = False
 
     def load_pipeline(self) -> Flux2Pipeline:
-        return Flux2Pipeline.from_pretrained(
+        return self._load_diffusers_pipeline(
+            Flux2Pipeline,
             self.model_args.model_name_or_path, low_cpu_mem_usage=False
         )
 

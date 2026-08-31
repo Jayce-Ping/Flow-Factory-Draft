@@ -26,6 +26,7 @@ from accelerate import Accelerator
 from ...hparams import Arguments, TDMTrainingArguments
 from ...hparams.training_args.dmd2 import DMD2_DEFAULT_OPTIMIZERS
 from ...models.abc import BaseAdapter
+from ...models.trajectory_bridge import resolve_replay_projection_times
 from ...samples import (
     BaseSample,
     ComponentTimes,
@@ -34,7 +35,6 @@ from ...samples import (
     StackedSampleBatch,
 )
 from ..abc import BaseTrainer
-from .dmd2 import DMD2Trainer
 from .distillation_runtime import (
     as_role_microbatches,
     detach_state,
@@ -45,6 +45,7 @@ from .distillation_runtime import (
     reference_forward_kwargs,
     reject_training_rewards,
     replay_forward_kwargs,
+    resolve_rollout_accumulation_steps,
     require_velocity,
     role_repeat_progress,
     run_distillation_training_step,
@@ -57,6 +58,7 @@ from .distribution_matching import (
     tdm_fake_loss,
     tdm_generator_loss,
 )
+from .dmd2 import DMD2Trainer
 from .tdm_trajectory import TDMBoundaryUnit, TDMTrajectoryRuntimeMixin
 
 
@@ -123,7 +125,7 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
         return reject_training_rewards(self, algorithm_name="TDM")
 
     def _run_training_step(self) -> None:
-        """Run GAS distinct trajectory rollouts and one fake/generator phase pair.
+        """Run timestep-aligned trajectory rollouts and one fake/generator phase pair.
 
         Overriding only this keeps the shared epoch loop, so checkpointing and
         eval-time reward monitoring behave exactly as they do for every other
@@ -150,53 +152,58 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
         del samples
 
     def optimize(self, samples: Sequence[Any]) -> None:
-        """Run fake TTUR updates, then one generator step, over GAS replay batches."""
+        """Run fake TTUR updates, then one generator step, over all boundaries."""
         if not samples:
             return
+        rollout_accumulation_steps = resolve_rollout_accumulation_steps(
+            self.training_args,
+        )
         microbatches = as_role_microbatches(
             samples,
             batch_size=self.training_args.per_device_batch_size,
-            accumulation_steps=self.training_args.gradient_accumulation_steps,
+            accumulation_steps=rollout_accumulation_steps,
             algorithm_name="TDM",
         )
+        boundary_units = self._flatten_boundary_units(microbatches)
         self.adapter.train()
         for _ in role_repeat_progress(
             self, role_name="fake", repeats=self.training_args.ttur_fake_updates
         ):
-            self._fake_phase(microbatches)
-        self._generator_phase(microbatches)
+            self._fake_phase(boundary_units)
+        self._generator_phase(boundary_units)
 
-    def _mean_boundary_loss(
+    def _flatten_boundary_units(
         self,
-        units: Sequence[TDMBoundaryUnit],
-        loss_fn,
-    ) -> torch.Tensor:
-        """Average one complete ordered boundary window into a single scalar."""
-        losses = [loss_fn(unit) for unit in units]
-        return torch.stack(losses).mean()
+        microbatches: Sequence[Sequence[BaseSample]],
+    ) -> List[TDMBoundaryUnit]:
+        """Flatten rollout-major boundaries into backend auto-GAS work items."""
+        units = [
+            unit for microbatch in microbatches for unit in self._build_boundary_units(microbatch)
+        ]
+        expected = self.training_args.gradient_accumulation_steps
+        if len(units) != expected:
+            raise RuntimeError(
+                f"TDM expected {expected} boundary work items from "
+                f"{len(microbatches)} rollout batches, received {len(units)}"
+            )
+        return units
 
-    def _fake_phase(self, microbatches: Sequence[Sequence[BaseSample]]) -> None:
-        """Fit the fake score over one complete ordered boundary window per microbatch."""
+    def _fake_phase(self, boundary_units: Sequence[TDMBoundaryUnit]) -> None:
+        """Fit the fake score over timestep-aligned boundary work items."""
         run_role_phase(
             self,
             "fake",
-            microbatches,
-            lambda batch: self._mean_boundary_loss(
-                self._build_boundary_units(batch),
-                self._fake_boundary_loss,
-            ),
+            boundary_units,
+            self._fake_boundary_loss,
         )
 
-    def _generator_phase(self, microbatches: Sequence[Sequence[BaseSample]]) -> None:
-        """Update the generator over the identical ordered boundary window per microbatch."""
+    def _generator_phase(self, boundary_units: Sequence[TDMBoundaryUnit]) -> None:
+        """Update the generator over the identical ordered boundary work items."""
         run_role_phase(
             self,
             "generator",
-            microbatches,
-            lambda batch: self._mean_boundary_loss(
-                self._build_boundary_units(batch),
-                self._generator_boundary_loss,
-            ),
+            boundary_units,
+            self._generator_boundary_loss,
         )
 
     def _fake_boundary_loss(self, unit: TDMBoundaryUnit) -> torch.Tensor:
@@ -204,19 +211,12 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
         with torch.no_grad():
             batch, clean_state, model_noise = self._replay_generator_prediction(unit)
         detached_clean = detach_state(clean_state)
-        mid_times = self.adapter.build_training_component_times(unit.interval_start, batch=batch)
-        primary_times = self._sample_perturbation_times(unit)
-        times = self.adapter.build_training_component_times(primary_times, batch=batch)
-        self._validate_score_query_sigmas(
-            times,
-            primary_times,
-            boundary_index=unit.boundary_index,
-        )
+        times = self._sample_score_query_times(unit, batch)
         noised, importance = tdm_conditional_renoise(
             self.adapter,
             detached_clean,
             detach_state(model_noise),
-            mid_times=mid_times,
+            mid_times=unit.mid_times,
             target_times=times,
             importance_clip=self.training_args.tdm_importance_clip,
         )
@@ -253,19 +253,12 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
     def _generator_score_terms(self, unit: TDMBoundaryUnit) -> TDMGeneratorScoreTerms:
         """Replay a live clean prediction and query scores on conditional stage noise."""
         batch, clean_state, model_noise = self._replay_generator_prediction(unit)
-        mid_times = self.adapter.build_training_component_times(unit.interval_start, batch=batch)
-        primary_times = self._sample_perturbation_times(unit)
-        times = self.adapter.build_training_component_times(primary_times, batch=batch)
-        self._validate_score_query_sigmas(
-            times,
-            primary_times,
-            boundary_index=unit.boundary_index,
-        )
+        times = self._sample_score_query_times(unit, batch)
         noised, _ = tdm_conditional_renoise(
             self.adapter,
             detach_state(clean_state),
             detach_state(model_noise),
-            mid_times=mid_times,
+            mid_times=unit.mid_times,
             target_times=times,
             importance_clip=self.training_args.tdm_importance_clip,
         )
@@ -342,9 +335,10 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
                     **self._replay_forward_kwargs(batch),
                 )
         velocity = require_velocity(output, algorithm_name="TDM", role_name="generator")
-        primary_name = self.adapter.trajectory_component_order[0]
-        projection_times = self.adapter.build_training_component_times(
-            replay_step.times.timestep[primary_name],
+        projection_times = self._normalize_replay_times(replay_step.times, len(unit.samples))
+        projection_times = resolve_replay_projection_times(
+            self.adapter,
+            projection_times,
             batch=batch,
         )
         clean_state = self.adapter.project_velocity_to_clean_state(
@@ -386,7 +380,7 @@ class TDMTrainer(TDMTrajectoryRuntimeMixin, BaseTrainer):
 
     def _reference_forward_kwargs(self, batch: StackedSampleBatch) -> Dict[str, object]:
         """Return forward arguments for the real score, which alone may be guided."""
-        return reference_forward_kwargs(self.training_args, batch)
+        return reference_forward_kwargs(self.adapter, self.training_args, batch)
 
     def _validate_media_free_rollout(self) -> None:
         """Require inference to expose a suppressible media reconstruction seam."""

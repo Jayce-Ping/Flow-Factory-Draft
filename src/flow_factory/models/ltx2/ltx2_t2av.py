@@ -174,7 +174,8 @@ class LTX2_T2AV_Adapter(BaseAdapter):
     # ============================== Pipeline Loading ==============================
 
     def load_pipeline(self) -> LTX2Pipeline:
-        return LTX2Pipeline.from_pretrained(
+        return self._load_diffusers_pipeline(
+            LTX2Pipeline,
             self.model_args.model_name_or_path,
             low_cpu_mem_usage=False,  # Required for FSDP compatibility
         )

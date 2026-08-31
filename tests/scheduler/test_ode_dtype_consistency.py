@@ -100,6 +100,54 @@ def test_ode_replay_uses_the_stored_boundary_but_recomputes_the_same_mean(
     "scheduler_type",
     [FlowMatchEulerDiscreteSDEScheduler, UniPCMultistepSDEScheduler],
 )
+def test_explicit_python_scalar_time_coordinates_remain_supported(
+    scheduler_type: Type,
+) -> None:
+    scheduler = scheduler_type(dynamics_type="ODE")
+    latents = torch.tensor([[1.0, -1.0]])
+    velocity = torch.tensor([[0.25, -0.5]])
+
+    output = scheduler.step(
+        velocity=velocity,
+        timestep=750.0,
+        timestep_next=250.0,
+        latents=latents,
+        compute_log_prob=False,
+    )
+
+    torch.testing.assert_close(
+        output.next_latents,
+        latents - 0.5 * velocity,
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "scheduler_type",
+    [FlowMatchEulerDiscreteSDEScheduler, UniPCMultistepSDEScheduler],
+)
+@pytest.mark.parametrize("timestep", [-1.0, 1001.0, float("inf")])
+def test_explicit_invalid_time_coordinates_fail_fast(
+    scheduler_type: Type,
+    timestep: float,
+) -> None:
+    scheduler = scheduler_type(dynamics_type="ODE")
+
+    with pytest.raises(ValueError, match=r"t_scheduler.*\[0, 1000\]"):
+        scheduler.step(
+            velocity=torch.zeros(1, 2),
+            timestep=timestep,
+            timestep_next=250.0,
+            latents=torch.zeros(1, 2),
+            compute_log_prob=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "scheduler_type",
+    [FlowMatchEulerDiscreteSDEScheduler, UniPCMultistepSDEScheduler],
+)
 def test_sde_and_ode_step_selection_share_epoch_seeded_randomness(
     scheduler_type: Type,
 ) -> None:

@@ -439,7 +439,8 @@ train:
     tdm_snr_gamma: 5.0
 ```
 
-See [`examples/tdm/lora/sd3_5/ocr.yaml`](../examples/tdm/lora/sd3_5/ocr.yaml).
+See [`examples/tdm/lora/sd3_5/ocr.yaml`](../examples/tdm/lora/sd3_5/ocr.yaml)
+and [`examples/tdm/lora/minimax_h3_t2va/default.yaml`](../examples/tdm/lora/minimax_h3_t2va/default.yaml).
 
 ## TDM-R1
 

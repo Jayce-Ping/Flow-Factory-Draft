@@ -59,6 +59,22 @@ The adapter's `inference()` method corresponds to the pipeline's `__call__()`, w
 
 Your adapter only needs to implement the model-specific logic: **how to encode inputs, how to run inference, and how to perform a single denoising step**.
 
+### Gradient checkpointing contract
+
+`train.enable_gradient_checkpointing` accepts the existing boolean or a selective
+policy such as `{mode: fraction, fraction: 0.25}`, `{every_n: 4}`, or
+`{layers: [0, 4, 8]}`. Selective policies discover ordered blocks from a
+Diffusers model's `_repeated_blocks` declaration. Adapters with multiple forward
+stacks should override `_gradient_checkpointing_units()` and return their blocks
+in execution order.
+
+Checkpointing has one owner. An explicit train-level model policy disables FSDP
+activation checkpointing to avoid nested recomputation; when the train-level
+policy is disabled, the backend may apply full FSDP activation checkpointing.
+Transformers-style components support full checkpointing through
+`gradient_checkpointing_enable()`, but must expose the Diffusers callback API to
+support selective modes.
+
 ## Step-by-Step Implementation
 
 ### Step 1: Define Sample Dataclass
@@ -836,6 +852,17 @@ Choose the runtime explicitly in `build_component_runtime()`:
   pipeline.
 
 Component membership uses canonical lookup through declared specs, not `hasattr`.
+When a logical target is a submodule alias of a larger physical root, declare
+`alias_routes` explicitly, for example
+`{"transformer": ("bagel", ("language_model",))}`. The load planner then marks
+the physical root as target-owned; auxiliary lifecycle code can move frozen
+siblings but must leave the prepared target route untouched. `BaseAdapter`
+freezes materialized roots before reopening the logical target.
+
+Adapters should leave `supports_fsdp2_cpu_efficient_loading = False` unless their
+component source can selectively materialize TARGET state without applying the
+rank-zero/meta policy to text encoders, VAEs, or reward models. Modular adapters
+that satisfy this contract may opt in.
 Keep declared specs distinct from materialized modules; use
 `materialize_components(None)` only when the workflow genuinely needs every
 declaration. A prepared/replacement override must be installed through the runtime so

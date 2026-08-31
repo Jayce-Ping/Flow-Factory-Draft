@@ -65,8 +65,10 @@ instance attribute.
 - `SchedulerGroup` owns ordered mode and seed dispatch; mapping iteration never defines RNG order.
 - `ModelBundle` plus `RoutedComponentProxy` is the sole distributed preparation runtime.
 - Trainer stages call public adapter lifecycle methods so model-specific overrides remain active.
-  `uses_fsdp_cpu_efficient_loading()` is public for exactly this reason: under that mode only rank
-  zero holds real weights before `prepare`, and the trainer orders broadcasts around it.
+- `ModelLoadCoordinator` compiles logical names and physical roots into one immutable load plan;
+  its backend runtime owns rank-zero/meta target loading and replicated auxiliary/reward loading.
+- A target-owned composite root may still contain frozen auxiliary siblings. Pseudo runtimes move
+  only that remainder and exclude every prepared target route.
 
 ## Failure modes
 

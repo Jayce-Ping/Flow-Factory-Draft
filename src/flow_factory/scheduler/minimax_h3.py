@@ -24,6 +24,7 @@ from diffusers.schedulers.scheduling_utils import SchedulerMixin
 from diffusers.utils.torch_utils import randn_tensor
 
 from ..utils.base import to_broadcast_tensor
+from ..utils.noise_schedule import flow_match_sigma
 from .abc import SDESchedulerMixin, SDESchedulerOutput
 
 
@@ -682,8 +683,8 @@ class MiniMaxH3SDEScheduler(SchedulerMixin, ConfigMixin, SDESchedulerMixin):
                 value_tensor = torch.as_tensor(value)
                 if not bool(torch.isfinite(value_tensor).all()):
                     raise ValueError(f"expected finite {field}, received {value_tensor.tolist()}")
-            current = torch.as_tensor(timestep, dtype=torch.float32) / 1000
-            following = torch.as_tensor(timestep_next, dtype=torch.float32) / 1000
+            current = flow_match_sigma(torch.as_tensor(timestep, dtype=torch.float32))
+            following = flow_match_sigma(torch.as_tensor(timestep_next, dtype=torch.float32))
         else:
             index = self.index_for_timestep(timestep)
             current = self.sigmas[index]

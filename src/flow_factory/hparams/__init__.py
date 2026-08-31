@@ -18,6 +18,10 @@ from .acceleration_args import AccelerationArguments, AccelerationSpec
 from .args import Arguments
 from .data_args import DataArguments
 from .dataset_args import DatasetArguments, DatasetEvalSpec, DatasetTrainSpec
+from .gradient_checkpointing import (
+    GradientCheckpointingPolicy,
+    GradientCheckpointingSpec,
+)
 from .log_args import LogArguments
 from .model_args import ModelArguments
 from .optimizer_args import (
@@ -51,6 +55,8 @@ __all__ = [
     "ModelArguments",
     "SchedulerArguments",
     "TrainingArguments",
+    "GradientCheckpointingPolicy",
+    "GradientCheckpointingSpec",
     "GRPOTrainingArguments",
     "DPPOTrainingArguments",
     "NFTTrainingArguments",

@@ -42,11 +42,43 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from .precision import within_one_native_ulp
+
 TIMESTEP_MAX = 1000.0
 
 
 def flow_match_sigma(t_scheduler: torch.Tensor) -> torch.Tensor:
-    """Map scheduler timestep in [0, TIMESTEP_MAX] to σ in [0, 1] for x_t = (1-σ)x0 + σ ε."""
+    """Map a valid scheduler timestep to flow-matching sigma.
+
+    Args:
+        t_scheduler: Scheduler-scale tensor in ``[0, TIMESTEP_MAX]``.
+
+    Returns:
+        Sigma in ``[0, 1]`` with the caller's floating dtype, or the default
+        floating dtype for integer inputs.
+
+    Raises:
+        TypeError: If ``t_scheduler`` is not a tensor.
+        ValueError: If any timestep is non-finite or outside the public range.
+    """
+    if not isinstance(t_scheduler, torch.Tensor):
+        raise TypeError(
+            "expected torch.Tensor t_scheduler, received "
+            f"{type(t_scheduler).__name__}: {t_scheduler!r}"
+        )
+    if (
+        not bool(torch.isfinite(t_scheduler).all())
+        or bool((t_scheduler < 0).any())
+        or bool((t_scheduler > TIMESTEP_MAX).any())
+    ):
+        raise ValueError(
+            f"expected t_scheduler in [0, {TIMESTEP_MAX:g}], received " f"{t_scheduler.tolist()}"
+        )
+    return _flow_match_sigma_unchecked(t_scheduler)
+
+
+def _flow_match_sigma_unchecked(t_scheduler: torch.Tensor) -> torch.Tensor:
+    """Convert an already-validated scheduler tensor without host synchronization."""
     output_dtype = (
         t_scheduler.dtype if t_scheduler.is_floating_point() else torch.get_default_dtype()
     )
@@ -55,6 +87,74 @@ def flow_match_sigma(t_scheduler: torch.Tensor) -> torch.Tensor:
     # float64, then restore the caller's dtype so strict open intervals remain
     # strict and CPU/GPU produce the same result.
     return (t_scheduler.to(torch.float64) / TIMESTEP_MAX).clamp(0.0, 1.0).to(output_dtype)
+
+
+def validate_flow_match_coordinates(
+    t_scheduler: torch.Tensor,
+    sigma: torch.Tensor,
+    *,
+    identifier: str = "flow-matching coordinates",
+) -> None:
+    """Validate redundant flow-matching coordinates within one native ULP.
+
+    ``t_scheduler`` and ``sigma`` may be rounded independently when one is
+    materialized as ``sigma * TIMESTEP_MAX``. Comparing in sigma space with the
+    larger native unit in the last place (ULP) accepts that representation noise
+    without hiding a semantic schedule mismatch.
+
+    Args:
+        t_scheduler: Scheduler-scale timesteps in ``[0, TIMESTEP_MAX]``.
+        sigma: Flow-matching sigma coordinates in ``[0, 1]``.
+
+    Raises:
+        TypeError: If timestep is not a real numeric tensor or sigma is not floating.
+        ValueError: If shape, device, domain, or coordinate relation is invalid.
+    """
+    if (
+        not isinstance(t_scheduler, torch.Tensor)
+        or t_scheduler.dtype == torch.bool
+        or t_scheduler.is_complex()
+    ):
+        raise TypeError(
+            f"expected {identifier} t_scheduler as real numeric torch.Tensor, received "
+            f"{type(t_scheduler).__name__}/{getattr(t_scheduler, 'dtype', None)}"
+        )
+    if not isinstance(sigma, torch.Tensor) or not sigma.is_floating_point():
+        raise TypeError(
+            f"expected {identifier} sigma as floating torch.Tensor, received "
+            f"{type(sigma).__name__}/{getattr(sigma, 'dtype', None)}"
+        )
+    if t_scheduler.shape != sigma.shape:
+        raise ValueError(
+            f"expected {identifier} shapes to match, received "
+            f"t_scheduler={tuple(t_scheduler.shape)} and sigma={tuple(sigma.shape)}"
+        )
+    if t_scheduler.device != sigma.device:
+        raise ValueError(
+            f"expected {identifier} devices to match, received "
+            f"t_scheduler={t_scheduler.device} and sigma={sigma.device}"
+        )
+    valid = (
+        torch.isfinite(t_scheduler)
+        & torch.isfinite(sigma)
+        & (t_scheduler >= 0)
+        & (t_scheduler <= TIMESTEP_MAX)
+        & (sigma >= 0)
+        & (sigma <= 1)
+    )
+    if not bool(valid.all()):
+        raise ValueError(
+            f"expected {identifier} timestep and sigma finite with timestep in "
+            f"[0, {TIMESTEP_MAX:g}] and sigma in [0, 1], received "
+            f"timestep={t_scheduler.tolist()} and sigma={sigma.tolist()}"
+        )
+
+    expected_sigma = _flow_match_sigma_unchecked(t_scheduler)
+    if not within_one_native_ulp(expected_sigma, sigma):
+        raise ValueError(
+            f"expected {identifier} timestep == sigma * {TIMESTEP_MAX:g} within one native "
+            f"ULP, received timestep={t_scheduler.tolist()} and sigma={sigma.tolist()}"
+        )
 
 
 def fraction_range_to_t_bounds(frac_lo: float, frac_hi: float) -> Tuple[float, float]:

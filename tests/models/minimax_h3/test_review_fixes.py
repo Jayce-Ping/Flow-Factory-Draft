@@ -71,6 +71,10 @@ def _state(batch_size: int = 1, value: float = 0.0) -> LatentState:
     )
 
 
+def test_media_free_video_batch_unwraps_to_single_sample_none() -> None:
+    assert workflow._decoded_video_sample([None]) is None
+
+
 def _times(batch_size: int = 1) -> ComponentTimes:
     return ComponentTimes(
         timestep={name: torch.full((batch_size,), 500.0) for name in ("video", "audio")},

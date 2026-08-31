@@ -33,6 +33,7 @@ from .distillation_runtime import (
     generate_one_rollout_batch,
     query_score_velocity,
     record_distillation_metric,
+    resolve_rollout_accumulation_steps,
     require_velocity,
     role_repeat_progress,
     run_role_phase,
@@ -111,31 +112,32 @@ class TDMR1Trainer(TDMTrainer):
         """Run fake TTUR, one surrogate step, then one generator step."""
         if not samples:
             return
+        rollout_accumulation_steps = resolve_rollout_accumulation_steps(
+            self.training_args,
+        )
         microbatches = as_role_microbatches(
             samples,
             batch_size=self.training_args.per_device_batch_size,
-            accumulation_steps=self.training_args.gradient_accumulation_steps,
+            accumulation_steps=rollout_accumulation_steps,
             algorithm_name="TDM-R1",
         )
+        boundary_units = self._flatten_boundary_units(microbatches)
         self.adapter.train()
         for _ in role_repeat_progress(
             self, role_name="fake", repeats=self.training_args.ttur_fake_updates
         ):
-            self._fake_phase(microbatches)
-        self._surrogate_phase(microbatches)
-        self._generator_phase(microbatches)
+            self._fake_phase(boundary_units)
+        self._surrogate_phase(boundary_units)
+        self._generator_phase(boundary_units)
 
-    def _surrogate_phase(self, microbatches: Sequence[Sequence[BaseSample]]) -> None:
+    def _surrogate_phase(self, boundary_units: Sequence[TDMBoundaryUnit]) -> None:
         """Update the surrogate with group preference on endpoint advantages."""
         self._ensure_slow_surrogate()
         run_role_phase(
             self,
             "surrogate",
-            microbatches,
-            lambda batch: self._mean_boundary_loss(
-                self._build_boundary_units(batch),
-                self._surrogate_boundary_loss,
-            ),
+            boundary_units,
+            self._surrogate_boundary_loss,
         )
         # Increase snapshot lag gradually so the trust-region clip strengthens over time.
         decay = min(
@@ -342,7 +344,9 @@ class TDMR1Trainer(TDMTrainer):
             active_masks=terms.boundary_state.active_masks,
         )
 
-    def _surrogate_reward_direction(self, batch: Any, terms: Any) -> tuple[LatentState, LatentState]:
+    def _surrogate_reward_direction(
+        self, batch: Any, terms: Any
+    ) -> tuple[LatentState, LatentState]:
         """Return the surrogate's guided direction against its frozen reference.
 
         The surrogate is queried with guidance so its learned preference is amplified the
@@ -431,13 +435,7 @@ class TDMR1Trainer(TDMTrainer):
         batch = self._stack_replay_unit(unit.samples)
         replay_step = self.adapter.get_replay_step(batch, unit.boundary_index - 1)
         boundary_state = detach_state(replay_step.next_state)
-        primary_times = self._sample_perturbation_times(unit)
-        times = self.adapter.build_training_component_times(primary_times, batch=batch)
-        self._validate_score_query_sigmas(
-            times,
-            primary_times,
-            boundary_index=unit.boundary_index,
-        )
+        times = self._sample_score_query_times(unit, batch)
         return batch, self.adapter.add_forward_process_noise(boundary_state, times), times
 
     def _boundary_preference_values(
@@ -454,13 +452,7 @@ class TDMR1Trainer(TDMTrainer):
         batch = self._stack_replay_unit(unit.samples)
         replay_step = self.adapter.get_replay_step(batch, unit.boundary_index - 1)
         boundary_state = detach_state(replay_step.next_state)
-        primary_times = self._sample_perturbation_times(unit)
-        times = self.adapter.build_training_component_times(primary_times, batch=batch)
-        self._validate_score_query_sigmas(
-            times,
-            primary_times,
-            boundary_index=unit.boundary_index,
-        )
+        times = self._sample_score_query_times(unit, batch)
         noised = self.adapter.add_forward_process_noise(boundary_state, times)
         return self._score_boundary_values(batch, noised, times, trainable_role)
 

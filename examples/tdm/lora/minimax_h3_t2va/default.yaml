@@ -1,0 +1,107 @@
+# MiniMax H3 T2VA six-step trajectory distribution matching.
+# MiniMax H3 requires B=1 and has no CFG; guidance must remain neutral at 1.0.
+# Run for over 200 steps to approach convergence.
+
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 8
+main_process_port: 29500
+mixed_precision: "bf16"
+
+data:
+  datasets:
+    - name: vid_prompt
+      dataset_dir: "dataset/vid_prompt"
+      train:
+        weight: 1
+        max_dataset_size: 1024
+      eval:
+        max_dataset_size: 128
+  preprocessing_batch_size: 1
+  dataloader_num_workers: 8
+  force_reprocess: false
+  cache_dir: "~/.cache/flow_factory/datasets"
+  preprocess_parallelism: local
+  sampler_type: "auto"
+
+model:
+  model_type: "minimax-h3-t2va"
+  model_name_or_path: "MiniMaxAI/MiniMax-H3"
+  component_load_dtypes: "bf16"
+  finetune_type: "lora"
+  lora_rank: 256
+  lora_alpha: 512
+  target_components: "transformer"
+  target_modules: "default"
+  frozen_parameters_dtype: null
+  trainable_parameters_dtype: "bf16"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: null
+  project: "Flow-Factory-TDM"
+  logging_backend: "wandb"
+  save_dir: "saves/"
+  save_freq: 20
+  save_model_only: true
+
+train:
+  trainer_type: "tdm"
+  max_epochs: 10000
+  resolution: [512, 768]
+  num_frames: 124
+  frame_rate: 24.0
+  num_inference_steps: 6
+  guidance_scale: 1.0
+
+  per_device_batch_size: 1
+  group_size: 1
+  unique_sample_num_per_epoch: 64
+  gradient_step_per_epoch: 1
+  gradient_accumulation_steps: "auto"
+  shuffle_samples: false
+
+  ttur_fake_updates: 1
+  use_huber: true
+  huber_c: 0.001
+  tdm_snr_gamma: 5.0
+  tdm_importance_clip: 20.0
+
+  enable_gradient_checkpointing:
+    mode: full
+  offload_samples_to_cpu: true
+  latent_storage_dtype: "fp16"
+  ema_decay: 0
+  ema_update_interval: 1
+  ema_device: "cuda"
+  replay_rtol: 0
+  replay_atol: 0
+  seed: 42
+
+scheduler:
+  dynamics_type: "ODE"
+
+eval:
+  eval_freq: 30
+  resolution: [512, 768]
+  num_frames: 124
+  frame_rate: 24.0
+  per_device_batch_size: 1
+  guidance_scale: 1.0
+  num_inference_steps: 6
+  seed: 42
+
+optimizers:
+  - name: "generator"
+    learning_rate: 1.0e-5
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    max_grad_norm: 1.0
+  - name: "fake"
+    learning_rate: 1.0e-5
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    max_grad_norm: 1.0

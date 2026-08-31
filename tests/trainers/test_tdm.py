@@ -22,6 +22,7 @@ from accelerate import Accelerator
 
 from flow_factory.hparams import Arguments, TDMTrainingArguments
 from flow_factory.models.abc import BaseAdapter
+from flow_factory.models.minimax_h3 import MiniMaxH3T2VAAdapter
 from flow_factory.samples import (
     BaseSample,
     ComponentTimes,
@@ -31,7 +32,7 @@ from flow_factory.samples import (
     StackedSampleBatch,
     StructuredTrajectory,
 )
-from flow_factory.scheduler import SDESchedulerOutput
+from flow_factory.scheduler import MiniMaxH3SDEScheduler, SDESchedulerOutput
 from flow_factory.trainers.abc import BaseTrainer
 from flow_factory.trainers.distillation.tdm import TDMBoundaryUnit, TDMTrainer
 from flow_factory.trainers.distillation.tdm_trajectory import TDMTrajectoryRuntimeMixin
@@ -85,7 +86,7 @@ class TinyTDMAdapter(BaseAdapter):
             },
             sigma={
                 "video": primary_timesteps / 1000,
-                "audio": audio_timesteps / 500,
+                "audio": audio_timesteps / 1000,
             },
             next_sigma={
                 "video": torch.zeros_like(primary_timesteps),
@@ -167,7 +168,7 @@ class ObjectiveTDMAdapter(BaseAdapter):
             },
             sigma={
                 "video": primary_timesteps / 1000,
-                "audio": audio_timesteps / 500,
+                "audio": audio_timesteps / 1000,
             },
             next_sigma={
                 "video": torch.zeros_like(primary_timesteps),
@@ -290,6 +291,8 @@ def _sample(
     audio_states: torch.Tensor | None = None,
     video_times: torch.Tensor | None = None,
     audio_times: torch.Tensor | None = None,
+    video_sigmas: torch.Tensor | None = None,
+    audio_sigmas: torch.Tensor | None = None,
 ) -> BaseSample:
     index_map = (
         torch.tensor([0, 1, 2], dtype=torch.int64) if state_index_map is None else state_index_map
@@ -307,7 +310,7 @@ def _sample(
                         else video_states
                     ),
                     timesteps=video_schedule,
-                    sigmas=video_schedule / 1000,
+                    sigmas=video_schedule / 1000 if video_sigmas is None else video_sigmas,
                     state_index_map=index_map,
                 ),
                 "audio": ComponentTrajectory(
@@ -317,7 +320,7 @@ def _sample(
                         else audio_states
                     ),
                     timesteps=audio_schedule,
-                    sigmas=audio_schedule / 500,
+                    sigmas=audio_schedule / 1000 if audio_sigmas is None else audio_sigmas,
                     state_index_map=(
                         index_map.clone()
                         if audio_state_index_map is None
@@ -335,7 +338,7 @@ def _trainer(**overrides: Any) -> TDMTrainer:
         "num_inference_steps": 2,
         "num_inner_epochs": 1,
         "per_device_batch_size": 1,
-        "gradient_accumulation_steps": 1,
+        "gradient_accumulation_steps": 2,
         "ttur_fake_updates": 1,
         "use_huber": False,
         "huber_c": 1e-3,
@@ -345,6 +348,10 @@ def _trainer(**overrides: Any) -> TDMTrainer:
     }
     defaults.update(overrides)
     trainer.training_args = SimpleNamespace(**defaults)
+    trainer.training_args.get_num_train_timesteps = (
+        lambda config: trainer.training_args.num_inference_steps
+    )
+    trainer.config = SimpleNamespace()
     trainer.adapter = TinyTDMAdapter()
     trainer.accelerator = SimpleNamespace(device=torch.device("cpu"), is_local_main_process=True)
     trainer.log_args = SimpleNamespace(verbose=False)
@@ -354,8 +361,26 @@ def _trainer(**overrides: Any) -> TDMTrainer:
     return trainer
 
 
+def _boundary_times(
+    adapter: BaseAdapter,
+    interval_start: torch.Tensor,
+    interval_end: torch.Tensor,
+) -> tuple[ComponentTimes, ComponentTimes]:
+    current = adapter.build_training_component_times(interval_end)
+    following = adapter.build_training_component_times(interval_start)
+    return (
+        ComponentTimes(
+            timestep=current.timestep,
+            next_timestep=following.timestep,
+            sigma=current.sigma,
+            next_sigma=following.sigma,
+        ),
+        following,
+    )
+
+
 def _objective_trainer() -> tuple[TDMTrainer, ObjectiveTDMAdapter, ObjectiveBundle]:
-    accelerator = Accelerator(cpu=True, gradient_accumulation_steps=1)
+    accelerator = Accelerator(cpu=True, gradient_accumulation_steps=2)
     bundle = ObjectiveBundle()
     adapter = ObjectiveTDMAdapter(bundle)
     configs = {
@@ -401,12 +426,13 @@ def _objective_trainer() -> tuple[TDMTrainer, ObjectiveTDMAdapter, ObjectiveBund
     trainer.training_args = TDMTrainingArguments(
         num_inference_steps=2,
         per_device_batch_size=1,
-        gradient_accumulation_steps=1,
+        gradient_accumulation_steps=2,
         ttur_fake_updates=1,
         use_huber=False,
         replay_rtol=0,
         replay_atol=0,
     )
+    trainer.config = SimpleNamespace()
     trainer.autocast = nullcontext
     trainer.step = 0
     trainer.epoch = 0
@@ -423,7 +449,7 @@ def test_tdm_config_counts_every_boundary_in_one_generator_window() -> None:
     training_args = TDMTrainingArguments()
 
     assert training_args.gradient_step_per_epoch == 1
-    assert training_args.get_num_train_timesteps(SimpleNamespace()) == 1
+    assert training_args.get_num_train_timesteps(SimpleNamespace()) == 4
 
     resolved = Arguments.from_dict(
         {
@@ -437,7 +463,7 @@ def test_tdm_config_counts_every_boundary_in_one_generator_window() -> None:
         }
     ).training_args
     assert resolved.num_batches_per_epoch == 8
-    assert resolved.gradient_accumulation_steps == 1
+    assert resolved.gradient_accumulation_steps == 32
 
 
 @pytest.mark.parametrize("manual_gas", [8, 16, 64])
@@ -471,6 +497,175 @@ def test_tdm_builds_every_boundary_with_half_open_non_overlapping_intervals() ->
     torch.testing.assert_close(units[1].interval_end, torch.tensor([500.0]))
     assert all(isinstance(unit, TDMBoundaryUnit) for unit in units)
     assert all(len(unit.samples) == 1 and unit.samples[0] is sample for unit in units)
+
+
+def test_tdm_keeps_stored_component_coordinates_at_discrete_boundaries() -> None:
+    trainer = _trainer()
+    stored_audio_timestep = torch.nextafter(torch.tensor(250.0), torch.tensor(float("inf")))
+    stored_audio_sigma = torch.nextafter(torch.tensor(0.25), torch.tensor(float("inf")))
+    sample = _sample(
+        audio_times=torch.tensor([500.0, stored_audio_timestep.item(), 0.0]),
+        audio_sigmas=torch.tensor([0.5, stored_audio_sigma.item(), 0.0]),
+    )
+
+    first, second = trainer._build_boundary_units([sample])
+
+    assert torch.equal(first.mid_times.timestep["audio"], stored_audio_timestep.reshape(1))
+    assert torch.equal(first.mid_times.sigma["audio"], stored_audio_sigma.reshape(1))
+    assert torch.equal(second.mid_times.timestep["audio"], torch.zeros(1))
+    assert torch.equal(second.mid_times.sigma["audio"], torch.zeros(1))
+
+
+def test_tdm_preserves_each_stored_coordinate_native_dtype() -> None:
+    trainer = _trainer()
+    video_timesteps = torch.tensor([1000.0, 500.0, 0.0], dtype=torch.float16)
+    video_sigmas = torch.tensor([1.0, 0.5002, 0.0], dtype=torch.float32)
+
+    first, second = trainer._build_boundary_units(
+        [_sample(video_times=video_timesteps, video_sigmas=video_sigmas)]
+    )
+
+    assert first.times.timestep["video"].dtype == torch.float16
+    assert first.mid_times.sigma["video"].dtype == torch.float32
+    assert torch.equal(first.mid_times.sigma["video"], video_sigmas[1:2])
+    assert torch.equal(second.times.sigma["video"], video_sigmas[1:2])
+
+
+def _h3_trainer_and_sample(
+    num_steps: int,
+) -> tuple[TDMTrainer, BaseSample, MiniMaxH3T2VAAdapter, torch.Tensor, torch.Tensor]:
+    adapter = object.__new__(MiniMaxH3T2VAAdapter)
+    adapter.pipeline = SimpleNamespace()
+    adapter.scheduler = MiniMaxH3SDEScheduler(shift=12.0, dynamics_type="ODE")
+    adapter.audio_scheduler = MiniMaxH3SDEScheduler(shift=3.0, dynamics_type="ODE")
+    adapter.scheduler.set_timesteps(num_steps)
+    adapter.audio_scheduler.set_timesteps(num_steps)
+    adapter.scheduler_group = {
+        "video": adapter.scheduler,
+        "audio": adapter.audio_scheduler,
+    }
+    video_timesteps = adapter.scheduler.sigmas * 1000
+    audio_timesteps = adapter.audio_scheduler.sigmas * 1000
+    index_map = torch.arange(num_steps + 1, dtype=torch.int64)
+    sample = BaseSample(
+        prompt_embeds=torch.tensor([1.0]),
+        trajectory=StructuredTrajectory(
+            components={
+                "video": ComponentTrajectory(
+                    states=torch.arange(num_steps + 1, dtype=torch.float32).reshape(-1, 1),
+                    timesteps=video_timesteps,
+                    sigmas=adapter.scheduler.sigmas,
+                    state_index_map=index_map,
+                ),
+                "audio": ComponentTrajectory(
+                    states=torch.arange(num_steps + 1, dtype=torch.float32).reshape(-1, 1),
+                    timesteps=audio_timesteps,
+                    sigmas=adapter.audio_scheduler.sigmas,
+                    state_index_map=index_map.clone(),
+                ),
+            }
+        ),
+    )
+    trainer = _trainer(num_inference_steps=num_steps)
+    trainer.adapter = adapter
+    return trainer, sample, adapter, video_timesteps, audio_timesteps
+
+
+@pytest.mark.parametrize("num_steps", [4, 10, 50, 1000])
+def test_tdm_uses_authoritative_h3_boundaries_without_grid_snapping(num_steps: int) -> None:
+    trainer, sample, adapter, video_timesteps, audio_timesteps = _h3_trainer_and_sample(num_steps)
+    analytic = adapter.build_training_component_times(video_timesteps)
+    assert not torch.equal(analytic.timestep["audio"], audio_timesteps)
+
+    units = trainer._build_boundary_units([sample])
+
+    assert len(units) == num_steps
+    for index, unit in enumerate(units):
+        assert torch.equal(unit.times.timestep["audio"], audio_timesteps[index : index + 1])
+        assert torch.equal(
+            unit.mid_times.timestep["audio"],
+            audio_timesteps[index + 1 : index + 2],
+        )
+        assert torch.equal(
+            unit.mid_times.sigma["audio"],
+            adapter.audio_scheduler.sigmas[index + 1 : index + 2],
+        )
+
+
+def test_tdm_resamples_h3_secondary_endpoint_rounding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer, sample, _, _, _ = _h3_trainer_and_sample(50)
+    unit = trainer._build_boundary_units([sample])[0]
+    batch = trainer._stack_replay_unit(unit.samples)
+    fractions = iter((torch.finfo(torch.float32).eps, 0.5))
+    draw_count = 0
+
+    def boundary_then_midpoint(*shape: Any, **kwargs: Any) -> torch.Tensor:
+        nonlocal draw_count
+        del shape
+        draw_count += 1
+        return torch.full(
+            unit.interval_start.shape,
+            next(fractions),
+            device=kwargs["device"],
+            dtype=kwargs["dtype"],
+        )
+
+    monkeypatch.setattr(torch, "rand", boundary_then_midpoint)
+
+    times = trainer._sample_score_query_times(unit, batch)
+
+    assert draw_count == 2
+    for name in trainer.adapter.trajectory_component_order:
+        assert bool((times.timestep[name] > unit.times.next_timestep[name]).all())
+        assert bool((times.timestep[name] < unit.times.timestep[name]).all())
+        assert bool((times.sigma[name] > unit.times.next_sigma[name]).all())
+        assert bool((times.sigma[name] < unit.times.sigma[name]).all())
+
+
+def test_tdm_fails_when_no_jointly_representable_mapped_interior_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = _trainer()
+    unit = trainer._build_boundary_units([_sample()])[0]
+    batch = trainer._stack_replay_unit(unit.samples)
+    original_mapping = trainer.adapter.build_training_component_times
+    mapping_calls = 0
+
+    def map_audio_to_lower_boundary(
+        primary_timesteps: torch.Tensor,
+        *,
+        batch: StackedSampleBatch | None = None,
+    ) -> ComponentTimes:
+        nonlocal mapping_calls
+        mapping_calls += 1
+        mapped = original_mapping(primary_timesteps, batch=batch)
+        lower_timestep = unit.times.next_timestep["audio"]
+        lower_sigma = unit.times.next_sigma["audio"]
+        mapped.timestep["audio"] = lower_timestep
+        mapped.sigma["audio"] = lower_sigma
+        return mapped
+
+    trainer.adapter.build_training_component_times = map_audio_to_lower_boundary
+    monkeypatch.setattr(
+        torch,
+        "rand",
+        lambda *shape, **kwargs: torch.full(
+            unit.interval_start.shape,
+            0.5,
+            device=kwargs["device"],
+            dtype=kwargs["dtype"],
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"jointly representable.*after 8 attempts.*boundary_index=1",
+    ):
+        trainer._sample_score_query_times(unit, batch)
+
+    assert mapping_calls == 8
 
 
 def test_tdm_samples_inside_each_boundary_half_open_interval() -> None:
@@ -518,11 +713,13 @@ def test_tdm_upper_interior_maps_to_sigma_strictly_below_one_on_cuda(
     trainer = _trainer()
     interval_start = torch.tensor([900.0], device="cuda", dtype=torch.float32)
     interval_end = torch.tensor([1000.0], device="cuda", dtype=torch.float32)
+    times, mid_times = _boundary_times(trainer.adapter, interval_start, interval_end)
     unit = TDMBoundaryUnit(
         samples=(_sample(),),
         boundary_index=1,
-        interval_start=interval_start,
-        interval_end=interval_end,
+        primary_name="video",
+        times=times,
+        mid_times=mid_times,
     )
 
     def upper_rand(*shape: Any, **kwargs: Any) -> torch.Tensor:
@@ -596,10 +793,7 @@ def test_tdm_rejects_zero_custom_mapped_sigma_before_score_queries() -> None:
     adapter.build_training_component_times = zero_audio_sigma
     with pytest.raises(
         ValueError,
-        match=(
-            r"boundary_index=2.*component='audio'.*tau=.*finite and strictly positive.*"
-            r"received sigma="
-        ),
+        match=r"mapped continuous.*component 'audio'.*boundary_index=2.*sigma \* 1000.*ULP",
     ):
         trainer._generator_boundary_loss(terminal_unit)
 
@@ -610,11 +804,13 @@ def test_tdm_rejects_interval_without_representable_interior() -> None:
     trainer = _trainer()
     start = torch.tensor([1.0])
     end = torch.nextafter(start, torch.tensor([float("inf")]))
+    times, mid_times = _boundary_times(trainer.adapter, start, end)
     unit = TDMBoundaryUnit(
         samples=(_sample(),),
         boundary_index=1,
-        interval_start=start,
-        interval_end=end,
+        primary_name="video",
+        times=times,
+        mid_times=mid_times,
     )
 
     with pytest.raises(ValueError, match=r"no representable floating interior"):
@@ -624,12 +820,11 @@ def test_tdm_rejects_interval_without_representable_interior() -> None:
 @pytest.mark.parametrize(
     ("video_times", "expected_type"),
     [
-        (torch.tensor([1000, 500, 0], dtype=torch.int64), "int64"),
         (torch.tensor([True, True, False]), "bool"),
         (torch.tensor([1000 + 0j, 500 + 0j, 0 + 0j]), "complex"),
     ],
 )
-def test_tdm_rejects_nonfloating_primary_coordinates(
+def test_tdm_rejects_nonreal_primary_coordinates(
     video_times: torch.Tensor,
     expected_type: str,
 ) -> None:
@@ -637,9 +832,22 @@ def test_tdm_rejects_nonfloating_primary_coordinates(
 
     with pytest.raises(
         TypeError,
-        match=rf"primary.*timestep.*floating.*{expected_type}",
+        match=rf"stored timestep.*component='video'.*real numeric.*{expected_type}",
     ):
         trainer._build_boundary_units([_sample(video_times=video_times)])
+
+
+def test_tdm_accepts_integral_primary_coordinates() -> None:
+    trainer = _trainer()
+    video_times = torch.tensor([1000, 500, 0], dtype=torch.int64)
+
+    units = trainer._build_boundary_units([_sample(video_times=video_times)])
+    sampled = trainer._sample_perturbation_times(units[0])
+
+    assert len(units) == 2
+    assert units[0].times.timestep["video"].dtype == torch.int64
+    assert sampled.is_floating_point()
+    assert bool(((sampled < 1000) & (sampled > 500)).all())
 
 
 @pytest.mark.parametrize("bad_value", [float("nan"), float("inf")])
@@ -649,7 +857,7 @@ def test_tdm_rejects_nonfinite_primary_coordinates(bad_value: float) -> None:
 
     with pytest.raises(
         ValueError,
-        match=r"primary.*timestep.*boundary_index=2.*finite",
+        match=r"stored next_timestep.*component='video'.*boundary_index=2.*finite",
     ):
         trainer._build_boundary_units([_sample(video_times=video_times)])
 
@@ -657,9 +865,8 @@ def test_tdm_rejects_nonfinite_primary_coordinates(bad_value: float) -> None:
 @pytest.mark.parametrize(
     ("bad_value", "error_type", "match"),
     [
-        (torch.tensor([500], dtype=torch.int64), TypeError, r"floating.*int64"),
-        (torch.tensor([True]), TypeError, r"floating.*bool"),
-        (torch.tensor([500 + 0j]), TypeError, r"floating.*complex"),
+        (torch.tensor([True]), TypeError, r"real numeric.*bool"),
+        (torch.tensor([500 + 0j]), TypeError, r"real numeric.*complex"),
         (torch.tensor([float("nan")]), ValueError, r"finite"),
         (torch.tensor([float("inf")]), ValueError, r"finite"),
     ],
@@ -680,15 +887,71 @@ def test_tdm_rejects_invalid_component_coordinates(
         invalid = bad_value.to(primary_timesteps.device).expand_as(primary_timesteps)
         return ComponentTimes(
             timestep={"video": primary_timesteps, "audio": invalid},
-            next_timestep={"video": primary_timesteps, "audio": invalid},
+            next_timestep={
+                "video": torch.zeros_like(primary_timesteps),
+                "audio": torch.zeros_like(invalid),
+            },
+            sigma={
+                "video": primary_timesteps / 1000,
+                "audio": primary_timesteps / 2000,
+            },
+            next_sigma={
+                "video": torch.zeros_like(primary_timesteps),
+                "audio": torch.zeros_like(primary_timesteps),
+            },
         )
 
-    trainer.adapter.build_training_component_times = invalid_component_times
+    unit = trainer._build_boundary_units([_sample()])[0]
+    primary_times = (unit.interval_start + unit.interval_end) / 2
+    times = invalid_component_times(primary_times)
     with pytest.raises(
         error_type,
-        match=rf"interval_end.*component='audio'.*{match}",
+        match=rf"mapped continuous timestep/sigma.*component 'audio'.*{match}",
     ):
-        trainer._build_boundary_units([_sample()])
+        trainer._validate_score_query_coordinates(times, primary_times, unit=unit)
+
+
+def test_tdm_rejects_a_mapped_component_time_outside_the_stored_interval() -> None:
+    trainer = _trainer()
+    unit = trainer._build_boundary_units([_sample()])[0]
+    primary_times = (unit.interval_start + unit.interval_end) / 2
+    times = trainer.adapter.build_training_component_times(primary_times)
+    times.timestep["audio"] = unit.times.next_timestep["audio"].clone()
+    times.sigma["audio"] = unit.times.next_sigma["audio"].clone()
+
+    with pytest.raises(
+        ValueError,
+        match=r"continuous timestep.*strictly inside.*component='audio'",
+    ):
+        trainer._validate_score_query_coordinates(times, primary_times, unit=unit)
+
+
+def test_tdm_resamples_legacy_sigma_that_rounds_to_one() -> None:
+    trainer = _trainer()
+    lower_primary = torch.tensor([900.0])
+    upper_primary = torch.tensor([1000.0])
+    current = trainer.adapter.build_training_component_times(upper_primary)
+    following = trainer.adapter.build_training_component_times(lower_primary)
+    stored_times = ComponentTimes(
+        timestep=current.timestep,
+        next_timestep=following.timestep,
+    )
+    unit = TDMBoundaryUnit(
+        samples=(_sample(),),
+        boundary_index=1,
+        primary_name="video",
+        times=stored_times,
+        mid_times=following,
+    )
+    primary_times = torch.nextafter(upper_primary, lower_primary)
+    times = trainer.adapter.build_training_component_times(primary_times)
+    times.sigma["video"] = torch.ones_like(times.sigma["video"])
+
+    with pytest.raises(
+        ValueError,
+        match=r"continuous sigma.*lower boundary.*strictly below one.*component='video'",
+    ):
+        trainer._validate_score_query_coordinates(times, primary_times, unit=unit)
 
 
 @pytest.mark.parametrize(
@@ -705,16 +968,23 @@ def test_tdm_rejects_tiny_nonzero_interval_gap_or_overlap(
 ) -> None:
     trainer = _trainer()
     batch = trainer._stack_replay_unit((_sample(),))
-    times = trainer.adapter.build_training_component_times(torch.tensor([current_end]), batch=batch)
+    times, _ = _boundary_times(
+        trainer.adapter,
+        torch.tensor([0.0]),
+        torch.tensor([current_end]),
+    )
+    previous_times, _ = _boundary_times(
+        trainer.adapter,
+        torch.tensor([previous_start]),
+        torch.tensor([1000.0]),
+    )
 
     with pytest.raises(ValueError, match=rf"exact.*{kind}"):
         trainer._validate_interval(
             batch,
             times,
             boundary_index=2,
-            interval_start=torch.tensor([0.0]),
-            interval_end=torch.tensor([current_end]),
-            previous_interval_start=torch.tensor([previous_start]),
+            previous_times=previous_times,
         )
 
 
@@ -730,28 +1000,44 @@ def test_tdm_rejects_tiny_nonzero_terminal_coordinate() -> None:
         sigma=end_times.sigma,
         next_sigma=start_times.sigma,
     )
+    previous_times, _ = _boundary_times(
+        trainer.adapter,
+        torch.tensor([500.0]),
+        torch.tensor([1000.0]),
+    )
 
     with pytest.raises(ValueError, match=r"terminal.*exact.*zero"):
         trainer._validate_interval(
             batch,
             times,
             boundary_index=2,
-            interval_start=tiny_terminal,
-            interval_end=torch.tensor([500.0]),
-            previous_interval_start=torch.tensor([500.0]),
+            previous_times=previous_times,
         )
 
 
-def test_tdm_rejects_tiny_component_endpoint_mismatch() -> None:
+def test_tdm_rejects_tiny_component_topology_overlap() -> None:
     trainer = _trainer()
-    trainer.training_args.replay_atol = 1.0
-    audio_times = torch.tensor([500.0, 250.0 + 1e-4, 0.0])
+    batch = trainer._stack_replay_unit((_sample(),))
+    previous_times, _ = _boundary_times(
+        trainer.adapter,
+        torch.tensor([500.0]),
+        torch.tensor([1000.0]),
+    )
+    times, _ = _boundary_times(
+        trainer.adapter,
+        torch.tensor([0.0]),
+        torch.tensor([500.0]),
+    )
+    times.timestep["audio"] = times.timestep["audio"] + 1e-4
+    times.sigma["audio"] = times.timestep["audio"] / 1000
 
-    with pytest.raises(
-        ValueError,
-        match=r"component='audio'.*exact.*endpoint='interval_start'",
-    ):
-        trainer._build_boundary_units([_sample(audio_times=audio_times)])
+    with pytest.raises(ValueError, match=r"component='audio'.*timestep.*exact.*overlap"):
+        trainer._validate_interval(
+            batch,
+            times,
+            boundary_index=2,
+            previous_times=previous_times,
+        )
 
 
 @pytest.mark.parametrize(
@@ -787,7 +1073,6 @@ def test_tdm_rejects_non_dense_or_misaligned_state_maps(
         ({"state_index_map": torch.tensor([0, -1, 2])}, "reading transition .* failed"),
         ({"video_times": torch.tensor([1000.0, 500.0, 100.0])}, "gap|terminal"),
         ({"video_times": torch.tensor([1000.0, 1100.0, 0.0])}, "reversed"),
-        ({"audio_times": torch.tensor([500.0, 300.0, 0.0])}, "shared interval"),
     ],
 )
 def test_tdm_rejects_invalid_boundary_geometry(
@@ -806,26 +1091,52 @@ def test_tdm_rejects_non_ode_before_building_units() -> None:
     with pytest.raises(ValueError, match=r"deterministic ODE.*audio.*Flow-SDE"):
         non_ode._build_boundary_units([_sample()])
 
-def test_tdm_optimize_runs_fake_ttur_then_generator_over_identical_ordered_units() -> None:
-    trainer = _trainer(ttur_fake_updates=3)
-    events: list[tuple[str, tuple[int, ...]]] = []
 
-    def record(self: TDMTrainer, microbatches: list, name: str) -> None:
-        units = self._build_boundary_units(microbatches[0])
-        events.append((name, tuple(unit.boundary_index for unit in units)))
+def test_tdm_optimize_runs_fake_ttur_then_generator_over_identical_ordered_units() -> None:
+    trainer = _trainer(ttur_fake_updates=3, gradient_accumulation_steps=4)
+    events: list[tuple[str, tuple[tuple[int, float], ...]]] = []
+
+    def record(self: TDMTrainer, units: list, name: str) -> None:
+        ordered = []
+        for unit in units:
+            trajectory = unit.samples[0].trajectory
+            assert trajectory is not None
+            ordered.append(
+                (
+                    unit.boundary_index,
+                    float(trajectory.components["video"].states[0].item()),
+                )
+            )
+        events.append((name, tuple(ordered)))
 
     trainer._fake_phase = MethodType(lambda self, units: record(self, units, "fake"), trainer)
     trainer._generator_phase = MethodType(
         lambda self, units: record(self, units, "generator"), trainer
     )
 
-    trainer.optimize([_sample()])
+    trainer.optimize(
+        [
+            [_sample()],
+            [
+                _sample(
+                    video_states=torch.tensor([[10.0], [11.0], [12.0]]),
+                    audio_states=torch.tensor([[20.0], [21.0], [22.0]]),
+                )
+            ],
+        ]
+    )
 
-    assert events == [("fake", (1, 2)), ("fake", (1, 2)), ("fake", (1, 2)), ("generator", (1, 2))]
+    ordered = ((1, 0.0), (2, 0.0), (1, 10.0), (2, 10.0))
+    assert events == [
+        ("fake", ordered),
+        ("fake", ordered),
+        ("fake", ordered),
+        ("generator", ordered),
+    ]
 
 
-def test_tdm_optimize_rejects_gas_microbatch_count_mismatch() -> None:
-    trainer = _trainer(gradient_accumulation_steps=2)
+def test_tdm_optimize_rejects_rollout_batch_count_mismatch() -> None:
+    trainer = _trainer(gradient_accumulation_steps=4)
 
     with pytest.raises(ValueError, match=r"TDM optimize expected 2 role microbatches.*received 1"):
         trainer.optimize([_sample()])
@@ -845,6 +1156,20 @@ def test_tdm_generator_loss_is_finite_and_queries_reference_and_fake() -> None:
     assert torch.isfinite(loss)
     assert torch.isfinite(gradient)
     assert adapter.events[0][:2] == ("generator", True)
+
+
+def test_tdm_remaps_only_the_sampled_continuous_interior_during_training() -> None:
+    trainer, adapter, _ = _objective_trainer()
+    unit = trainer._build_boundary_units([_sample()])[0]
+    adapter.mapped_primary_times.clear()
+    adapter.mapped_component_times.clear()
+
+    trainer._generator_boundary_loss(unit)
+
+    assert len(adapter.mapped_primary_times) == 1
+    sampled = adapter.mapped_primary_times[0]
+    assert bool((sampled > unit.interval_start).all())
+    assert bool((sampled < unit.interval_end).all())
 
 
 def test_tdm_replay_mismatch_fails_before_score_queries() -> None:
@@ -908,8 +1233,7 @@ def test_tdm_fake_units_draw_fresh_noise_for_every_component_and_repeat(
     component_count = len(adapter.trajectory_component_order)
     assert len(draws) == 3 * component_count
     grouped = [
-        draws[offset : offset + component_count]
-        for offset in range(0, len(draws), component_count)
+        draws[offset : offset + component_count] for offset in range(0, len(draws), component_count)
     ]
     for draw in grouped:
         assert not torch.equal(draw[0], draw[1])
@@ -944,10 +1268,10 @@ def test_tdm_media_suppression_restores_decoder_after_rollout_scope() -> None:
 
 def test_tdm_real_role_phases_advance_exact_gas_counters() -> None:
     trainer, _, _ = _objective_trainer()
-    microbatches = [[_sample()]]
+    boundary_units = trainer._flatten_boundary_units([[_sample()]])
 
-    trainer._fake_phase(microbatches)
-    trainer._generator_phase(microbatches)
+    trainer._fake_phase(boundary_units)
+    trainer._generator_phase(boundary_units)
 
     assert trainer.optimization_roles["fake"].step == 1
     assert trainer.optimization_roles["generator"].step == 1

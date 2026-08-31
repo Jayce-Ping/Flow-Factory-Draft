@@ -29,17 +29,14 @@ data:
 model:
   model_type: "minimax-h3-t2va"
   model_name_or_path: "MiniMaxAI/MiniMax-H3"
+  component_load_dtypes: "bf16"  # Official recipe; Diffusers preserves FP32 islands.
   finetune_type: "lora"
   lora_rank: 64
   lora_alpha: 128
   target_components: "transformer"
   target_modules: "default"
-  frozen_parameters_dtype:
-    default: null
-    transformers: "bf16"
-    text_encoders: "bf16"
-    vae: "fp32"  # H3 autoencoders require FP32 weights.
-    audio_vae: "fp32"
+  # Do not override the loader-managed mixed dtype after materialization.
+  frozen_parameters_dtype: null
   trainable_parameters_dtype: "bf16"
   resume_path: null
   resume_type: null

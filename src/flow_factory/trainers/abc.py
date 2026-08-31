@@ -35,7 +35,6 @@ from typing import (
 
 import numpy as np
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from accelerate import Accelerator
 from accelerate.utils import DistributedType, ProjectConfiguration, set_seed
@@ -53,6 +52,7 @@ from ..data_utils.loader import (
 )
 from ..hparams import *
 from ..hparams.optimizer_args import OptimizerArguments
+from ..loading import ComponentRole, ModelLoadCoordinator
 from ..logger import LogFormatter, load_logger
 from ..models.abc import BaseAdapter
 from ..models.model_bundle import ModelBundle, RoutedComponentProxy
@@ -63,7 +63,6 @@ from ..rewards import (
     MultiRewardLoader,
     RewardBuffer,
     RewardProcessor,
-    load_reward_model,
 )
 from ..samples import BaseSample, LatentState, NoisedState, StackedSampleBatch
 from ..utils.base import (
@@ -126,6 +125,7 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         )  # If `eval_reward_args` is not given, use `reward_args`
 
         self.adapter = adapter
+        self.load_coordinator = ModelLoadCoordinator(adapter, accelerator)
         self.epoch = 0
         self.step = 0
 
@@ -236,13 +236,13 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
             else []
         )
 
-        # Initialize all reward model instances
         self.reward_loader = MultiRewardLoader(
             reward_args=self.config.reward_args,
             accelerator=self.accelerator,
             training_dataset_names=training_dataset_names,
             eval_reward_args=self.config.eval_reward_args,
             eval_dataset_names=eval_dataset_names,
+            load_context=lambda: self.load_coordinator.load_scope(ComponentRole.REWARD),
         ).load()
         # Get training & eval reward models
         self.reward_models = self.reward_loader.get_training_reward_models()
@@ -317,11 +317,10 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         Returns:
             Tuple of (train_dataloader, eval_dataloaders_by_name).
         """
-        self.adapter.on_load_components(
-            components=self.adapter.preprocessing_modules, device=self.accelerator.device
+        self.load_coordinator.load_components(
+            self.adapter.preprocessing_modules,
+            device=self.accelerator.device,
         )
-        if self.adapter.uses_fsdp_cpu_efficient_loading():
-            self._synchronize_frozen_components(self.adapter.preprocessing_modules)
 
         dataloader, train_dataloaders_by_source = get_train_dataloader(
             config=self.config,
@@ -602,12 +601,10 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         resolved = [m for m in resolved if m not in prepared_names]
 
         if resolved:
-            self.adapter.on_load_components(
-                components=resolved,
+            self.load_coordinator.load_components(
+                resolved,
                 device=self.accelerator.device,
             )
-            if self.adapter.uses_fsdp_cpu_efficient_loading():
-                self._synchronize_frozen_components(resolved)
 
     def _validate_paradigm_dynamics(self) -> None:
         """Reject a scheduler whose dynamics the declared paradigm cannot use.
@@ -635,31 +632,42 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
                 )
 
     def _apply_backend_checkpointing_constraints(self) -> None:
-        """Disable an FSDP1 checkpointing combination that recomputes a different graph."""
-        if (
-            self.accelerator.distributed_type != DistributedType.FSDP
-            or self.training_args.trainer_type != "tdm-r1"
-        ):
+        """Select one checkpoint owner and reject the unsafe TDM-R1/FSDP1 case."""
+        if self.accelerator.distributed_type != DistributedType.FSDP:
             return
         fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
-        if getattr(fsdp_plugin, "fsdp_version", 1) >= 2:
-            return
         model_checkpointing = bool(
-            getattr(self.training_args, "enable_gradient_checkpointing", False)
+            getattr(
+                self.training_args,
+                "gradient_checkpointing_enabled",
+                getattr(self.training_args, "enable_gradient_checkpointing", False),
+            )
         )
         fsdp_checkpointing = bool(getattr(fsdp_plugin, "activation_checkpointing", False))
-        if not model_checkpointing and not fsdp_checkpointing:
+        if (
+            self.training_args.trainer_type == "tdm-r1"
+            and getattr(fsdp_plugin, "fsdp_version", 1) < 2
+        ):
+            if not model_checkpointing and not fsdp_checkpointing:
+                return
+            self.adapter.disable_gradient_checkpointing()
+            self.training_args.enable_gradient_checkpointing = False
+            if fsdp_plugin is not None:
+                fsdp_plugin.activation_checkpointing = False
+            logger.warning(
+                "Disabled model and FSDP activation checkpointing for TDM-R1 on FSDP1: "
+                "the surrogate objective runs reference/snapshot forwards between its live "
+                "forward and backward, so FSDP1 recomputation saves a different graph. "
+                "FSDP2 does not require this fallback."
+            )
             return
-        self.adapter.disable_gradient_checkpointing()
-        self.training_args.enable_gradient_checkpointing = False
-        if fsdp_plugin is not None:
+
+        if model_checkpointing and fsdp_checkpointing:
             fsdp_plugin.activation_checkpointing = False
-        logger.warning(
-            "Disabled model and FSDP activation checkpointing for TDM-R1 on FSDP1: "
-            "the surrogate objective runs reference/snapshot forwards between its live "
-            "forward and backward, so FSDP1 recomputation saves a different graph. "
-            "FSDP2 does not require this fallback."
-        )
+            logger.info(
+                "Disabled FSDP activation checkpointing because train-level model "
+                "checkpointing is enabled; nested checkpoint boundaries duplicate recompute."
+            )
 
     def _initialization(self):
         self._validate_paradigm_dynamics()
@@ -667,12 +675,7 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
             self.accelerator, self.training_args.per_device_batch_size
         )
 
-        # Fix for FSDP, synchronize frozen components like text encoder & VAE.
-        # Otherwise they may be uninitialized on Rank > 0.
-        if self.adapter.uses_fsdp_cpu_efficient_loading():
-            logger.info("FSDP CPU Efficient Loading detected. Synchronizing frozen components...")
-            # self.adapter.on_load(self.accelerator.device)
-            self._synchronize_frozen_components()
+        self.load_coordinator.bootstrap_targets()
 
         # Init dataloader, then materialize every live component variant before
         # optimizer and distributed bundle construction.
@@ -702,7 +705,11 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         # One prepare call -> one DDP/FSDP/DeepSpeed root for the whole bundle.
         # (Parameter dtypes -- incl. the FSDP2 uniform-fp32 requirement for sharded trained
         # components -- are already handled in the adapter's `_mix_precision`.)
-        prepared = self.accelerator.prepare(model_bundle, self.optimizer, *eval_dataloader_list)
+        prepared = self.load_coordinator.prepare(
+            model_bundle,
+            self.optimizer,
+            *eval_dataloader_list,
+        )
         self.model_bundle = prepared[0]
         self.optimizer = prepared[1]
         inner_bundle = self.accelerator.unwrap_model(self.model_bundle)
@@ -821,30 +828,6 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
             for accelerator in self.rollout_accelerators:
                 stack.enter_context(accelerator.rollout_context(self.adapter))
             yield
-
-    def _synchronize_frozen_components(
-        self,
-        components: Optional[Union[str, List[str]]] = None,
-    ):
-        if self.accelerator.num_processes <= 1:
-            return
-
-        # Synchronize all non-prepared components
-        all_names = self.adapter._resolve_component_names(components)
-        for name in all_names:
-            if self.adapter._should_manage_device(name):
-                comp = self.adapter.get_component(name)
-                if isinstance(comp, nn.Module):
-                    for param in comp.parameters():
-                        param.data = param.data.to(self.accelerator.device)
-                        dist.broadcast(param.data, src=0)
-                    for buffer in comp.buffers():
-                        buffer.data = buffer.data.to(self.accelerator.device)
-                        dist.broadcast(buffer.data, src=0)
-
-        # Barrier to ensure everyone is done
-        self.accelerator.wait_for_everyone()
-        logger.info(f"[Rank {self.accelerator.process_index}] Frozen components synchronized.")
 
     @staticmethod
     def _patch_deepspeed_autocast(accelerator):
@@ -1475,9 +1458,8 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
 
         1. Generate samples using the dataset's DataLoader with per-dataset
            eval overrides (resolution, guidance_scale, num_inference_steps).
-        2. Compute rewards via the dataset-specific RewardBuffer.
-        3. Gather rewards across ranks.
-        4. Log metrics under ``eval/{dataset_name}/reward_{name}_{stat}``.
+        2. Optionally compute and gather configured eval rewards.
+        3. Always log generated media; add reward metrics when available.
 
         Logs are flushed per-dataset to avoid holding all generated samples
         in memory simultaneously.  Uses EMA parameters (if available) and
@@ -1493,10 +1475,8 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
         with torch.no_grad(), self.autocast(), self.adapter.use_ema_parameters():
             for dataset_name, dataloader in self.eval_dataloaders.items():
                 buffer = self.eval_dataset_reward_buffers.get(dataset_name)
-                if buffer is None:
-                    logger.warning(f"No reward buffer for eval dataset '{dataset_name}', skipping.")
-                    continue
-                buffer.clear()
+                if buffer is not None:
+                    buffer.clear()
                 all_samples: List[BaseSample] = []
 
                 # Merge per-dataset eval overrides with shared eval_args
@@ -1526,21 +1506,22 @@ class BaseTrainer(MultiRoleCheckpointingMixin, MultiRoleBackendValidationMixin, 
                     )
                     all_samples.extend(samples)
 
-                rewards = buffer.finalize(store_to_samples=True, split="pointwise")
-
-                # Pack all reward columns so evaluation pays for one gather per
-                # dataset rather than one gather per reward model.
-                rewards_tensors = {
-                    key: torch.as_tensor(value).to(self.accelerator.device)
-                    for key, value in rewards.items()
-                }
-                gathered_rewards = {
-                    key: value.cpu().numpy()
-                    for key, value in gather_aligned_floating_tensors(
-                        self.accelerator,
-                        rewards_tensors,
-                    ).items()
-                }
+                gathered_rewards: Dict[str, np.ndarray] = {}
+                if buffer is not None:
+                    rewards = buffer.finalize(store_to_samples=True, split="pointwise")
+                    # Pack all reward columns so evaluation pays for one gather per
+                    # dataset rather than one gather per reward model.
+                    rewards_tensors = {
+                        key: torch.as_tensor(value).to(self.accelerator.device)
+                        for key, value in rewards.items()
+                    }
+                    gathered_rewards = {
+                        key: value.cpu().numpy()
+                        for key, value in gather_aligned_floating_tensors(
+                            self.accelerator,
+                            rewards_tensors,
+                        ).items()
+                    }
 
                 # Log per-dataset immediately to avoid accumulating all samples in memory
                 if self.accelerator.is_main_process:

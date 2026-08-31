@@ -60,6 +60,32 @@ def build_training_component_times(
     )
 
 
+def resolve_replay_projection_times(
+    adapter: Any,
+    times: ComponentTimes,
+    *,
+    batch: Optional[StackedSampleBatch],
+) -> ComponentTimes:
+    """Prefer authoritative replay sigmas and map only legacy timestep-only data.
+
+    Args:
+        adapter: Adapter that maps a primary scheduler coordinate when needed.
+        times: Coordinates read from one replay transition.
+        batch: Optional stacked batch required by model-specific time mapping.
+
+    Returns:
+        The original stored coordinates when sigmas are present, otherwise mapped
+        coordinates reconstructed from the stored primary timestep.
+    """
+    if times.sigma is not None:
+        return times
+    primary_name = adapter.trajectory_component_order[0]
+    return adapter.build_training_component_times(
+        times.timestep[primary_name],
+        batch=batch,
+    )
+
+
 def project_velocity_to_clean_state(
     adapter: Any,
     state: LatentState,

@@ -342,9 +342,7 @@ def tdm_conditional_renoise(
         or not math.isfinite(float(importance_clip))
         or importance_clip <= 0
     ):
-        raise ValueError(
-            f"expected finite TDM importance_clip > 0, received {importance_clip!r}"
-        )
+        raise ValueError(f"expected finite TDM importance_clip > 0, received {importance_clip!r}")
     if (
         isinstance(eps, bool)
         or not isinstance(eps, Real)
@@ -386,26 +384,22 @@ def tdm_conditional_renoise(
             )
         beta = beta_sq.clamp_min(0).sqrt()
         fresh = torch.randn_like(clean)
-        mixed = (old_noise_coeff * implied_noise + beta * fresh) / sigma_t.clamp_min(
-            float(eps)
-        )
+        mixed = (old_noise_coeff * implied_noise + beta * fresh) / sigma_t.clamp_min(float(eps))
         mixed_components[name] = mixed
         fresh_components[name] = fresh
 
-    mixed_noise = LatentState(mixed_components, active_masks=clean_state.active_masks)
-    fresh_noise = LatentState(fresh_components, active_masks=clean_state.active_masks)
-    noised = adapter.apply_forward_process_noise(clean_state, target_times, mixed_noise)
-    mixed_square = {
-        name: mixed_noise.components[name].square() for name in expected_names
-    }
-    fresh_square = {
-        name: fresh_noise.components[name].square() for name in expected_names
-    }
-    log_ratio = -0.5 * adapter.reduce_latent_values(
-        mixed_square, state=clean_state
-    ).to(torch.float32) + 0.5 * adapter.reduce_latent_values(
-        fresh_square, state=clean_state
-    ).to(torch.float32)
+    # Keep the likelihood calculation in float32, but restore each component's
+    # actual latent dtype/device at the strict adapter boundary.
+    adapter_noise = LatentState(
+        {name: mixed_components[name].to(clean_state.components[name]) for name in expected_names},
+        active_masks=clean_state.active_masks,
+    )
+    noised = adapter.apply_forward_process_noise(clean_state, target_times, adapter_noise)
+    mixed_square = {name: mixed_components[name].square() for name in expected_names}
+    fresh_square = {name: fresh_components[name].square() for name in expected_names}
+    log_ratio = -0.5 * adapter.reduce_latent_values(mixed_square, state=clean_state).to(
+        torch.float32
+    ) + 0.5 * adapter.reduce_latent_values(fresh_square, state=clean_state).to(torch.float32)
     log_clip = math.log(float(importance_clip))
     importance = torch.exp(log_ratio.clamp(-log_clip, log_clip)).detach()
     return noised, importance
@@ -512,9 +506,7 @@ def revised_x0_loss(
     adapter = _require_adapter(adapter)
     x0_student = _require_state(x0_student, identifier="x0_student")
     correction = _require_state(correction, identifier="correction")
-    normalizer_reference = _require_state(
-        normalizer_reference, identifier="normalizer_reference"
-    )
+    normalizer_reference = _require_state(normalizer_reference, identifier="normalizer_reference")
     if not isinstance(use_huber, bool):
         raise TypeError(
             f"expected use_huber as a bool, received {type(use_huber).__name__}: {use_huber!r}"

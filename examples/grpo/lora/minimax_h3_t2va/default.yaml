@@ -1,5 +1,3 @@
-# This quality-oriented geometry has not been run with the 61 GB checkpoint.
-# For a real-weight validated low-memory correctness recipe, use debug.yaml.
 # MiniMax H3 requires B=1 and has no CFG; guidance must remain neutral at 1.0.
 
 launcher: "accelerate"
@@ -10,24 +8,26 @@ mixed_precision: "bf16"
 
 data:
   datasets:
-    - name: minimax_h3_t2va
-      dataset_dir: "dataset/minimax_h3_t2va"
+    - name: vid_prompt
+      dataset_dir: "dataset/vid_prompt"
       train: {weight: 1, max_dataset_size: 1024}
       eval: {}
   preprocessing_batch_size: 1
   dataloader_num_workers: 8
   force_reprocess: true
   cache_dir: "~/.cache/flow_factory/datasets"
+  preprocess_parallelism: local
   sampler_type: "auto"
 
 model:
   finetune_type: "lora"
-  lora_rank: 32  # Conservative starting value, not a validated optimum.
-  lora_alpha: 64
+  lora_rank: 64
+  lora_alpha: 128
   target_components: "transformer"
   target_modules: "default"
   model_name_or_path: "MiniMaxAI/MiniMax-H3"
   model_type: "minimax-h3-t2va"
+  component_load_dtypes: "bf16"  # Official recipe; Diffusers preserves FP32 islands.
   resume_path: null
   resume_type: null
 
@@ -54,11 +54,16 @@ train:
   num_inference_steps: 24
   guidance_scale: 1.0
   per_device_batch_size: 1
-  group_size: 8
+  group_size: 16
+  global_std: true
   unique_sample_num_per_epoch: 48
   gradient_step_per_epoch: 2
   gradient_accumulation_steps: "auto"
+  ema_decay: 0.9
+  ema_update_interval: 4
+  ema_device: "cuda"
   seed: 42
+  # Selective example: {mode: fraction, fraction: 0.25}
   enable_gradient_checkpointing: true
   offload_samples_to_cpu: true
 
@@ -75,19 +80,29 @@ eval:
   resolution: [512, 768]
   per_device_batch_size: 1
   guidance_scale: 1.0
-  num_inference_steps: 24
+  num_inference_steps: 50
 
 rewards:
   - name: "audio_text_alignment"
     reward_model: "clap"
     weight: 1.0
-    batch_size: 1
+    batch_size: 4
     device: "cuda"
     model_name_or_path: "laion/larger_clap_general"
+    applicable_datasets: [vid_prompt]
+
+  - name: "audio_video_alignment"
+    reward_model: "imagebind"
+    weight: 1.0
+    batch_size: 4
+    device: "cuda"
+    dtype: bfloat16
+    mode: "audio_video"
+    applicable_datasets: [vid_prompt]
 
 optimizers:
   - name: "default"
-    learning_rate: 1.0e-4
+    learning_rate: 3.0e-4
     weight_decay: 1.0e-4
     betas: [0.9, 0.999]
     eps: 1.0e-8

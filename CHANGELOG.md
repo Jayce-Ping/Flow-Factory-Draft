@@ -18,6 +18,8 @@
   responsibilities into focused runtime modules.
 - Added packed distributed metric/sample collectives with benchmark-gated fallbacks.
 - Added scalar or selector-based `frozen_parameters_dtype` policies.
+- Added adapter defaults and scalar/selector overrides for load-time component dtypes.
+- Added physical-root load planning and backend-owned target/auxiliary/reward lifecycles.
 
 ### Breaking changes
 

@@ -29,6 +29,8 @@ ff-train examples/grpo/lora/flux1/default.yaml
 - [`dmd2` SD3.5 OCR recipe](dmd2/lora/sd3_5/ocr.yaml) — validated in a
   distributed OCR training run.
 - [`tdm` SD3.5 OCR recipe](tdm/lora/sd3_5/ocr.yaml) — official conditional-noise objective.
+- [`tdm` MiniMax H3 T2VA 6-step recipe](tdm/lora/minimax_h3_t2va/default.yaml) —
+  validated 512×768×124 run; train over 200 steps to approach convergence.
 - [`tdm-r1` SD3.5 OCR recipe](tdm_r1/lora/sd3_5/ocr.yaml) — official G24
   fake-surrogate-generator objective initialized from the released TDM adapter.
 
@@ -37,6 +39,7 @@ ff-train examples/grpo/lora/flux1/default.yaml
 - [`minimax-h3-t2va`](../examples/grpo/lora/minimax_h3_t2va/default.yaml)
 - [`minimax-h3-t2va` real-weight debug recipe](../examples/grpo/lora/minimax_h3_t2va/debug.yaml)
 - [`minimax-h3-t2va` native-quality FSDP2 recipe](../examples/grpo/lora/minimax_h3_t2va/quality_720p_fsdp2.yaml)
+- [`minimax-h3-t2va` TDM 6-step recipe](../examples/tdm/lora/minimax_h3_t2va/default.yaml)
 - [`minimax-h3-fl2va`](../examples/grpo/lora/minimax_h3_fl2va/default.yaml)
 - [`minimax-h3-ref2va`](../examples/grpo/lora/minimax_h3_ref2va/default.yaml)
 

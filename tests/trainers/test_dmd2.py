@@ -17,13 +17,12 @@ from contextlib import contextmanager, nullcontext
 from types import MethodType, SimpleNamespace
 from typing import Any, Iterator, List, Tuple
 
-
 import pytest
 import torch
 
 from flow_factory.hparams import Arguments
 from flow_factory.models.abc import BaseAdapter
-from flow_factory.samples import BaseSample, LatentState
+from flow_factory.samples import BaseSample, ComponentTimes, LatentState, MultiModalStepOutput
 from flow_factory.trainers.abc import BaseTrainer
 from flow_factory.trainers.distillation.dmd2 import DMD2Trainer
 
@@ -101,6 +100,135 @@ def test_dmd2_accepts_a_multi_step_generator(num_inference_steps: int) -> None:
 
     drawn = {trainer._draw_boundary_index() for _ in range(200)}
     assert drawn == set(range(1, num_inference_steps + 1))
+
+
+def test_dmd2_clean_projection_reuses_authoritative_structured_sigmas() -> None:
+    trainer = _trainer()
+    trainer.training_args.replay_rtol = 0.0
+    trainer.training_args.replay_atol = 0.0
+    state = LatentState(
+        {
+            "video": torch.tensor([[1.0]]),
+            "audio": torch.tensor([[2.0]]),
+        }
+    )
+    velocity = LatentState(
+        {
+            "video": torch.tensor([[3.0]]),
+            "audio": torch.tensor([[4.0]]),
+        }
+    )
+    stored_times = ComponentTimes(
+        timestep={"video": torch.tensor([750.0]), "audio": torch.tensor([600.0])},
+        next_timestep={"video": torch.tensor([500.0]), "audio": torch.tensor([300.0])},
+        sigma={"video": torch.tensor([0.75]), "audio": torch.tensor([0.6])},
+        next_sigma={"video": torch.tensor([0.5]), "audio": torch.tensor([0.3])},
+    )
+    mapping_calls: list[torch.Tensor] = []
+    projected_times: list[ComponentTimes] = []
+
+    def project(
+        replay_state: LatentState,
+        times: ComponentTimes,
+        replay_velocity: LatentState,
+    ) -> LatentState:
+        assert replay_state is state
+        assert replay_velocity is velocity
+        projected_times.append(times)
+        return state
+
+    trainer.adapter = SimpleNamespace(
+        trajectory_component_order=("video", "audio"),
+        get_replay_step=lambda batch, index: SimpleNamespace(state=state, times=stored_times),
+        use_component_variant=lambda name: nullcontext(),
+        replay_generator_boundary=lambda *args, **kwargs: MultiModalStepOutput(velocity=velocity),
+        build_training_component_times=lambda timesteps, batch=None: mapping_calls.append(
+            timesteps
+        ),
+        project_velocity_to_clean_state=project,
+    )
+    trainer._replay_forward_kwargs = lambda batch: {}
+
+    result = trainer._replay_generator_clean_prediction(SimpleNamespace(), boundary_index=1)
+
+    assert result is state
+    assert projected_times == [stored_times]
+    assert mapping_calls == []
+
+
+def test_dmd2_rejects_inconsistent_stored_projection_sigma_before_replay() -> None:
+    trainer = _trainer()
+    state = LatentState({"latent": torch.tensor([[1.0]])})
+    stored_times = ComponentTimes(
+        timestep={"latent": torch.tensor([750.0])},
+        next_timestep={"latent": torch.tensor([500.0])},
+        sigma={"latent": torch.tensor([0.5])},
+        next_sigma={"latent": torch.tensor([0.25])},
+    )
+    replay_calls: list[int] = []
+    trainer.adapter = SimpleNamespace(
+        trajectory_component_order=("latent",),
+        get_replay_step=lambda batch, index: SimpleNamespace(state=state, times=stored_times),
+        replay_generator_boundary=lambda *args, **kwargs: replay_calls.append(1),
+    )
+
+    with pytest.raises(ValueError, match=r"DMD2.*latent.*timestep.*sigma.*one native ULP"):
+        trainer._replay_generator_clean_prediction(SimpleNamespace(), boundary_index=1)
+
+    assert replay_calls == []
+
+
+def test_dmd2_clean_projection_maps_legacy_timestep_only_replay() -> None:
+    trainer = _trainer()
+    trainer.training_args.replay_rtol = 0.0
+    trainer.training_args.replay_atol = 0.0
+    state = LatentState({"latent": torch.tensor([[1.0]])})
+    velocity = LatentState({"latent": torch.tensor([[2.0]])})
+    replay_times = ComponentTimes(
+        timestep={"latent": torch.tensor([750.0])},
+        next_timestep={"latent": torch.tensor([500.0])},
+    )
+    mapped_times = ComponentTimes(
+        timestep=replay_times.timestep,
+        next_timestep=replay_times.next_timestep,
+        sigma={"latent": torch.tensor([0.75])},
+        next_sigma={"latent": torch.tensor([0.5])},
+    )
+    mapping_calls: list[torch.Tensor] = []
+    projected_times: list[ComponentTimes] = []
+
+    def map_times(
+        timesteps: torch.Tensor,
+        *,
+        batch: Any = None,
+    ) -> ComponentTimes:
+        del batch
+        mapping_calls.append(timesteps)
+        return mapped_times
+
+    def project(
+        replay_state: LatentState,
+        times: ComponentTimes,
+        replay_velocity: LatentState,
+    ) -> LatentState:
+        del replay_state, replay_velocity
+        projected_times.append(times)
+        return state
+
+    trainer.adapter = SimpleNamespace(
+        trajectory_component_order=("latent",),
+        get_replay_step=lambda batch, index: SimpleNamespace(state=state, times=replay_times),
+        use_component_variant=lambda name: nullcontext(),
+        replay_generator_boundary=lambda *args, **kwargs: MultiModalStepOutput(velocity=velocity),
+        build_training_component_times=map_times,
+        project_velocity_to_clean_state=project,
+    )
+    trainer._replay_forward_kwargs = lambda batch: {}
+
+    trainer._replay_generator_clean_prediction(SimpleNamespace(), boundary_index=1)
+
+    assert mapping_calls == [replay_times.timestep["latent"]]
+    assert projected_times == [mapped_times]
 
 
 def test_dmd2_boundary_draw_restarts_reproducibly_with_scheduler_seed() -> None:
@@ -232,7 +360,7 @@ def test_dmd2_media_suppression_rejects_missing_batch_tensor() -> None:
             TypeError,
             match=(
                 r"DMD2 media-free decoder adapter='KeywordDecoderAdapter'.*"
-                    r"signature=.*latents.*expected tensor or LatentState argument named.*"
+                r"signature=.*latents.*expected tensor or LatentState argument named.*"
                 r"received latents=str"
             ),
         ):
@@ -313,22 +441,25 @@ def test_dmd2_suppresses_structured_h3_media_through_adapter_owned_shape() -> No
         )
 
 
-def test_dmd2_rejects_bagel_per_sample_decode_contract() -> None:
+def test_dmd2_accepts_bagel_batched_decode_contract() -> None:
     trainer = _trainer()
 
     class BagelDecodeAdapter:
         __module__ = "flow_factory.models.bagel.bagel"
+        trajectory_component_order = ("latent",)
 
-        def decode_latents(self, *args: Any, **kwargs: Any) -> Any:
-            return None
+        def decode_latents(self, latents: torch.Tensor, **kwargs: Any) -> Any:
+            del latents, kwargs
+            raise AssertionError("real Bagel decoder must remain suppressed")
 
     trainer.adapter = BagelDecodeAdapter()
 
-    with pytest.raises(
-        ValueError,
-        match=r"DMD2 media-free rollout.*BagelDecodeAdapter.*unsupported media decode contract",
-    ):
-        trainer._validate_media_free_rollout()
+    trainer._validate_media_free_rollout()
+    with trainer._without_media_decoding():
+        assert trainer.adapter.decode_latents(
+            torch.zeros(2, 16, 64),
+            image_shape=(512, 512),
+        ) == [None, None]
 
 
 def test_dmd2_optimize_runs_fake_ttur_then_one_generator() -> None:

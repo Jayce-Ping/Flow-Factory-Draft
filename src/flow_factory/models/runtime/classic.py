@@ -52,6 +52,15 @@ class ClassicPipelineRuntime(ComponentRuntime):
     def _get_materialized_component(self, name: str) -> Any:
         return getattr(self.pipeline, name, None)
 
+    def physical_route(self, name: str) -> tuple[str, tuple[str, ...]]:
+        """Collapse logical aliases that reference one canonical module object."""
+        self._validate_declared_names([name])
+        component = self.declared_components[name]
+        for canonical_name, canonical_component in self.canonical_components.items():
+            if component is canonical_component:
+                return canonical_name, ()
+        return name, ()
+
     def _materialize_components(self, names: List[str]) -> None:
         missing = [
             name

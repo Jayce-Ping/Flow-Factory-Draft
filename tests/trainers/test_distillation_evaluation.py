@@ -42,7 +42,11 @@ def _loop_trainer(trainer_cls: type, *, eval_freq: int, epochs: int = 2) -> Any:
         device=torch.device("cpu"),
         reduce=lambda tensor, reduction: tensor,
     )
-    trainer.training_args = SimpleNamespace(seed=0, gradient_accumulation_steps=2)
+    trainer.training_args = SimpleNamespace(
+        seed=0,
+        gradient_accumulation_steps=2,
+        get_num_train_timesteps=lambda config: 1,
+    )
     trainer.log_args = SimpleNamespace(save_freq=0, save_dir=None, run_name="run", verbose=False)
     trainer.eval_args = SimpleNamespace(eval_freq=eval_freq)
     trainer.should_continue_training = lambda: trainer.epoch < epochs

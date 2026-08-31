@@ -34,10 +34,16 @@ from .nft import NFTTrainingArguments
 from .opd import DiffusionOPDTrainingArguments, TeacherConfig
 from .tdm import TDMTrainingArguments
 from .tdm_r1 import TDMR1TrainingArguments
+from ..gradient_checkpointing import (
+    GradientCheckpointingPolicy,
+    GradientCheckpointingSpec,
+)
 
 __all__ = [
     "EvaluationArguments",
     "TrainingArguments",
+    "GradientCheckpointingPolicy",
+    "GradientCheckpointingSpec",
     "GRPOTrainingArguments",
     "DPPOTrainingArguments",
     "NFTTrainingArguments",
