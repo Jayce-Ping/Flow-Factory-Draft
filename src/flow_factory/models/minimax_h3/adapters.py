@@ -56,6 +56,7 @@ from ._chunking import (
 )
 from ._common import apply_forward_process_noise, draw_forward_process_noise
 from ._condition import MiniMaxH3ConditionStatePreparer
+from ._diffusers_cache import H3_DIFFUSERS_CACHE_POLICIES, prepare_h3_diffusers_cache
 from ._output import MiniMaxH3AVOutputCodec, validate_h3_encoded_output_geometry
 from .workflow import (
     build_h3_component_runtime,
@@ -92,10 +93,35 @@ class _MiniMaxH3WorkflowAdapter:
     flow_velocity_direction: ClassVar[Literal["data"]] = "data"
     preprocess_cache_fields: ClassVar[frozenset[str]] = _H3_PREPROCESS_CACHE_FIELDS
     preprocess_cache_version: ClassVar[str] = _H3_PREPROCESS_CACHE_VERSION
+    supports_diffusers_cache: ClassVar[bool] = True
+    supported_diffusers_cache_policies: ClassVar[frozenset[str]] = H3_DIFFUSERS_CACHE_POLICIES
     supports_fsdp2_cpu_efficient_loading: ClassVar[bool] = True
     # Official Diffusers recipe: load at BF16 and let each ModelMixin preserve
     # its declared FP32 islands (including both H3 autoencoders).
     component_load_dtype_defaults: ClassVar[torch.dtype] = torch.bfloat16
+
+    def prepare_diffusers_cache(
+        self,
+        policy: str,
+        component_name: str,
+        transformer: torch.nn.Module,
+    ) -> None:
+        """Register H3 block metadata required by FirstBlockCache.
+
+        Args:
+            policy: User-facing diffusers cache policy identifier.
+            component_name: Canonical transformer component name.
+            transformer: Prepared transformer route that will receive the policy.
+
+        Raises:
+            ValueError: If the accelerator targets another workflow component.
+        """
+        if component_name != self.transformer_component_name:
+            raise ValueError(
+                f"MiniMax H3 workflow={self.workflow!r} diffusers cache expected component "
+                f"{self.transformer_component_name!r}, received {component_name!r}"
+            )
+        prepare_h3_diffusers_cache(policy, transformer)
 
     def _gradient_checkpointing_units(
         self,

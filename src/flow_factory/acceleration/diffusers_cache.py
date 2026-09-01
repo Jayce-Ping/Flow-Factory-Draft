@@ -25,7 +25,9 @@ Only valid in the rollout slot of a decoupled / distillation trainer — the
 paradigm validator enforces this (``constraints.md`` #7).
 """
 
+import math
 from contextlib import contextmanager
+from numbers import Real
 from typing import TYPE_CHECKING, Iterator, List
 
 from diffusers.hooks import (
@@ -73,20 +75,40 @@ class DiffusersCacheAccelerator(BaseAccelerator):
         ``cache_context`` the adapter opens around its transformer call must persist
         cache state across the loop. Adapters that already wrap their forward in
         ``transformer.cache_context(...)`` (Qwen-Image, Wan2, LTX2, FLUX.2-Klein)
-        are cache-ready; verify the reward distribution before/after enabling.
+        are cache-ready. MiniMax H3 supplies a policy-specific compatibility hook and
+        accepts FirstBlockCache only. Verify the reward distribution before/after
+        enabling any lossy cache policy.
     """
 
     safety = "lossy"
     stage = "rollout"
 
-    def _build_config(self):
-        params = dict(self.params)
-        policy = params.pop("policy", "first_block")
-        if policy not in _POLICY_CONFIGS:
+    def _resolve_policy(self) -> str:
+        policy = self.params.get("policy", "first_block")
+        if not isinstance(policy, str) or policy not in _POLICY_CONFIGS:
+            expected = sorted(_POLICY_CONFIGS)
             raise ValueError(
-                f"DiffusersCacheAccelerator: unknown policy={policy!r}; "
-                f"expected one of {sorted(_POLICY_CONFIGS)}."
+                f"DiffusersCacheAccelerator: unknown policy={policy!r}; expected one of "
+                f"{expected}."
             )
+        return policy
+
+    def _build_config(self, policy: str):
+        params = dict(self.params)
+        params.pop("policy", None)
+        if policy == "first_block":
+            threshold = params.get("threshold", 0.05)
+            if (
+                isinstance(threshold, bool)
+                or not isinstance(threshold, Real)
+                or not math.isfinite(float(threshold))
+                or threshold < 0
+            ):
+                raise ValueError(
+                    "DiffusersCacheAccelerator: policy='first_block' requires threshold "
+                    "to be a finite non-negative real number, received "
+                    f"{type(threshold).__name__}: {threshold!r}."
+                )
         config_cls = _POLICY_CONFIGS[policy]
         try:
             return config_cls(**params)
@@ -98,34 +120,44 @@ class DiffusersCacheAccelerator(BaseAccelerator):
 
     @contextmanager
     def rollout_context(self, adapter: "BaseAdapter") -> Iterator[None]:
+        policy = self._resolve_policy()
         if not adapter.supports_diffusers_cache:
             raise ValueError(
                 f"DiffusersCacheAccelerator: adapter {type(adapter).__name__} does not support "
                 "diffusers feature caching because not every transformer forward branch runs "
                 "inside `cache_context`. Remove the accelerator or add complete adapter support."
             )
+        supported_policies = adapter.supported_diffusers_cache_policies
+        if supported_policies is not None and policy not in supported_policies:
+            raise ValueError(
+                f"DiffusersCacheAccelerator: adapter {type(adapter).__name__} does not support "
+                f"policy={policy!r}; supported policies: {sorted(supported_policies)}."
+            )
 
         transformer_names = adapter.transformer_names
         if not transformer_names:
             raise ValueError("DiffusersCacheAccelerator: adapter exposes no transformer to cache.")
+        configs = [self._build_config(policy) for _ in transformer_names]
 
         transformers = []
-        for name in transformer_names:
+        for name, config in zip(transformer_names, configs):
             transformer = adapter.get_component(name)
             if not callable(getattr(transformer, "enable_cache", None)):
                 raise ValueError(
                     f"DiffusersCacheAccelerator: component '{name}' is not a diffusers "
                     "CacheMixin (no callable `enable_cache`); use a different accelerator."
                 )
-            transformers.append((name, transformer))
+            transformers.append((name, transformer, config))
+        for name, transformer, _ in transformers:
+            adapter.prepare_diffusers_cache(policy, name, transformer)
 
         enabled: List["torch.nn.Module"] = []
         try:
-            for name, transformer in transformers:
+            for name, transformer, config in transformers:
                 # Defensive: clear any stale cache left enabled by a prior epoch.
                 if getattr(transformer, "is_cache_enabled", False):
                     transformer.disable_cache()
-                transformer.enable_cache(self._build_config())
+                transformer.enable_cache(config)
                 enabled.append(transformer)
                 # diffusers' HookRegistry caches its child-registry list the first time
                 # a `cache_context` sets a context. If a `cache_context` ran while the
@@ -142,7 +174,11 @@ class DiffusersCacheAccelerator(BaseAccelerator):
                 if cache_hook is not None:
                     cache_hook._child_registries_cache = None
                 if adapter.accelerator.is_main_process:
-                    logger.info("DiffusersCacheAccelerator: cache enabled for '%s'.", name)
+                    logger.info(
+                        "DiffusersCacheAccelerator: policy='%s' enabled for '%s'.",
+                        policy,
+                        name,
+                    )
             yield
         finally:
             for transformer in enabled:

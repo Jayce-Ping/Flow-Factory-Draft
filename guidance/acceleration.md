@@ -64,7 +64,7 @@ accepted as shorthand for a one-element list. A direct python path (e.g.
 |----|--------|-------|-------|
 | `attention_backend` | lossless | both | Sets the diffusers attention backend on every transformer. Requires a `backend` param. Forwards any backend (`native` / `flash` / `_flash_3` / `_flash_3_hub` / `sage` / `xformers`) to `set_attention_backend`. List it in `shared` **before** `torch_compile` so the compiled graph captures the backend. |
 | `torch_compile` | lossy | both | `torch.compile` of the shared transformer. `mode: auto` (default) selects regional compilation when the base transformer declares `_repeated_blocks`, otherwise full compilation. Explicit `regional` forces diffusers' `compile_repeated_blocks`; explicit `full` compiles the whole module. Extra `compile_kwargs` are forwarded to the selected compile call. Compiles in place (checkpoint- and EMA/ref-safe), applied after `post_init`. Marked **lossy** because it is applied symmetrically but is **not bit-exact across rollout vs training** (grad/no-grad graph split → intermittent ~1e-5 on-policy residual, within `clip_range`); allowed on coupled algos, but the validator warns. |
-| `diffusers_cache` | lossy | rollout | Diffusers-native feature caching (no extra dependency). Requires an adapter with `supports_diffusers_cache = True`, meaning every transformer forward branch uses `cache_context`. `policy`: `first_block` (default) / `faster` / `pyramid` / `taylorseer` / `magcache`; remaining params are forwarded to the policy config. |
+| `diffusers_cache` | lossy | rollout | Diffusers-native feature caching (no extra dependency). Requires an adapter with `supports_diffusers_cache = True`; an adapter may further restrict the accepted policies with `supported_diffusers_cache_policies`. `policy`: `first_block` (default) / `faster` / `pyramid` / `taylorseer` / `magcache`; remaining params are forwarded to the policy config. |
 
 ### Attention backend
 
@@ -149,13 +149,33 @@ See `.scratch/torch_compile_consistency_report.md` for the full analysis.
 Feature caching reuses block outputs across denoising steps via the transformer's
 `cache_context(...)`. Readiness is explicit: an adapter opts in with
 `supports_diffusers_cache = True` only when every transformer forward branch has a context.
-The cache accelerator checks this capability before enabling any component and fails fast
-for unsupported adapters.
+Models with a narrower upstream surface also declare
+`supported_diffusers_cache_policies = frozenset({...})`; `None` preserves the existing
+all-policy behavior for cache-ready adapters. The cache accelerator validates the policy and its
+config before preparing or enabling any component. An adapter that needs upstream compatibility
+may override `prepare_diffusers_cache(policy, component_name, transformer)` with an idempotent
+shim; it must not enable the cache itself.
 
 Cache-ready adapters are FLUX.2-Klein, Qwen-Image, Qwen-Image-Edit-Plus, Wan T2V/I2V, and
-LTX2 T2AV/I2AV. Qwen merged CFG uses a shared `cond_uncond` context; no-CFG uses `cond`.
-FLUX.1/Kontext, FLUX.2, SD3.5, Z-Image, and Bagel are not cache-ready. Validate
-the reward distribution before and after enabling caching on a supported model.
+LTX2 T2AV/I2AV. MiniMax H3 T2VA/FL2VA/Ref2VA are cache-ready for `first_block` only.
+Qwen merged CFG uses a shared `cond_uncond` context; no-CFG uses `cond`. FLUX.1/Kontext,
+FLUX.2, SD3.5, Z-Image, and Bagel are not cache-ready. Validate the reward distribution before
+and after enabling caching on a supported model.
+
+MiniMax H3 support bridges a missing diffusers 0.40.0 transformer-block registry entry with the
+FirstBlockCache metadata required by the main block stack. It registers the actual runtime block
+class, including an FSDP2-generated subclass, before enabling the cache. Each independent B=1
+inference resets state once; every denoising forward reuses a workflow-specific context while the
+call itself continues through the prepared component route (`transformer_ref` for Ref2VA).
+Invalid policies and configurations fail before cache enablement. H3 FirstBlockCache cannot be
+combined with Flow-Factory's `torch_compile`: its forced-grad rollout path would make diffusers
+0.40.0 retain cross-step autograd graphs, so that combination fails fast. This path has exact
+diffusers-0.40.0 CPU lifecycle coverage, including a real cache hit and reset, but no H3 GPU
+speed/quality calibration yet; tune `threshold` and recheck reward/quality on target hardware.
+
+As a lossy rollout accelerator, H3 caching remains restricted to decoupled or distillation
+trainers such as TDM. Coupled GRPO/GRPO-Guard/DPPO configurations are rejected by the paradigm
+validator.
 
 `torch_compile` is model-agnostic and applies to every adapter.
 
