@@ -221,6 +221,13 @@ LTX2 packs `[video|audio]` into one `(B, Seq, C)` sequence, so it resolves as PA
     variants narrow the class-level I/O superset through `_resolve_pipeline_io_contract()` rather
     than branching inside the dataset or algorithm.
 
+16. **Diffusers cache readiness may be policy-specific** — When an opted-in adapter supports only
+    a subset of upstream cache policies, declare the exact user-facing ids in
+    `supported_diffusers_cache_policies`; `None` retains all-policy behavior for existing
+    cache-ready adapters. Model-specific `prepare_diffusers_cache()` shims run only after the
+    accelerator validates both policy and config, and before cache enablement. Unsupported
+    adapters, policies, and configs must fail before component or global-registry mutation.
+
 ## Fix Records
 
 ### Sampling CFG leaked into finite-data velocity matching

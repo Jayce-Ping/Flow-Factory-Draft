@@ -230,8 +230,12 @@ class BaseAdapter(ABC):
     python_format_columns: ClassVar[frozenset[str]] = frozenset()
 
     # Opt in only when every transformer forward branch runs inside a diffusers
-    # ``cache_context``. The rollout cache accelerator rejects the default.
+    # ``cache_context`` while caching is enabled. The rollout cache accelerator
+    # rejects the default. ``None`` preserves the existing all-policy behavior for
+    # cache-ready adapters; models with narrower upstream support declare the exact
+    # user-facing policy ids they accept.
     supports_diffusers_cache: ClassVar[bool] = False
+    supported_diffusers_cache_policies: ClassVar[Optional[frozenset[str]]] = None
     supports_fsdp2_cpu_efficient_loading: ClassVar[bool] = False
     # Opt in only when FSDP2 communication overlap exceeds the model's activation headroom.
     fsdp2_use_default_stream_unshard: ClassVar[bool] = False
@@ -1103,6 +1107,21 @@ class BaseAdapter(ABC):
     def get_component_unwrapped(self, name: str) -> torch.nn.Module:
         """Get the original unwrapped component."""
         return cast(torch.nn.Module, self.component_runtime.get_canonical_component(name))
+
+    def prepare_diffusers_cache(
+        self,
+        policy: str,
+        component_name: str,
+        transformer: torch.nn.Module,
+    ) -> None:
+        """Prepare model-specific compatibility required by a cache policy.
+
+        Args:
+            policy: User-facing diffusers cache policy identifier.
+            component_name: Canonical transformer component name.
+            transformer: Prepared transformer route that will receive the policy.
+        """
+        return None
 
     def get_component_config(self, name: str):
         """Get the config of a component."""

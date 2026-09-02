@@ -42,6 +42,27 @@ and lets that boundary stay strict.
   scheduler conversion and trainer `x0` projection use the correct sign.
 - `num_inference_steps=N` means N transitions and N + 1 state coordinates.
 
+## Diffusers cache contract
+
+All three workflows opt into rollout-only diffusers caching for `first_block` only. Diffusers
+0.40.0 does not register `MiniMaxH3TransformerBlock` for FirstBlockCache, so the adapter installs
+the required `(hidden=0, encoder=None)` metadata before cache enablement. Registration targets each
+actual unwrapped main-block class, including the runtime subclass produced by FSDP2, is idempotent,
+and rejects incompatible upstream metadata instead of overwriting it. The token-refiner stack is
+not registered because diffusers FirstBlockCache scans only the top-level `transformer_blocks`.
+
+`infer_h3_workflow()` resets stateful cache hooks once at the start of each independent B=1
+generation. Every step opens the stable `minimax_h3_<workflow>` context on the prepared component;
+the same proxy routes the actual call through the prepared bundle, including `transformer_ref` for
+Ref2VA. An exceptional forward resets the state before re-raising. This lifecycle has a real tiny-H3
+CPU cache-hit/reset test on diffusers 0.40.0. Treat it as lifecycle evidence; deployment speed,
+memory, reward, and quality remain workload-dependent.
+
+Do not combine H3 FirstBlockCache with Flow-Factory `torch_compile`. Compile's forced-grad rollout
+path would let the diffusers 0.40.0 cache retain autograd graphs across denoising steps, so the H3
+shim fails before registry mutation. Because caching is lossy and rollout-only, only decoupled or
+distillation trainers may use it; coupled GRPO/GRPO-Guard/DPPO remain validator-rejected.
+
 ## Input contracts
 
 - T2VA accepts prompt-only workflow input.
@@ -143,7 +164,9 @@ element-weighted reducer.
 ## Verification boundary
 
 All workflows have pinned API/schema/no-weight verification and local offline codec/forward
-coverage. T2VA additionally completed real-weight LoRA rollout, decode, reward, replay, backward,
+coverage. FirstBlockCache additionally has a real diffusers-0.40.0 tiny-model CPU cache-hit/reset
+lifecycle test, including FSDP2-style runtime block subclasses and Ref2VA prepared-route ownership.
+T2VA additionally completed real-weight LoRA rollout, decode, reward, replay, backward,
 checkpoint, and resume tests on one GPU and with FSDP2 on 16 GPUs. The native-resolution path
 completed initialization, checkpoint, decode, and evaluation. The
 [PR #220 matrix](../../../guidance/gpu_validation.md#pr-220-result) then completed all 36 H3
@@ -165,4 +188,4 @@ not claim long-run reward improvement, convergence, quality parity, or numerical
 ## Cross-refs
 
 - UP: [`constraints.md` #5](../constraints.md#5-adapter-component-runtime-contract), [`constraints.md` #14](../constraints.md#14-sample-dataclass-hierarchy), [`architecture.md` registered components](../architecture.md#registered-components)
-- PEER: [Component Runtime](component_runtime.md), [Structured Trajectory](structured_trajectory.md), [Parity Testing](parity_testing.md)
+- PEER: [Component Runtime](component_runtime.md), [Structured Trajectory](structured_trajectory.md), [Parity Testing](parity_testing.md), [Acceleration](../../../guidance/acceleration.md)

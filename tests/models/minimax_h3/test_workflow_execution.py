@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
@@ -291,6 +292,7 @@ def test_training_times_map_primary_video_coordinate_to_audio_shift(
 
 def test_inference_collects_structured_target_only_trajectory(monkeypatch) -> None:
     calls: List[Any] = []
+    cache_events: List[Any] = []
     prepared_values: List[Dict[str, Any]] = []
     prefixes = {
         "video": torch.ones(1, 1, 96),
@@ -318,6 +320,7 @@ def test_inference_collects_structured_target_only_trajectory(monkeypatch) -> No
     )
 
     def forward(*args, **kwargs):
+        cache_events.append(("step", len(calls)))
         calls.append((args[1], kwargs))
         value = float(len(calls))
         return SimpleNamespace(
@@ -339,7 +342,26 @@ def test_inference_collects_structured_target_only_trajectory(monkeypatch) -> No
         lambda *args, **kwargs: (torch.zeros(1, 2, 3, 4, 4), torch.zeros(1, 2, 16), 32000),
         raising=False,
     )
-    adapter = _adapter(MiniMaxH3T2VAAdapter, transformer=torch.nn.Linear(1, 1))
+
+    class CacheAwareTransformer(torch.nn.Module):
+        is_cache_enabled = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+        def _reset_stateful_cache(self) -> None:
+            cache_events.append(("reset", len(calls)))
+
+        @contextmanager
+        def cache_context(self, name: str):
+            cache_events.append(("enter", name, len(calls)))
+            try:
+                yield
+            finally:
+                cache_events.append(("exit", name, len(calls)))
+
+    adapter = _adapter(MiniMaxH3T2VAAdapter, transformer=CacheAwareTransformer())
     adapter_forward = adapter.forward
     adapter_forward_calls: List[Dict[str, Any]] = []
     adapter_decode = adapter.decode_latents
@@ -425,6 +447,76 @@ def test_inference_collects_structured_target_only_trajectory(monkeypatch) -> No
     assert final_only.trajectory is not None
     assert final_only.trajectory.log_probs is None
     assert final_only.trajectory.log_prob_index_map is None
+    assert [event for event in cache_events if event[0] == "reset"] == [
+        ("reset", 0),
+        ("reset", 2),
+    ]
+    assert [event for event in cache_events if event[0] == "step"] == [
+        ("step", 0),
+        ("step", 1),
+        ("step", 2),
+        ("step", 3),
+    ]
+    assert [event[1] for event in cache_events if event[0] == "enter"] == ["minimax_h3_t2va"] * 4
+
+
+def test_ref_forward_cache_context_owns_inner_while_forward_uses_prepared_route(
+    monkeypatch,
+) -> None:
+    from flow_factory.models.model_bundle import RoutedComponentProxy
+
+    events: List[Any] = []
+
+    class CacheAwareInner(torch.nn.Module):
+        is_cache_enabled = True
+
+        @contextmanager
+        def cache_context(self, name: str):
+            events.append(("enter", name))
+            try:
+                yield
+            finally:
+                events.append(("exit", name))
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            events.append(("inner",))
+            return value
+
+    inner = CacheAwareInner()
+
+    class PreparedBundle(torch.nn.Module):
+        def forward(self, name: str, *args: Any, **kwargs: Any) -> Any:
+            events.append(("bundle", name))
+            return inner(*args, **kwargs)
+
+    proxy = RoutedComponentProxy(
+        PreparedBundle(),
+        "transformer_ref",
+        inner,
+    )
+
+    def forward(transformer, state, *args, **kwargs):
+        transformer(torch.ones(1))
+        return state
+
+    monkeypatch.setattr("flow_factory.models.minimax_h3.workflow.forward_h3_state", forward)
+    adapter = _adapter(MiniMaxH3Ref2VAAdapter, transformer=proxy)
+
+    adapter.forward(
+        state=_state(),
+        times=_times(),
+        condition_prefixes={},
+        prompt_embeds=torch.zeros(1, 2, 4),
+        layout={},
+        return_fields=("velocity",),
+    )
+
+    assert events == [
+        ("enter", "minimax_h3_ref2va"),
+        ("bundle", "transformer_ref"),
+        ("inner",),
+        ("exit", "minimax_h3_ref2va"),
+    ]
 
 
 def test_forward_state_uses_prepared_component_and_forward_parity(monkeypatch) -> None:

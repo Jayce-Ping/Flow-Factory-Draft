@@ -81,6 +81,33 @@ def test_examples_readme_links_h3_and_separates_validation_levels() -> None:
     assert "NonCommercial" in text
 
 
+def test_h3_first_block_cache_docs_preserve_support_and_validation_boundaries() -> None:
+    acceleration = _text("guidance/acceleration.md")
+    knowledge = _text(".agents/knowledge/topics/minimax_h3.md")
+    example = _text("examples/tdm/lora/minimax_h3_t2va/default.yaml")
+
+    for required in (
+        "supported_diffusers_cache_policies",
+        "prepare_diffusers_cache(policy, component_name, transformer)",
+        "MiniMax H3 T2VA/FL2VA/Ref2VA",
+        "`first_block` only",
+        "H3 FirstBlockCache cannot be",
+        "forced-grad rollout path",
+        "threshold is workload-dependent",
+    ):
+        assert required in acceleration
+    for required in (
+        "actual unwrapped main-block class",
+        "transformer_ref",
+        "CPU cache-hit/reset test",
+        "remain workload-dependent",
+    ):
+        assert required in knowledge
+    assert "# acceleration:" in example
+    assert "#     - name: diffusers_cache" in example
+    assert "#       params: { policy: first_block, threshold: 0.05 }" in example
+
+
 def test_gpu_validation_matrix_declares_scope_and_completed_result() -> None:
     text = _text("guidance/gpu_validation.md")
 

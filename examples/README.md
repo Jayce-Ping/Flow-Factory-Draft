@@ -44,7 +44,9 @@ for the production schema and media requirements.
   distributed OCR training run.
 - [`tdm` SD3.5 OCR recipe](tdm/lora/sd3_5/ocr.yaml) — official conditional-noise objective.
 - [`tdm` MiniMax H3 T2VA 6-step recipe](tdm/lora/minimax_h3_t2va/default.yaml) —
-  validated 512×768×124 run; train over 200 steps to approach convergence.
+  validated 512×768×124 run; train over 200 steps to approach convergence. It includes a disabled,
+  optional FirstBlockCache snippet whose threshold still requires target-GPU reward/quality
+  calibration; do not combine it with `torch_compile`.
 - [`tdm-r1` SD3.5 OCR recipe](tdm_r1/lora/sd3_5/ocr.yaml) — official G24
   fake-surrogate-generator objective initialized from the released TDM adapter.
 

@@ -38,7 +38,10 @@ from ._common import (
     build_structured_trajectories,
 )
 from ._common import build_training_component_times as build_h3_component_times
-from ._common import validate_target_state
+from ._common import (
+    validate_target_state,
+)
+from ._diffusers_cache import h3_diffusers_cache_context, reset_h3_diffusers_cache
 from .blocks import encode_h3_workflow_inputs, prepare_h3_rollout_state
 from .decoding import decode_h3_targets
 from .denoise import forward_h3_state
@@ -256,6 +259,7 @@ def infer_h3_workflow(adapter: Any, **kwargs: Any) -> List[Any]:
     geometry = _normalize_geometry(kwargs)
     generator = kwargs.get("generator")
     transformer = adapter.get_component(adapter.transformer_component_name)
+    reset_h3_diffusers_cache(transformer, workflow=adapter.workflow)
     rollout_values = dict(kwargs)
     rollout_values.update(layout)
     rollout_values.update(geometry)
@@ -512,24 +516,26 @@ def forward_h3_adapter_state(
     velocity_only = (
         not compute_log_prob and next_state is None and tuple(return_fields) == ("velocity",)
     )
-    result = forward_h3_state(
-        adapter.get_component(adapter.transformer_component_name),
-        state,
-        condition_prefixes,
-        prompt_embeds,
-        times,
-        layout,
-        adapter.scheduler,
-        adapter.audio_scheduler,
-        next_state=next_state,
-        generator=forward_kwargs.get("generator"),
-        noise_level=noise_level,
-        compute_log_prob=compute_log_prob,
-        velocity_only=velocity_only,
-        attention_kwargs=forward_kwargs.get("attention_kwargs"),
-        return_kwargs=return_fields,
-        workflow=adapter.workflow,
-    )
+    transformer = adapter.get_component(adapter.transformer_component_name)
+    with h3_diffusers_cache_context(transformer, workflow=adapter.workflow):
+        result = forward_h3_state(
+            transformer,
+            state,
+            condition_prefixes,
+            prompt_embeds,
+            times,
+            layout,
+            adapter.scheduler,
+            adapter.audio_scheduler,
+            next_state=next_state,
+            generator=forward_kwargs.get("generator"),
+            noise_level=noise_level,
+            compute_log_prob=compute_log_prob,
+            velocity_only=velocity_only,
+            attention_kwargs=forward_kwargs.get("attention_kwargs"),
+            return_kwargs=return_fields,
+            workflow=adapter.workflow,
+        )
     if velocity_only:
         if not isinstance(result, LatentState):
             raise TypeError(
