@@ -93,14 +93,14 @@ def test_h3_first_block_cache_docs_preserve_support_and_validation_boundaries() 
         "`first_block` only",
         "H3 FirstBlockCache cannot be",
         "forced-grad rollout path",
-        "speed/quality calibration yet",
+        "threshold is workload-dependent",
     ):
         assert required in acceleration
     for required in (
         "actual unwrapped main-block class",
         "transformer_ref",
         "CPU cache-hit/reset test",
-        "not a GPU speed, memory, reward, or quality claim",
+        "remain workload-dependent",
     ):
         assert required in knowledge
     assert "# acceleration:" in example

@@ -170,8 +170,9 @@ call itself continues through the prepared component route (`transformer_ref` fo
 Invalid policies and configurations fail before cache enablement. H3 FirstBlockCache cannot be
 combined with Flow-Factory's `torch_compile`: its forced-grad rollout path would make diffusers
 0.40.0 retain cross-step autograd graphs, so that combination fails fast. This path has exact
-diffusers-0.40.0 CPU lifecycle coverage, including a real cache hit and reset, but no H3 GPU
-speed/quality calibration yet; tune `threshold` and recheck reward/quality on target hardware.
+diffusers-0.40.0 CPU lifecycle coverage, including a real cache hit and reset. Because
+FirstBlockCache is lossy and its threshold is workload-dependent, tune `threshold` and recheck
+reward/quality on the target prompt distribution and hardware.
 
 As a lossy rollout accelerator, H3 caching remains restricted to decoupled or distillation
 trainers such as TDM. Coupled GRPO/GRPO-Guard/DPPO configurations are rejected by the paradigm

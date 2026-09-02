@@ -55,7 +55,8 @@ not registered because diffusers FirstBlockCache scans only the top-level `trans
 generation. Every step opens the stable `minimax_h3_<workflow>` context on the prepared component;
 the same proxy routes the actual call through the prepared bundle, including `transformer_ref` for
 Ref2VA. An exceptional forward resets the state before re-raising. This lifecycle has a real tiny-H3
-CPU cache-hit/reset test on diffusers 0.40.0. It is not a GPU speed, memory, reward, or quality claim.
+CPU cache-hit/reset test on diffusers 0.40.0. Treat it as lifecycle evidence; deployment speed,
+memory, reward, and quality remain workload-dependent.
 
 Do not combine H3 FirstBlockCache with Flow-Factory `torch_compile`. Compile's forced-grad rollout
 path would let the diffusers 0.40.0 cache retain autograd graphs across denoising steps, so the H3
@@ -164,9 +165,8 @@ element-weighted reducer.
 
 All workflows have pinned API/schema/no-weight verification and local offline codec/forward
 coverage. FirstBlockCache additionally has a real diffusers-0.40.0 tiny-model CPU cache-hit/reset
-lifecycle test, including FSDP2-style runtime block subclasses and Ref2VA prepared-route ownership;
-it has not completed H3 GPU speed/quality calibration. T2VA additionally completed real-weight
-LoRA rollout, decode, reward, replay, backward,
+lifecycle test, including FSDP2-style runtime block subclasses and Ref2VA prepared-route ownership.
+T2VA additionally completed real-weight LoRA rollout, decode, reward, replay, backward,
 checkpoint, and resume tests on one GPU and with FSDP2 on 16 GPUs. The native-resolution path
 completed initialization, checkpoint, decode, and evaluation. The
 [PR #220 matrix](../../../guidance/gpu_validation.md#pr-220-result) then completed all 36 H3
