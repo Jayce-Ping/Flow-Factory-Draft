@@ -17,14 +17,14 @@ from typing import Any, Dict
 
 import pytest
 import torch
-from peft import LoraConfig, get_peft_model
-
 from diffusers.hooks import FirstBlockCacheConfig
 from diffusers.hooks._helpers import TransformerBlockMetadata, TransformerBlockRegistry
 from diffusers.models.transformers.transformer_minimax_h3 import (
     MiniMaxH3Transformer3DModel,
     MiniMaxH3TransformerBlock,
 )
+from peft import LoraConfig, get_peft_model
+
 from flow_factory.acceleration.torch_compile import CompileAccelerator
 from flow_factory.models.minimax_h3._chunking import (
     install_h3_in_forward_block_checkpointing,
